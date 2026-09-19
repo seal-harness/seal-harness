@@ -1,0 +1,133 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The skill entry model. A *skill* is a named Markdown bundle (name +
+<span class="lineno">    3 </span>-- description + body) the agent can read into a prompt or update. 'SkillId' is
+<span class="lineno">    4 </span>-- a smart-constructed newtype with the charset predicate
+<span class="lineno">    5 </span>-- (@[A-Za-z0-9_\/-]+@, non-empty, no leading dot, no double\/trailing slash). The
+<span class="lineno">    6 </span>-- skill body is agent-visible data (not a vault secret); it is recorded in full
+<span class="lineno">    7 </span>-- in both the session transcript and the Audited log.
+<span class="lineno">    8 </span>module Seal.Skills.Types
+<span class="lineno">    9 </span>  ( SkillId (..)
+<span class="lineno">   10 </span>  , mkSkillId
+<span class="lineno">   11 </span>  , isValidSkillId
+<span class="lineno">   12 </span>  , skillIdText
+<span class="lineno">   13 </span>  , skillIdSeparator
+<span class="lineno">   14 </span>  , qualifiedSkillId
+<span class="lineno">   15 </span>  , skillIdGroup
+<span class="lineno">   16 </span>  , bareSkillIdText
+<span class="lineno">   17 </span>  , Skill (..)
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import Data.Time (UTCTime)
+<span class="lineno">   24 </span>import GHC.Generics (Generic)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | Opaque skill key. Smart-constructed via 'mkSkillId'; the charset predicate
+<span class="lineno">   29 </span>-- guards every Audited-log / path / SQL-parameter position.
+<span class="lineno">   30 </span>newtype SkillId = SkillId Text
+<span class="lineno">   31 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   32 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | @[A-Za-z0-9_\/-]+@, non-empty, no leading dot, no double slash, no
+<span class="lineno">   35 </span>-- trailing slash. The forward slash is allowed so a skill id can carry its
+<span class="lineno">   36 </span>-- group as a prefix (e.g. @core\/dummy-test@), making the fully-qualified
+<span class="lineno">   37 </span>-- id unique across groups. A bare id (no slash) is also valid for ungrouped
+<span class="lineno">   38 </span>-- skills or when the group is unambiguous. Mirrors 'isValidMemoryId' but
+<span class="lineno">   39 </span>-- adds @\/@.
+<span class="lineno">   40 </span>isValidSkillId :: Text -&gt; Bool
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">isValidSkillId t =</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head t /= '.'</span>
+<span class="lineno">   44 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; not (T.isInfixOf &quot;//&quot; t)</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.last t /= '/'</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all (`elem` chars) t</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   48 </span><span class="spaces">    </span><span class="istickedoff">chars = ['A' .. 'Z'] &lt;&gt; ['a' .. 'z'] &lt;&gt; ['0' .. '9'] &lt;&gt; &quot;_-/&quot;</span></span>
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- | The forward slash separator used to join a group and a bare id into a
+<span class="lineno">   51 </span>-- fully-qualified skill id.
+<span class="lineno">   52 </span>skillIdSeparator :: Char
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">skillIdSeparator = '/'</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>mkSkillId :: Text -&gt; Either Text SkillId
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">mkSkillId t</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">| isValidSkillId t = Right (SkillId t)</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>        = Left <span class="nottickedoff">(&quot;invalid skill id: &quot; &lt;&gt; T.pack (show t))</span></span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Construct a fully-qualified 'SkillId' from a group and a bare id.
+<span class="lineno">   61 </span>-- Returns the bare id as-is when the group is 'Nothing' or empty.
+<span class="lineno">   62 </span>qualifiedSkillId :: Maybe Text -&gt; SkillId -&gt; SkillId
+<span class="lineno">   63 </span><span class="decl"><span class="istickedoff">qualifiedSkillId Nothing sid = sid</span>
+<span class="lineno">   64 </span><span class="spaces"></span><span class="istickedoff">qualifiedSkillId (Just g) sid</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.null (T.strip g)</span> = <span class="nottickedoff">sid</span></span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case mkSkillId (g &lt;&gt; T.singleton skillIdSeparator &lt;&gt; skillIdText sid) of</span>
+<span class="lineno">   67 </span><span class="spaces">      </span><span class="istickedoff">Right fq -&gt; fq</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">sid</span></span></span>  -- fail-soft: return bare id if the qualified form is invalid
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | Extract the group component from a 'SkillId' (the text before the
+<span class="lineno">   71 </span>-- first @\/@). Returns 'Nothing' for a bare id with no slash.
+<span class="lineno">   72 </span>skillIdGroup :: SkillId -&gt; Maybe Text
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">skillIdGroup (SkillId t) =</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn (T.singleton skillIdSeparator) t of</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">(g, rest) | not (T.null rest) -&gt; Just g</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | The bare (unqualified) id component — the text after the last @\/@.
+<span class="lineno">   79 </span>-- For a bare id (no slash), returns the id unchanged.
+<span class="lineno">   80 </span>bareSkillIdText :: SkillId -&gt; Text
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">bareSkillIdText (SkillId t) = snd (T.breakOnEnd (T.singleton skillIdSeparator) t)</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>skillIdText :: SkillId -&gt; Text
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">skillIdText (SkillId t) = t</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | One agent skill. The body is agent-visible data (not a vault secret); it is
+<span class="lineno">   87 </span>-- recorded in full in both the session transcript and the Audited log.
+<span class="lineno">   88 </span>-- 'skSession' is the originating session (provenance).
+<span class="lineno">   89 </span>--
+<span class="lineno">   90 </span>-- 'skGroup' is an optional category for display grouping in the
+<span class="lineno">   91 </span>-- @\&lt;available_skills\&gt;@ catalog. It is derived from the on-disk parent
+<span class="lineno">   92 </span>-- directory name (@config\/skills\/\&lt;group\&gt;\/\&lt;id\&gt;.md@) and may be
+<span class="lineno">   93 </span>-- overridden via a @group:@ frontmatter key. 'Nothing' means the skill
+<span class="lineno">   94 </span>-- belongs to the default (ungrouped) section. The skill id may be either
+<span class="lineno">   95 </span>-- bare (e.g. @greet@) or fully-qualified with a group prefix
+<span class="lineno">   96 </span>-- (e.g. @core\/greet@) so two skills with the same bare name in different
+<span class="lineno">   97 </span>-- groups are distinct. The 'skGroup' field mirrors the group component of
+<span class="lineno">   98 </span>-- the id for display grouping when present.
+<span class="lineno">   99 </span>data Skill = Skill
+<span class="lineno">  100 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">skId</span></span></span>          :: SkillId
+<span class="lineno">  101 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skDescription</span></span></span> :: Text
+<span class="lineno">  102 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skBody</span></span></span>        :: Text
+<span class="lineno">  103 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skGroup</span></span></span>       :: Maybe Text
+<span class="lineno">  104 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skCreatedAt</span></span></span>   :: UTCTime
+<span class="lineno">  105 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skUpdatedAt</span></span></span>   :: UTCTime
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">skSession</span></span></span>     :: SessionId
+<span class="lineno">  107 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON Skill</span></span></span></span></span></span></span></span></span></span>
+<span class="lineno">  110 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON Skill</span></span></span></span></span></span>
+
+</pre>
+</body>
+</html>

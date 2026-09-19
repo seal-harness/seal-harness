@@ -1,0 +1,149 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Validated argv newtypes (Invariant 2 — type-guaranteed argument
+<span class="lineno">    3 </span>-- sanitization). Every value derived from user/LLM input that reaches a
+<span class="lineno">    4 </span>-- subprocess argv must be carried by one of these validated,
+<span class="lineno">    5 </span>-- smart-constructed newtypes — never raw 'Text'/'String'. The exec
+<span class="lineno">    6 </span>-- wrappers accept ONLY these types in their signatures, so passing
+<span class="lineno">    7 </span>-- unsanitized input fails to compile.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- Defense against option injection is built into every smart constructor:
+<span class="lineno">   10 </span>-- reject leading-dash values and always pass a leading @--@ separator
+<span class="lineno">   11 </span>-- before user-derived arguments at the call site. Reject NUL, newlines
+<span class="lineno">   12 </span>-- (where they would break argv token boundaries), and control chars.
+<span class="lineno">   13 </span>module Seal.Tools.Args
+<span class="lineno">   14 </span>  ( ShellArg (..)
+<span class="lineno">   15 </span>  , mkShellArg
+<span class="lineno">   16 </span>  , textShellArg
+<span class="lineno">   17 </span>  , ShellCommand (..)
+<span class="lineno">   18 </span>  , mkShellCommand
+<span class="lineno">   19 </span>  , textShellCommand
+<span class="lineno">   20 </span>  , BinName (..)
+<span class="lineno">   21 </span>  , mkBinName
+<span class="lineno">   22 </span>  , textBinName
+<span class="lineno">   23 </span>  , BinArg (..)
+<span class="lineno">   24 </span>  , mkBinArg
+<span class="lineno">   25 </span>  , textBinArg
+<span class="lineno">   26 </span>  , SearchPattern (..)
+<span class="lineno">   27 </span>  , mkSearchPattern
+<span class="lineno">   28 </span>  , textSearchPattern
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Data.Char (isControl)
+<span class="lineno">   32 </span>import Data.Text (Text)
+<span class="lineno">   33 </span>import Data.Text qualified as T
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | A single argv token (a program argument). Rejects leading-dash (option
+<span class="lineno">   36 </span>-- injection), NUL, newlines, and control chars.
+<span class="lineno">   37 </span>newtype ShellArg = ShellArg Text
+<span class="lineno">   38 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>mkShellArg :: Text -&gt; Either Text ShellArg
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">mkShellArg t</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">| T.null t            = Left <span class="nottickedoff">&quot;shell arg is empty&quot;</span></span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-'     = Left <span class="nottickedoff">&quot;shell arg must not start with '-' (option injection)&quot;</span></span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">| T.any isArgBad t    = Left <span class="nottickedoff">&quot;shell arg contains NUL, newline, or control char&quot;</span></span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Right (ShellArg t)</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   47 </span><span class="spaces">    </span><span class="istickedoff">isArgBad c = c == '\0' || c == '\n' || isControl c</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>textShellArg :: ShellArg -&gt; Text
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">textShellArg (ShellArg t) = t</span></span>
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | A shell command string — the single argument passed to @\/bin\/sh -c@.
+<span class="lineno">   53 </span>-- Rejects NUL (which would terminate the C-string early). Does NOT reject
+<span class="lineno">   54 </span>-- leading dash (a command may begin with @-@; the executor passes it as a
+<span class="lineno">   55 </span>-- single arg to @-c@, not as a flag). Does NOT reject newlines (a shell
+<span class="lineno">   56 </span>-- command legitimately spans lines).
+<span class="lineno">   57 </span>newtype ShellCommand = ShellCommand Text
+<span class="lineno">   58 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>mkShellCommand :: Text -&gt; Either Text ShellCommand
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">mkShellCommand t</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">| T.null t            = Left <span class="nottickedoff">&quot;shell command is empty&quot;</span></span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">| T.any (== '\0') t   = Left <span class="nottickedoff">&quot;shell command contains NUL&quot;</span></span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Right (ShellCommand t)</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>textShellCommand :: ShellCommand -&gt; Text
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">textShellCommand (ShellCommand t) = t</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | A binary name (e.g. @python3@, @node@, @ls@). The executor resolves
+<span class="lineno">   70 </span>-- it on PATH via 'System.Process.proc' (RawCommand — no shell), so the
+<span class="lineno">   71 </span>-- value never passes through a shell. Minimal validation: reject empty
+<span class="lineno">   72 </span>-- and NUL (which would truncate the C-string). Leading dashes are
+<span class="lineno">   73 </span>-- permitted (a binary *may* legitimately begin with @-@), and the
+<span class="lineno">   74 </span>-- argv-passing model means leading-dash args are passed as argv tokens,
+<span class="lineno">   75 </span>-- not flags to a shell. Path separators are permitted (the binary may be
+<span class="lineno">   76 </span>-- an absolute or relative path). Control chars other than NUL are
+<span class="lineno">   77 </span>-- permitted (the executor passes them verbatim through argv).
+<span class="lineno">   78 </span>newtype BinName = BinName Text
+<span class="lineno">   79 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>mkBinName :: Text -&gt; Either Text BinName
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">mkBinName t</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">| T.null t          = Left <span class="nottickedoff">&quot;binary name is empty&quot;</span></span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">| T.any (== '\0') t = Left <span class="nottickedoff">&quot;binary name contains NUL&quot;</span></span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>         = Right (BinName t)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>textBinName :: BinName -&gt; Text
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">textBinName (BinName t) = t</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | A single argv token passed to a binary. The executor uses
+<span class="lineno">   91 </span>-- 'System.Process.proc' (RawCommand), so the value is never interpreted
+<span class="lineno">   92 </span>-- by a shell — it is passed verbatim as one argv entry. Minimal
+<span class="lineno">   93 </span>-- validation: reject empty and NUL. Leading dashes are permitted (a
+<span class="lineno">   94 </span>-- leading-dash arg is a flag for the binary, not option injection — the
+<span class="lineno">   95 </span>-- caller explicitly chose to pass it).
+<span class="lineno">   96 </span>newtype BinArg = BinArg Text
+<span class="lineno">   97 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>mkBinArg :: Text -&gt; Either Text BinArg
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">mkBinArg t</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">| T.null t          = Left <span class="nottickedoff">&quot;bin arg is empty&quot;</span></span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">| T.any (== '\0') t = Left <span class="nottickedoff">&quot;bin arg contains NUL&quot;</span></span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>         = Right (BinArg t)</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>textBinArg :: BinArg -&gt; Text
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">textBinArg (BinArg t) = t</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | A search pattern passed to a search tool (e.g. @rg@). Smart-constructed:
+<span class="lineno">  109 </span>-- rejects empty and leading-dash (option-injection defense at the search
+<span class="lineno">  110 </span>-- tool's argv boundary). NUL/newlines rejected so the pattern cannot break
+<span class="lineno">  111 </span>-- out of its single argv token. The validated newtype is what the
+<span class="lineno">  112 </span>-- 'UntrustedIO' search methods accept; the caller never passes raw 'Text'.
+<span class="lineno">  113 </span>newtype SearchPattern = SearchPattern Text
+<span class="lineno">  114 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>mkSearchPattern :: Text -&gt; Either Text SearchPattern
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">mkSearchPattern t</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.null t</span>          = <span class="nottickedoff">Left &quot;search pattern is empty&quot;</span></span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.head t == '-'</span>   = <span class="nottickedoff">Left &quot;search pattern must not start with '-' (option injection)&quot;</span></span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.any isArgBad t</span>  = <span class="nottickedoff">Left &quot;search pattern contains NUL, newline, or control char&quot;</span></span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>         = Right (SearchPattern t)</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">isArgBad c = c == '\0' || c == '\n' || isControl c</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>textSearchPattern :: SearchPattern -&gt; Text
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">textSearchPattern (SearchPattern t) = t</span></span>
+
+</pre>
+</body>
+</html>

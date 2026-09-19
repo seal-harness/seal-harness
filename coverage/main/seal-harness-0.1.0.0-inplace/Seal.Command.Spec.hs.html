@@ -1,0 +1,113 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>module Seal.Command.Spec
+<span class="lineno">    2 </span>  ( CommandName(..)
+<span class="lineno">    3 </span>  , CommandGroup(..)
+<span class="lineno">    4 </span>  , Availability(..)
+<span class="lineno">    5 </span>  , CommandAction(..)
+<span class="lineno">    6 </span>  , CommandSpec(..)
+<span class="lineno">    7 </span>  , Registry(..)
+<span class="lineno">    8 </span>  , mkRegistry
+<span class="lineno">    9 </span>  , lookupSpec
+<span class="lineno">   10 </span>  , runCommandActionMaybe
+<span class="lineno">   11 </span>  , commandAction
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Control.Monad (void)
+<span class="lineno">   15 </span>import Data.List (find)
+<span class="lineno">   16 </span>import Data.Text (Text)
+<span class="lineno">   17 </span>import qualified Data.Text as T
+<span class="lineno">   18 </span>import Options.Applicative (ParserInfo)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Channel.Caps (ChannelCaps)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>newtype CommandName = CommandName Text
+<span class="lineno">   23 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>data CommandGroup
+<span class="lineno">   26 </span>  = GroupGeneral
+<span class="lineno">   27 </span>  | GroupProvider
+<span class="lineno">   28 </span>  | GroupSession
+<span class="lineno">   29 </span>  | GroupModel
+<span class="lineno">   30 </span>  | GroupVault
+<span class="lineno">   31 </span>  | GroupSkills
+<span class="lineno">   32 </span>  | GroupAgent
+<span class="lineno">   33 </span>  | GroupTools
+<span class="lineno">   34 </span>  | GroupRepos
+<span class="lineno">   35 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Bounded</span></span></span></span>)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>data Availability
+<span class="lineno">   38 </span>  = AlwaysAvailable
+<span class="lineno">   39 </span>  | InteractiveOnly
+<span class="lineno">   40 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | The runnable action a successfully-parsed command performs on its channel.
+<span class="lineno">   43 </span>-- Returns an optional follow-up turn text: 'Nothing' for commands that do not
+<span class="lineno">   44 </span>-- trigger a turn (the vast majority); @'Just' t@ when the command wants the
+<span class="lineno">   45 </span>-- agent loop to run a turn with text @t@ immediately after the command
+<span class="lineno">   46 </span>-- completes (e.g. @\/skill load@ after writing the skill body to
+<span class="lineno">   47 </span>-- @conversation.jsonl@). The follow-up turn is forked by each channel's
+<span class="lineno">   48 </span>-- dispatch site so the channel loop continues reading input while the LLM
+<span class="lineno">   49 </span>-- runs.
+<span class="lineno">   50 </span>newtype CommandAction = CommandAction { <span class="istickedoff"><span class="decl"><span class="istickedoff">runCommandAction</span></span></span> :: ChannelCaps -&gt; IO (Maybe Text) }
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | Construct a 'CommandAction' from an @IO ()@ action that never triggers a
+<span class="lineno">   53 </span>-- follow-up turn. This is the common case — most commands produce output via
+<span class="lineno">   54 </span>-- 'ccSend' and return 'Nothing'. Commands that DO want to trigger a turn
+<span class="lineno">   55 </span>-- (e.g. @\/skill load@) construct 'CommandAction' directly and return
+<span class="lineno">   56 </span>-- @'Just' text@.
+<span class="lineno">   57 </span>commandAction :: (ChannelCaps -&gt; IO ()) -&gt; CommandAction
+<span class="lineno">   58 </span><span class="decl"><span class="istickedoff">commandAction act = CommandAction (\caps -&gt; void (act caps) &gt;&gt; pure Nothing)</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Run a 'CommandAction' and return the optional follow-up-turn signal.
+<span class="lineno">   61 </span>-- Convenience alias for 'runCommandAction'.
+<span class="lineno">   62 </span>runCommandActionMaybe :: CommandAction -&gt; ChannelCaps -&gt; IO (Maybe Text)
+<span class="lineno">   63 </span><span class="decl"><span class="istickedoff">runCommandActionMaybe = runCommandAction</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>data CommandSpec = CommandSpec
+<span class="lineno">   66 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">csName</span></span></span> :: CommandName
+<span class="lineno">   67 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csAliases</span></span></span> :: [CommandName]
+<span class="lineno">   68 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csGroup</span></span></span> :: CommandGroup
+<span class="lineno">   69 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csSynopsis</span></span></span> :: Text              -- ^ One line for /help index
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csParserInfo</span></span></span> :: ParserInfo CommandAction
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csAvailability</span></span></span> :: Availability
+<span class="lineno">   72 </span>  }
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | NOTE: /help is NOT a registered spec — it is a meta-operation handled by
+<span class="lineno">   75 </span>-- Seal.Command.Help / Seal.Command.Parse over the Registry (avoids the
+<span class="lineno">   76 </span>-- registry-needs-itself knot). Feature modules build their own CommandSpec
+<span class="lineno">   77 </span>-- and the startup wiring assembles the Registry.
+<span class="lineno">   78 </span>newtype Registry = Registry { <span class="istickedoff"><span class="decl"><span class="istickedoff">registrySpecs</span></span></span> :: [CommandSpec] }
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>mkRegistry :: [CommandSpec] -&gt; Registry
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">mkRegistry = Registry</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | Case-insensitive lookup by primary name or any alias.
+<span class="lineno">   84 </span>lookupSpec :: Registry -&gt; CommandName -&gt; Maybe CommandSpec
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">lookupSpec (Registry specs) (CommandName needle) =</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">find matchesAny specs</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">lower = T.toCaseFold needle</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">nameEq (CommandName n) = T.toCaseFold n == lower</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">matchesAny spec = nameEq (csName spec) || any nameEq (csAliases spec)</span></span>
+
+</pre>
+</body>
+</html>

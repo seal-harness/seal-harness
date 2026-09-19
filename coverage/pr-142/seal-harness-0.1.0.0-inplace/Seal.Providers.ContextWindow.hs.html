@@ -1,0 +1,57 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | A pure static lookup table for model context windows and max output
+<span class="lineno">    3 </span>-- tokens, keyed by model-id prefix. Used by the gateway's
+<span class="lineno">    4 </span>-- @/api/providers/:p/models@ + @/api/providers/:p/models/:m/context@
+<span class="lineno">    5 </span>-- endpoints (Phase 7b T11). The real @/v1/models@ upstream call needs vault
+<span class="lineno">    6 </span>-- credentials + a live HTTP request and is out of scope for T11; this table
+<span class="lineno">    7 </span>-- ships a static, best-known approximation. Unknown model ids yield @0@.
+<span class="lineno">    8 </span>module Seal.Providers.ContextWindow
+<span class="lineno">    9 </span>  ( modelContextWindow
+<span class="lineno">   10 </span>  , modelMaxOutputTokens
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Data.Text (Text)
+<span class="lineno">   14 </span>import Data.Text qualified as T
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>-- | The context window size for a model id, by prefix match. 0 if unknown.
+<span class="lineno">   17 </span>modelContextWindow :: Text -&gt; Int
+<span class="lineno">   18 </span><span class="decl"><span class="nottickedoff">modelContextWindow m</span>
+<span class="lineno">   19 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;claude-sonnet-&quot; `T.isPrefixOf` m = 200000</span>
+<span class="lineno">   20 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;claude-opus-&quot;   `T.isPrefixOf` m = 200000</span>
+<span class="lineno">   21 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;claude-haiku-&quot;  `T.isPrefixOf` m = 200000</span>
+<span class="lineno">   22 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;gpt-4o-&quot;        `T.isPrefixOf` m = 128000</span>
+<span class="lineno">   23 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;gpt-4-turbo&quot;    `T.isPrefixOf` m = 128000</span>
+<span class="lineno">   24 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;llama3.1&quot;       `T.isPrefixOf` m = 128000</span>
+<span class="lineno">   25 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;llama3&quot;         `T.isPrefixOf` m = 8192</span>
+<span class="lineno">   26 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise                          = 0</span></span>
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | The max output tokens for a model id, by prefix match. 0 if unknown.
+<span class="lineno">   29 </span>modelMaxOutputTokens :: Text -&gt; Int
+<span class="lineno">   30 </span><span class="decl"><span class="nottickedoff">modelMaxOutputTokens m</span>
+<span class="lineno">   31 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;claude-&quot;   `T.isPrefixOf` m = 64000</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;gpt-4o-&quot;   `T.isPrefixOf` m = 16384</span>
+<span class="lineno">   33 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;llama3&quot;    `T.isPrefixOf` m = 4096</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise                     = 0</span></span>
+
+</pre>
+</body>
+</html>

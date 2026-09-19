@@ -1,0 +1,169 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @[signal]@ config section + the smart-constructed 'SignalAccount'
+<span class="lineno">    3 </span>-- newtype (the option-injection defense for the signal-cli argv). Lives in
+<span class="lineno">    4 </span>-- its own module so &quot;Seal.Config.File&quot; can add the section without a cycle:
+<span class="lineno">    5 </span>-- this module exports the codec; Seal.Config.File imports it and wires the
+<span class="lineno">    6 </span>-- @[signal]@ table. Resolution takes the section directly (not the whole
+<span class="lineno">    7 </span>-- 'RuntimeConfig') to keep the modules acyclic.
+<span class="lineno">    8 </span>module Seal.Signal.Config
+<span class="lineno">    9 </span>  ( SignalAccount (..)
+<span class="lineno">   10 </span>  , mkSignalAccount
+<span class="lineno">   11 </span>  , signalAccountText
+<span class="lineno">   12 </span>  , SignalConfig (..)
+<span class="lineno">   13 </span>  , defaultSignalConfig
+<span class="lineno">   14 </span>  , defaultSignalChunkLimit
+<span class="lineno">   15 </span>  , resolveSignalConfig
+<span class="lineno">   16 </span>  , signalConfigCodec
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   20 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   21 </span>import Data.Set (Set)
+<span class="lineno">   22 </span>import Data.Set qualified as Set
+<span class="lineno">   23 </span>import Data.Text (Text)
+<span class="lineno">   24 </span>import Data.Text qualified as T
+<span class="lineno">   25 </span>import Toml ((.=))
+<span class="lineno">   26 </span>import Toml qualified
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Seal.Core.AllowList (AllowList (..))
+<span class="lineno">   29 </span>import Seal.Core.MessageSource (UserId, mkUserId)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   32 </span>-- SignalAccount — the validated account label for the signal-cli argv
+<span class="lineno">   33 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | The signal-cli account label (a phone number or UUID). Smart-constructed:
+<span class="lineno">   36 </span>-- non-empty, no leading dash (option-injection defense — a leading-dash
+<span class="lineno">   37 </span>-- value would be interpreted as a flag by signal-cli), charset
+<span class="lineno">   38 </span>-- @[A-Za-z0-9+:-_@. The validated type that reaches the subprocess argv.
+<span class="lineno">   39 </span>newtype SignalAccount = SignalAccount Text
+<span class="lineno">   40 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>mkSignalAccount :: Text -&gt; Either Text SignalAccount
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">mkSignalAccount t</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">| T.null t        = Left <span class="nottickedoff">&quot;signal account is empty&quot;</span></span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-' = Left <span class="nottickedoff">&quot;signal account must not start with '-' (option injection)&quot;</span></span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">| not (T.all validAccountChar t)</span>
+<span class="lineno">   47 </span><span class="spaces">                    </span><span class="istickedoff">= Left <span class="nottickedoff">&quot;signal account has invalid characters&quot;</span></span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = Right (SignalAccount t)</span></span>
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>validAccountChar :: Char -&gt; Bool
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">validAccountChar c = c `Set.member` accountChars</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">accountChars :: Set Char</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">accountChars = Set.fromList</span>
+<span class="lineno">   55 </span><span class="spaces">      </span><span class="istickedoff">$ ['A'..'Z'] &lt;&gt; ['a'..'z'] &lt;&gt; ['0'..'9'] &lt;&gt; &quot;+-:_&quot;</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>signalAccountText :: SignalAccount -&gt; Text
+<span class="lineno">   58 </span><span class="decl"><span class="istickedoff">signalAccountText (SignalAccount t) = t</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   61 </span>-- SignalConfig — the [signal] config section
+<span class="lineno">   62 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | The @[signal]@ config section. All fields optional at the file level;
+<span class="lineno">   65 </span>-- @seal signal@ fails fast via 'resolveSignalConfig' if 'scAccount' is
+<span class="lineno">   66 </span>-- unset (no config account AND no vault-supplied account).
+<span class="lineno">   67 </span>data SignalConfig = SignalConfig
+<span class="lineno">   68 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scAccount</span></span></span>        :: Maybe Text       -- ^ phone number or UUID
+<span class="lineno">   69 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scTextChunkLimit</span></span></span> :: Maybe Int        -- ^ default 'defaultSignalChunkLimit'
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scAllowFrom</span></span></span>      :: AllowList Text   -- ^ sender allow-list (phone or UUID)
+<span class="lineno">   71 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | Signal's text-message character limit. Replies longer than this are
+<span class="lineno">   74 </span>-- chunked via 'Seal.Channels.Signal.Transport.chunkMessage'.
+<span class="lineno">   75 </span>defaultSignalChunkLimit :: Int
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">defaultSignalChunkLimit = 1998</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>defaultSignalConfig :: SignalConfig
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">defaultSignalConfig = SignalConfig</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">{ scAccount = Nothing</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">, scTextChunkLimit = Just defaultSignalChunkLimit</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">, scAllowFrom = AllowAll</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   86 </span>-- TOML codec (bidirectional, used by Seal.Config.File)
+<span class="lineno">   87 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Bidirectional tomland codec for the @[signal]@ section. 'scAllowFrom'
+<span class="lineno">   90 </span>-- is a TOML array of strings (@allow_from = [&quot;+1&quot;, &quot;uuid:abc&quot;]@); an absent
+<span class="lineno">   91 </span>-- array decodes as 'AllowAll'.
+<span class="lineno">   92 </span>signalConfigCodec :: Toml.TomlCodec SignalConfig
+<span class="lineno">   93 </span><span class="decl"><span class="istickedoff">signalConfigCodec = SignalConfig</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;account&quot;)         .= scAccount</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.int &quot;text_chunk_limit&quot;) .= scTextChunkLimit</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; allowListCodec                                 .= scAllowFrom</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | Codec for the @allow_from@ array: 'AllowAll' when absent, 'AllowOnly'
+<span class="lineno">   99 </span>-- of the listed strings when present.
+<span class="lineno">  100 </span>allowListCodec :: Toml.TomlCodec (AllowList Text)
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">allowListCodec = Toml.dimap toList fromList (Toml.dioptional (Toml.arrayOf Toml._Text &quot;allow_from&quot;))</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">toList :: AllowList Text -&gt; Maybe [Text]</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">toList AllowAll       = Nothing</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">toList (AllowOnly xs) = Just (Set.toList xs)</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">fromList :: Maybe [Text] -&gt; AllowList Text</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">fromList Nothing   = AllowAll</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">fromList (Just xs) = AllowOnly (Set.fromList xs)</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  111 </span>-- Resolution — config section + vault account -&gt; validated (account, limit, allow)
+<span class="lineno">  112 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Resolve the @[signal]@ section + an optional vault-supplied account
+<span class="lineno">  115 </span>-- label into a validated 'SignalAccount', chunk limit, and
+<span class="lineno">  116 </span>-- 'AllowList UserId' for the channel's sender check. The vault account (if
+<span class="lineno">  117 </span>-- supplied) overrides the config account; either way it's smart-constructed
+<span class="lineno">  118 </span>-- here. A missing account (no section, no vault account) is rejected. The
+<span class="lineno">  119 </span>-- @allow_from@ 'AllowList Text' is mapped through 'mkUserId' to an
+<span class="lineno">  120 </span>-- 'AllowList UserId' — a malformed entry fails the whole resolution with a
+<span class="lineno">  121 </span>-- clear error.
+<span class="lineno">  122 </span>resolveSignalConfig
+<span class="lineno">  123 </span>  :: Maybe SignalConfig -&gt; Maybe Text
+<span class="lineno">  124 </span>  -&gt; Either Text (SignalAccount, Int, AllowList UserId)
+<span class="lineno">  125 </span><span class="decl"><span class="istickedoff">resolveSignalConfig mSection mVaultAccount =</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">case mVaultAccount &lt;|&gt; (mSection &gt;&gt;= scAccount) of</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left <span class="nottickedoff">&quot;signal: no account configured (set [signal].account or supply via vault)&quot;</span></span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">Just acctRaw -&gt; do</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">acct &lt;- mkSignalAccount acctRaw</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">let sigCfg = fromMaybe <span class="nottickedoff">defaultSignalConfig</span> mSection</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">limit  = fromMaybe defaultSignalChunkLimit (scTextChunkLimit sigCfg)</span></span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">allowUserId &lt;- mapAllowUserId (scAllowFrom sigCfg)</span>
+<span class="lineno">  133 </span><span class="spaces">      </span><span class="istickedoff">Right (acct, <span class="nottickedoff">limit</span>, allowUserId)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Map an 'AllowList Text' through 'mkUserId' to an 'AllowList UserId'.
+<span class="lineno">  136 </span>-- 'AllowAll' passes through; 'AllowOnly' maps each element (a malformed
+<span class="lineno">  137 </span>-- entry fails the whole resolution).
+<span class="lineno">  138 </span>mapAllowUserId :: AllowList Text -&gt; Either Text (AllowList UserId)
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">mapAllowUserId AllowAll = Right AllowAll</span>
+<span class="lineno">  140 </span><span class="spaces"></span><span class="istickedoff">mapAllowUserId (AllowOnly txts) = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">uids &lt;- traverse mkUserIdText (Set.toList txts)</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">Right (AllowOnly (Set.fromList uids))</span></span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">mkUserIdText t = case mkUserId t of</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">Right u  -&gt; <span class="nottickedoff">Right u</span></span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; Left <span class="nottickedoff">(&quot;signal allow_from has invalid user id &quot; &lt;&gt; T.pack (show t) &lt;&gt; &quot;: &quot; &lt;&gt; err)</span></span></span>
+
+</pre>
+</body>
+</html>

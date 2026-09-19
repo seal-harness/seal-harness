@@ -1,0 +1,1158 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE LambdaCase        #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The unified capability handle for Untrusted opcodes. Every side-effecting
+<span class="lineno">    4 </span>-- operation an untrusted tool call can perform is a method on this type.
+<span class="lineno">    5 </span>-- Opcode modules never import 'System.Process', 'System.Directory', or
+<span class="lineno">    6 </span>-- 'System.Posix' — they call these methods. The constructor is NOT exported;
+<span class="lineno">    7 </span>-- the two smart constructors ('mkLocalUntrustedIO', 'mkRemoteUntrustedIO')
+<span class="lineno">    8 </span>-- are the only way to obtain one.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Security properties preserved by construction:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>--   * Capability scoping (spec §4/§8): a Trusted opcode has no 'UntrustedIO'
+<span class="lineno">   13 </span>--     in scope — it cannot call any of these methods (compile error).
+<span class="lineno">   14 </span>--   * SafePath confinement: file methods take a 'RemotePath' (a
+<span class="lineno">   15 </span>--     workspace-relative path) and internally 'mkSafePath' /
+<span class="lineno">   16 </span>--     'mkSafePathForWrite' (local arm) or 'mkSafePathRemote' (remote arm).
+<span class="lineno">   17 </span>--     The caller never sees a raw 'FilePath'.
+<span class="lineno">   18 </span>--   * Bounded: read/write/search methods carry operator ceilings.
+<span class="lineno">   19 </span>--   * Validated argv: shell/bin/search methods take validated newtypes
+<span class="lineno">   20 </span>--     ('ShellCommand', 'BinName', 'BinArg', 'SearchPattern'), never raw
+<span class="lineno">   21 </span>--     'Text'.
+<span class="lineno">   22 </span>--
+<span class="lineno">   23 </span>-- The local arm is implemented via the existing 'System.Process' /
+<span class="lineno">   24 </span>-- 'System.Directory' code (lifted out of 'Seal.Tools.Exec.Local' and the
+<span class="lineno">   25 </span>-- opcode modules). The remote arm is implemented over SSH (Option A in the
+<span class="lineno">   26 </span>-- plan: file IO piped over the SSH channel's stdin/stdout; commands via
+<span class="lineno">   27 </span>-- the existing 'RemoteRunner'). SafePath is validated LOCALLY before any
+<span class="lineno">   28 </span>-- SSH call so a @..@ escape is rejected before the network is touched.
+<span class="lineno">   29 </span>module Seal.Tools.Exec.UntrustedIO
+<span class="lineno">   30 </span>  ( UntrustedIO (..)
+<span class="lineno">   31 </span>  , WriteMode (..)
+<span class="lineno">   32 </span>  , UntrustedErr (..)
+<span class="lineno">   33 </span>  , renderUntrustedErr
+<span class="lineno">   34 </span>  , mkLocalUntrustedIO
+<span class="lineno">   35 </span>  , mkRemoteUntrustedIO
+<span class="lineno">   36 </span>  , mkRemoteUntrustedIOFromRunner
+<span class="lineno">   37 </span>  , mkRemoteUntrustedIOStub
+<span class="lineno">   38 </span>  , applyUnifiedDiff
+<span class="lineno">   39 </span>  , lineWindowFromText
+<span class="lineno">   40 </span>  , buildRgCmd
+<span class="lineno">   41 </span>  , shellQuote
+<span class="lineno">   42 </span>  , renderEnvPrefix
+<span class="lineno">   43 </span>  , mergeEnv
+<span class="lineno">   44 </span>  , logExecDebug
+<span class="lineno">   45 </span>  , secretEnvKeys
+<span class="lineno">   46 </span>  , redactEnv
+<span class="lineno">   47 </span>  ) where
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Control.Exception (IOException, try)
+<span class="lineno">   50 </span>import Data.ByteString qualified as BS
+<span class="lineno">   51 </span>import Data.Char (isDigit, isSpace)
+<span class="lineno">   52 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   53 </span>import Data.Set (Set)
+<span class="lineno">   54 </span>import Data.Set qualified as Set
+<span class="lineno">   55 </span>import Data.Text (Text)
+<span class="lineno">   56 </span>import Data.Text qualified as T
+<span class="lineno">   57 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   58 </span>import System.Directory (renameFile)
+<span class="lineno">   59 </span>import System.Environment (getEnvironment)
+<span class="lineno">   60 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   61 </span>import System.FilePath (isAbsolute)
+<span class="lineno">   62 </span>import System.Process
+<span class="lineno">   63 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess
+<span class="lineno">   64 </span>  )
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>import Seal.Security.Path
+<span class="lineno">   67 </span>  ( PathError (..), SafePath, WorkspaceRoot (..), getSafePath, mkSafePath
+<span class="lineno">   68 </span>  , mkSafePathForWrite, mkSafePathRemote
+<span class="lineno">   69 </span>  )
+<span class="lineno">   70 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   71 </span>import Seal.Text.LineFile
+<span class="lineno">   72 </span>  ( LineWindow (..) )
+<span class="lineno">   73 </span>import Seal.Tools.Args
+<span class="lineno">   74 </span>  ( BinArg, BinName, SearchPattern, ShellCommand
+<span class="lineno">   75 </span>  , mkShellCommand, textBinArg, textBinName, textSearchPattern, textShellCommand
+<span class="lineno">   76 </span>  )
+<span class="lineno">   77 </span>import Seal.Tools.Exec.Local
+<span class="lineno">   78 </span>  ( readBounded, withManagedProcess )
+<span class="lineno">   79 </span>import Seal.Tools.Exec.Remote
+<span class="lineno">   80 </span>  ( RemoteRunner (..), runRemoteShell
+<span class="lineno">   81 </span>  , runRemoteStdin, sshExecArgv, sshExecArgvForwarding
+<span class="lineno">   82 </span>  )
+<span class="lineno">   83 </span>import Seal.Tools.Exec.Types
+<span class="lineno">   84 </span>  ( ExecError (..), RemotePath, SshConfig (..), getRemotePath
+<span class="lineno">   85 </span>  )
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>import Katip (Severity (..))
+<span class="lineno">   88 </span>import Katip qualified as K (ls)
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | The unified capability handle. Each field is an IO action the opcode
+<span class="lineno">   91 </span>-- calls; the smart constructors wire the local or remote implementation.
+<span class="lineno">   92 </span>-- The constructor is NOT exported — only the smart constructors are.
+<span class="lineno">   93 </span>--
+<span class="lineno">   94 </span>-- File methods take a 'RemotePath' (a workspace-relative path). Internally
+<span class="lineno">   95 </span>-- each arm re-anchors the path against its own 'WorkspaceRoot' and runs
+<span class="lineno">   96 </span>-- the lexical + (local arm) canonical confinement check. The remote arm
+<span class="lineno">   97 </span>-- uses 'mkSafePathRemote' (lexical-only — the file lives on the remote
+<span class="lineno">   98 </span>-- machine, so no local 'canonicalizePath').
+<span class="lineno">   99 </span>data UntrustedIO = UntrustedIO
+<span class="lineno">  100 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uioReadFile</span></span></span>    :: RemotePath -&gt; Int -&gt; IO (Either UntrustedErr LineWindow)
+<span class="lineno">  101 </span>    -- ^ Read a workspace-relative file as a 'LineWindow' (line-oriented,
+<span class="lineno">  102 </span>    -- paged, bounded by the operator scan-byte ceiling). Returns the
+<span class="lineno">  103 </span>    -- window (the opcode renders it via 'renderWindow') or a structured
+<span class="lineno">  104 </span>    -- error. The path is validated + confined internally.
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioWriteFile</span></span></span>   :: RemotePath -&gt; Text -&gt; WriteMode -&gt; Int
+<span class="lineno">  107 </span>                   -&gt; IO (Either UntrustedErr Int)
+<span class="lineno">  108 </span>    -- ^ Write or append content to a workspace-relative file. The
+<span class="lineno">  109 </span>    -- @operatorWriteCeiling@ is the hard upper bound on bytes written per
+<span class="lineno">  110 </span>    -- call; the capability rejects content above the ceiling with
+<span class="lineno">  111 </span>    -- 'UeBounded' (the opcode may pre-check, but the capability is the
+<span class="lineno">  112 </span>    -- authoritative bound). Returns bytes written. The path is validated
+<span class="lineno">  113 </span>    -- + confined internally.
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioPatchFile</span></span></span>   :: RemotePath -&gt; Text -&gt; IO (Either UntrustedErr ())
+<span class="lineno">  116 </span>    -- ^ Apply a unified diff to a workspace-relative file. Read (cat) →
+<span class="lineno">  117 </span>    -- apply the diff in-process (the pure 'applyUnifiedDiff') → write
+<span class="lineno">  118 </span>    -- atomically (temp + rename on the target plane). Returns '()' or
+<span class="lineno">  119 </span>    -- a structured error.
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioShellExec</span></span></span>   :: ShellCommand -&gt; Maybe RemotePath
+<span class="lineno">  122 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  123 </span>    -- ^ Run a validated shell command (single arg to @/bin/sh -c@), with
+<span class="lineno">  124 </span>    -- an optional SafePath-confined cwd. Returns stdout (+ exit
+<span class="lineno">  125 </span>    -- annotation) or a structured error.
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioBinExec</span></span></span>     :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath
+<span class="lineno">  128 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  129 </span>    -- ^ Run a named binary (no shell, fixed argv) with an optional cwd.
+<span class="lineno">  130 </span>    -- A relative 'RemotePath' is SafePath-confined to the workspace root;
+<span class="lineno">  131 </span>    -- an absolute 'RemotePath' is passed through verbatim (not confined).
+<span class="lineno">  132 </span>    -- Returns stdout or error.
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioProcessList</span></span></span> :: IO (Either UntrustedErr Text)
+<span class="lineno">  135 </span>    -- ^ List processes on the untrusted plane (bounded output).
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioProcessKill</span></span></span> :: Int -&gt; IO (Either UntrustedErr ())
+<span class="lineno">  138 </span>    -- ^ Kill a process by PID (validated positive integer) on the
+<span class="lineno">  139 </span>    -- untrusted plane.
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioSearchFiles</span></span></span> :: SearchPattern -&gt; Maybe RemotePath -&gt; Int
+<span class="lineno">  142 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  143 </span>    -- ^ Search workspace files for a pattern (@rg -n -- &lt;pattern&gt;
+<span class="lineno">  144 </span>    -- &lt;path&gt;@). The path defaults to the workspace root. The result
+<span class="lineno">  145 </span>    -- count is bounded by the operator ceiling. Returns matching lines
+<span class="lineno">  146 </span>    -- or error.
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioShellExecEnv</span></span></span> :: [(String, String)] -&gt; ShellCommand -&gt; Maybe RemotePath
+<span class="lineno">  149 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  150 </span>    -- ^ Like 'uioShellExec' but with env overrides MERGED over the
+<span class="lineno">  151 </span>    -- inherited environment (local arm) / @env VAR=val@-prefixed into the
+<span class="lineno">  152 </span>    -- command string (remote arm — portable: @ssh -A@ only forwards the
+<span class="lineno">  153 </span>    -- agent socket; @SendEnv@/@SetEnv@ need server @AcceptEnv@ which is
+<span class="lineno">  154 </span>    -- @none@ by default). Used by the git-credential opcodes to inject
+<span class="lineno">  155 </span>    -- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ for deploy-key ops (the
+<span class="lineno">  156 </span>    -- forwarded agent + pinned @known_hosts@, never the key bytes).
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uioShellExecGitEnv</span></span></span> :: [(String, String)] -&gt; Maybe BS.ByteString
+<span class="lineno">  159 </span>                   -&gt; ShellCommand -&gt; Maybe RemotePath
+<span class="lineno">  160 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  161 </span>    -- ^ Like 'uioShellExecEnv' but with an optional @known_hosts@
+<span class="lineno">  162 </span>    -- content payload for the REMOTE deploy-key path. When the content
+<span class="lineno">  163 </span>    -- is 'Just' the remote arm: (1) writes it to a remote temp file via
+<span class="lineno">  164 </span>    -- @ssh ... -- tee &lt;path&gt;@, (2) rewrites @GIT_SSH_COMMAND@ in the
+<span class="lineno">  165 </span>    -- extras to add @UserKnownHostsFile=&lt;remote temp path&gt;@, (3) uses
+<span class="lineno">  166 </span>    -- @ssh -A@ (agent forwarding) so the remote @git@ can sign via the
+<span class="lineno">  167 </span>    -- forwarded @SSH_AUTH_SOCK@, (4) strips @SSH_AUTH_SOCK@ /
+<span class="lineno">  168 </span>    -- @SSH_AGENT_PID@ from the @env@ prefix (the forwarded socket
+<span class="lineno">  169 </span>    -- replaces them), (5) cleans up the remote temp file after. The
+<span class="lineno">  170 </span>    -- local arm ignores the content (the local temp file is already
+<span class="lineno">  171 </span>    -- written by 'resolveCloneTarget') + delegates to
+<span class="lineno">  172 </span>    -- 'uioShellExecEnv'. Used by 'cloneWithCredential' + 'runGitCommand'
+<span class="lineno">  173 </span>    -- for deploy-key ops (the only credential kind that needs the
+<span class="lineno">  174 </span>    -- agent + known_hosts).
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioBinExecEnv</span></span></span> :: [(String, String)] -&gt; BinName -&gt; [BinArg]
+<span class="lineno">  177 </span>                 -&gt; Maybe RemotePath
+<span class="lineno">  178 </span>                 -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  179 </span>    -- ^ Like 'uioBinExec' but with env overrides (same merge strategy as
+<span class="lineno">  180 </span>    -- 'uioShellExecEnv') and an optional cwd. Used by the PAT clone path
+<span class="lineno">  181 </span>    -- (@http.extraHeader@ is an argv element, but the env override is
+<span class="lineno">  182 </span>    -- still needed for @GIT_TERMINAL_PROMPT=0@).
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uioBinExecGitEnv</span></span></span> :: [(String, String)] -&gt; Maybe BS.ByteString
+<span class="lineno">  185 </span>                   -&gt; BinName -&gt; [BinArg] -&gt; Maybe RemotePath
+<span class="lineno">  186 </span>                   -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  187 </span>    -- ^ Like 'uioBinExecEnv' but with optional @known_hosts@ content for
+<span class="lineno">  188 </span>    -- the REMOTE deploy-key path (mirrors 'uioShellExecGitEnv'). The
+<span class="lineno">  189 </span>    -- local arm delegates to 'uioBinExecEnv' (ignoring the content). The
+<span class="lineno">  190 </span>    -- remote arm uses @ssh -A@ (agent forwarding) + strips
+<span class="lineno">  191 </span>    -- @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ from the remote env prefix (the
+<span class="lineno">  192 </span>    -- forwarded socket replaces them). Used by BIN_EXEC when the binary
+<span class="lineno">  193 </span>    -- is @git@ and the cwd is inside a registered repo with a deploy-key
+<span class="lineno">  194 </span>    -- credential.
+<span class="lineno">  195 </span>  }
+<span class="lineno">  196 </span>
+<span class="lineno">  197 </span>-- | Write mode for 'uioWriteFile': truncate + create (@'WMWrite'@, the
+<span class="lineno">  198 </span>-- default) or append.
+<span class="lineno">  199 </span>data WriteMode = WMWrite | WMAppend
+<span class="lineno">  200 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- | The structured error an 'UntrustedIO' method returns. Wraps the
+<span class="lineno">  203 </span>-- path-error, the bounded-overflow, and the executor-layer errors so the
+<span class="lineno">  204 </span>-- opcode can render a single, consistent error message.
+<span class="lineno">  205 </span>data UntrustedErr
+<span class="lineno">  206 </span>  = UePath PathError
+<span class="lineno">  207 </span>    -- ^ SafePath confinement failed (blocked name, @..@ escape, missing
+<span class="lineno">  208 </span>    -- parent, symlink escape).
+<span class="lineno">  209 </span>  | UeBounded Int
+<span class="lineno">  210 </span>    -- ^ The call exceeded the operator ceiling (write/read/search). The
+<span class="lineno">  211 </span>    -- 'Int' is the ceiling for the error message.
+<span class="lineno">  212 </span>  | UeExec ExecError
+<span class="lineno">  213 </span>    -- ^ The executor failed (remote unreachable, host-key mismatch, not
+<span class="lineno">  214 </span>    -- implemented).
+<span class="lineno">  215 </span>  | UeIo Text
+<span class="lineno">  216 </span>    -- ^ An otherwise-uncategorized IO error (caught 'IOException',
+<span class="lineno">  217 </span>    -- rendered as 'Text').
+<span class="lineno">  218 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  219 </span>
+<span class="lineno">  220 </span>-- | Render an 'UntrustedErr' as a human-readable 'Text' for the opcode's
+<span class="lineno">  221 </span>-- 'orParts' (the model-visible error message).
+<span class="lineno">  222 </span>renderUntrustedErr :: UntrustedErr -&gt; Text
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">renderUntrustedErr = \case</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">UePath pe   -&gt; <span class="nottickedoff">&quot;path error: &quot; &lt;&gt; T.pack (show pe)</span></span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">UeBounded n -&gt; <span class="nottickedoff">&quot;content exceeds operator ceiling (&quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot; bytes)&quot;</span></span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">UeExec ee   -&gt; &quot;exec error: &quot; &lt;&gt; T.pack (show ee)</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">UeIo msg    -&gt; <span class="nottickedoff">&quot;io error: &quot; &lt;&gt; msg</span></span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  230 </span>-- The local arm
+<span class="lineno">  231 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  232 </span>
+<span class="lineno">  233 </span>-- | The local untrusted executor. Workspace files live on the local FS;
+<span class="lineno">  234 </span>-- commands run via @/bin/sh -c@ (shell) or @proc@ (bin). Absent under
+<span class="lineno">  235 </span>-- @-f remote-only-untrusted@.
+<span class="lineno">  236 </span>mkLocalUntrustedIO :: WorkspaceRoot -&gt; UntrustedIO
+<span class="lineno">  237 </span><span class="decl"><span class="istickedoff">mkLocalUntrustedIO wsRoot =</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">-- The workdir root itself, resolved once as the SafePath for @.@. This</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">-- is the single source of truth for the \&quot;untrusted opcodes share one</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">-- workspace root\&quot; invariant: 'uioShellExec' / 'uioBinExec' default to</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">-- it when the caller omits a cwd, so every opcode agrees on the same</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">-- root without any opcode needing to remember to pass it.</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">let wsRootPath = case mkSafePathRemote wsRoot &quot;.&quot; of</span>
+<span class="lineno">  244 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; getSafePath sp</span>
+<span class="lineno">  245 </span><span class="spaces">        </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">&quot;/nonexistent-workdir-fail-closed&quot;</span></span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">in UntrustedIO</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">{ uioReadFile = \rp scanBytes -&gt; do</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  251 </span><span class="spaces">        </span><span class="istickedoff">Left pe  -&gt; pure (Left <span class="nottickedoff">(UePath pe)</span>)</span>
+<span class="lineno">  252 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  253 </span><span class="spaces">          </span><span class="istickedoff">-- Bounded read: read at most scanBytes from the file, decode to</span>
+<span class="lineno">  254 </span><span class="spaces">          </span><span class="istickedoff">-- Text, split to lines, build a LineWindow covering all read</span>
+<span class="lineno">  255 </span><span class="spaces">          </span><span class="istickedoff">-- lines. The 'lwTruncated' flag is set when the file exceeds the</span>
+<span class="lineno">  256 </span><span class="spaces">          </span><span class="istickedoff">-- scan ceiling (the read stopped before EOF). This matches the</span>
+<span class="lineno">  257 </span><span class="spaces">          </span><span class="istickedoff">-- remote arm's 'lineWindowFromText' — both arms return the same</span>
+<span class="lineno">  258 </span><span class="spaces">          </span><span class="istickedoff">-- shape, and the opcode does the offset/limit windowing purely.</span>
+<span class="lineno">  259 </span><span class="spaces">          </span><span class="istickedoff">eContent &lt;- try (readBoundedLocal (getSafePath sp) scanBytes)</span>
+<span class="lineno">  260 </span><span class="spaces">                        </span><span class="istickedoff">:: IO (Either IOException (BS.ByteString, Bool))</span>
+<span class="lineno">  261 </span><span class="spaces">          </span><span class="istickedoff">pure $ case eContent of</span>
+<span class="lineno">  262 </span><span class="spaces">            </span><span class="istickedoff">Left ioErr   -&gt; Left <span class="nottickedoff">(UeIo (T.pack (show ioErr)))</span></span>
+<span class="lineno">  263 </span><span class="spaces">            </span><span class="istickedoff">Right (bs, truncated) -&gt;</span>
+<span class="lineno">  264 </span><span class="spaces">              </span><span class="istickedoff">-- When truncated, the trailing partial line (no newline) is</span>
+<span class="lineno">  265 </span><span class="spaces">              </span><span class="istickedoff">-- NOT counted as a complete line — matching the original</span>
+<span class="lineno">  266 </span><span class="spaces">              </span><span class="istickedoff">-- 'readLineWindow' semantics (lwTotal is a lower bound). When</span>
+<span class="lineno">  267 </span><span class="spaces">              </span><span class="istickedoff">-- not truncated, 'T.lines' counts a trailing partial line</span>
+<span class="lineno">  268 </span><span class="spaces">              </span><span class="istickedoff">-- (matching Data.Text.lines).</span>
+<span class="lineno">  269 </span><span class="spaces">              </span><span class="istickedoff">let txt = TE.decodeUtf8Lenient bs</span>
+<span class="lineno">  270 </span><span class="spaces">                  </span><span class="istickedoff">rawLines = T.lines txt</span>
+<span class="lineno">  271 </span><span class="spaces">                  </span><span class="istickedoff">-- Drop the trailing partial line if truncated AND it has</span>
+<span class="lineno">  272 </span><span class="spaces">                  </span><span class="istickedoff">-- no newline (i.e. it's a partial). T.lines splits on \n;</span>
+<span class="lineno">  273 </span><span class="spaces">                  </span><span class="istickedoff">-- a trailing partial line is one where the original bytes</span>
+<span class="lineno">  274 </span><span class="spaces">                  </span><span class="istickedoff">-- didn't end with \n.</span>
+<span class="lineno">  275 </span><span class="spaces">                  </span><span class="istickedoff">endsWithNl = not (BS.null bs) &amp;&amp; BS.last bs == 0x0A</span>
+<span class="lineno">  276 </span><span class="spaces">                  </span><span class="istickedoff">ls = if truncated &amp;&amp; not endsWithNl</span>
+<span class="lineno">  277 </span><span class="spaces">                         </span><span class="istickedoff">then init rawLines   -- drop the partial</span>
+<span class="lineno">  278 </span><span class="spaces">                         </span><span class="istickedoff">else rawLines</span>
+<span class="lineno">  279 </span><span class="spaces">                  </span><span class="istickedoff">n = length ls</span>
+<span class="lineno">  280 </span><span class="spaces">              </span><span class="istickedoff">in Right LineWindow</span>
+<span class="lineno">  281 </span><span class="spaces">                   </span><span class="istickedoff">{ lwLines     = ls</span>
+<span class="lineno">  282 </span><span class="spaces">                   </span><span class="istickedoff">, lwStart     = 0</span>
+<span class="lineno">  283 </span><span class="spaces">                   </span><span class="istickedoff">, lwEnd       = n</span>
+<span class="lineno">  284 </span><span class="spaces">                   </span><span class="istickedoff">, lwTotal     = n</span>
+<span class="lineno">  285 </span><span class="spaces">                   </span><span class="istickedoff">, lwHasMore   = truncated</span>
+<span class="lineno">  286 </span><span class="spaces">                   </span><span class="istickedoff">, lwTruncated = truncated</span>
+<span class="lineno">  287 </span><span class="spaces">                   </span><span class="istickedoff">}</span>
+<span class="lineno">  288 </span><span class="spaces">  </span><span class="istickedoff">, uioWriteFile = \rp content mode ceiling' -&gt; do</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">let rel       = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  290 </span><span class="spaces">          </span><span class="istickedoff">byteCount = BS.length (TE.encodeUtf8 content)</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">byteCount &gt; ceiling'</span></span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (UeBounded ceiling'))</span></span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">eSafe &lt;- mkSafePathForWrite wsRoot rel</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  296 </span><span class="spaces">            </span><span class="istickedoff">Left pe  -&gt; pure (Left <span class="nottickedoff">(UePath pe)</span>)</span>
+<span class="lineno">  297 </span><span class="spaces">            </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  298 </span><span class="spaces">              </span><span class="istickedoff">eUnit &lt;- try (writeLocal sp content mode) :: IO (Either IOException ())</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff">pure $ case eUnit of</span>
+<span class="lineno">  300 </span><span class="spaces">                </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">Left (UeIo (T.pack (show ioErr)))</span></span>
+<span class="lineno">  301 </span><span class="spaces">                </span><span class="istickedoff">Right _    -&gt; Right byteCount</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">, uioPatchFile = \rp patch -&gt; do</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  304 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  305 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  306 </span><span class="spaces">        </span><span class="istickedoff">Left pe  -&gt; pure (Left <span class="nottickedoff">(UePath pe)</span>)</span>
+<span class="lineno">  307 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; patchLocal sp patch</span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExec = \cmd mCwd -&gt;</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="istickedoff">let argv = [&quot;/bin/sh&quot;, &quot;-c&quot;, T.unpack (textShellCommand cmd)]</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">in case mCwd of</span>
+<span class="lineno">  311 </span><span class="spaces">           </span><span class="istickedoff">Nothing -&gt; runLocalFixedArgv False argv (Just wsRootPath)</span>
+<span class="lineno">  312 </span><span class="spaces">           </span><span class="istickedoff">Just rp -&gt; case mkSafePathRemote wsRoot (T.unpack (getRemotePath rp)) of</span>
+<span class="lineno">  313 </span><span class="spaces">             </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  314 </span><span class="spaces">             </span><span class="istickedoff">Right sp -&gt; runLocalFixedArgv False argv (Just (getSafePath sp))</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExec = \bin bargs mCwd -&gt;</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">let argv = T.unpack (textBinName bin) : map <span class="nottickedoff">(T.unpack . textBinArg)</span> bargs</span>
+<span class="lineno">  317 </span><span class="spaces">      </span><span class="istickedoff">in case resolveBinCwd wsRoot mCwd of</span>
+<span class="lineno">  318 </span><span class="spaces">           </span><span class="istickedoff">Left pe       -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  319 </span><span class="spaces">           </span><span class="istickedoff">Right cwdAbs -&gt; runLocalFixedArgv <span class="nottickedoff">True</span> argv (Just cwdAbs)</span>
+<span class="lineno">  320 </span><span class="spaces">  </span><span class="istickedoff">, uioProcessList =</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case mkShellCommand &quot;ps -o pid=,cmd=&quot; of</span></span>
+<span class="lineno">  322 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left _   -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  323 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right sh -&gt; uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing</span></span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">, uioProcessKill = <span class="nottickedoff">\pid -&gt;</span></span>
+<span class="lineno">  325 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case mkShellCommand (&quot;kill &quot; &lt;&gt; T.pack (show pid)) of</span></span>
+<span class="lineno">  326 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left _   -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  327 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right sh -&gt; do</span></span>
+<span class="lineno">  328 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">res &lt;- uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing</span></span>
+<span class="lineno">  329 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure (const (Right ()) =&lt;&lt; res)</span></span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">, uioSearchFiles = <span class="nottickedoff">\pat mPath _limit -&gt; do</span></span>
+<span class="lineno">  331 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let mRel = maybe &quot;&quot; (T.unpack . getRemotePath) mPath</span></span>
+<span class="lineno">  332 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case mkSafePathRemote wsRoot mRel of</span></span>
+<span class="lineno">  333 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left pe  -&gt; pure (Left (UePath pe))</span></span>
+<span class="lineno">  334 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right sp -&gt; case mkShellCommand (buildRgCmd pat (Just sp)) of</span></span>
+<span class="lineno">  335 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Left _   -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  336 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Right sh -&gt; uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing</span></span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExecEnv = \extras cmd mCwd -&gt;</span>
+<span class="lineno">  338 </span><span class="spaces">      </span><span class="istickedoff">let argv = [&quot;/bin/sh&quot;, &quot;-c&quot;, T.unpack (textShellCommand cmd)]</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">in case mCwd of</span>
+<span class="lineno">  340 </span><span class="spaces">           </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">runLocalFixedArgvEnv False argv (Just wsRootPath) extras</span></span>
+<span class="lineno">  341 </span><span class="spaces">           </span><span class="istickedoff">Just rp -&gt; case mkSafePathRemote wsRoot (T.unpack (getRemotePath rp)) of</span>
+<span class="lineno">  342 </span><span class="spaces">             </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  343 </span><span class="spaces">             </span><span class="istickedoff">Right sp -&gt; runLocalFixedArgvEnv <span class="nottickedoff">False</span> argv (Just (getSafePath sp)) extras</span>
+<span class="lineno">  344 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExecGitEnv = <span class="nottickedoff">\extras _knownHosts cmd mCwd -&gt;</span></span>
+<span class="lineno">  345 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- Local arm: the known_hosts temp file is already written by</span></span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- resolveCloneTarget (cdIsRemote=False path); ignore the content</span></span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- + delegate to uioShellExecEnv.</span></span>
+<span class="lineno">  348 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">uioShellExecEnv (mkLocalUntrustedIO wsRoot) extras cmd mCwd</span></span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExecEnv = <span class="nottickedoff">\extras bin bargs mCwd -&gt;</span></span>
+<span class="lineno">  350 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let argv = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs</span></span>
+<span class="lineno">  351 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">in case resolveBinCwd wsRoot mCwd of</span></span>
+<span class="lineno">  352 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">Left pe       -&gt; pure (Left (UePath pe))</span></span>
+<span class="lineno">  353 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">Right cwdAbs -&gt; runLocalFixedArgvEnv True argv (Just cwdAbs) extras</span></span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExecGitEnv = <span class="nottickedoff">\extras _mKnownHosts bin bargs mCwd -&gt;</span></span>
+<span class="lineno">  355 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- Local arm: the known_hosts temp file is already written by</span></span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- resolveCloneTarget (cdIsRemote=False path); ignore the content</span></span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- + delegate to uioBinExecEnv.</span></span>
+<span class="lineno">  358 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">uioBinExecEnv (mkLocalUntrustedIO wsRoot) extras bin bargs mCwd</span></span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  360 </span>
+<span class="lineno">  361 </span>-- | Build the @rg@ command string from a validated 'SearchPattern' + an
+<span class="lineno">  362 </span>-- optional workspace-relative path (anchored to the workspace root, not
+<span class="lineno">  363 </span>-- the remote user's home CWD). Defaults to the workspace root itself.
+<span class="lineno">  364 </span>-- Both the pattern and the path are 'shellQuote'-d so a pattern
+<span class="lineno">  365 </span>-- containing spaces (e.g. @Recent Sessions@) or a single quote is passed
+<span class="lineno">  366 </span>-- to @rg@ as a single argv token, not word-split by the shell.
+<span class="lineno">  367 </span>buildRgCmd :: SearchPattern -&gt; Maybe SafePath -&gt; Text
+<span class="lineno">  368 </span><span class="decl"><span class="istickedoff">buildRgCmd pat mSafePath =</span>
+<span class="lineno">  369 </span><span class="spaces">  </span><span class="istickedoff">T.pack (&quot;rg -n -- &quot; &lt;&gt; shellQuote (T.unpack (textSearchPattern pat))</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="istickedoff">&lt;&gt; &quot; &quot; &lt;&gt; shellQuote (maybe &quot;.&quot; getSafePath mSafePath))</span></span>
+<span class="lineno">  371 </span>
+<span class="lineno">  372 </span>-- | Read at most @maxBytes@ from a local file. Returns the bytes read and
+<span class="lineno">  373 </span>-- a 'Bool' indicating whether the file was truncated (the file is larger
+<span class="lineno">  374 </span>-- than @maxBytes@ — the read stopped at the ceiling).
+<span class="lineno">  375 </span>readBoundedLocal :: FilePath -&gt; Int -&gt; IO (BS.ByteString, Bool)
+<span class="lineno">  376 </span><span class="decl"><span class="istickedoff">readBoundedLocal path maxBytes = do</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">bs &lt;- BS.readFile path</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">let len = BS.length bs</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">if len &lt;= maxBytes</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="istickedoff">then pure (bs, False)</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">else pure (BS.take maxBytes bs, True)</span></span>
+<span class="lineno">  382 </span>
+<span class="lineno">  383 </span>-- | Write content to the local FS via the validated 'SafePath'. The temp
+<span class="lineno">  384 </span>-- file + rename is used for @'WMWrite'@ so the write is atomic (a crash
+<span class="lineno">  385 </span>-- mid-write leaves the old file intact); @'WMAppend'@ appends directly
+<span class="lineno">  386 </span>-- (the file already exists or is created fresh by 'BS.appendFile').
+<span class="lineno">  387 </span>writeLocal :: SafePath -&gt; Text -&gt; WriteMode -&gt; IO ()
+<span class="lineno">  388 </span><span class="decl"><span class="istickedoff">writeLocal sp content mode =</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">let path  = getSafePath sp</span>
+<span class="lineno">  390 </span><span class="spaces">      </span><span class="istickedoff">bytes = TE.encodeUtf8 content</span>
+<span class="lineno">  391 </span><span class="spaces">  </span><span class="istickedoff">in case mode of</span>
+<span class="lineno">  392 </span><span class="spaces">       </span><span class="istickedoff">WMAppend -&gt; BS.appendFile path bytes</span>
+<span class="lineno">  393 </span><span class="spaces">       </span><span class="istickedoff">WMWrite  -&gt; do</span>
+<span class="lineno">  394 </span><span class="spaces">         </span><span class="istickedoff">let tmp = path &lt;&gt; &quot;.seal-write-tmp&quot;</span>
+<span class="lineno">  395 </span><span class="spaces">         </span><span class="istickedoff">BS.writeFile tmp bytes</span>
+<span class="lineno">  396 </span><span class="spaces">         </span><span class="istickedoff">renameFile tmp path</span></span>
+<span class="lineno">  397 </span>
+<span class="lineno">  398 </span>-- | Apply a unified diff to the local file at the validated 'SafePath':
+<span class="lineno">  399 </span>-- read → apply in-process → atomic temp+rename write.
+<span class="lineno">  400 </span>patchLocal :: SafePath -&gt; Text -&gt; IO (Either UntrustedErr ())
+<span class="lineno">  401 </span><span class="decl"><span class="istickedoff">patchLocal sp patch = do</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">eContent &lt;- try (BS.readFile (getSafePath sp)) :: IO (Either IOException BS.ByteString)</span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">case eContent of</span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">pure (Left (UeIo (T.pack (show ioErr))))</span></span>
+<span class="lineno">  405 </span><span class="spaces">    </span><span class="istickedoff">Right content -&gt; case applyUnifiedDiff (TE.decodeUtf8Lenient content) patch of</span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">Left applyErr -&gt; pure (Left <span class="nottickedoff">(UeIo applyErr)</span>)</span>
+<span class="lineno">  407 </span><span class="spaces">      </span><span class="istickedoff">Right newContent -&gt; do</span>
+<span class="lineno">  408 </span><span class="spaces">        </span><span class="istickedoff">let path = getSafePath sp</span>
+<span class="lineno">  409 </span><span class="spaces">            </span><span class="istickedoff">tmp  = path &lt;&gt; &quot;.seal-patch-tmp&quot;</span>
+<span class="lineno">  410 </span><span class="spaces">        </span><span class="istickedoff">eUnit &lt;- try (BS.writeFile tmp (TE.encodeUtf8 newContent) &gt;&gt; renameFile tmp path)</span>
+<span class="lineno">  411 </span><span class="spaces">                   </span><span class="istickedoff">:: IO (Either IOException ())</span>
+<span class="lineno">  412 </span><span class="spaces">        </span><span class="istickedoff">pure $ case eUnit of</span>
+<span class="lineno">  413 </span><span class="spaces">          </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">Left (UeIo (T.pack (show ioErr)))</span></span>
+<span class="lineno">  414 </span><span class="spaces">          </span><span class="istickedoff">Right _    -&gt; Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  415 </span>
+<span class="lineno">  416 </span>-- | Run a fixed-argv program locally, capturing stdout + stderr as Text.
+<span class="lineno">  417 </span>-- @treat127AsMissing@: a 127 exit maps to 'Left ExecNotImplemented'
+<span class="lineno">  418 </span>-- (the binary is not on PATH) when True; otherwise 127 is a normal
+<span class="lineno">  419 </span>-- command-not-found failure, returned via 'Right' with the exit code
+<span class="lineno">  420 </span>-- annotation. Any 'IOException' becomes 'Left ExecNotImplemented'.
+<span class="lineno">  421 </span>-- No env overrides — delegates to 'runLocalFixedArgvEnv' with @[]@.
+<span class="lineno">  422 </span>runLocalFixedArgv
+<span class="lineno">  423 </span>  :: Bool -&gt; [String] -&gt; Maybe String -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  424 </span><span class="decl"><span class="istickedoff">runLocalFixedArgv treat127AsMissing argv mCwd =</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">runLocalFixedArgvEnv treat127AsMissing argv mCwd []</span></span>
+<span class="lineno">  426 </span>
+<span class="lineno">  427 </span>-- | Run a fixed-argv program locally with env overrides. The @extras@
+<span class="lineno">  428 </span>-- are MERGED over the inherited environment ('getEnvironment'): the
+<span class="lineno">  429 </span>-- process inherits the harness env (PATH, HOME, etc.) plus the overrides
+<span class="lineno">  430 </span>-- (e.g. @SSH_AUTH_SOCK@, @GIT_SSH_COMMAND@, @GIT_TERMINAL_PROMPT=0@). This
+<span class="lineno">  431 </span>-- is the local-arm env-override seam (W2) — the secret-free auth env for
+<span class="lineno">  432 </span>-- deploy-key ops. The overrides are NEVER secret bytes (only paths +
+<span class="lineno">  433 </span>-- non-secret values); the secret lives only in the forwarded agent's
+<span class="lineno">  434 </span>-- memory.
+<span class="lineno">  435 </span>runLocalFixedArgvEnv
+<span class="lineno">  436 </span>  :: Bool -&gt; [String] -&gt; Maybe String -&gt; [(String, String)]
+<span class="lineno">  437 </span>  -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  438 </span><span class="decl"><span class="istickedoff">runLocalFixedArgvEnv treat127AsMissing argv mCwd extras = do</span>
+<span class="lineno">  439 </span><span class="spaces">  </span><span class="istickedoff">let (program, args) = case argv of</span>
+<span class="lineno">  440 </span><span class="spaces">        </span><span class="istickedoff">(p : as) -&gt; (p, as)</span>
+<span class="lineno">  441 </span><span class="spaces">        </span><span class="istickedoff">[]       -&gt; <span class="nottickedoff">error &quot;runLocalFixedArgvEnv: empty argv (unreachable)&quot;</span></span>
+<span class="lineno">  442 </span><span class="spaces">  </span><span class="istickedoff">logExecDebug <span class="nottickedoff">&quot;[local]&quot;</span> <span class="nottickedoff">argv</span> <span class="nottickedoff">mCwd</span> <span class="nottickedoff">extras</span></span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="istickedoff">inherited &lt;- getEnvironment</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">let env' = Just (mergeEnv inherited extras)</span>
+<span class="lineno">  445 </span><span class="spaces">      </span><span class="istickedoff">cp = (proc program args)</span>
+<span class="lineno">  446 </span><span class="spaces">              </span><span class="istickedoff">{ std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe</span>
+<span class="lineno">  447 </span><span class="spaces">              </span><span class="istickedoff">, cwd = mCwd, env = env'</span>
+<span class="lineno">  448 </span><span class="spaces">              </span><span class="istickedoff">, create_group = <span class="nottickedoff">True</span></span>
+<span class="lineno">  449 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">-- ^ @create_group = True@ puts the child in its own POSIX process</span>
+<span class="lineno">  451 </span><span class="spaces">      </span><span class="istickedoff">-- group so 'withManagedProcess' can kill the whole group on cleanup</span>
+<span class="lineno">  452 </span><span class="spaces">      </span><span class="istickedoff">-- (SIGTERM → grace → SIGKILL). This prevents orphans when the</span>
+<span class="lineno">  453 </span><span class="spaces">      </span><span class="istickedoff">-- dispatch wrapper cancels the Haskell worker thread.</span>
+<span class="lineno">  454 </span><span class="spaces">      </span><span class="istickedoff">maxOutput = 50_000  -- bounded output cap (Task 4, matches ttcMaxOutputBytes)</span>
+<span class="lineno">  455 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- try @IOException</span>
+<span class="lineno">  456 </span><span class="spaces">         </span><span class="istickedoff">(withManagedProcess cp $ \ph _mIn hOut hErr -&gt; do</span>
+<span class="lineno">  457 </span><span class="spaces">            </span><span class="istickedoff">out &lt;- readBounded hOut maxOutput</span>
+<span class="lineno">  458 </span><span class="spaces">            </span><span class="istickedoff">err &lt;- readBounded hErr maxOutput</span>
+<span class="lineno">  459 </span><span class="spaces">            </span><span class="istickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">  460 </span><span class="spaces">            </span><span class="istickedoff">pure (ec, out, err))</span>
+<span class="lineno">  461 </span><span class="spaces">  </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  462 </span><span class="spaces">    </span><span class="istickedoff">Left _ioErr                     -&gt; <span class="nottickedoff">Left (UeExec ExecNotImplemented)</span></span>
+<span class="lineno">  463 </span><span class="spaces">    </span><span class="istickedoff">Right (ExitSuccess, out, _)    -&gt; Right out</span>
+<span class="lineno">  464 </span><span class="spaces">    </span><span class="istickedoff">Right (ExitFailure 127, _, _)</span>
+<span class="lineno">  465 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">treat127AsMissing</span>           -&gt; <span class="nottickedoff">Left (UeExec ExecNotImplemented)</span></span>
+<span class="lineno">  466 </span><span class="spaces">    </span><span class="istickedoff">Right (ExitFailure n, out, err) -&gt; Right (formatExitResult n out err)</span></span>
+<span class="lineno">  467 </span>
+<span class="lineno">  468 </span>-- | Merge env overrides over the inherited environment. The @overrides@
+<span class="lineno">  469 </span>-- WIN on collision (per-op auth env must shadow any ambient value — e.g.
+<span class="lineno">  470 </span>-- a user's ambient @SSH_AUTH_SOCK@ must NOT override the per-op agent's
+<span class="lineno">  471 </span>-- socket, or git would sign with the user's ambient agent keys, breaking
+<span class="lineno">  472 </span>-- the per-op scoping invariant in design §4.6). The result is sorted by
+<span class="lineno">  473 </span>-- key for a deterministic order (mainly for test assertions —
+<span class="lineno">  474 </span>-- @CreateProcess.env@ is order-insensitive but a stable order makes the
+<span class="lineno">  475 </span>-- recording-fake + no-disk tests' diffs readable).
+<span class="lineno">  476 </span>--
+<span class="lineno">  477 </span>-- Implementation: @Map.union left right@ keeps @left@ on collision; putting
+<span class="lineno">  478 </span>-- @overrides@ as @left@ makes overrides win. Mirrors
+<span class="lineno">  479 </span>-- 'Seal.Git.Repo.readProcessBinaryCwdEnv' (which uses
+<span class="lineno">  480 </span>-- @Map.union (Map.fromList extras) (Map.fromList inherited)@ — same
+<span class="lineno">  481 </span>-- extras-win semantics).
+<span class="lineno">  482 </span>mergeEnv :: [(String, String)] -&gt; [(String, String)] -&gt; [(String, String)]
+<span class="lineno">  483 </span><span class="decl"><span class="istickedoff">mergeEnv inherited overrides =</span>
+<span class="lineno">  484 </span><span class="spaces">  </span><span class="istickedoff">Map.toList (Map.union (Map.fromList overrides) (Map.fromList inherited))</span></span>
+<span class="lineno">  485 </span>
+<span class="lineno">  486 </span>-- | Format a non-zero exit result for the tool-call consumer. Combines
+<span class="lineno">  487 </span>-- stdout and stderr (if non-empty) and annotates the exit code.
+<span class="lineno">  488 </span>formatExitResult :: Int -&gt; Text -&gt; Text -&gt; Text
+<span class="lineno">  489 </span><span class="decl"><span class="istickedoff">formatExitResult n out err =</span>
+<span class="lineno">  490 </span><span class="spaces">  </span><span class="istickedoff">let parts = [ t | t &lt;- [out, err], not (T.null (T.strip t)) ]</span>
+<span class="lineno">  491 </span><span class="spaces">      </span><span class="istickedoff">body  = if null parts then &quot;&quot; else T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> parts</span>
+<span class="lineno">  492 </span><span class="spaces">  </span><span class="istickedoff">in body &lt;&gt; &quot;\n[exit code: &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot;]&quot;</span></span>
+<span class="lineno">  493 </span>
+<span class="lineno">  494 </span>-- | Env keys whose values are redacted in debug logs. These carry raw
+<span class="lineno">  495 </span>-- secrets injected by credential-injection paths (gh: 'GH_TOKEN';
+<span class="lineno">  496 </span>-- 'GITHUB_TOKEN' is the older env var that some CI runners set, shadowed
+<span class="lineno">  497 </span>-- by 'GH_TOKEN' at precedence; the git PAT path's 'http.extraHeader' is
+<span class="lineno">  498 </span>-- an argv element, not env, but is listed here for defense-in-depth so a
+<span class="lineno">  499 </span>-- value that accidentally reaches the env extras surface is still
+<span class="lineno">  500 </span>-- redacted). Add to this set as new credential-injection paths introduce
+<span class="lineno">  501 </span>-- new secret env keys.
+<span class="lineno">  502 </span>secretEnvKeys :: Set String
+<span class="lineno">  503 </span><span class="decl"><span class="istickedoff">secretEnvKeys = Set.fromList</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;GH_TOKEN&quot;</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="istickedoff">, &quot;GITHUB_TOKEN&quot;</span>
+<span class="lineno">  506 </span><span class="spaces">  </span><span class="istickedoff">, &quot;http.extraHeader&quot;</span>
+<span class="lineno">  507 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  508 </span>
+<span class="lineno">  509 </span>-- | Replace the values of keys in 'secretEnvKeys' with @&quot;&lt;redacted&gt;&quot;@,
+<span class="lineno">  510 </span>-- preserving the key (so the reader sees that an env override was
+<span class="lineno">  511 </span>-- applied) and redacting only the value. Keys NOT in 'secretEnvKeys' pass
+<span class="lineno">  512 </span>-- through unchanged.
+<span class="lineno">  513 </span>redactEnv :: [(String, String)] -&gt; [(String, String)]
+<span class="lineno">  514 </span><span class="decl"><span class="istickedoff">redactEnv = map (\(k, v) -&gt;</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="istickedoff">if k `Set.member` secretEnvKeys then (k, &quot;&lt;redacted&gt;&quot;) else (k, v))</span></span>
+<span class="lineno">  516 </span>
+<span class="lineno">  517 </span>-- | Emit a debug-level log line showing the exact command the UntrustedIO
+<span class="lineno">  518 </span>-- executor is about to run. Covers both the local arm (a fixed-argv
+<span class="lineno">  519 </span>-- subprocess) and the remote arm (an @ssh@ argv, including @-A@ for
+<span class="lineno">  520 </span>-- agent-forwarding git ops). The @tag@ prefixes the line so the reader
+<span class="lineno">  521 </span>-- can distinguish local vs remote vs remote-with-agent at a glance:
+<span class="lineno">  522 </span>--
+<span class="lineno">  523 </span>--   * @&quot;[local]&quot;@        — a local subprocess (@runLocalFixedArgvEnv@)
+<span class="lineno">  524 </span>--   * @&quot;[remote ssh]&quot;@   — a remote SSH exec (no agent forwarding)
+<span class="lineno">  525 </span>--   * @&quot;[remote ssh -A]&quot;@ — a remote SSH exec with agent forwarding
+<span class="lineno">  526 </span>--                          (deploy-key git ops)
+<span class="lineno">  527 </span>--
+<span class="lineno">  528 </span>-- For the remote arm, the full SSH argv is logged (e.g.
+<span class="lineno">  529 </span>-- @ssh -o StrictHostKeyChecking=yes ... agent@exec.internal -- cd ... &amp;&amp; git pull@),
+<span class="lineno">  530 </span>-- so the complete command — including the SSH portion — is visible when
+<span class="lineno">  531 </span>-- @mode=remote@. Env overrides (e.g. @SSH_AUTH_SOCK=...@,
+<span class="lineno">  532 </span>-- @GIT_SSH_COMMAND=...@) are shown as @KEY=VAL@ tokens. The cwd is shown
+<span class="lineno">  533 </span>-- as @cd &lt;path&gt; &amp;&amp;@ when set.
+<span class="lineno">  534 </span>--
+<span class="lineno">  535 </span>-- Secret-bearing env keys (see 'secretEnvKeys') are redacted via
+<span class="lineno">  536 </span>-- 'redactEnv' before the @KEY=VAL@ tokens are rendered, so a value like
+<span class="lineno">  537 </span>-- @GH_TOKEN=ghp_secret...@ appears as @GH_TOKEN=&lt;redacted&gt;@ in the log.
+<span class="lineno">  538 </span>-- This is a defense-in-depth seam on 'logExecDebug' itself, not caller
+<span class="lineno">  539 </span>-- discipline — the redaction fires regardless of which arm produced the
+<span class="lineno">  540 </span>-- call (the remote arm passes the secret extras separately via
+<span class="lineno">  541 </span>-- 'runRemoteShellTextEnv' so the same redaction path covers it).
+<span class="lineno">  542 </span>logExecDebug :: String -&gt; [String] -&gt; Maybe String -&gt; [(String, String)] -&gt; IO ()
+<span class="lineno">  543 </span><span class="decl"><span class="istickedoff">logExecDebug tag argv mCwd extras =</span>
+<span class="lineno">  544 </span><span class="spaces">  </span><span class="istickedoff">globalLogIO DebugS (K.ls msg)</span>
+<span class="lineno">  545 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  546 </span><span class="spaces">    </span><span class="istickedoff">msg = T.pack (unwords (filter (not . null) parts))</span>
+<span class="lineno">  547 </span><span class="spaces">    </span><span class="istickedoff">parts =</span>
+<span class="lineno">  548 </span><span class="spaces">      </span><span class="istickedoff">[ tag ]</span>
+<span class="lineno">  549 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; envPart</span>
+<span class="lineno">  550 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; cwdPart</span>
+<span class="lineno">  551 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ unwords (map shellQuoteArgv argv) ]</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">-- Secret values NEVER reach the log: 'redactEnv' replaces the values</span>
+<span class="lineno">  553 </span><span class="spaces">    </span><span class="istickedoff">-- of 'secretEnvKeys' with &lt;redacted&gt; before rendering. Non-secret</span>
+<span class="lineno">  554 </span><span class="spaces">    </span><span class="istickedoff">-- keys (SSH_AUTH_SOCK, GIT_TERMINAL_PROMPT, ...) pass through so</span>
+<span class="lineno">  555 </span><span class="spaces">    </span><span class="istickedoff">-- operators can still diagnose credential-injection plumbing.</span>
+<span class="lineno">  556 </span><span class="spaces">    </span><span class="istickedoff">envPart = case redactEnv extras of</span>
+<span class="lineno">  557 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; []</span>
+<span class="lineno">  558 </span><span class="spaces">      </span><span class="istickedoff">xs -&gt; [ unwords (map (\(k, v) -&gt; k &lt;&gt; &quot;=&quot; &lt;&gt; v) xs) ]</span>
+<span class="lineno">  559 </span><span class="spaces">    </span><span class="istickedoff">cwdPart = case mCwd of</span>
+<span class="lineno">  560 </span><span class="spaces">      </span><span class="istickedoff">Just c  -&gt; <span class="nottickedoff">[&quot;cd &quot; &lt;&gt; c &lt;&gt; &quot; &amp;&amp;&quot;]</span></span>
+<span class="lineno">  561 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">  562 </span><span class="spaces">    </span><span class="istickedoff">-- Quote an argv token for log readability: wrap in single quotes if</span>
+<span class="lineno">  563 </span><span class="spaces">    </span><span class="istickedoff">-- it contains spaces or shell metacharacters. This is display-only</span>
+<span class="lineno">  564 </span><span class="spaces">    </span><span class="istickedoff">-- (the actual subprocess argv is passed verbatim, never shell-parsed).</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="istickedoff">shellQuoteArgv s</span>
+<span class="lineno">  566 </span><span class="spaces">      </span><span class="istickedoff">| any (\c -&gt; c == ' ' || c == '\'' || c == '&quot;' || c == '$' || c == '`') s = &quot;'&quot; &lt;&gt; s &lt;&gt; &quot;'&quot;</span>
+<span class="lineno">  567 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = s</span></span>
+<span class="lineno">  568 </span>
+<span class="lineno">  569 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  570 </span>-- The remote arm
+<span class="lineno">  571 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  572 </span>
+<span class="lineno">  573 </span>-- | The remote SSH executor. Workspace files live on the remote machine;
+<span class="lineno">  574 </span>-- commands run via the SSH transport. File IO is implemented over SSH
+<span class="lineno">  575 </span>-- (Option A in the plan: content piped over the SSH channel's
+<span class="lineno">  576 </span>-- stdin/stdout). The 'SshConfig' is the validated, host-key-pinned config;
+<span class="lineno">  577 </span>-- the 'RemoteRunner' is the existing SSH transport.
+<span class="lineno">  578 </span>mkRemoteUntrustedIO :: SshConfig -&gt; RemoteRunner -&gt; UntrustedIO
+<span class="lineno">  579 </span><span class="decl"><span class="istickedoff">mkRemoteUntrustedIO = mkRemoteUntrustedIOFromRunner</span></span>
+<span class="lineno">  580 </span>
+<span class="lineno">  581 </span>-- | Same as 'mkRemoteUntrustedIO' (the two names document the same
+<span class="lineno">  582 </span>-- constructor). Provided for the wiring site, which threads the runner
+<span class="lineno">  583 </span>-- explicitly.
+<span class="lineno">  584 </span>mkRemoteUntrustedIOFromRunner :: SshConfig -&gt; RemoteRunner -&gt; UntrustedIO
+<span class="lineno">  585 </span><span class="decl"><span class="istickedoff">mkRemoteUntrustedIOFromRunner sshCfg runner =</span>
+<span class="lineno">  586 </span><span class="spaces">  </span><span class="istickedoff">-- The workdir root itself, resolved once as the SafePath for @.@. This</span>
+<span class="lineno">  587 </span><span class="spaces">  </span><span class="istickedoff">-- is the single source of truth for the \&quot;untrusted opcodes share one</span>
+<span class="lineno">  588 </span><span class="spaces">  </span><span class="istickedoff">-- workspace root\&quot; invariant on the remote arm: 'uioShellExec' /</span>
+<span class="lineno">  589 </span><span class="spaces">  </span><span class="istickedoff">-- 'uioBinExec' default to it when the caller omits a cwd, so every</span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">-- opcode agrees on the same root (the remote @scWorkspace@), not the</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">-- remote user's home or wherever the SSH server drops it.</span>
+<span class="lineno">  592 </span><span class="spaces">  </span><span class="istickedoff">let wsRootPath = case mkSafePathRemote (wsRootFromCfg sshCfg) &quot;.&quot; of</span>
+<span class="lineno">  593 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; getSafePath sp</span>
+<span class="lineno">  594 </span><span class="spaces">        </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">&quot;/nonexistent-workdir-fail-closed&quot;</span></span>
+<span class="lineno">  595 </span><span class="spaces">  </span><span class="istickedoff">in UntrustedIO</span>
+<span class="lineno">  596 </span><span class="spaces">  </span><span class="istickedoff">{ uioReadFile = \rp scanBytes -&gt;</span>
+<span class="lineno">  597 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  598 </span><span class="spaces">      </span><span class="istickedoff">in case mkSafePathRemote (wsRootFromCfg sshCfg) rel of</span>
+<span class="lineno">  599 </span><span class="spaces">           </span><span class="istickedoff">Left pe  -&gt; pure (Left (UePath <span class="nottickedoff">pe</span>))</span>
+<span class="lineno">  600 </span><span class="spaces">           </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  601 </span><span class="spaces">             </span><span class="istickedoff">-- ssh ... -- head -c &lt;scanBytes&gt; &lt;abspath&gt;  (bounded read).</span>
+<span class="lineno">  602 </span><span class="spaces">             </span><span class="istickedoff">-- The SafePath is the workspace-anchored absolute path on the</span>
+<span class="lineno">  603 </span><span class="spaces">             </span><span class="istickedoff">-- remote machine; the SSH command reads from that path, not</span>
+<span class="lineno">  604 </span><span class="spaces">             </span><span class="istickedoff">-- the remote user's home CWD.</span>
+<span class="lineno">  605 </span><span class="spaces">             </span><span class="istickedoff">let absPath = getSafePath sp</span>
+<span class="lineno">  606 </span><span class="spaces">                 </span><span class="istickedoff">cmd = T.pack (&quot;head -c &quot; &lt;&gt; show scanBytes &lt;&gt; &quot; &quot; &lt;&gt; shellQuote absPath)</span>
+<span class="lineno">  607 </span><span class="spaces">             </span><span class="istickedoff">res &lt;- runRemoteShellText runner sshCfg cmd</span>
+<span class="lineno">  608 </span><span class="spaces">             </span><span class="istickedoff">pure (Right . <span class="nottickedoff">lineWindowFromText</span> =&lt;&lt; res)</span>
+<span class="lineno">  609 </span><span class="spaces">  </span><span class="istickedoff">, uioWriteFile = \rp content mode _ceiling' -&gt; do</span>
+<span class="lineno">  610 </span><span class="spaces">      </span><span class="istickedoff">let rel       = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  611 </span><span class="spaces">          </span><span class="istickedoff">byteCount = BS.length (TE.encodeUtf8 content)</span>
+<span class="lineno">  612 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote (wsRootFromCfg sshCfg) rel of</span>
+<span class="lineno">  613 </span><span class="spaces">        </span><span class="istickedoff">Left pe  -&gt; pure (Left (UePath <span class="nottickedoff">pe</span>))</span>
+<span class="lineno">  614 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  615 </span><span class="spaces">          </span><span class="istickedoff">-- ssh ... -- tee [-a] &lt;abspath&gt;   with content on stdin.</span>
+<span class="lineno">  616 </span><span class="spaces">          </span><span class="istickedoff">-- The SafePath is the workspace-anchored absolute path.</span>
+<span class="lineno">  617 </span><span class="spaces">          </span><span class="istickedoff">let absPath  = getSafePath sp</span>
+<span class="lineno">  618 </span><span class="spaces">              </span><span class="istickedoff">teeFlag = case mode of WMWrite -&gt; &quot;&quot; ; WMAppend -&gt; &quot;-a &quot;</span>
+<span class="lineno">  619 </span><span class="spaces">              </span><span class="istickedoff">cmd  = T.pack (&quot;tee &quot; &lt;&gt; teeFlag &lt;&gt; shellQuote absPath)</span>
+<span class="lineno">  620 </span><span class="spaces">              </span><span class="istickedoff">argv = sshExecArgv sshCfg cmd</span>
+<span class="lineno">  621 </span><span class="spaces">          </span><span class="istickedoff">res &lt;- runRemoteStdin runner argv (TE.encodeUtf8 content)</span>
+<span class="lineno">  622 </span><span class="spaces">          </span><span class="istickedoff">pure (either (Left . UeExec) (const (Right byteCount)) res)</span>
+<span class="lineno">  623 </span><span class="spaces">  </span><span class="istickedoff">, uioPatchFile = <span class="nottickedoff">\rp patch -&gt; do</span></span>
+<span class="lineno">  624 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let rel = T.unpack (getRemotePath rp)</span></span>
+<span class="lineno">  625 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case mkSafePathRemote (wsRootFromCfg sshCfg) rel of</span></span>
+<span class="lineno">  626 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left pe  -&gt; pure (Left (UePath pe))</span></span>
+<span class="lineno">  627 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right sp -&gt; do</span></span>
+<span class="lineno">  628 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let absPath = getSafePath sp</span></span>
+<span class="lineno">  629 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">-- Read remote (cat) → apply diff in-process → write remote via</span></span>
+<span class="lineno">  630 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">-- a single SSH exec with stdin. The patched content is piped to</span></span>
+<span class="lineno">  631 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">-- a remote sh -c that writes the temp + mv (atomic).</span></span>
+<span class="lineno">  632 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let readCmd = T.pack (&quot;cat &quot; &lt;&gt; shellQuote absPath)</span></span>
+<span class="lineno">  633 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">rRead &lt;- runRemoteShellText runner sshCfg readCmd</span></span>
+<span class="lineno">  634 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case rRead of</span></span>
+<span class="lineno">  635 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left e       -&gt; pure (Left e)</span></span>
+<span class="lineno">  636 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right oldTxt -&gt; case applyUnifiedDiff oldTxt patch of</span></span>
+<span class="lineno">  637 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left applyErr -&gt; pure (Left (UeIo applyErr))</span></span>
+<span class="lineno">  638 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right newContent -&gt; do</span></span>
+<span class="lineno">  639 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">let tmpPath = absPath &lt;&gt; &quot;.seal-patch-tmp&quot;</span></span>
+<span class="lineno">  640 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">remoteSh = T.pack</span></span>
+<span class="lineno">  641 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">(&quot;sh -c 'cat &gt; &quot; &lt;&gt; shellQuote tmpPath</span></span>
+<span class="lineno">  642 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; &amp;&amp; mv &quot; &lt;&gt; shellQuote tmpPath</span></span>
+<span class="lineno">  643 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; &quot; &lt;&gt; shellQuote absPath &lt;&gt; &quot;'&quot;)</span></span>
+<span class="lineno">  644 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">argv = sshExecArgv sshCfg remoteSh</span></span>
+<span class="lineno">  645 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">res &lt;- runRemoteStdin runner argv (TE.encodeUtf8 newContent)</span></span>
+<span class="lineno">  646 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">pure (either (Left . UeExec) (const (Right ())) res)</span></span>
+<span class="lineno">  647 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExec = \cmd mCwd -&gt;</span>
+<span class="lineno">  648 </span><span class="spaces">      </span><span class="istickedoff">let prefixCd p = &quot;cd &quot; &lt;&gt; shellQuote p &lt;&gt; &quot; &amp;&amp; &quot;</span>
+<span class="lineno">  649 </span><span class="spaces">      </span><span class="istickedoff">in case mCwd of</span>
+<span class="lineno">  650 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; runRemoteShellText runner sshCfg</span>
+<span class="lineno">  651 </span><span class="spaces">                     </span><span class="istickedoff">(T.pack (prefixCd wsRootPath</span>
+<span class="lineno">  652 </span><span class="spaces">                              </span><span class="istickedoff">&lt;&gt; T.unpack (textShellCommand cmd)))</span>
+<span class="lineno">  653 </span><span class="spaces">        </span><span class="istickedoff">Just rp -&gt;</span>
+<span class="lineno">  654 </span><span class="spaces">          </span><span class="istickedoff">case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of</span>
+<span class="lineno">  655 </span><span class="spaces">            </span><span class="istickedoff">Left pe  -&gt; pure (Left (UePath <span class="nottickedoff">pe</span>))</span>
+<span class="lineno">  656 </span><span class="spaces">            </span><span class="istickedoff">Right sp -&gt;</span>
+<span class="lineno">  657 </span><span class="spaces">              </span><span class="istickedoff">let cdCmd = &quot;cd &quot; &lt;&gt; shellQuote (getSafePath sp)</span>
+<span class="lineno">  658 </span><span class="spaces">                          </span><span class="istickedoff">&lt;&gt; &quot; &amp;&amp; &quot; &lt;&gt; T.unpack (textShellCommand cmd)</span>
+<span class="lineno">  659 </span><span class="spaces">              </span><span class="istickedoff">in runRemoteShellText runner sshCfg (T.pack cdCmd)</span>
+<span class="lineno">  660 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExec = \bin bargs mCwd -&gt;</span>
+<span class="lineno">  661 </span><span class="spaces">      </span><span class="istickedoff">let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs</span>
+<span class="lineno">  662 </span><span class="spaces">      </span><span class="istickedoff">in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of</span>
+<span class="lineno">  663 </span><span class="spaces">           </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  664 </span><span class="spaces">           </span><span class="istickedoff">Right cwdPath -&gt;</span>
+<span class="lineno">  665 </span><span class="spaces">             </span><span class="istickedoff">let cmd = T.pack (&quot;cd &quot; &lt;&gt; shellQuote cwdPath &lt;&gt; &quot; &amp;&amp; &quot;</span>
+<span class="lineno">  666 </span><span class="spaces">                             </span><span class="istickedoff">&lt;&gt; T.unpack (T.intercalate &quot; &quot; (map (T.pack . shellQuote) argv')))</span>
+<span class="lineno">  667 </span><span class="spaces">             </span><span class="istickedoff">in runRemoteShellText runner sshCfg cmd</span>
+<span class="lineno">  668 </span><span class="spaces">  </span><span class="istickedoff">, uioProcessList =</span>
+<span class="lineno">  669 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">runRemoteShellText runner sshCfg &quot;ps -o pid=,cmd=&quot;</span></span>
+<span class="lineno">  670 </span><span class="spaces">   </span><span class="istickedoff">, uioProcessKill = <span class="nottickedoff">\pid -&gt; do</span></span>
+<span class="lineno">  671 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">res &lt;- runRemoteShellText runner sshCfg (&quot;kill &quot; &lt;&gt; T.pack (show pid))</span></span>
+<span class="lineno">  672 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">pure (const (Right ()) =&lt;&lt; res)</span></span>
+<span class="lineno">  673 </span><span class="spaces">   </span><span class="istickedoff">, uioSearchFiles = \pat mPath _limit -&gt;</span>
+<span class="lineno">  674 </span><span class="spaces">       </span><span class="istickedoff">let mRel = maybe <span class="nottickedoff">&quot;&quot;</span> (T.unpack . getRemotePath) mPath</span>
+<span class="lineno">  675 </span><span class="spaces">       </span><span class="istickedoff">in case mkSafePathRemote (wsRootFromCfg sshCfg) mRel of</span>
+<span class="lineno">  676 </span><span class="spaces">            </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  677 </span><span class="spaces">            </span><span class="istickedoff">Right sp -&gt; runRemoteShellText runner sshCfg (buildRgCmd pat (Just sp))</span>
+<span class="lineno">  678 </span><span class="spaces">    </span><span class="istickedoff">, uioShellExecEnv = \extras cmd mCwd -&gt;</span>
+<span class="lineno">  679 </span><span class="spaces">       </span><span class="istickedoff">let prefixCd p = &quot;cd &quot; &lt;&gt; shellQuote p &lt;&gt; &quot; &amp;&amp; &quot;</span>
+<span class="lineno">  680 </span><span class="spaces">       </span><span class="istickedoff">in case mCwd of</span>
+<span class="lineno">  681 </span><span class="spaces">         </span><span class="istickedoff">Nothing -&gt; runRemoteShellTextEnv runner sshCfg</span>
+<span class="lineno">  682 </span><span class="spaces">                      </span><span class="istickedoff">(T.pack (prefixCd wsRootPath)) extras</span>
+<span class="lineno">  683 </span><span class="spaces">                      </span><span class="istickedoff">(T.pack (T.unpack (textShellCommand cmd)))</span>
+<span class="lineno">  684 </span><span class="spaces">         </span><span class="istickedoff">Just rp -&gt;</span>
+<span class="lineno">  685 </span><span class="spaces">           </span><span class="istickedoff">case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of</span>
+<span class="lineno">  686 </span><span class="spaces">             </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  687 </span><span class="spaces">             </span><span class="istickedoff">Right sp -&gt;</span>
+<span class="lineno">  688 </span><span class="spaces">               </span><span class="istickedoff">runRemoteShellTextEnv runner sshCfg</span>
+<span class="lineno">  689 </span><span class="spaces">                 </span><span class="istickedoff">(T.pack (&quot;cd &quot; &lt;&gt; shellQuote (getSafePath sp) &lt;&gt; &quot; &amp;&amp; &quot;)) extras</span>
+<span class="lineno">  690 </span><span class="spaces">                 </span><span class="istickedoff">(T.pack (T.unpack (textShellCommand cmd)))</span>
+<span class="lineno">  691 </span><span class="spaces">    </span><span class="istickedoff">, uioShellExecGitEnv = <span class="nottickedoff">\extras _mKnownHosts cmd mCwd -&gt;</span></span>
+<span class="lineno">  692 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- Remote deploy-key path (simple approach): ssh -A forwards the</span></span>
+<span class="lineno">  693 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- SEAL agent to the remote machine. The remote git clone uses the</span></span>
+<span class="lineno">  694 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- default ssh + the forwarded agent + the remote machine's default</span></span>
+<span class="lineno">  695 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- known_hosts. No GIT_SSH_COMMAND, no remote known_hosts file.</span></span>
+<span class="lineno">  696 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- Strip SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix</span></span>
+<span class="lineno">  697 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- (the forwarded agent replaces them). Keep them in the LOCAL</span></span>
+<span class="lineno">  698 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- ssh -A process env so the right agent is forwarded.</span></span>
+<span class="lineno">  699 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">let localEnv = [ (k, v) | (k, v) &lt;- extras</span></span>
+<span class="lineno">  700 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, k == &quot;SSH_AUTH_SOCK&quot; || k == &quot;SSH_AGENT_PID&quot;</span></span>
+<span class="lineno">  701 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  702 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">remoteExtras = [ (k, v) | (k, v) &lt;- extras</span></span>
+<span class="lineno">  703 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">, k /= &quot;SSH_AUTH_SOCK&quot;</span></span>
+<span class="lineno">  704 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">, k /= &quot;SSH_AGENT_PID&quot;</span></span>
+<span class="lineno">  705 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  706 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">remoteEnvPrefix = T.pack (renderEnvPrefix remoteExtras)</span></span>
+<span class="lineno">  707 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">in case mCwd of</span></span>
+<span class="lineno">  708 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt;</span></span>
+<span class="lineno">  709 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">let prefixCd = &quot;cd &quot; &lt;&gt; shellQuote wsRootPath &lt;&gt; &quot; &amp;&amp; &quot;</span></span>
+<span class="lineno">  710 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">fullCmd = T.pack prefixCd &lt;&gt; remoteEnvPrefix &lt;&gt; T.pack (T.unpack (textShellCommand cmd))</span></span>
+<span class="lineno">  711 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd</span></span>
+<span class="lineno">  712 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Just rp -&gt;</span></span>
+<span class="lineno">  713 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of</span></span>
+<span class="lineno">  714 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left pe  -&gt; pure (Left (UePath pe))</span></span>
+<span class="lineno">  715 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right sp -&gt;</span></span>
+<span class="lineno">  716 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">let cdCmd = &quot;cd &quot; &lt;&gt; shellQuote (getSafePath sp) &lt;&gt; &quot; &amp;&amp; &quot;</span></span>
+<span class="lineno">  717 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">fullCmd = T.pack cdCmd &lt;&gt; remoteEnvPrefix &lt;&gt; T.pack (T.unpack (textShellCommand cmd))</span></span>
+<span class="lineno">  718 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd</span></span>
+<span class="lineno">  719 </span><span class="spaces">     </span><span class="istickedoff">, uioBinExecEnv = \extras bin bargs mCwd -&gt;</span>
+<span class="lineno">  720 </span><span class="spaces">         </span><span class="istickedoff">let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs</span>
+<span class="lineno">  721 </span><span class="spaces">         </span><span class="istickedoff">in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of</span>
+<span class="lineno">  722 </span><span class="spaces">            </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">pure (Left (UePath pe))</span></span>
+<span class="lineno">  723 </span><span class="spaces">            </span><span class="istickedoff">Right cwdPath -&gt;</span>
+<span class="lineno">  724 </span><span class="spaces">              </span><span class="istickedoff">let cdPart = T.pack (&quot;cd &quot; &lt;&gt; shellQuote cwdPath &lt;&gt; &quot; &amp;&amp; &quot;)</span>
+<span class="lineno">  725 </span><span class="spaces">                  </span><span class="istickedoff">cmd = T.pack (T.unpack (T.intercalate &quot; &quot; (map (T.pack . shellQuote) argv')))</span>
+<span class="lineno">  726 </span><span class="spaces">              </span><span class="istickedoff">in runRemoteShellTextEnv runner sshCfg cdPart extras cmd</span>
+<span class="lineno">  727 </span><span class="spaces">    </span><span class="istickedoff">, uioBinExecGitEnv = <span class="nottickedoff">\extras _mKnownHosts bin bargs mCwd -&gt;</span></span>
+<span class="lineno">  728 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- Remote deploy-key path: mirrors uioShellExecGitEnv. Strip</span></span>
+<span class="lineno">  729 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix (the</span></span>
+<span class="lineno">  730 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- forwarded agent replaces them). Keep them in the LOCAL ssh -A</span></span>
+<span class="lineno">  731 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- process env so the right agent is forwarded.</span></span>
+<span class="lineno">  732 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">let localEnv = [ (k, v) | (k, v) &lt;- extras</span></span>
+<span class="lineno">  733 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, k == &quot;SSH_AUTH_SOCK&quot; || k == &quot;SSH_AGENT_PID&quot;</span></span>
+<span class="lineno">  734 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  735 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">remoteExtras = [ (k, v) | (k, v) &lt;- extras</span></span>
+<span class="lineno">  736 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">, k /= &quot;SSH_AUTH_SOCK&quot;</span></span>
+<span class="lineno">  737 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">, k /= &quot;SSH_AGENT_PID&quot;</span></span>
+<span class="lineno">  738 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  739 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs</span></span>
+<span class="lineno">  740 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">remoteEnvPrefix = T.pack (renderEnvPrefix remoteExtras)</span></span>
+<span class="lineno">  741 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of</span></span>
+<span class="lineno">  742 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">Left pe  -&gt; pure (Left (UePath pe))</span></span>
+<span class="lineno">  743 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">Right cwdPath -&gt;</span></span>
+<span class="lineno">  744 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">let cdPart = T.pack (&quot;cd &quot; &lt;&gt; shellQuote cwdPath &lt;&gt; &quot; &amp;&amp; &quot;)</span></span>
+<span class="lineno">  745 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">cmd = T.pack (T.unpack (T.intercalate &quot; &quot; (map (T.pack . shellQuote) argv')))</span></span>
+<span class="lineno">  746 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">in runRemoteShellForwardingEnvText runner sshCfg localEnv (cdPart &lt;&gt; remoteEnvPrefix &lt;&gt; cmd)</span></span>
+<span class="lineno">  747 </span><span class="spaces">   </span><span class="istickedoff">}</span></span>
+<span class="lineno">  748 </span>
+<span class="lineno">  749 </span>-- | A stub remote executor that fails-closed on every method (preserving
+<span class="lineno">  750 </span>-- the pre-Phase-3 behavior). Used by the wiring site in @mode=remote@
+<span class="lineno">  751 </span>-- before the real remote arm is constructed, or in tests that want to
+<span class="lineno">  752 </span>-- prove a remote-mode call never reaches the local FS.
+<span class="lineno">  753 </span>mkRemoteUntrustedIOStub :: UntrustedIO
+<span class="lineno">  754 </span><span class="decl"><span class="istickedoff">mkRemoteUntrustedIOStub = UntrustedIO</span>
+<span class="lineno">  755 </span><span class="spaces">  </span><span class="istickedoff">{ uioReadFile    = \_ _      -&gt; pure (Left (UeExec ExecNotImplemented))</span>
+<span class="lineno">  756 </span><span class="spaces">  </span><span class="istickedoff">, uioWriteFile   = \_ _ _ _ -&gt; pure (Left <span class="nottickedoff">(UeExec ExecNotImplemented)</span>)</span>
+<span class="lineno">  757 </span><span class="spaces">  </span><span class="istickedoff">, uioPatchFile   = <span class="nottickedoff">\_ _      -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  758 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExec   = \_ _      -&gt; pure (Left <span class="nottickedoff">(UeExec ExecNotImplemented)</span>)</span>
+<span class="lineno">  759 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExec     = <span class="nottickedoff">\_ _ _  -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  760 </span><span class="spaces">  </span><span class="istickedoff">, uioProcessList =             <span class="nottickedoff">pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  761 </span><span class="spaces">  </span><span class="istickedoff">, uioProcessKill = <span class="nottickedoff">\_         -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  762 </span><span class="spaces">  </span><span class="istickedoff">, uioSearchFiles = <span class="nottickedoff">\_ _ _     -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  763 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExecEnv = <span class="nottickedoff">\_ _ _    -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  764 </span><span class="spaces">  </span><span class="istickedoff">, uioShellExecGitEnv = <span class="nottickedoff">\_ _ _ _ -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  765 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExecEnv   = <span class="nottickedoff">\_ _ _ _  -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  766 </span><span class="spaces">  </span><span class="istickedoff">, uioBinExecGitEnv = <span class="nottickedoff">\_ _ _ _ _ -&gt; pure (Left (UeExec ExecNotImplemented))</span></span>
+<span class="lineno">  767 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  768 </span>
+<span class="lineno">  769 </span>-- | The workspace root for remote confinement. The 'SshConfig' carries
+<span class="lineno">  770 </span>-- the remote workspace as a 'RemotePath'; we wrap it back into a
+<span class="lineno">  771 </span>-- 'WorkspaceRoot' for 'mkSafePathRemote'.
+<span class="lineno">  772 </span>wsRootFromCfg :: SshConfig -&gt; WorkspaceRoot
+<span class="lineno">  773 </span><span class="decl"><span class="istickedoff">wsRootFromCfg cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))</span></span>
+<span class="lineno">  774 </span>
+<span class="lineno">  775 </span>-- | Resolve an optional cwd ('RemotePath') for BIN_EXEC into an absolute
+<span class="lineno">  776 </span>-- 'FilePath' the executor can pass to the subprocess. Unlike
+<span class="lineno">  777 </span>-- 'uioShellExec' (which confines ALL paths — relative and absolute —
+<span class="lineno">  778 </span>-- under the workspace root via 'mkSafePathRemote'), BIN_EXEC treats an
+<span class="lineno">  779 </span>-- ABSOLUTE cwd as a pass-through (the operator explicitly chose an
+<span class="lineno">  780 </span>-- out-of-workspace directory); a RELATIVE cwd is SafePath-confined under
+<span class="lineno">  781 </span>-- the workspace root (the default untrusted-confinement contract).
+<span class="lineno">  782 </span>--
+<span class="lineno">  783 </span>--   * 'Nothing' → the workspace root itself (the one-root invariant).
+<span class="lineno">  784 </span>--   * 'Just rp' (absolute) → the path verbatim (no confinement).
+<span class="lineno">  785 </span>--   * 'Just rp' (relative) → 'mkSafePathRemote'-confined under the root;
+<span class="lineno">  786 </span>--     a @..@ escape or blocked name is rejected with 'Left'.
+<span class="lineno">  787 </span>resolveBinCwd :: WorkspaceRoot -&gt; Maybe RemotePath -&gt; Either PathError FilePath
+<span class="lineno">  788 </span><span class="decl"><span class="istickedoff">resolveBinCwd wsRoot mCwd =</span>
+<span class="lineno">  789 </span><span class="spaces">  </span><span class="istickedoff">case mCwd of</span>
+<span class="lineno">  790 </span><span class="spaces">    </span><span class="istickedoff">Nothing   -&gt; Right wsRootPath</span>
+<span class="lineno">  791 </span><span class="spaces">    </span><span class="istickedoff">Just rp -&gt;</span>
+<span class="lineno">  792 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let rel = T.unpack (getRemotePath rp)</span></span>
+<span class="lineno">  793 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">in if isAbsolute rel</span></span>
+<span class="lineno">  794 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">then Right rel</span></span>
+<span class="lineno">  795 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">else getSafePath &lt;$&gt; mkSafePathRemote wsRoot rel</span></span>
+<span class="lineno">  796 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  797 </span><span class="spaces">    </span><span class="istickedoff">wsRootPath = case mkSafePathRemote wsRoot &quot;.&quot; of</span>
+<span class="lineno">  798 </span><span class="spaces">      </span><span class="istickedoff">Right sp -&gt; getSafePath sp</span>
+<span class="lineno">  799 </span><span class="spaces">      </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">&quot;/nonexistent-workdir-fail-closed&quot;</span></span></span>
+<span class="lineno">  800 </span>
+<span class="lineno">  801 </span>-- | Single-quote a 'String' for the remote shell (the path is already
+<span class="lineno">  802 </span>-- SafePath-validated, but quoting is defense-in-depth against any
+<span class="lineno">  803 </span>-- metacharacters the validator permits, e.g. spaces). Embedded single
+<span class="lineno">  804 </span>-- quotes are escaped with the standard @'\''@ idiom so a value containing
+<span class="lineno">  805 </span>-- a quote cannot break out of its single-quoted argv token — e.g.
+<span class="lineno">  806 </span>-- @foo'bar@ becomes @'foo'\''bar'@, which the shell parses back to the
+<span class="lineno">  807 </span>-- literal @foo'bar@ as a single token. Applied uniformly to all remote
+<span class="lineno">  808 </span>-- paths and search patterns.
+<span class="lineno">  809 </span>shellQuote :: String -&gt; String
+<span class="lineno">  810 </span><span class="decl"><span class="istickedoff">shellQuote s = &quot;'&quot; &lt;&gt; go s &lt;&gt; &quot;'&quot;</span>
+<span class="lineno">  811 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  812 </span><span class="spaces">    </span><span class="istickedoff">go []         = []</span>
+<span class="lineno">  813 </span><span class="spaces">    </span><span class="istickedoff">go ('\'':rest) = &quot;'\\''&quot; &lt;&gt; go rest</span>
+<span class="lineno">  814 </span><span class="spaces">    </span><span class="istickedoff">go (c:rest)    = c : go rest</span></span>
+<span class="lineno">  815 </span>
+<span class="lineno">  816 </span>-- | Render the env-override prefix for the remote arm: @env VAR='val'
+<span class="lineno">  817 </span>-- VAR2='val2' @ (each value single-quoted via 'shellQuote' so a value
+<span class="lineno">  818 </span>-- containing spaces / quotes / @$()@ is passed as a single token — the
+<span class="lineno">  819 </span>-- @env@ command sets them before the command runs). The @env@ prefix is
+<span class="lineno">  820 </span>-- portable (@ssh -A@ only forwards the agent socket; @SendEnv@/@SetEnv@
+<span class="lineno">  821 </span>-- need server @AcceptEnv@ which is @none@ by default — design §4.4). The
+<span class="lineno">  822 </span>-- caller appends the command after the prefix.
+<span class="lineno">  823 </span>renderEnvPrefix :: [(String, String)] -&gt; String
+<span class="lineno">  824 </span><span class="decl"><span class="istickedoff">renderEnvPrefix extras =</span>
+<span class="lineno">  825 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">null extras</span></span>
+<span class="lineno">  826 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  827 </span><span class="spaces">    </span><span class="istickedoff">else &quot;env &quot; &lt;&gt; unwords [ k &lt;&gt; &quot;=&quot; &lt;&gt; shellQuote v | (k, v) &lt;- extras ] &lt;&gt; &quot; &quot;</span></span>
+<span class="lineno">  828 </span>
+<span class="lineno">  829 </span>-- | Smart-construct a 'ShellCommand', lifting a parse failure into an
+<span class="lineno">  830 </span>-- 'UntrustedErr' (defensive — the inputs are already validated, so this
+<span class="lineno">  831 </span>-- only fires on a NUL that slipped through). Returns 'Left' so the caller
+<span class="lineno">  832 </span>-- can short-circuit; the message is uniform across the remote arm.
+<span class="lineno">  833 </span>shellCmd :: Text -&gt; Either UntrustedErr ShellCommand
+<span class="lineno">  834 </span><span class="decl"><span class="istickedoff">shellCmd t = case mkShellCommand t of</span>
+<span class="lineno">  835 </span><span class="spaces">  </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">Left (UeExec ExecNotImplemented)</span></span>
+<span class="lineno">  836 </span><span class="spaces">  </span><span class="istickedoff">Right c -&gt; Right c</span></span>
+<span class="lineno">  837 </span>
+<span class="lineno">  838 </span>-- | Like 'runRemoteShellForwardingText' but with local env overrides
+<span class="lineno">  839 </span>-- (MERGED over the inherited environment). Used by the remote deploy-key
+<span class="lineno">  840 </span>-- clone path so the local @ssh -A@ process uses the SEAL agent's
+<span class="lineno">  841 </span>-- @SSH_AUTH_SOCK@ (not the ambient one) — the forwarded agent then has
+<span class="lineno">  842 </span>-- the deploy key loaded.
+<span class="lineno">  843 </span>runRemoteShellForwardingEnvText
+<span class="lineno">  844 </span>  :: RemoteRunner -&gt; SshConfig -&gt; [(String, String)] -&gt; Text
+<span class="lineno">  845 </span>  -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  846 </span><span class="decl"><span class="nottickedoff">runRemoteShellForwardingEnvText runner cfg localEnv cmdText =</span>
+<span class="lineno">  847 </span><span class="spaces">  </span><span class="nottickedoff">case shellCmd cmdText of</span>
+<span class="lineno">  848 </span><span class="spaces">    </span><span class="nottickedoff">Left e    -&gt; pure (Left e)</span>
+<span class="lineno">  849 </span><span class="spaces">    </span><span class="nottickedoff">Right cmd -&gt; do</span>
+<span class="lineno">  850 </span><span class="spaces">      </span><span class="nottickedoff">let argv = sshExecArgvForwarding cfg (textShellCommand cmd)</span>
+<span class="lineno">  851 </span><span class="spaces">      </span><span class="nottickedoff">logExecDebug &quot;[remote ssh -A]&quot; argv Nothing localEnv</span>
+<span class="lineno">  852 </span><span class="spaces">      </span><span class="nottickedoff">res &lt;- runRemoteEnv runner localEnv argv</span>
+<span class="lineno">  853 </span><span class="spaces">      </span><span class="nottickedoff">pure (either (Left . UeExec) Right res)</span></span>
+<span class="lineno">  854 </span>
+<span class="lineno">  855 </span>-- | Run a remote shell command built from a 'Text' command string. The
+<span class="lineno">  856 </span>-- 'shellCmd' parse failure is lifted to 'UeExec'; the 'runRemoteShell'
+<span class="lineno">  857 </span>-- 'ExecError' is lifted to 'UeExec'. Uniform across the remote arm.
+<span class="lineno">  858 </span>runRemoteShellText
+<span class="lineno">  859 </span>  :: RemoteRunner -&gt; SshConfig -&gt; Text -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  860 </span><span class="decl"><span class="istickedoff">runRemoteShellText runner cfg cmdText =</span>
+<span class="lineno">  861 </span><span class="spaces">  </span><span class="istickedoff">case shellCmd cmdText of</span>
+<span class="lineno">  862 </span><span class="spaces">    </span><span class="istickedoff">Left e    -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  863 </span><span class="spaces">    </span><span class="istickedoff">Right cmd -&gt; do</span>
+<span class="lineno">  864 </span><span class="spaces">      </span><span class="istickedoff">let argv = sshExecArgv cfg (textShellCommand cmd)</span>
+<span class="lineno">  865 </span><span class="spaces">      </span><span class="istickedoff">logExecDebug &quot;[remote ssh]&quot; argv Nothing []</span>
+<span class="lineno">  866 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- runRemoteShell runner cfg cmd</span>
+<span class="lineno">  867 </span><span class="spaces">      </span><span class="istickedoff">pure (either (Left . UeExec) Right res)</span></span>
+<span class="lineno">  868 </span>
+<span class="lineno">  869 </span>-- | Like 'runRemoteShellText' but with env overrides applied to the
+<span class="lineno">  870 </span>-- SUBPROCESS. The caller supplies the @cd@ prefix and the command SEPARATELY;
+<span class="lineno">  871 </span>-- the composed remote command is @\&lt;cdPart\&gt;env K='V' … \&lt;cmd\&gt;@ so the vars
+<span class="lineno">  872 </span>-- scope to the trailing command — NOT to the @cd@.
+<span class="lineno">  873 </span>--
+<span class="lineno">  874 </span>-- Placement is security-relevant (the PAT-clone bug): a POSIX shell scopes a
+<span class="lineno">  875 </span>-- leading @env@ assignment only to the single command that follows it, so an
+<span class="lineno">  876 </span>-- env prefix BEFORE @\&lt;cd\&gt; &amp;&amp; \&lt;cmd\&gt;@ binds nothing for @\&lt;cmd\&gt;@. This
+<span class="lineno">  877 </span>-- mirrors the deploy-key path ('uioShellExecGitEnv'), which composes
+<span class="lineno">  878 </span>-- @cd … &amp;&amp; env … git …@ for the same reason.
+<span class="lineno">  879 </span>--
+<span class="lineno">  880 </span>-- The 'logExecDebug' call receives the command WITHOUT the env prefix and
+<span class="lineno">  881 </span>-- the extras SEPARATELY so 'redactEnv' can redact secret-bearing keys before
+<span class="lineno">  882 </span>-- rendering (design §3.7): the logged message must not contain any value
+<span class="lineno">  883 </span>-- from a key in 'secretEnvKeys'.
+<span class="lineno">  884 </span>runRemoteShellTextEnv
+<span class="lineno">  885 </span>  :: RemoteRunner -&gt; SshConfig -&gt; Text -&gt; [(String, String)] -&gt; Text
+<span class="lineno">  886 </span>  -&gt; IO (Either UntrustedErr Text)
+<span class="lineno">  887 </span><span class="decl"><span class="istickedoff">runRemoteShellTextEnv runner cfg cdPart extras cmd =</span>
+<span class="lineno">  888 </span><span class="spaces">  </span><span class="istickedoff">let envPrefix = T.pack (renderEnvPrefix extras)</span>
+<span class="lineno">  889 </span><span class="spaces">      </span><span class="istickedoff">fullCmdText = cdPart &lt;&gt; envPrefix &lt;&gt; cmd</span>
+<span class="lineno">  890 </span><span class="spaces">      </span><span class="istickedoff">logCmdText = cdPart &lt;&gt; cmd</span>
+<span class="lineno">  891 </span><span class="spaces">  </span><span class="istickedoff">in case shellCmd fullCmdText of</span>
+<span class="lineno">  892 </span><span class="spaces">       </span><span class="istickedoff">Left e     -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  893 </span><span class="spaces">       </span><span class="istickedoff">Right full -&gt; do</span>
+<span class="lineno">  894 </span><span class="spaces">         </span><span class="istickedoff">logCmd &lt;- case shellCmd logCmdText of</span>
+<span class="lineno">  895 </span><span class="spaces">           </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">pure full</span></span>
+<span class="lineno">  896 </span><span class="spaces">           </span><span class="istickedoff">Right l  -&gt; pure l</span>
+<span class="lineno">  897 </span><span class="spaces">         </span><span class="istickedoff">let argv = sshExecArgv cfg (textShellCommand logCmd)</span>
+<span class="lineno">  898 </span><span class="spaces">         </span><span class="istickedoff">logExecDebug &quot;[remote ssh]&quot; argv Nothing extras</span>
+<span class="lineno">  899 </span><span class="spaces">         </span><span class="istickedoff">res &lt;- runRemoteShell runner cfg full</span>
+<span class="lineno">  900 </span><span class="spaces">         </span><span class="istickedoff">pure (either <span class="nottickedoff">(Left . UeExec)</span> Right res)</span></span>
+<span class="lineno">  901 </span>
+<span class="lineno">  902 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  903 </span>-- Pure diff applier (lifted from Seal.ISA.Ops.File so the local AND remote
+<span class="lineno">  904 </span>-- arms share the same patch logic without an opcode-module import cycle).
+<span class="lineno">  905 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  906 </span>
+<span class="lineno">  907 </span>-- | Apply a minimal unified diff to the original content. Returns
+<span class="lineno">  908 </span>-- @Left errMsg@ if the patch is malformed or the context doesn't match;
+<span class="lineno">  909 </span>-- @Right newContent@ on success. This is the same applier that lived in
+<span class="lineno">  910 </span>-- 'Seal.ISA.Ops.File.applyUnifiedDiff' — lifted here so both arms share
+<span class="lineno">  911 </span>-- one implementation.
+<span class="lineno">  912 </span>--
+<span class="lineno">  913 </span>-- The applier is **content-based**, not position-based: for each hunk it
+<span class="lineno">  914 </span>-- extracts the old lines (context @ @ + removed @-@), searches for that
+<span class="lineno">  915 </span>-- sequence in the file starting near the hunk header's line-number hint,
+<span class="lineno">  916 </span>-- and splices in the new lines (context @ @ + added @+@). The line number
+<span class="lineno">  917 </span>-- is a hint to disambiguate duplicate matches, NOT a trusted insertion
+<span class="lineno">  918 </span>-- index — this is the design used by OpenCode (@seek@ in patch.ts) and
+<span class="lineno">  919 </span>-- Hermes (@fuzzy_find_and_replace@). A position-based applier that
+<span class="lineno">  920 </span>-- blindly @splitAt@s at the header's oldStart corrupts the file when:
+<span class="lineno">  921 </span>--   * the model's line number is stale (file changed since it read it),
+<span class="lineno">  922 </span>--   * an earlier hunk in the same patch shifted line numbers, or
+<span class="lineno">  923 </span>--   * the model miscounted lines.
+<span class="lineno">  924 </span>-- All three were observed in session 20260810-123133-477 (&quot;The patch is
+<span class="lineno">  925 </span>-- inserting lines at wrong positions&quot;).
+<span class="lineno">  926 </span>applyUnifiedDiff :: Text -&gt; Text -&gt; Either Text Text
+<span class="lineno">  927 </span><span class="decl"><span class="istickedoff">applyUnifiedDiff original patch =</span>
+<span class="lineno">  928 </span><span class="spaces">  </span><span class="istickedoff">let origLines  = T.lines original</span>
+<span class="lineno">  929 </span><span class="spaces">      </span><span class="istickedoff">patchLines = T.lines patch</span>
+<span class="lineno">  930 </span><span class="spaces">  </span><span class="istickedoff">in go origLines patchLines</span>
+<span class="lineno">  931 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  932 </span><span class="spaces">    </span><span class="istickedoff">-- All hunks apply against the ORIGINAL file's line numbering; we</span>
+<span class="lineno">  933 </span><span class="spaces">    </span><span class="istickedoff">-- thread the already-patched lines through 'go' so successive hunks</span>
+<span class="lineno">  934 </span><span class="spaces">    </span><span class="istickedoff">-- see a consistent view. The search-start hint is carried in the</span>
+<span class="lineno">  935 </span><span class="spaces">    </span><span class="istickedoff">-- accumulator so a later hunk's line-number hint still points into</span>
+<span class="lineno">  936 </span><span class="spaces">    </span><span class="istickedoff">-- the original's coordinate space (we never let an earlier hunk's</span>
+<span class="lineno">  937 </span><span class="spaces">    </span><span class="istickedoff">-- insertions/deletions shift a later hunk's target).</span>
+<span class="lineno">  938 </span><span class="spaces">    </span><span class="istickedoff">go origLines [] = Right (joinLines origLines)</span>
+<span class="lineno">  939 </span><span class="spaces">    </span><span class="istickedoff">go origLines (h : rest)</span>
+<span class="lineno">  940 </span><span class="spaces">      </span><span class="istickedoff">| T.isPrefixOf &quot;@@ &quot; h  = applyHunk origLines h rest</span>
+<span class="lineno">  941 </span><span class="spaces">      </span><span class="istickedoff">| T.isPrefixOf &quot;--- &quot; h = go origLines rest</span>
+<span class="lineno">  942 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">T.isPrefixOf &quot;+++ &quot; h</span> = go origLines rest</span>
+<span class="lineno">  943 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">T.null h</span>              = <span class="nottickedoff">go origLines rest</span></span>
+<span class="lineno">  944 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>             = <span class="nottickedoff">Left (&quot;unexpected line in patch: &quot; &lt;&gt; h)</span></span>
+<span class="lineno">  945 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  946 </span><span class="spaces">    </span><span class="istickedoff">applyHunk origLines header rest =</span>
+<span class="lineno">  947 </span><span class="spaces">      </span><span class="istickedoff">case parseHunkHeader header of</span>
+<span class="lineno">  948 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left err</span></span>
+<span class="lineno">  949 </span><span class="spaces">        </span><span class="istickedoff">Right (oldStart, mOldLen) -&gt;</span>
+<span class="lineno">  950 </span><span class="spaces">          </span><span class="istickedoff">let (hunkLines, remainingPatch) = span isHunkLine rest</span>
+<span class="lineno">  951 </span><span class="spaces">              </span><span class="istickedoff">(oldLines, _newLines) = splitHunk hunkLines</span>
+<span class="lineno">  952 </span><span class="spaces">              </span><span class="istickedoff">-- The line-number hint is a 0-based index into the file</span>
+<span class="lineno">  953 </span><span class="spaces">              </span><span class="istickedoff">-- pointing at where the hunk's old lines BEGIN. For a</span>
+<span class="lineno">  954 </span><span class="spaces">              </span><span class="istickedoff">-- normal hunk (oldLen &gt;= 1) that's oldStart-1 (1-based -&gt;</span>
+<span class="lineno">  955 </span><span class="spaces">              </span><span class="istickedoff">-- 0-based). For a PURE-INSERT hunk (oldLen == 0) the</span>
+<span class="lineno">  956 </span><span class="spaces">              </span><span class="istickedoff">-- header's oldStart is the line AFTER which to insert</span>
+<span class="lineno">  957 </span><span class="spaces">              </span><span class="istickedoff">-- (1-based), so the 0-based insertion index is oldStart</span>
+<span class="lineno">  958 </span><span class="spaces">              </span><span class="istickedoff">-- itself (insert after that line). The @@ -0,0 +1,N @@</span>
+<span class="lineno">  959 </span><span class="spaces">              </span><span class="istickedoff">-- form (insert at start of empty file) gives oldStart=0,</span>
+<span class="lineno">  960 </span><span class="spaces">              </span><span class="istickedoff">-- which clamps to index 0.</span>
+<span class="lineno">  961 </span><span class="spaces">              </span><span class="istickedoff">isPureInsert = case mOldLen of</span>
+<span class="lineno">  962 </span><span class="spaces">                </span><span class="istickedoff">Just 0  -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  963 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; null oldLines   -- short-form header; infer</span>
+<span class="lineno">  964 </span><span class="spaces">                </span><span class="istickedoff">_       -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  965 </span><span class="spaces">              </span><span class="istickedoff">hint = if isPureInsert</span>
+<span class="lineno">  966 </span><span class="spaces">                       </span><span class="istickedoff">then max 0 oldStart        -- insert after line oldStart</span>
+<span class="lineno">  967 </span><span class="spaces">                       </span><span class="istickedoff">else max 0 (oldStart - 1) -- replace starting at oldStart</span>
+<span class="lineno">  968 </span><span class="spaces">          </span><span class="istickedoff">in case findMatch origLines oldLines hint of</span>
+<span class="lineno">  969 </span><span class="spaces">               </span><span class="istickedoff">Left err -&gt; Left <span class="nottickedoff">err</span></span>
+<span class="lineno">  970 </span><span class="spaces">               </span><span class="istickedoff">Right idx -&gt;</span>
+<span class="lineno">  971 </span><span class="spaces">                 </span><span class="istickedoff">let (before, atAndAfter) = splitAt idx origLines</span>
+<span class="lineno">  972 </span><span class="spaces">                     </span><span class="istickedoff">matched = take (length oldLines) atAndAfter</span>
+<span class="lineno">  973 </span><span class="spaces">                     </span><span class="istickedoff">after   = drop (length oldLines) atAndAfter</span>
+<span class="lineno">  974 </span><span class="spaces">                     </span><span class="istickedoff">-- Build the replacement: walk the hunk body and the</span>
+<span class="lineno">  975 </span><span class="spaces">                     </span><span class="istickedoff">-- matched file lines in parallel. For context (' ')</span>
+<span class="lineno">  976 </span><span class="spaces">                     </span><span class="istickedoff">-- lines we prefer the FILE's actual text (so a</span>
+<span class="lineno">  977 </span><span class="spaces">                     </span><span class="istickedoff">-- fuzzy match doesn't drag the patch's trailing</span>
+<span class="lineno">  978 </span><span class="spaces">                     </span><span class="istickedoff">-- whitespace into the file); for '+' lines we use</span>
+<span class="lineno">  979 </span><span class="spaces">                     </span><span class="istickedoff">-- the patch's text; '-' lines are dropped.</span>
+<span class="lineno">  980 </span><span class="spaces">                     </span><span class="istickedoff">replacement = spliceHunk hunkLines matched</span>
+<span class="lineno">  981 </span><span class="spaces">                 </span><span class="istickedoff">in go (before ++ replacement ++ after) remainingPatch</span>
+<span class="lineno">  982 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  983 </span><span class="spaces">    </span><span class="istickedoff">-- | Walk the hunk body and the matched file lines in parallel,</span>
+<span class="lineno">  984 </span><span class="spaces">    </span><span class="istickedoff">-- producing the replacement line list. Context (' ') lines take</span>
+<span class="lineno">  985 </span><span class="spaces">    </span><span class="istickedoff">-- the FILE's line (preserving the file's actual whitespace);</span>
+<span class="lineno">  986 </span><span class="spaces">    </span><span class="istickedoff">-- '+' lines take the patch's text; '-' and '\\' lines are dropped.</span>
+<span class="lineno">  987 </span><span class="spaces">    </span><span class="istickedoff">spliceHunk :: [Text] -&gt; [Text] -&gt; [Text]</span>
+<span class="lineno">  988 </span><span class="spaces">    </span><span class="istickedoff">spliceHunk = go'</span>
+<span class="lineno">  989 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  990 </span><span class="spaces">        </span><span class="istickedoff">go' [] _ = []</span>
+<span class="lineno">  991 </span><span class="spaces">        </span><span class="istickedoff">go' (l : ls) fileLines =</span>
+<span class="lineno">  992 </span><span class="spaces">          </span><span class="istickedoff">case T.uncons l of</span>
+<span class="lineno">  993 </span><span class="spaces">            </span><span class="istickedoff">Just (' ', _) -&gt; case fileLines of</span>
+<span class="lineno">  994 </span><span class="spaces">              </span><span class="istickedoff">(f : fs) -&gt; f : go' ls <span class="nottickedoff">fs</span></span>
+<span class="lineno">  995 </span><span class="spaces">              </span><span class="istickedoff">[]       -&gt; <span class="nottickedoff">go' ls []</span>   -- shouldn't happen; findMatch guards</span>
+<span class="lineno">  996 </span><span class="spaces">            </span><span class="istickedoff">Just ('+', body') -&gt; body' : go' ls <span class="nottickedoff">fileLines</span></span>
+<span class="lineno">  997 </span><span class="spaces">            </span><span class="istickedoff">Just ('-', _) -&gt; go' ls <span class="nottickedoff">(drop 1 fileLines)</span></span>
+<span class="lineno">  998 </span><span class="spaces">            </span><span class="istickedoff">Just ('\\', _) -&gt; <span class="nottickedoff">go' ls fileLines</span></span>
+<span class="lineno">  999 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">go' ls fileLines</span>   -- empty/malformed: skip, keep file pos</span>
+<span class="lineno"> 1000 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1001 </span><span class="spaces">    </span><span class="istickedoff">-- | Split hunk body lines into (oldLines, newLines). Context lines</span>
+<span class="lineno"> 1002 </span><span class="spaces">    </span><span class="istickedoff">-- (' ' prefix) appear in BOTH; removed lines ('-') in old only;</span>
+<span class="lineno"> 1003 </span><span class="spaces">    </span><span class="istickedoff">-- added lines ('+') in new only. '\\' (no-newline-at-eof) and empty</span>
+<span class="lineno"> 1004 </span><span class="spaces">    </span><span class="istickedoff">-- lines are ignored.</span>
+<span class="lineno"> 1005 </span><span class="spaces">    </span><span class="istickedoff">splitHunk :: [Text] -&gt; ([Text], [Text])</span>
+<span class="lineno"> 1006 </span><span class="spaces">    </span><span class="istickedoff">splitHunk ls =</span>
+<span class="lineno"> 1007 </span><span class="spaces">      </span><span class="istickedoff">let go' []         = ([], <span class="nottickedoff">[]</span>)</span>
+<span class="lineno"> 1008 </span><span class="spaces">          </span><span class="istickedoff">go' (l : rest) =</span>
+<span class="lineno"> 1009 </span><span class="spaces">            </span><span class="istickedoff">case T.uncons l of</span>
+<span class="lineno"> 1010 </span><span class="spaces">              </span><span class="istickedoff">Just (' ', body) -&gt; let (o, n) = go' rest in (body : o, <span class="nottickedoff">body : n</span>)</span>
+<span class="lineno"> 1011 </span><span class="spaces">              </span><span class="istickedoff">Just ('-', body) -&gt; let (o, n) = go' rest in (body : o, <span class="nottickedoff">n</span>)</span>
+<span class="lineno"> 1012 </span><span class="spaces">              </span><span class="istickedoff">Just ('+', body) -&gt; let (o, n) = go' rest in (o, <span class="nottickedoff">body : n</span>)</span>
+<span class="lineno"> 1013 </span><span class="spaces">              </span><span class="istickedoff">Just ('\\', _)   -&gt; <span class="nottickedoff">go' rest</span></span>
+<span class="lineno"> 1014 </span><span class="spaces">              </span><span class="istickedoff">_                -&gt; <span class="nottickedoff">go' rest</span>  -- empty or malformed: skip</span>
+<span class="lineno"> 1015 </span><span class="spaces">      </span><span class="istickedoff">in go' ls</span>
+<span class="lineno"> 1016 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1017 </span><span class="spaces">    </span><span class="istickedoff">-- | Find the index in @lines@ where the @pattern@ sequence matches,</span>
+<span class="lineno"> 1018 </span><span class="spaces">    </span><span class="istickedoff">-- searching near the @hint@ first, then the whole file. Tries four</span>
+<span class="lineno"> 1019 </span><span class="spaces">    </span><span class="istickedoff">-- comparison strategies in order (exact -&gt; rstrip -&gt; trim -&gt;</span>
+<span class="lineno"> 1020 </span><span class="spaces">    </span><span class="istickedoff">-- normalized) so trailing-whitespace and Unicode punctuation</span>
+<span class="lineno"> 1021 </span><span class="spaces">    </span><span class="istickedoff">-- differences don't cause a hard failure — mirrors OpenCode's</span>
+<span class="lineno"> 1022 </span><span class="spaces">    </span><span class="istickedoff">-- @seek@ fallback ladder. An empty pattern (pure-insert hunk) lands</span>
+<span class="lineno"> 1023 </span><span class="spaces">    </span><span class="istickedoff">-- at the hint index (insert after the hinted line).</span>
+<span class="lineno"> 1024 </span><span class="spaces">    </span><span class="istickedoff">findMatch :: [Text] -&gt; [Text] -&gt; Int -&gt; Either Text Int</span>
+<span class="lineno"> 1025 </span><span class="spaces">    </span><span class="istickedoff">findMatch _    []     hint = Right hint</span>
+<span class="lineno"> 1026 </span><span class="spaces">    </span><span class="istickedoff">findMatch xs pat    hint =</span>
+<span class="lineno"> 1027 </span><span class="spaces">      </span><span class="istickedoff">case searchNear xs pat hint of</span>
+<span class="lineno"> 1028 </span><span class="spaces">        </span><span class="istickedoff">Just idx -&gt; Right idx</span>
+<span class="lineno"> 1029 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt;</span>
+<span class="lineno"> 1030 </span><span class="spaces">          </span><span class="istickedoff">case searchAll xs pat of</span>
+<span class="lineno"> 1031 </span><span class="spaces">            </span><span class="istickedoff">Just idx -&gt; <span class="nottickedoff">Right idx</span></span>
+<span class="lineno"> 1032 </span><span class="spaces">            </span><span class="istickedoff">Nothing  -&gt;</span>
+<span class="lineno"> 1033 </span><span class="spaces">              </span><span class="istickedoff">Left <span class="nottickedoff">(&quot;FILE_PATCH: context not found near line &quot;</span></span>
+<span class="lineno"> 1034 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show (hint + 1)) &lt;&gt; &quot;:\n&quot;</span></span>
+<span class="lineno"> 1035 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.intercalate &quot;\n&quot; pat)</span></span>
+<span class="lineno"> 1036 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1037 </span><span class="spaces">    </span><span class="istickedoff">searchNear xs pat hint =</span>
+<span class="lineno"> 1038 </span><span class="spaces">      </span><span class="istickedoff">let n      = length xs</span>
+<span class="lineno"> 1039 </span><span class="spaces">          </span><span class="istickedoff">plen   = length pat</span>
+<span class="lineno"> 1040 </span><span class="spaces">          </span><span class="istickedoff">-- Search outward from the hint: try hint, hint±1, hint±2, ...</span>
+<span class="lineno"> 1041 </span><span class="spaces">          </span><span class="istickedoff">-- so the closest match to the claimed line wins (disambiguates</span>
+<span class="lineno"> 1042 </span><span class="spaces">          </span><span class="istickedoff">-- duplicates by proximity to the hint).</span>
+<span class="lineno"> 1043 </span><span class="spaces">          </span><span class="istickedoff">offsets = concatMap (\d -&gt; [hint + d, hint - d]) [0..(n - 1)]</span>
+<span class="lineno"> 1044 </span><span class="spaces">          </span><span class="istickedoff">valid  = filter (\i -&gt; i &gt;= 0 &amp;&amp; i &lt;= n - plen) offsets</span>
+<span class="lineno"> 1045 </span><span class="spaces">      </span><span class="istickedoff">in firstMatch xs pat valid</span>
+<span class="lineno"> 1046 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1047 </span><span class="spaces">    </span><span class="istickedoff">searchAll xs pat =</span>
+<span class="lineno"> 1048 </span><span class="spaces">      </span><span class="istickedoff">let n    = length xs</span>
+<span class="lineno"> 1049 </span><span class="spaces">          </span><span class="istickedoff">plen = length pat</span>
+<span class="lineno"> 1050 </span><span class="spaces">      </span><span class="istickedoff">in firstMatch xs pat [0 .. n - plen]</span>
+<span class="lineno"> 1051 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1052 </span><span class="spaces">    </span><span class="istickedoff">firstMatch _    _   []       = Nothing</span>
+<span class="lineno"> 1053 </span><span class="spaces">    </span><span class="istickedoff">firstMatch xs pat (i : is) =</span>
+<span class="lineno"> 1054 </span><span class="spaces">      </span><span class="istickedoff">if matchesAt xs pat i</span>
+<span class="lineno"> 1055 </span><span class="spaces">        </span><span class="istickedoff">then Just i</span>
+<span class="lineno"> 1056 </span><span class="spaces">        </span><span class="istickedoff">else firstMatch xs pat is</span>
+<span class="lineno"> 1057 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1058 </span><span class="spaces">    </span><span class="istickedoff">matchesAt xs pat i =</span>
+<span class="lineno"> 1059 </span><span class="spaces">      </span><span class="istickedoff">any (\cmp -&gt; and (zipWith cmp (drop i xs) pat))</span>
+<span class="lineno"> 1060 </span><span class="spaces">           </span><span class="istickedoff">[exactEq, rstripEq, trimEq, normalizedEq]</span>
+<span class="lineno"> 1061 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1062 </span><span class="spaces">    </span><span class="istickedoff">exactEq a b = a == b</span>
+<span class="lineno"> 1063 </span><span class="spaces">    </span><span class="istickedoff">rstripEq a b = T.dropWhileEnd isSpace a == T.dropWhileEnd isSpace b</span>
+<span class="lineno"> 1064 </span><span class="spaces">    </span><span class="istickedoff">trimEq a b = T.dropWhile isSpace (T.dropWhileEnd isSpace a)</span>
+<span class="lineno"> 1065 </span><span class="spaces">              </span><span class="istickedoff">== T.dropWhile isSpace (T.dropWhileEnd isSpace b)</span>
+<span class="lineno"> 1066 </span><span class="spaces">    </span><span class="istickedoff">normalizedEq a b = normalize (trimLine a) == normalize (trimLine b)</span>
+<span class="lineno"> 1067 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno"> 1068 </span><span class="spaces">        </span><span class="istickedoff">trimLine = T.dropWhile isSpace . T.dropWhileEnd isSpace</span>
+<span class="lineno"> 1069 </span><span class="spaces">        </span><span class="istickedoff">normalize = T.map (\c -&gt; if <span class="tickonlyfalse">c == '\t'</span> then <span class="nottickedoff">' '</span> else c)</span>
+<span class="lineno"> 1070 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1071 </span><span class="spaces">    </span><span class="istickedoff">isHunkLine l =</span>
+<span class="lineno"> 1072 </span><span class="spaces">      </span><span class="istickedoff">T.null l</span>
+<span class="lineno"> 1073 </span><span class="spaces">      </span><span class="istickedoff">|| T.isPrefixOf &quot; &quot; l</span>
+<span class="lineno"> 1074 </span><span class="spaces">      </span><span class="istickedoff">|| T.isPrefixOf &quot;-&quot; l</span>
+<span class="lineno"> 1075 </span><span class="spaces">      </span><span class="istickedoff">|| T.isPrefixOf &quot;+&quot; l</span>
+<span class="lineno"> 1076 </span><span class="spaces">      </span><span class="istickedoff">|| T.isPrefixOf &quot;\\&quot; l</span>
+<span class="lineno"> 1077 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1078 </span><span class="spaces">    </span><span class="istickedoff">-- | Join lines back into text, preserving the trailing newline if</span>
+<span class="lineno"> 1079 </span><span class="spaces">    </span><span class="istickedoff">-- the original had one (T.lines drops it; we re-add it so a file</span>
+<span class="lineno"> 1080 </span><span class="spaces">    </span><span class="istickedoff">-- ending in a newline round-trips).</span>
+<span class="lineno"> 1081 </span><span class="spaces">    </span><span class="istickedoff">joinLines [] = <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno"> 1082 </span><span class="spaces">    </span><span class="istickedoff">joinLines ls = T.intercalate &quot;\n&quot; ls &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno"> 1083 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno"> 1084 </span><span class="spaces">    </span><span class="istickedoff">parseHunkHeader h =</span>
+<span class="lineno"> 1085 </span><span class="spaces">      </span><span class="istickedoff">case T.stripPrefix &quot;@@ -&quot; h of</span>
+<span class="lineno"> 1086 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left (&quot;malformed hunk header: &quot; &lt;&gt; h)</span></span>
+<span class="lineno"> 1087 </span><span class="spaces">        </span><span class="istickedoff">Just rest0 -&gt;</span>
+<span class="lineno"> 1088 </span><span class="spaces">          </span><span class="istickedoff">let (oldStartStr, afterOld) = breakNum rest0</span>
+<span class="lineno"> 1089 </span><span class="spaces">              </span><span class="istickedoff">(oldLenStr, afterOldLen) = breakLen afterOld</span>
+<span class="lineno"> 1090 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">afterPlus0 = T.dropWhile (/= '+') afterOldLen</span></span>
+<span class="lineno"> 1091 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">afterPlus  = T.drop 1 afterPlus0</span></span>
+<span class="lineno"> 1092 </span><span class="spaces">              </span><span class="istickedoff">(newStartStr, _) = <span class="nottickedoff">breakNum afterPlus</span></span>
+<span class="lineno"> 1093 </span><span class="spaces">              </span><span class="istickedoff">oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int</span>
+<span class="lineno"> 1094 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">_newStart = readMaybe (T.unpack newStartStr) :: Maybe Int</span></span>
+<span class="lineno"> 1095 </span><span class="spaces">          </span><span class="istickedoff">in case oldStart of</span>
+<span class="lineno"> 1096 </span><span class="spaces">               </span><span class="istickedoff">Just os_ -&gt; Right (os_, readMaybe (T.unpack oldLenStr) :: Maybe Int)</span>
+<span class="lineno"> 1097 </span><span class="spaces">               </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">Left (&quot;malformed hunk header numbers: &quot; &lt;&gt; h)</span></span>
+<span class="lineno"> 1098 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno"> 1099 </span><span class="spaces">        </span><span class="istickedoff">breakNum :: Text -&gt; (Text, Text)</span>
+<span class="lineno"> 1100 </span><span class="spaces">        </span><span class="istickedoff">breakNum s =</span>
+<span class="lineno"> 1101 </span><span class="spaces">          </span><span class="istickedoff">let (digits, rest) = T.span isDigit s</span>
+<span class="lineno"> 1102 </span><span class="spaces">          </span><span class="istickedoff">in case T.uncons rest of</span>
+<span class="lineno"> 1103 </span><span class="spaces">               </span><span class="istickedoff">Just (',', rest') -&gt; (digits, T.dropWhile isDigit rest')</span>
+<span class="lineno"> 1104 </span><span class="spaces">               </span><span class="istickedoff">_                 -&gt; (digits, rest)</span>
+<span class="lineno"> 1105 </span><span class="spaces">        </span><span class="istickedoff">-- | After the oldStart number, an optional @,len@ may follow.</span>
+<span class="lineno"> 1106 </span><span class="spaces">        </span><span class="istickedoff">-- Return the len string (empty if the short form was used) and</span>
+<span class="lineno"> 1107 </span><span class="spaces">        </span><span class="istickedoff">-- the rest after the @,len@ (or after the start number if short</span>
+<span class="lineno"> 1108 </span><span class="spaces">        </span><span class="istickedoff">-- form). The length is informational (the content search is the</span>
+<span class="lineno"> 1109 </span><span class="spaces">        </span><span class="istickedoff">-- source of truth); we keep it only for diagnostics.</span>
+<span class="lineno"> 1110 </span><span class="spaces">        </span><span class="istickedoff">breakLen :: Text -&gt; (Text, Text)</span>
+<span class="lineno"> 1111 </span><span class="spaces">        </span><span class="istickedoff">breakLen s =</span>
+<span class="lineno"> 1112 </span><span class="spaces">          </span><span class="istickedoff">case T.uncons s of</span>
+<span class="lineno"> 1113 </span><span class="spaces">            </span><span class="istickedoff">Just (',', rest) -&gt; <span class="nottickedoff">T.span isDigit rest</span></span>
+<span class="lineno"> 1114 </span><span class="spaces">            </span><span class="istickedoff">_                -&gt; (&quot;&quot;, <span class="nottickedoff">s</span>)</span>
+<span class="lineno"> 1115 </span><span class="spaces">        </span><span class="istickedoff">readMaybe :: String -&gt; Maybe Int</span>
+<span class="lineno"> 1116 </span><span class="spaces">        </span><span class="istickedoff">readMaybe s = case reads s :: [(Int, String)] of</span>
+<span class="lineno"> 1117 </span><span class="spaces">          </span><span class="istickedoff">[(n, _)] -&gt; Just n</span>
+<span class="lineno"> 1118 </span><span class="spaces">          </span><span class="istickedoff">_        -&gt; Nothing</span></span>
+<span class="lineno"> 1119 </span>
+<span class="lineno"> 1120 </span>-- | Build a 'LineWindow' from raw text (the remote arm returns raw
+<span class="lineno"> 1121 </span>-- content via @cat@; the opcode renders it just like the local arm).
+<span class="lineno"> 1122 </span>-- The text is split to lines and the whole thing is one window (no
+<span class="lineno"> 1123 </span>-- truncation — the bounded read already enforced the byte ceiling).
+<span class="lineno"> 1124 </span>lineWindowFromText :: Text -&gt; LineWindow
+<span class="lineno"> 1125 </span><span class="decl"><span class="nottickedoff">lineWindowFromText txt =</span>
+<span class="lineno"> 1126 </span><span class="spaces">  </span><span class="nottickedoff">let ls = T.lines txt</span>
+<span class="lineno"> 1127 </span><span class="spaces">      </span><span class="nottickedoff">n  = length ls</span>
+<span class="lineno"> 1128 </span><span class="spaces">  </span><span class="nottickedoff">in LineWindow</span>
+<span class="lineno"> 1129 </span><span class="spaces">       </span><span class="nottickedoff">{ lwLines     = ls</span>
+<span class="lineno"> 1130 </span><span class="spaces">       </span><span class="nottickedoff">, lwStart     = 0</span>
+<span class="lineno"> 1131 </span><span class="spaces">       </span><span class="nottickedoff">, lwEnd       = n</span>
+<span class="lineno"> 1132 </span><span class="spaces">       </span><span class="nottickedoff">, lwTotal     = n</span>
+<span class="lineno"> 1133 </span><span class="spaces">       </span><span class="nottickedoff">, lwHasMore   = False</span>
+<span class="lineno"> 1134 </span><span class="spaces">       </span><span class="nottickedoff">, lwTruncated = False</span>
+<span class="lineno"> 1135 </span><span class="spaces">       </span><span class="nottickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

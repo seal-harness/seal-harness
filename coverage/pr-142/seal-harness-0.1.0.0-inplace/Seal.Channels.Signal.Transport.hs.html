@@ -1,0 +1,326 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The testability seam over signal-cli. The real implementation spawns
+<span class="lineno">    3 </span>-- @signal-cli --output=json --trust-new-identities=always -u &lt;account&gt; jsonRpc@
+<span class="lineno">    4 </span>-- as a child process (via &quot;System.Process&quot;) and talks JSON-RPC over
+<span class="lineno">    5 </span>-- stdin/stdout; the mock implementation backs the test suite, so no
+<span class="lineno">    6 </span>-- signal-cli binary is needed for @cabal test@.
+<span class="lineno">    7 </span>module Seal.Channels.Signal.Transport
+<span class="lineno">    8 </span>  ( SignalTransport (..)
+<span class="lineno">    9 </span>  , mkMockSignalTransport
+<span class="lineno">   10 </span>  , mkRealSignalTransport
+<span class="lineno">   11 </span>  , chunkMessage
+<span class="lineno">   12 </span>  , SignalEnvelope (..)
+<span class="lineno">   13 </span>  , parseSignalEnvelope
+<span class="lineno">   14 </span>  , conversationIdForSignal
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Control.Concurrent.STM (atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+<span class="lineno">   18 </span>import Control.Exception (IOException, try)
+<span class="lineno">   19 </span>import Data.Aeson (Value)
+<span class="lineno">   20 </span>import Data.Aeson qualified as A
+<span class="lineno">   21 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   22 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   23 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   24 </span>import Data.IORef (modifyIORef', newIORef, readIORef)
+<span class="lineno">   25 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   26 </span>import Data.Text (Text)
+<span class="lineno">   27 </span>import Data.Text qualified as T
+<span class="lineno">   28 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   29 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   30 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   31 </span>import System.IO (BufferMode (..), hClose, hFlush, hGetLine, hSetBuffering)
+<span class="lineno">   32 </span>import System.Process
+<span class="lineno">   33 </span>  ( CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess,
+<span class="lineno">   34 </span>    waitForProcess, withCreateProcess )
+<span class="lineno">   35 </span>import System.Timeout (timeout)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Seal.Core.MessageSource (ConversationId (..), UserId (..), mkConversationId, mkUserId)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | The testability seam over signal-cli.
+<span class="lineno">   40 </span>data SignalTransport = SignalTransport
+<span class="lineno">   41 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">stReceive</span></span></span> :: IO (Either Text Value)
+<span class="lineno">   42 </span>    -- ^ Next inbound JSON value (one line from signal-cli's stdout).
+<span class="lineno">   43 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stSend</span></span></span>    :: Text -&gt; Text -&gt; IO ()
+<span class="lineno">   44 </span>    -- ^ Send a message: recipient, body. Writes a JSON-RPC @send@ frame.
+<span class="lineno">   45 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stClose</span></span></span>   :: IO ()
+<span class="lineno">   46 </span>  }
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | A mock transport backed by a 'TQueue' of inbound 'Value's and an 'IORef'
+<span class="lineno">   49 </span>-- of captured sends. 'stReceive' pops the next inbound (or returns
+<span class="lineno">   50 </span>-- @Left &quot;inbox empty&quot;@); 'stSend' appends @(recipient, body)@ to the
+<span class="lineno">   51 </span>-- capture; 'stClose' is a no-op (idempotent).
+<span class="lineno">   52 </span>mkMockSignalTransport :: [Value] -&gt; IO (SignalTransport, IO [(Text, Text)])
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">mkMockSignalTransport scripted = do</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">q &lt;- newTQueueIO</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">mapM_ (atomically . writeTQueue q) scripted</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">capRef &lt;- newIORef []</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">let transport = SignalTransport</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="istickedoff">{ stReceive = do</span>
+<span class="lineno">   59 </span><span class="spaces">            </span><span class="istickedoff">m &lt;- atomically (tryReadTQueue q)</span>
+<span class="lineno">   60 </span><span class="spaces">            </span><span class="istickedoff">case m of</span>
+<span class="lineno">   61 </span><span class="spaces">              </span><span class="istickedoff">Just v  -&gt; pure (Right v)</span>
+<span class="lineno">   62 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; pure (Left &quot;signal inbox empty&quot;)</span>
+<span class="lineno">   63 </span><span class="spaces">        </span><span class="istickedoff">, stSend = \r b -&gt; modifyIORef' capRef ((r, b) :)</span>
+<span class="lineno">   64 </span><span class="spaces">        </span><span class="istickedoff">, stClose = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   65 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="istickedoff">getCaptured = reverse &lt;$&gt; readIORef capRef</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">pure (transport, getCaptured)</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | Spawn @signal-cli --output=json --trust-new-identities=always
+<span class="lineno">   70 </span>-- -u &lt;account&gt; jsonRpc@ as a child process via &quot;System.Process&quot;, line-
+<span class="lineno">   71 </span>-- buffered JSON-RPC over stdin/stdout. 'stReceive' reads one line from
+<span class="lineno">   72 </span>-- stdout and decodes it; 'stSend' writes a JSON-RPC @send@ frame to stdin;
+<span class="lineno">   73 </span>-- 'stClose' terminates the child (with a 5s graceful wait). A preflight
+<span class="lineno">   74 </span>-- @signal-cli --version@ probe fails fast if the binary is absent.
+<span class="lineno">   75 </span>--
+<span class="lineno">   76 </span>-- The '&lt;account&gt;' is the smart-constructed validated 'SignalAccount' from
+<span class="lineno">   77 </span>-- &quot;Seal.Signal.Config&quot; — option injection fails to compile. This module
+<span class="lineno">   78 </span>-- takes it as 'Text' here to avoid a cycle (Signal.Config imports nothing
+<span class="lineno">   79 </span>-- from this module; the constructor is enforced at the call site).
+<span class="lineno">   80 </span>mkRealSignalTransport :: Text -&gt; IO (Either Text SignalTransport)
+<span class="lineno">   81 </span><span class="decl"><span class="nottickedoff">mkRealSignalTransport account = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="nottickedoff">versionOk &lt;- probeSignalCli</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="nottickedoff">if not versionOk</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="nottickedoff">then pure (Left &quot;signal-cli not installed or on PATH&quot;)</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="nottickedoff">else do</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="nottickedoff">eStarted &lt;- try @IOException $</span>
+<span class="lineno">   87 </span><span class="spaces">        </span><span class="nottickedoff">createProcess</span>
+<span class="lineno">   88 </span><span class="spaces">          </span><span class="nottickedoff">( (proc &quot;signal-cli&quot;</span>
+<span class="lineno">   89 </span><span class="spaces">              </span><span class="nottickedoff">[ &quot;--output=json&quot;</span>
+<span class="lineno">   90 </span><span class="spaces">              </span><span class="nottickedoff">, &quot;--trust-new-identities=always&quot;</span>
+<span class="lineno">   91 </span><span class="spaces">              </span><span class="nottickedoff">, &quot;-u&quot;, T.unpack account</span>
+<span class="lineno">   92 </span><span class="spaces">              </span><span class="nottickedoff">, &quot;jsonRpc&quot;</span>
+<span class="lineno">   93 </span><span class="spaces">              </span><span class="nottickedoff">])</span>
+<span class="lineno">   94 </span><span class="spaces">              </span><span class="nottickedoff">{ std_in = CreatePipe, std_out = CreatePipe, std_err = Inherit }</span>
+<span class="lineno">   95 </span><span class="spaces">          </span><span class="nottickedoff">)</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="nottickedoff">case eStarted of</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="nottickedoff">Left e -&gt; pure (Left (&quot;signal-cli launch failed: &quot; &lt;&gt; T.pack (show e)))</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="nottickedoff">Right (mIn, mOut, _err, ph) -&gt; do</span>
+<span class="lineno">   99 </span><span class="spaces">          </span><span class="nottickedoff">(hIn, hOut) &lt;- case (mIn, mOut) of</span>
+<span class="lineno">  100 </span><span class="spaces">            </span><span class="nottickedoff">(Just a, Just b) -&gt; pure (a, b)</span>
+<span class="lineno">  101 </span><span class="spaces">            </span><span class="nottickedoff">_ -&gt; error &quot;mkRealSignalTransport: pipe creation failed (unreachable)&quot;</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="nottickedoff">hSetBuffering hIn (BlockBuffering Nothing)</span>
+<span class="lineno">  103 </span><span class="spaces">          </span><span class="nottickedoff">hSetBuffering hOut LineBuffering</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="nottickedoff">pure (Right SignalTransport</span>
+<span class="lineno">  105 </span><span class="spaces">            </span><span class="nottickedoff">{ stReceive = do</span>
+<span class="lineno">  106 </span><span class="spaces">                </span><span class="nottickedoff">line &lt;- hGetLine hOut</span>
+<span class="lineno">  107 </span><span class="spaces">                </span><span class="nottickedoff">pure $ case A.decode (BL.fromStrict (TE.encodeUtf8 (T.pack line))) of</span>
+<span class="lineno">  108 </span><span class="spaces">                  </span><span class="nottickedoff">Just v  -&gt; Right v</span>
+<span class="lineno">  109 </span><span class="spaces">                  </span><span class="nottickedoff">Nothing -&gt; Left (&quot;signal-cli: malformed JSON line: &quot; &lt;&gt; T.pack line)</span>
+<span class="lineno">  110 </span><span class="spaces">            </span><span class="nottickedoff">, stSend = \recipient body -&gt; do</span>
+<span class="lineno">  111 </span><span class="spaces">                </span><span class="nottickedoff">let frame = A.object</span>
+<span class="lineno">  112 </span><span class="spaces">                      </span><span class="nottickedoff">[ &quot;jsonrpc&quot; A..= (&quot;2.0&quot; :: Text)</span>
+<span class="lineno">  113 </span><span class="spaces">                      </span><span class="nottickedoff">, &quot;method&quot;  A..= (&quot;send&quot; :: Text)</span>
+<span class="lineno">  114 </span><span class="spaces">                      </span><span class="nottickedoff">, &quot;params&quot;  A..= A.object</span>
+<span class="lineno">  115 </span><span class="spaces">                          </span><span class="nottickedoff">[ &quot;recipient&quot; A..= [recipient]</span>
+<span class="lineno">  116 </span><span class="spaces">                          </span><span class="nottickedoff">, &quot;message&quot;   A..= body</span>
+<span class="lineno">  117 </span><span class="spaces">                          </span><span class="nottickedoff">]</span>
+<span class="lineno">  118 </span><span class="spaces">                      </span><span class="nottickedoff">]</span>
+<span class="lineno">  119 </span><span class="spaces">                </span><span class="nottickedoff">BL.hPutStr hIn (A.encode frame)</span>
+<span class="lineno">  120 </span><span class="spaces">                </span><span class="nottickedoff">TIO.hPutStrLn hIn &quot;&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">                </span><span class="nottickedoff">hFlush hIn</span>
+<span class="lineno">  122 </span><span class="spaces">            </span><span class="nottickedoff">, stClose = do</span>
+<span class="lineno">  123 </span><span class="spaces">                </span><span class="nottickedoff">_ &lt;- try @IOException (hClose hIn)</span>
+<span class="lineno">  124 </span><span class="spaces">                </span><span class="nottickedoff">terminateProcess ph</span>
+<span class="lineno">  125 </span><span class="spaces">                </span><span class="nottickedoff">_ &lt;- timeout 5000000 (waitForProcess ph)</span>
+<span class="lineno">  126 </span><span class="spaces">                </span><span class="nottickedoff">pure ()</span>
+<span class="lineno">  127 </span><span class="spaces">            </span><span class="nottickedoff">})</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | Preflight @signal-cli --version@. Returns 'True' if the binary is on
+<span class="lineno">  130 </span>-- PATH and exits successfully. Mirrors 'Seal.Security.Vault.Age's
+<span class="lineno">  131 </span>-- @age --version@ preflight.
+<span class="lineno">  132 </span>probeSignalCli :: IO Bool
+<span class="lineno">  133 </span><span class="decl"><span class="nottickedoff">probeSignalCli = do</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="nottickedoff">r &lt;- try @IOException $</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="nottickedoff">withCreateProcess</span>
+<span class="lineno">  136 </span><span class="spaces">          </span><span class="nottickedoff">( (proc &quot;signal-cli&quot; [&quot;--version&quot;])</span>
+<span class="lineno">  137 </span><span class="spaces">              </span><span class="nottickedoff">{ std_out = NoStream, std_err = NoStream }</span>
+<span class="lineno">  138 </span><span class="spaces">          </span><span class="nottickedoff">) $ \_ _ _ ph -&gt; waitForProcess ph</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="nottickedoff">pure $ case r of</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="nottickedoff">Right ExitSuccess -&gt; True</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="nottickedoff">_                 -&gt; False</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  144 </span>-- chunkMessage
+<span class="lineno">  145 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>-- | Split a message into chunks of at most 'limit' characters, preferring
+<span class="lineno">  148 </span>-- paragraph boundaries (@\\n\\n@), then line boundaries (@\\n@), hard-cut
+<span class="lineno">  149 </span>-- as a last resort. **Chunks carry their trailing separator** (except the
+<span class="lineno">  150 </span>-- last chunk, which has none), so 'T.concat' of the chunks is identity:
+<span class="lineno">  151 </span>--
+<span class="lineno">  152 </span>-- &gt; T.concat (chunkMessage limit t) == t
+<span class="lineno">  153 </span>--
+<span class="lineno">  154 </span>-- This makes the chunks the literal bytes to send, in order — the receiver
+<span class="lineno">  155 </span>-- concatenates and sees the original text. Pure.
+<span class="lineno">  156 </span>chunkMessage :: Int -&gt; Text -&gt; [Text]
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">chunkMessage limit t</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">limit &lt; 1</span> = <span class="nottickedoff">error &quot;chunkMessage: limit must be &gt;= 1&quot;</span></span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">| T.null t  = []</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go t</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">go s</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.null s</span>       = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">| T.length s &lt;= limit = [s]</span>
+<span class="lineno">  165 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  166 </span><span class="spaces">          </span><span class="istickedoff">let (chunk, rest) = nextChunk limit s</span>
+<span class="lineno">  167 </span><span class="spaces">          </span><span class="istickedoff">in chunk : if <span class="tickonlyfalse">T.null rest</span> then <span class="nottickedoff">[]</span> else go rest</span></span>
+<span class="lineno">  168 </span>
+<span class="lineno">  169 </span>-- | Extract the next chunk (with its trailing separator) and the remaining
+<span class="lineno">  170 </span>-- text. Prefers a paragraph boundary (@\\n\\n@) within the limit, then a
+<span class="lineno">  171 </span>-- line boundary (@\\n@), then a hard cut at the limit.
+<span class="lineno">  172 </span>nextChunk :: Int -&gt; Text -&gt; (Text, Text)
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">nextChunk limit s =</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">case findParagraphBreak limit s of</span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">Just n -&gt; T.splitAt n s</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case findLineBreak limit s of</span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff">Just n -&gt; T.splitAt n s</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; T.splitAt limit s</span></span>
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>-- | The 1-based cut position (inclusive of the @\\n\\n@ separator) of the
+<span class="lineno">  181 </span>-- last @\\n\\n@ within the first 'limit' characters, or 'Nothing' if there
+<span class="lineno">  182 </span>-- is none. The chunk will then be @take n s@ (which ends in @\\n\\n@).
+<span class="lineno">  183 </span>findParagraphBreak :: Int -&gt; Text -&gt; Maybe Int
+<span class="lineno">  184 </span><span class="decl"><span class="istickedoff">findParagraphBreak limit s =</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">-- Search the first `limit` characters for the rightmost &quot;\n\n&quot;.</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">let window = T.take limit s</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">in case T.breakOnEnd &quot;\n\n&quot; window of</span>
+<span class="lineno">  188 </span><span class="spaces">       </span><span class="istickedoff">(pre, _post) | not (T.null pre) -&gt; Just (T.length pre)</span>
+<span class="lineno">  189 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>-- | The 1-based cut position (inclusive of the @\\n@ separator) of the last
+<span class="lineno">  192 </span>-- @\\n@ within the first 'limit' characters, or 'Nothing' if there is none.
+<span class="lineno">  193 </span>findLineBreak :: Int -&gt; Text -&gt; Maybe Int
+<span class="lineno">  194 </span><span class="decl"><span class="istickedoff">findLineBreak limit s =</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">let window = T.take limit s</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">in case T.breakOnEnd &quot;\n&quot; window of</span>
+<span class="lineno">  197 </span><span class="spaces">       </span><span class="istickedoff">(pre, _post) | not (T.null pre) -&gt; Just (T.length pre)</span>
+<span class="lineno">  198 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  199 </span>
+<span class="lineno">  200 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  201 </span>-- SignalEnvelope — parsed inbound envelope + server-derived conversation id
+<span class="lineno">  202 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  203 </span>
+<span class="lineno">  204 </span>-- | A parsed inbound signal-cli envelope: the peer-derived conversation id,
+<span class="lineno">  205 </span>-- the sender's user id, and the message body. The conversation id is
+<span class="lineno">  206 </span>-- **server-derived from authenticated transport metadata** (the peer's
+<span class="lineno">  207 </span>-- phone number + UUID), never read from the message body — enforced
+<span class="lineno">  208 </span>-- structurally by 'conversationIdForSignal' taking only the peer fields.
+<span class="lineno">  209 </span>data SignalEnvelope = SignalEnvelope
+<span class="lineno">  210 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">seConversationId</span></span></span> :: ConversationId
+<span class="lineno">  211 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seSender</span></span></span>         :: UserId
+<span class="lineno">  212 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seBody</span></span></span>           :: Text
+<span class="lineno">  213 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | Derive the server-side 'ConversationId' from the peer's authenticated
+<span class="lineno">  216 </span>-- transport metadata. signal-cli envelopes carry both a phone number
+<span class="lineno">  217 </span>-- (@source@) and a UUID (@sourceUuid@); the conversation id is
+<span class="lineno">  218 </span>-- @sig:&lt;source&gt;:&lt;sourceUuid&gt;@ (or @sig:&lt;source&gt;@ when the UUID is absent).
+<span class="lineno">  219 </span>-- Never reads the message body. A missing or empty @source@ is rejected
+<span class="lineno">  220 </span>-- (a peer phone number is required).
+<span class="lineno">  221 </span>conversationIdForSignal :: Maybe Text -&gt; Maybe Text -&gt; Either Text ConversationId
+<span class="lineno">  222 </span><span class="decl"><span class="istickedoff">conversationIdForSignal mSource mUuid =</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">case mSource of</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="istickedoff">Nothing        -&gt; Left <span class="nottickedoff">&quot;signal envelope missing source (peer phone number)&quot;</span></span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">Just src</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">| T.null src -&gt; Left <span class="nottickedoff">&quot;signal envelope source is empty&quot;</span></span>
+<span class="lineno">  227 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>  -&gt; mkConversationId full</span>
+<span class="lineno">  228 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  229 </span><span class="spaces">        </span><span class="istickedoff">full = case mUuid of</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="istickedoff">Nothing   -&gt; &quot;sig:&quot; &lt;&gt; src</span>
+<span class="lineno">  231 </span><span class="spaces">          </span><span class="istickedoff">Just uuid -&gt; &quot;sig:&quot; &lt;&gt; src &lt;&gt; &quot;:&quot; &lt;&gt; uuid</span></span>
+<span class="lineno">  232 </span>
+<span class="lineno">  233 </span>-- | Parse a raw signal-cli JSON value into a 'SignalEnvelope'. Handles both
+<span class="lineno">  234 </span>-- raw envelopes (@{&quot;envelope&quot;: {...}}@) and JSON-RPC-wrapped messages
+<span class="lineno">  235 </span>-- (@{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;method&quot;:&quot;receive&quot;,&quot;params&quot;:{&quot;envelope&quot;:{...}}}@).
+<span class="lineno">  236 </span>-- Returns 'Left' on a malformed value, a missing peer field, or a
+<span class="lineno">  237 </span>-- conversation-id smart-constructor failure. The body is taken from the
+<span class="lineno">  238 </span>-- envelope's @dataMessage.message@; a @conversationId@ key in the body is
+<span class="lineno">  239 </span>-- IGNORED (the conversation id is always server-derived via
+<span class="lineno">  240 </span>-- 'conversationIdForSignal').
+<span class="lineno">  241 </span>parseSignalEnvelope :: Value -&gt; Either Text SignalEnvelope
+<span class="lineno">  242 </span><span class="decl"><span class="istickedoff">parseSignalEnvelope v = do</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- unwrapEnvelope v</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">source &lt;- fieldText &quot;source&quot; env</span>
+<span class="lineno">  245 </span><span class="spaces">  </span><span class="istickedoff">let mUuid = fieldTextMaybe &quot;sourceUuid&quot; env</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">cid &lt;- conversationIdForSignal (Just source) mUuid</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">uid &lt;- case mkUserId source of</span>
+<span class="lineno">  248 </span><span class="spaces">    </span><span class="istickedoff">Right u  -&gt; Right u</span>
+<span class="lineno">  249 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;signal sender not a valid UserId: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">let body = extractBody env</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">Right SignalEnvelope</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">{ seConversationId = cid</span>
+<span class="lineno">  253 </span><span class="spaces">    </span><span class="istickedoff">, seSender         = uid</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">, seBody           = body</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>-- | Unwrap a raw envelope (@{&quot;envelope&quot;: {...}}@) or a JSON-RPC-wrapped
+<span class="lineno">  258 </span>-- message (@{&quot;params&quot;: {&quot;envelope&quot;: {...}}}@) to the inner envelope object.
+<span class="lineno">  259 </span>-- Returns 'Left' if neither shape is present or the value is not an object.
+<span class="lineno">  260 </span>unwrapEnvelope :: Value -&gt; Either Text Value
+<span class="lineno">  261 </span><span class="decl"><span class="istickedoff">unwrapEnvelope v =</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">case v of</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt;</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">case KeyMap.lookup (Key.fromString &quot;envelope&quot;) o of</span>
+<span class="lineno">  265 </span><span class="spaces">        </span><span class="istickedoff">Just env -&gt; Right env</span>
+<span class="lineno">  266 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; case KeyMap.lookup (Key.fromString &quot;params&quot;) o of</span>
+<span class="lineno">  267 </span><span class="spaces">          </span><span class="istickedoff">Just (A.Object p) -&gt; case KeyMap.lookup (Key.fromString &quot;envelope&quot;) p of</span>
+<span class="lineno">  268 </span><span class="spaces">            </span><span class="istickedoff">Just env -&gt; Right env</span>
+<span class="lineno">  269 </span><span class="spaces">            </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">Left &quot;signal envelope: no envelope in params&quot;</span></span>
+<span class="lineno">  270 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;signal envelope: no envelope and no params&quot;</span></span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;signal envelope: not an object&quot;</span></span></span>
+<span class="lineno">  272 </span>
+<span class="lineno">  273 </span>-- | Extract a required text field from an object, failing on absence or
+<span class="lineno">  274 </span>-- non-text value.
+<span class="lineno">  275 </span>fieldText :: Text -&gt; Value -&gt; Either Text Text
+<span class="lineno">  276 </span><span class="decl"><span class="istickedoff">fieldText key v =</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">case v of</span>
+<span class="lineno">  278 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromString (T.unpack key)) o of</span>
+<span class="lineno">  279 </span><span class="spaces">      </span><span class="istickedoff">Just (A.String t) -&gt; Right t</span>
+<span class="lineno">  280 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">(&quot;signal envelope missing or non-text field: &quot; &lt;&gt; key)</span></span>
+<span class="lineno">  281 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left (&quot;signal envelope field &quot; &lt;&gt; key &lt;&gt; &quot;: not an object&quot;)</span></span></span>
+<span class="lineno">  282 </span>
+<span class="lineno">  283 </span>-- | Extract an optional text field from an object.
+<span class="lineno">  284 </span>fieldTextMaybe :: Text -&gt; Value -&gt; Maybe Text
+<span class="lineno">  285 </span><span class="decl"><span class="istickedoff">fieldTextMaybe key v = do</span>
+<span class="lineno">  286 </span><span class="spaces">  </span><span class="istickedoff">inner &lt;- fieldValueMaybe key v</span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="istickedoff">case inner of</span>
+<span class="lineno">  288 </span><span class="spaces">    </span><span class="istickedoff">A.String t -&gt; Just t</span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- | Extract an optional sub-value from an object.
+<span class="lineno">  292 </span>fieldValueMaybe :: Text -&gt; Value -&gt; Maybe Value
+<span class="lineno">  293 </span><span class="decl"><span class="istickedoff">fieldValueMaybe key v =</span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="istickedoff">case v of</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; KeyMap.lookup (Key.fromString (T.unpack key)) o</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  297 </span>
+<span class="lineno">  298 </span>-- | Extract the message body from @dataMessage.message@. Empty when absent
+<span class="lineno">  299 </span>-- (a non-data envelope, e.g. a receipt — the caller drops these).
+<span class="lineno">  300 </span>extractBody :: Value -&gt; Text
+<span class="lineno">  301 </span><span class="decl"><span class="istickedoff">extractBody v = fromMaybe <span class="nottickedoff">&quot;&quot;</span> $ do</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">dm &lt;- fieldValueMaybe &quot;dataMessage&quot; v</span>
+<span class="lineno">  303 </span><span class="spaces">  </span><span class="istickedoff">fieldTextMaybe &quot;message&quot; dm</span></span>
+
+</pre>
+</body>
+</html>
