@@ -212,7 +212,7 @@ memoryListOp store = TrustedOpcode
 -- | MEMORY_SEARCH: semantic search over memory files via the
 -- 'EmbeddingBackend'. Returns ranked results by meaning.
 memorySearchOp :: EmbeddingBackend -> MemoryStore -> Opcode
-memorySearchOp embedding _store = TrustedOpcode
+memorySearchOp embedding store = TrustedOpcode
   { toName = OpName "MEMORY_SEARCH"
   , toTrust = Trusted
   , toDesc = "Semantic search over memory files. Returns ranked results by meaning."
@@ -242,22 +242,34 @@ memorySearchOp embedding _store = TrustedOpcode
         Nothing -> pure (OpResult [TrpText "missing query"] True (object []))
         Just query -> do
           let limit = limitField v
+              includeArchived = includeArchivedField v
           results <- liftIO (ebSearch embedding query limit)
-          let rendered = if null results
+          -- Fall back to substring search when the embedding backend
+          -- returns no results (e.g. null backend or no index).
+          substringResults <-
+            if null results
+              then liftIO (msSearch store query includeArchived)
+              else pure []
+          let totalResults = length results + length substringResults
+              allResults = map renderEmbeddingResult results
+                        <> map renderSubstringResult substringResults
+              rendered = if null allResults
                            then "No results."
-                           else T.intercalate "\n" (map renderResult results)
-                       <> "\n---\n" <> T.pack (show (length results)) <> " results"
+                           else T.intercalate "\n" allResults
+                       <> "\n---\n" <> T.pack (show totalResults) <> " results"
               recorded = object
                 [ "query" .= query
                 , "limit" .= limit
-                , "total_matches" .= length results
+                , "total_matches" .= totalResults
                 ]
           pure (OpResult [TrpText rendered] False recorded)
   }
   where
-    renderResult sr =
+    renderEmbeddingResult sr =
       srPath sr <> " (score: " <> T.pack (show (srScore sr)) <> "):\n"
         <> srContent sr
+    renderSubstringResult (mp, content) =
+      memoryPathText mp <> ":\n" <> content
 
 -- | MEMORY_ARCHIVE: move a memory file from @active\/@ to @archived\/@
 -- with a timestamp prefix. This is the only way to "remove" a memory —

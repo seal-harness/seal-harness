@@ -118,6 +118,33 @@ spec = describe "Seal.ISA.Ops.Memory" $ do
           [TrpText t] -> T.isInfixOf "No results" t `shouldBe` True
           _           -> expectationFailure "expected a single text part"
 
+    it "returns matching memories by substring when using null backend" $
+      withSystemTempDirectory "seal-mem-ops" $ \root -> do
+        store <- fileMemoryStore root
+        let writeOp = memoryWriteOp store nullEmbeddingBackend
+            searchOp = memorySearchOp nullEmbeddingBackend store
+        _ <- runTestApp (opRun writeOp localBackend (object ["path" .= ("haskell/beam" :: Text), "content" .= ("Beam has quirks with monadic joins" :: Text)]))
+        _ <- runTestApp (opRun writeOp localBackend (object ["path" .= ("user/tz" :: Text), "content" .= ("User is UTC-5" :: Text)]))
+        r <- runTestApp (opRun searchOp localBackend (object ["query" .= ("beam" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            "beam" `T.isInfixOf` t `shouldBe` True
+            "UTC-5" `T.isInfixOf` t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "returns empty results for a query with no matches" $
+      withSystemTempDirectory "seal-mem-ops" $ \root -> do
+        store <- fileMemoryStore root
+        let writeOp = memoryWriteOp store nullEmbeddingBackend
+            searchOp = memorySearchOp nullEmbeddingBackend store
+        _ <- runTestApp (opRun writeOp localBackend (object ["path" .= ("a" :: Text), "content" .= ("hello" :: Text)]))
+        r <- runTestApp (opRun searchOp localBackend (object ["query" .= ("nonexistent" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> T.isInfixOf "No results" t `shouldBe` True
+          _           -> expectationFailure "expected a single text part"
+
   describe "MEMORY_ARCHIVE" $ do
     it "moves the file and subsequent read returns archived=true" $
       withSystemTempDirectory "seal-mem-ops" $ \root -> do

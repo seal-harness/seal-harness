@@ -22,7 +22,7 @@ import Data.IORef
 import Data.List (sortOn, isInfixOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, catMaybes)
 import Data.Either (rights)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -57,6 +57,9 @@ data MemoryStore = MemoryStore
     -- ^ List memory paths matching a prefix. includeArchived flag.
   , msArchive :: MemoryPath -> IO (Either Text MemoryPath)
     -- ^ Move active/<path> to archived/<path>/<timestamp>-<filename>.
+  , msSearch :: Text -> Bool -> IO [(MemoryPath, Text)]
+    -- ^ Substring search over memory content. Returns (path, content) pairs.
+    --   includeArchived flag.
   }
 
 -- | The on-disk file extension for memory files.
@@ -153,6 +156,20 @@ fileMemoryStore root = do
                   Right p  -> p
                   Left _   -> mp  -- fallback (shouldn't happen)
             pure (Right archivedMP)
+    , msSearch = \query includeArchived -> do
+        activeEntries <- listTree activeDir
+        archivedEntries <-
+          if includeArchived
+            then listTree archivedDir
+            else pure []
+        let activePaths = mapMaybe (relPathToMemoryPath activeDir) activeEntries
+            archivedPaths = mapMaybe (archivedRelPathToMemoryPath archivedDir) archivedEntries
+        activeResults <- mapM (readAndFilter activeDir query) activePaths
+        archivedResults <-
+          if includeArchived
+            then mapM (readAndFilterArchived query) (zip (map (archivedDir </>) archivedEntries) archivedPaths)
+            else pure []
+        pure (catMaybes activeResults <> catMaybes archivedResults)
     }
   where
     -- Recursively list all files under a directory, returning relative paths.
@@ -201,6 +218,33 @@ fileMemoryStore root = do
     matchesPrefix :: Text -> MemoryPath -> Bool
     matchesPrefix prefix mp =
       T.null prefix || prefix `T.isPrefixOf` memoryPathText mp
+
+    -- Read a memory file and return (path, content) if the query is a
+    -- substring of the content (case-insensitive). 'Nothing' if no match.
+    readAndFilter :: FilePath -> Text -> MemoryPath -> IO (Maybe (MemoryPath, Text))
+    readAndFilter baseDir query mp = do
+      let relPath = pathToFile mp
+          absPath = baseDir </> relPath
+      exists <- doesFileExist absPath
+      if not exists
+        then pure Nothing
+        else do
+          content <- TIO.readFile absPath
+          if query `T.isInfixOf` T.toCaseFold content
+            then pure (Just (mp, content))
+            else pure Nothing
+
+    -- Like 'readAndFilter' but reads from an explicit archived path.
+    readAndFilterArchived :: Text -> (FilePath, MemoryPath) -> IO (Maybe (MemoryPath, Text))
+    readAndFilterArchived query (absPath, mp) = do
+      exists <- doesFileExist absPath
+      if not exists
+        then pure Nothing
+        else do
+          content <- TIO.readFile absPath
+          if query `T.isInfixOf` T.toCaseFold content
+            then pure (Just (mp, content))
+            else pure Nothing
 
 -- | Find an archived file matching the given memory path. Archived files
 -- have a timestamp prefix, so we walk the directory tree and match by
@@ -273,4 +317,17 @@ noneMemoryStore = do
             modifyIORef' activeRef (Map.delete key)
             modifyIORef' archivedRef (Map.insert key content)
             pure (Right mp)
+    , msSearch = \query includeArchived -> do
+        active <- readIORef activeRef
+        archived <- readIORef archivedRef
+        let activeResults = [ (mp, c)
+                            | (k, c) <- Map.toAscList active
+                            , query `T.isInfixOf` T.toCaseFold c
+                            , Right mp <- [mkMemoryPath k] ]
+            archivedResults = [ (mp, c)
+                              | includeArchived
+                              , (k, c) <- Map.toAscList archived
+                              , query `T.isInfixOf` T.toCaseFold c
+                              , Right mp <- [mkMemoryPath k] ]
+        pure (activeResults <> archivedResults)
     }
