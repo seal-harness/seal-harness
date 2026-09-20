@@ -31,7 +31,16 @@ import Seal.ISA.Opcode
 data Registry = Registry (Map OpName Opcode) [Opcode]
 
 mkRegistry :: [Opcode] -> Registry
-mkRegistry ops = Registry (Map.fromList [(opName o, o) | o <- ops]) ops
+-- | Deduplicate by opcode name, keeping the first occurrence in
+-- registration order. This guards the tool-definition list (and thus the
+-- model's tool catalog) against accidental duplicates in the wiring layer.
+mkRegistry ops =
+  let dedup = dedupByName Set.empty ops
+        where dedupByName _ [] = []
+              dedupByName acc (o : rest)
+                | opName o `Set.member` acc = dedupByName acc rest
+                | otherwise = o : dedupByName (Set.insert (opName o) acc) rest
+  in Registry (Map.fromList [(opName o, o) | o <- dedup]) dedup
 
 lookupOp :: Registry -> OpName -> Maybe Opcode
 lookupOp (Registry m _) n = Map.lookup n m
