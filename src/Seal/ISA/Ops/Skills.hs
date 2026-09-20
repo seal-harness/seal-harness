@@ -196,7 +196,7 @@ skillLoadOp backend = TrustedOpcode
 
 -- | SKILL_DELETE: remove a skill by id. Idempotent (deleting a missing id is
 -- a success with a "not present" message, not an error). Mirrors
--- 'Seal.ISA.Ops.Memory.memoryDeleteOp'.
+-- 'Seal.ISA.Ops.Memory.memoryArchiveOp'.
 skillDeleteOp :: SkillBackend -> Opcode
 skillDeleteOp backend = TrustedOpcode
   { toName = OpName "SKILL_DELETE"

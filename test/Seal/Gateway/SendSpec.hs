@@ -150,7 +150,7 @@ mkSendDepsWith paths resolveStub = do
   createDirectoryIfMissing True sessionRoot
   ensureConfigRepo configRoot
   let repo = openConfigRepo configRoot
-  backends <- newBackends configRoot repo
+  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo
   reg   <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
   askReply <- newAskReplyStore 0

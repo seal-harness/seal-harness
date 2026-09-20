@@ -134,7 +134,7 @@ runServeMain autonomy logger = do
       cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  backends <- newBackends paths repo
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
   -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on

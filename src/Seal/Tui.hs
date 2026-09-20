@@ -121,7 +121,7 @@ runTui autonomy logger = do
   -- once and shared between the @\/skill@ \/ @\/agent@ command specs
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
   -- Built before initSession so the default agent can be resolved from disk.
-  backends <- newBackends cfgRoot repo
+  backends <- newBackends paths repo
   tabsH   <- newTabsHandle
   cli <- mkRealSignalCli
   tgApi <- mkRealTelegramBotApi

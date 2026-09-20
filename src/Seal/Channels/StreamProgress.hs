@@ -274,8 +274,10 @@ opEmoji (OpName name) = case name of
   "SETUP_REPO"       -> "\x1F4E5"  -- 📥 inbox tray
   "SECRET_GET"       -> "\x1F5DD"  -- 🗝 old key
   "MEMORY_WRITE"     -> "\x1F9E0"  -- 🧠 brain
-  "MEMORY_RECALL"    -> "\x1F9E0"  -- 🧠 brain
-  "MEMORY_DELETE"    -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_READ"      -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_LIST"      -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_SEARCH"    -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_ARCHIVE"   -> "\x1F9E0"  -- 🧠 brain
   "SKILL_WRITE"      -> "\x1F4DD"  -- 📝 memo
   "SKILL_LOAD"       -> "\x1F4DA"  -- 📚 books
   "SKILL_LIST"       -> "\x1F4DA"  -- 📚 books

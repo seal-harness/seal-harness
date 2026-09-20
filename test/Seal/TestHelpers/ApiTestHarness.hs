@@ -393,7 +393,7 @@ buildTestEnv tmp mode mRepo opts = do
              (\rc -> rc { rcDelegation = Just dfc })
       pure ()
   let configRepo = openConfigRepo configRoot
-  backends <- newBackends configRoot configRepo
+  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) configRepo
   tabsH <- newTabsHandle
   reg <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner

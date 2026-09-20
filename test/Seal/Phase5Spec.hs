@@ -27,7 +27,6 @@ import Seal.Agent.Runtime.Registry
   ( newAgentRuntime )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
-import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.AskReply (newApprovalCache)
@@ -44,11 +43,12 @@ import Seal.ISA.Ops.Agent
   , agentStartOp, agentStatusOp, agentStopOp, agentInterruptOp
   , AgentStartWiring (..), gateOpen )
 import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
+  ( memoryWriteOp, memoryReadOp, memoryListOp, memorySearchOp, memoryArchiveOp )
+import Seal.Memory.Store qualified as Mem
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Registry qualified as ISA
-import Seal.Memory.Backend qualified as Mem
 import Seal.Providers.Class
   ( ToolResultPart (..), CompletionResponse (..), ContentBlock (..), Provider (..)
   , StopReason (..), Usage (..), SomeProvider (..) )
@@ -89,10 +89,11 @@ capstoneScript =
   [ CompletionResponse
       [ CbToolUse (ToolCallId "t1") (OpName "MEMORY_WRITE")
           (object
-            [ "id" .= ("greeting" :: Text)
+            [ "path" .= ("greeting" :: Text)
             , "content" .= ("hello world" :: Text)
             ])
-      , CbToolUse (ToolCallId "t2") (OpName "MEMORY_RECALL") (object [])
+      , CbToolUse (ToolCallId "t2") (OpName "MEMORY_READ")
+          (object ["path" .= ("greeting" :: Text)])
       , CbToolUse (ToolCallId "t3") (OpName "SKILL_WRITE")
           (object
             [ "id" .= ("greet" :: Text)
@@ -116,7 +117,7 @@ capstoneScript =
 buildRegistry :: FilePath -> IORef Int -> SessionId -> IO ISA.Registry
 buildRegistry cfgRoot workerRan sid = do
   let repo = openConfigRepo cfgRoot
-  memBackend    <- Mem.markdownMemoryBackend (cfgRoot </> "memory") repo
+  memBackend    <- Mem.fileMemoryStore (cfgRoot </> "memory")
   skillBackend  <- Skill.markdownSkillBackend (cfgRoot </> "skills") repo
   defBackend    <- Def.markdownAgentDefBackend (cfgRoot </> "agents") repo
   rt            <- newAgentRuntime
@@ -136,9 +137,11 @@ buildRegistry cfgRoot workerRan sid = do
         , aswGate = gateOpen
         }
   pure $ ISA.mkRegistry
-    [ memoryWriteOp memBackend sid
-    , memoryRecallOp defaultPageParams memBackend
-    , memoryDeleteOp memBackend
+    [ memoryWriteOp memBackend nullEmbeddingBackend
+    , memoryReadOp memBackend
+    , memoryListOp memBackend
+    , memorySearchOp nullEmbeddingBackend memBackend
+    , memoryArchiveOp memBackend nullEmbeddingBackend
     , skillWriteOp skillBackend sid
     , skillLoadOp skillBackend
     , skillListOp skillBackend
@@ -196,7 +199,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   }
       runTestApp (runTurn env "run the capstone")
       -- 1. Each mutation landed as a Markdown file under config/.
-      doesFileExist (cfgRoot </> "memory" </> "greeting.md") `shouldReturn` True
+      doesFileExist (cfgRoot </> "memory" </> "active" </> "greeting.md") `shouldReturn` True
       doesFileExist (cfgRoot </> "skills" </> "greet.md") `shouldReturn` True
       doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
       -- 2. The config git repo has commits (the auto-commits fired).

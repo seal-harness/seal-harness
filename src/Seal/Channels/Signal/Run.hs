@@ -299,7 +299,7 @@ runSignalMain autonomy logger = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  backends <- newBackends paths repo
   sessionMeta <- initSession paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime

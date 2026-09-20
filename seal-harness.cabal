@@ -205,8 +205,6 @@ library
          Seal.ISA.Ops.Agent
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
-        Seal.Memory.Types
-        Seal.Memory.Backend
         Seal.Memory.Path
         Seal.Memory.Store
         Seal.Memory.Embedding
@@ -372,8 +370,6 @@ test-suite tests
         Seal.Handles.HarnessSpec
         Seal.Handles.TabSpec
         Seal.Handles.TranscriptSpec
-        Seal.Memory.TypesSpec
-        Seal.Memory.BackendSpec
         Seal.Memory.PathSpec
         Seal.Memory.StoreSpec
         Seal.Memory.EmbeddingSpec

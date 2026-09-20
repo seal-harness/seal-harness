@@ -96,7 +96,7 @@ mkChannelDeps paths = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
   harnessReg <- newHarnessRegistry
   let vaultRt = VaultRuntime
         { vrPaths = paths

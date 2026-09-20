@@ -36,6 +36,7 @@ newtype AgentDefId = AgentDefId Text
   deriving newtype (ToJSON, FromJSON)
 
 -- | @[A-Za-z0-9_-]+@, non-empty, no leading dot. Mirrors 'isValidMemoryId'.
+-- | @[A-Za-z0-9_-]+@, non-empty, no leading dot. Mirrors 'isValidMemoryPath'.
 isValidAgentDefId :: Text -> Bool
 isValidAgentDefId t =
   not (T.null t)

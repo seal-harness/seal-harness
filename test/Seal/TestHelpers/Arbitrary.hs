@@ -23,7 +23,6 @@ import Seal.Providers.Class
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
-import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
 import Seal.Memory.Path (MemoryPath (..), mkMemoryPath)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
@@ -119,22 +118,6 @@ instance Arbitrary UTCTime where
     secs  <- chooseInt (0, 86399)
     pure (UTCTime (fromGregorian (fromIntegral year) month day)
                   (secondsToDiffTime (fromIntegral secs)))
-
--- | A 'MemoryId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
-instance Arbitrary MemoryId where
-  arbitrary = do
-    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
-    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
-    pure (fromRight (MemoryId "x") (mkMemoryId (pack (c : cs))))
-
-instance Arbitrary MemoryEntry where
-  arbitrary = MemoryEntry
-    <$> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> genSessionId
 
 -- | A 'MemoryPath' generator producing valid hierarchical paths (1-3
 -- segments, each [A-Za-z0-9_-]+, non-empty, no leading dot).

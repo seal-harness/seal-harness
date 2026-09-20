@@ -124,8 +124,6 @@ import qualified Seal.Tabs.PersistSpec
 import qualified Seal.Tabs.RelaySpec
 import qualified Seal.Tabs.WizardSpec
 import qualified Seal.Routing.RouteSpec
-import qualified Seal.Memory.TypesSpec
-import qualified Seal.Memory.BackendSpec
 import qualified Seal.Memory.PathSpec
 import qualified Seal.Memory.StoreSpec
 import qualified Seal.Memory.EmbeddingSpec
@@ -307,8 +305,6 @@ main = withNoLeakedSshAgents $ hspec $ do
   Seal.Tabs.RelaySpec.spec
   Seal.Tabs.WizardSpec.spec
   Seal.Routing.RouteSpec.spec
-  Seal.Memory.TypesSpec.spec
-  Seal.Memory.BackendSpec.spec
   Seal.Memory.PathSpec.spec
   Seal.Memory.StoreSpec.spec
   Seal.Memory.EmbeddingSpec.spec

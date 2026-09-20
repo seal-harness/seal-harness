@@ -125,7 +125,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
     ensureConfigRepo cfgRoot
     let repo = openConfigRepo cfgRoot
-    backends <- newBackends cfgRoot repo
+    backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
     harnessReg <- newHarnessRegistry
     let paths = SealPaths
           { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -171,7 +171,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let cfgRoot = "/tmp/seal-channelCallDispatcher-skillload-test"
     ensureConfigRepo cfgRoot
     let repo = openConfigRepo cfgRoot
-    backends <- newBackends cfgRoot repo
+    backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
     -- Preload a skill into the backend.
     let skillId = case mkSkillId "greet" of
           Right i  -> i
@@ -324,7 +324,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
     ensureConfigRepo cfgRoot
     let repo = openConfigRepo cfgRoot
-    backends <- newBackends cfgRoot repo
+    backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
     harnessReg <- newHarnessRegistry
     let paths = SealPaths
           { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -366,7 +366,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
     ensureConfigRepo cfgRoot
     let repo = openConfigRepo cfgRoot
-    backends <- newBackends cfgRoot repo
+    backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
     harnessReg <- newHarnessRegistry
     let paths = SealPaths
           { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -481,7 +481,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       let cfgRoot = "/tmp/seal-createConversationSessionHeadless-test"
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
       harnessReg <- newHarnessRegistry
       let paths = SealPaths
             { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -531,7 +531,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       let cfgRoot = "/tmp/seal-createConversationSession-full-test"
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
       harnessReg <- newHarnessRegistry
       let paths = SealPaths
             { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -586,7 +586,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       let cfgRoot = "/tmp/seal-mkBgRunner-broadcast-test"
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
       harnessReg <- newHarnessRegistry
       let paths = SealPaths
             { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -631,7 +631,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       let cfgRoot = "/tmp/seal-mkBgRunner-nobroker-test"
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
       harnessReg <- newHarnessRegistry
       let paths = SealPaths
             { spHome = cfgRoot, spState = cfgRoot </> "state"
@@ -786,7 +786,7 @@ mkLoopDeps :: FilePath -> IO ChannelDeps
 mkLoopDeps cfgRoot = do
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
   harnessReg <- newHarnessRegistry
   let paths = SealPaths
         { spHome = cfgRoot, spState = cfgRoot </> "state"
