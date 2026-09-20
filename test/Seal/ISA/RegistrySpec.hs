@@ -38,3 +38,10 @@ spec = describe "Seal.ISA.Registry" $ do
           , stubTrustedOp (OpName "M")
           ]
     map tdName (registryToolDefs regOrdered) `shouldBe` [OpName "Z", OpName "A", OpName "M"]
+  it "emits at most one ToolDefinition per opcode name when the input list has duplicates" $ do
+    let regDup = mkRegistry
+          [ stubTrustedOp (OpName "A")
+          , stubTrustedOp (OpName "A")
+          , stubUntrustedOp (OpName "B")
+          ]
+    map tdName (registryToolDefs regDup) `shouldBe` [OpName "A", OpName "B"]
