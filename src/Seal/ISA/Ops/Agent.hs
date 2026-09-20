@@ -29,6 +29,7 @@
 module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
   , agentDefManageOp
+  , agentManageOp
   , agentDefReadOp
   , agentDefListOp
   , agentDefDeleteOp
@@ -290,9 +291,11 @@ knownOpNames = Set.fromList
   , "MEMORY_WRITE", "MEMORY_READ", "MEMORY_LIST", "MEMORY_SEARCH", "MEMORY_ARCHIVE"
   , "MEMORY_MANAGE"
   , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
+  , "SKILL_MANAGE"
   , "AGENT_DEF_WRITE", "AGENT_DEF_READ", "AGENT_DEF_LIST", "AGENT_DEF_DELETE"
   , "AGENT_DEF_MANAGE"
   , "AGENT_INSTANCES", "AGENT_START", "AGENT_STATUS", "AGENT_STOP", "AGENT_INTERRUPT"
+  , "AGENT_MANAGE"
   , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
   , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
   , "WEB_FETCH", "WEB_SEARCH"
@@ -477,38 +480,7 @@ agentDefDeleteOp backend = TrustedOpcode
   , toRun = \_ v -> handleDefDelete backend v
   }
 -- ---------------------------------------------------------------------------
-
--- | AGENT_INSTANCES: snapshot the in-process agent runtime (running
--- instances). Trusted — listing running instances is harness-internal, not an
--- evolutionary mutation.
-agentInstancesOp :: AgentRuntime -> Opcode
-agentInstancesOp runtime = TrustedOpcode
-  { toName = OpName "AGENT_INSTANCES"
-  , toTrust = Trusted
-  , toDesc = "List running agent instances (subagent_id + def id + status)."
-  , toInSchema = object
-      [ "type" .= ("object" :: Text)
-      , "properties" .= object []
-      ]
-  , toOutSchema = object []
-  , toAuthorize = const (Right ())
-  , toBlocking = False
-  , toRun = \_ _ -> do
-      insts <- liftIO (listAgents runtime)
-      let rendered = case insts of
-            [] -> "(no agents running)"
-            _  -> T.intercalate "\n"
-                    [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
-                    | i <- insts ]
-          recorded = object
-            [ "count" .= length insts
-            , "ids" .= fmap (subagentIdText . aiSubagentId) insts
-            ]
-      pure (OpResult [TrpText rendered] False recorded)
-  }
-
--- ---------------------------------------------------------------------------
--- AGENT_START (synchronous goal-driven delegation)
+-- AgentStartWiring (wiring-layer bundle for AGENT_START / AGENT_MANAGE start)
 -- ---------------------------------------------------------------------------
 
 -- | The wiring-layer bundle the AGENT_START opcode closes over. The
@@ -523,23 +495,12 @@ data AgentStartWiring = AgentStartWiring
   { aswDefBackend   :: AgentDefBackend
   , aswRuntime      :: AgentRuntime
   , aswConfig       :: IO DelegationConfig
-    -- ^ Re-read the [delegation] config per AGENT_START call (so config
-    -- changes take effect without a restart). The IO action reads
-    -- @config.toml@ and returns the resolved 'DelegationConfig'.
   , aswPauseFlag    :: SpawnPauseFlag
   , aswParentActivity :: Maybe ParentActivity
   , aswMintSession  :: IO SessionId
-    -- ^ Mint a fresh 'SessionId' for a child.
   , aswParentDepth  :: Int
-    -- ^ The parent's delegation depth (0 for a top-level turn).
   , aswWorker       :: AgentWorkerBuilder
-    -- ^ The worker-builder (closes over per-turn 'AgentEnv' deps).
   , aswGate         :: AgentStartGate
-    -- ^ The role/kill-switch gate (issue #154 §3.2): a nested (child-side)
-    -- AGENT_START carries the spawning child's effective role + the
-    -- resolved kill-switch state so the op can reject with the dedicated
-    -- leaf/kill-switch messages. A top-level turn's wiring passes
-    -- 'gateOpen'.
   }
 
 -- | The role/switch condition the nested AGENT_START enforces before it
@@ -548,9 +509,7 @@ data AgentStartWiring = AgentStartWiring
 -- the dedicated error.
 data AgentStartGate = AgentStartGate
   { gEffectiveRole :: Maybe Text
-    -- ^ The spawning agent's effective role ('Nothing' = leaf).
   , gOrchEnabled   :: Bool
-    -- ^ The resolved @delegation.orchestrator_enabled@.
   }
 
 -- | The open gate for top-level (operator-authorized) turns: spawning is
@@ -558,92 +517,6 @@ data AgentStartGate = AgentStartGate
 -- checks.
 gateOpen :: AgentStartGate
 gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
-
--- | AGENT_START: spawn one or more child agents, run each against a goal to
--- completion, return a JSON result per child. Input is either
--- @{id, goal, context?, role?}@ (single mode) or @{tasks: [{id, goal, context?, role?}, ...]}@
--- (batch mode). Returns JSON with a @results@ array, one entry per task.
-agentStartOp :: AgentStartWiring -> Opcode
-agentStartOp wiring = TrustedOpcode
-  { toName = OpName "AGENT_START"
-  , toTrust = Trusted
-  , toDesc = "Spawn one or more child agents, run each against a goal to completion, return a JSON result per child. Single mode: {id, goal, context?, role?}. Batch mode: {tasks: [{id, goal, context?, role?}, ...]}."
-  , toInSchema = object
-      [ "type" .= ("object" :: Text)
-      , "properties" .= object
-          [ fromText "id" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("Agent def id (single-task mode)." :: Text)
-              ]
-          , fromText "goal" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("The task goal — becomes the child's first user message (single-task mode)." :: Text)
-              ]
-          , fromText "context" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("Optional background context appended to the child's system prompt." :: Text)
-              ]
-          , fromText "role" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("Optional narrow-only role hint: only \"leaf\" is meaningful per-task (downgrades an orchestrator def's child to leaf). Spawning capability comes from the def's role field — a leaf def can never be widened by task input." :: Text)
-              ]
-          , fromText "tasks" .= object
-              [ "type" .= ("array" :: Text)
-              , "description" .= ("Batch mode: array of {id, goal, context?, role?}. Cap on parallelism is delegation.max_concurrent_children." :: Text)
-              ]
-          ]
-      , "required" .= (["goal"] :: [Text])
-      ]
-  , toOutSchema = object []
-  , toAuthorize = \v ->
-      let shapeGate =
-            -- Require either a top-level goal (single) or a tasks array (batch).
-            let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
-                hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
-            in if hasGoal || hasTasks
-                 then Right ()
-                 else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
-          roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
-            (Just "orchestrator", True) -> Right ()
-            (Just "orchestrator", False) -> Left killSwitchMsg
-            (_, _) -> Left leafMsg
-      in shapeGate *> roleGate
-  , toBlocking = False
-  , toRun = \_ v -> do
-      input <- liftIO (parseInput v)
-      case input of
-        Left err -> pure (OpResult [TrpText err] True (object []))
-        Right di -> do
-          cfg <- liftIO (aswConfig wiring)
-          let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
-          eResults <- liftIO (runDelegate
-                                cfg
-                                (aswPauseFlag wiring)
-                                (aswParentActivity wiring)
-                                (aswParentDepth wiring)
-                                di
-                                (resolveTask (aswDefBackend wiring)
-                                             (aswRuntime wiring)
-                                             (aswMintSession wiring)
-                                             (aswParentDepth wiring)
-                                             orchEnabled
-                                             (aswWorker wiring)))
-          case eResults of
-            Left err -> pure (OpResult [TrpText err] True (object []))
-            Right results -> do
-              -- Register each finished child in the runtime registry so
-              -- AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe
-              -- it after the synchronous run completes. The child is
-              -- recorded with status Stopped (the synchronous worker has
-              -- already finished by the time we reach here). Zipped with
-              -- the input tasks to recover the AgentDefId (the ChildResult
-              -- carries the SubagentId but not the def id).
-              let tasks = diTasks di
-                  childDepth = aswParentDepth wiring + 1
-              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) childDepth t r)) tasks results
-              let rendered = encodeResultsJson results
-              pure (OpResult [TrpText rendered] False (object ["results" .= results]))
-   }
 
 -- | Parse the model's input into a 'DelegateInput'. Single mode requires
 -- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
@@ -678,12 +551,7 @@ parseTask v =
 
 -- | Resolve a task to its def + worker + fresh session id. Returns Left if
 -- the def id is invalid, the def doesn't exist, or the effective-role /
--- kill-switch gate rejects the spawn (issue #154 §3.2 item 5 — the
--- dispatch-time TOCTOU gate: the def is in hand here, which is the only
--- place the effective role is computable). @orchEnabled@ is the resolved
--- @delegation.orchestrator_enabled@; @parentDepth@ is the spawning
--- parent's depth (consumed for the error message context and forwarded
--- via the wiring, not stored here).
+-- kill-switch gate rejects the spawn.
 resolveTask
   :: AgentDefBackend
   -> AgentRuntime
@@ -708,14 +576,13 @@ resolveTask defBackend _runtime mintSession _parentDepth orchEnabled worker task
               sid <- mintSession
               pure (Right (def, worker, sid))
 
--- | The dedicated kill-switch error (§3.2 item 6). Distinct from the
--- depth/leaf/pause messages so the parent transcript distinguishes all
--- spawn-failure causes.
+-- | The dedicated kill-switch error. Distinct from the depth/leaf/pause
+-- messages so the parent transcript distinguishes all spawn-failure causes.
 killSwitchMsg :: Text
 killSwitchMsg = "Delegation spawning is disabled: delegation.orchestrator_enabled = false. Re-trying will not succeed until the operator re-enables it."
 
--- | The dedicated leaf-role error (§3.2 item 6): a leaf agent cannot
--- spawn — actionable for both the model and the operator.
+-- | The dedicated leaf-role error: a leaf agent cannot spawn — actionable
+-- for both the model and the operator.
 leafMsg :: Text
 leafMsg = "AGENT_START is not available to this agent: its definition is a leaf (role: leaf). Ask the operator to grant the orchestrator role if delegation is required."
 
@@ -725,15 +592,14 @@ leafMsg = "AGENT_START is not available to this agent: its definition is a leaf 
 -- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
 -- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
 -- carries the 'SubagentId' but not the def id). The recorded depth is the
--- CHILD's own depth — the wiring's parent depth + 1 (issue #154: the
--- former hardcoded 0 recorded every child at the root).
+-- CHILD's own depth — the wiring's parent depth + 1.
 registerChild :: AgentRuntime -> Int -> ChildTask -> ChildResult -> IO ()
 registerChild runtime childDepth task result =
   case mkAgentDefId (ctDefId task) of
-    Left _ -> pure ()  -- malformed def id; skip registration
+    Left _ -> pure ()
     Right aid ->
       case crChildSession result of
-        Nothing -> pure ()  -- no child session; skip (error/timeout case)
+        Nothing -> pure ()
         Just session -> do
           registerCompletedAgent runtime aid (crSubagentId result) session childDepth
 
@@ -743,81 +609,293 @@ diTasks (DiSingle t) = [t]
 diTasks (DiBatch ts) = ts
 
 -- ---------------------------------------------------------------------------
--- AGENT_STATUS
+-- Agent runtime action enum (AGENT_MANAGE)
 -- ---------------------------------------------------------------------------
 
+data AgentAction
+  = AgInstances
+  | AgStart
+  | AgStatus
+  | AgStop
+  | AgInterrupt
+
+parseAgentAction :: Value -> Either Text AgentAction
+parseAgentAction v =
+  case parseMaybe (withObject "in" (.: "action")) v of
+    Just t -> case t :: Text of
+      "instances" -> Right AgInstances
+      "start"     -> Right AgStart
+      "status"    -> Right AgStatus
+      "stop"      -> Right AgStop
+      "interrupt" -> Right AgInterrupt
+      other       -> Left ("unknown agent action: " <> other)
+    Nothing -> Left "missing or invalid action field"
+
+-- | Authorize gate for the `start` action (shared with the legacy
+-- AGENT_START shim). Checks both the input shape (goal or tasks present)
+-- and the role/kill-switch gate from the wiring.
+authorizeStart :: AgentStartWiring -> Value -> Either Text ()
+authorizeStart wiring v =
+  let shapeGate =
+        let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
+            hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
+        in if hasGoal || hasTasks
+             then Right ()
+             else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+      roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
+        (Just "orchestrator", True) -> Right ()
+        (Just "orchestrator", False) -> Left killSwitchMsg
+        (_, _) -> Left leafMsg
+  in shapeGate *> roleGate
+
+-- | Authorize gate for AGENT_MANAGE — dispatches per-action validation.
+authorizeAgentManage :: AgentStartWiring -> Value -> Either Text ()
+authorizeAgentManage wiring v =
+  case parseAgentAction v of
+    Left e -> Left e
+    Right action -> case action of
+      AgInstances -> Right ()
+      AgStart     -> authorizeStart wiring v
+      AgStatus    -> maybe (Left "status requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
+      AgStop      -> maybe (Left "stop requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
+      AgInterrupt -> maybe (Left "interrupt requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
+
+-- | Handle the instances action (shared with the legacy AGENT_INSTANCES shim).
+handleInstances :: AgentRuntime -> App OpResult
+handleInstances runtime = do
+  insts <- liftIO (listAgents runtime)
+  let rendered = case insts of
+        [] -> "(no agents running)"
+        _  -> T.intercalate "\n"
+                [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
+                | i <- insts ]
+      recorded = object
+        [ "count" .= length insts
+        , "ids" .= fmap (subagentIdText . aiSubagentId) insts
+        ]
+  pure (OpResult [TrpText rendered] False recorded)
+
+-- | Handle the start action (shared with the legacy AGENT_START shim).
+handleStart :: AgentStartWiring -> Value -> App OpResult
+handleStart wiring v = do
+  input <- liftIO (parseInput v)
+  case input of
+    Left err -> pure (OpResult [TrpText err] True (object []))
+    Right di -> do
+      cfg <- liftIO (aswConfig wiring)
+      let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
+      eResults <- liftIO (runDelegate
+                            cfg
+                            (aswPauseFlag wiring)
+                            (aswParentActivity wiring)
+                            (aswParentDepth wiring)
+                            di
+                            (resolveTask (aswDefBackend wiring)
+                                         (aswRuntime wiring)
+                                         (aswMintSession wiring)
+                                         (aswParentDepth wiring)
+                                         orchEnabled
+                                         (aswWorker wiring)))
+      case eResults of
+        Left err -> pure (OpResult [TrpText err] True (object []))
+        Right results -> do
+          let tasks = diTasks di
+              childDepth = aswParentDepth wiring + 1
+          zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) childDepth t r)) tasks results
+          let rendered = encodeResultsJson results
+          pure (OpResult [TrpText rendered] False (object ["results" .= results]))
+
+-- | Handle the status action (shared with the legacy AGENT_STATUS shim).
+handleStatus :: AgentRuntime -> Value -> App OpResult
+handleStatus runtime v = do
+  let mSid = subagentIdField v
+  case mSid of
+    Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+    Just sid -> do
+      mStatus <- liftIO (agentStatus runtime sid)
+      case mStatus of
+        Nothing -> pure (OpResult [TrpText "not running"] False (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
+        Just s  -> pure (OpResult [TrpText (renderStatus s)] False (object ["subagent_id" .= subagentIdText sid, "status" .= renderStatus s]))
+
+-- | Handle the stop action (shared with the legacy AGENT_STOP shim).
+handleStop :: AgentRuntime -> Value -> App OpResult
+handleStop runtime v = do
+  let mSid = subagentIdField v
+  case mSid of
+    Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+    Just sid -> do
+      _ <- liftIO (stopAgent runtime sid)
+      pure (OpResult [TrpText "stopped"] False (object ["subagent_id" .= subagentIdText sid]))
+
+-- | Handle the interrupt action (shared with the legacy AGENT_INTERRUPT shim).
+handleInterrupt :: AgentRuntime -> Value -> App OpResult
+handleInterrupt runtime v = do
+  let mSid = subagentIdField v
+  case mSid of
+    Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+    Just sid -> do
+      found <- liftIO (interruptAgent runtime sid)
+      let msg = if found then "interrupt requested" else "subagent not running"
+      pure (OpResult [TrpText msg] False (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
+
+-- ---------------------------------------------------------------------------
+-- Consolidated opcode: AGENT_MANAGE
+-- ---------------------------------------------------------------------------
+
+-- | AGENT_MANAGE: action-based entry point for all agent runtime lifecycle
+-- operations. The @action@ field discriminates between @instances@, @start@,
+-- @status@, @stop@, and @interrupt@. The @start@ action carries the full
+-- 'AgentStartWiring' (delegation config, worker builder, role/kill-switch
+-- gate, batch mode).
+agentManageOp :: AgentStartWiring -> Opcode
+agentManageOp wiring = TrustedOpcode
+  { toName = OpName "AGENT_MANAGE"
+  , toTrust = Trusted
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents), status (check one agent), stop (kill agent), interrupt (cooperative stop)."
+  , toInSchema = object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= object
+          [ fromText "action" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
+              , "description" .= ("Operation to perform." :: Text)
+              ]
+          , fromText "id" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Agent def id (start, single-task)." :: Text)
+              ]
+          , fromText "goal" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Task goal (start, single-task)." :: Text)
+              ]
+          , fromText "context" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Background context (start)." :: Text)
+              ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Role hint: \"leaf\" (start)." :: Text)
+              ]
+          , fromText "tasks" .= object
+              [ "type" .= ("array" :: Text)
+              , "description" .= ("Batch: [{id, goal, context?, role?}] (start)." :: Text)
+              ]
+          , fromText "subagent_id" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Subagent id (status/stop/interrupt)." :: Text)
+              ]
+          ]
+      , "required" .= (["action"] :: [Text])
+      ]
+  , toOutSchema = object []
+  , toAuthorize = authorizeAgentManage wiring
+  , toBlocking = False
+  , toRun = \_ v ->
+      case parseAgentAction v of
+        Left e -> pure (OpResult [TrpText e] True (object []))
+        Right action -> case action of
+          AgInstances -> handleInstances (aswRuntime wiring)
+          AgStart     -> handleStart wiring v
+          AgStatus    -> handleStatus (aswRuntime wiring) v
+          AgStop      -> handleStop (aswRuntime wiring) v
+          AgInterrupt -> handleInterrupt (aswRuntime wiring) v
+  }
+
+-- ---------------------------------------------------------------------------
+-- Legacy shims (backward compatibility)
+-- ---------------------------------------------------------------------------
+
+-- | AGENT_INSTANCES (legacy shim): delegates to the instances handler.
+agentInstancesOp :: AgentRuntime -> Opcode
+agentInstancesOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_INSTANCES"
+  , toTrust = Trusted
+  , toDesc = "List running agent instances (subagent_id + def id + status). (Legacy — prefer AGENT_MANAGE with action=\"instances\".)"
+  , toInSchema = object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= object []
+      ]
+  , toOutSchema = object []
+  , toAuthorize = const (Right ())
+  , toBlocking = False
+  , toRun = \_ _ -> handleInstances runtime
+  }
+
+-- | AGENT_START (legacy shim): delegates to the start handler.
+agentStartOp :: AgentStartWiring -> Opcode
+agentStartOp wiring = TrustedOpcode
+  { toName = OpName "AGENT_START"
+  , toTrust = Trusted
+  , toDesc = "Spawn one or more child agents, run each against a goal to completion, return a JSON result per child. Single mode: {id, goal, context?, role?}. Batch mode: {tasks: [{id, goal, context?, role?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
+  , toInSchema = object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= object
+          [ fromText "id" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Agent def id (single-task mode)." :: Text)
+              ]
+          , fromText "goal" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("The task goal — becomes the child's first user message (single-task mode)." :: Text)
+              ]
+          , fromText "context" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional background context appended to the child's system prompt." :: Text)
+              ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional narrow-only role hint: only \"leaf\" is meaningful per-task (downgrades an orchestrator def's child to leaf). Spawning capability comes from the def's role field — a leaf def can never be widened by task input." :: Text)
+              ]
+          , fromText "tasks" .= object
+              [ "type" .= ("array" :: Text)
+              , "description" .= ("Batch mode: array of {id, goal, context?, role?}. Cap on parallelism is delegation.max_concurrent_children." :: Text)
+              ]
+          ]
+      , "required" .= (["goal"] :: [Text])
+      ]
+  , toOutSchema = object []
+  , toAuthorize = authorizeStart wiring
+  , toBlocking = False
+  , toRun = \_ v -> handleStart wiring v
+  }
+
+-- | AGENT_STATUS (legacy shim): delegates to the status handler.
 agentStatusOp :: AgentRuntime -> Opcode
 agentStatusOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STATUS"
   , toTrust = Trusted
-  , toDesc = "Read one running agent's status by subagent_id."
+  , toDesc = "Read one running agent's status by subagent_id. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
   , toInSchema = singleStringSchema "subagent_id" "The subagent id (from AGENT_START's result)."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") checkSubagentId . subagentIdField
+  , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mSid = subagentIdField v
-      case mSid of
-        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
-        Just sid -> do
-          mStatus <- liftIO (agentStatus runtime sid)
-          case mStatus of
-            Nothing -> pure (OpResult [TrpText "not running"] False (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
-            Just s  -> pure (OpResult [TrpText (renderStatus s)] False (object ["subagent_id" .= subagentIdText sid, "status" .= renderStatus s]))
+  , toRun = \_ v -> handleStatus runtime v
   }
-  where
-    checkSubagentId _ = Right ()
 
--- ---------------------------------------------------------------------------
--- AGENT_STOP
--- ---------------------------------------------------------------------------
-
--- | AGENT_STOP: stop a running agent instance (kill the thread, deregister).
--- Idempotent. Now keyed by @subagent_id@ (the new AGENT_START returns
--- subagent ids, not def ids).
+-- | AGENT_STOP (legacy shim): delegates to the stop handler.
 agentStopOp :: AgentRuntime -> Opcode
 agentStopOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STOP"
   , toTrust = Trusted
-  , toDesc = "Stop a running agent instance by subagent_id (idempotent)."
+  , toDesc = "Stop a running agent instance by subagent_id (idempotent). (Legacy — prefer AGENT_MANAGE with action=\"stop\".)"
   , toInSchema = singleStringSchema "subagent_id" "The subagent id to stop."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STOP requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mSid = subagentIdField v
-      case mSid of
-        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
-        Just sid -> do
-          _ <- liftIO (stopAgent runtime sid)
-          pure (OpResult [TrpText "stopped"] False (object ["subagent_id" .= subagentIdText sid]))
+  , toRun = \_ v -> handleStop runtime v
   }
 
--- ---------------------------------------------------------------------------
--- AGENT_INTERRUPT
--- ---------------------------------------------------------------------------
-
--- | AGENT_INTERRUPT: request that a single running subagent stop at its next
--- iteration boundary. Unlike AGENT_STOP (which hard-kills the thread),
--- AGENT_INTERRUPT sets a flag the worker polls between turns, letting it
--- exit cleanly. Trusted.
+-- | AGENT_INTERRUPT (legacy shim): delegates to the interrupt handler.
 agentInterruptOp :: AgentRuntime -> Opcode
 agentInterruptOp runtime = TrustedOpcode
   { toName = OpName "AGENT_INTERRUPT"
   , toTrust = Trusted
-  , toDesc = "Request that a running subagent stop at its next iteration boundary (cooperative; the worker polls an interrupt flag between turns)."
+  , toDesc = "Request that a running subagent stop at its next iteration boundary (cooperative; the worker polls an interrupt flag between turns). (Legacy — prefer AGENT_MANAGE with action=\"interrupt\".)"
   , toInSchema = singleStringSchema "subagent_id" "The subagent id to interrupt."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_INTERRUPT requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mSid = subagentIdField v
-      case mSid of
-        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
-        Just sid -> do
-          found <- liftIO (interruptAgent runtime sid)
-          let msg = if found then "interrupt requested" else "subagent not running"
-          pure (OpResult [TrpText msg] False (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
+  , toRun = \_ v -> handleInterrupt runtime v
   }
 
 -- ---------------------------------------------------------------------------

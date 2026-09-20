@@ -94,7 +94,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -272,6 +272,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , memorySearchOp (bEmbedding backends) (bMemory backends)
       , memoryArchiveOp (bMemory backends) (bEmbedding backends)
       , skillWriteOp (bSkills backends) sid
+     , skillManageOp (bSkills backends) sid
       , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
@@ -285,6 +286,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
+     , agentManageOp startWiring
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
@@ -1073,6 +1075,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , memorySearchOp (bEmbedding (tdBaseBackends td)) (bMemory (tdBaseBackends td))
         , memoryArchiveOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , skillWriteOp (bSkills sessionBackends) childSid
+       , skillManageOp (bSkills sessionBackends) childSid
         , skillLoadOp (bSkills sessionBackends)
         , skillListOp (bSkills sessionBackends)
         , skillDeleteOp (bSkills sessionBackends)
