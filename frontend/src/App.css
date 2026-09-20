@@ -603,6 +603,14 @@ body {
 .json-punct { color: var(--text-muted); }
 .json-collapsed-summary { color: var(--text-faint); font-style: italic; }
 
+.json-collapsed-preview { color: var(--text-faint); font-style: italic; }
+
+.json-toggle-spacer {
+  display: inline-block;
+  width: 21px;
+  flex-shrink: 0;
+}
+
 .json-toggle {
   background: transparent;
   border: none;

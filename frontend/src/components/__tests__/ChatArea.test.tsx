@@ -862,7 +862,9 @@ describe('ChatArea', () => {
     // Open the modal and verify the raw JSON (with input_schema) is shown.
     fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
     expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
-    expect(screen.getByText('"input_schema"')).toBeTruthy()
+    // Top-level keys are visible; nested fields are collapsed by default.
+    expect(screen.getByText('"system"')).toBeTruthy()
+    expect(screen.getByText('"tools"')).toBeTruthy()
   })
 
   it('slash bubble renders transiently with the "command output — not saved" label', () => {
