@@ -8,7 +8,7 @@
 module Seal.Channels.TabFocusSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryTakeMVar)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (newIORef)
@@ -143,16 +143,6 @@ captureHandler mvar _ meta _ _ = putMVar mvar (smId meta)
 noopHandler :: ChannelHandle -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
 noopHandler _ _ _ _ = pure ()
 
--- | Wait for a condition to become true, polling at 20ms intervals up to 1s.
-waitFor :: IO Bool -> IO ()
-waitFor p = go (0 :: Int)
-  where
-    go n
-      | n >= 50 = pure ()
-      | otherwise = do
-          done <- p
-          if done then pure () else threadDelay 20000 >> go (n + 1)
-
 spec :: Spec
 spec = describe "Seal.Channels.TabFocus" $ do
   it "/tab focus <N> updates the conversation cursor so the next plain message routes to the focused tab's session" $
@@ -191,11 +181,24 @@ spec = describe "Seal.Channels.TabFocus" $ do
       runChannelLoop deps withCh plainHandler (mkRegistry []) emptyChain ar tabsH Nothing Nothing
 
       -- The plainHandler is forked, so wait for it to be called.
-      waitFor (fmap (const True) (tryTakeMVar handlerSid))
+      -- Use a bounded wait (30s) instead of an unbounded takeMVar, which
+      -- would hang the entire test suite if the forked plainHandler never
+      -- fires (a race on slow CI runners).
+      let waitForResult = go (0 :: Int)
+            where
+              go n
+                | n >= 1500 = pure Nothing  -- 30s timeout (1500 * 20ms)
+                | otherwise = do
+                    m <- tryTakeMVar handlerSid
+                    case m of
+                      Just sid -> pure (Just sid)
+                      Nothing -> threadDelay 20000 >> go (n + 1)
+      mRoutedSid <- waitForResult
 
       -- The plainHandler should have been called with session B's sid.
-      routedSid <- takeMVar handlerSid
-      routedSid `shouldBe` smId metaB
+      case mRoutedSid of
+        Nothing -> expectationFailure "plainHandler was not called within 30s (possible fork race)"
+        Just routedSid -> routedSid `shouldBe` smId metaB
 
       -- The cursor should now point at session B.
       mCursor <- cursorLookup cursors convKey
