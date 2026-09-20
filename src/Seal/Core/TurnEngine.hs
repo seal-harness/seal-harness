@@ -287,7 +287,6 @@ buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy w
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
       , setupRepoOp cloneDeps wsRoot autonomy
-      , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
