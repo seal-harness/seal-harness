@@ -1024,6 +1024,100 @@ spec = describe "Seal.Agent.Loop" $ do
 
   -- ── StopMaxTokens handling ──────────────────────────────────────────────
 
+  -- ── Blocking opcode (ASK_HUMAN) turn-counter reset ──────────────────────
+
+  -- When a blocking opcode (ASK_HUMAN) is dispatched, the human's reply is
+  -- new information — equivalent to a new user message. The turn counter
+  -- must reset to aeMaxTurns after the blocking opcode completes, so the
+  -- turns spent building up to the question don't count against the
+  -- post-answer budget. Without the reset, a session that used 85 of 90
+  -- turns before asking the human would have only 5 turns left to act on
+  -- the answer.
+  it "resets the turn counter after a blocking opcode (ASK_HUMAN) completes" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
+        -- A blocking opcode that simulates ASK_HUMAN: returns immediately
+        -- with a fixed reply. The toBlocking flag is True so the dispatcher
+        -- treats it as a blocking opcode.
+        askOp = TrustedOpcode (OpName "ASK_HUMAN") Trusted "ask"
+                  (object ["question" .= ("continue?" :: Text)])
+                  (object [])
+                  (const (Right ()))
+                  True  -- blocking
+                  (\_ _ -> pure (OpResult [TrpText "yes proceed"] False Null))
+        -- Script: 8 tool calls (to burn through turns), then ASK_HUMAN,
+        -- then 2 more tool calls, then a final text response.
+        -- With maxTurns=10 and NO reset: 8 pre-ask + 1 ask + 1 post-ask
+        -- = 10 → hits the limit before the final text.
+        -- With reset: the counter restarts at 10 after ASK_HUMAN, so the
+        -- 2 post-ask tool calls + final text complete within budget.
+        stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                   (const (Right ())) False
+                   (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
+        script =
+          -- 8 PING calls
+          [ CompletionResponse
+              [CbToolUse (ToolCallId (T.pack ("t" <> show n))) (OpName "PING") (object [])]
+              StopToolUse (Usage 0 0)
+          | n <- [(1 :: Int)..8]
+          ] <>
+          -- ASK_HUMAN
+          [ CompletionResponse
+              [CbToolUse (ToolCallId "ask") (OpName "ASK_HUMAN")
+                  (object ["question" .= ("continue?" :: Text)])]
+              StopToolUse (Usage 0 0)
+          ] <>
+          -- 2 more PING calls
+          [ CompletionResponse
+              [CbToolUse (ToolCallId (T.pack ("t" <> show n))) (OpName "PING") (object [])]
+              StopToolUse (Usage 0 0)
+          | n <- [(9 :: Int)..10]
+          ] <>
+          -- Final text
+          [ CompletionResponse [CbText "finished after human input"] StopEnd (Usage 0 0)
+          ]
+    ref <- newIORef script
+    (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry [stubOp, askOp]
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 10
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnStop = Nothing
+                , aeStopFanoutDone = stopFanoutDoneRef
+                , aeOnToolCall = \_ _ -> pure ()
+                , aeOnTextDelta = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
+                }
+    runTestApp (runTurn env "start")
+    sentMsgs <- readIORef sent
+    -- The final text should be delivered — if the counter didn't reset,
+    -- the loop would hit the 10-turn limit after the 2 post-ask PINGs
+    -- (8 pre + 1 ask + 2 post = 11 > 10) and never reach the final text.
+    sentMsgs `shouldSatisfy` any ("finished after human input" `T.isInfixOf`)
+
+  -- ── StopMaxTokens handling (continued) ──────────────────────────────────
+
   -- A truncated text response (StopMaxTokens, no tool calls) must trigger an
   -- auto-continuation: the loop appends the partial text + a synthetic
   -- continuation prompt and re-requests. The model "resumes" and emits the

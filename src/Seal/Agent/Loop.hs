@@ -37,7 +37,7 @@ import Seal.Handles.AskReply
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
-import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
+import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
@@ -456,7 +456,23 @@ runTurn env userText = do
                 aeOnEntry env'
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
-              go (n - 1) 0 (msgs <> [assistantMsg, resultMsg])
+              -- | Turn-counter reset after a blocking opcode (ASK_HUMAN).
+              -- When the human replies to a blocking opcode, their answer is
+              -- new information — equivalent to a new user message. The
+              -- turns spent building up to the question should not count
+              -- against the post-answer budget. If any of the dispatched
+              -- tool calls was a blocking opcode, reset the counter to
+              -- 'aeMaxTurns' so the agent has a full turn budget to act on
+              -- the human's reply.
+              let hadBlocking = any isBlockingTool toolUses
+                  nextN = if hadBlocking then aeMaxTurns env' else n - 1
+              go nextN 0 (msgs <> [assistantMsg, resultMsg])
+
+    -- | Check whether a tool-use block targets a blocking opcode (ASK_HUMAN).
+    isBlockingTool :: ContentBlock -> Bool
+    isBlockingTool (CbToolUse _ name _) =
+      maybe False opBlocking (lookupOp (aeRegistry env) name)
+    isBlockingTool _ = False
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
