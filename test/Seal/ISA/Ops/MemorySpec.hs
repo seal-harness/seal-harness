@@ -175,3 +175,180 @@ spec = describe "Seal.ISA.Ops.Memory" $ do
         r <- runTestApp (opRun op localBackend (object ["path" .= ("m1" :: Text), "content" .= ("not-a-secret" :: Text)]))
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
         T.isInfixOf "not-a-secret" recorded `shouldBe` True
+
+  -- -----------------------------------------------------------------------
+  -- MEMORY_MANAGE (consolidated opcode)
+  -- -----------------------------------------------------------------------
+  describe "MEMORY_MANAGE" $ do
+    describe "action = write" $ do
+      it "writes a new memory file" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let op = memoryManageOp store nullEmbeddingBackend
+          r <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("user/tz" :: Text)
+            , "content" .= ("UTC-5" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> "stored" `T.isInfixOf` t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
+
+      it "fails on an existing path (write-once)" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let op = memoryManageOp store nullEmbeddingBackend
+          _ <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("tz" :: Text)
+            , "content" .= ("old" :: Text)
+            ]))
+          r <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("tz" :: Text)
+            , "content" .= ("new" :: Text)
+            ]))
+          orIsError r `shouldBe` True
+
+      it "rejects an invalid path" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let op = memoryManageOp store nullEmbeddingBackend
+          r <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("../etc" :: Text)
+            , "content" .= ("x" :: Text)
+            ]))
+          orIsError r `shouldBe` True
+
+    describe "action = read" $ do
+      it "returns content for an existing memory" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let mOp = memoryManageOp store nullEmbeddingBackend
+          _ <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("user/tz" :: Text)
+            , "content" .= ("UTC-5" :: Text)
+            ]))
+          r <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("read" :: Text)
+            , "path" .= ("user/tz" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> "UTC-5" `T.isInfixOf` t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
+
+      it "returns not-found for a non-existent path" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let op = memoryManageOp store nullEmbeddingBackend
+          r <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("read" :: Text)
+            , "path" .= ("nope" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> "not found" `T.isInfixOf` t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
+
+    describe "action = list" $ do
+      it "returns paths matching a prefix" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let mOp = memoryManageOp store nullEmbeddingBackend
+          _ <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("projects/a/arch" :: Text)
+            , "content" .= ("a" :: Text)
+            ]))
+          _ <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("user/tz" :: Text)
+            , "content" .= ("UTC" :: Text)
+            ]))
+          r <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("list" :: Text)
+            , "prefix" .= ("projects/" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> do
+              "projects/a/arch" `T.isInfixOf` t `shouldBe` True
+              "user/tz" `T.isInfixOf` t `shouldBe` False
+            _ -> expectationFailure "expected a single text part"
+
+    describe "action = search" $ do
+      it "returns empty results with null backend" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let op = memoryManageOp store nullEmbeddingBackend
+          r <- runTestApp (opRun op localBackend (object
+            [ "action" .= ("search" :: Text)
+            , "query" .= ("haskell" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> T.isInfixOf "No results" t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
+
+    describe "action = archive" $ do
+      it "moves the file and subsequent read returns archived=true" $
+        withSystemTempDirectory "seal-mem-ops" $ \root -> do
+          store <- fileMemoryStore root
+          let mOp = memoryManageOp store nullEmbeddingBackend
+          _ <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("write" :: Text)
+            , "path" .= ("tz" :: Text)
+            , "content" .= ("UTC-5" :: Text)
+            ]))
+          r <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("archive" :: Text)
+            , "path" .= ("tz" :: Text)
+            ]))
+          orIsError r `shouldBe` False
+          readResult <- runTestApp (opRun mOp localBackend (object
+            [ "action" .= ("read" :: Text)
+            , "path" .= ("tz" :: Text)
+            ]))
+          case orParts readResult of
+            [TrpText t] -> "archived" `T.isInfixOf` t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
+
+    describe "authorize gate" $ do
+      it "rejects write without path" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("write" :: Text), "content" .= ("x" :: Text)])
+          `shouldBe` Left "missing path field"
+
+      it "rejects write without content" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("write" :: Text), "path" .= ("a" :: Text)])
+          `shouldBe` Left "write requires non-empty content"
+
+      it "rejects read without path" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("read" :: Text)])
+          `shouldBe` Left "missing path field"
+
+      it "accepts list with no extra fields" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("list" :: Text)])
+          `shouldBe` Right ()
+
+      it "rejects search without query" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("search" :: Text)])
+          `shouldBe` Left "search requires query"
+
+      it "rejects archive without path" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("archive" :: Text)])
+          `shouldBe` Left "missing path field"
+
+      it "rejects unknown action" $
+        opAuthorize (memoryManageOp undefined undefined)
+          (object ["action" .= ("frobnicate" :: Text)])
+          `shouldBe` Left "unknown memory action: frobnicate"
