@@ -431,6 +431,9 @@ agentDefWriteOp backend session = TrustedOpcode
   , toBlocking = False
   , toRun = \_ v -> handleDefWrite backend session v
   }
+-- ---------------------------------------------------------------------------
+-- AGENT_DEF_READ
+-- ---------------------------------------------------------------------------
 
 -- | AGENT_DEF_READ (legacy shim): delegates to the read handler.
 agentDefReadOp :: AgentDefBackend -> Opcode

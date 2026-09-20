@@ -267,6 +267,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , secretGetOp rt
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
+      , memoryManageOp (bMemory backends) (bEmbedding backends)
       , memoryListOp (bMemory backends)
       , memorySearchOp (bEmbedding backends) (bMemory backends)
       , memoryArchiveOp (bMemory backends) (bEmbedding backends)
@@ -1066,6 +1067,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , secretGetOp (tdVault td)
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
+       , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryListOp (bMemory (tdBaseBackends td))
         , memorySearchOp (bEmbedding (tdBaseBackends td)) (bMemory (tdBaseBackends td))
         , memoryArchiveOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
