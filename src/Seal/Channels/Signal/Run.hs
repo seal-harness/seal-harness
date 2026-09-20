@@ -68,6 +68,7 @@ import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
+import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Signal.Config (SignalAccount (..), resolveSignalConfig, signalAccountText)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -299,7 +300,8 @@ runSignalMain autonomy logger = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
+  backends <- newBackends paths repo embedding
   sessionMeta <- initSession paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime

@@ -43,7 +43,6 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
@@ -70,8 +69,8 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Registry qualified as Registry
 import Seal.Media.Image (imageDescribeOp, imageGenerateOp, noImageProvider)
 import Seal.Media.Tts (noTtsProvider, textToSpeechOp)
-import Seal.Memory.Backend qualified as MemoryBackend
-import Seal.Memory.Types (meContent)
+import Seal.Memory.Store qualified as MemoryStore
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 import Seal.Providers.Class
   (CompletionResponse (..), ContentBlock (..), Provider (..), SomeProvider (..),
    StopReason (..), ToolResultPart (..), Usage (..))
@@ -419,82 +418,72 @@ spec = describe "Seal.ISA.Integration" $ do
       r `shouldBe` Left (Denied "SEARCH_FILES: pattern must not start with '-' (option injection)")
 
   -- ----------------------------------------------------------------------
-  -- MEMORY_WRITE / RECALL / DELETE
+  -- MEMORY_WRITE / READ / LIST / SEARCH / ARCHIVE
   -- ----------------------------------------------------------------------
   describe "MEMORY_WRITE" $ do
-    it "\"Remember that the user prefers concise answers.\" -> MEMORY_WRITE (create) -> memory in the store" $ do
-      backend <- MemoryBackend.noneBackend
-      let op = memoryWriteOp backend sid
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_WRITE")
-                        (object [ "id" .= ("user-pref" :: Text)
-                                , "content" .= ("prefer concise answers" :: Text) ]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "stored"]
-          entries <- MemoryBackend.mbList backend
-          case entries of
-            (e : _) -> meContent e `shouldBe` "prefer concise answers"
-            []     -> expectationFailure "expected at least one memory"
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
+    it "\"Remember that the user prefers concise answers.\" -> MEMORY_WRITE -> memory in the store" $
+      withSystemTempDirectory "seal-int-mem" $ \root -> do
+        store <- MemoryStore.fileMemoryStore root
+        let op = memoryWriteOp store nullEmbeddingBackend
+            reg = Registry.mkRegistry [op]
+        r <- runTestApp (dispatchOne reg (OpName "MEMORY_WRITE")
+                          (object [ "path" .= ("user/pref" :: Text)
+                                  , "content" .= ("prefer concise answers" :: Text) ]))
+        case r of
+          Right res -> do
+            orIsError res `shouldBe` False
+            case orParts res of
+              [TrpText t] -> "stored" `T.isInfixOf` t `shouldBe` True
+              _           -> expectationFailure "expected text part"
+          Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-    it "\"Update the 'pref' memory to say 'very concise'.\" -> MEMORY_WRITE (update) -> content changed, provenance preserved" $ do
-      backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
-                          (OpName "MEMORY_WRITE")
-                          (object [ "id" .= ("pref" :: Text)
-                                  , "content" .= ("concise" :: Text) ]))
-      let op = memoryWriteOp backend sid
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_WRITE")
-                        (object [ "id" .= ("pref" :: Text)
-                                , "content" .= ("very concise" :: Text) ]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "updated"]
-          entries <- MemoryBackend.mbList backend
-          case entries of
-            (e : _) -> meContent e `shouldBe` "very concise"
-            []     -> expectationFailure "expected at least one memory"
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
+    it "\"Write to an existing path.\" -> MEMORY_WRITE (write-once) -> fails" $
+      withSystemTempDirectory "seal-int-mem" $ \root -> do
+        store <- MemoryStore.fileMemoryStore root
+        let reg1 = Registry.mkRegistry [memoryWriteOp store nullEmbeddingBackend]
+        _ <- runTestApp (dispatchOne reg1 (OpName "MEMORY_WRITE")
+                          (object ["path" .= ("pref" :: Text), "content" .= ("old" :: Text)]))
+        r <- runTestApp (dispatchOne reg1 (OpName "MEMORY_WRITE")
+                          (object ["path" .= ("pref" :: Text), "content" .= ("new" :: Text)]))
+        case r of
+          Right res -> orIsError res `shouldBe` True
+          Left e    -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "MEMORY_RECALL" $ do
-    it "\"What do you remember about the user?\" -> MEMORY_RECALL -> returns stored memories" $ do
-      backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
-                          (OpName "MEMORY_WRITE")
-                          (object [ "id" .= ("pref" :: Text)
-                                  , "content" .= ("concise" :: Text) ]))
-      let op = memoryRecallOp defaultPageParams backend
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_RECALL") (object []))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          case orParts res of
-            [TrpText t] -> "concise" `T.isInfixOf` t `shouldBe` True
-            _          -> expectationFailure "expected text part"
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
+  describe "MEMORY_READ" $ do
+    it "\"What do you remember about the user?\" -> MEMORY_READ -> returns stored memory" $
+      withSystemTempDirectory "seal-int-mem" $ \root -> do
+        store <- MemoryStore.fileMemoryStore root
+        let writeReg = Registry.mkRegistry [memoryWriteOp store nullEmbeddingBackend]
+        _ <- runTestApp (dispatchOne writeReg (OpName "MEMORY_WRITE")
+                          (object ["path" .= ("pref" :: Text), "content" .= ("concise" :: Text)]))
+        let readReg = Registry.mkRegistry [memoryReadOp store]
+        r <- runTestApp (dispatchOne readReg (OpName "MEMORY_READ")
+                          (object ["path" .= ("pref" :: Text)]))
+        case r of
+          Right res -> do
+            orIsError res `shouldBe` False
+            case orParts res of
+              [TrpText t] -> "concise" `T.isInfixOf` t `shouldBe` True
+              _           -> expectationFailure "expected text part"
+          Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "MEMORY_DELETE" $ do
-    it "\"Forget the 'pref' memory.\" -> MEMORY_DELETE -> memory removed" $ do
-      backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
-                          (OpName "MEMORY_WRITE")
-                          (object [ "id" .= ("pref" :: Text)
-                                  , "content" .= ("concise" :: Text) ]))
-      let op = memoryDeleteOp backend
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_DELETE")
-                        (object ["id" .= ("pref" :: Text)]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          entries <- MemoryBackend.mbList backend
-          entries `shouldBe` []
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
+  describe "MEMORY_ARCHIVE" $ do
+    it "\"Archive the 'pref' memory.\" -> MEMORY_ARCHIVE -> memory archived" $
+      withSystemTempDirectory "seal-int-mem" $ \root -> do
+        store <- MemoryStore.fileMemoryStore root
+        let writeReg = Registry.mkRegistry [memoryWriteOp store nullEmbeddingBackend]
+        _ <- runTestApp (dispatchOne writeReg (OpName "MEMORY_WRITE")
+                          (object ["path" .= ("pref" :: Text), "content" .= ("concise" :: Text)]))
+        let archReg = Registry.mkRegistry [memoryArchiveOp store nullEmbeddingBackend]
+        r <- runTestApp (dispatchOne archReg (OpName "MEMORY_ARCHIVE")
+                          (object ["path" .= ("pref" :: Text)]))
+        case r of
+          Right res -> do
+            orIsError res `shouldBe` False
+            case orParts res of
+              [TrpText t] -> "archived" `T.isInfixOf` t `shouldBe` True
+              _           -> expectationFailure "expected text part"
+          Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------
   -- SKILL_WRITE / READ / LIST / DELETE

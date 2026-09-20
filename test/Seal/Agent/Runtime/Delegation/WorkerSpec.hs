@@ -110,4 +110,4 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
 -- list lives in buildChildRegistry; the property only needs SOME universe).
 baseSet :: Set.Set OpName
 baseSet = Set.fromList
-  [ agentStart, OpName "FILE_READ", OpName "FILE_WRITE", OpName "MEMORY_RECALL" ]
+  [ agentStart, OpName "FILE_READ", OpName "FILE_WRITE", OpName "MEMORY_READ" ]

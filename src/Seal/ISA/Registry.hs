@@ -71,9 +71,9 @@ registryToolDefs' useStub (Registry _ order) =
 -- | The set of opcode names whose tool results may carry secrets and must be
 -- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a
 -- vault secret value in 'orParts' belong here — currently just 'SECRET_GET'.
--- Other opcodes (MEMORY_RECALL, FILE_READ, SHELL_EXEC, etc.) return
+-- Other opcodes (MEMORY_READ, FILE_READ, SHELL_EXEC, etc.) return
 -- agent-visible data that is safe to persist verbatim and display in the
--- frontend. Using trust level as a proxy was wrong: MEMORY_RECALL is Trusted
+-- frontend. Using trust level as a proxy was wrong: MEMORY_READ is Trusted
 -- but returns memory content (not vault secrets), so redacting it hid
 -- harmless output behind @<redacted:secret>@.
 secretOpNames :: Registry -> Set OpName

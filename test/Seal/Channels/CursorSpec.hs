@@ -42,6 +42,7 @@ import Seal.Tabs.Types (TabRef (BoundSession))
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 
 mkSid :: String -> SessionId
 mkSid s = case mkSessionId (T.pack s) of
@@ -239,7 +240,7 @@ spec = describe "Seal.Channels.Cursor (persistence)" $ do
       withSystemTempDirectory "seal-cursor-e2e" $ \dir -> do
         ensureConfigRepo dir
         let repo = openConfigRepo dir
-        backends <- newBackends dir repo
+        backends <- newBackends (SealPaths { spHome = dir, spState = dir </> "state", spConfig = dir, spKeys = dir </> "keys", spCache = dir </> "cache" }) repo nullEmbeddingBackend
         let paths = mkPaths dir
             vaultRt = VaultRuntime
               { vrPaths = paths

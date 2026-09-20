@@ -35,7 +35,7 @@ newtype SkillId = SkillId Text
 -- trailing slash. The forward slash is allowed so a skill id can carry its
 -- group as a prefix (e.g. @core\/dummy-test@), making the fully-qualified
 -- id unique across groups. A bare id (no slash) is also valid for ungrouped
--- skills or when the group is unambiguous. Mirrors 'isValidMemoryId' but
+-- skills or when the group is unambiguous. Mirrors 'isValidMemoryPath' but
 -- adds @\/@.
 isValidSkillId :: Text -> Bool
 isValidSkillId t =

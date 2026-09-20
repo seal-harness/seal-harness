@@ -16,6 +16,7 @@ module Seal.Config.File
   , RetrievalConfig (..)
   , DelegationFileConfig (..)
   , WebConfig (..)
+  , EmbeddingConfig (..)
   , WorkdirConfig (..)
   , SkillsConfig (..)
   , AgentConfig (..)
@@ -157,6 +158,10 @@ data RuntimeConfig = RuntimeConfig
     -- behavior for opcode dispatch). Absent means
     -- 'Seal.Tools.Timeout.defaultToolTimeoutConfig' applies at resolution
     -- time. Each field inside is optional too; the resolver fills defaults.
+  , rcEmbedding :: Maybe EmbeddingConfig
+    -- ^ Optional @[embedding]@ section (semantic search backend for
+    -- memory). Absent means the null backend is used (substring search
+    -- only). Set @backend = "engram"@ to enable engram subprocess search.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -226,6 +231,21 @@ data ToolTimeoutFileConfig = ToolTimeoutFileConfig
     -- ^ Abort-poll interval in microseconds (default 100_000).
   } deriving stock (Eq, Show)
 
+-- | The @[embedding]@ section: semantic search backend for the memory
+-- system. Every field is optional; a missing key decodes as 'Nothing' and
+-- the null backend is used (substring search only). Set @backend = "engram"@
+-- to enable engram subprocess search; @binary_path@ defaults to
+-- @~\/.local\/bin\/engram@ and @index_path@ defaults to
+-- @~\/.seal\/memory\/engram.db@.
+data EmbeddingConfig = EmbeddingConfig
+  { ecBackend    :: Maybe Text
+    -- ^ Backend name: @engram@ or @null@. Absent → @null@.
+  , ecBinaryPath :: Maybe Text
+    -- ^ Absolute path to the engram binary. Absent → @~\/.local\/bin\/engram@.
+  , ecIndexPath  :: Maybe Text
+    -- ^ Path to the engram index file. Absent → @~\/.seal\/memory\/engram.db@.
+  } deriving stock (Eq, Show)
+
 emptyProviderConfig :: ProviderConfig
 emptyProviderConfig = ProviderConfig Nothing Nothing
 
@@ -279,6 +299,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcChatStreaming    = Nothing
   , rcMaxTurns         = Nothing
   , rcToolTimeout      = Nothing
+  , rcEmbedding        = Nothing
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -474,6 +495,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table chatStreamingConfigCodec "chat_streaming") .= rcChatStreaming
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
   <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
+  <*> Toml.dioptional (Toml.table embeddingConfigCodec "embedding")       .= rcEmbedding
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -501,6 +523,13 @@ toolTimeoutConfigCodec = ToolTimeoutFileConfig
 retrievalConfigCodec :: Toml.TomlCodec RetrievalConfig
 retrievalConfigCodec = RetrievalConfig
   <$> Toml.dioptional (Toml.int "max_scan_bytes") .= rcMaxScanBytes
+
+-- | Bidirectional tomland codec for the @[embedding]@ section.
+embeddingConfigCodec :: Toml.TomlCodec EmbeddingConfig
+embeddingConfigCodec = EmbeddingConfig
+  <$> Toml.dioptional (Toml.text "backend")     .= ecBackend
+  <*> Toml.dioptional (Toml.text "binary_path") .= ecBinaryPath
+  <*> Toml.dioptional (Toml.text "index_path")  .= ecIndexPath
 
 -- | Bidirectional tomland codec for the @[delegation]@ section. Every field
 -- is optional at the TOML layer. 'dfcChildTimeoutSeconds' uses 'Toml.double'

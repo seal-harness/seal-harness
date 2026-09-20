@@ -10,6 +10,7 @@ module Seal.TestHelpers.Arbitrary () where
 
 import Data.Aeson (Value (..))
 import Data.Either (fromRight)
+import Data.List (intercalate)
 import Data.Set qualified as Set
 import Data.Text (Text, pack)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -22,7 +23,7 @@ import Seal.Providers.Class
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
-import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
+import Seal.Memory.Path (MemoryPath (..), mkMemoryPath)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Security.Policy (AllowList (..))
@@ -118,21 +119,19 @@ instance Arbitrary UTCTime where
     pure (UTCTime (fromGregorian (fromIntegral year) month day)
                   (secondsToDiffTime (fromIntegral secs)))
 
--- | A 'MemoryId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
-instance Arbitrary MemoryId where
+-- | A 'MemoryPath' generator producing valid hierarchical paths (1-3
+-- segments, each [A-Za-z0-9_-]+, non-empty, no leading dot).
+instance Arbitrary MemoryPath where
   arbitrary = do
-    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
-    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
-    pure (fromRight (MemoryId "x") (mkMemoryId (pack (c : cs))))
-
-instance Arbitrary MemoryEntry where
-  arbitrary = MemoryEntry
-    <$> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> arbitrary
-    <*> genSessionId
+    n  <- chooseInt (1, 3)
+    segs <- vectorOf n genPathSegment
+    let pathText = pack (intercalate "/" segs)
+    pure (fromRight (MemoryPath "x") (mkMemoryPath pathText))
+    where
+      genPathSegment = do
+        c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+        cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+        pure (c : cs)
 
 -- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_\/-]+, non-empty,
 -- no leading dot, no double\/trailing slash). May include a single forward

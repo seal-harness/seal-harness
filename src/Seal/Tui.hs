@@ -20,7 +20,7 @@ import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
-import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
@@ -46,6 +46,7 @@ import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (..))
 import Seal.Handles.Tab (TabKind (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -121,7 +122,8 @@ runTui autonomy logger = do
   -- once and shared between the @\/skill@ \/ @\/agent@ command specs
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
   -- Built before initSession so the default agent can be resolved from disk.
-  backends <- newBackends cfgRoot repo
+  embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
+  backends <- newBackends paths repo embedding
   tabsH   <- newTabsHandle
   cli <- mkRealSignalCli
   tgApi <- mkRealTelegramBotApi

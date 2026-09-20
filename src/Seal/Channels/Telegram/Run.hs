@@ -70,6 +70,7 @@ import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Store (SessionRuntime (..), initSession)
+import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Tabs (newTabsHandle)
 import Seal.Telegram.Config
   ( TelegramToken (..), resolveTelegramConfig, telegramTokenText
@@ -137,7 +138,8 @@ runTelegramMain autonomy logger = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends cfgRoot repo
+  embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
+  backends <- newBackends paths repo embedding
   sessionMeta <- initSession paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime

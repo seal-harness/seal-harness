@@ -89,6 +89,7 @@ import Seal.Web.UiState (newUiStateHandle)
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
 import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
 import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe, testSealLogger)
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
 testAbortReg :: SessionAbortRegistry
@@ -895,7 +896,7 @@ spec = describe "Seal.Gateway.API" $ do
       -- that must be filtered out — it has no corresponding conv line.
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
         [ "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.100Z\",\"kind\":\"request\",\"convLen\":1}"
-        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.500Z\",\"kind\":\"harness\",\"convLen\":0,\"meta\":{\"op\":{\"name\":\"MEMORY_RECALL\"}}}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.500Z\",\"kind\":\"harness\",\"convLen\":0,\"meta\":{\"op\":{\"name\":\"MEMORY_READ\"}}}"
         , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:01.234Z\",\"kind\":\"response\",\"convLen\":2}"
         ]
       deps <- mkDepsFor paths
@@ -1686,7 +1687,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True cfgRoot
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg <- newHarnessRegistry
       activeRef <- newIORef fakeMeta
@@ -1755,7 +1756,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True cfgRoot
       ensureConfigRepo cfgRoot
       let repo = openConfigRepo cfgRoot
-      backends <- newBackends cfgRoot repo
+      backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg <- newHarnessRegistry
       activeRef <- newIORef fakeMeta
@@ -3796,7 +3797,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True sessionRoot
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
-      backends <- newBackends configRoot repo
+      backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -3936,7 +3937,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True sessionRoot
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
-      backends <- newBackends configRoot repo
+      backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4057,7 +4058,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True sessionRoot
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
-      backends <- newBackends configRoot repo
+      backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4177,7 +4178,7 @@ spec = describe "Seal.Gateway.API" $ do
       createDirectoryIfMissing True sessionRoot
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
-      backends <- newBackends configRoot repo
+      backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner

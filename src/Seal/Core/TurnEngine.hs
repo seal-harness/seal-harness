@@ -76,7 +76,6 @@ import Seal.Config.Security
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
-import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Gateway.Broadcast
   (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
@@ -264,9 +263,11 @@ buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy w
       [ showHumanOp caps
       , askHumanOp caps
       , secretGetOp rt
-      , memoryWriteOp (bMemory backends) sid
-      , memoryRecallOp defaultPageParams (bMemory backends)
-      , memoryDeleteOp (bMemory backends)
+      , memoryWriteOp (bMemory backends) (bEmbedding backends)
+      , memoryReadOp (bMemory backends)
+      , memoryListOp (bMemory backends)
+      , memorySearchOp (bEmbedding backends) (bMemory backends)
+      , memoryArchiveOp (bMemory backends) (bEmbedding backends)
       , skillWriteOp (bSkills backends) sid
       , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
@@ -1057,9 +1058,11 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         [ showHumanOp childCaps
         , askHumanOp childCaps
         , secretGetOp (tdVault td)
-        , memoryWriteOp (bMemory (tdBaseBackends td)) childSid
-        , memoryRecallOp defaultPageParams (bMemory (tdBaseBackends td))
-        , memoryDeleteOp (bMemory (tdBaseBackends td))
+        , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
+        , memoryReadOp (bMemory (tdBaseBackends td))
+        , memoryListOp (bMemory (tdBaseBackends td))
+        , memorySearchOp (bEmbedding (tdBaseBackends td)) (bMemory (tdBaseBackends td))
+        , memoryArchiveOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , skillWriteOp (bSkills sessionBackends) childSid
         , skillLoadOp (bSkills sessionBackends)
         , skillListOp (bSkills sessionBackends)
