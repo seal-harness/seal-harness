@@ -291,6 +291,7 @@ function ObjectNode({
   if (entries.length === 0) {
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
+        <span className="json-toggle-spacer" aria-hidden="true" />
         {keyPrefix !== null && <KeyPrefix name={keyPrefix} />}
         <span className="json-punct">{'{}'}</span>
         {trailing && <span className="json-punct">,</span>}
@@ -361,6 +362,7 @@ function ArrayNode({
   if (value.length === 0) {
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
+        <span className="json-toggle-spacer" aria-hidden="true" />
         {keyPrefix !== null && <KeyPrefix name={keyPrefix} />}
         <span className="json-punct">{'[]'}</span>
         {trailing && <span className="json-punct">,</span>}
