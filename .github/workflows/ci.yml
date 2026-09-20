@@ -64,6 +64,36 @@ jobs:
       - name: Run tests with coverage
         run: nix develop --command cabal test --enable-coverage
 
+      - name: Post test timing summary
+        if: always()
+        run: |
+          if [ ! -f test-timings.txt ]; then
+            echo "No test-timings.txt found — timing summary skipped." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## Test Case Timing Report"
+            echo ""
+            echo "Slowest 20 test cases (descending by wall-clock duration):"
+            echo ""
+            echo "| # | Duration | Result | Test |"
+            echo "|---|----------|--------|------|"
+            # Skip the header line, format the rest as a Markdown table.
+            tail -n +2 test-timings.txt | while IFS=$'\t' read -r rank dur result path; do
+              echo "| $rank | ${dur}s | $result | \`$path\` |"
+            done
+            echo ""
+            echo "<details>"
+            echo "<summary>Full timing data (all test cases)</summary>"
+            echo ""
+            echo '```tsv'
+            cat test-timings.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate coverage report
         if: always()
         run: |

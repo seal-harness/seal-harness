@@ -1,7 +1,9 @@
 module Main (main) where
 
 import Seal.TestHelpers.SshAgentGuard (withNoLeakedSshAgents)
+import Seal.TestHelpers.TimingFormatter (timingFormatter)
 import Test.Hspec
+import Test.Hspec.Core.Runner (Config (..), defaultConfig, hspecWith)
 
 import qualified Seal.Core.ChannelKindSpec
 import qualified Seal.Core.MessageSourceSpec
@@ -184,7 +186,12 @@ import qualified Seal.Tools.Exec.AbortSpec
 import qualified Seal.Tools.Exec.TimeoutSpec
 
 main :: IO ()
-main = withNoLeakedSshAgents $ hspec $ do
+main = do
+  fmt <- timingFormatter
+  withNoLeakedSshAgents $ hspecWith defaultConfig { configFormat = Just fmt } specs
+
+specs :: Spec
+specs = do
   Seal.Core.ChannelKindSpec.spec
   Seal.Core.MessageSourceSpec.spec
   Seal.Core.AllowListSpec.spec

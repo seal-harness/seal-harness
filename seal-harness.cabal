@@ -305,6 +305,7 @@ test-suite tests
       , directory
       , filepath
       , hspec
+     , hspec-core
       , http-client
       , http-client-tls
       , katip
@@ -494,6 +495,7 @@ test-suite tests
         Seal.TestHelpers.FakeVault
         Seal.TestHelpers.SshAgentGuard
         Seal.TestHelpers.SshAgentGuardSpec
+        Seal.TestHelpers.TimingFormatter
         Seal.TestHelpers.FixtureRepo
         Seal.TestHelpers.FreePort
         Seal.TestHelpers.ScriptProvider
