@@ -258,6 +258,21 @@ not just the one it was started in.
 
 ### Install and Run
 
+You can either download a pre-built binary or build from source:
+
+#### Download a pre-built binary (no Nix required)
+
+Grab the latest binary from the [Releases page](https://github.com/seal-harness/seal-harness/releases/tag/latest):
+
+```bash
+# Linux (x86_64)
+curl -L https://github.com/seal-harness/seal-harness/releases/download/latest/seal-x86_64-linux -o seal
+chmod +x seal
+./seal --help
+```
+
+#### Build from source
+
 ```bash
 # Clone the repository
 git clone https://github.com/seal-harness/seal-harness.git

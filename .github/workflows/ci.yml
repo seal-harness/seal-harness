@@ -61,6 +61,28 @@ jobs:
       - name: Build
         run: nix build --print-build-logs
 
+      # ─────────────────────────────────────────────────────────────────────
+      # Binary artifact: copy the built `seal` executable to a per-platform
+      # filename and upload it as a GitHub workflow artifact. This lets users
+      # download the binary directly from a CI run without installing Nix.
+      # The frontend dist/ is NOT embedded in the binary (served from
+      # configurable static_dir), so the binary is self-contained for
+      # CLI/TUI use; `seal serve` requires a separate frontend build.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Stage binary artifact
+        run: |
+          # nix build leaves ./result/bin/seal — copy to a platform-named file
+          cp ./result/bin/seal "seal-${{ matrix.system }}"
+          echo "Staged seal-${{ matrix.system }} ($(wc -c < seal-${{ matrix.system }}) bytes)"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-${{ matrix.system }}
+          path: seal-${{ matrix.system }}
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Run tests with coverage
         run: nix develop --command cabal test --enable-coverage
 
@@ -352,3 +374,42 @@ jobs:
           echo "$ALL_PATHS" | xargs nix store sign --key-file "$KEY"
           echo "$ALL_PATHS" | xargs nix copy --to "$S3_CACHE"
           echo "Cache push complete: $TOTAL paths."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Release: on pushes to main, download the per-platform binaries from the
+  # build job and attach them to a rolling "latest" GitHub Release. Users can
+  # download the latest binary from the Releases page without digging through
+  # individual workflow runs. PR builds upload artifacts (above) but do not
+  # create a release.
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Update latest release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Update rolling "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Flatten artifacts: each artifact is in its own subdirectory
+          # (seal-x86_64-linux/seal-x86_64-linux, etc.). Move to top level.
+          mkdir -p release-assets
+          find artifacts -type f -name 'seal-*' -exec cp {} release-assets/ \;
+
+          # Delete any existing "latest" release, then create a fresh one.
+          gh release delete latest --yes 2>/dev/null || true
+          gh release create latest \
+            --title "Seal Harness (latest from main)" \
+            --notes "Automated build from commit ${{ github.sha }}." \
+            --target main \
+            release-assets/seal-*
+
+          echo "Release 'latest' updated with:"
+          ls -la release-assets/
