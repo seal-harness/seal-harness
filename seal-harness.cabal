@@ -203,6 +203,7 @@ library
          Seal.ISA.Ops.Skills
          Seal.ISA.Ops.Repo
          Seal.ISA.Ops.Agent
+        Seal.ISA.Ops.Session
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
         Seal.Memory.Path
@@ -391,6 +392,7 @@ test-suite tests
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.ISA.Ops.SessionSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec
         Seal.Phase2bSpec

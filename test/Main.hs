@@ -142,6 +142,7 @@ import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
 import qualified Seal.ISA.Ops.AgentSpec
+import qualified Seal.ISA.Ops.SessionSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
 import qualified Seal.SourceControl.RegistrySpec
@@ -324,6 +325,7 @@ main = withNoLeakedSshAgents $ hspec $ do
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
+  Seal.ISA.Ops.SessionSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec
   Seal.SourceControl.RegistrySpec.spec

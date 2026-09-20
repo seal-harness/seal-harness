@@ -108,6 +108,7 @@ import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp)
 import Seal.ISA.Ops.Skills
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
@@ -241,6 +242,7 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
 -- 'Seal.Channel.Cli.cliIsaReg'.
 buildSessionRegistry
   :: VaultRuntime
+  -> SealPaths
   -> Clone.CloneDeps
   -> Backends
   -> WorkspaceRoot
@@ -255,7 +257,7 @@ buildSessionRegistry
   -> ChannelCaps
   -> Bool
   -> ISA.Registry
-buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
+buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                      startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -295,6 +297,9 @@ buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy w
       , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
+      , sessionListOp paths
+      , sessionSearchOp paths
+      , sessionGetOp paths
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
@@ -627,7 +632,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
-      isaReg = buildSessionRegistry (tdVault td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -868,7 +873,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
-        isaReg = buildSessionRegistry (tdVault td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -1079,6 +1084,9 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
+       , sessionListOp (tdPaths td)
+       , sessionSearchOp (tdPaths td)
+       , sessionGetOp (tdPaths td)
         , nestedAgentStartOp
         ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
