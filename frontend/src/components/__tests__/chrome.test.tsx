@@ -207,4 +207,68 @@ describe('JsonTree', () => {
     // The full content is inside a <pre> block.
     expect(screen.getByText(/line two/)).toBeTruthy()
   })
+
+  it('shows preview fields when an object with name/description is collapsed', () => {
+    const tool = {
+      name: 'FILE_READ',
+      description: 'Read a file from the workspace',
+      parameters: { type: 'object', properties: {} },
+    }
+    render(<JsonTree value={{ tools: [tool] }} />)
+    // Top-level expanded; "tools" key visible.
+    expect(screen.getByText('"tools"')).toBeTruthy()
+    // The tools array is collapsed — expand it.
+    const expandArray = screen.getAllByLabelText('Expand')[0]!
+    fireEvent.click(expandArray)
+    // Now the tool object inside is collapsed — it should show the name and description.
+    expect(screen.getByText(/FILE_READ/)).toBeTruthy()
+    expect(screen.getByText(/Read a file from the workspace/)).toBeTruthy()
+  })
+
+  it('truncates long description values in collapsed preview', () => {
+    const longDesc = 'A'.repeat(120)
+    const tool = { name: 'SEARCH', description: longDesc }
+    render(<JsonTree value={{ tools: [tool] }} />)
+    // Expand the tools array to reveal the collapsed tool object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // The preview should contain a truncated version, not the full 120-char string.
+    const preview = screen.getByText(/SEARCH/)
+    expect(preview.textContent).toBeTruthy()
+    // The full 120 A's should NOT appear in the preview.
+    expect(preview.textContent).not.toContain(longDesc)
+    // An ellipsis should be present.
+    expect(preview.textContent).toContain('…')
+  })
+
+  it('falls back to {N keys} when no preview fields are present', () => {
+    const obj = { foo: 1, bar: 2, baz: 3 }
+    render(<JsonTree value={{ items: obj }} />)
+    // Top-level expanded; "items" key visible.
+    expect(screen.getByText('"items"')).toBeTruthy()
+    // The nested object is collapsed — no preview fields, so fall back to count.
+    expect(screen.getByText(/3 keys/)).toBeTruthy()
+  })
+
+  it('respects custom previewFields prop', () => {
+    const obj = { label: 'my-label', count: 42, name: 'should-not-show' }
+    render(<JsonTree value={{ items: obj }} previewFields={['label', 'count']} />)
+    // Top-level is expanded; "items" is collapsed by default with a preview.
+    // The preview should show label and count (the configured fields), not name.
+    expect(screen.getByText(/my-label/)).toBeTruthy()
+    expect(screen.getByText(/42/)).toBeTruthy()
+    // The collapsed preview should NOT include the "name" field value
+    // since it's not in the custom previewFields list.
+    expect(screen.queryByText(/should-not-show/)).toBeNull()
+  })
+
+  it('shows only preview fields that exist in the object', () => {
+    const obj = { name: 'OnlyName' }
+    render(<JsonTree value={{ tools: [obj] }} />)
+    // Expand the tools array.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // Should show name but not error on missing description.
+    expect(screen.getByText(/OnlyName/)).toBeTruthy()
+    // Should NOT show the generic {N keys} since name was found.
+    expect(screen.queryByText(/1 key/)).toBeNull()
+  })
 })
