@@ -286,6 +286,7 @@ opEmoji (OpName name) = case name of
   "AGENT_DEF_READ"   -> "\x1F916"  -- 🤖 robot face
   "AGENT_DEF_LIST"   -> "\x1F916"  -- 🤖 robot face
   "AGENT_DEF_DELETE" -> "\x1F916"  -- 🤖 robot face
+  "AGENT_DEF_MANAGE" -> "\x1F916"  -- 🤖 robot face
   "AGENT_INSTANCES"  -> "\x1F916"  -- 🤖 robot face
   "AGENT_START"      -> "\x1F680"  -- 🚀 rocket
   "AGENT_STATUS"     -> "\x1F916"  -- 🤖 robot face

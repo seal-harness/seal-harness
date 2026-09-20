@@ -28,6 +28,7 @@
 -- 'AgentWorkerBuilder', and serializes the 'ChildResult' list to JSON.
 module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
+  , agentDefManageOp
   , agentDefReadOp
   , agentDefListOp
   , agentDefDeleteOp
@@ -78,6 +79,7 @@ import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
   , interruptAgent, listAgents, registerCompletedAgent, stopAgent )
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..))
+import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..))
@@ -128,26 +130,260 @@ groupField v mExisting =
     Nothing -> adGroup =<< mExisting
 
 -- ---------------------------------------------------------------------------
--- AGENT_DEF_WRITE
+-- Action enum (AGENT_DEF_MANAGE)
 -- ---------------------------------------------------------------------------
 
--- | AGENT_DEF_WRITE: upsert an agent definition by id. If the def already
--- exists, its name/system/tools are updated (the original 'adSession'
--- provenance and 'adCreatedAt' are preserved; only 'adUpdatedAt' is bumped);
--- if not, a fresh def is created. The name, provider, model, system prompt,
--- and tool list are recorded in full (agent-visible data); 'orRecorded'
--- carries the id + op name + fields + @was_new@ (+ @unknown_tools@ when the
--- tools list names opcodes the harness does not have — a def-author typo
--- is discoverable in the audit trail). The optional @role@ field gates
--- delegation (\"orchestrator\" | \"leaf\"); anything else fails the
--- authorize gate (role controls spawning — it must be explicit, never
--- permissive). Optional @description@ is a one-line catalog summary; both
--- are sanitized via 'sanitizeAgentDefFields'.
+data AgentDefAction = AdWrite | AdRead | AdList | AdDelete
+
+parseAgentDefAction :: Value -> Either Text AgentDefAction
+parseAgentDefAction v =
+  case parseMaybe (withObject "in" (.: "action")) v of
+    Just t -> case t :: Text of
+      "write"  -> Right AdWrite
+      "read"   -> Right AdRead
+      "list"   -> Right AdList
+      "delete" -> Right AdDelete
+      other    -> Left ("unknown agent def action: " <> other)
+    Nothing -> Left "missing or invalid action field"
+
+-- | Shared id validator (used by write/read/delete).
+checkAgentDefId :: Text -> Either Text ()
+checkAgentDefId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
+
+-- | Authorize gate for AGENT_DEF_MANAGE — dispatches per-action validation.
+authorizeAgentDefManage :: Value -> Either Text ()
+authorizeAgentDefManage v =
+  case parseAgentDefAction v of
+    Left e -> Left e
+    Right action -> case action of
+      AdWrite  -> authorizeDefWrite v
+      AdRead   -> maybe (Left "read requires {id:string}") checkAgentDefId . idField $ v
+      AdList   -> Right ()
+      AdDelete -> maybe (Left "delete requires {id:string}") checkAgentDefId . idField $ v
+
+-- | Authorize the write action (shared with the legacy AGENT_DEF_WRITE shim).
+authorizeDefWrite :: Value -> Either Text ()
+authorizeDefWrite v =
+  case idField v of
+    Nothing -> Left "AGENT_DEF_WRITE requires {id:string}"
+    Just idTxt -> case checkAgentDefId idTxt of
+      Left e -> Left e
+      Right () -> case T.strip <$> textFieldMaybe "role" v of
+        Nothing -> Right ()
+        Just "" -> Right ()
+        Just r
+          | r == "orchestrator" || r == "leaf" -> Right ()
+          | otherwise ->
+            Left ("AGENT_DEF_WRITE: role must be \"orchestrator\" or \"leaf\" (got: " <> r <> ")")
+
+-- | Handle the write action (shared with the legacy AGENT_DEF_WRITE shim).
+handleDefWrite :: AgentDefBackend -> SessionId -> Value -> App OpResult
+handleDefWrite backend session v = do
+  let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
+      roleField vv = case T.strip <$> textFieldMaybe "role" vv of
+        Just ""  -> Nothing
+        r        -> r
+  case mId of
+    Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
+    Just aid -> do
+      mExisting <- liftIO (adbRead backend aid)
+      now <- liftIO getCurrentTime
+      let (def0, wasNew) = case mExisting of
+            Just existing ->
+              ( existing
+                  { adName = textField "name" v
+                  , adSystem = textFieldMaybe "system" v
+                  , adTools = toolsField v
+                  , adGroup = groupField v (Just existing)
+                  , adRole = roleField v
+                  , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
+                  , adUpdatedAt = now
+                  }
+              , False
+              )
+            Nothing ->
+              ( AgentDef
+                  { adId = aid
+                  , adName = textField "name" v
+                  , adProvider = textField "provider" v
+                  , adModel = ModelId (textField "model" v)
+                  , adSystem = textFieldMaybe "system" v
+                  , adTools = toolsField v
+                  , adGroup = groupField v Nothing
+                  , adRole = roleField v
+                  , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
+                  , adCreatedAt = now
+                  , adUpdatedAt = now
+                  , adSession = session
+                  }
+              , True
+              )
+          def = sanitizeAgentDefFields def0
+          unknownTools =
+            case adTools def of
+              AllowOnly xs ->
+                [ t | OpName t <- Set.toList xs, Set.notMember t knownOpNames ]
+              AllowAll -> []
+      liftIO (adbUpdate backend def)
+      let recorded = encodeDefRecorded def wasNew unknownTools
+      pure (OpResult [TrpText (if wasNew then "defined" else "updated")] False recorded)
+
+-- | Handle the read action (shared with the legacy AGENT_DEF_READ shim).
+handleDefRead :: AgentDefBackend -> Value -> App OpResult
+handleDefRead backend v = do
+  let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
+  case mId of
+    Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
+    Just aid -> do
+      mDef <- liftIO (adbRead backend aid)
+      case mDef of
+        Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
+        Just d  -> do
+          let rendered = renderDef d
+              recorded = encodeDefRecorded d False []
+          pure (OpResult [TrpText rendered] False recorded)
+
+-- | Handle the list action (shared with the legacy AGENT_DEF_LIST shim).
+handleDefList :: AgentDefBackend -> App OpResult
+handleDefList backend = do
+  defs <- liftIO (adbList backend)
+  let rendered = case defs of
+        [] -> "(no agent definitions)"
+        _  -> T.intercalate "\n"
+                [ agentDefIdText (adId d) <> roleSuffix (adRole d) <> ": " <> adName d
+                    <> " (" <> adProvider d <> "/" <> modelName <> ")"
+                | d <- defs, let ModelId modelName = adModel d ]
+      recorded = object
+        [ "count" .= length defs
+        , "ids" .= fmap (agentDefIdText . adId) defs
+        , "roles" .= object
+            [ fromText (agentDefIdText (adId d)) .= adRole d | d <- defs ]
+        ]
+  pure (OpResult [TrpText rendered] False recorded)
+
+-- | Handle the delete action (shared with the legacy AGENT_DEF_DELETE shim).
+handleDefDelete :: AgentDefBackend -> Value -> App OpResult
+handleDefDelete backend v = do
+  let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
+  case mId of
+    Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
+    Just aid -> do
+      mExisting <- liftIO (adbRead backend aid)
+      liftIO (adbDelete backend aid)
+      let msg = case mExisting of
+            Nothing -> "deleted (was not present)"
+            Just _  -> "deleted"
+          recorded = object ["id" .= agentDefIdText aid]
+      pure (OpResult [TrpText msg] False recorded)
+
+-- ---------------------------------------------------------------------------
+-- knownOpNames — the universe of opcode names the harness exposes
+-- ---------------------------------------------------------------------------
+
+-- | The universe of opcode names the harness actually exposes. A tools
+-- entry outside this set is silently dropped from the child registry
+-- (intersection semantics) but recorded here so a def-author typo is
+-- discoverable in the audit trail.
+knownOpNames :: Set.Set Text
+knownOpNames = Set.fromList
+  [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_GET"
+  , "MEMORY_WRITE", "MEMORY_READ", "MEMORY_LIST", "MEMORY_SEARCH", "MEMORY_ARCHIVE"
+  , "MEMORY_MANAGE"
+  , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
+  , "AGENT_DEF_WRITE", "AGENT_DEF_READ", "AGENT_DEF_LIST", "AGENT_DEF_DELETE"
+  , "AGENT_DEF_MANAGE"
+  , "AGENT_INSTANCES", "AGENT_START", "AGENT_STATUS", "AGENT_STOP", "AGENT_INTERRUPT"
+  , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
+  , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
+  , "WEB_FETCH", "WEB_SEARCH"
+  , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
+  , "SESSION_NEW", "SESSION_LIST", "SESSION_SEARCH", "SESSION_GET"
+  , "SESSION_MANAGE"
+  , "OPCODE_DESCRIBE", "OPCODE_LIST"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Consolidated opcode: AGENT_DEF_MANAGE
+-- ---------------------------------------------------------------------------
+
+-- | AGENT_DEF_MANAGE: action-based entry point for all agent definition
+-- operations. The @action@ field discriminates between @write@, @read@,
+-- @list@, and @delete@.
+agentDefManageOp :: AgentDefBackend -> SessionId -> Opcode
+agentDefManageOp backend session = TrustedOpcode
+  { toName = OpName "AGENT_DEF_MANAGE"
+  , toTrust = Trusted
+  , toDesc = "Manage agent definitions. Use action to select: write (create/update upsert), read (by id), list (all defs), delete (by id, idempotent)."
+  , toInSchema = object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= object
+          [ fromText "action" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["write", "read", "list", "delete"] :: [Text])
+              , "description" .= ("Operation to perform." :: Text)
+              ]
+          , fromText "id" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Agent def id ([A-Za-z0-9_-]+) (write, read, delete)." :: Text)
+              ]
+          , fromText "name" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Human-readable agent name (write)." :: Text)
+              ]
+          , fromText "provider" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Provider label, e.g. \"ollama\" (write)." :: Text)
+              ]
+          , fromText "model" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Model id, e.g. \"llama3\" (write)." :: Text)
+              ]
+          , fromText "system" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional system prompt (write)." :: Text)
+              ]
+          , fromText "tools" .= object
+              [ "type" .= ("array" :: Text)
+              , "description" .= ("Allowed opcode names, or \"all\" (write)." :: Text)
+              ]
+          , fromText "group" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional display group (e.g. \"core\") (write). Omit for the default (ungrouped) section." :: Text)
+              ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional delegation role: \"orchestrator\" or \"leaf\" (write)." :: Text)
+              ]
+          , fromText "description" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("One-line catalog summary (write)." :: Text)
+              ]
+          ]
+      , "required" .= (["action"] :: [Text])
+      ]
+  , toOutSchema = object []
+  , toAuthorize = authorizeAgentDefManage
+  , toBlocking = False
+  , toRun = \_ v ->
+      case parseAgentDefAction v of
+        Left e -> pure (OpResult [TrpText e] True (object []))
+        Right action -> case action of
+          AdWrite  -> handleDefWrite backend session v
+          AdRead   -> handleDefRead backend v
+          AdList   -> handleDefList backend
+          AdDelete -> handleDefDelete backend v
+  }
+
+-- ---------------------------------------------------------------------------
+-- Legacy shims (backward compatibility)
+-- ---------------------------------------------------------------------------
+
+-- | AGENT_DEF_WRITE (legacy shim): delegates to the write handler.
 agentDefWriteOp :: AgentDefBackend -> SessionId -> Opcode
 agentDefWriteOp backend session = TrustedOpcode
   { toName = OpName "AGENT_DEF_WRITE"
   , toTrust = Trusted
-  , toDesc = "Create or update an agent definition by id (upsert; preserves provenance on update)."
+  , toDesc = "Create or update an agent definition by id (upsert; preserves provenance on update). (Legacy — prefer AGENT_DEF_MANAGE with action=\"write\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -191,127 +427,30 @@ agentDefWriteOp backend session = TrustedOpcode
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = \v ->
-      case idField v of
-        Nothing -> Left "AGENT_DEF_WRITE requires {id:string}"
-        Just idTxt -> case checkId idTxt of
-          Left e -> Left e
-          Right () -> case T.strip <$> textFieldMaybe "role" v of
-            Nothing -> Right ()
-            Just "" -> Right ()   -- empty role = unset (leaf)
-            Just r
-              | r == "orchestrator" || r == "leaf" -> Right ()
-              | otherwise ->
-                Left ("AGENT_DEF_WRITE: role must be \"orchestrator\" or \"leaf\" (got: " <> r <> ")")
+  , toAuthorize = authorizeDefWrite
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-          roleField vv = case T.strip <$> textFieldMaybe "role" vv of
-            Just ""  -> Nothing
-            r        -> r
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          mExisting <- liftIO (adbRead backend aid)
-          now <- liftIO getCurrentTime
-          let (def0, wasNew) = case mExisting of
-                Just existing ->
-                  ( existing
-                      { adName = textField "name" v
-                      , adSystem = textFieldMaybe "system" v
-                      , adTools = toolsField v
-                      , adGroup = groupField v (Just existing)
-                      , adRole = roleField v
-                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
-                      , adUpdatedAt = now
-                      }
-                  , False
-                  )
-                Nothing ->
-                  ( AgentDef
-                      { adId = aid
-                      , adName = textField "name" v
-                      , adProvider = textField "provider" v
-                      , adModel = ModelId (textField "model" v)
-                      , adSystem = textFieldMaybe "system" v
-                      , adTools = toolsField v
-                      , adGroup = groupField v Nothing
-                      , adRole = roleField v
-                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
-                      , adCreatedAt = now
-                      , adUpdatedAt = now
-                      , adSession = session
-                      }
-                  , True
-                  )
-              def = sanitizeAgentDefFields def0
-              unknownTools =
-                case adTools def of
-                  AllowOnly xs ->
-                    [ t | OpName t <- Set.toList xs, Set.notMember t knownOpNames ]
-                  AllowAll -> []
-          liftIO (adbUpdate backend def)
-          let recorded = encodeDefRecorded def wasNew unknownTools
-          pure (OpResult [TrpText (if wasNew then "defined" else "updated")] False recorded)
+  , toRun = \_ v -> handleDefWrite backend session v
   }
-  where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
-    -- The universe of opcode names the harness actually exposes. A tools
-    -- entry outside this set is silently dropped from the child registry
-    -- (intersection semantics) but recorded here so a def-author typo is
-    -- discoverable in the audit trail.
-    knownOpNames :: Set.Set Text
-    knownOpNames = Set.fromList
-      [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_GET"
-      , "MEMORY_WRITE", "MEMORY_READ", "MEMORY_LIST", "MEMORY_SEARCH", "MEMORY_ARCHIVE"
-      , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
-      , "AGENT_DEF_WRITE", "AGENT_DEF_READ", "AGENT_DEF_LIST", "AGENT_DEF_DELETE"
-      , "AGENT_INSTANCES", "AGENT_START", "AGENT_STATUS", "AGENT_STOP", "AGENT_INTERRUPT"
-      , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
-      , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
-      , "WEB_FETCH", "WEB_SEARCH"
-      , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
-      , "OPCODE_DESCRIBE", "OPCODE_LIST"
-      ]
 
--- ---------------------------------------------------------------------------
--- AGENT_DEF_READ
--- ---------------------------------------------------------------------------
-
+-- | AGENT_DEF_READ (legacy shim): delegates to the read handler.
 agentDefReadOp :: AgentDefBackend -> Opcode
 agentDefReadOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_READ"
   , toTrust = Trusted
-  , toDesc = "Read one agent definition by id."
+  , toDesc = "Read one agent definition by id. (Legacy — prefer AGENT_DEF_MANAGE with action=\"read\".)"
   , toInSchema = singleStringSchema "id" "The agent def id to read."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_READ requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "AGENT_DEF_READ requires {id:string}") checkAgentDefId . idField
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          mDef <- liftIO (adbRead backend aid)
-          case mDef of
-            Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
-            Just d  -> do
-              let rendered = renderDef d
-                  recorded = encodeDefRecorded d False []
-              pure (OpResult [TrpText rendered] False recorded)
+  , toRun = \_ v -> handleDefRead backend v
   }
-  where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- ---------------------------------------------------------------------------
--- AGENT_DEF_LIST
--- ---------------------------------------------------------------------------
-
+-- | AGENT_DEF_LIST (legacy shim): delegates to the list handler.
 agentDefListOp :: AgentDefBackend -> Opcode
 agentDefListOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_LIST"
   , toTrust = Trusted
-  , toDesc = "List all agent definitions (id + role + name + provider/model)."
+  , toDesc = "List all agent definitions (id + role + name + provider/model). (Legacy — prefer AGENT_DEF_MANAGE with action=\"list\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
@@ -319,54 +458,21 @@ agentDefListOp backend = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = const (Right ())
   , toBlocking = False
-  , toRun = \_ _ -> do
-      defs <- liftIO (adbList backend)
-      let rendered = case defs of
-            [] -> "(no agent definitions)"
-            _  -> T.intercalate "\n"
-                    [ agentDefIdText (adId d) <> roleSuffix (adRole d) <> ": " <> adName d
-                        <> " (" <> adProvider d <> "/" <> modelName <> ")"
-                    | d <- defs, let ModelId modelName = adModel d ]
-          recorded = object
-            [ "count" .= length defs
-            , "ids" .= fmap (agentDefIdText . adId) defs
-            , "roles" .= object
-                [ fromText (agentDefIdText (adId d)) .= adRole d | d <- defs ]
-            ]
-      pure (OpResult [TrpText rendered] False recorded)
+  , toRun = \_ _ -> handleDefList backend
   }
 
--- ---------------------------------------------------------------------------
--- AGENT_DEF_DELETE
--- ---------------------------------------------------------------------------
-
+-- | AGENT_DEF_DELETE (legacy shim): delegates to the delete handler.
 agentDefDeleteOp :: AgentDefBackend -> Opcode
 agentDefDeleteOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_DELETE"
   , toTrust = Trusted
-  , toDesc = "Delete an agent definition by id (idempotent)."
+  , toDesc = "Delete an agent definition by id (idempotent). (Legacy — prefer AGENT_DEF_MANAGE with action=\"delete\".)"
   , toInSchema = singleStringSchema "id" "The agent def id to delete."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_DELETE requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "AGENT_DEF_DELETE requires {id:string}") checkAgentDefId . idField
   , toBlocking = False
-  , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          mExisting <- liftIO (adbRead backend aid)
-          liftIO (adbDelete backend aid)
-          let msg = case mExisting of
-                Nothing -> "deleted (was not present)"
-                Just _  -> "deleted"
-              recorded = object ["id" .= agentDefIdText aid]
-          pure (OpResult [TrpText msg] False recorded)
+  , toRun = \_ v -> handleDefDelete backend v
   }
-  where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
-
--- ---------------------------------------------------------------------------
--- AGENT_INSTANCES
 -- ---------------------------------------------------------------------------
 
 -- | AGENT_INSTANCES: snapshot the in-process agent runtime (running
