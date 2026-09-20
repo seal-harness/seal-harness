@@ -64,6 +64,56 @@ jobs:
       - name: Run tests with coverage
         run: nix develop --command cabal test --enable-coverage
 
+      - name: Post test timing summary
+        if: always()
+        run: |
+          {
+            echo "## Test Case Timing Report"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Check for a hung test (currently-running.txt is non-empty
+          # if the process was killed mid-test).
+          if [ -f currently-running.txt ] && [ -s currently-running.txt ]; then
+            RUNNING=$(cat currently-running.txt)
+            {
+              echo "### ⚠️ Test process was killed while running: \`$RUNNING\`"
+              echo ""
+              echo "This test was still executing when the process terminated."
+              echo "It is the prime suspect for a hang or timeout."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ ! -f test-timings.txt ]; then
+            echo "No test-timings.txt found — timing summary skipped." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Slowest test cases (top 20)"
+            echo ""
+            echo "| # | Duration | Result | Test |"
+            echo "|---:|----------|--------|------|"
+            # Sort by duration descending, take top 20, format as table.
+            # Skip header line, sort numerically on first column.
+            tail -n +2 test-timings.txt \
+              | sort -t$'\t' -k1 -rn \
+              | head -20 \
+              | nl -w1 -s'. ' | while IFS=$'\t' read -r num dur result path; do
+                echo "| $num | ${dur}s | $result | \`$path\` |"
+            done
+            echo ""
+            echo "<details>"
+            echo "<summary>Full timing data (all completed test cases, streaming)</summary>"
+            echo ""
+            echo '```tsv'
+            cat test-timings.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate coverage report
         if: always()
         run: |
