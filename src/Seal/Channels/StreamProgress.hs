@@ -299,6 +299,7 @@ opEmoji (OpName name) = case name of
   "HARNESS_STOP"     -> "\x1F5A5\xFE0F"  -- 🖥️ desktop computer
   "OPCODE_DESCRIBE"  -> "\x1F50E"  -- 🔎 magnifying glass tilted right
   "OPCODE_LIST"      -> "\x1F4CB"  -- 📋 clipboard
+  "SESSION_MANAGE"   -> "\x1F4AC"  -- 💬 speech balloon
   _                  -> "\x26A1"   -- ⚡ high voltage
 
 -- | Should the manager send an edit now? Returns 'True' when enough

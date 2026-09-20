@@ -108,7 +108,7 @@ import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp)
+import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp, sessionManageOp)
 import Seal.ISA.Ops.Skills
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
@@ -300,6 +300,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , sessionListOp paths
       , sessionSearchOp paths
       , sessionGetOp paths
+      , sessionManageOp paths
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
