@@ -82,6 +82,7 @@ import Seal.Tabs.Persist (loadTabList)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Telegram.Config (resolveTelegramConfig)
+import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
@@ -134,7 +135,8 @@ runServeMain autonomy logger = do
       cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends paths repo
+  embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
+  backends <- newBackends paths repo embedding
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
   -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on

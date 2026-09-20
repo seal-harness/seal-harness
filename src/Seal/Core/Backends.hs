@@ -60,11 +60,13 @@ data Backends = Backends
 -- enumerate the dir). The memory store is constructed from
 -- @\<sealHome\>\/memory\/@ (NOT @\<configRoot\>\/memory\/@) — memory is a
 -- separate store with its own immutability guarantees. The embedding backend
--- is 'nullEmbeddingBackend' (engram wiring is deferred). The delegation knobs
--- are process-global; the config is re-read per AGENT_START call so config
--- changes take effect without a restart.
-newBackends :: SealPaths -> ConfigRepo -> IO Backends
-newBackends paths repo = do
+-- The embedding backend is passed in (resolved from config at the call
+-- site) so this function doesn't depend on 'RuntimeConfig' or
+-- 'Seal.Memory.EngramBackend'. The delegation knobs are process-global;
+-- the config is re-read per AGENT_START call so config changes take effect
+-- without a restart.
+newBackends :: SealPaths -> ConfigRepo -> Emb.EmbeddingBackend -> IO Backends
+newBackends paths repo embedding = do
   let skillsDir    = spConfig paths </> "skills"
       agentsDir    = spConfig paths </> "agents"
       memoryDir    = spHome paths </> "memory"
@@ -74,13 +76,13 @@ newBackends paths repo = do
   memStore    <- Mem.fileMemoryStore memoryDir
   skills      <- Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo
   agentDefs   <- Def.markdownAgentDefBackend agentsDir repo
-  pure Backends
+  pure (Backends
     { bMemory = memStore
-    , bEmbedding = Emb.nullEmbeddingBackend
+    , bEmbedding = embedding
     , bSkills = skills
     , bAgentDefs = agentDefs
     , bRuntime = rt
     , bDelegationConfig = pure defaultDelegationConfig
     , bSpawnPauseFlag = pauseFlag
     , bParentActivity = parentAct
-    }
+    })

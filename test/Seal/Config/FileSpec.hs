@@ -48,6 +48,7 @@ spec = describe "Seal.Config.File" $ do
         , rcChatStreaming    = Nothing
         , rcMaxTurns         = Nothing
         , rcToolTimeout      = Nothing
+        , rcEmbedding        = Nothing
         }
 
   describe "loadRuntimeConfig" $ do
@@ -103,6 +104,7 @@ spec = describe "Seal.Config.File" $ do
               , rcChatStreaming   = Nothing
               , rcMaxTurns        = Nothing
               , rcToolTimeout     = Nothing
+             , rcEmbedding       = Nothing
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path

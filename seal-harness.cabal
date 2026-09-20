@@ -208,6 +208,7 @@ library
         Seal.Memory.Path
         Seal.Memory.Store
         Seal.Memory.Embedding
+        Seal.Memory.EngramBackend
         Seal.Skills.Types
         Seal.Skills.Codec
         Seal.Skills.Backend
@@ -373,6 +374,7 @@ test-suite tests
         Seal.Memory.PathSpec
         Seal.Memory.StoreSpec
         Seal.Memory.EmbeddingSpec
+        Seal.Memory.EngramBackendSpec
         Seal.Skills.TypesSpec
          Seal.Skills.BackendSpec
          Seal.Skills.BackendNoDirectFsFailSpec

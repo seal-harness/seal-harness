@@ -65,6 +65,7 @@ import Seal.Tabs.Types (TabRef (BoundSession), tlTabs, tRef, tabCount)
 import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier)
 import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter, noStopTranscriptWriter)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 1) 0
@@ -150,7 +151,7 @@ mkSendDepsWith paths resolveStub = do
   createDirectoryIfMissing True sessionRoot
   ensureConfigRepo configRoot
   let repo = openConfigRepo configRoot
-  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo
+  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
   reg   <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
   askReply <- newAskReplyStore 0

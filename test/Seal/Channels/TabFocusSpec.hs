@@ -53,6 +53,7 @@ import Seal.Tabs.Types (TabRef (BoundSession))
 import Seal.TestHelpers.FakeChannel
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 
 -- | A stub TmuxRunner that always succeeds with empty output.
 stubTmux :: TmuxRunner
@@ -96,7 +97,7 @@ mkChannelDeps paths = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
-  backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo
+  backends <- newBackends (SealPaths { spHome = cfgRoot, spState = cfgRoot </> "state", spConfig = cfgRoot, spKeys = cfgRoot </> "keys", spCache = cfgRoot </> "cache" }) repo nullEmbeddingBackend
   harnessReg <- newHarnessRegistry
   let vaultRt = VaultRuntime
         { vrPaths = paths

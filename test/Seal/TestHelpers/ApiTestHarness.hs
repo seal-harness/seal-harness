@@ -118,6 +118,7 @@ import Seal.Tools.Exec.Types (ExecError)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Memory.Embedding (nullEmbeddingBackend)
 
 -- ---------------------------------------------------------------------------
 -- The test environment
@@ -393,7 +394,7 @@ buildTestEnv tmp mode mRepo opts = do
              (\rc -> rc { rcDelegation = Just dfc })
       pure ()
   let configRepo = openConfigRepo configRoot
-  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) configRepo
+  backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) configRepo nullEmbeddingBackend
   tabsH <- newTabsHandle
   reg <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
