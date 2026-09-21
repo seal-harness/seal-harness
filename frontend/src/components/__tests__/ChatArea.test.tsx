@@ -1721,3 +1721,138 @@ describe('AskHumanForm', () => {
     })
   })
 })
+
+// ── Synthesized pending ASK_HUMAN (server restart recovery) ─────────────
+// When the server restarts, the in-memory AskReplyStore is wiped, so
+// fetchPendingQuestions returns []. But the transcript still has the
+// ASK_HUMAN tool_use block with no matching tool_result. The frontend
+// should synthesize a PendingQuestion from the tool call input so the
+// user can still see and interact with the question UI.
+describe('Synthesized pending ASK_HUMAN', () => {
+  function makeAskMessageWithResult(opts: { label: string; description?: string }[]): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question: 'which branch?', options: opts },
+          result: 'main',
+        },
+      }],
+      rawJson: '{}',
+    }
+  }
+
+  function makeSynthAskMessage(opts: { label: string; description?: string }[], overrides: Partial<Message> = {}): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question: 'which branch?', options: opts },
+        },
+      }],
+      rawJson: '{}',
+      ...overrides,
+    }
+  }
+
+  function makeSynthOpenAskMessage(question: string): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question },
+        },
+      }],
+      rawJson: '{}',
+    }
+  }
+
+  it('renders AskHumanForm from synthesized question when no real pending question exists', () => {
+    const messages = [makeSynthAskMessage([
+      { label: 'main', description: 'the default branch' },
+      { label: 'develop', description: 'the integration branch' },
+    ])]
+    // No pendingQuestions prop — simulates server restart (empty store)
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onSend={() => {}}
+      />,
+    )
+    // The AskHumanForm should render with the question and options
+    // derived from the tool call input
+    expect(screen.getByTestId('ask-human-form')).toBeTruthy()
+    expect(screen.getByText('which branch?')).toBeTruthy()
+    expect(screen.getByText('main')).toBeTruthy()
+    expect(screen.getByText('develop')).toBeTruthy()
+    expect(screen.getByPlaceholderText('Type your own answer…')).toBeTruthy()
+  })
+
+  it('does NOT synthesize a pending question when the ASK_HUMAN has a result', () => {
+    const messages = [makeAskMessageWithResult([
+      { label: 'main', description: 'd' },
+    ])]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onSend={() => {}}
+      />,
+    )
+    // No AskHumanForm — the question was already answered (has a result)
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
+  })
+
+  it('synthesized question submit sends answer as a regular user message', () => {
+    const messages = [makeSynthAskMessage([
+      { label: 'main', description: 'd' },
+    ])]
+    const onSend = vi.fn()
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onSend={onSend}
+      />,
+    )
+    // Click a stock button — should call onSend with the label
+    fireEvent.click(screen.getByText('main'))
+    expect(onSend).toHaveBeenCalledWith('main')
+  })
+
+  it('synthesized open-ended ASK_HUMAN (no options) renders the form', () => {
+    const messages = [makeSynthOpenAskMessage('What is your name?')]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onSend={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('ask-human-form')).toBeTruthy()
+    expect(screen.getByText('What is your name?')).toBeTruthy()
+    expect(screen.getByPlaceholderText('Type your own answer…')).toBeTruthy()
+  })
+})

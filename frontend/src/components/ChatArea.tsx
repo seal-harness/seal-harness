@@ -2140,6 +2140,51 @@ export function computeTokensUsed(entries: TranscriptEntry[]): number {
   return Math.ceil(lastRequestTextLen / 4) + estimatedTokens
 }
 
+/** Synthesize `PendingQuestion` objects from the transcript for ASK_HUMAN
+ *  tool calls that have no matching tool_result. This recovers the pending
+ *  question UI when the server's in-memory `AskReplyStore` has been wiped
+ *  (e.g. after a server restart). The synthesized question carries a
+ *  sentinel id (`synth:<toolCallId>`) so the rendering layer can
+ *  distinguish it from a real pending question (which has an `AskId` from
+ *  the store) and route the answer submission differently — via `onSend`
+ *  (a regular user message) instead of `onAnswerQuestionText` (the
+ *  `POST .../questions/:qid/answer` path that requires a live store entry).
+ *
+ *  Only the LAST unanswered ASK_HUMAN in the transcript is synthesized —
+ *  earlier ones are historical (the agent continued past them in a prior
+ *  turn that was lost on restart). The question text and options are
+ *  extracted from the tool call's input payload. */
+export function synthesizePendingQuestions(messages: Message[]): PendingQuestion[] {
+  const result: PendingQuestion[] = []
+  // Walk messages in reverse to find the last ASK_HUMAN without a result.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    for (let j = messages[i]!.blocks.length - 1; j >= 0; j--) {
+      const block = messages[i]!.blocks[j]!
+      if (!block.toolCall || block.toolCall.name !== 'ASK_HUMAN') continue
+      // Skip ASK_HUMAN calls that already have a result (answered).
+      if (block.toolCall.result !== undefined) continue
+      // Found the last unanswered ASK_HUMAN — synthesize a pending question.
+      const input = block.toolCall.input as Record<string, unknown> | null
+      const question = typeof input?.question === 'string' ? input.question : ''
+      const rawOpts = Array.isArray(input?.options) ? input!.options as Array<Record<string, unknown>> : undefined
+      const options = rawOpts?.map((o) => ({
+        label: typeof o.label === 'string' ? o.label : '',
+        description: typeof o.description === 'string' ? o.description : undefined,
+      })).filter((o) => o.label.length > 0)
+      result.push({
+        id: `synth:${block.toolCall.id}`,
+        question,
+        createdAt: messages[i]!.timestamp,
+        options: options && options.length > 0 ? options : undefined,
+        meta: undefined,
+      })
+      // Only synthesize the LAST unanswered ASK_HUMAN.
+      return result
+    }
+  }
+  return result
+}
+
 /** Extract the provider label from a session's `runtime` string
  *  (`"session:<provider>"`), or null when the runtime isn't in that shape. */
 export function providerFromRuntime(runtime: string | undefined): string | null {
@@ -2302,6 +2347,26 @@ export function ChatArea({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+
+  // Merge real pending questions (from the in-memory store via
+  // `fetchPendingQuestions`) with synthesized ones derived from the
+  // transcript (for recovery after server restart). Real questions take
+  // priority — a synthesized question is only used when no real question
+  // matches the same ASK_HUMAN tool call. The synthesis scans for the last
+  // unanswered ASK_HUMAN in the transcript and creates a sentinel question
+  // with id `synth:<toolCallId>` so the rendering layer can route the
+  // answer via `onSend` (a regular user message) instead of
+  // `onAnswerQuestionText` (which requires a live store entry).
+  const effectivePendingQuestions = useMemo(() => {
+    const synth = synthesizePendingQuestions(messages)
+    if (synth.length === 0) return pendingQuestions ?? []
+    // Filter out synthesized questions whose tool call already has a real
+    // pending question matched (by ASK_HUMAN opcode matching — any real
+    // pending question matches any ASK_HUMAN tool call, so if there are
+    // any real pending questions, skip synthesis).
+    if ((pendingQuestions ?? []).length > 0) return pendingQuestions ?? []
+    return synth
+  }, [messages, pendingQuestions])
 
   // Whether the session is actively thinking — drives the stop button's
   // visibility. The parent (App.tsx) derives this from the live activity
@@ -2548,10 +2613,25 @@ export function ChatArea({
                     message={msg}
                     onBranch={onBranch}
                     sending={sending}
-                    pendingQuestions={pendingQuestions}
+                    pendingQuestions={effectivePendingQuestions}
                     onAnswer={onAnswerQuestion}
-                    onAnswerText={onAnswerQuestionText}
-                    onCancel={onCancelQuestion}
+                    onAnswerText={(qid, answer) => {
+                      if (qid.startsWith('synth:')) {
+                        // Synthesized question (server restart recovery) —
+                        // no live AskReplyStore entry, so send the answer
+                        // as a regular user message.
+                        onSend?.(answer)
+                        return Promise.resolve(true)
+                      }
+                      return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+                    }}
+                    onCancel={(qid) => {
+                      // For synthesized questions, cancel is a no-op (the
+                      // agent turn is already dead — there's nothing to
+                      // cancel). Just let the form dismiss.
+                      if (qid.startsWith('synth:')) return
+                      onCancelQuestion?.(qid)
+                    }}
                   />
                 </Profiler>
               ))}
