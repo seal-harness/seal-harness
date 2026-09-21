@@ -2351,6 +2351,34 @@ export function ChatArea({
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
 
+  // Track ASK_HUMAN tool call IDs that had a real pending question which
+  // was subsequently removed (answered/cancelled via WS ask_resolved).
+  // Without this, synthesizePendingQuestions revives the form from the
+  // unanswered tool call in the transcript — the form stays mounted with
+  // submitting=true, showing "Submitting…" until the 15s fallback timeout.
+  // The set is cleared when the tool call gains a result (the agent's next
+  // response arrives with the matching tool_result).
+  const answeredAskHumanToolCallIds = useRef<Set<string>>(new Set())
+  const prevPendingQuestionIds = useRef<Set<string>>(new Set())
+
+  // Record real pending question ids as they arrive. When they disappear
+  // (answered/cancelled), mark all currently-unanswered ASK_HUMAN tool
+  // calls so synthesis won't revive them.
+  if (pendingQuestions && pendingQuestions.length > 0) {
+    for (const pq of pendingQuestions) {
+      prevPendingQuestionIds.current.add(pq.id)
+    }
+  } else if (prevPendingQuestionIds.current.size > 0) {
+    for (const msg of messages) {
+      for (const block of msg.blocks) {
+        if (block.toolCall?.name === 'ASK_HUMAN' && block.toolCall.result === undefined) {
+          answeredAskHumanToolCallIds.current.add(block.toolCall.id)
+        }
+      }
+    }
+    prevPendingQuestionIds.current.clear()
+  }
+
   // Merge real pending questions (from the in-memory store via
   // `fetchPendingQuestions`) with synthesized ones derived from the
   // transcript (for recovery after server restart). Real questions take
@@ -2361,14 +2389,30 @@ export function ChatArea({
   // answer via `onSend` (a regular user message) instead of
   // `onAnswerQuestionText` (which requires a live store entry).
   const effectivePendingQuestions = useMemo(() => {
+    // Clean up answered tracking for tool calls that now have a result
+    // (the agent continued past the ASK_HUMAN).
+    for (const msg of messages) {
+      for (const block of msg.blocks) {
+        if (block.toolCall?.name === 'ASK_HUMAN' && block.toolCall.result !== undefined) {
+          answeredAskHumanToolCallIds.current.delete(block.toolCall.id)
+        }
+      }
+    }
     const synth = synthesizePendingQuestions(messages)
     if (synth.length === 0) return pendingQuestions ?? []
+    // Filter out synthesized questions whose tool call was already answered
+    // (a real pending question was seen and removed for it).
+    const filtered = synth.filter((pq) => {
+      const toolCallId = pq.id.startsWith('synth:') ? pq.id.slice(6) : pq.id
+      return !answeredAskHumanToolCallIds.current.has(toolCallId)
+    })
+    if (filtered.length === 0) return pendingQuestions ?? []
     // Filter out synthesized questions whose tool call already has a real
     // pending question matched (by ASK_HUMAN opcode matching — any real
     // pending question matches any ASK_HUMAN tool call, so if there are
     // any real pending questions, skip synthesis).
     if ((pendingQuestions ?? []).length > 0) return pendingQuestions ?? []
-    return synth
+    return filtered
   }, [messages, pendingQuestions])
 
   // Whether the session is actively thinking — drives the stop button's
