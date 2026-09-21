@@ -1047,17 +1047,9 @@ function ToolCallBlock({
   const isAskHuman = tc.name === 'ASK_HUMAN'
   const isShowHuman = tc.name === 'SHOW_HUMAN'
   const showHumanMsg = isShowHuman ? (tc.input as Record<string, unknown> | null)?.message : undefined
-  // Auto-expand for the confirmation gate (inline-approval panel lives
-  // inside the expanded section). For ASK_HUMAN-with-options, the
-  // AskHumanForm renders OUTSIDE the collapsible part (attached to the
-  // box, always visible), so the box stays collapsed for conciseness.
-  // For open-ended ASK_HUMAN (no options), the form also renders outside,
-  // so stay collapsed. For synthesized questions (server restart
-  // recovery), auto-expand so the user sees the full context.
-  const isSynth = pendingQuestion?.id.startsWith('synth:') ?? false
-  const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions && !isAskHuman) || (isAskHuman && isSynth))
+  const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions && !isAskHuman))
 
-  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman) || (isAskHuman && isSynth)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman, isShowHuman, isSynth])
+  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman, isShowHuman])
 
   const summary = toolCallSummary(tc.input)
   const inputJson = (() => {
