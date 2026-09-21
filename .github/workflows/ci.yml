@@ -61,6 +61,35 @@ jobs:
       - name: Build
         run: nix build --print-build-logs
 
+      # ─────────────────────────────────────────────────────────────────────
+      # Binary artifact: package the built `seal` executable as a tarball
+      # with a SHA256 checksum and upload it as a GitHub workflow artifact.
+      # This lets users download the binary directly from a CI run without
+      # installing Nix. The frontend dist/ is NOT embedded in the binary
+      # (served from configurable static_dir), so the binary is self-contained
+      # for CLI/TUI use; `seal serve` requires a separate frontend build.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Package binary artifact
+        run: |
+          # nix build leaves ./result/bin/seal
+          TARGET="seal-${{ matrix.system }}"
+          ARCHIVE="${TARGET}.tar.gz"
+          mkdir -p staging
+          cp ./result/bin/seal "staging/seal"
+          tar czf "$ARCHIVE" -C staging seal
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          echo "Packaged $ARCHIVE ($(wc -c < "$ARCHIVE") bytes)"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-${{ matrix.system }}
+          path: |
+            seal-${{ matrix.system }}.tar.gz
+            seal-${{ matrix.system }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Run tests with coverage
         run: nix develop --command cabal test --enable-coverage
 
@@ -352,3 +381,48 @@ jobs:
           echo "$ALL_PATHS" | xargs nix store sign --key-file "$KEY"
           echo "$ALL_PATHS" | xargs nix copy --to "$S3_CACHE"
           echo "Cache push complete: $TOTAL paths."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Rolling "latest" release: on pushes to main, download the per-platform
+  # tarballs from the build job and attach them to a rolling "latest"
+  # GitHub Release. Users who want bleeding-edge binaries download from the
+  # Releases page; for stable versioned releases, see release.yml (triggered
+  # by `git tag v*`). PR builds upload artifacts (above) but do not create
+  # a release.
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Rolling latest release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release assets
+        run: |
+          # Flatten artifacts: each artifact is in its own subdirectory
+          # (seal-x86_64-linux/seal-x86_64-linux.tar.gz, etc.).
+          mkdir -p release-assets
+          find artifacts -type f \( -name 'seal-*.tar.gz' -o -name 'seal-*.sha256' \) \
+            -exec cp {} release-assets/ \;
+          # Consolidate per-platform checksums into one file.
+          cat release-assets/*.sha256 > release-assets/checksums-sha256.txt
+          echo "Release assets:"
+          ls -la release-assets/
+
+      - name: Update rolling "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Seal Harness (latest from main)"
+          body: "Automated build from commit ${{ github.sha }}."
+          target_commitish: main
+          files: |
+            release-assets/seal-*.tar.gz
+            release-assets/checksums-sha256.txt
+          prerelease: true
