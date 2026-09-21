@@ -2451,56 +2451,61 @@ export function ChatArea({
   // when the data cache delivers entries in the same commit).
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
   // When the session changes, we need to scroll to bottom AFTER the new
-  // messages are in the DOM — not in the render where selectedSession
-  // changes (the messages prop hasn't updated yet in that render). This
-  // ref flags that a deferred scroll is needed.
+  // session's messages are actually in the DOM. We record a message
+  // signature (first message id + count) at session-change time, then
+  // wait until the messages prop changes to a DIFFERENT signature before
+  // scrolling. This ensures we scroll to the bottom of the NEW session's
+  // messages, not the old session's.
   const needsScrollToBottomRef = useRef(false)
+  const scrollMsgSignatureRef = useRef<string>('')
   const scrollDebugRef = useRef(0)
+
+  // A signature for the current messages array. Changes when the content
+  // actually changes (different first message id or count), not just when
+  // the array reference changes.
+  const msgSignature = messages.length > 0
+    ? messages[0]!.id + ':' + messages.length
+    : 'empty'
 
   useEffect(() => {
     if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
     const dbgId = ++scrollDebugRef.current
-    console.log('[scroll:' + dbgId + '] effect1', { sessionChanged, prev: prevSessionIdRef.current, next: selectedSession?.id, msgCount: messages.length, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current, hasFragment })
+    console.log('[scroll:' + dbgId + '] effect1', { sessionChanged, prev: prevSessionIdRef.current, next: selectedSession?.id, msgCount: messages.length, msgSig: msgSignature, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current, hasFragment })
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
       wasAtBottom.current = true
-      // Don't scroll yet — the messages prop may not have updated in this
-      // render. The data cache delivers entries via setEntries, which
-      // triggers a re-render, but the messages prop chains through
-      // useTranscriptMessages → useMemo → App → ChatArea props, so the
-      // new messages may arrive in the NEXT render. Flag that we need
-      // to scroll once the new messages are committed to the DOM.
       needsScrollToBottomRef.current = true
+      scrollMsgSignatureRef.current = msgSignature
       return
     }
-    // Session didn't change — normal sticky-bottom auto-scroll.
     if (wasAtBottom.current) {
+      console.log('[scroll:' + dbgId + '] effect1 sticky-bottom scroll')
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
-  }, [messages, hasFragment, selectedSession?.id])
+  }, [messages, hasFragment, selectedSession?.id, msgSignature])
 
-  // Deferred scroll-to-bottom: when a session change was detected but the
-  // messages hadn't arrived yet, scroll once they do. Uses rAF to ensure
-  // the DOM is painted before scrolling.
+  // Deferred scroll-to-bottom: wait until the messages actually change to
+  // the new session's content (signature differs from session-change time),
+  // then scroll to bottom via rAF.
   useEffect(() => {
     const dbg2Id = ++scrollDebugRef.current
-    console.log('[scroll:' + dbg2Id + '] effect2', { needsScroll: needsScrollToBottomRef.current, msgCount: messages.length, hasFragment })
+    console.log('[scroll:' + dbg2Id + '] effect2', { needsScroll: needsScrollToBottomRef.current, msgCount: messages.length, msgSig: msgSignature, expectedSig: scrollMsgSignatureRef.current, hasFragment })
     if (!needsScrollToBottomRef.current) return
     if (hasFragment) {
       needsScrollToBottomRef.current = false
       return
     }
-    if (messages.length > 0) {
+    if (msgSignature !== scrollMsgSignatureRef.current) {
       needsScrollToBottomRef.current = false
       wasAtBottom.current = true
       requestAnimationFrame(() => {
         const el = scrollerRef.current
-        console.log('[scroll:' + dbg2Id + '] effect2 rAF', { scrollHeight: el?.scrollHeight, clientHeight: el?.clientHeight, scrollTop: el?.scrollTop, msgCount: messages.length })
+        console.log('[scroll:' + dbg2Id + '] effect2 rAF', { scrollHeight: el?.scrollHeight, clientHeight: el?.clientHeight, scrollTop: el?.scrollTop, msgCount: messages.length, msgSig: msgSignature })
         messagesEndRef.current?.scrollIntoView({ block: 'end' })
       })
     }
-  }, [messages, hasFragment])
+  }, [messages, hasFragment, msgSignature])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context

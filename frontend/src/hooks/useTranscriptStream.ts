@@ -185,8 +185,12 @@ export function useTranscriptStream(
     if (cached !== undefined && cached.length > 0 && isFirstLoad) {
       // Cache hit on session switch — instantly show cached data, no
       // loading spinner. Focus with `since` = last cached entry id so
-      // the WS replay delivers only new entries.
-      setEntries(cached); console.log("[transcript-stream] cache hit", { sessionId, entryCount: cached.length })
+      // the WS replay delivers only new entries. No background re-seed —
+      // the WS `since` replay is the sole mechanism for catching entries
+      // that arrived since the last visit. A background re-seed would
+      // race with WS-delivered entries and cause flickering (the re-seed
+      // overwrites newer WS entries with stale HTTP data).
+      setEntries(cached)
       setLoading(false)
       loadedSessionRef.current = sessionId
       const lastId = cached[cached.length - 1]!.id
@@ -195,25 +199,12 @@ export function useTranscriptStream(
         if (cancelled) return
         setPendingQuestions(qs)
       })
-      // Background re-seed for consistency — only adopt if it has at
-      // least as many entries as the current state (prevents a stale
-      // re-seed from overwriting newer WS-delivered entries).
-      fetchTranscriptSeed(sessionId).then((seed) => {
-        if (cancelled || currentSessionRef.current !== sessionId) return
-        setEntries((prev) => {
-          if (seed.length >= prev.length) {
-            dataCache.set(sessionId, seed)
-            return seed
-          }
-          return prev
-        })
-      })
     } else {
       // Cache miss or refresh — full HTTP GET seed.
       if (isFirstLoad) setLoading(true)
       fetchTranscriptSeed(sessionId).then((seed) => {
         if (cancelled) return
-        setEntries(seed); console.log("[transcript-stream] seed fetched", { sessionId, entryCount: seed.length })
+        setEntries(seed)
         dataCache.set(sessionId, seed)
         setLoading(false)
         loadedSessionRef.current = sessionId
