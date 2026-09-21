@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
-import { ChatArea, transcriptToMessages, computeTokensUsed } from './components/ChatArea'
+import { ChatArea, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
+import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
   useSendMessage,
   useSessionAgents,
@@ -543,7 +544,7 @@ export default function App() {
     return false
   }, [syncPath])
 
-  const transcriptMessages = useMemo(() => transcriptToMessages(entries), [entries])
+  const transcriptMessages = useTranscriptMessages(entries)
   // Keep the ref in sync so handleSendResult can read the current count
   // without depending on transcriptMessages in its callback deps.
   transcriptMsgCountRef.current = transcriptMessages.length

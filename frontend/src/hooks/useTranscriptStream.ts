@@ -40,15 +40,22 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
 }
 
 /**
- * Pure reconciler: insert `incoming` into `existing`, dedup by id, sort by
- * timestamp ascending. Replaces the entry with a matching id (always returns
- * a new array), or inserts new entries at the sorted position by timestamp.
+ * Pure reconciler: insert `incoming` into `existing`, dedup by id.
+ * Append-only — new entries (by id) are always appended at the end; existing
+ * entries (id match, e.g. streaming updates) are replaced in place. This
+ * guarantees that nothing already rendered shifts position when a new entry
+ * arrives — the transcript view is a pure append-only function of the
+ * transcript.
  *
  * When `incoming` is a finalized entry (no `streaming` flag), any prior
  * `streaming: true` placeholder is evicted first — the streaming placeholder
  * (id `"streaming"`) uses a sentinel id that won't match the final entry's
  * positional id, so without eviction the streaming placeholder would linger
  * as a duplicate row alongside the real entry.
+ *
+ * The initial HTTP seed provides entries in their final on-disk order; WS
+ * events arrive in append order. Append-only is correct because the backend
+ * writes entries sequentially and the seed is already sorted.
  */
 export function reconcileEntries(
   existing: TranscriptEntry[],
@@ -73,17 +80,10 @@ export function reconcileEntries(
       return next
     }
   }
-  // Find insertion index that keeps the array sorted by timestamp ascending.
-  let insertAt = base.length
-  for (let i = base.length - 1; i >= 0; i--) {
-    if (base[i]!.timestamp.localeCompare(incoming.timestamp) <= 0) {
-      insertAt = i + 1
-      break
-    }
-    insertAt = i
-  }
+  // Append-only: new entries always go at the end. The HTTP seed provides
+  // the initial sorted array; WS events arrive in append order.
   const next = base.slice()
-  next.splice(insertAt, 0, incoming)
+  next.push(incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
   return next
 }

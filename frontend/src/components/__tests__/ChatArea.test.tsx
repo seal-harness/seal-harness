@@ -216,7 +216,7 @@ describe('transcriptToMessages', () => {
     expect(block.toolDefs!.descriptions).toEqual(['search the web'])
   })
 
-  it('renders System + Tools rows for every request that carries them (no dedup)', () => {
+  it('deduplicates System + Tools rows by content — identical values render once', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -240,9 +240,9 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    // No deduplication — every request carrying system+tools renders rows.
-    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
-    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(2)
+    // Deduplication — identical system+tools values render only once.
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
   it('renders rows only when fields are present (backend omits unchanged fields)', () => {
@@ -273,6 +273,46 @@ describe('transcriptToMessages', () => {
     // Only the first request carries system+tools; the second omits both.
     expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
+  })
+
+  it('renders a new System Prompt row when the value changes between turns', () => {
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'c1',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys-A', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'c2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+        raw: '{}',
+      }),
+      // Second request: system CHANGED to 'sys-B'; tools unchanged (omitted
+      // by the backend's delta encoding, but we include them here for the
+      // test since the dedup is purely content-based).
+      makeEntry({
+        id: 'c3',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys-B', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // Two distinct system prompts → two rows; identical tools → one row.
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
+    // The first System Prompt row appears before the second.
+    const sysRows = msgs.filter((m) => m.agentName === 'System Prompt')
+    const firstIdx = msgs.indexOf(sysRows[0]!)
+    const secondIdx = msgs.indexOf(sysRows[1]!)
+    expect(firstIdx).toBeLessThan(secondIdx)
+    // The first System Prompt row appears before the first user message.
+    const userIdx = msgs.findIndex((m) => m.agentName === 'You')
+    expect(firstIdx).toBeLessThan(userIdx)
   })
 
   it('renders System Prompt and Tools rows BEFORE the first user message (preamble entry)', () => {
@@ -381,7 +421,9 @@ describe('transcriptToMessages', () => {
     const msgs = transcriptToMessages(entries)
     const userRow = msgs.find((m) => m.agentName === 'You')
     expect(userRow).toBeTruthy()
-    expect(userRow!.rawJson).toBe(raw)
+    // rawJson is now a lazy provider function — call it to get the value.
+    const rj = userRow!.rawJson
+    expect(typeof rj === 'function' ? rj() : rj).toBe(raw)
     expect(userRow!.entryId).toBe('u1')
   })
 

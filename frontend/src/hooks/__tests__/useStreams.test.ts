@@ -104,9 +104,8 @@ describe('reconcileEntries', () => {
   const e1 = makeEntry('e1', '2026-01-01T00:00:00Z')
   const e2 = makeEntry('e2', '2026-01-01T00:00:01Z')
 
-  it('inserts a new entry at the sorted position (ascending by timestamp)', () => {
-    expect(reconcileEntries([e2], e1)).toEqual([e1, e2])
-    expect(reconcileEntries([e1], e2)).toEqual([e1, e2])
+  it('appends a new entry at the end (append-only — no timestamp sort)', () => {
+    expect(reconcileEntries([e2], e1)).toEqual([e2, e1])
   })
 
   it('replaces an existing entry with a matching id in place', () => {
