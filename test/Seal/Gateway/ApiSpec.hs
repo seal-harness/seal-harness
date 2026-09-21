@@ -4320,7 +4320,7 @@ spec = describe "Seal.Gateway.API" $ do
                  , Just (A.Object res)
                  ) ->
                   case KeyMap.lookup (Key.fromText "name") op of
-                    Just (A.String n) -> n == "SKILL_LOAD" && KeyMap.member (Key.fromText "body") res
+                    Just (A.String n) -> (n == "SKILL_LOAD" || n == "SKILL_MANAGE") && KeyMap.member (Key.fromText "body") res
                     _ -> False
                 _ -> False
             -- Legacy path: payload may still be a string (teLineToFrontend
@@ -4334,7 +4334,7 @@ spec = describe "Seal.Gateway.API" $ do
                      , Just (A.Object res)
                      ) ->
                       case KeyMap.lookup (Key.fromText "name") op of
-                        Just (A.String n) -> n == "SKILL_LOAD" && KeyMap.member (Key.fromText "body") res
+                        Just (A.String n) -> (n == "SKILL_LOAD" || n == "SKILL_MANAGE") && KeyMap.member (Key.fromText "body") res
                         _ -> False
                     _ -> False
                 _ -> False

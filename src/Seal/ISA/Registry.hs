@@ -9,11 +9,12 @@ module Seal.ISA.Registry
   ( Registry
   , mkRegistry
   , lookupOp
+  , hideOpcodes
   , registryToolDefs
   , registryToolDefs'
   , stubSchema
   , secretOpNames
- , secretOpcodes
+  , secretOpcodes
   ) where
 
 import Data.Map.Strict (Map)
@@ -27,8 +28,10 @@ import Seal.ISA.Opcode
 
 -- | The registry carries both a name-indexed 'Map' (O(log n) dispatch
 -- lookup) and the registration-ordered opcode list (for tool-definition
--- emission in a stable, wiring-controlled order).
-data Registry = Registry (Map OpName Opcode) [Opcode]
+-- emission in a stable, wiring-controlled order). The 'Set OpName' marks
+-- opcodes that are dispatchable but hidden from the model's tool catalog
+-- (e.g. legacy shims superseded by consolidated MANAGE opcodes).
+data Registry = Registry (Map OpName Opcode) [Opcode] (Set OpName)
 
 mkRegistry :: [Opcode] -> Registry
 -- | Deduplicate by opcode name, keeping the first occurrence in
@@ -40,10 +43,18 @@ mkRegistry ops =
               dedupByName acc (o : rest)
                 | opName o `Set.member` acc = dedupByName acc rest
                 | otherwise = o : dedupByName (Set.insert (opName o) acc) rest
-  in Registry (Map.fromList [(opName o, o) | o <- dedup]) dedup
+  in Registry (Map.fromList [(opName o, o) | o <- dedup]) dedup Set.empty
 
 lookupOp :: Registry -> OpName -> Maybe Opcode
-lookupOp (Registry m _) n = Map.lookup n m
+lookupOp (Registry m _ _) n = Map.lookup n m
+
+-- | Mark opcodes as hidden from the model's tool catalog. They remain
+-- dispatchable via 'lookupOp' (so @\/skill load@, transcript replay, and
+-- other internal callers that reference legacy opcode names still work),
+-- but 'registryToolDefs'' omits them — the model only sees the
+-- consolidated MANAGE opcodes, not the legacy shims they subsume.
+hideOpcodes :: Set OpName -> Registry -> Registry
+hideOpcodes hidden (Registry m order _) = Registry m order hidden
 
 -- | The tool definitions the provider is offered each turn, in registration
 -- order (the order 'mkRegistry' received). NOT alphabetical — the wiring
@@ -63,9 +74,10 @@ registryToolDefs = registryToolDefs' False
 -- stub costs zero tokens on the wire rather than the few a real stub object
 -- would cost.
 registryToolDefs' :: Bool -> Registry -> [ToolDefinition]
-registryToolDefs' useStub (Registry _ order) =
+registryToolDefs' useStub (Registry _ order hidden) =
   [ ToolDefinition (opName o) (opDesc o) (if useStub then stubSchema else opInSchema o)
   | o <- order
+  , not (opName o `Set.member` hidden)
   ]
 
 -- | The set of opcode names whose tool results may carry secrets and must be
@@ -77,7 +89,7 @@ registryToolDefs' useStub (Registry _ order) =
 -- but returns memory content (not vault secrets), so redacting it hid
 -- harmless output behind @<redacted:secret>@.
 secretOpNames :: Registry -> Set OpName
-secretOpNames (Registry m _) =
+secretOpNames (Registry m _ _) =
   Set.fromList [ opName o | o <- Map.elems m, opName o `Set.member` secretOpcodes ]
 
 -- | The static set of opcode names that return secret values in 'orParts'.

@@ -36,7 +36,7 @@ import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.Set (member)
+import Data.Set (member, fromList)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
@@ -94,7 +94,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -108,7 +108,7 @@ import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp)
+import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp, sessionManageOp)
 import Seal.ISA.Ops.Skills
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
@@ -267,14 +267,17 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , secretGetOp rt
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
+      , memoryManageOp (bMemory backends) (bEmbedding backends)
       , memoryListOp (bMemory backends)
       , memorySearchOp (bEmbedding backends) (bMemory backends)
       , memoryArchiveOp (bMemory backends) (bEmbedding backends)
       , skillWriteOp (bSkills backends) sid
+     , skillManageOp (bSkills backends) sid
       , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
       , agentDefWriteOp (bAgentDefs backends) sid
+     , agentDefManageOp (bAgentDefs backends) sid
       , agentDefReadOp (bAgentDefs backends)
       , agentDefListOp (bAgentDefs backends)
       , agentDefDeleteOp (bAgentDefs backends)
@@ -283,6 +286,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
+     , agentManageOp startWiring
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
@@ -300,9 +304,21 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , sessionListOp paths
       , sessionSearchOp paths
       , sessionGetOp paths
+      , sessionManageOp paths
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
-    reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
+    reg = ISA.hideOpcodes legacyHidden
+            (ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else []))
+    legacyHidden = fromList
+      [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
+      , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
+      , OpName "SKILL_WRITE", OpName "SKILL_LOAD", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+      , OpName "AGENT_DEF_WRITE", OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
+      , OpName "AGENT_DEF_DELETE"
+      , OpName "AGENT_INSTANCES", OpName "AGENT_START", OpName "AGENT_STATUS"
+      , OpName "AGENT_STOP", OpName "AGENT_INTERRUPT"
+      , OpName "SESSION_LIST", OpName "SESSION_SEARCH", OpName "SESSION_GET"
+      ]
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     binAllowList = Nothing
     webSearchCfg = WebSearchConfig
@@ -1065,10 +1081,12 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , secretGetOp (tdVault td)
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
+       , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryListOp (bMemory (tdBaseBackends td))
         , memorySearchOp (bEmbedding (tdBaseBackends td)) (bMemory (tdBaseBackends td))
         , memoryArchiveOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , skillWriteOp (bSkills sessionBackends) childSid
+       , skillManageOp (bSkills sessionBackends) childSid
         , skillLoadOp (bSkills sessionBackends)
         , skillListOp (bSkills sessionBackends)
         , skillDeleteOp (bSkills sessionBackends)
@@ -1142,11 +1160,20 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
   -- authorize: leaf/kill-switch rejections carry the dedicated messages
   -- instead of unknown-tool). The gate is the enforcement — the
   -- blocklist's AGENT_START entry would undo always-present.
-  pure (ISA.mkRegistry
-         (Worker.filterBlocklistedWith
-            (applyDefAllowList def baseOps)
-            bl
-            opName))
+  pure (ISA.hideOpcodes legacyHiddenChild
+          (ISA.mkRegistry
+            (Worker.filterBlocklistedWith
+               (applyDefAllowList def baseOps)
+               bl
+               opName)))
+    where
+      legacyHiddenChild = fromList
+        [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
+        , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
+        , OpName "SKILL_WRITE", OpName "SKILL_LOAD", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+        , OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
+        , OpName "SESSION_LIST", OpName "SESSION_SEARCH", OpName "SESSION_GET"
+        ]
 
 -- | §3.3: enforce the def's @tools@ allow-list as an INTERSECTION with the
 -- harness's base ops (only narrows; unknown names silently drop; the

@@ -39,7 +39,8 @@ spec = describe "Seal.Skills.Prompt" $ do
       T.isInfixOf "<available_skills>" block `shouldBe` True
       T.isInfixOf "</available_skills>" block `shouldBe` True
       T.isInfixOf "- greet: say hello" block `shouldBe` True
-      T.isInfixOf "SKILL_LOAD" block `shouldBe` True
+      T.isInfixOf "SKILL_MANAGE" block `shouldBe` True
+      T.isInfixOf "action=\"load\"" block `shouldBe` True
 
     it "groups skills by skGroup with a header per group" $ do
       let block = availableSkillsBlock

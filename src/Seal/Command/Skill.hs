@@ -4,10 +4,10 @@
 -- as structured records materialized from the Audited log into the
 -- in-memory 'SkillBackend'; @/skill list@ and @/skill info@ read that
 -- backend directly (no filesystem discovery, no audit-trail entry).
--- @/skill load@ dispatches the 'SKILL_LOAD' opcode via the channel-supplied
+-- @/skill load@ dispatches the 'SKILL_MANAGE' opcode (action="load") via the channel-supplied
 -- 'CallDispatcher' (the same closure @/call@ uses), which records an
 -- 'EKHarness' entry to the session transcript with
--- @erMeta.op.name = "SKILL_LOAD"@ and @erMeta.input.id = <id>@ — the
+-- @erMeta.op.name = "SKILL_MANAGE"@ and @erMeta.input.id = <id>@ — the
 -- audit-trail attribution that distinguishes a skill load from a user
 -- pasting the body.
 module Seal.Command.Skill
@@ -118,9 +118,9 @@ infoCmd backend raw = CommandAction $ \caps ->
         Nothing -> ccSend caps ("skill not found: " <> skillIdText sid) >> pure Nothing
         Just s  -> mapM_ (ccSend caps) (renderSkillInfo s) >> pure Nothing
 
--- | @/skill load <id> [message...]@ — dispatch the 'SKILL_LOAD' opcode with
+-- | @/skill load <id> [message...]@ — dispatch the 'SKILL_MANAGE' opcode with
 -- @{"id": <id>, "message": <message>}@ via the channel-supplied
--- 'CallDispatcher'. Mirrors @/call@'s pattern: echo a header line first (so
+-- 'CallDispatcher' (action="load"). Mirrors @/call@'s pattern: echo a header line first (so
 -- the "Command output" bubble is self-contained).
 --
 -- The optional trailing @message@ is forwarded to the dispatcher as a
@@ -152,10 +152,11 @@ loadCmd dispatcher raw message = CommandAction $ \caps -> do
     Left err -> ccSend caps err >> pure Nothing
     Right sid -> do
       let input = object
-            [ "id" .= skillIdText sid
+            [ "action" .= ("load" :: Text)
+            , "id" .= skillIdText sid
             , "message" .= message
             ]
-      res <- dispatcher (OpName "SKILL_LOAD") input
+      res <- dispatcher (OpName "SKILL_MANAGE") input
       case res of
         Left e  -> do
           ccSend caps (renderDispatchError e)

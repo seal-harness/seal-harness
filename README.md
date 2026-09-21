@@ -435,3 +435,4 @@ The project uses a [TODO.md](TODO.md) at the repo root as a navigation layer —
 **FSL-1.1-MIT** (Functional Source License) — source-available with a
 "Competing Use" restriction. Each version converts to MIT license two years
 after its release date. See [LICENSE](LICENSE) for details.
+

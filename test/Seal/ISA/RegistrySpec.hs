@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.RegistrySpec (spec) where
 
+import Data.Set qualified as Set
 import Data.Aeson (Value (..), object)
 import Test.Hspec
 
@@ -45,3 +46,24 @@ spec = describe "Seal.ISA.Registry" $ do
           , stubUntrustedOp (OpName "B")
           ]
     map tdName (registryToolDefs regDup) `shouldBe` [OpName "A", OpName "B"]
+
+  describe "hideOpcodes" $ do
+    let hideReg = mkRegistry
+          [ stubTrustedOp (OpName "MANAGE_OP")
+          , stubTrustedOp (OpName "LEGACY_OP")
+          ]
+        hidden = Set.fromList [OpName "LEGACY_OP"]
+        reg' = hideOpcodes hidden hideReg
+
+    it "omits hidden opcodes from tool definitions" $
+      map tdName (registryToolDefs reg') `shouldBe` [OpName "MANAGE_OP"]
+
+    it "still dispatches hidden opcodes via lookupOp" $
+      fmap opName (lookupOp reg' (OpName "LEGACY_OP")) `shouldBe` Just (OpName "LEGACY_OP")
+
+    it "does not affect non-hidden opcodes" $
+      fmap opName (lookupOp reg' (OpName "MANAGE_OP")) `shouldBe` Just (OpName "MANAGE_OP")
+
+    it "hideOpcodes with empty set is a no-op for tool definitions" $
+      map tdName (registryToolDefs (hideOpcodes Set.empty hideReg))
+        `shouldMatchList` [OpName "MANAGE_OP", OpName "LEGACY_OP"]

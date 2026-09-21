@@ -1858,10 +1858,13 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         // opcode runs). Render as a collapsible ToolCallBlock — collapsed
         // by default showing the opcode name + a one-line summary;
         // expanded shows the full input/result. SKILL_LOAD carries the
-        // skill body in result.body; SETUP_REPO carries status/target
+        // skill body in result.body (now dispatched as SKILL_MANAGE with
+        // action="load"; legacy SKILL_LOAD entries still match for old
+        // transcripts); SETUP_REPO carries status/target
         // (and, on failure, the error text is in the conversation message).
         const opName = (parsed.op as { name?: string } | undefined)?.name
-        if (opName === 'SKILL_LOAD' && parsed.result) {
+        const isSkillLoad = opName === 'SKILL_LOAD' || (opName === 'SKILL_MANAGE' && (parsed.input as { action?: string } | undefined)?.action === 'load')
+        if (isSkillLoad && parsed.result) {
           const input = parsed.input as { id?: string } | undefined
           const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
           const body = result?.body ?? ''
@@ -1873,7 +1876,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           const channel = e.channel
           const tc: ToolCallInfo = {
             id: 'skillload-' + e.id,
-            name: 'SKILL_LOAD',
+            name: opName === 'SKILL_MANAGE' ? 'SKILL_MANAGE' : 'SKILL_LOAD',
             input: input ?? {},
             result: body,
             resultIsError: false,
