@@ -2445,18 +2445,30 @@ export function ChatArea({
     })
   }, [messages])
 
+  // Track the previous session id so we can detect session changes
+  // within the auto-scroll effect (rather than a separate effect that
+  // runs in declaration order — which races with the messages effect
+  // when the data cache delivers entries in the same commit).
+  const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
+
   useEffect(() => {
     if (hasFragment) return
+    // On session change, force scroll to bottom (regardless of where the
+    // user was scrolled in the previous session). This is merged into the
+    // auto-scroll effect rather than a separate effect so it runs in the
+    // same commit — when the data cache delivers entries instantly, a
+    // separate session-change effect would run AFTER this one (effects run
+    // in declaration order), causing the auto-scroll to see the stale
+    // wasAtBottom value from the previous session and skip the scroll.
+    const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
+    prevSessionIdRef.current = selectedSession?.id
+    if (sessionChanged) {
+      wasAtBottom.current = true
+    }
     if (wasAtBottom.current) {
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
-  }, [messages, hasFragment])
-
-  // When the user clicks a different session in the sidebar, force the next
-  // render to auto-scroll to the most recent message.
-  useEffect(() => {
-    wasAtBottom.current = true
-  }, [selectedSession?.id])
+  }, [messages, hasFragment, selectedSession?.id])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
