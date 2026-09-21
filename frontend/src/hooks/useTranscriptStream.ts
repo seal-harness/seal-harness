@@ -236,6 +236,9 @@ export function useTranscriptStream(
     const unsub = sc.onEntry((e) => {
       setEntries((prev) => {
         const next = reconcileEntries(prev, e)
+        if (next.length !== prev.length || (next.length > 0 && prev.length > 0 && next[next.length-1]!.id !== prev[prev.length-1]!.id)) {
+          console.log("[ws] entries " + prev.length + " -> " + next.length + " mode=" + (next.length === prev.length ? "replace" : next.length > prev.length ? "append" : "evict") + " lastId=" + (next.length > 0 ? next[next.length-1]!.id : "none") + " streaming=" + !!e.streaming)
+        }
         // Update the data cache so it stays fresh for this session.
         const sid = currentSessionRef.current
         if (sid !== null) getGlobalDataCache().update(sid, next)

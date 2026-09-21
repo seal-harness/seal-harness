@@ -2415,13 +2415,17 @@ export function ChatArea({
     const el = scrollerRef.current
     if (!el) return
     const onScroll = () => {
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80; wasAtBottom.current = atBottom; console.log("[scroll-listener] wasAtBottom=" + atBottom + " scrollHeight=" + el.scrollHeight + " scrollTop=" + el.scrollTop + " clientHeight=" + el.clientHeight)
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      if (atBottom !== wasAtBottom.current) {
+        console.log("[scroll] wasAtBottom " + wasAtBottom.current + " -> " + atBottom + " scrollTop=" + el.scrollTop + " scrollHeight=" + el.scrollHeight)
+      }
+      wasAtBottom.current = atBottom
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [hasFragment])
 
+  }, [hasFragment])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2458,7 +2462,7 @@ export function ChatArea({
   // messages, not the old session's.
   const needsScrollToBottomRef = useRef(false)
   const scrollMsgSignatureRef = useRef<string>('')
-  const scrollDebugRef = useRef(0)
+  const prevMsgSigRef = useRef<string>("")
 
   // A signature for the current messages array. Changes when the content
   // actually changes (different first message id or count), not just when
@@ -2470,9 +2474,10 @@ export function ChatArea({
   useEffect(() => {
     if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
-    const dbgId = ++scrollDebugRef.current
-    console.log('[scroll:' + dbgId + '] effect1', { sessionChanged, prev: prevSessionIdRef.current, next: selectedSession?.id, msgCount: messages.length, msgSig: msgSignature, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current, hasFragment })
-    prevSessionIdRef.current = selectedSession?.id
+    if (sessionChanged || msgSignature !== prevMsgSigRef.current) {
+      prevMsgSigRef.current = msgSignature
+      console.log("[scroll] effect1", { sessionChanged, session: selectedSession?.id, msgCount: messages.length, msgSig: msgSignature, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current })
+    }
     if (sessionChanged) {
       wasAtBottom.current = true
       needsScrollToBottomRef.current = true
@@ -2480,7 +2485,7 @@ export function ChatArea({
       return
     }
     if (wasAtBottom.current) {
-      console.log('[scroll:' + dbgId + '] effect1 sticky-bottom scroll')
+      // sticky-bottom scroll (not logged to reduce noise)
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
   }, [messages, hasFragment, selectedSession?.id, msgSignature])
@@ -2489,8 +2494,9 @@ export function ChatArea({
   // the new session's content (signature differs from session-change time),
   // then scroll to bottom via rAF.
   useEffect(() => {
-    const dbg2Id = ++scrollDebugRef.current
-    console.log('[scroll:' + dbg2Id + '] effect2', { needsScroll: needsScrollToBottomRef.current, msgCount: messages.length, msgSig: msgSignature, expectedSig: scrollMsgSignatureRef.current, hasFragment })
+    if (needsScrollToBottomRef.current) {
+      console.log("[scroll] effect2", { msgCount: messages.length, msgSig: msgSignature, expectedSig: scrollMsgSignatureRef.current })
+    }
     if (!needsScrollToBottomRef.current) return
     if (hasFragment) {
       needsScrollToBottomRef.current = false
@@ -2501,7 +2507,7 @@ export function ChatArea({
       wasAtBottom.current = true
       requestAnimationFrame(() => {
         const el = scrollerRef.current
-        console.log('[scroll:' + dbg2Id + '] effect2 rAF', { scrollHeight: el?.scrollHeight, clientHeight: el?.clientHeight, scrollTop: el?.scrollTop, msgCount: messages.length, msgSig: msgSignature })
+        console.log("[scroll] effect2 rAF", { scrollHeight: el?.scrollHeight, scrollTop: el?.scrollTop, msgCount: messages.length, msgSig: msgSignature })
         messagesEndRef.current?.scrollIntoView({ block: 'end' })
       })
     }

@@ -531,6 +531,7 @@ class RendererCache {
 
 /** Module-level singleton — survives re-mounts and session switches. */
 let globalRendererCache: RendererCache | null = null
+const globalMsgCountRef: { value: number | null } = { value: null }
 
 function getGlobalRendererCache(): RendererCache {
   if (globalRendererCache === null) {
@@ -564,7 +565,14 @@ export function useTranscriptMessages(
     return []
   }
 
-  return useMemo(() => renderer.update(entries), [entries, renderer])
+  return useMemo(() => {
+    const msgs = renderer.update(entries)
+    if (msgs.length !== (globalMsgCountRef.value ?? 0)) {
+      console.log("[renderer] msgs " + (globalMsgCountRef.value ?? 0) + " -> " + msgs.length + " entries=" + entries.length + " sig=" + (msgs.length > 0 ? msgs[0]!.id + ":" + msgs.length : "empty"))
+      globalMsgCountRef.value = msgs.length
+    }
+    return msgs
+  }, [entries, renderer])
 }
 
 /** Reset the global renderer cache. Test-only — clears all cached
