@@ -36,7 +36,7 @@ import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.Set (member)
+import Data.Set (member, fromList)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
@@ -307,7 +307,18 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , sessionManageOp paths
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
-    reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
+    reg = ISA.hideOpcodes legacyHidden
+            (ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else []))
+    legacyHidden = fromList
+      [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
+      , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
+      , OpName "SKILL_WRITE", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+      , OpName "AGENT_DEF_WRITE", OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
+      , OpName "AGENT_DEF_DELETE"
+      , OpName "AGENT_INSTANCES", OpName "AGENT_START", OpName "AGENT_STATUS"
+      , OpName "AGENT_STOP", OpName "AGENT_INTERRUPT"
+      , OpName "SESSION_LIST", OpName "SESSION_SEARCH", OpName "SESSION_GET"
+      ]
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     binAllowList = Nothing
     webSearchCfg = WebSearchConfig
@@ -1149,11 +1160,20 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
   -- authorize: leaf/kill-switch rejections carry the dedicated messages
   -- instead of unknown-tool). The gate is the enforcement — the
   -- blocklist's AGENT_START entry would undo always-present.
-  pure (ISA.mkRegistry
-         (Worker.filterBlocklistedWith
-            (applyDefAllowList def baseOps)
-            bl
-            opName))
+  pure (ISA.hideOpcodes legacyHiddenChild
+          (ISA.mkRegistry
+            (Worker.filterBlocklistedWith
+               (applyDefAllowList def baseOps)
+               bl
+               opName)))
+    where
+      legacyHiddenChild = fromList
+        [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
+        , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
+        , OpName "SKILL_WRITE", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+        , OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
+        , OpName "SESSION_LIST", OpName "SESSION_SEARCH", OpName "SESSION_GET"
+        ]
 
 -- | §3.3: enforce the def's @tools@ allow-list as an INTERSECTION with the
 -- harness's base ops (only narrows; unknown names silently drop; the
