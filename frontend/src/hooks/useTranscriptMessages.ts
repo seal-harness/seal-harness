@@ -27,7 +27,7 @@
  * ones.
  */
 
-import { useMemo, useRef } from 'react'
+import { useMemo } from 'react'
 import type { Message, MessageContent, ToolCallInfo, TranscriptEntry } from '../types'
 import {
   extractTextFromContent,
@@ -492,13 +492,64 @@ class TranscriptRenderer {
   }
 }
 
-/** React hook: incrementally convert transcript entries to messages.
- *  Uses a ref to persist the renderer state across renders. On session
- *  change (different first entry id), the cache is cleared and rebuilt. */
-export function useTranscriptMessages(entries: TranscriptEntry[]): Message[] {
-  const ref = useRef<TranscriptRenderer | null>(null)
-  if (ref.current === null) {
-    ref.current = new TranscriptRenderer()
+const MAX_CACHED_RENDERERS = 8
+
+/** LRU cache of per-session renderers, persisted across session switches
+ *  in a module-level ref. Each renderer retains its per-entry message cache,
+ *  tool-result index, and dedup state. When the cache is full, the
+ *  least-recently-used renderer is evicted. */
+class RendererCache {
+  private map: Map<string, TranscriptRenderer> = new Map()
+
+  get(sessionId: string): TranscriptRenderer {
+    const r = this.map.get(sessionId)
+    if (r) {
+      // Move to end (most recently used).
+      this.map.delete(sessionId)
+      this.map.set(sessionId, r)
+      return r
+    }
+    const fresh = new TranscriptRenderer()
+    this.map.set(sessionId, fresh)
+    if (this.map.size > MAX_CACHED_RENDERERS) {
+      // Evict oldest (first entry in insertion order).
+      const oldest = this.map.keys().next().value
+      if (oldest) this.map.delete(oldest)
+    }
+    return fresh
   }
-  return useMemo(() => ref.current!.update(entries), [entries])
+}
+
+/** Module-level singleton — survives re-mounts and session switches. */
+let globalRendererCache: RendererCache | null = null
+
+function getGlobalRendererCache(): RendererCache {
+  if (globalRendererCache === null) {
+    globalRendererCache = new RendererCache()
+  }
+  return globalRendererCache
+}
+
+/** React hook: incrementally convert transcript entries to messages.
+ *  Uses a multi-session renderer cache (Map<sessionId, TranscriptRenderer>)
+ *  that persists across session switches. When the user switches back to a
+ *  previously-viewed session, its renderer is retrieved from the cache with
+ *  its per-entry message cache intact — only new entries (arrived via WS
+ *  since the last visit) need processing. The cache holds up to
+ *  MAX_CACHED_RENDERERS sessions (LRU eviction). */
+export function useTranscriptMessages(
+  entries: TranscriptEntry[],
+  sessionId: string | null,
+): Message[] {
+  const renderer = sessionId !== null
+    ? getGlobalRendererCache().get(sessionId)
+    : new TranscriptRenderer() // ephemeral for null session
+
+  return useMemo(() => renderer.update(entries), [entries, renderer])
+}
+
+/** Reset the global renderer cache. Test-only — clears all cached
+ *  renderers so tests start with a clean state. */
+export function _resetRendererCacheForTests(): void {
+  globalRendererCache = null
 }
