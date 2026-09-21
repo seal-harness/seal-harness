@@ -35,6 +35,38 @@ flag remote-only-untrusted
     description: Omit the local untrusted executor from the build (hardened: untrusted execution can only run remotely over SSH)
     default:     False
 
+library seal-gateway-types
+    import: settings
+    exposed-modules:
+        Seal.Gateway.Types
+        Seal.Gateway.Types.Core
+        Seal.Gateway.Types.Tab
+        Seal.Gateway.Types.ChannelKind
+        Seal.Gateway.Types.HarnessId
+        Seal.Gateway.Types.MessageSource
+        Seal.Gateway.Types.Transcript
+        Seal.Gateway.Types.TabList
+        Seal.Gateway.Types.Route
+        Seal.Gateway.Types.Stream
+        Seal.Gateway.Types.ListsSnapshot
+        Seal.Gateway.Types.AesonUtils
+    build-depends:
+        base >= 4.18 && < 5
+      , aeson
+      , bytestring
+      , containers
+      , text
+      , time
+      , unordered-containers
+      , uuid-types
+      , trasa
+      , trasa-server
+      , trasa-openapi-hs
+      , openapi-hs
+      , lens
+      , case-insensitive
+    hs-source-dirs: src-gateway-types
+
 library
     import: settings
     exposed-modules:
@@ -276,6 +308,7 @@ library
       , trasa-openapi-hs
       , openapi-hs
       , http-media
+      , seal-gateway-types
     hs-source-dirs: src
 
 executable seal
@@ -329,6 +362,7 @@ test-suite tests
       , unordered-containers
       , lens
       , openapi-hs
+      , seal-gateway-types
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
