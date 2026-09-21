@@ -2450,25 +2450,50 @@ export function ChatArea({
   // runs in declaration order — which races with the messages effect
   // when the data cache delivers entries in the same commit).
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
+  // When the session changes, we need to scroll to bottom AFTER the new
+  // messages are in the DOM — not in the render where selectedSession
+  // changes (the messages prop hasn't updated yet in that render). This
+  // ref flags that a deferred scroll is needed.
+  const needsScrollToBottomRef = useRef(false)
 
   useEffect(() => {
     if (hasFragment) return
-    // On session change, force scroll to bottom (regardless of where the
-    // user was scrolled in the previous session). This is merged into the
-    // auto-scroll effect rather than a separate effect so it runs in the
-    // same commit — when the data cache delivers entries instantly, a
-    // separate session-change effect would run AFTER this one (effects run
-    // in declaration order), causing the auto-scroll to see the stale
-    // wasAtBottom value from the previous session and skip the scroll.
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
       wasAtBottom.current = true
+      // Don't scroll yet — the messages prop may not have updated in this
+      // render. The data cache delivers entries via setEntries, which
+      // triggers a re-render, but the messages prop chains through
+      // useTranscriptMessages → useMemo → App → ChatArea props, so the
+      // new messages may arrive in the NEXT render. Flag that we need
+      // to scroll once the new messages are committed to the DOM.
+      needsScrollToBottomRef.current = true
+      return
     }
+    // Session didn't change — normal sticky-bottom auto-scroll.
     if (wasAtBottom.current) {
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
   }, [messages, hasFragment, selectedSession?.id])
+
+  // Deferred scroll-to-bottom: when a session change was detected but the
+  // messages hadn't arrived yet, scroll once they do. Uses rAF to ensure
+  // the DOM is painted before scrolling.
+  useEffect(() => {
+    if (!needsScrollToBottomRef.current) return
+    if (hasFragment) {
+      needsScrollToBottomRef.current = false
+      return
+    }
+    if (messages.length > 0) {
+      needsScrollToBottomRef.current = false
+      wasAtBottom.current = true
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView({ block: 'end' })
+      })
+    }
+  }, [messages, hasFragment])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context

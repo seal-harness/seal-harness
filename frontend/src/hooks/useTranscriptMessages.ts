@@ -449,6 +449,15 @@ class TranscriptRenderer {
     return messages
   }
 
+  /** Check whether this renderer is compatible with the given first
+   *  entry id. If the entries belong to a different session (different
+   *  first entry id than what this renderer was built from), the
+   *  renderer should not process them — it would reset and produce
+   *  stale results for one render. */
+  accepts(firstEntryId: string): boolean {
+    return this.lastFirstId === null || this.lastFirstId === firstEntryId
+  }
+
   private reset(): void {
     this.cache.clear()
     this.toolResults.clear()
@@ -544,6 +553,16 @@ export function useTranscriptMessages(
   const renderer = sessionId !== null
     ? getGlobalRendererCache().get(sessionId)
     : new TranscriptRenderer() // ephemeral for null session
+
+  // Guard against renderer/entries mismatch on session switch. When the
+  // user switches sessions, entries (from useTranscriptStream) and
+  // renderer (from the cache, keyed by sessionId) might update in
+  // different React renders. If the entries belong to a different session
+  // than the renderer was built from, return an empty array for this
+  // render — the next render will have both in sync.
+  if (entries.length > 0 && !renderer.accepts(entries[0]!.id)) {
+    return []
+  }
 
   return useMemo(() => renderer.update(entries), [entries, renderer])
 }
