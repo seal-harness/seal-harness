@@ -21,11 +21,10 @@ module Seal.Gateway.Stream
   , extractId
   ) where
 
-import Control.Applicative ((<|>))
 import Control.Exception (SomeException, catch)
 import Control.Monad (forever, forM_)
 import Data.Maybe (fromMaybe)
-import Data.Aeson (object, (.=), (.:), (.:?))
+import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -50,6 +49,8 @@ import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
+
+import Seal.Gateway.Types.Stream (FocusOp (..))
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
@@ -242,22 +243,6 @@ extractId v = case v of
     Just (A.String t) -> t
     _                 -> ""
   _ -> ""
-
--- | The focus op the client sends to change its focused session. Accepts
--- both the frontend's shape (@{"op":"focus","sessionId":"..."}@) and the
--- legacy shape (@{"session":"..."}@) for robustness. The optional @since@
--- field requests replay of entries after the given entry id.
-data FocusOp = FocusOp
-  { foSession :: Text
-  , foSince   :: Maybe Text
-  }
-  deriving stock (Eq, Show)
-
-instance A.FromJSON FocusOp where
-  parseJSON = A.withObject "focus" $ \o ->
-    FocusOp
-      <$> (o .: "sessionId" <|> o .: "session")
-      <*> (o .:? "since")
 
 -- | Look up a header value from the pending request headers (case-insensitive).
 lookupHeader :: Text -> WS.RequestHead -> Maybe String
