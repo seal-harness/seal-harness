@@ -11,14 +11,18 @@ module Seal.Channels.Chat.WsClient
   , WsEventCallback
   ) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryTakeMVar)
+import Control.Concurrent (forkIO)
+import Control.Monad (void)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.WebSockets
   (ClientApp, Connection, receiveData, runClient, sendTextData, sendClose)
+import System.Timeout (timeout)
 
 import Seal.Gateway.Types.Core (SessionId, sessionIdText)
 import Seal.Gateway.Types.Stream
@@ -37,39 +41,33 @@ data WsClient = WsClient
     -- ^ Close the WS connection and stop the background reader.
   }
 
--- | Connect to the gateway's WS server. Spawns a background thread that
--- reads events and calls the callback for each. Returns 'Left' if the
--- connection fails.
+-- | Connect to the gateway's WS server. Forks the connection in a
+-- background thread and returns a 'WsClient' handle immediately. Returns
+-- 'Left' if the connection fails within 5 seconds.
 startWsClient
   :: Text    -- ^ Host (e.g. @"127.0.0.1"@)
   -> Int     -- ^ Port (e.g. 8081)
   -> WsEventCallback
   -> IO (Either Text WsClient)
 startWsClient host port callback = do
-  connVar <- newEmptyMVar
+  connRef <- newIORef Nothing
+  readyVar <- newEmptyMVar
   let app :: ClientApp ()
       app conn = do
-        -- Store the connection so the main thread can build the WsClient.
-        putMVar connVar conn
-        -- Run the reader loop in this thread (blocks until connection closes).
+        writeIORef connRef (Just conn)
+        putMVar readyVar ()
         readerLoop conn callback
-  -- Run the client in a background thread so we can return the WsClient
-  -- handle immediately after the connection is established.
-  -- The connVar is filled once 'app' receives the Connection.
-  _ <- try (runClient (T.unpack host) port "/" app) :: IO (Either SomeException ())
-  -- Try to get the connection — if it was filled, we connected successfully.
-  mConn <- tryTakeMVar connVar
-  case mConn of
-    Nothing -> pure (Left ("WS connect failed: " <> host <> ":" <> T.pack (show port)))
-    Just conn -> do
-      -- Re-put the connection so close can access it.
-      putMVar connVar conn
+  -- Fork the client connection so we can return immediately.
+  _ <- forkIO $ void (try (runClient (T.unpack host) port "/" app) :: IO (Either SomeException ()))
+  -- Wait up to 5s for the connection to be established.
+  mReady <- timeout 5000000 (takeMVar readyVar)
+  case mReady of
+    Nothing -> pure (Left ("WS connect timeout: " <> host <> ":" <> T.pack (show port)))
+    Just () -> do
       let client = WsClient
-            { wcFocus = \sid -> sendFocusOp conn sid Nothing
-            , wcFocusSince = sendFocusOp conn
-            , wcClose = do
-                _ <- try (sendClose conn ("client closed" :: Text)) :: IO (Either SomeException ())
-                pure ()
+            { wcFocus = \sid -> sendFocusOpRef connRef sid Nothing
+            , wcFocusSince = sendFocusOpRef connRef
+            , wcClose = closeConnRef connRef
             }
       pure (Right client)
 
@@ -86,6 +84,24 @@ readerLoop conn callback = go
           case decodeServerEvent bs of
             Just ev -> callback ev >> go
             Nothing -> go  -- unparseable frame; skip
+
+-- | Send a 'FocusOp' via the connection stored in the 'IORef'.
+sendFocusOpRef :: IORef (Maybe Connection) -> SessionId -> Maybe Text -> IO ()
+sendFocusOpRef ref sid mSince = do
+  mConn <- readIORef ref
+  case mConn of
+    Nothing -> pure ()  -- connection not established or closed
+    Just conn -> sendFocusOp conn sid mSince
+
+-- | Close the connection stored in the 'IORef'.
+closeConnRef :: IORef (Maybe Connection) -> IO ()
+closeConnRef ref = do
+  mConn <- readIORef ref
+  case mConn of
+    Nothing -> pure ()
+    Just conn -> do
+      _ <- try (sendClose conn ("client closed" :: Text)) :: IO (Either SomeException ())
+      writeIORef ref Nothing
 
 -- | Send a 'FocusOp' over the WS connection.
 sendFocusOp :: Connection -> SessionId -> Maybe Text -> IO ()

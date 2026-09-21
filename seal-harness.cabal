@@ -76,6 +76,8 @@ library seal-chat-channels
         Seal.Channels.Chat.RateLimit
         Seal.Channels.Chat.HttpClient
         Seal.Channels.Chat.WsClient
+        Seal.Channels.Chat.Class
+        Seal.Channels.Chat.Loop
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -474,6 +476,7 @@ test-suite tests
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
         Seal.Channels.Chat.WsClientSpec
+        Seal.Channels.Chat.LoopSpec
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
