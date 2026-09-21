@@ -7,6 +7,7 @@ module Seal.Gateway.Types
   ( module Seal.Gateway.Types.Core
   , module Seal.Gateway.Types.Tab
   , module Seal.Gateway.Types.ChannelKind
+  , module Seal.Gateway.Types.AllowList
   , module Seal.Gateway.Types.HarnessId
   , module Seal.Gateway.Types.MessageSource
   , module Seal.Gateway.Types.Transcript
@@ -20,6 +21,7 @@ module Seal.Gateway.Types
 import Seal.Gateway.Types.Core
 import Seal.Gateway.Types.Tab
 import Seal.Gateway.Types.ChannelKind
+import Seal.Gateway.Types.AllowList
 import Seal.Gateway.Types.HarnessId
 import Seal.Gateway.Types.MessageSource
 import Seal.Gateway.Types.Transcript

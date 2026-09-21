@@ -41,6 +41,7 @@ library seal-gateway-types
         Seal.Gateway.Types
         Seal.Gateway.Types.Core
         Seal.Gateway.Types.Tab
+        Seal.Gateway.Types.AllowList
         Seal.Gateway.Types.ChannelKind
         Seal.Gateway.Types.HarnessId
         Seal.Gateway.Types.MessageSource
@@ -66,6 +67,22 @@ library seal-gateway-types
       , lens
       , case-insensitive
     hs-source-dirs: src-gateway-types
+
+library seal-chat-channels
+    import: settings
+    exposed-modules:
+        Seal.Channels.Chat.Types
+        Seal.Channels.Chat.Route
+        Seal.Channels.Chat.RateLimit
+    build-depends:
+        base >= 4.18 && < 5
+      , aeson
+      , text
+      , time
+      , stm
+      , containers
+      , seal-gateway-types
+    hs-source-dirs: src-chat-channels
 
 library
     import: settings
@@ -309,6 +326,7 @@ library
       , openapi-hs
       , http-media
       , seal-gateway-types
+      , seal-chat-channels
     hs-source-dirs: src
 
 executable seal
@@ -363,6 +381,7 @@ test-suite tests
       , lens
       , openapi-hs
       , seal-gateway-types
+       , seal-chat-channels
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -442,6 +461,9 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.ClassSpec
+        Seal.Channels.Chat.RouteSpec
+        Seal.Channels.Chat.TypesSpec
+        Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
