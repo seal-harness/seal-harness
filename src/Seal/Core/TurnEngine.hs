@@ -312,7 +312,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
     legacyHidden = fromList
       [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
       , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
-      , OpName "SKILL_WRITE", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+      , OpName "SKILL_WRITE", OpName "SKILL_LOAD", OpName "SKILL_LIST", OpName "SKILL_DELETE"
       , OpName "AGENT_DEF_WRITE", OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
       , OpName "AGENT_DEF_DELETE"
       , OpName "AGENT_INSTANCES", OpName "AGENT_START", OpName "AGENT_STATUS"
@@ -1170,7 +1170,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
       legacyHiddenChild = fromList
         [ OpName "MEMORY_WRITE", OpName "MEMORY_READ", OpName "MEMORY_LIST"
         , OpName "MEMORY_SEARCH", OpName "MEMORY_ARCHIVE"
-        , OpName "SKILL_WRITE", OpName "SKILL_LIST", OpName "SKILL_DELETE"
+        , OpName "SKILL_WRITE", OpName "SKILL_LOAD", OpName "SKILL_LIST", OpName "SKILL_DELETE"
         , OpName "AGENT_DEF_READ", OpName "AGENT_DEF_LIST"
         , OpName "SESSION_LIST", OpName "SESSION_SEARCH", OpName "SESSION_GET"
         ]

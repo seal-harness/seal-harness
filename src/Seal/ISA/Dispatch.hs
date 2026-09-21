@@ -25,8 +25,9 @@ module Seal.ISA.Dispatch
 
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask)
-import Data.Aeson (Value, object, (.=))
+import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Types (parseMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -203,7 +204,7 @@ mkInvocationEntry name input = do
 -- body only).
 recordSkillLoadResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
 recordSkillLoadResult h (OpName nm) input result mChannel
-  | nm == "SKILL_LOAD" && not (orIsError result) = do
+  | isSkillLoadOp nm input && not (orIsError result) = do
       now <- getCurrentTime
       let channelMeta = case mChannel of
             Just ch  -> [("channel", A.String ch)]
@@ -230,6 +231,17 @@ recordSkillLoadResult h (OpName nm) input result mChannel
             [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
       tfwRecordAndAck h (TwoFileWrite convMsgs entry)
   | otherwise = pure ()
+
+-- | Predicate: is this opcode invocation a skill-load? Matches the
+-- consolidated @SKILL_MANAGE@ with @action="load"@, and also the legacy
+-- @SKILL_LOAD@ name (for backward compatibility with old transcripts and
+-- any caller still dispatching the legacy shim).
+isSkillLoadOp :: Text -> Value -> Bool
+isSkillLoadOp nm input =
+  nm == "SKILL_LOAD"
+  || (nm == "SKILL_MANAGE" && parseAction input == Just ("load" :: Text))
+  where
+    parseAction = parseMaybe (withObject "input" (.: "action"))
 
 -- | Record the result of a 'SETUP_REPO' opcode invocation as an
 -- 'EKHarness' transcript entry + a conversation message. Unlike
