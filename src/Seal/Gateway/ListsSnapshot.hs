@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
 -- | The wire snapshot for the WS @lists@ frame and the REST @GET /api/lists@
 -- endpoint. Carries the partitioned session lists (mutually exclusive by
 -- construction via 'partitionSessions') plus the set of sessions currently
@@ -7,6 +5,11 @@
 -- sidebar without waiting for the next harness-status event). The WS frame
 -- wraps this with @{"type": "lists", ...}@ (added by the broadcast path);
 -- the REST body is the bare record (no @type@ field).
+--
+-- The 'ListsSnapshotWire' type lives in 'Seal.Gateway.Types.ListsSnapshot'
+-- (the 'seal-gateway-types' library stanza). Only the builder
+-- ('buildListsSnapshot') stays here — it depends on 'TabsHandle',
+-- 'SealPaths', and 'SessionStore' (server-internal types).
 --
 -- Takes 'TabsHandle' + 'SealPaths' directly (NOT 'ApiDeps') so this module
 -- does NOT import 'Seal.Gateway.API' — avoids a source-level import cycle
@@ -16,40 +19,17 @@ module Seal.Gateway.ListsSnapshot
   , buildListsSnapshot
   ) where
 
-import Data.Aeson (ToJSON (..), object, (.=))
-import Data.Aeson qualified as A
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Text (Text)
-import GHC.Generics (Generic)
 
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Gateway.Types.Core (SessionId, sessionIdText)
+import Seal.Gateway.Types.ListsSnapshot (ListsSnapshotWire (..))
 import Seal.Gateway.SessionJson (sessionInfoJsonWithSnippet, tabToJson)
 import Seal.Session.Store (listArchivedSessions, listSessions)
 import Seal.Tabs (snapshotTabs, TabsHandle)
 import Seal.Tabs.Partition (PartitionedSessions (..), partitionSessions)
 import Seal.Tabs.Types (tlTabs)
-
--- | The partitioned snapshot. Haskell record fields use the @lsw@ prefix;
--- the 'ToJSON' instance drops it (wire keys: @tabs@, @recentSessions@,
--- @archivedSessions@, @tabSessions@, @thinkingSessionIds@).
-data ListsSnapshotWire = ListsSnapshotWire
-  { lswTabs             :: [A.Value]
-  , lswRecentSessions   :: [A.Value]
-  , lswArchivedSessions :: [A.Value]
-  , lswTabSessions      :: [A.Value]
-  , lswThinkingSessionIds :: [Text]
-  } deriving stock (Eq, Show, Generic)
-
-instance ToJSON ListsSnapshotWire where
-  toJSON s = object
-    [ "tabs"             .= lswTabs s
-    , "recentSessions"   .= lswRecentSessions s
-    , "archivedSessions" .= lswArchivedSessions s
-    , "tabSessions"      .= lswTabSessions s
-    , "thinkingSessionIds" .= lswThinkingSessionIds s
-    ]
 
 -- | Build the partitioned snapshot. Takes the components directly (not
 -- 'ApiDeps') so this module stays free of a cycle with 'Seal.Gateway.API'.

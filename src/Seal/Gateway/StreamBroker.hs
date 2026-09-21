@@ -2,6 +2,11 @@
 -- | The in-process broker that fans 'BrokerEvent's to every subscribed WS
 -- connection, filtering by each connection's focused session. STM-backed:
 -- a 'TVar' of subscribers + a global cap.
+--
+-- 'BrokerEvent' is re-exported from 'Seal.Gateway.Types.Stream' (the
+-- canonical home in the 'seal-gateway-types' library stanza). The runtime
+-- types ('Subscriber', 'StreamBroker') and all IO functions stay here
+-- because they carry STM state — a server-internal concern.
 module Seal.Gateway.StreamBroker
   ( BrokerEvent (..)
   , Subscriber (..)
@@ -30,21 +35,8 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 
-import Seal.Core.Types (SessionId)
-
--- | One event the broker fans out to subscribers.
-data BrokerEvent
-  = BeEntryRecorded SessionId Value   -- ^ a transcript entry (the JSON the WS peer receives)
-  | BeEntryUpdate SessionId Value      -- ^ a streaming entry whose text is still growing (the WS peer renders as an @entry-update@ event, replacing the in-place entry by id)
-  | BeHarnessStatus Value             -- ^ a harness liveness change
-  | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
-  | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
-  | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
-  | BeActivity SessionId Value          -- ^ a per-session activity signal (harness-status / reply-delivered) the WS peer renders as an @activity@ envelope
-  | BeAgentDefsChanged                 -- ^ agent defs were created/updated/deleted; clients should re-fetch
-  | BeSkillsChanged                    -- ^ skills were created/updated/deleted; clients should re-fetch
-  | BeReposChanged                     -- ^ the source-control repo registry was mutated; clients should re-fetch /api/repos
-  deriving stock (Eq, Show)
+import Seal.Gateway.Types.Core (SessionId)
+import Seal.Gateway.Types.Stream (BrokerEvent (..))
 
 -- | The per-subscriber state: the focused session (via an 'TVar' so the
 -- connection thread can update it on focus without re-subscribing), a
