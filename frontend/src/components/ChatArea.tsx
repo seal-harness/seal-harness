@@ -2415,11 +2415,7 @@ export function ChatArea({
     const el = scrollerRef.current
     if (!el) return
     const onScroll = () => {
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-      if (atBottom !== wasAtBottom.current) {
-        console.log("[scroll] wasAtBottom " + wasAtBottom.current + " -> " + atBottom + " scrollTop=" + el.scrollTop + " scrollHeight=" + el.scrollHeight)
-      }
-      wasAtBottom.current = atBottom
+      wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
@@ -2449,69 +2445,30 @@ export function ChatArea({
     })
   }, [messages])
 
-  // Track the previous session id so we can detect session changes
-  // within the auto-scroll effect (rather than a separate effect that
-  // runs in declaration order — which races with the messages effect
-  // when the data cache delivers entries in the same commit).
+  // Track the previous session id so we can detect session changes within
+  // the auto-scroll effect. Always update it here so sessionChanged is
+  // only true on the render where the session actually changed.
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
-  // When the session changes, we need to scroll to bottom AFTER the new
-  // session's messages are actually in the DOM. We record a message
-  // signature (first message id + count) at session-change time, then
-  // wait until the messages prop changes to a DIFFERENT signature before
-  // scrolling. This ensures we scroll to the bottom of the NEW session's
-  // messages, not the old session's.
-  const needsScrollToBottomRef = useRef(false)
-  const scrollMsgSignatureRef = useRef<string>('')
-  const prevMsgSigRef = useRef<string>("")
-
-  // A signature for the current messages array. Changes when the content
-  // actually changes (different first message id or count), not just when
-  // the array reference changes.
-  const msgSignature = messages.length > 0
-    ? messages[0]!.id + ':' + messages.length
-    : 'empty'
 
   useEffect(() => {
     if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
-    if (sessionChanged || msgSignature !== prevMsgSigRef.current) {
-      prevMsgSigRef.current = msgSignature
-      console.log("[scroll] effect1", { sessionChanged, session: selectedSession?.id, msgCount: messages.length, msgSig: msgSignature, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current })
-    }
+    prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
+      // Session switched — scroll to the bottom of whatever is currently
+      // rendered. If the new session's messages are already in props
+      // (cache hit), this scrolls to the right place. If they haven't
+      // arrived yet (HTTP fetch), this scrolls to the bottom of the
+      // loading/empty view, and the sticky-bottom scroll on the next
+      // render (when the real messages arrive) will scroll again.
       wasAtBottom.current = true
-      needsScrollToBottomRef.current = true
-      scrollMsgSignatureRef.current = msgSignature
+      messagesEndRef.current?.scrollIntoView({ block: 'end' })
       return
     }
     if (wasAtBottom.current) {
-      // sticky-bottom scroll (not logged to reduce noise)
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
   }, [messages, hasFragment, selectedSession?.id])
-
-  // Deferred scroll-to-bottom: wait until the messages actually change to
-  // the new session's content (signature differs from session-change time),
-  // then scroll to bottom via rAF.
-  useEffect(() => {
-    if (needsScrollToBottomRef.current) {
-      console.log("[scroll] effect2", { msgCount: messages.length, msgSig: msgSignature, expectedSig: scrollMsgSignatureRef.current })
-    }
-    if (!needsScrollToBottomRef.current) return
-    if (hasFragment) {
-      needsScrollToBottomRef.current = false
-      return
-    }
-    if (msgSignature !== scrollMsgSignatureRef.current) {
-      needsScrollToBottomRef.current = false
-      wasAtBottom.current = true
-      requestAnimationFrame(() => {
-        const el = scrollerRef.current
-        console.log("[scroll] effect2 rAF", { scrollHeight: el?.scrollHeight, scrollTop: el?.scrollTop, msgCount: messages.length, msgSig: msgSignature })
-        messagesEndRef.current?.scrollIntoView({ block: 'end' })
-      })
-    }
-  }, [messages, hasFragment])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
@@ -2613,6 +2570,7 @@ export function ChatArea({
               onClick={() => {
                 const el = scrollerRef.current
                 if (el) el.scrollTo({ top: el.scrollHeight })
+                wasAtBottom.current = true
               }}
             >
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
