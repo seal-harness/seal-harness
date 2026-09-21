@@ -2488,7 +2488,7 @@ export function ChatArea({
       // sticky-bottom scroll (not logged to reduce noise)
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
-  }, [messages, hasFragment, selectedSession?.id, msgSignature])
+  }, [messages, hasFragment, selectedSession?.id])
 
   // Deferred scroll-to-bottom: wait until the messages actually change to
   // the new session's content (signature differs from session-change time),
@@ -2511,7 +2511,7 @@ export function ChatArea({
         messagesEndRef.current?.scrollIntoView({ block: 'end' })
       })
     }
-  }, [messages, hasFragment, msgSignature])
+  }, [messages, hasFragment])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
