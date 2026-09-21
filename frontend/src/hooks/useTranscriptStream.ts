@@ -119,26 +119,37 @@ export function reconcileEntries(
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
   const done = perf.begin('reconcileEntries')
-  // Evict any streaming placeholder when a finalized entry arrives.
+  // When a finalized entry arrives, check if there's a streaming
+  // placeholder with the SAME id — if so, replace it in place (stable
+  // position, no flicker). Only evict streaming placeholders with a
+  // DIFFERENT id (stale placeholders from a different entry).
   let base = existing
   if (!incoming.streaming) {
     const streamingIdx = existing.findIndex((e) => e.streaming)
     if (streamingIdx !== -1) {
+      if (existing[streamingIdx]!.id === incoming.id) {
+        // Same id — replace the streaming placeholder in place with the
+        // finalized entry. This keeps the position stable and prevents
+        // the flicker of evict-then-append.
+        const next = existing.slice()
+        next[streamingIdx] = incoming
+        done({ count: existing.length, meta: { mode: 'replace-streaming' } })
+        return next
+      }
+      // Different id — evict the stale streaming placeholder.
       base = existing.filter((_, i) => i !== streamingIdx)
     }
   }
   for (let i = 0; i < base.length; i++) {
     if (base[i]!.id === incoming.id) {
-      // Replace in place (stable timestamp keeps sort order intact; streaming
-      // entry-update entries carry their original timestamp throughout).
+      // Replace in place (same id, non-streaming entry updated).
       const next = base.slice()
       next[i] = incoming
       done({ count: existing.length, meta: { mode: 'replace' } })
       return next
     }
   }
-  // Append-only: new entries always go at the end. The HTTP seed provides
-  // the initial sorted array; WS events arrive in append order.
+  // Append-only: new entries always go at the end.
   const next = base.slice()
   next.push(incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
