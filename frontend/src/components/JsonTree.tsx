@@ -2,18 +2,32 @@ import { useState } from 'react'
 
 const INDENT_PX = 16
 
+/**
+ * Default field names used to build a preview string when an object is
+ * collapsed.  Fields that exist in the object and appear in this list are
+ * rendered as `key: value` pairs (truncated) on the collapsed preview line.
+ */
+const DEFAULT_PREVIEW_FIELDS = ['name', 'description', 'title', 'id']
+
+/**
+ * Maximum length of each field value in the collapsed preview.  Longer
+ * values are truncated with an ellipsis character.
+ */
+const PREVIEW_FIELD_MAX_LEN = 60
+
 interface JsonValueProps {
   value: unknown
   indent: number
   trailing: boolean
   keyPrefix: string | null
   defaultExpanded: boolean
+  previewFields: string[]
 }
 
-export function JsonTree({ value }: { value: unknown }) {
+export function JsonTree({ value, previewFields = DEFAULT_PREVIEW_FIELDS }: { value: unknown; previewFields?: string[] }) {
   return (
     <div className="json-tree" data-testid="formatted-json-body">
-      <JsonValue value={value} indent={0} trailing={false} keyPrefix={null} defaultExpanded />
+      <JsonValue value={value} indent={0} trailing={false} keyPrefix={null} defaultExpanded previewFields={previewFields} />
     </div>
   )
 }
@@ -57,7 +71,70 @@ function previewText(value: unknown): string {
   return String(value)
 }
 
-function JsonValue({ value, indent, trailing, keyPrefix, defaultExpanded }: JsonValueProps) {
+/**
+ * Truncate a string to `maxLen` characters, appending an ellipsis if
+ * truncation occurred.  Returns the original string if it fits.
+ */
+function truncate(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s
+  return s.slice(0, maxLen) + '…'
+}
+
+/**
+ * Render a single preview field value as a short string suitable for
+ * inline display.  Strings are shown without their surrounding quotes
+ * (the preview is already visually distinct via styling).  Primitives
+ * are stringified.  Complex values (objects/arrays) are skipped — they
+ * don't make useful one-line previews.
+ */
+function previewFieldValue(value: unknown): string | null {
+  if (value === null) return 'null'
+  if (typeof value === 'string') return truncate(value, PREVIEW_FIELD_MAX_LEN)
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  // Objects, arrays, and multi-line strings are not useful as inline previews.
+  return null
+}
+
+/**
+ * Build a preview string for a collapsed object by extracting the values
+ * of any configured preview fields that exist in the object.  Returns null
+ * if no preview fields are present, in which case the caller should fall
+ * back to the generic `{N keys}` summary.
+ */
+function objectPreview(value: Record<string, unknown>, previewFields: string[]): string | null {
+  const parts: string[] = []
+  for (const field of previewFields) {
+    if (field in value) {
+      const rendered = previewFieldValue(value[field])
+      if (rendered !== null) {
+        parts.push(`${field}: ${rendered}`)
+      }
+    }
+  }
+  if (parts.length === 0) return null
+  return parts.join(', ')
+}
+
+/**
+ * Heuristic: if an object has exactly one primitive field (string, number,
+ * boolean, or null) and all remaining fields are complex (objects or
+ * arrays), show that lone primitive field as the preview.  This catches
+ * common patterns like { role: "user", content: [...] } where the
+ * primitive field is the most useful summary.  Returns null if the
+ * heuristic does not apply.
+ */
+function lonePrimitivePreview(value: Record<string, unknown>): string | null {
+  const primitiveEntries = Object.entries(value).filter(
+    ([, v]) => !isComplex(v),
+  )
+  if (primitiveEntries.length !== 1) return null
+  const [key, val] = primitiveEntries[0]!
+  const rendered = previewFieldValue(val)
+  if (rendered === null) return null
+  return `${key}: ${rendered}`
+}
+
+function JsonValue({ value, indent, trailing, keyPrefix, defaultExpanded, previewFields }: JsonValueProps) {
   if (value === null) {
     return <PrimitiveRow indent={indent} keyPrefix={keyPrefix} trailing={trailing} className="json-null" text="null" />
   }
@@ -77,7 +154,7 @@ function JsonValue({ value, indent, trailing, keyPrefix, defaultExpanded }: Json
     )
   }
   if (Array.isArray(value)) {
-    return <ArrayNode value={value} indent={indent} trailing={trailing} keyPrefix={keyPrefix} defaultExpanded={defaultExpanded} />
+    return <ArrayNode value={value} indent={indent} trailing={trailing} keyPrefix={keyPrefix} defaultExpanded={defaultExpanded} previewFields={previewFields} />
   }
   if (t === 'object') {
     return (
@@ -87,6 +164,7 @@ function JsonValue({ value, indent, trailing, keyPrefix, defaultExpanded }: Json
         trailing={trailing}
         keyPrefix={keyPrefix}
         defaultExpanded={defaultExpanded}
+        previewFields={previewFields}
       />
     )
   }
@@ -217,12 +295,14 @@ function ObjectNode({
   trailing,
   keyPrefix,
   defaultExpanded,
+  previewFields,
 }: {
   value: Record<string, unknown>
   indent: number
   trailing: boolean
   keyPrefix: string | null
   defaultExpanded: boolean
+  previewFields: string[]
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded)
   const entries = Object.entries(value)
@@ -230,6 +310,7 @@ function ObjectNode({
   if (entries.length === 0) {
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
+        <span className="json-toggle-spacer" aria-hidden="true" />
         {keyPrefix !== null && <KeyPrefix name={keyPrefix} />}
         <span className="json-punct">{'{}'}</span>
         {trailing && <span className="json-punct">,</span>}
@@ -237,15 +318,18 @@ function ObjectNode({
     )
   }
 
-  // When collapsed (or as the collapse toggle row for expanded), show the
-  // opening brace line with toggle.
+  // When collapsed, show the opening brace line with toggle and a preview.
+  // If the object has any of the configured preview fields, show their
+  // values instead of the generic "{N keys}" count.  If no configured
+  // fields match, try the lone-primitive heuristic before falling back.
   if (!expanded) {
+    const preview = objectPreview(value, previewFields) ?? lonePrimitivePreview(value) ?? previewText(value)
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
         <Toggle expanded={false} onToggle={() => setExpanded(true)} />
         {keyPrefix !== null && <KeyPrefix name={keyPrefix} />}
         <span className="json-punct">{'{'}</span>
-        <span className="json-collapsed-preview"> {previewText(value)} </span>
+        <span className="json-collapsed-preview"> {preview} </span>
         <span className="json-punct">{'}'}</span>
         {trailing && <span className="json-punct">,</span>}
       </div>
@@ -267,6 +351,7 @@ function ObjectNode({
           indent={indent + 1}
           trailing={i < entries.length - 1}
           defaultExpanded={false}
+          previewFields={previewFields}
         />
       ))}
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
@@ -283,18 +368,21 @@ function ArrayNode({
   trailing,
   keyPrefix,
   defaultExpanded,
+  previewFields,
 }: {
   value: unknown[]
   indent: number
   trailing: boolean
   keyPrefix: string | null
   defaultExpanded: boolean
+  previewFields: string[]
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded)
 
   if (value.length === 0) {
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
+        <span className="json-toggle-spacer" aria-hidden="true" />
         {keyPrefix !== null && <KeyPrefix name={keyPrefix} />}
         <span className="json-punct">{'[]'}</span>
         {trailing && <span className="json-punct">,</span>}
@@ -330,6 +418,7 @@ function ArrayNode({
           indent={indent + 1}
           trailing={i < value.length - 1}
           defaultExpanded={false}
+          previewFields={previewFields}
         />
       ))}
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
@@ -355,12 +444,14 @@ function FieldValue({
   indent,
   trailing,
   defaultExpanded,
+  previewFields,
 }: {
   fieldKey: string | null
   value: unknown
   indent: number
   trailing: boolean
   defaultExpanded: boolean
+  previewFields: string[]
 }) {
   // For complex values, use the existing node components which already
   // handle their own toggle.  The `defaultExpanded` controls the initial
@@ -373,6 +464,7 @@ function FieldValue({
         trailing={trailing}
         keyPrefix={fieldKey}
         defaultExpanded={defaultExpanded}
+        previewFields={previewFields}
       />
     )
   }
