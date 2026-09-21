@@ -262,3 +262,134 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           (object ["session_id" .= sessionIdText (smId meta)]))
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
         T.isInfixOf "secret-value-123" recorded `shouldBe` False
+
+  -- -----------------------------------------------------------------------
+  -- SESSION_MANAGE (consolidated opcode)
+  -- -----------------------------------------------------------------------
+  describe "SESSION_MANAGE" $ do
+    describe "action = new" $ do
+      it "creates a new session and returns its id + metadata" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+              op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend (object ["action" .= ("new" :: Text)]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> T.null t `shouldBe` False
+            _ -> expectationFailure "expected a single text part"
+
+      it "accepts optional provider/model/description" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+              op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend
+            (object
+              [ "action" .= ("new" :: Text)
+              , "provider" .= ("ollama" :: Text)
+              , "model" .= ("llama3" :: Text)
+              , "description" .= ("test session" :: Text)
+              ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> T.isInfixOf "ollama" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+
+    describe "action = list" $ do
+      it "returns an empty message when no sessions exist" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+              op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> t `shouldBe` "(no sessions found)"
+            _ -> expectationFailure "expected a single text part"
+
+      it "lists existing sessions" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+          _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          let op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> do
+              T.isInfixOf "claude-opus-4" t `shouldBe` True
+              T.isInfixOf "anthropic" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+
+    describe "action = search" $ do
+      it "finds sessions by description match" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
+          let op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend
+            (object ["action" .= ("search" :: Text), "query" .= ("auth" :: Text)]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> T.isInfixOf "auth" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+
+      it "errors on missing query" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+              op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend (object ["action" .= ("search" :: Text)]))
+          orIsError r `shouldBe` True
+
+    describe "action = get" $ do
+      it "returns transcript entries for a session with conversation" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          seedConversation paths (smId meta)
+            [ userMsg "Hello world"
+            , assistantMsg "Hi there"
+            ]
+          let op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend
+            (object
+              [ "action" .= ("get" :: Text)
+              , "session_id" .= sessionIdText (smId meta)
+              ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> do
+              T.isInfixOf "Hello world" t `shouldBe` True
+              T.isInfixOf "Hi there" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+
+      it "errors on missing session_id" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+              op = sessionManageOp paths
+          r <- runTestApp (opRun op localBackend (object ["action" .= ("get" :: Text)]))
+          orIsError r `shouldBe` True
+
+    describe "authorize gate" $ do
+      it "accepts new with no extra fields" $
+        opAuthorize (sessionManageOp undefined)
+          (object ["action" .= ("new" :: Text)])
+          `shouldBe` Right ()
+
+      it "accepts list with no extra fields" $
+        opAuthorize (sessionManageOp undefined)
+          (object ["action" .= ("list" :: Text)])
+          `shouldBe` Right ()
+
+      it "rejects search without query" $
+        opAuthorize (sessionManageOp undefined)
+          (object ["action" .= ("search" :: Text)])
+          `shouldBe` Left "search requires {query:string}"
+
+      it "rejects get without session_id" $
+        opAuthorize (sessionManageOp undefined)
+          (object ["action" .= ("get" :: Text)])
+          `shouldBe` Left "get requires {session_id:string}"
+
+      it "rejects unknown action" $
+        opAuthorize (sessionManageOp undefined)
+          (object ["action" .= ("frobnicate" :: Text)])
+          `shouldBe` Left "unknown session action: frobnicate"

@@ -110,7 +110,7 @@ spec = describe "Seal.Command.Skill" $ do
 
   describe "/skill commands" $ do
     -- A placeholder dispatcher for the list/info tests (which don't invoke it).
-    let noLoad = fakeErrorDispatcher (OpNotFound (OpName "SKILL_LOAD"))
+    let noLoad = fakeErrorDispatcher (OpNotFound (OpName "SKILL_MANAGE"))
 
     it "list shows defined skills" $ do
       (fc, _) <- makeFakeCaps []
@@ -189,7 +189,7 @@ spec = describe "Seal.Command.Skill" $ do
 
     it "renders a dispatcher Left (OpNotFound) gracefully" $ do
       (fc, _) <- makeFakeCaps []
-      let dispatcher = fakeErrorDispatcher (OpNotFound (OpName "SKILL_LOAD"))
+      let dispatcher = fakeErrorDispatcher (OpNotFound (OpName "SKILL_MANAGE"))
       mTurn <- runSkillWith [] dispatcher ["load", "greet"] fc
       sent <- getSent fc
       case sent of
@@ -200,13 +200,14 @@ spec = describe "Seal.Command.Skill" $ do
       mTurn `shouldBe` Nothing
 
     it "forwards the trailing message in the opcode input" $ do
-      -- /skill load start #123 should dispatch SKILL_LOAD with
+      -- /skill load start #123 should dispatch SKILL_MANAGE with
       -- input.message = "#123" so recordSkillLoadResult appends it to
       -- conversation.jsonl after the skill body.
       (fc, _) <- makeFakeCaps []
       (dispatcher, getInput) <- recordingDispatcher
       mTurn <- runSkillWith [] dispatcher ["load", "start", "#123"] fc
       val <- getInput
+      requireTextField val "action" `shouldReturn` "load"
       requireTextField val "id" `shouldReturn` "start"
       requireTextField val "message" `shouldReturn` "#123"
       mTurn `shouldBe` Just "#123"
@@ -216,6 +217,7 @@ spec = describe "Seal.Command.Skill" $ do
       (dispatcher, getInput) <- recordingDispatcher
       mTurn <- runSkillWith [] dispatcher ["load", "greet"] fc
       val <- getInput
+      requireTextField val "action" `shouldReturn` "load"
       requireTextField val "id" `shouldReturn` "greet"
       requireTextField val "message" `shouldReturn` ""
       mTurn `shouldBe` Just "Skill loaded. Follow the instructions in the skill above."

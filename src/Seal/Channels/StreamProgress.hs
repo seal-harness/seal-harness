@@ -278,15 +278,19 @@ opEmoji (OpName name) = case name of
   "MEMORY_LIST"      -> "\x1F9E0"  -- 🧠 brain
   "MEMORY_SEARCH"    -> "\x1F9E0"  -- 🧠 brain
   "MEMORY_ARCHIVE"   -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_MANAGE"    -> "\x1F9E0"  -- 🧠 brain
   "SKILL_WRITE"      -> "\x1F4DD"  -- 📝 memo
   "SKILL_LOAD"       -> "\x1F4DA"  -- 📚 books
   "SKILL_LIST"       -> "\x1F4DA"  -- 📚 books
   "SKILL_DELETE"     -> "\x1F4DA"  -- 📚 books
+  "SKILL_MANAGE"     -> "\x1F4DA"  -- 📚 books
   "AGENT_DEF_WRITE"  -> "\x1F916"  -- 🤖 robot face
   "AGENT_DEF_READ"   -> "\x1F916"  -- 🤖 robot face
   "AGENT_DEF_LIST"   -> "\x1F916"  -- 🤖 robot face
   "AGENT_DEF_DELETE" -> "\x1F916"  -- 🤖 robot face
+  "AGENT_DEF_MANAGE" -> "\x1F916"  -- 🤖 robot face
   "AGENT_INSTANCES"  -> "\x1F916"  -- 🤖 robot face
+  "AGENT_MANAGE"     -> "\x1F916"  -- 🤖 robot face
   "AGENT_START"      -> "\x1F680"  -- 🚀 rocket
   "AGENT_STATUS"     -> "\x1F916"  -- 🤖 robot face
   "AGENT_STOP"       -> "\x1F6D1"  -- 🛑 stop sign
@@ -299,6 +303,7 @@ opEmoji (OpName name) = case name of
   "HARNESS_STOP"     -> "\x1F5A5\xFE0F"  -- 🖥️ desktop computer
   "OPCODE_DESCRIBE"  -> "\x1F50E"  -- 🔎 magnifying glass tilted right
   "OPCODE_LIST"      -> "\x1F4CB"  -- 📋 clipboard
+  "SESSION_MANAGE"   -> "\x1F4AC"  -- 💬 speech balloon
   _                  -> "\x26A1"   -- ⚡ high voltage
 
 -- | Should the manager send an edit now? Returns 'True' when enough

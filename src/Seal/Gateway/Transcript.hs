@@ -463,18 +463,34 @@ trpToFrontend blk =
 -- A 'Set' rather than a list to make the shared-state surface
 -- discoverable (see the design doc's §8 risk 2).
 userSurfacingOps :: Set.Set Text
-userSurfacingOps = Set.fromList ["SKILL_LOAD", "SETUP_REPO", "ASK_HUMAN"]
+userSurfacingOps = Set.fromList ["SKILL_LOAD", "SKILL_MANAGE", "SETUP_REPO", "ASK_HUMAN"]
 
 -- | Predicate: does a harness payload's @op.name@ fall in
 -- 'userSurfacingOps'? Returns 'False' for payloads with no @op@ key, a
 -- non-object @op@, or no @name@ field — those are dropped by the filter
 -- (matching the pre-v1 behavior for non-approval harness entries).
+-- For @SKILL_MANAGE@, additionally requires @input.action == "load"@
+-- (other SKILL_MANAGE actions like write/list/delete are not user-surfacing).
 isUserSurfacingOp :: KeyMap.KeyMap Value -> Bool
 isUserSurfacingOp o =
   case KeyMap.lookup (Key.fromText "op") o of
     Just (Object opObj) ->
       case KeyMap.lookup (Key.fromText "name") opObj of
-        Just (String n) -> n `Set.member` userSurfacingOps
+        Just (String n)
+          | n == "SKILL_MANAGE" -> isSkillLoadAction o
+          | otherwise -> n `Set.member` userSurfacingOps
+        _               -> False
+    _ -> False
+
+-- | Predicate: does a harness payload's @input.action@ equal @"load"@?
+-- Used to distinguish the user-surfacing skill-load action of
+-- @SKILL_MANAGE@ from its other actions (write/list/delete).
+isSkillLoadAction :: KeyMap.KeyMap Value -> Bool
+isSkillLoadAction o =
+  case KeyMap.lookup (Key.fromText "input") o of
+    Just (Object inputObj) ->
+      case KeyMap.lookup (Key.fromText "action") inputObj of
+        Just (String a) -> a == "load"
         _               -> False
     _ -> False
 

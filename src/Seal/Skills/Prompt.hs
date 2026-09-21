@@ -7,7 +7,7 @@
 -- grouped by 'skGroup', and truncated to a token-safe budget.
 --
 -- The catalog is /teaching/, not enforcement: it tells the model which
--- skills exist and that it should call @SKILL_LOAD@ to read one. It does
+-- skills exist and that it should call @SKILL_MANAGE@ with @action="load"@ to read one. It does
 -- not auto-load skill bodies (only the operator-configured @autoload@ id
 -- is auto-injected, via 'Seal.Skills.Autoload').
 module Seal.Skills.Prompt
@@ -53,7 +53,7 @@ fullBlock :: [Skill] -> Text
 fullBlock skills =
   "<available_skills>\n"
   <> T.intercalate "\n\n" (map renderGroup grouped)
-  <> "\n\nCall SKILL_LOAD with an id to read a skill's full body before relying on it."
+  <> "\n\nCall SKILL_MANAGE with action=\"load\" and an id to read a skill's full body before relying on it."
   <> "\n</available_skills>"
   where
     -- Sort by (group, id) then group by group. Ungrouped (Nothing) sorts
