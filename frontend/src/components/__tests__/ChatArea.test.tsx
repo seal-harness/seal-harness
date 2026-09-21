@@ -1357,7 +1357,7 @@ describe('AskHumanForm', () => {
     if (_resolve) _resolve(true)
   })
 
-  it('resets submitting after a timeout if WS ask_resolved never arrives', async () => {
+  it('shows Answered (not Submitting) after POST resolves true, even without WS', async () => {
     vi.useFakeTimers()
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
@@ -1374,17 +1374,60 @@ describe('AskHumanForm', () => {
       />,
     )
     fireEvent.click(screen.getByText('main'))
-    // The submitting indicator should be visible
+    // Flush the microtask so Promise.resolve(true) settles.
+    await vi.advanceTimersByTimeAsync(0)
+    // The indicator should show "Answered", not the spinner
     expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
-    // Advance past the 15s grace period. This fires the fallback timeout
-    // that resets submitting. The promise microtask (Promise.resolve) is
-    // flushed as part of advancing timers.
+    expect(screen.getByText('Answered')).toBeTruthy()
+    // Advance past the 15s grace period — no false error should appear
+    // (the timeout is gated on !answered).
     await vi.advanceTimersByTimeAsync(16_000)
-    // The submitting indicator should be gone
-    expect(screen.queryByTestId('ask-human-submitting')).toBeNull()
-    // An error should be shown
-    expect(screen.getByText('No confirmation from server — try again')).toBeTruthy()
+    expect(screen.queryByText('No confirmation from server — try again')).toBeNull()
     vi.useRealTimers()
+  })
+
+  // Regression (session 20260921-192522-899): after the user answers an
+  // ASK_HUMAN question and the real pending question is removed (WS
+  // ask_resolved arrives), the AskHumanForm should disappear. But the
+  // transcript's ASK_HUMAN tool call still has no result (the agent hasn't
+  // produced its next response yet), so synthesizePendingQuestions creates
+  // a synthetic question that keeps the form mounted — preserving the
+  // submitting=true state and showing "Submitting…" indefinitely (until
+  // the 15s fallback timeout fires with "No confirmation from server").
+  // The fix: once the user has answered (the real question was removed),
+  // don't synthesize a replacement from the same tool call.
+  it('does NOT re-synthesize a pending question after the user answers (form unmounts)', async () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const initialPq = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={initialPq}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // Click the option — answer is accepted (promise resolves true)
+    fireEvent.click(screen.getByText('main'))
+    expect(onAnswerText).toHaveBeenCalledWith('q1', 'main')
+    // Flush the microtask queue so the resolved promise runs
+    await Promise.resolve()
+    // Simulate the WS ask_resolved event removing the real pending question.
+    // The transcript still has no tool_result for the ASK_HUMAN call.
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={[]}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The form should be gone — no synthetic question should take over
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
+    expect(screen.queryByTestId('ask-human-submitting')).toBeNull()
   })
 
   it('typing + Enter submits the Other textarea', () => {
