@@ -603,6 +603,14 @@ body {
 .json-punct { color: var(--text-muted); }
 .json-collapsed-summary { color: var(--text-faint); font-style: italic; }
 
+.json-collapsed-preview { color: var(--text-faint); font-style: italic; }
+
+.json-toggle-spacer {
+  display: inline-block;
+  width: 21px;
+  flex-shrink: 0;
+}
+
 .json-toggle {
   background: transparent;
   border: none;
@@ -610,7 +618,10 @@ body {
   cursor: pointer;
   font-size: 9px;
   line-height: 1;
-  padding: 0 6px 0 0;
+  padding: 0;
+  display: inline-block;
+  width: 21px;
+  text-align: left;
   font-family: var(--font-mono);
 }
 .json-toggle:hover { color: var(--accent-primary); }

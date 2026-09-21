@@ -99,6 +99,7 @@ describe('BottomBar', () => {
 describe('JsonTree', () => {
   it('renders a primitive object with keys', () => {
     render(<JsonTree value={{ a: 1, b: 'two', c: true }} />)
+    // Top-level object is expanded; primitive fields are shown inline.
     expect(screen.getByText('"a"')).toBeTruthy()
     expect(screen.getByText('1')).toBeTruthy()
     expect(screen.getByText('"two"')).toBeTruthy()
@@ -120,27 +121,176 @@ describe('JsonTree', () => {
     expect(screen.getByText('[]')).toBeTruthy()
   })
 
-  it('toggles an object open/closed via the toggle button', () => {
+  it('toggles the top-level object open/closed via the toggle button', () => {
     render(<JsonTree value={{ a: 1, b: 2 }} />)
-    // Initially expanded — both keys visible.
+    // Top-level is expanded; primitive keys are visible inline.
     expect(screen.getByText('"a"')).toBeTruthy()
-    // Collapse via the toggle button (the first toggle button).
+    // Collapse the top-level object.
     const toggle = screen.getAllByLabelText('Collapse')[0]!
     fireEvent.click(toggle)
     expect(screen.queryByText('"a"')).toBeNull()
-    // The collapsed summary shows "2 keys".
+    // The collapsed preview shows "2 keys".
     expect(screen.getByText(/2 keys/)).toBeTruthy()
     // Re-expand.
     fireEvent.click(screen.getByLabelText('Expand'))
     expect(screen.getByText('"a"')).toBeTruthy()
   })
 
-  it('toggles an array open/closed', () => {
+  it('toggles the top-level array open/closed', () => {
     render(<JsonTree value={[1, 2, 3]} />)
+    // Top-level is expanded; primitive items are visible.
+    expect(screen.getByText('1')).toBeTruthy()
     const toggle = screen.getAllByLabelText('Collapse')[0]!
     fireEvent.click(toggle)
     expect(screen.getByText(/3 items/)).toBeTruthy()
     fireEvent.click(screen.getByLabelText('Expand'))
     expect(screen.getByText('1')).toBeTruthy()
+  })
+
+  it('collapses nested object fields by default', () => {
+    render(<JsonTree value={{ outer: { inner: 1 } }} />)
+    // Top-level is expanded; "outer" key is visible.
+    expect(screen.getByText('"outer"')).toBeTruthy()
+    // The nested object is collapsed by default — "inner" key is NOT visible.
+    expect(screen.queryByText('"inner"')).toBeNull()
+    // A collapsed preview is shown — the lone-primitive heuristic shows 'inner: 1'.
+    expect(screen.getByText(/inner: 1/)).toBeTruthy()
+    // Expand the nested field.
+    const expandBtn = screen.getAllByLabelText('Expand')[0]!
+    fireEvent.click(expandBtn)
+    // Now the inner key is visible.
+    expect(screen.getByText('"inner"')).toBeTruthy()
+  })
+
+  it('collapses nested array fields by default', () => {
+    render(<JsonTree value={{ items: [1, 2] }} />)
+    // Top-level is expanded; "items" key is visible.
+    expect(screen.getByText('"items"')).toBeTruthy()
+    // The nested array is collapsed by default — items are NOT visible.
+    expect(screen.queryByText('1')).toBeNull()
+    // A collapsed preview is shown.
+    expect(screen.getByText(/2 items/)).toBeTruthy()
+    // Expand the nested field.
+    const expandBtn = screen.getAllByLabelText('Expand')[0]!
+    fireEvent.click(expandBtn)
+    expect(screen.getByText('1')).toBeTruthy()
+  })
+
+  it('hides toggle for primitive fields and shows them inline', () => {
+    render(<JsonTree value={{ a: 1, b: 'hi', c: true, d: null }} />)
+    // All primitive fields should be visible without needing to expand.
+    expect(screen.getByText('"a"')).toBeTruthy()
+    expect(screen.getByText('1')).toBeTruthy()
+    expect(screen.getByText('"b"')).toBeTruthy()
+    expect(screen.getByText('"hi"')).toBeTruthy()
+    expect(screen.getByText('"c"')).toBeTruthy()
+    expect(screen.getByText('true')).toBeTruthy()
+    expect(screen.getByText('"d"')).toBeTruthy()
+    expect(screen.getByText('null')).toBeTruthy()
+    // There should be exactly one toggle button (for the top-level object).
+    expect(screen.getAllByRole('button').filter((b) => b.getAttribute('aria-label') === 'Collapse')).toHaveLength(1)
+  })
+
+  it('shows a one-line preview when a multi-line string field is collapsed', () => {
+    const multiline = 'line one\nline two\nline three'
+    render(<JsonTree value={{ text: multiline }} />)
+    // Top-level expanded; "text" key visible.
+    expect(screen.getByText('"text"')).toBeTruthy()
+    // The multi-line string is collapsed by default — full content NOT visible.
+    expect(screen.queryByText('line two')).toBeNull()
+    // A preview is shown.
+    expect(screen.getByText(/line one/)).toBeTruthy()
+    // Expand it.
+    const expandBtn = screen.getAllByLabelText('Expand')[0]!
+    fireEvent.click(expandBtn)
+    // Now the full content is visible.
+    // The full content is inside a <pre> block.
+    expect(screen.getByText(/line two/)).toBeTruthy()
+  })
+
+  it('shows preview fields when an object with name/description is collapsed', () => {
+    const tool = {
+      name: 'FILE_READ',
+      description: 'Read a file from the workspace',
+      parameters: { type: 'object', properties: {} },
+    }
+    render(<JsonTree value={{ tools: [tool] }} />)
+    // Top-level expanded; "tools" key visible.
+    expect(screen.getByText('"tools"')).toBeTruthy()
+    // The tools array is collapsed — expand it.
+    const expandArray = screen.getAllByLabelText('Expand')[0]!
+    fireEvent.click(expandArray)
+    // Now the tool object inside is collapsed — it should show the name and description.
+    expect(screen.getByText(/FILE_READ/)).toBeTruthy()
+    expect(screen.getByText(/Read a file from the workspace/)).toBeTruthy()
+  })
+
+  it('truncates long description values in collapsed preview', () => {
+    const longDesc = 'A'.repeat(120)
+    const tool = { name: 'SEARCH', description: longDesc }
+    render(<JsonTree value={{ tools: [tool] }} />)
+    // Expand the tools array to reveal the collapsed tool object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // The preview should contain a truncated version, not the full 120-char string.
+    const preview = screen.getByText(/SEARCH/)
+    expect(preview.textContent).toBeTruthy()
+    // The full 120 A's should NOT appear in the preview.
+    expect(preview.textContent).not.toContain(longDesc)
+    // An ellipsis should be present.
+    expect(preview.textContent).toContain('…')
+  })
+
+  it('falls back to {N keys} when no preview fields are present', () => {
+    const obj = { foo: 1, bar: 2, baz: 3 }
+    render(<JsonTree value={{ items: obj }} />)
+    // Top-level expanded; "items" key visible.
+    expect(screen.getByText('"items"')).toBeTruthy()
+    // The nested object is collapsed — no preview fields, so fall back to count.
+    expect(screen.getByText(/3 keys/)).toBeTruthy()
+  })
+
+  it('respects custom previewFields prop', () => {
+    const obj = { label: 'my-label', count: 42, name: 'should-not-show' }
+    render(<JsonTree value={{ items: obj }} previewFields={['label', 'count']} />)
+    // Top-level is expanded; "items" is collapsed by default with a preview.
+    // The preview should show label and count (the configured fields), not name.
+    expect(screen.getByText(/my-label/)).toBeTruthy()
+    expect(screen.getByText(/42/)).toBeTruthy()
+    // The collapsed preview should NOT include the "name" field value
+    // since it's not in the custom previewFields list.
+    expect(screen.queryByText(/should-not-show/)).toBeNull()
+  })
+
+  it('shows only preview fields that exist in the object', () => {
+    const obj = { name: 'OnlyName' }
+    render(<JsonTree value={{ tools: [obj] }} />)
+    // Expand the tools array.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // Should show name but not error on missing description.
+    expect(screen.getByText(/OnlyName/)).toBeTruthy()
+    // Should NOT show the generic {N keys} since name was found.
+    expect(screen.queryByText(/1 key/)).toBeNull()
+  })
+
+  it('shows lone primitive field in preview when other fields are all complex', () => {
+    // 'role' is the only primitive; 'content' is an array.
+    const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
+    render(<JsonTree value={{ messages: [msg] }} />)
+    // Expand the messages array to reveal the collapsed msg object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // The collapsed object should show 'role: user' as the preview.
+    expect(screen.getByText(/role: user/)).toBeTruthy()
+    // Should NOT show the generic {N keys} count.
+    expect(screen.queryByText(/2 keys/)).toBeNull()
+  })
+
+  it('does not use lone-primitive heuristic when multiple primitive fields exist', () => {
+    // Both 'role' and 'status' are primitives; 'content' is an array.
+    const msg = { role: 'user', status: 'sent', content: [] }
+    render(<JsonTree value={{ messages: [msg] }} />)
+    // Expand the messages array to reveal the collapsed msg object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // No configured preview fields match; multiple primitives → fall back to count.
+    expect(screen.getByText(/3 keys/)).toBeTruthy()
   })
 })
