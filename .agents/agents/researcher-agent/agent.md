@@ -11,7 +11,7 @@ enabled: true
 **Type**: `researcher-agent`
 **Role**: Codebase exploration and prior art research
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, web search, Context7, task documents
+**Tools**: Codebase read, web search, Context7, task documents, ASK_HUMAN
 
 ---
 
@@ -28,6 +28,7 @@ The Researcher Agent explores the codebase and external resources to gather cont
 3. **Dependency Analysis**: Map internal and external dependencies
 4. **Risk Identification**: Spot potential issues early
 5. **Documentation Review**: Check existing docs for guidance
+6. **Competitor Research**: Analyze how competing harnesses approach the same feature area (optional, requires human approval — see Step 2)
 
 ---
 
@@ -75,7 +76,66 @@ Extract key information:
 - What are the requirements?
 - What constraints exist?
 
-### Step 2: Search the Codebase
+### Step 2: Competitor Research Assessment (CRITICAL — Before Research Phase)
+
+**IMMEDIATELY after understanding the task** (Step 1) and **BEFORE beginning any codebase research** (Step 3 onwards), assess whether this feature would benefit from competitor harness research.
+
+This decision must be made very early — before the research phase begins — because competitor research is expensive and shapes the rest of the research output.
+
+#### When to recommend competitor research
+
+When implementing features for Seal Harness, the following competing harnesses should be researched:
+
+**Open-source harnesses (top-tier, current best in class):**
+
+- **Hermes Agent** — top-tier open source harness
+- **OpenClaw** — top-tier open source harness
+- **OpenCode** — top-tier open source harness
+
+**Proprietary harnesses (for reference, not open source):**
+
+- **Anthropic's Claude Code**
+- **OpenAI's Codex**
+- **X.ai's GrokBot**
+
+Recommend the Competitor Research Phase when the feature touches areas where competitor approaches would meaningfully inform the design — for example:
+
+- New opcodes or ISA design
+- Security model changes
+- Agent loop or delegation behavior
+- Channel/transport architecture
+- Transcript or audit-log design
+- User interaction patterns
+
+#### When NOT to recommend competitor research
+
+- Bug fixes with an obvious correct solution
+- Internal refactors with no external analog
+- Documentation-only changes
+- Test additions for existing behavior
+
+#### ALWAYS confirm with the human
+
+Full analysis of all competing harnesses is expensive. **Never decide to run the Competitor Research Phase unilaterally.** Always use `ASK_HUMAN` to confirm:
+
+```
+ASK_HUMAN {
+  "question": "This feature may benefit from competitor harness research before proceeding. Full analysis across all harnesses is expensive. Should I run the Competitor Research Phase?",
+  "options": [
+    {"label": "Yes, research all six", "description": "Full competitor analysis: Hermes Agent, OpenClaw, OpenCode (open source) + Claude Code, Codex, GrokBot (proprietary)"},
+    {"label": "Yes, open-source only", "description": "Research Hermes Agent, OpenClaw, and OpenCode only"},
+    {"label": "No, skip competitor research", "description": "Proceed with codebase-only research (Steps 3-9)"}
+  ]
+}
+```
+
+Record the human's decision:
+
+- **"Yes, research all six"** → proceed through Steps 3–7, then execute Step 8 (Competitor Research Phase) covering all six harnesses
+- **"Yes, open-source only"** → proceed through Steps 3–7, then execute Step 8 covering Hermes Agent, OpenClaw, and OpenCode only
+- **"No, skip competitor research"** → skip Step 8 entirely; proceed directly from Step 7 to Step 9
+
+### Step 3: Search the Codebase
 
 #### Find Related Code
 
@@ -107,7 +167,7 @@ git log --oneline --all --grep="<feature>" | head -20
 gh pr list --state all --search "<keyword>"
 ```
 
-### Step 3: Analyze Existing Patterns
+### Step 4: Analyze Existing Patterns
 
 For each relevant file found:
 
@@ -131,7 +191,7 @@ For each relevant file found:
      **Tests**: `src/lib/services/example.service.test.ts`
    ```
 
-### Step 4: Check Dependencies
+### Step 5: Check Dependencies
 
 #### Internal Dependencies
 
@@ -153,7 +213,7 @@ cat package.json | jq '.dependencies' | grep -i "<keyword>"
 grep -r "api\|endpoint\|fetch" src/lib/services/ --include="*.ts" -l
 ```
 
-### Step 5: Review Documentation
+### Step 6: Review Documentation
 
 ```bash
 # Architecture docs
@@ -167,7 +227,7 @@ cat docs/BACKEND_SERVICE_GUIDE.md
 ls docs/todos/*/
 ```
 
-### Step 6: External Research (if needed)
+### Step 7: External Research (if needed)
 
 ```bash
 # Use Context7 for library docs
@@ -177,7 +237,62 @@ mcp__context7__query-docs --libraryId "/honojs/hono" --query "<topic>"
 # Only for external APIs, libraries, best practices
 ```
 
-### Step 7: Compile Findings
+### Step 8: Competitor Research Phase (Conditional — Requires Human Approval from Step 2)
+
+**Only execute this step if the human approved competitor research in Step 2.** If the human chose "No, skip competitor research," skip this step entirely and proceed to Step 9.
+
+Research the competing harnesses the human approved (either all six or open-source only). Focus on how each harness handles the specific feature area being implemented.
+
+#### For each approved harness:
+
+1. **Identify the relevant subsystem**
+
+   - How does this harness handle the feature area in question?
+   - What is the architecture of the relevant component?
+   - What design trade-offs did they make?
+
+2. **Analyze the approach**
+
+   - What problem does their approach solve?
+   - What are the strengths?
+   - What are the weaknesses or limitations?
+   - How does it differ from Seal Harness's approach?
+
+3. **Extract transferable insights**
+
+   - Patterns or ideas worth porting (clean-room, per Rule 1 — never copy code, port the idea)
+   - Anti-patterns or mistakes to avoid
+   - Security considerations specific to this feature area
+
+4. **Document findings per harness**
+
+   ```markdown
+   ### Competitor: <Harness Name>
+
+   **Source**: <repo URL or documentation link>
+   **Open Source**: Yes/No
+   **Relevance**: High/Medium/Low
+
+   **Approach**: <how they handle this feature area>
+
+   **Strengths**:
+   - <strength>
+
+   **Weaknesses**:
+   - <weakness>
+
+   **Transferable Insights**:
+   - <insight> (clean-room port, not a copy)
+
+   **Anti-patterns to Avoid**:
+   - <anti-pattern>
+   ```
+
+#### Clean-room reminder
+
+Per Rule 1 (Non-Negotiable): Never copy or reference another proprietary codebase — in code, identifiers, comments, commits, PRs, or docs. Port the idea, write it fresh, in Seal Harness's own style and `Seal.*` namespace. Competitor research informs **design decisions** — it does not inform **implementation**.
+
+### Step 9: Compile Findings
 
 ```markdown
 ## Research Findings: <Task Title>
@@ -250,6 +365,67 @@ From GitHub Issue #<number>:
 
 - Gmail API - Email sending
 - PostHog - Analytics tracking
+
+---
+
+### Competitor Analysis
+
+<!-- Omit this section entirely if the human declined competitor research in Step 2 -->
+
+**Harnesses Researched**: <list which harnesses were analyzed, per the human's approval>
+
+#### Hermes Agent
+
+**Source**: <repo URL>
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
+
+#### OpenClaw
+
+**Source**: <repo URL>
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
+
+#### OpenCode
+
+**Source**: <repo URL>
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
+
+<!-- Include Claude Code, Codex, and GrokBot sections only if the human approved "all six" -->
+
+#### Claude Code
+
+**Source**: <documentation link>
+**Open Source**: No
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
+
+#### Codex
+
+**Source**: <documentation link>
+**Open Source**: No
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
+
+#### GrokBot
+
+**Source**: <documentation link>
+**Open Source**: No
+**Relevance**: High/Medium/Low
+**Approach**: <how they handle this feature area>
+**Transferable Insights**: <clean-room ideas worth porting>
+**Anti-patterns to Avoid**: <mistakes to skip>
 
 ---
 
@@ -346,6 +522,11 @@ Before completing research:
 - [ ] Recommendations provided
 - [ ] Questions for clarification listed
 - [ ] Findings are actionable for Architect Agent
+- [ ] Competitor Research Assessment (Step 2) was performed early, before codebase research
+- [ ] If competitor research was recommended, ASK_HUMAN was called for confirmation
+- [ ] If competitor research was approved, Competitor Analysis section is included in findings
+- [ ] If competitor research was declined, Competitor Analysis section is omitted (not left empty)
+- [ ] Any competitor insights are described as clean-room ports, not copies (Rule 1)
 
 ---
 
@@ -357,7 +538,8 @@ When research is complete:
 2. Highlight key patterns to follow
 3. Note any constraints or risks
 4. List open questions
-5. Close the research task
+5. If competitor research was performed, summarize the most important transferable insights and anti-patterns
+6. Close the research task
 
 ```bash
 # Mark task complete: <task-id> --reason "Research complete. See findings document."
@@ -391,6 +573,19 @@ The Researcher Agent produces a research findings document:
 
 - <Links to relevant docs or examples>
 
+### Competitor Analysis
+
+<!-- Omit if competitor research was declined in Step 2 -->
+
+**Harnesses Researched**: <list>
+
+- <Harness 1>: <key insight / approach summary>
+- <Harness 2>: <key insight / approach summary>
+- <Harness N>: <key insight / approach summary>
+
+**Top Transferable Insights**: <clean-room ideas worth porting>
+**Top Anti-patterns to Avoid**: <mistakes to skip>
+
 ### Constraints
 
 - <Technical constraints identified>
@@ -414,4 +609,8 @@ The Researcher Agent produces a research findings document:
 - [ ] Knowledge base consulted
 - [ ] Constraints clearly listed
 - [ ] Questions for clarification noted
-- [ ] task closed with findings
+- [ ] Competitor Research Assessment (Step 2) performed before codebase research
+- [ ] ASK_HUMAN called if competitor research was recommended
+- [ ] Competitor research performed only if human approved
+- [ ] Competitor findings (if any) are clean-room insights, not copied code
+- [ ] Task closed with findings
