@@ -1,9 +1,8 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { renderHook } from '@testing-library/react'
-import { useTranscriptMessages } from '../useTranscriptMessages'
+import { useTranscriptMessages, _resetRendererCacheForTests } from '../useTranscriptMessages'
 import { transcriptToMessages } from '../../components/ChatArea'
-import type { TranscriptEntry } from '../../types'
-import type { Message } from '../../types'
+import type { TranscriptEntry, Message } from '../../types'
 
 /** Resolve rawJson provider functions to strings for deep-equal
  *  comparison. Functions can't be compared by toEqual, so we call them
@@ -83,11 +82,15 @@ function threeEntryTranscript(): TranscriptEntry[] {
   ]
 }
 
+beforeEach(() => {
+  _resetRendererCacheForTests()
+})
+
 describe('useTranscriptMessages', () => {
   it('produces the same result as transcriptToMessages for a full transcript', () => {
     const entries = threeEntryTranscript()
     const expected = resolveRawJson(transcriptToMessages(entries))
-    const { result } = renderHook(() => useTranscriptMessages(entries))
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
     expect(resolveRawJson(result.current)).toEqual(expected)
   })
 
@@ -97,7 +100,7 @@ describe('useTranscriptMessages', () => {
 
     // Start with first entry only.
     const { result, rerender } = renderHook(
-      ({ entries }) => useTranscriptMessages(entries),
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
       { initialProps: { entries: [entries[0]!] } },
     )
     // Add second entry.
@@ -111,7 +114,7 @@ describe('useTranscriptMessages', () => {
   it('matches tool calls with tool_results that arrive in later entries', () => {
     const entries = threeEntryTranscript()
     const { result, rerender } = renderHook(
-      ({ entries }) => useTranscriptMessages(entries),
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
       { initialProps: { entries: [entries[0]!, entries[1]!] } },
     )
     // Before e3 arrives, the tool call in e2 has no result.
@@ -143,7 +146,7 @@ describe('useTranscriptMessages', () => {
     })
 
     const { result, rerender } = renderHook(
-      ({ entries }) => useTranscriptMessages(entries),
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
       { initialProps: { entries: [e1] } },
     )
     expect(result.current[0]!.blocks[0]!.text).toBe('partial')
@@ -155,7 +158,7 @@ describe('useTranscriptMessages', () => {
     expect(result.current[0]!.streaming).toBeUndefined()
   })
 
-  it('resets cache on session change (different first entry id)', () => {
+  it('handles session change by using a separate renderer', () => {
     const session1 = threeEntryTranscript()
     const session2 = [
       makeEntry({
@@ -169,14 +172,45 @@ describe('useTranscriptMessages', () => {
     ]
 
     const { result, rerender } = renderHook(
-      ({ entries }) => useTranscriptMessages(entries),
-      { initialProps: { entries: session1 } },
+      ({ entries, sid }) => useTranscriptMessages(entries, sid),
+      { initialProps: { entries: session1, sid: 's1' } },
     )
     expect(result.current).toHaveLength(transcriptToMessages(session1).length)
 
-    rerender({ entries: session2 })
+    rerender({ entries: session2, sid: 's2' })
     const expected = resolveRawJson(transcriptToMessages(session2))
     expect(resolveRawJson(result.current)).toEqual(expected)
+  })
+
+  it('reuses cached renderer when switching back to a previous session', () => {
+    const session1 = threeEntryTranscript()
+    const session2 = [
+      makeEntry({
+        id: 'x1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'session 2' }] }],
+        }),
+      }),
+    ]
+
+    // Load session 1.
+    const { result, rerender } = renderHook(
+      ({ entries, sid }) => useTranscriptMessages(entries, sid),
+      { initialProps: { entries: session1, sid: 's1' } },
+    )
+    const s1Messages = result.current
+    expect(s1Messages).toHaveLength(transcriptToMessages(session1).length)
+
+    // Switch to session 2.
+    rerender({ entries: session2, sid: 's2' })
+    expect(result.current).toHaveLength(transcriptToMessages(session2).length)
+
+    // Switch back to session 1 — should reuse cached renderer.
+    rerender({ entries: session1, sid: 's1' })
+    expect(result.current).toHaveLength(s1Messages.length)
+    // The messages should be the same (cached, not re-processed).
+    expect(resolveRawJson(result.current)).toEqual(resolveRawJson(s1Messages))
   })
 
   it('deduplicates System Prompt and Tools rows', () => {
@@ -199,13 +233,18 @@ describe('useTranscriptMessages', () => {
         payload: JSON.stringify({ system: 'sys', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
       }),
     ]
-    const { result } = renderHook(() => useTranscriptMessages(entries))
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
     expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(result.current.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
   it('handles empty entries', () => {
-    const { result } = renderHook(() => useTranscriptMessages([]))
+    const { result } = renderHook(() => useTranscriptMessages([], 's1'))
+    expect(result.current).toEqual([])
+  })
+
+  it('handles null sessionId', () => {
+    const { result } = renderHook(() => useTranscriptMessages([], null))
     expect(result.current).toEqual([])
   })
 })

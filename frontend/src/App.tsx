@@ -544,7 +544,7 @@ export default function App() {
     return false
   }, [syncPath])
 
-  const transcriptMessages = useTranscriptMessages(entries)
+  const transcriptMessages = useTranscriptMessages(entries, currentSessionId)
   // Keep the ref in sync so handleSendResult can read the current count
   // without depending on transcriptMessages in its callback deps.
   transcriptMsgCountRef.current = transcriptMessages.length
