@@ -49,6 +49,11 @@ seal-harness (server)  ← depends on seal-chat-channels
 - `SessionMap` — conversation key → SessionId map (client-side cursor replacement)
 - `GatewayConfig` — host, httpPort, wsPort, baseUrl
 
+**Prerequisite: Move `AllowList` to `seal-gateway-types`**
+- `Seal.Core.AllowList` is a pure leaf (zero internal deps, just `Data.Set`).
+  Move it to `src-gateway-types/Seal/Gateway/Types/AllowList.hs` and make
+  `Seal.Core.AllowList` a re-export (same pattern as Step 1).
+
 **Route module (pure, no IO):**
 - Reimplements `Seal.Routing.Route.route` using `Seal.Gateway.Types.Tab`
   (TabIndex, tabIndexFromChar). Returns `ChatRoute` ADT:
@@ -139,6 +144,10 @@ class ChatChannel c where
 - Main loop: `ccReceive` → route → dispatch:
   - `ChatFocus idx` → `httpGetTabs` → resolve tab N's session_id →
     `wcFocus sid` → send "focused tab N" to platform
+    → `httpGetTranscript sid` → send last assistant reply to platform
+  - `/tab focus N` is intercepted the same as `/N` (local intercept → WS
+    focus, NOT HTTP send). The routing module parses both forms and returns
+    `ChatFocus idx`.
   - `ChatSlash cmd` → `httpSend` to the conversation's session →
     receive slash result via HTTP response
   - `ChatPlain text` → `httpSend` to the conversation's session →
@@ -269,6 +278,13 @@ WU-4               ──→ WU-5 (server wiring)
 5. **Existing code stays untouched** — no removal of `ChannelDeps`,
    `StreamProgress`, etc. The new package is purely additive.
 
+## Edge cases to test (WU-3/WU-4)
+
+1. **Tab doesn't exist**: `/N` → `httpGetTabs` → tab N missing → send
+   "focus failed: tab index out of range" to platform. No FocusOp sent.
+2. **WS connection drop**: reconnect with `since` field (last entry id).
+3. **Rapid re-subscription**: sending another FocusOp for same session
+   is a no-op; next entry-update carries full accumulated text.
 6. **`seal-gateway-types` may need additions** — if `StreamProgressConfig`
    or `shouldEdit`/`addCursor`/`stripCursor` should be shared, they move
    to `seal-gateway-types`. Otherwise they're reimplemented in
