@@ -883,38 +883,50 @@ function AskHumanForm({
   const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null)
   const opts = pendingQuestion.options ?? []
 
-  // Fallback: if the answer was accepted (promise resolved true) but the WS
-  // ask_resolved event never arrives (e.g. WS disconnected), reset the
-  // submitting state after a grace period so the user isn't permanently
-  // locked out. The WS path unmounts the form; this only fires if it
-  // doesn't.
+  // `answered` is set when the POST resolves true — the answer was
+  // accepted. The form stays mounted (but visually dimmed/disabled) until
+  // the WS ask_resolved event unmounts it. If the WS event never arrives
+  // (disconnected), the form stays harmless: no spinner, no false error,
+  // and re-submission is blocked.
+  const [answered, setAnswered] = useState(false)
+
+  // Fallback: if the POST never resolves (network failure) and the form is
+  // stuck in submitting, reset after a grace period so the user can retry.
+  // This only fires when submitting=true AND answered=false (the POST is
+  // genuinely stuck, not successfully completed).
   useEffect(() => {
-    if (!submitting) return
+    if (!submitting || answered) return
     const id = window.setTimeout(() => {
       setSubmitting(false)
       setError('No confirmation from server — try again')
       setSelectedAnswer(null)
     }, 15_000)
     return () => window.clearTimeout(id)
-  }, [submitting])
+  }, [submitting, answered])
 
   const submit = (answer: string) => {
-    if (!onAnswerText || submitting) return
+    if (!onAnswerText || submitting || answered) return
     setSelectedAnswer(answer)
     setSubmitting(true)
     setError(null)
     const result = onAnswerText(pendingQuestion.id, answer)
     if (result && typeof result.then === 'function') {
       void result.then((accepted) => {
-        if (!accepted) {
+        if (accepted) {
+          // Answer accepted — clear submitting immediately. The form
+          // unmounts when the WS ask_resolved event removes the pending
+          // question; until then, `answered` keeps it disabled.
+          setSubmitting(false)
+          setAnswered(true)
+        } else {
           setSubmitting(false)
           setError('Answer failed — try again')
         }
       })
     } else {
-      // void return (older callback) — assume success; the WS ask_resolved
-      // unmounts the form.
+      // void return (older callback) — assume success.
       setSubmitting(false)
+      setAnswered(true)
     }
   }
 
@@ -939,9 +951,9 @@ function AskHumanForm({
     background: isSelected ? 'rgba(124,108,246,0.12)' : 'var(--bg-sunken)',
     border: `1px solid ${isSelected ? 'var(--accent-primary)' : 'var(--border)'}`,
     color: isSelected ? 'var(--accent-primary)' : 'var(--text-primary)',
-    cursor: submitting ? 'default' : 'pointer',
+    cursor: (submitting || answered) ? 'default' : 'pointer',
     transition: 'background var(--duration-fast) ease, border-color var(--duration-fast) ease, color var(--duration-fast) ease',
-    opacity: submitting && !isSelected ? 0.5 : 1,
+    opacity: (submitting || answered) && !isSelected ? 0.5 : 1,
   })
 
   return (
@@ -949,10 +961,12 @@ function AskHumanForm({
       <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
         {pendingQuestion.question}
       </div>
-      {submitting && (
+      {(submitting || answered) && (
         <div data-testid="ask-human-submitting" className="flex items-center gap-2 text-xs" style={{ color: 'var(--accent-primary)' }}>
-          <span className="composer-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
-          Submitting…
+          {answered ? 'Answered' : (
+            <><span className="composer-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+            Submitting…</>
+          )}
         </div>
       )}
       <div className="flex flex-col gap-2">
@@ -962,7 +976,7 @@ function AskHumanForm({
             type="button"
             role="radio"
             aria-checked={selectedAnswer === opt.label}
-            disabled={submitting}
+            disabled={submitting || answered}
             className="rounded-lg px-3 py-2 text-left ask-human-option"
             style={{ ...optBtnStyle(selectedAnswer === opt.label), width: '100%' }}
             onClick={() => submit(opt.label)}
@@ -984,11 +998,11 @@ function AskHumanForm({
             outline: 'none',
             minHeight: '40px',
             width: '100%',
-            cursor: submitting ? 'default' : 'text',
+            cursor: (submitting || answered) ? 'default' : 'text',
           }}
           placeholder="Type your own answer…"
           value={otherText}
-          disabled={submitting}
+          disabled={submitting || answered}
           onChange={(e) => setOtherText(e.target.value)}
           onKeyDown={onKeyDown}
           rows={1}
@@ -998,7 +1012,7 @@ function AskHumanForm({
             type="button"
             className="px-3 py-1.5 rounded-lg text-xs font-medium"
             style={btnStyle('var(--accent-primary)')}
-            disabled={submitting || !otherText.trim()}
+            disabled={submitting || answered || !otherText.trim()}
             onClick={() => submit(otherText.trim())}
           >
             Submit
@@ -1007,7 +1021,7 @@ function AskHumanForm({
             type="button"
             className="px-3 py-1.5 rounded-lg text-xs font-medium"
             style={btnStyle('var(--text-muted)')}
-            disabled={submitting}
+            disabled={submitting || answered}
             onClick={() => onCancel?.(pendingQuestion.id)}
           >
             Cancel

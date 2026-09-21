@@ -1357,7 +1357,7 @@ describe('AskHumanForm', () => {
     if (_resolve) _resolve(true)
   })
 
-  it('resets submitting after a timeout if WS ask_resolved never arrives', async () => {
+  it('shows Answered (not Submitting) after POST resolves true, even without WS', async () => {
     vi.useFakeTimers()
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
@@ -1374,16 +1374,15 @@ describe('AskHumanForm', () => {
       />,
     )
     fireEvent.click(screen.getByText('main'))
-    // The submitting indicator should be visible
+    // Flush the microtask so Promise.resolve(true) settles.
+    await vi.advanceTimersByTimeAsync(0)
+    // The indicator should show "Answered", not the spinner
     expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
-    // Advance past the 15s grace period. This fires the fallback timeout
-    // that resets submitting. The promise microtask (Promise.resolve) is
-    // flushed as part of advancing timers.
+    expect(screen.getByText('Answered')).toBeTruthy()
+    // Advance past the 15s grace period — no false error should appear
+    // (the timeout is gated on !answered).
     await vi.advanceTimersByTimeAsync(16_000)
-    // The submitting indicator should be gone
-    expect(screen.queryByTestId('ask-human-submitting')).toBeNull()
-    // An error should be shown
-    expect(screen.getByText('No confirmation from server — try again')).toBeTruthy()
+    expect(screen.queryByText('No confirmation from server — try again')).toBeNull()
     vi.useRealTimers()
   })
 
