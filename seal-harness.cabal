@@ -78,6 +78,8 @@ library seal-chat-channels
         Seal.Channels.Chat.WsClient
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
+        Seal.Channels.Chat.Signal
+        Seal.Channels.Chat.Telegram
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -477,6 +479,8 @@ test-suite tests
         Seal.Channels.Chat.HttpClientSpec
         Seal.Channels.Chat.WsClientSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.Chat.SignalAdapterSpec
+        Seal.Channels.Chat.TelegramAdapterSpec
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
