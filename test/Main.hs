@@ -92,6 +92,8 @@ import qualified Seal.Channels.ClassSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.Chat.RouteSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
+import qualified Seal.Channels.Chat.HttpClientSpec
+import qualified Seal.Channels.Chat.WsClientSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
@@ -283,6 +285,8 @@ specs = do
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
+  Seal.Channels.Chat.HttpClientSpec.spec
+  Seal.Channels.Chat.WsClientSpec.spec
   Seal.Channels.LoopSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.SignalSpec.spec

@@ -74,6 +74,8 @@ library seal-chat-channels
         Seal.Channels.Chat.Types
         Seal.Channels.Chat.Route
         Seal.Channels.Chat.RateLimit
+        Seal.Channels.Chat.HttpClient
+        Seal.Channels.Chat.WsClient
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -81,6 +83,12 @@ library seal-chat-channels
       , time
       , stm
       , containers
+      , bytestring
+      , http-client
+      , http-types
+      , websockets
+      , network
+      , async
       , seal-gateway-types
     hs-source-dirs: src-chat-channels
 
@@ -464,6 +472,8 @@ test-suite tests
         Seal.Channels.Chat.RouteSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
+        Seal.Channels.Chat.HttpClientSpec
+        Seal.Channels.Chat.WsClientSpec
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
