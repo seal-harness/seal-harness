@@ -153,8 +153,8 @@ describe('JsonTree', () => {
     expect(screen.getByText('"outer"')).toBeTruthy()
     // The nested object is collapsed by default — "inner" key is NOT visible.
     expect(screen.queryByText('"inner"')).toBeNull()
-    // A collapsed preview is shown for the nested object.
-    expect(screen.getByText(/1 key/)).toBeTruthy()
+    // A collapsed preview is shown — the lone-primitive heuristic shows 'inner: 1'.
+    expect(screen.getByText(/inner: 1/)).toBeTruthy()
     // Expand the nested field.
     const expandBtn = screen.getAllByLabelText('Expand')[0]!
     fireEvent.click(expandBtn)
@@ -270,5 +270,27 @@ describe('JsonTree', () => {
     expect(screen.getByText(/OnlyName/)).toBeTruthy()
     // Should NOT show the generic {N keys} since name was found.
     expect(screen.queryByText(/1 key/)).toBeNull()
+  })
+
+  it('shows lone primitive field in preview when other fields are all complex', () => {
+    // 'role' is the only primitive; 'content' is an array.
+    const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
+    render(<JsonTree value={{ messages: [msg] }} />)
+    // Expand the messages array to reveal the collapsed msg object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // The collapsed object should show 'role: user' as the preview.
+    expect(screen.getByText(/role: user/)).toBeTruthy()
+    // Should NOT show the generic {N keys} count.
+    expect(screen.queryByText(/2 keys/)).toBeNull()
+  })
+
+  it('does not use lone-primitive heuristic when multiple primitive fields exist', () => {
+    // Both 'role' and 'status' are primitives; 'content' is an array.
+    const msg = { role: 'user', status: 'sent', content: [] }
+    render(<JsonTree value={{ messages: [msg] }} />)
+    // Expand the messages array to reveal the collapsed msg object.
+    fireEvent.click(screen.getAllByLabelText('Expand')[0]!)
+    // No configured preview fields match; multiple primitives → fall back to count.
+    expect(screen.getByText(/3 keys/)).toBeTruthy()
   })
 })

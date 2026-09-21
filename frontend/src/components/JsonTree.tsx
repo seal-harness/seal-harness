@@ -115,6 +115,25 @@ function objectPreview(value: Record<string, unknown>, previewFields: string[]):
   return parts.join(', ')
 }
 
+/**
+ * Heuristic: if an object has exactly one primitive field (string, number,
+ * boolean, or null) and all remaining fields are complex (objects or
+ * arrays), show that lone primitive field as the preview.  This catches
+ * common patterns like { role: "user", content: [...] } where the
+ * primitive field is the most useful summary.  Returns null if the
+ * heuristic does not apply.
+ */
+function lonePrimitivePreview(value: Record<string, unknown>): string | null {
+  const primitiveEntries = Object.entries(value).filter(
+    ([, v]) => !isComplex(v),
+  )
+  if (primitiveEntries.length !== 1) return null
+  const [key, val] = primitiveEntries[0]!
+  const rendered = previewFieldValue(val)
+  if (rendered === null) return null
+  return `${key}: ${rendered}`
+}
+
 function JsonValue({ value, indent, trailing, keyPrefix, defaultExpanded, previewFields }: JsonValueProps) {
   if (value === null) {
     return <PrimitiveRow indent={indent} keyPrefix={keyPrefix} trailing={trailing} className="json-null" text="null" />
@@ -301,9 +320,10 @@ function ObjectNode({
 
   // When collapsed, show the opening brace line with toggle and a preview.
   // If the object has any of the configured preview fields, show their
-  // values instead of the generic "{N keys}" count.
+  // values instead of the generic "{N keys}" count.  If no configured
+  // fields match, try the lone-primitive heuristic before falling back.
   if (!expanded) {
-    const preview = objectPreview(value, previewFields) ?? previewText(value)
+    const preview = objectPreview(value, previewFields) ?? lonePrimitivePreview(value) ?? previewText(value)
     return (
       <div className="json-row" style={{ paddingLeft: indent * INDENT_PX }}>
         <Toggle expanded={false} onToggle={() => setExpanded(true)} />
