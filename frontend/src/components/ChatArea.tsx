@@ -2415,7 +2415,7 @@ export function ChatArea({
     const el = scrollerRef.current
     if (!el) return
     const onScroll = () => {
-      wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80; wasAtBottom.current = atBottom; console.log("[scroll-listener] wasAtBottom=" + atBottom + " scrollHeight=" + el.scrollHeight + " scrollTop=" + el.scrollTop + " clientHeight=" + el.clientHeight)
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
@@ -2455,10 +2455,13 @@ export function ChatArea({
   // changes (the messages prop hasn't updated yet in that render). This
   // ref flags that a deferred scroll is needed.
   const needsScrollToBottomRef = useRef(false)
+  const scrollDebugRef = useRef(0)
 
   useEffect(() => {
     if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
+    const dbgId = ++scrollDebugRef.current
+    console.log('[scroll:' + dbgId + '] effect1', { sessionChanged, prev: prevSessionIdRef.current, next: selectedSession?.id, msgCount: messages.length, wasAtBottom: wasAtBottom.current, needsScroll: needsScrollToBottomRef.current, hasFragment })
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
       wasAtBottom.current = true
@@ -2481,6 +2484,8 @@ export function ChatArea({
   // messages hadn't arrived yet, scroll once they do. Uses rAF to ensure
   // the DOM is painted before scrolling.
   useEffect(() => {
+    const dbg2Id = ++scrollDebugRef.current
+    console.log('[scroll:' + dbg2Id + '] effect2', { needsScroll: needsScrollToBottomRef.current, msgCount: messages.length, hasFragment })
     if (!needsScrollToBottomRef.current) return
     if (hasFragment) {
       needsScrollToBottomRef.current = false
@@ -2490,6 +2495,8 @@ export function ChatArea({
       needsScrollToBottomRef.current = false
       wasAtBottom.current = true
       requestAnimationFrame(() => {
+        const el = scrollerRef.current
+        console.log('[scroll:' + dbg2Id + '] effect2 rAF', { scrollHeight: el?.scrollHeight, clientHeight: el?.clientHeight, scrollTop: el?.scrollTop, msgCount: messages.length })
         messagesEndRef.current?.scrollIntoView({ block: 'end' })
       })
     }

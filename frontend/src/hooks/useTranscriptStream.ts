@@ -186,7 +186,7 @@ export function useTranscriptStream(
       // Cache hit on session switch — instantly show cached data, no
       // loading spinner. Focus with `since` = last cached entry id so
       // the WS replay delivers only new entries.
-      setEntries(cached)
+      setEntries(cached); console.log("[transcript-stream] cache hit", { sessionId, entryCount: cached.length })
       setLoading(false)
       loadedSessionRef.current = sessionId
       const lastId = cached[cached.length - 1]!.id
@@ -213,7 +213,7 @@ export function useTranscriptStream(
       if (isFirstLoad) setLoading(true)
       fetchTranscriptSeed(sessionId).then((seed) => {
         if (cancelled) return
-        setEntries(seed)
+        setEntries(seed); console.log("[transcript-stream] seed fetched", { sessionId, entryCount: seed.length })
         dataCache.set(sessionId, seed)
         setLoading(false)
         loadedSessionRef.current = sessionId
