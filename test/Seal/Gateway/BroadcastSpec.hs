@@ -12,11 +12,13 @@ import Test.Hspec
 
 import Data.Default (def)
 import Data.Aeson qualified as A
+import Data.Aeson (object, (.=))
 import Data.Aeson.KeyMap qualified as KM
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
-import Seal.Core.Types (mkSessionId, SessionId)
-import Seal.Gateway.Broadcast (wrapCapsForAskStatus)
+import Seal.Core.Types (mkSessionId, SessionId, OpName (..))
+import Seal.Gateway.Broadcast (wrapCapsForAskStatus, broadcastToolCall)
 import Seal.Gateway.StreamBroker
   (BrokerEvent (..), StreamBroker, newStreamBroker, subscribe, thinkingSessions)
 
@@ -163,3 +165,85 @@ spec = describe "Seal.Gateway.Broadcast" $ do
       events <- readIORef ref
       hasStatus "idle" events `shouldBe` True
       hasStatus "thinking" events `shouldBe` True
+
+  describe "broadcastToolCall" $ do
+
+    it "broadcasts a tool-call activity event with the tool name and input" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tc1"
+      (_, ref) <- collectEvents broker sid
+      let input = object ["path" .= ("src/Main.hs" :: Text)]
+      broadcastToolCall (Just broker) sid (OpName "FILE_READ") input
+      events <- readIORef ref
+      case events of
+        [BeActivity _ payload] -> case payload of
+          A.Object o -> do
+            case KM.lookup "kind" o of
+              Just (A.String "tool-call") -> pure ()
+              other -> expectationFailure ("expected kind=tool-call, got " <> show other)
+            case KM.lookup "tool" o of
+              Just (A.String "FILE_READ") -> pure ()
+              other -> expectationFailure ("expected tool=FILE_READ, got " <> show other)
+            case KM.lookup "input" o of
+              Just (A.String t) ->
+                ("path" `T.isInfixOf` t) `shouldBe` True
+              other -> expectationFailure ("expected input string, got " <> show other)
+          other -> expectationFailure ("expected object payload, got " <> show other)
+        other -> expectationFailure ("expected [BeActivity], got " <> show other)
+
+    it "is a no-op when broker is Nothing" $ do
+      let sid = mkSid "tc2"
+      let input = object ["cmd" .= ("ls" :: Text)]
+      -- Should not throw and should not block
+      broadcastToolCall Nothing sid (OpName "SHELL_EXEC") input
+
+    it "redacts input for secret opcodes (SECRET_GET)" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tc3"
+      (_, ref) <- collectEvents broker sid
+      let input = object ["name" .= ("MY_API_KEY" :: Text)]
+      broadcastToolCall (Just broker) sid (OpName "SECRET_GET") input
+      events <- readIORef ref
+      case events of
+        [BeActivity _ payload] -> case payload of
+          A.Object o -> do
+            case KM.lookup "input" o of
+              Just (A.String t) ->
+                ("<redacted>" `T.isInfixOf` t) `shouldBe` True
+              other -> expectationFailure ("expected input string, got " <> show other)
+            -- The secret name should NOT appear in the input
+            case KM.lookup "input" o of
+              Just (A.String t) ->
+                ("MY_API_KEY" `T.isInfixOf` t) `shouldBe` False
+              _ -> pure ()
+          other -> expectationFailure ("expected object payload, got " <> show other)
+        other -> expectationFailure ("expected [BeActivity], got " <> show other)
+
+    it "is delivered to ALL subscribers (not session-filtered)" $ do
+      -- BeActivity is an all-subscriber event (the broker's shouldSend
+      -- sends BeActivity to every subscriber, not just those focused on
+      -- the session). This matches the existing harness-status behavior.
+      broker <- newStreamBroker 10
+      (_, refA) <- collectEvents broker (mkSid "tc4a")
+      (_, refB) <- collectEvents broker (mkSid "tc4b")
+      let input = object ["x" .= (1 :: Int)]
+      broadcastToolCall (Just broker) (mkSid "tc4a") (OpName "BIN_EXEC") input
+      a <- readIORef refA
+      b <- readIORef refB
+      length a `shouldBe` 1
+      length b `shouldBe` 1
+
+    it "includes the tool name even for redacted opcodes" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tc5"
+      (_, ref) <- collectEvents broker sid
+      let input = object ["name" .= ("TOKEN" :: Text)]
+      broadcastToolCall (Just broker) sid (OpName "SECRET_GET") input
+      events <- readIORef ref
+      case events of
+        [BeActivity _ payload] -> case payload of
+          A.Object o -> case KM.lookup "tool" o of
+            Just (A.String "SECRET_GET") -> pure ()
+            other -> expectationFailure ("expected tool=SECRET_GET, got " <> show other)
+          other -> expectationFailure ("expected object payload, got " <> show other)
+        other -> expectationFailure ("expected [BeActivity], got " <> show other)

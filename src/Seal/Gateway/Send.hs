@@ -72,7 +72,7 @@ import Seal.Providers.Class
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastToolCall)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
@@ -266,7 +266,7 @@ mkWebTurnAdapter deps td caps = TurnAdapter
   , taPreTurn       = \sid _meta t -> replyFanoutMessage (sdReplies deps) sid "web" t
   , taChannelLabel  = const "web"
   , taOnStop        = Just . replyFanout (sdReplies deps)
-  , taOnToolCall    = Nothing :: Maybe (SessionId -> OpName -> Value -> IO ())
+  , taOnToolCall    = Just (broadcastToolCall (sdBroker deps))
   , taOnTextDelta   = Nothing
   , taOnUserMessage = const (Just (pure ()))
   , taPostTurn      = \_ _ -> pure ()

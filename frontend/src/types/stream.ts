@@ -49,6 +49,7 @@ export type ActivityEvent =
   | { kind: 'harness-status'; status: HarnessActivity }
   | { kind: 'session-created'; session: StreamSessionMeta }
   | { kind: 'reply-delivered'; timestamp: string }
+  | { kind: 'tool-call'; tool: string; input: string }
 
 export interface ActivityEnvelope {
   type: 'activity'

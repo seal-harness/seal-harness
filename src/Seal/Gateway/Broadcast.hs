@@ -18,6 +18,7 @@ module Seal.Gateway.Broadcast
   ( broadcastListsSnapshot
   , broadcastHarnessStatus
   , broadcastReplyDelivered
+  , broadcastToolCall
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
@@ -29,15 +30,19 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Foldable (for_)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (decodeUtf8)
 import Data.Time (getCurrentTime)
+import Data.ByteString.Lazy qualified as BL
 
 import Control.Exception (onException)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (SessionId)
+import Seal.Core.Types (SessionId, OpName (..))
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+import Seal.ISA.Registry (secretOpcodes)
 import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
 import Seal.Gateway.Transcript (showIso)
@@ -94,6 +99,32 @@ broadcastReplyDelivered mBroker sid =
         [ "kind" .= ("reply-delivered" :: Text)
         , "timestamp" .= T.pack (showIso now)
         ]))
+
+-- | Push a per-session @tool-call@ activity signal to every WS subscriber.
+-- The WS client receives this as an @activity@ envelope with
+-- @kind: "tool-call"@, the tool (opcode) name, and a redacted+truncated
+-- rendering of the tool input. Secret opcodes (those in
+-- 'Seal.ISA.Registry.secretOpcodes') have their input replaced with
+-- @"\<redacted\>"@ so secret values never reach the WS stream. Non-secret
+-- inputs are JSON-encoded and truncated to 120 codepoints (matching
+-- 'Seal.Channels.StreamProgress.formatToolLine'). 'Nothing' broker (tests)
+-- is a no-op.
+broadcastToolCall :: Maybe StreamBroker -> SessionId -> OpName -> A.Value -> IO ()
+broadcastToolCall mBroker sid opName input =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker ->
+      broadcast broker (BeActivity sid (object
+        [ "kind" .= ("tool-call" :: Text)
+        , "tool" .= opName
+        , "input" .= displayInput
+        ]))
+  where
+    displayInput
+      | opName `Set.member` secretOpcodes = "<redacted>" :: Text
+      | otherwise =
+          let encoded = decodeUtf8 (BL.toStrict (A.encode input))
+          in if T.length encoded > 120 then T.take 120 encoded <> "..." else encoded
 
 -- | Push an @agent-defs-changed@ signal to every WS subscriber. The
 -- frontend re-fetches GET /api/agents on receipt (invalidation, not
