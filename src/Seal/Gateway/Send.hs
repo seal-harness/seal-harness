@@ -25,7 +25,8 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Monad (unless, when)
+import Control.Concurrent (forkIO)
+import Control.Monad (unless, void, when)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -324,15 +325,23 @@ handleSend deps sid rawText = do
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) (smId meta))) "plainTurn" $
-          plainTurn deps meta t
-        case er of
-          Left err -> pure (SendError 500 err)
-          Right (Left err) -> pure (SendError 500 err)
-          Right (Right ()) -> do
-            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
-            triggerBroadcast deps
-            pure SendAssistant
+        -- Async: fork the turn in a background thread and return
+        -- SendAssistant immediately. The turn streams updates via the
+        -- WS broker (entry-update, entry, activity events). The reply
+        -- is delivered to WS subscribers (web frontend, chat channels).
+        -- Slash commands remain synchronous (they return transient
+        -- output in the response body).
+        let sid' = smId meta
+        void (forkIO (do
+          er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
+            plainTurn deps meta t
+          case er of
+            Left _   -> pure ()
+            Right (Left _) -> pure ()
+            Right (Right ()) -> do
+              ensureTabForSession (sdTabsHandle deps) KindProvider sid'
+              triggerBroadcast deps))
+        pure SendAssistant
       Right (SlashCommand cmdName) -> do
         -- W5: no srActive swap bracket. The per-request call/skill
         -- dispatcher closes over the request's explicit sid (see

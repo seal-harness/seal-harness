@@ -308,6 +308,22 @@ mkCorruptRepoRegistryHandle = pure RepoRegistryHandle
   , rrhMutate = \_ -> pure (Right ())
   }
 
+-- | Poll an IO action until the predicate holds, or timeout after the
+-- given microseconds (retrying every 10ms).
+waitForPoll :: Int -> IO a -> (a -> Bool) -> IO Bool
+waitForPoll totalWaitUs readAction predicate = go totalWaitUs
+  where
+    stepUs = 10000
+    go remaining
+      | remaining <= 0 = pure False
+      | otherwise = do
+          val <- readAction
+          if predicate val
+            then pure True
+            else do
+              threadDelay stepUs
+              go (remaining - stepUs)
+
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
   -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
@@ -3903,20 +3919,22 @@ spec = describe "Seal.Gateway.API" $ do
             (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
           (sendStatus, _sendBody) <- runAppBody app sendReq
           sendStatus `shouldBe` 200
-          -- 3. Read the transcript; it should contain the assistant reply.
-          let transcriptReq = testRequest methodGet ["api", "sessions", sidTxt, "transcript"]
-          (transcriptStatus, transcriptBody) <- runAppBody app transcriptReq
-          transcriptStatus `shouldBe` 200
-          let arr = case A.decode transcriptBody :: Maybe A.Value of
-                Just (A.Array a) -> V.toList a
-                _ -> []
-          -- The transcript should have at least 2 entries (user request +
-          -- assistant response).
-          length arr `shouldSatisfy` (>= 2)
-          -- The canned reply text appears somewhere in the transcript JSON
-          -- (the frontend's block payload encodes it).
-          T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
-            `shouldBe` True
+          -- 3. Poll the transcript; the turn runs async so the reply
+          -- may not be on disk yet. Wait up to 5 seconds.
+          let pollTranscript = do
+                let transcriptReq = testRequest methodGet ["api", "sessions", sidTxt, "transcript"]
+                (transcriptStatus, transcriptBody) <- runAppBody app transcriptReq
+                if transcriptStatus /= 200
+                  then pure False
+                  else do
+                    let arr = case A.decode transcriptBody :: Maybe A.Value of
+                          Just (A.Array a) -> V.toList a
+                          _ -> []
+                        hasReply = length arr >= 2 &&
+                          "Hello from the fake provider" `T.isInfixOf` T.pack (show transcriptBody)
+                    pure hasReply
+          replyFound <- waitForPoll 5000000 pollTranscript id
+          replyFound `shouldBe` True
 
   -- ── Regression: subscribed chat channels must receive the final reply
   -- EXACTLY ONCE after a web-originated turn ──────────────────────────────
@@ -4036,10 +4054,16 @@ spec = describe "Seal.Gateway.API" $ do
       -- branch: "<provider>/<model>> <text>". Before the fix the channel
       -- got TWO copies — the prefixed one via taOnStop → replyFanout and a
       -- raw one via the engine's fanoutLastReply cleanup.)
+      -- The turn runs async; poll for the reply to arrive (up to 5s).
+      let pollSends = do
+            sends <- readIORef sentRef
+            pure (length (filter ("the one and only reply" `T.isInfixOf`) sends))
+      replySeen <- waitForPoll 5000000 pollSends (>= 1)
+      replySeen `shouldBe` True
       sends <- readIORef sentRef
-      length (filter ("the one and only reply" `T.isInfixOf`) sends) `shouldBe` 1
-      filter ("the one and only reply" `T.isInfixOf`) sends
-        `shouldSatisfy` all ("ollama/llama3.2>" `T.isPrefixOf`)
+      let replies = filter ("the one and only reply" `T.isInfixOf`) sends
+      length replies `shouldBe` 1
+      replies `shouldSatisfy` all ("ollama/llama3.2>" `T.isPrefixOf`)
   -- ── Regression: benign slash commands must not navigate ─────────────
   -- The web gateway is multi-session: srActive is a process-global ref
   -- that may point at a DIFFERENT session than the one a request targets.
