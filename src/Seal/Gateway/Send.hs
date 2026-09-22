@@ -34,6 +34,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client (Manager)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
@@ -72,8 +73,9 @@ import Seal.Providers.Class
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastToolCall)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
+import Seal.ISA.Registry (secretOpcodes)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
@@ -266,7 +268,10 @@ mkWebTurnAdapter deps td caps = TurnAdapter
   , taPreTurn       = \sid _meta t -> replyFanoutMessage (sdReplies deps) sid "web" t
   , taChannelLabel  = const "web"
   , taOnStop        = Just . replyFanout (sdReplies deps)
-  , taOnToolCall    = Nothing :: Maybe (SessionId -> OpName -> Value -> IO ())
+  , taOnToolCall    = Just $ \sid opName input ->
+      broadcastToolCall (sdBroker deps) sid opName
+        (TE.decodeUtf8 (BL.toStrict (A.encode input)))
+        secretOpcodes
   , taOnTextDelta   = Nothing
   , taOnUserMessage = const (Just (pure ()))
   , taPostTurn      = \_ _ -> pure ()

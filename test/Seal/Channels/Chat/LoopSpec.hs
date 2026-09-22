@@ -66,6 +66,28 @@ spec = do
       let val = A.object ["id" .= ("q1" :: Text)]
       extractAskQuestion val `shouldBe` ""
 
+  describe "extractToolName" $ do
+    it "extracts the tool field from a tool-call activity" $ do
+      let val = A.object ["kind" .= ("tool-call" :: Text), "tool" .= ("SHELL_EXEC" :: Text), "input" .= ("ls" :: Text)]
+      extractToolName val `shouldBe` Just "SHELL_EXEC"
+
+    it "returns Nothing when kind is not tool-call" $ do
+      let val = A.object ["kind" .= ("harness-status" :: Text), "tool" .= ("SHELL_EXEC" :: Text)]
+      extractToolName val `shouldBe` Nothing
+
+    it "returns Nothing when tool field is missing" $ do
+      let val = A.object ["kind" .= ("tool-call" :: Text), "input" .= ("ls" :: Text)]
+      extractToolName val `shouldBe` Nothing
+
+  describe "extractToolInput" $ do
+    it "extracts the input field from a tool-call activity" $ do
+      let val = A.object ["kind" .= ("tool-call" :: Text), "tool" .= ("FILE_READ" :: Text), "input" .= ("README.md" :: Text)]
+      extractToolInput val `shouldBe` Just "README.md"
+
+    it "returns Nothing when kind is not tool-call" $ do
+      let val = A.object ["kind" .= ("harness-status" :: Text), "input" .= ("ls" :: Text)]
+      extractToolInput val `shouldBe` Nothing
+
   describe "lastAssistantText" $ do
     it "extracts the last response entry's text" $ do
       let entries =
