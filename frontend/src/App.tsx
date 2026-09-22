@@ -353,6 +353,11 @@ export default function App() {
   // output never bleeds into another's view.
   useEffect(() => { setSlashBubbles([]) }, [currentSessionId])
 
+  // Clear the optimistic pending message on session switch so a prior
+  // session's in-flight user message + thinking indicator never bleeds
+  // into another session's transcript view.
+  useEffect(() => { setPendingMessage(null); setPendingMessageModel(null) }, [currentSessionId])
+
   // ── Per-session model override (frontend-only, never persisted) ────────
   const [modelOverride, setModelOverride] = useState<string | null>(null)
   useEffect(() => { setModelOverride(null) }, [currentSessionId])
