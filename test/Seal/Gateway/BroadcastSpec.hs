@@ -7,16 +7,18 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar)
 import Control.Exception (catch, SomeException)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
 import Test.Hspec
 
 import Data.Default (def)
 import Data.Aeson qualified as A
 import Data.Aeson.KeyMap qualified as KM
-import Data.Set qualified as Set
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
-import Seal.Core.Types (mkSessionId, SessionId)
-import Seal.Gateway.Broadcast (wrapCapsForAskStatus)
+import Seal.Core.Types (mkSessionId, OpName (..), SessionId)
+import Seal.Gateway.Broadcast (broadcastToolCall, wrapCapsForAskStatus)
 import Seal.Gateway.StreamBroker
   (BrokerEvent (..), StreamBroker, newStreamBroker, subscribe, thinkingSessions)
 
@@ -29,6 +31,36 @@ collectEvents broker sid = do
   ref <- newIORef ([] :: [BrokerEvent])
   tv <- subscribe broker sid (\e -> modifyIORef' ref (e :)) (pure ())
   pure (tv, ref)
+
+-- | Extract the kind string from a BeActivity event payload.
+activityKind :: BrokerEvent -> Maybe Text
+activityKind (BeActivity _ payload) =
+  case payload of
+    A.Object o -> case KM.lookup "kind" o of
+      Just (A.String s) -> Just s
+      _ -> Nothing
+    _ -> Nothing
+activityKind _ = Nothing
+
+-- | Extract the tool name from a BeActivity tool-call event payload.
+activityToolName :: BrokerEvent -> Maybe Text
+activityToolName (BeActivity _ payload) =
+  case payload of
+    A.Object o -> case KM.lookup "tool" o of
+      Just (A.String s) -> Just s
+      _ -> Nothing
+    _ -> Nothing
+activityToolName _ = Nothing
+
+-- | Extract the tool input from a BeActivity tool-call event payload.
+activityToolInput :: BrokerEvent -> Maybe Text
+activityToolInput (BeActivity _ payload) =
+  case payload of
+    A.Object o -> case KM.lookup "input" o of
+      Just (A.String s) -> Just s
+      _ -> Nothing
+    _ -> Nothing
+activityToolInput _ = Nothing
 
 -- | Extract the status string from a BeActivity harness-status event.
 harnessStatusVal :: BrokerEvent -> Maybe Text
@@ -63,6 +95,61 @@ waitFor totalWaitUs readAction predicate = go totalWaitUs
 
 spec :: Spec
 spec = describe "Seal.Gateway.Broadcast" $ do
+
+  describe "broadcastToolCall" $ do
+
+    it "broadcasts a BeActivity tool-call event with tool name and input" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tool1"
+      (_, ref) <- collectEvents broker sid
+      let secretOps = Set.empty :: Set OpName
+      broadcastToolCall (Just broker) sid (OpName "SHELL_EXEC") "ls -la" secretOps
+      events <- readIORef ref
+      let toolEvents = filter (\e -> activityKind e == Just "tool-call") events
+      length toolEvents `shouldBe` 1
+      case toolEvents of
+        (e : _) -> do
+          activityToolName e `shouldBe` Just "SHELL_EXEC"
+          activityToolInput e `shouldBe` Just "ls -la"
+        [] -> fail "expected at least one tool-call event"
+
+    it "redacts input for secret opcodes" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tool2"
+      (_, ref) <- collectEvents broker sid
+      let secretOps = Set.fromList [OpName "SECRET_GET"] :: Set OpName
+      broadcastToolCall (Just broker) sid (OpName "SECRET_GET") "{\"name\":\"vault-key\"}" secretOps
+      events <- readIORef ref
+      let toolEvents = filter (\e -> activityKind e == Just "tool-call") events
+      length toolEvents `shouldBe` 1
+      case toolEvents of
+        (e : _) -> do
+          activityToolName e `shouldBe` Just "SECRET_GET"
+          activityToolInput e `shouldBe` Just "<redacted>"
+        [] -> fail "expected at least one tool-call event"
+
+    it "truncates long input to 120 characters" $ do
+      broker <- newStreamBroker 10
+      let sid = mkSid "tool3"
+      (_, ref) <- collectEvents broker sid
+      let secretOps = Set.empty :: Set OpName
+          longInput = T.replicate 200 "x"
+      broadcastToolCall (Just broker) sid (OpName "FILE_WRITE") longInput secretOps
+      events <- readIORef ref
+      let toolEvents = filter (\e -> activityKind e == Just "tool-call") events
+      case toolEvents of
+        (e : _) -> case activityToolInput e of
+          Just inp -> do
+            T.length inp `shouldBe` 123  -- 120 + "..."
+            "..." `T.isSuffixOf` inp `shouldBe` True
+          Nothing -> fail "expected tool input"
+        [] -> fail "expected at least one tool-call event"
+
+    it "is a no-op when broker is Nothing" $ do
+      let sid = mkSid "tool4"
+          secretOps = Set.empty :: Set OpName
+      -- Should not throw; just a no-op.
+      broadcastToolCall Nothing sid (OpName "SHELL_EXEC") "ls" secretOps
 
   describe "wrapCapsForAskStatus" $ do
 

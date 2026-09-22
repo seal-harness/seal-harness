@@ -11,6 +11,8 @@ module Seal.Channels.Chat.Loop
   , extractEntryText
   , extractActivityKind
   , extractActivityStatus
+  , extractToolName
+  , extractToolInput
   , extractAskQuestion
   , lastAssistantText
   ) where
@@ -207,6 +209,9 @@ handleServerEvent cfg chan key wsConns focusedSid ev =
       | sid == focusedSid -> handleEntry cfg chan key wsConns val
     SeActivity sid val
       | sid == focusedSid -> handleActivity cfg chan key wsConns val
+    -- Tool-call events are BeActivity with kind="tool-call", broadcast
+    -- by the server's aeOnToolCall hook. They arrive as SeActivity.
+    -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key sid val
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
@@ -283,7 +288,19 @@ handleActivity
   -> Value -> IO ()
 handleActivity cfg chan key wsConns val = do
   let kind = extractActivityKind val
-  when (kind == "harness-status") $ do
+  case kind of
+    "harness-status" -> handleHarnessStatus cfg chan key wsConns val
+    "tool-call" -> handleToolCallActivity cfg chan key val
+    _ -> pure ()
+
+-- | Handle a @harness-status@ activity: if status is idle, finalize any
+-- in-progress streaming bubble.
+handleHarnessStatus
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> ConversationKey
+  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> Value -> IO ()
+handleHarnessStatus cfg chan key wsConns val = do
     let status = extractActivityStatus val
     when (status == "idle") $ do
       conns <- readTVarIO wsConns
@@ -303,6 +320,24 @@ handleActivity cfg chan key wsConns val = do
           writeIORef (ssMsgId ss) Nothing
           writeIORef (ssAccumulated ss) ""
           writeIORef (ssLastEdit ss) Nothing
+
+-- | Handle a @tool-call@ activity: send the tool-progress line to the
+-- platform as a separate message. This renders the tool-call progress
+-- bubble (tool name + truncated/redacted input) that the user sees while
+-- the agent is executing tools.
+handleToolCallActivity
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> ConversationKey -> Value
+  -> IO ()
+handleToolCallActivity _cfg chan _key val = do
+  case extractToolName val of
+    Nothing -> pure ()
+    Just toolName -> do
+      let mInput = extractToolInput val
+          line = case mInput of
+            Just inp | not (T.null inp) -> toolName <> " " <> inp
+            _ -> toolName
+      ccSend chan line
 
 -- | Handle an @ask@ event: render the question on the platform. The answer
 -- will come as the next inbound message (the loop's normal receive path).
@@ -436,6 +471,28 @@ extractActivityStatus val =
   case val of
     A.Object o -> fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "status") o)
     _ -> ""
+
+-- | Extract the @tool@ field from a @tool-call@ activity event payload.
+-- Returns 'Nothing' when the payload is not a @tool-call@ activity or the
+-- @tool@ field is missing. Pure.
+extractToolName :: Value -> Maybe Text
+extractToolName val =
+  case val of
+    A.Object o
+      | extractActivityKind val == "tool-call"
+        -> asText =<< KeyMap.lookup (Key.fromText "tool") o
+    _ -> Nothing
+
+-- | Extract the @input@ field from a @tool-call@ activity event payload.
+-- Returns 'Nothing' when the payload is not a @tool-call@ activity or the
+-- @input@ field is missing. Pure.
+extractToolInput :: Value -> Maybe Text
+extractToolInput val =
+  case val of
+    A.Object o
+      | extractActivityKind val == "tool-call"
+        -> asText =<< KeyMap.lookup (Key.fromText "input") o
+    _ -> Nothing
 
 -- | Extract the @question@ field from an @ask@ event payload.
 extractAskQuestion :: Value -> Text

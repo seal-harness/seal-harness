@@ -21,6 +21,7 @@ module Seal.Gateway.Broadcast
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
+  , broadcastToolCall
   , wrapCapsForAskStatus
   ) where
 
@@ -32,11 +33,13 @@ import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import Control.Exception (onException)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (SessionId)
+import Seal.Core.Types (OpName (..), SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
@@ -94,6 +97,36 @@ broadcastReplyDelivered mBroker sid =
         [ "kind" .= ("reply-delivered" :: Text)
         , "timestamp" .= T.pack (showIso now)
         ]))
+
+-- | Push a per-session @tool-call@ activity signal to every WS subscriber.
+-- The chat-channel WS client receives this as an @activity@ event and
+-- renders a tool-progress bubble. The tool input is redacted for opcodes
+-- in the @secretOps@ set (e.g. @SECRET_GET@) and truncated to 120
+-- characters for non-secret opcodes. 'Nothing' broker (tests) is a no-op.
+-- Pure input formatting (no IO beyond the broadcast itself).
+broadcastToolCall
+  :: Maybe StreamBroker
+  -> SessionId
+  -> OpName
+  -> Text
+  -> Set OpName
+  -> IO ()
+broadcastToolCall mBroker sid opName input secretOps =
+  for_ mBroker $ \broker ->
+    broadcast broker (BeActivity sid (object
+      [ "kind" .= ("tool-call" :: Text)
+      , "tool" .= opNameText
+      , "input" .= inputDisplay
+      ]))
+  where
+    OpName opNameText = opName
+    inputDisplay
+      | opName `Set.member` secretOps = "<redacted>" :: Text
+      | otherwise = truncateInput input
+    truncateInput t =
+      if T.length t > 120
+        then T.take 120 t <> "..."
+        else t
 
 -- | Push an @agent-defs-changed@ signal to every WS subscriber. The
 -- frontend re-fetches GET /api/agents on receipt (invalidation, not
