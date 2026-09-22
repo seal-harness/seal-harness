@@ -93,6 +93,8 @@ library seal-chat-channels
       , websockets
       , network
       , async
+      , process
+      , vector
       , seal-gateway-types
     hs-source-dirs: src-chat-channels
 

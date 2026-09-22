@@ -9,6 +9,7 @@ module Seal.Channels.Chat.Types
   , ChatMessageId (..)
     -- * Session tracking
   , ConversationKey (..)
+  , ReceivedMessage (..)
   , convKeyFromSource
   , SessionMap
   , newSessionMap
@@ -32,7 +33,8 @@ import Data.Time (UTCTime)
 import Seal.Gateway.Types.Core (SessionId)
 import Seal.Gateway.Types.ChannelKind (channelKindToText)
 import Seal.Gateway.Types.MessageSource
-  ( MessageSource
+  ( ConversationId
+  , MessageSource
   , msChannelKind
   , msConversationId
   , conversationIdText
@@ -42,6 +44,21 @@ import Seal.Gateway.Types.MessageSource
 data InboundMessage = InboundMessage
   { imSource :: MessageSource
   , imBody   :: Text
+  } deriving stock (Eq, Show)
+
+-- | A raw received message from the transport: the conversation id, the
+-- sender's user id (if available), and the message body. The transport
+-- derives these from authenticated transport metadata (e.g. Telegram's
+-- @chat.id@ + @from.id@, Signal's peer phone number + UUID). The body is
+-- the message text. Pure data; the adapter's reader loop constructs a
+-- 'MessageSource' from these fields.
+data ReceivedMessage = ReceivedMessage
+  { rmConversationId :: ConversationId
+  , rmSender         :: Maybe Text
+  , rmReplyTo        :: Text
+    -- ^ The platform-specific reply target (Telegram chat id, Signal
+    -- phone number). Used by the adapter to address sends/edits.
+  , rmBody           :: Text
   } deriving stock (Eq, Show)
 
 -- | A platform message identifier (opaque: a Telegram @message_id@ or a
