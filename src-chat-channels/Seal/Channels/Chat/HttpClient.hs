@@ -23,6 +23,7 @@ module Seal.Channels.Chat.HttpClient
   ) where
 
 import Control.Exception (try)
+import System.IO (hPutStrLn, stderr)
 import Data.Aeson (Value, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -158,22 +159,24 @@ doRequest mgr url m mBody = do
                    }
             Nothing -> req1
       eResp <- try (httpLbs req2 mgr) :: IO (Either HttpException (Response BL.ByteString))
-      pure $ case eResp of
-        Left _ -> Left "HTTP request failed"
-        Right resp ->
+      case eResp of
+        Left _ -> pure (Left "HTTP request failed")
+        Right resp -> do
           let code = statusCode (responseStatus resp)
-          in if code >= 200 && code <= 299
-               then Right (responseBody resp)
-               else Left ("HTTP " <> T.pack (show code))
+          if code >= 200 && code <= 299
+            then pure (Right (responseBody resp))
+            else do
+              hPutStrLn stderr ("[chat-channel] HTTP " <> show code <> " from " <> url <> ": " <> show (responseBody resp))
+              pure (Left ("HTTP " <> T.pack (show code)))
 
 -- | Extract the @id@ field from a session info JSON object.
 extractSessionId :: BL.ByteString -> Either Text Text
 extractSessionId body =
   case A.decode body :: Maybe Value of
     Just (A.Object o) ->
-      case asText =<< KeyMap.lookup (Key.fromText "id") o of
+      case asText =<< KeyMap.lookup (Key.fromText "session_id") o of
         Just sid -> Right sid
-        Nothing  -> Left "session response missing 'id' field"
+        Nothing  -> Left "session response missing 'session_id' field"
     Just _ -> Left "session response is not a JSON object"
     Nothing -> Left "failed to parse session response JSON"
 

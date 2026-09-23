@@ -31,6 +31,7 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
+import System.IO (hPutStrLn, stderr)
 import Network.HTTP.Client (Manager)
 
 import Seal.Channels.Chat.Class (ChatChannel (..))
@@ -73,6 +74,10 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccHttpManager = mgr
   }
 
+-- | Debug log to stderr.
+dbg :: Text -> IO ()
+dbg msg = hPutStrLn stderr ("[chat-channel] " <> T.unpack msg)
+
 -- | Run the generic chat-channel loop. Blocks until the channel's
 -- 'ccReceive' returns EOF. Each conversation gets its own WS connection
 -- for streaming.
@@ -88,6 +93,7 @@ runChatChannel cfg chan = do
       case mMsg of
         Nothing -> pure ()  -- EOF
         Just (InboundMessage src body) -> do
+          dbg ("received: " <> body)
           let key = convKeyFromSource src
           handleInbound cfg chan sessions wsConns key body
           loop sessions wsConns
@@ -179,16 +185,21 @@ ensureWsConn
   -> IO ()
 ensureWsConn cfg chan wsConns key sid = do
   let gwCfg = cccGateway cfg
+  dbg ("ensureWsConn: key=" <> T.pack (show key) <> " sid=" <> sessionIdText sid)
   conns <- readTVarIO wsConns
   case Map.lookup key conns of
     Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
     Nothing -> do
       -- Start a new WS connection with the streaming event handler.
       let callback = handleServerEvent cfg chan key wsConns sid
-      eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
+          wsHost = gcHost gwCfg
+          wsPort = gcWsPort gwCfg
+      dbg ("ensureWsConn: connecting to ws://" <> wsHost <> ":" <> T.pack (show wsPort))
+      eWs <- startWsClient wsHost wsPort callback
       case eWs of
-        Left _ -> pure ()  -- WS failed; the channel still works via HTTP
+        Left err -> dbg ("ensureWsConn: WS connect failed: " <> err)
         Right ws -> do
+          dbg ("ensureWsConn: WS connected, focusing sid=" <> sessionIdText sid)
           ss <- newStreamingState
           atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
           wcFocus ws sid
@@ -202,7 +213,8 @@ handleServerEvent
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> SessionId -> ServerEvent -> IO ()
 handleServerEvent cfg chan key wsConns focusedSid ev =
-  case ev of
+  dbg ("handleServerEvent: " <> T.pack (show ev)) >>
+  (case ev of
     SeEntryUpdate sid val
       | sid == focusedSid -> handleEntryUpdate cfg chan key wsConns val
     SeEntry sid val
@@ -214,7 +226,7 @@ handleServerEvent cfg chan key wsConns focusedSid ev =
     -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key sid val
-    _ -> pure ()  -- ignore events for other sessions or irrelevant types
+    _ -> pure ())  -- ignore events for other sessions or irrelevant types
 
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
@@ -360,9 +372,13 @@ sendPlain
   -> IO ()
 sendPlain cfg chan sessions wsConns key text = do
   sid <- resolveSession cfg chan sessions wsConns key
+  dbg ("sendPlain: sid=" <> sessionIdText sid <> " text=" <> T.take 50 text)
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eResult <- httpSend mgr apiBase sid text
+  case eResult of
+    Right sr -> dbg ("sendPlain: kind=" <> srKind sr <> " response=" <> T.take 50 (srResponse sr))
+    Left e -> dbg ("sendPlain: HTTP error=" <> e)
   case eResult of
     Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
     Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -408,9 +424,11 @@ resolveSession cfg chan sessions wsConns key = do
       let apiBase = gcApiBase (cccGateway cfg)
           mgr = cccHttpManager cfg
       eSid <- httpNewSession mgr apiBase (A.object [])
+      dbg ("resolveSession: httpNewSession result=" <> either ("Left " <>) ("Right " <>) eSid)
       case eSid of
         Right sidText -> case mkSessionId sidText of
           Right sid -> do
+            dbg ("resolveSession: created sid=" <> sessionIdText sid)
             sessionInsert sessions key sid
             ensureWsConn cfg chan wsConns key sid
             pure sid

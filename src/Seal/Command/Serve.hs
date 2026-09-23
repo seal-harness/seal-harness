@@ -519,13 +519,18 @@ forkNewSignalChatChannel logger gwCfg mgr cfg =
   case Seal.Signal.Config.resolveSignalConfig (rcSignal cfg) Nothing of
     Left _ -> pure ()
     Right (account, chunkLimit, allow) -> do
+      -- The chat channels connect to the gateway as clients. When the
+      -- gateway binds to 0.0.0.0, use 127.0.0.1 for client connections.
+      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
+                         then "127.0.0.1" :: T.Text
+                         else Seal.Gateway.Config.gcHost gwCfg
       let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = Seal.Gateway.Config.gcHost gwCfg
+            { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> Seal.Gateway.Config.gcHost gwCfg
+            , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> Seal.Gateway.Config.gcHost gwCfg
+            , ChatTypes.gcWsUrl = "ws://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
@@ -533,7 +538,8 @@ forkNewSignalChatChannel logger gwCfg mgr cfg =
       eTransport <- ChatSignal.mkRealSignalChatTransport accountText
       case eTransport of
         Left err -> logIO logger WarningS ("signal chat channel: " <> ls err)
-        Right transport ->
+        Right transport -> do
+          logIO logger InfoS "signal chat channel: starting with real transport"
           void (forkIO (withSignalChatChannel
                           allow
                           chunkLimit
@@ -547,18 +553,22 @@ forkNewTelegramChatChannel gwCfg mgr cfg = do
   case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) Nothing of
     Left _ -> pure ()
     Right (token, chunkLimit, allow) -> do
+      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
+                         then "127.0.0.1" :: T.Text
+                         else Seal.Gateway.Config.gcHost gwCfg
       let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = Seal.Gateway.Config.gcHost gwCfg
+            { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> Seal.Gateway.Config.gcHost gwCfg
+            , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> Seal.Gateway.Config.gcHost gwCfg
+            , ChatTypes.gcWsUrl = "ws://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
+      putStrLn "[seal] telegram chat channel: starting with real transport"
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit
