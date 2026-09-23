@@ -2,7 +2,7 @@
 id: seal-usage
 description: How to work inside a Seal Harness session — your cwd is a fresh isolated workspace; prefer it as your default; clone into `.`; operating outside the workdir is fine when the task calls for it but shouldn't be your default mode. Load this at the start of any session before touching files.
 created_at: 2026-07-24T00:00:00Z
-updated_at: 2026-07-24T00:00:00Z
+updated_at: 2026-09-23T00:00:00Z
 session: manual
 ---
 
@@ -177,6 +177,24 @@ BIN_EXEC { "binary": "gh", "args": ["pr", "create", "--head", "my-feature-branch
 This is the safe default for PR creation from any cloned repo in a Seal
 session, not just shallow clones — there is no downside to passing
 `--head` explicitly.
+
+### Checking out a different branch in a shallow clone
+
+`SETUP_REPO` does a **shallow clone** (`--depth 1`) of the default branch
+only. Other branches exist on the remote but have no local
+remote-tracking refs, so a plain `git checkout <branch>` fails with
+`pathspec '<branch>' did not match any file(s) known to git`. Two
+commands are needed — first fetch the branch's ref at depth 1 with an
+explicit refspec, then check it out:
+
+```
+BIN_EXEC { "binary": "git", "args": ["fetch", "origin", "my-feature-branch:refs/remotes/origin/my-feature-branch", "--depth", "1"], "cwd": "seal-harness" }
+BIN_EXEC { "binary": "git", "args": ["checkout", "my-feature-branch"], "cwd": "seal-harness" }
+```
+
+Both steps are required. A bare `git fetch origin <branch>` only populates
+`FETCH_HEAD`, not the `refs/remotes/origin/<branch>` ref that `checkout`
+resolves the branch against — the explicit refspec is what creates it.
 
 ### Why this matters
 
