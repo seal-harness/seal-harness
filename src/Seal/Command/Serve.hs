@@ -362,7 +362,7 @@ runServeMain autonomy logger = do
     then do
       logIO logger InfoS "chat_channels: using new gateway-API-client implementation"
       forkNewSignalChatChannel logger gwCfg mgr cfg
-      forkNewTelegramChatChannel gwCfg mgr cfg
+      forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle
     else do
       forkSignalListener chanDeps cfg registry
       forkTelegramListener chanDeps cfg registry
@@ -548,10 +548,17 @@ forkNewSignalChatChannel logger gwCfg mgr cfg =
 
 -- | Fork the new Telegram chat channel if @[telegram]@ is configured.
 forkNewTelegramChatChannel
-  :: Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> IO ()
-forkNewTelegramChatChannel gwCfg mgr cfg = do
-  case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) Nothing of
-    Left _ -> pure ()
+  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> IO ()
+forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle = do
+  mVaultToken <- case mHandle of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
+      pure (case r of
+        Right bs -> Just (TE.decodeUtf8 bs)
+        Left _   -> Nothing)
+  case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) mVaultToken of
+    Left err -> logIO logger WarningS ("telegram chat channel: " <> ls err)
     Right (token, chunkLimit, allow) -> do
       let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
                          then "127.0.0.1" :: T.Text

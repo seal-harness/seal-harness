@@ -10,6 +10,7 @@ module Seal.Channels.Chat.Loop
     -- * Pure helpers (for testing)
   , extractEntryText
   , extractActivityKind
+  , extractDirection
   , extractActivityStatus
   , extractToolName
   , extractToolInput
@@ -270,26 +271,32 @@ handleEntry
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> Value -> IO ()
 handleEntry cfg chan key wsConns val = do
-  conns <- readTVarIO wsConns
-  case Map.lookup key conns of
-    Nothing -> pure ()
-    Just (_, ss) -> do
-      let streamCfg = cccStreamCfg cfg
-          text = extractEntryText val
-      if T.null text
-        then pure ()
-        else do
-          mMsgId <- readIORef (ssMsgId ss)
-          let finalText = stripCursor streamCfg text
-          case mMsgId of
-            Nothing -> void (ccSendWithId chan finalText)
-            Just id' -> do
-              ok <- ccEditMessage chan id' finalText
-              unless ok $ void (ccSendWithId chan finalText)
-          -- Reset streaming state for the next turn.
-          writeIORef (ssMsgId ss) Nothing
-          writeIORef (ssAccumulated ss) ""
-          writeIORef (ssLastEdit ss) Nothing
+  -- Only process response entries (skip request entries which would
+  -- incorrectly finalize the streaming bubble with the user's text).
+  let direction = extractDirection val
+  if direction /= "response"
+    then pure ()
+    else do
+      conns <- readTVarIO wsConns
+      case Map.lookup key conns of
+        Nothing -> pure ()
+        Just (_, ss) -> do
+          let streamCfg = cccStreamCfg cfg
+              text = extractEntryText val
+          if T.null text
+            then pure ()
+            else do
+              mMsgId <- readIORef (ssMsgId ss)
+              let finalText = stripCursor streamCfg text
+              case mMsgId of
+                Nothing -> void (ccSendWithId chan finalText)
+                Just id' -> do
+                  ok <- ccEditMessage chan id' finalText
+                  unless ok $ void (ccSendWithId chan finalText)
+              -- Reset streaming state for the next turn.
+              writeIORef (ssMsgId ss) Nothing
+              writeIORef (ssAccumulated ss) ""
+              writeIORef (ssLastEdit ss) Nothing
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
@@ -481,6 +488,15 @@ extractActivityKind :: Value -> Text
 extractActivityKind val =
   case val of
     A.Object o -> fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "kind") o)
+    _ -> ""
+
+-- | Extract the @direction@ field from an entry event payload.
+-- Returns @""@ when absent. Used to filter request entries (direction
+-- @"request"@) from response entries (direction @"response"@).
+extractDirection :: Value -> Text
+extractDirection val =
+  case val of
+    A.Object o -> fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "direction") o)
     _ -> ""
 
 -- | Extract the @status@ field from an @activity@ event payload.
