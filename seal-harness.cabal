@@ -410,6 +410,7 @@ test-suite tests
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
         Seal.Gateway.BroadcastSpec
+        Seal.Gateway.EntryCursorSpec
         Seal.Gateway.PatIngestionSpec
         Seal.Gateway.SendSpec
         Seal.Gateway.ServerSpec
