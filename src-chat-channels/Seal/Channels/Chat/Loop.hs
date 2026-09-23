@@ -293,10 +293,6 @@ handleEntry cfg chan key wsConns val = do
                 Just id' -> do
                   ok <- ccEditMessage chan id' finalText
                   unless ok $ void (ccSendWithId chan finalText)
-              -- Reset streaming state for the next turn.
-              writeIORef (ssMsgId ss) Nothing
-              writeIORef (ssAccumulated ss) ""
-              writeIORef (ssLastEdit ss) Nothing
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
