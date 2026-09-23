@@ -112,7 +112,7 @@ handleInbound cfg chan sessions wsConns key body = do
       Right (ChatInject idx payload) -> do
         -- Focus the tab, then send the payload as a plain message.
         handleFocus cfg chan sessions wsConns key idx
-        sendPlain cfg chan sessions key payload
+        sendPlain cfg chan sessions wsConns key payload
       Right ChatCurrentTab -> do
         -- Send the current tab info via HTTP (the gateway routes /tab).
         mSid <- sessionLookup sessions key
@@ -125,14 +125,14 @@ handleInbound cfg chan sessions wsConns key body = do
           Nothing -> ccSend chan "no current tab"
       Right (ChatNewSession args) -> do
         -- Create a new session via HTTP, update the session map.
-        handleNewSession cfg chan sessions key args
+        handleNewSession cfg chan sessions wsConns key args
       Right (ChatSlash _cmd) ->
-        sendSlash cfg chan sessions key body
+        sendSlash cfg chan sessions wsConns key body
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
-        sendSlash cfg chan sessions key body
+        sendSlash cfg chan sessions wsConns key body
       Right (ChatPlain text) ->
-        sendPlain cfg chan sessions key text
+        sendPlain cfg chan sessions wsConns key text
       Left _ -> ccSend chan "error: invalid command"
 
 -- | Handle a focus command: resolve the tab index to a session id via
@@ -356,10 +356,10 @@ handleAsk _cfg chan _key _sid val = do
 -- session (creating one if it doesn't exist yet).
 sendPlain
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> ConversationKey -> Text
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState)) -> ConversationKey -> Text
   -> IO ()
-sendPlain cfg chan sessions key text = do
-  sid <- resolveSession cfg sessions key
+sendPlain cfg chan sessions wsConns key text = do
+  sid <- resolveSession cfg chan sessions wsConns key
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eResult <- httpSend mgr apiBase sid text
@@ -372,16 +372,16 @@ sendPlain cfg chan sessions key text = do
 -- | Send a slash command via the HTTP API.
 sendSlash
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> ConversationKey -> Text
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState)) -> ConversationKey -> Text
   -> IO ()
 sendSlash = sendPlain  -- same mechanism; the gateway routes slash commands
 
 -- | Handle /new: create a new session via HTTP, update the session map.
 handleNewSession
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> ConversationKey -> Text
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState)) -> ConversationKey -> Text
   -> IO ()
-handleNewSession cfg chan sessions key _args = do
+handleNewSession cfg chan sessions wsConns key _args = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eSid <- httpNewSession mgr apiBase (A.object [])
@@ -392,16 +392,15 @@ handleNewSession cfg chan sessions key _args = do
       Right sid -> do
         sessionInsert sessions key sid
         -- Ensure a WS connection exists for this conversation.
-        wsConns <- newTVarIO Map.empty
         ensureWsConn cfg chan wsConns key sid
         ccSend chan ("new session " <> sessionIdText sid)
 
 -- | Resolve the conversation's session. If the conversation has no session
 -- yet, create one via the HTTP API.
 resolveSession
-  :: ChatChannelConfig -> SessionMap -> ConversationKey
+  :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState)) -> ConversationKey
   -> IO SessionId
-resolveSession cfg sessions key = do
+resolveSession cfg chan sessions wsConns key = do
   mSid <- sessionLookup sessions key
   case mSid of
     Just sid -> pure sid
@@ -413,6 +412,7 @@ resolveSession cfg sessions key = do
         Right sidText -> case mkSessionId sidText of
           Right sid -> do
             sessionInsert sessions key sid
+            ensureWsConn cfg chan wsConns key sid
             pure sid
           Left _ -> fallbackSid
         Left _ -> fallbackSid
