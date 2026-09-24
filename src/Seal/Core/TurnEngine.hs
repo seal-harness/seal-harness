@@ -5,7 +5,6 @@
 --
 -- This module replaces the three duplicated implementations that lived in
 -- 'Seal.Gateway.Send.buildWebRegistry' + 'plainTurn',
--- 'Seal.Channels.Loop.buildIsaRegistry' + 'runTurnOnSession', and
 -- 'Seal.Channel.Cli.cliIsaReg' + 'withCliTurn'. The structural guarantee: a
 -- new opcode added to 'buildSessionRegistry' is available on all four
 -- surfaces (Web, TUI, Telegram, Signal) with zero additional wiring per
@@ -238,7 +237,6 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
 -- | Build the ISA registry for a session turn. This is the **single**
 -- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
 -- Replaces 'Seal.Gateway.Send.buildWebRegistry',
--- 'Seal.Channels.Loop.buildIsaRegistry', and
 -- 'Seal.Channel.Cli.cliIsaReg'.
 buildSessionRegistry
   :: VaultRuntime

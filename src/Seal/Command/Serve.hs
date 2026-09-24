@@ -11,7 +11,7 @@ import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -22,8 +22,6 @@ import Katip (Severity (..), ls)
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
 import qualified Data.Text.Encoding as TE
-import qualified Seal.Channels.Telegram.Commands
-import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 import Seal.Channels.Chat.Loop (runChatChannel, defaultChatChannelConfig)
 import Seal.Channels.Chat.Types qualified as ChatTypes
   (GatewayConfig (..))
@@ -36,11 +34,7 @@ import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Cursor
   ( newPersistingCursorStore, seedCursorStore )
 import Seal.Channels.Cursor.Persist (loadCursorMap)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
-import Seal.Channels.Signal (withSignalChannel)
-import Seal.Channels.Signal.Transport (mkRealSignalTransport)
-import Seal.Channels.Telegram (withTelegramChannel)
-import Seal.Channels.Telegram.Run (mkTelegramHandleCaps, onTelegramCallback)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, mkTabCloseNotifier)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Core.Types (OpName (..))
@@ -51,10 +45,10 @@ import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
 import Seal.Command.Stop (mkStopTranscriptWriter)
-import Seal.Command.Spec (mkRegistry, Registry)
+import Seal.Command.Spec (mkRegistry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
 import Seal.Logging.Logger (SealLogger, logIO)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, useNewChatChannels)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
@@ -356,16 +350,10 @@ runServeMain autonomy logger = do
     void (reconcileStaleThinking broker (30 * 60))
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
-  -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'
-  -- so the agent loop is identical to the standalone modes.
-  if Seal.Config.File.useNewChatChannels cfg
-    then do
-      logIO logger InfoS "chat_channels: using new gateway-API-client implementation"
-      forkNewSignalChatChannel logger gwCfg mgr cfg
-      forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle
-    else do
-      forkSignalListener chanDeps cfg registry
-      forkTelegramListener chanDeps cfg registry
+  -- listener). The channels connect to the gateway as clients (HTTP + WS)
+  -- via the 'seal-chat-channels' package.
+  forkNewSignalChatChannel logger gwCfg mgr cfg
+  forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle
   -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
   -- mode=remote (design V6: prevents network access to the unauthenticated
   -- updateRuntimeConfig caller).
@@ -450,68 +438,9 @@ renumberTabs ts = TabList (zipWith renumber [0..] ts)
       Right i -> i
       Left _  -> error ("renumberTabs: index out of range (unreachable, n=" <> show n <> ")")
 
--- | Fork the Signal channel listener if @[signal]@ is configured. Resolves
--- the config section, spawns the signal-cli transport, and runs the shared
--- inbox-driven loop in a background thread. A missing/unresolved section
--- is logged to stderr and skipped (not fatal — the gateway still starts).
-forkSignalListener :: ChannelDeps -> RuntimeConfig -> Registry -> IO ()
-forkSignalListener deps cfg registry =
-  case resolveSignalConfig (rcSignal cfg) Nothing of
-    Left _ -> pure ()  -- not configured; skip silently
-    Right (account, chunkLimit, allow) -> do
-      let accountLabel = Seal.Signal.Config.signalAccountText account
-      eTransport <- mkRealSignalTransport accountLabel
-      case eTransport of
-        Left err -> logIO (cdLogger deps) WarningS ("seal serve: signal channel skipped: " <> ls err)
-        Right transport -> do
-          let tabsH = cdTabs deps
-          askReply <- newAskReplyStore 0
-          let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
-              plainHandler h = plainTurn deps h askReply
-          _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH Nothing Nothing)
-          pure ()
-
--- | Fork the Telegram channel listener if @[telegram]@ is configured.
--- Resolves the config section, spawns the Bot API transport, registers the
--- bot's slash-command menu with BotFather for auto-completion, and runs the
--- shared inbox-driven loop in a background thread. A missing/unresolved
--- section is logged to stderr and skipped.
-forkTelegramListener :: ChannelDeps -> RuntimeConfig -> Registry -> IO ()
-forkTelegramListener deps cfg registry = do
-  -- Read the bot token from the vault (the wizard stores it there).
-  mh <- readIORef (vrHandleRef (cdVault deps))
-  mVaultToken <- case mh of
-    Nothing -> pure Nothing
-    Just vh -> do
-      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
-      pure $ case r of
-        Right bs -> Just (TE.decodeUtf8 bs)
-        Left _   -> Nothing
-  case resolveTelegramConfig (rcTelegram cfg) mVaultToken of
-    Left err
-      | isJust (rcTelegram cfg) ->
-          -- The [telegram] section is present but unresolved (e.g. the vault
-          -- is locked / missing the token). Surface it so the channel isn't
-          -- silently dropped on startup.
-          logIO (cdLogger deps) WarningS ("seal serve: telegram channel skipped: " <> ls err)
-      | otherwise -> pure ()  -- not configured; skip silently
-    Right (token, chunkLimit, allow) -> do
-      mgr <- newTlsManager
-      transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr
-      -- Register the bot's slash-command menu with BotFather.
-      tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
-      let tabsH = cdTabs deps
-      askReply <- newAskReplyStore 0
-      let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
-          plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))
-      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH
-                     (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply)))
-      pure ()
-
 -- ---------------------------------------------------------------------------
--- New chat-channel fork functions (gateway-API-client implementation)
+-- Chat-channel fork functions (gateway-API-client implementation)
 -- ---------------------------------------------------------------------------
-
 -- | Fork the new Signal chat channel if @[signal]@ is configured.
 forkNewSignalChatChannel
   :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> IO ()

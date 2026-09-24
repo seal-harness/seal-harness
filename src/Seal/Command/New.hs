@@ -20,7 +20,7 @@
 -- The command is registered as a 'CommandSpec' for the CLI and web-gateway
 -- paths (both track "current" via an active-session ref + a 'TabsHandle').
 -- The inbox channels (Signal, Telegram) handle @/new@ at the loop level
--- ('Seal.Channels.Loop') instead, because the per-conversation cursor +
+-- ('Seal.Channels.Chat.Loop') instead, because the per-conversation cursor +
 -- conversation key aren't available to a registry 'CommandAction' — see the
 -- design doc.
 module Seal.Command.New
@@ -69,7 +69,7 @@ emptyNewArgs = NewArgs { naProvider = Nothing, naModel = Nothing, naRepo = Nothi
 
 -- | Parse the raw argument text from the routing layer into 'NewArgs'.
 -- This is a simple manual parse used by the inbox-channel loop path
--- ('Seal.Channels.Loop.handleNewSession'), which doesn't go through
+-- ('Seal.Channels.Chat.Loop'), which doesn't go through
 -- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@, and
 -- @-r@\/@--repo@ with a single value each. Unknown flags are ignored.
 parseNewArgs :: Text -> NewArgs

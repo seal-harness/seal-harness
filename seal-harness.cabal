@@ -147,18 +147,9 @@ library
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
-        Seal.Channels.Class
         Seal.Channels.Cursor
         Seal.Channels.Cursor.Persist
         Seal.Channels.Loop
-        Seal.Channels.Signal
-        Seal.Channels.Signal.Run
-        Seal.Channels.Signal.Transport
-        Seal.Channels.Telegram
-        Seal.Channels.Telegram.Commands
-        Seal.Channels.Telegram.Run
-        Seal.Channels.Telegram.Transport
-        Seal.Channels.StreamProgress
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
@@ -429,7 +420,6 @@ test-suite tests
         Seal.TabsSpec
         Seal.Tabs.PartitionSpec
         Seal.Tabs.PersistSpec
-        Seal.Channels.CursorSpec
         Seal.Tabs.RelaySpec
         Seal.Tabs.WizardSpec
         Seal.Routing.RouteSpec
@@ -464,8 +454,6 @@ test-suite tests
         Seal.ISA.Ops.AgentSpec
         Seal.ISA.Ops.SessionSpec
         Seal.ISA.Ops.RegistrySpec
-        Seal.Phase2aSpec
-        Seal.Phase2bSpec
         Seal.Phase6aSpec
         Seal.Phase6bSpec
         Seal.Phase7aSpec
@@ -476,7 +464,6 @@ test-suite tests
         Seal.Telegram.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
-        Seal.Channels.ClassSpec
         Seal.Channels.Chat.RouteSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
@@ -485,20 +472,6 @@ test-suite tests
         Seal.Channels.Chat.LoopSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
-        Seal.Channels.LoopSpec
-        Seal.Channels.SignalSpec
-        Seal.Channels.Signal.EnvelopeSpec
-        Seal.Channels.TabFocusSpec
-        Seal.Channels.Signal.RunSpec
-        Seal.Channels.Signal.TransportSpec
-        Seal.Channels.Signal.TransportEditSpec
-        Seal.Channels.Signal.TransportLockSpec
-        Seal.Channels.TelegramSpec
-        Seal.Channels.StreamProgressSpec
-        Seal.Channels.Telegram.ButtonsSpec
-        Seal.Channels.Telegram.TransportEditSpec
-        Seal.Channels.Telegram.CommandsSpec
-        Seal.Channels.Telegram.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec
@@ -569,7 +542,6 @@ test-suite tests
         Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
-        Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeRegistry
         Seal.TestHelpers.FakeVault
         Seal.TestHelpers.SshAgentGuard

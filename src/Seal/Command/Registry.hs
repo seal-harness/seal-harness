@@ -35,8 +35,7 @@ import Seal.Vault.Commands (VaultRuntime, vaultCommandSpec)
 
 -- | The shared dependencies for the core slash-command specs. Built once
 -- at startup by each wiring site (web 'Seal.Command.Serve', CLI
--- 'Seal.Tui', Signal/Telegram 'Seal.Channels.Signal.Run' /
--- 'Seal.Channels.Telegram.Run') and passed to 'coreCommandSpecs' to
+-- 'Seal.Tui') and passed to 'coreCommandSpecs' to
 -- produce the channel-agnostic slice of the 'Registry'.
 --
 -- The web's multi-session @\/stop@ (which must target the request's
@@ -97,7 +96,7 @@ data CoreCommandDeps = CoreCommandDeps
 --
 -- @\/new@ is deliberately NOT in the core list: on inbox channels
 -- (Signal, Telegram) @\/new@ is handled at the loop level
--- ('Seal.Channels.Loop.handleNewSession') because the conversation key +
+-- ('Seal.Channels.Chat.Loop') because the conversation key +
 -- cursor aren't available to a registry 'CommandAction'. The CLI and web
 -- add @newCommandSpec@ to their registries directly (closing over their
 -- channel-specific @ndInsertTab@).
