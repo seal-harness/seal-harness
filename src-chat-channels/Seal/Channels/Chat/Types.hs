@@ -45,6 +45,10 @@ import Seal.Gateway.Types.MessageSource
 data InboundMessage = InboundMessage
   { imSource :: MessageSource
   , imBody   :: Text
+  , imCallbackData :: Maybe Text
+    -- ^ @Just data@ when this message is a @callback_query@ (button tap);
+    -- @Nothing@ for a regular text message. The loop uses this to route
+    -- callback taps to the ASK_HUMAN answer-delivery path.
   } deriving stock (Eq, Show)
 
 -- | A raw received message from the transport: the conversation id, the
@@ -60,6 +64,17 @@ data ReceivedMessage = ReceivedMessage
     -- ^ The platform-specific reply target (Telegram chat id, Signal
     -- phone number). Used by the adapter to address sends/edits.
   , rmBody           :: Text
+  , rmCallbackData   :: Maybe Text
+    -- ^ @Just data@ when the message is a @callback_query@ (button tap);
+    -- @Nothing@ for a regular text message. The data is the
+    -- @callback_data@ string the keyboard was built with.
+  , rmCallbackId     :: Maybe Text
+    -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@
+    -- for regular messages.
+  , rmCallbackMessageId :: Maybe Text
+    -- ^ @Just msgId@ for callback_query (the message holding the
+    -- keyboard, so the adapter can remove it after a tap); @Nothing@
+    -- for regular messages.
   } deriving stock (Eq, Show)
 
 -- | A platform message identifier (opaque: a Telegram @message_id@ or a

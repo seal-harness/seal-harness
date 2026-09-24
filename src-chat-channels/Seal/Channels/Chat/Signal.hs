@@ -300,6 +300,9 @@ parseSignalEnvelope v = do
     , rmSender = Just source
     , rmReplyTo = replyTo
     , rmBody = body
+    , rmCallbackData = Nothing
+    , rmCallbackId = Nothing
+    , rmCallbackMessageId = Nothing
     }
 
 -- | Derive the 'ConversationId' from the peer's authenticated transport
@@ -404,6 +407,11 @@ instance ChatChannel SignalChatChannel where
 
   ccLabel _ = "signal"
 
+  -- Signal doesn't reliably support message editing (signal-cli's
+  -- editTimestamp is flaky in practice). Disable streaming: send the
+  -- final text as a single message after the turn completes.
+  ccSupportsStreaming _ = False
+
 -- | Send one chunk verbatim to the last sender.
 sendRaw :: SignalChatChannel -> Text -> IO ()
 sendRaw ch t = do
@@ -454,13 +462,13 @@ readerLoop ch = go
       case eVal of
         Left _ -> writeIORef (sccReaderAlive ch) False
         Right (Left _) -> writeIORef (sccReaderAlive ch) False
-        Right (Right (ReceivedMessage cid mSender replyTo body))
+        Right (Right (ReceivedMessage cid mSender replyTo body _ _ _))
           | T.null body -> go
           | otherwise -> do
               case mkMessageSource cid Signal (mkSender <$> mSender) mempty of
                 Right ms -> do
                   writeIORef (sccLastSender ch) (Just replyTo)
-                  atomically (writeTQueue (sccInbox ch) (InboundMessage ms body))
+                  atomically (writeTQueue (sccInbox ch) (InboundMessage ms body Nothing))
                 Left _ -> pure ()
               go
 

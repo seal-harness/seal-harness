@@ -22,6 +22,9 @@ dummyMsg = ReceivedMessage
   , rmSender = Just "123"
   , rmReplyTo = "test-chat"
   , rmBody = "init"
+  , rmCallbackData = Nothing
+  , rmCallbackId = Nothing
+  , rmCallbackMessageId = Nothing
   }
 
 -- | Wait briefly for the reader thread to process the seed message.
