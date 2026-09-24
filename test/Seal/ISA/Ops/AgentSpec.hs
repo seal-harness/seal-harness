@@ -3,7 +3,7 @@ module Seal.ISA.Ops.AgentSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
-  ( MVar, newMVar, modifyMVar, withMVar )
+  ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (bracket)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
@@ -17,9 +17,14 @@ import Seal.Agent.Def.Backend
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Agent.Runtime.Delegation qualified as Del
 import Seal.Agent.Runtime.Delegation
-  ( ChildExitReason (..), ChildWorkerOutcome (..)
+  ( ChildExitReason (..), ChildResult (..), ChildStatus (..)
+  , ChildWorkerOutcome (..)
+  , DelegateInput (..)
+  , SpawnInfo (..)
   , defaultDelegationConfig, dcChildTimeoutSeconds
-  , newSpawnPauseFlag, setSpawnPaused )
+  , newSpawnPauseFlag, setSpawnPaused
+  , runDelegateAsync
+  )
 import Seal.Agent.Runtime.Registry
 import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
@@ -489,6 +494,151 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       case orParts r of
         [TrpText t] -> t `shouldBe` "subagent not running"
         _           -> expectationFailure "expected a single text part"
+
+  describe "runDelegateAsync (async core)" $ do
+    it "returns immediately with SpawnInfo (does not block on worker completion)" $ do
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      let cfg = defaultDelegationConfig
+          callback = putMVar resultMVar
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker ran
+                                        , mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      case eResult of
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+        Right [info] -> do
+          siTaskIndex info `shouldBe` 0
+          siChildSession info `shouldBe` mkSystemSessionId "child"
+        Right _ -> expectationFailure "expected exactly one SpawnInfo"
+      -- The worker hasn't necessarily run yet — we just verify we got
+      -- SpawnInfo back without blocking. Wait for the callback to verify
+      -- the worker did eventually run.
+      _result <- takeMVar resultMVar
+      readIORef ran `shouldReturn` 1
+
+    it "completion callback fires with ChildResult after worker finishes" $ do
+      pauseFlag <- newSpawnPauseFlag
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      ran <- newIORef (0 :: Int)
+      let cfg = defaultDelegationConfig
+          callback = putMVar resultMVar
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker ran
+                                        , mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      result <- takeMVar resultMVar
+      crStatus result `shouldBe` CsCompleted
+      crSummary result `shouldBe` Just "done"
+      crChildSession result `shouldBe` Just (mkSystemSessionId "child")
+
+    it "resolve error calls callback with CsError" $ do
+      pauseFlag <- newSpawnPauseFlag
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      let cfg = defaultDelegationConfig
+          callback = putMVar resultMVar
+          resolver _task = pure (Left "agent def not found: nope")
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing)
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      result <- takeMVar resultMVar
+      crStatus result `shouldBe` CsError
+      crError result `shouldBe` Just "agent def not found: nope"
+
+    it "worker exception results in CsError" $ do
+      pauseFlag <- newSpawnPauseFlag
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      let cfg = defaultDelegationConfig
+          callback = putMVar resultMVar
+          crashingWorker :: Del.AgentWorkerBuilder
+          crashingWorker _ _ _ _ = ioError (userError "boom")
+          resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      result <- takeMVar resultMVar
+      crStatus result `shouldBe` CsError
+      crExitReason result `shouldBe` CerError
+
+    it "worker timeout results in CsTimeout" $ do
+      pendingWith "minChildTimeoutSeconds=30 makes a real timeout test take >30s; \
+                  \needs a test seam to lower the floor"
+      pauseFlag <- newSpawnPauseFlag
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+          callback = putMVar resultMVar
+          slowWorker :: Del.AgentWorkerBuilder
+          slowWorker _ _ _ _ = do
+            threadDelay 31000000  -- 31s, just over the 30s timeout
+            pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+          resolver _task = pure (Right (undefined, slowWorker, mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      result <- takeMVar resultMVar
+      crStatus result `shouldBe` CsTimeout
+      crExitReason result `shouldBe` CerTimeout
+
+    it "spawn paused returns Left immediately" $ do
+      pauseFlag <- newSpawnPauseFlag
+      _ <- setSpawnPaused pauseFlag True
+      let cfg = defaultDelegationConfig
+          callback = const (pure ())
+          dummyWorker :: Del.AgentWorkerBuilder
+          dummyWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+          resolver _task = pure (Right (undefined, dummyWorker, mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      case eResult of
+        Left err -> T.isInfixOf "paused" err `shouldBe` True
+        Right _  -> expectationFailure "expected Left (paused)"
+      _ <- setSpawnPaused pauseFlag False
+      pure ()
+
+    it "batch mode runs children concurrently (max_concurrent_children respected)" $ do
+      pauseFlag <- newSpawnPauseFlag
+      concurrencyState <- newMVar (0 :: Int, 0 :: Int)
+      let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+          callback = const (pure ())
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing
+          tasks = [mkTask i | i <- [1..5 :: Int]]
+          input = DiBatch tasks
+          resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState, mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (pure (mkSystemSessionId "child"))
+      -- Wait a bit for all workers to finish
+      threadDelay 500000  -- 500ms
+      mc <- maxConcurrent concurrencyState
+      mc `shouldSatisfy` (<= 3)  -- max_concurrent_children=3
+
+    it "registerCompletedAgentResult stores the ChildResult in the registry" $ do
+      rt <- newAgentRuntime
+      let sid = Del.SubagentId "test-12345678"
+          childSid = mkSystemSessionId "child"
+          result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsCompleted
+            , crSummary = Just "done"
+            , crExitReason = CerCompleted
+            , crDurationSeconds = 1.0
+            , crSubagentId = sid
+            , crTokensInput = 0
+            , crTokensOutput = 0
+            , crToolTrace = []
+            , crError = Nothing
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just childSid
+            }
+      -- First register a running instance (simulates startAgent)
+      _ <- startAgent rt sampleDefId sid childSid 0 (pure ())
+      -- Then register the completed result
+      registerCompletedAgentResult rt sid result
+      mInst <- agentInstanceBySubagentId rt sid
+      case mInst of
+        Just inst -> do
+          aiStatus inst `shouldBe` Stopped
+          aiResult inst `shouldBe` Just result
+        Nothing -> expectationFailure "instance not found in registry"
 
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do
