@@ -24,6 +24,7 @@ module Seal.Agent.Runtime.Registry
   , AgentRuntime
   , newAgentRuntime
   , startAgent
+  , registerRunningAgent
   , registerCompletedAgent
   , registerCompletedAgentResult
   , stopAgent
@@ -106,6 +107,20 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
     Nothing   -> do
       killThread tid
       pure (Left "agent already running for this subagent id")
+
+-- | Register a running agent instance WITHOUT forking a worker thread.
+-- Used by 'runDelegateAsync' which forks its own threads (via 'forkIO')
+-- and needs the instance in the registry at spawn time so 'AGENT_INSTANCES'
+-- lists it while running. The 'ThreadId' is the calling thread's (the
+-- parent's) — 'stopAgent' will kill it (a no-op if the child has already
+-- finished). Idempotent: re-registering overwrites.
+registerRunningAgent
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> IO ()
+registerRunningAgent (AgentRuntime tv) aid subagentId session depth = do
+  tid <- myThreadId
+  atomically $ do
+    let inst = AgentInstance aid subagentId session Running tid depth Nothing
+    modifyTVar' tv (Map.insert subagentId inst)
 
 -- | Register a synchronously-completed child in the runtime registry. The
 -- synchronous delegation model runs the worker to completion BEFORE this is

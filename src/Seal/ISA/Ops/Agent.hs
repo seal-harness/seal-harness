@@ -45,7 +45,6 @@ module Seal.ISA.Ops.Agent
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad (zipWithM_)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson.Key (fromText)
@@ -65,21 +64,27 @@ import Seal.Agent.Def.Types
 import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
+  , AgentCompletionCallback
+  , SpawnCallback
   , ChildResult (..)
   , ChildTask (..)
   , DelegationConfig
   , DelegateInput (..)
+  , SpawnInfo (..)
   , SpawnPauseFlag
   , ParentActivity
   , SubagentId (..)
   , resolveDelegationConfig
-  , runDelegate
+  , runDelegateAsync
   , subagentIdText
   )
 import Seal.Agent.Runtime.Registry
-  ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
-  , interruptAgent, listAgents, registerCompletedAgent, stopAgent )
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..))
+  ( AgentInstance (..), AgentRuntime, AgentStatus (..)
+  , agentInstanceBySubagentId
+  , interruptAgent, listAgents
+  , registerCompletedAgentResult, registerRunningAgent, stopAgent )
+import Seal.Config.Paths (SealPaths)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -501,6 +506,12 @@ data AgentStartWiring = AgentStartWiring
   , aswParentDepth  :: Int
   , aswWorker       :: AgentWorkerBuilder
   , aswGate         :: AgentStartGate
+  , aswPaths        :: SealPaths
+    -- ^ The harness paths (for appending completion messages to the
+    -- parent's transcript via direct file append).
+  , aswParentSession :: SessionId
+    -- ^ The parent's session id (so the completion callback knows which
+    -- @conversation.jsonl@ to append to).
   }
 
 -- | The role/switch condition the nested AGENT_START enforces before it
@@ -589,25 +600,6 @@ leafMsg = "AGENT_START is not available to this agent: its definition is a leaf 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
 -- ran synchronously to completion). Records the instance with status
 -- 'Stopped' (the synchronous child has already finished by the time this is
--- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
--- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
--- carries the 'SubagentId' but not the def id). The recorded depth is the
--- CHILD's own depth — the wiring's parent depth + 1.
-registerChild :: AgentRuntime -> Int -> ChildTask -> ChildResult -> IO ()
-registerChild runtime childDepth task result =
-  case mkAgentDefId (ctDefId task) of
-    Left _ -> pure ()
-    Right aid ->
-      case crChildSession result of
-        Nothing -> pure ()
-        Just session -> do
-          registerCompletedAgent runtime aid (crSubagentId result) session childDepth
-
--- | Extract the task list from a 'DelegateInput' (in order).
-diTasks :: DelegateInput -> [ChildTask]
-diTasks (DiSingle t) = [t]
-diTasks (DiBatch ts) = ts
-
 -- ---------------------------------------------------------------------------
 -- Agent runtime action enum (AGENT_MANAGE)
 -- ---------------------------------------------------------------------------
@@ -676,6 +668,7 @@ handleInstances runtime = do
   pure (OpResult [TrpText rendered] False recorded)
 
 -- | Handle the start action (shared with the legacy AGENT_START shim).
+-- Async: forks children, returns immediately with per-child SpawnInfo.
 handleStart :: AgentStartWiring -> Value -> App OpResult
 handleStart wiring v = do
   input <- liftIO (parseInput v)
@@ -684,38 +677,72 @@ handleStart wiring v = do
     Right di -> do
       cfg <- liftIO (aswConfig wiring)
       let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
-      eResults <- liftIO (runDelegate
-                            cfg
-                            (aswPauseFlag wiring)
-                            (aswParentActivity wiring)
-                            (aswParentDepth wiring)
-                            di
-                            (resolveTask (aswDefBackend wiring)
-                                         (aswRuntime wiring)
-                                         (aswMintSession wiring)
-                                         (aswParentDepth wiring)
-                                         orchEnabled
-                                         (aswWorker wiring)))
-      case eResults of
+          runtime = aswRuntime wiring
+          callback :: AgentCompletionCallback
+          callback result = do
+            registerCompletedAgentResult runtime (crSubagentId result) result
+            -- TODO: append completion message to parent's conversation.jsonl.
+            -- Disabled for now: the direct O_APPEND write conflicts with the
+            -- single-writer daemon's in-memory diff state (tfsWritten),
+            -- corrupting the transcript. A proper fix requires either:
+            -- (a) a queue drained by the turn engine, or
+            -- (b) writing to a sidecar file that the next turn reads.
+            -- The completion result IS stored in the registry via
+            -- registerCompletedAgentResult, so AGENT_STATUS works.
+          spawnCb :: SpawnCallback
+          spawnCb sid def childSid =
+            registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)
+      eSpawnInfos <- liftIO (runDelegateAsync
+                               cfg
+                               (aswPauseFlag wiring)
+                               (aswParentActivity wiring)
+                               (aswParentDepth wiring)
+                               di
+                               (resolveTask (aswDefBackend wiring)
+                                            runtime
+                                            (aswMintSession wiring)
+                                            (aswParentDepth wiring)
+                                            orchEnabled
+                                            (aswWorker wiring))
+                               callback
+                               spawnCb
+                               (aswMintSession wiring))
+      case eSpawnInfos of
         Left err -> pure (OpResult [TrpText err] True (object []))
-        Right results -> do
-          let tasks = diTasks di
-              childDepth = aswParentDepth wiring + 1
-          zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) childDepth t r)) tasks results
-          let rendered = encodeResultsJson results
-          pure (OpResult [TrpText rendered] False (object ["results" .= results]))
+        Right spawnInfos ->
+          pure (OpResult [TrpText (encodeSpawnInfos spawnInfos)] False
+                 (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
 
 -- | Handle the status action (shared with the legacy AGENT_STATUS shim).
+-- Enriched: when the registry has a completed entry with aiResult, the
+-- response includes summary, child_session, exit_reason, and duration.
 handleStatus :: AgentRuntime -> Value -> App OpResult
 handleStatus runtime v = do
   let mSid = subagentIdField v
   case mSid of
     Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
     Just sid -> do
-      mStatus <- liftIO (agentStatus runtime sid)
-      case mStatus of
-        Nothing -> pure (OpResult [TrpText "not running"] False (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
-        Just s  -> pure (OpResult [TrpText (renderStatus s)] False (object ["subagent_id" .= subagentIdText sid, "status" .= renderStatus s]))
+      mInst <- liftIO (agentInstanceBySubagentId runtime sid)
+      case mInst of
+        Nothing -> pure (OpResult [TrpText "not running"] False
+                         (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
+        Just inst -> do
+          let s = aiStatus inst
+              baseRecord = [ "subagent_id" .= subagentIdText sid
+                           , "status" .= renderStatus s
+                           ]
+          case aiResult inst of
+            Nothing ->
+              pure (OpResult [TrpText (renderStatus s)] False (object baseRecord))
+            Just result ->
+              let enriched = baseRecord
+                    ++ [ "summary" .= crSummary result
+                       , "child_session" .= fmap sessionIdText (crChildSession result)
+                       , "exit_reason" .= T.pack (show (crExitReason result))
+                       , "duration_seconds" .= crDurationSeconds result
+                       ]
+                  statusText = renderStatus s <> maybe "" ("\n" <>) (crSummary result)
+              in pure (OpResult [TrpText statusText] False (object enriched))
 
 -- | Handle the stop action (shared with the legacy AGENT_STOP shim).
 handleStop :: AgentRuntime -> Value -> App OpResult
@@ -789,7 +816,7 @@ agentManageOp wiring = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = authorizeAgentManage wiring
-  , toBlocking = False
+  , toBlocking = True
   , toRun = \_ v ->
       case parseAgentAction v of
         Left e -> pure (OpResult [TrpText e] True (object []))
@@ -855,7 +882,7 @@ agentStartOp wiring = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = authorizeStart wiring
-  , toBlocking = False
+  , toBlocking = True
   , toRun = \_ v -> handleStart wiring v
   }
 
@@ -901,23 +928,6 @@ agentInterruptOp runtime = TrustedOpcode
 -- ---------------------------------------------------------------------------
 -- JSON encoding of ChildResult
 -- ---------------------------------------------------------------------------
-
--- | Render the results list as a JSON string for the model (the @orParts@
--- text the model sees). One line per result:
--- @subagent_id | status | summary-or-error@. The full structured JSON goes
--- into 'orRecorded' via the 'ToJSON ChildResult' instance defined in
--- 'Seal.Agent.Runtime.Delegation'.
-encodeResultsJson :: [ChildResult] -> Text
-encodeResultsJson [] = "(no results)"
-encodeResultsJson rs = T.intercalate "\n" (map renderOne rs)
-  where
-    renderOne r =
-      subagentIdText (crSubagentId r) <> " | " <>
-      T.pack (show (crStatus r)) <> " | " <>
-      fromMaybe "(no summary)" (summaryOrError r)
-    summaryOrError r = case crSummary r of
-      Just s  -> Just s
-      Nothing -> crError r
 
 renderStatus :: AgentStatus -> Text
 renderStatus = \case
@@ -997,3 +1007,26 @@ renderDef d =
 renderTools :: AllowList OpName -> Text
 renderTools AllowAll       = "all"
 renderTools (AllowOnly xs) = T.intercalate ", " [ t | OpName t <- Set.toList xs ]
+
+-- ---------------------------------------------------------------------------
+-- Async spawn helpers
+-- ---------------------------------------------------------------------------
+
+-- | Render the spawn-info list as a text block for the model (the
+-- @orParts@ text the model sees). One line per child:
+-- @subagent_id | child_session | status@.
+encodeSpawnInfos :: [SpawnInfo] -> Text
+encodeSpawnInfos [] = "(no children spawned)"
+encodeSpawnInfos infos = T.intercalate "\n" (map renderOne infos)
+  where
+    renderOne si =
+      subagentIdText (siSubagentId si) <> " | " <>
+      sessionIdText (siChildSession si) <> " | running"
+
+-- | Encode a 'SpawnInfo' as JSON for the 'orRecorded' payload.
+toJSONSpawnInfo :: SpawnInfo -> Value
+toJSONSpawnInfo si = object
+  [ "subagent_id"   .= subagentIdText (siSubagentId si)
+  , "child_session" .= sessionIdText (siChildSession si)
+  , "status"        .= ("running" :: Text)
+  ]

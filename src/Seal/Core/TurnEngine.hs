@@ -993,6 +993,8 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
+    , aswPaths = tdPaths td
+    , aswParentSession = parentSid
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
@@ -1157,6 +1159,8 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
                 { gEffectiveRole = mRole
                 , gOrchEnabled = orchEnabled
                 }
+          , aswPaths = tdPaths td
+          , aswParentSession = childSid
           }
       nestedWorker = case tdMkWorker td of
         Just stub

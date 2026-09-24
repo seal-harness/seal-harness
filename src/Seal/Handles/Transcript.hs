@@ -30,6 +30,7 @@ module Seal.Handles.Transcript
   , TwoFileWrite (..)
   , TranscriptError (..)
   , defaultAckTimeoutUs
+  , appendConversationMessage
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -38,7 +39,7 @@ import Control.Concurrent.STM
   ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
   , orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry, takeTMVar
   , tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
-import Control.Exception (bracket, catch, Exception, SomeException, throwIO)
+import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
 import Control.Monad (void)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
@@ -60,7 +61,8 @@ import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
 
 import Katip (Severity (..), ls)
-import Seal.Core.Types (OpName, ToolCallId, ModelId (..))
+import Seal.Config.Paths (SealPaths, sessionConversationPath)
+import Seal.Core.Types (OpName, ToolCallId, ModelId (..), SessionId)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), ToolResultPart (..), ToolChoice (..) )
@@ -530,3 +532,33 @@ minimalDelta mPrior next = case mPrior of
           , edMaxTokens = if envMaxTokens next == envMaxTokens prior then Nothing else Just (envMaxTokens next)
           }
     in if d == emptyEnvelopeDelta then Nothing else Just d
+
+-- | Append a single 'Message' to a session's @conversation.jsonl@ file
+-- using direct @O_APPEND@ + @fsync@. This is used by the async delegation
+-- completion callback — which runs in a forked child thread that may
+-- outlive the parent's 'withTwoFileTranscript' bracket (and its
+-- single-writer daemon). POSIX @O_APPEND@ guarantees each @write()@
+-- atomically seeks to end-of-file, so concurrent writes (from the daemon
+-- during the parent's turn, or from another completion callback) do not
+-- interleave.
+--
+-- IO errors are swallowed (best-effort): a completion write failure must
+-- not crash the forked child thread. The error is logged via the global
+-- katip scribe.
+appendConversationMessage :: SealPaths -> SessionId -> Message -> IO ()
+appendConversationMessage paths sid msg =
+  catch @IOException
+    ( do
+        let convPath = sessionConversationPath paths sid
+        let flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }
+        fd <- openFd convPath ReadWrite flags
+        let bs = encodeConvLine (ConvLine msg) <> "\n"
+        BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -> do
+          _ <- fdWriteBuf fd (castPtr ptr) (fromIntegral len)
+          pure ()
+        fileSynchronise fd
+        closeFd fd
+    )
+    ( \e -> globalLogIO ErrorS
+              (ls ("appendConversationMessage failed: " <> T.pack (show e)))
+    )
