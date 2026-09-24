@@ -158,6 +158,18 @@ export function findSession(
     ?? tabSessions.find((s) => s.id === id)
 }
 
+/** Convert a numeric tab index (0..35) to its single-character display label,
+ *  mirroring the backend's `tabIndexToChar` (0→'0', 9→'9', 10→'a', 35→'z').
+ *  This keeps the web frontend's tab badges in sync with the `/tab list` CLI
+ *  and the chat-channel routing grammar, which all use this single-char
+ *  scheme. Indices outside 0..35 are returned as their decimal string (they
+ *  should never occur from the backend, but we fail soft rather than crash). */
+export function tabIndexToChar(index: number): string {
+  if (index >= 0 && index <= 9) return String(index)
+  if (index >= 10 && index <= 35) return String.fromCharCode('a'.charCodeAt(0) + index - 10)
+  return String(index)
+}
+
 // ── Discovery (harness adoption) ───────────────────────────────────────
 
 /** An external (unmanaged) tmux window that Seal discovered via an on-demand
