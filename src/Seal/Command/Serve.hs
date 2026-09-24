@@ -538,8 +538,7 @@ forkNewSignalChatChannel logger gwCfg mgr cfg =
       eTransport <- ChatSignal.mkRealSignalChatTransport accountText
       case eTransport of
         Left err -> logIO logger WarningS ("signal chat channel: " <> ls err)
-        Right transport -> do
-          logIO logger InfoS "signal chat channel: starting with real transport"
+        Right transport ->
           void (forkIO (withSignalChatChannel
                           allow
                           chunkLimit
@@ -575,7 +574,6 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle = do
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
-      putStrLn "[seal] telegram chat channel: starting with real transport"
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit

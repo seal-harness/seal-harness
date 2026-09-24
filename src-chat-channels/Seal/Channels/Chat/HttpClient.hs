@@ -23,7 +23,6 @@ module Seal.Channels.Chat.HttpClient
   ) where
 
 import Control.Exception (try)
-import System.IO (hPutStrLn, stderr)
 import Data.Aeson (Value, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -161,13 +160,11 @@ doRequest mgr url m mBody = do
       eResp <- try (httpLbs req2 mgr) :: IO (Either HttpException (Response BL.ByteString))
       case eResp of
         Left _ -> pure (Left "HTTP request failed")
-        Right resp -> do
+        Right resp ->
           let code = statusCode (responseStatus resp)
-          if code >= 200 && code <= 299
-            then pure (Right (responseBody resp))
-            else do
-              hPutStrLn stderr ("[chat-channel] HTTP " <> show code <> " from " <> url <> ": " <> show (responseBody resp))
-              pure (Left ("HTTP " <> T.pack (show code)))
+          in if code >= 200 && code <= 299
+               then pure (Right (responseBody resp))
+               else pure (Left ("HTTP " <> T.pack (show code)))
 
 -- | Extract the @id@ field from a session info JSON object.
 extractSessionId :: BL.ByteString -> Either Text Text

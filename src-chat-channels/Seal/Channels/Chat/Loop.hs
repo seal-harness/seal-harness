@@ -188,21 +188,16 @@ ensureWsConn
   -> IO ()
 ensureWsConn cfg chan wsConns key sid = do
   let gwCfg = cccGateway cfg
-  dbg ("ensureWsConn: key=" <> T.pack (show key) <> " sid=" <> sessionIdText sid)
   conns <- readTVarIO wsConns
   case Map.lookup key conns of
     Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
     Nothing -> do
       -- Start a new WS connection with the streaming event handler.
       let callback = handleServerEvent cfg chan key wsConns sid
-          wsHost = gcHost gwCfg
-          wsPort = gcWsPort gwCfg
-      dbg ("ensureWsConn: connecting to ws://" <> wsHost <> ":" <> T.pack (show wsPort))
-      eWs <- startWsClient wsHost wsPort callback
+      eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
-        Left err -> dbg ("ensureWsConn: WS connect failed: " <> err)
+        Left _ -> pure ()  -- WS failed; the channel still works via HTTP
         Right ws -> do
-          dbg ("ensureWsConn: WS connected, focusing sid=" <> sessionIdText sid)
           ss <- newStreamingState
           atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
           wcFocus ws sid
@@ -216,8 +211,7 @@ handleServerEvent
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> SessionId -> ServerEvent -> IO ()
 handleServerEvent cfg chan key wsConns focusedSid ev =
-  logEvent ev >>
-  (case ev of
+  case ev of
     SeEntryUpdate sid val
       | sid == focusedSid -> handleEntryUpdate cfg chan key wsConns val
     SeEntry sid val
@@ -229,17 +223,7 @@ handleServerEvent cfg chan key wsConns focusedSid ev =
     -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key sid val
-    _ -> pure ())  -- ignore events for other sessions or irrelevant types
-  where
-    -- Log each event, but summarize streaming entry-updates: they fire
-    -- many times per response (once per rate-limited frame), and each
-    -- carried JSON is the FULL accumulated text — dumping every frame
-    -- swamped the log (the 810KB/117-line output.log). One compact line
-    -- per update keeps the cadence observable without the flood.
-    logEvent (SeEntryUpdate sid val) =
-      dbg ("handleServerEvent: SeEntryUpdate " <> sessionIdText sid
-           <> " len=" <> T.pack (show (T.length (extractEntryText val))))
-    logEvent e = dbg ("handleServerEvent: " <> T.pack (show e))
+    _ -> pure ()  -- ignore events for other sessions or irrelevant types
 
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
@@ -440,13 +424,9 @@ sendPlain
   -> IO ()
 sendPlain cfg chan sessions wsConns key text = do
   sid <- resolveSession cfg chan sessions wsConns key
-  dbg ("sendPlain: sid=" <> sessionIdText sid <> " text=" <> T.take 50 text)
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eResult <- httpSend mgr apiBase sid text
-  case eResult of
-    Right sr -> dbg ("sendPlain: kind=" <> srKind sr <> " response=" <> T.take 50 (srResponse sr))
-    Left e -> dbg ("sendPlain: HTTP error=" <> e)
   case eResult of
     Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
     Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -492,11 +472,9 @@ resolveSession cfg chan sessions wsConns key = do
       let apiBase = gcApiBase (cccGateway cfg)
           mgr = cccHttpManager cfg
       eSid <- httpNewSession mgr apiBase (A.object [])
-      dbg ("resolveSession: httpNewSession result=" <> either ("Left " <>) ("Right " <>) eSid)
       case eSid of
         Right sidText -> case mkSessionId sidText of
           Right sid -> do
-            dbg ("resolveSession: created sid=" <> sessionIdText sid)
             sessionInsert sessions key sid
             ensureWsConn cfg chan wsConns key sid
             pure sid
