@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 
@@ -217,7 +217,7 @@ describe('transcriptToMessages', () => {
     expect(block.toolDefs!.descriptions).toEqual(['search the web'])
   })
 
-  it('renders System + Tools rows for every request that carries them (no dedup)', () => {
+  it('deduplicates System + Tools rows by content — identical values render once', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -241,9 +241,9 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    // No deduplication — every request carrying system+tools renders rows.
-    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
-    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(2)
+    // Deduplication — identical system+tools values render only once.
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
   it('renders rows only when fields are present (backend omits unchanged fields)', () => {
@@ -274,6 +274,46 @@ describe('transcriptToMessages', () => {
     // Only the first request carries system+tools; the second omits both.
     expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
+  })
+
+  it('renders a new System Prompt row when the value changes between turns', () => {
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'c1',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys-A', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'c2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+        raw: '{}',
+      }),
+      // Second request: system CHANGED to 'sys-B'; tools unchanged (omitted
+      // by the backend's delta encoding, but we include them here for the
+      // test since the dedup is purely content-based).
+      makeEntry({
+        id: 'c3',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys-B', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // Two distinct system prompts → two rows; identical tools → one row.
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
+    // The first System Prompt row appears before the second.
+    const sysRows = msgs.filter((m) => m.agentName === 'System Prompt')
+    const firstIdx = msgs.indexOf(sysRows[0]!)
+    const secondIdx = msgs.indexOf(sysRows[1]!)
+    expect(firstIdx).toBeLessThan(secondIdx)
+    // The first System Prompt row appears before the first user message.
+    const userIdx = msgs.findIndex((m) => m.agentName === 'You')
+    expect(firstIdx).toBeLessThan(userIdx)
   })
 
   it('renders System Prompt and Tools rows BEFORE the first user message (preamble entry)', () => {
@@ -382,7 +422,9 @@ describe('transcriptToMessages', () => {
     const msgs = transcriptToMessages(entries)
     const userRow = msgs.find((m) => m.agentName === 'You')
     expect(userRow).toBeTruthy()
-    expect(userRow!.rawJson).toBe(raw)
+    // rawJson is now a lazy provider function — call it to get the value.
+    const rj = userRow!.rawJson
+    expect(typeof rj === 'function' ? rj() : rj).toBe(raw)
     expect(userRow!.entryId).toBe('u1')
   })
 
@@ -1898,5 +1940,190 @@ describe('Synthesized pending ASK_HUMAN', () => {
     expect(screen.getByTestId('ask-human-form')).toBeTruthy()
     expect(screen.getByText('What is your name?')).toBeTruthy()
     expect(screen.getByPlaceholderText('Type your own answer…')).toBeTruthy()
+  })
+})
+
+// ── Scroll-to-bottom behavior ──────────────────────────────────────────────
+
+describe('Scroll-to-bottom behavior', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    // jsdom doesn't implement layout, so scrollTo/scrollIntoView are no-ops.
+    // We spy on them to verify the scroll behavior is triggered.
+    // Restore stubs after each test.
+    cleanup()
+  })
+
+  it('"Scroll to bottom" button sets pin-to-bottom so subsequent streaming auto-scrolls', () => {
+    // The scroll-to-bottom button must set wasAtBottom=true (pin-to-bottom
+    // mode) so that new streaming messages auto-scroll. We verify this by
+    // checking that after clicking the button, a new message arrival
+    // triggers scrollIntoView on the messages-end sentinel.
+    const msgsA = makeMessages('a', 3)
+    const scrollIntoViewSpy = vi.fn()
+    const scrollToSpy = vi.fn()
+
+    // Override the no-op stubs with spies.
+    const origScrollIntoView = Element.prototype.scrollIntoView
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+        />,
+      )
+      // Clear calls from initial render effects.
+      scrollIntoViewSpy.mockClear()
+      scrollToSpy.mockClear()
+
+      // Click the "Scroll to bottom" button.
+      fireEvent.click(screen.getByLabelText('Scroll to bottom'))
+      // The button calls scrollTo directly.
+      expect(scrollToSpy).toHaveBeenCalled()
+
+      // Now simulate a new streaming message arriving. Because the button
+      // pinned to bottom, the sticky-bottom effect should fire
+      // scrollIntoView.
+      scrollIntoViewSpy.mockClear()
+      const msgsWithNew = [...msgsA, {
+        id: 'a-m3',
+        entryId: 'a-e3',
+        agentName: 'Assistant',
+        agentStatus: 'completed' as const,
+        timestamp: '2024-06-01 12:00:01',
+        blocks: [{ id: 'a-b3', text: 'New streaming message' }],
+        rawJson: '{}',
+      }]
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsWithNew}
+        />,
+      )
+      // sticky-bottom scroll should have been called.
+      expect(scrollIntoViewSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('switching sessions scrolls to bottom of the new session', () => {
+    // When the user switches from session s1 to session s2, the transcript
+    // should scroll to the bottom of s2's messages. We verify this by
+    // checking that scrollIntoView is called after the session switch
+    // completes (the deferred scroll fires once the new messages arrive).
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+
+    const scrollIntoViewSpy = vi.fn()
+    const origScrollIntoView = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+        />,
+      )
+      // Clear calls from initial render.
+      scrollIntoViewSpy.mockClear()
+
+      // Switch to session s2 with different messages.
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+          />,
+        )
+      })
+
+      // The deferred scroll should have fired, calling scrollIntoView.
+      expect(scrollIntoViewSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView
+    }
+  })
+
+  it('after session switch, subsequent streaming messages auto-scroll (sticky-bottom not broken)', () => {
+    // Regression test: after switching sessions, the sticky-bottom state
+    // must not be permanently broken. New messages arriving in the new
+    // session should auto-scroll.
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+
+    const scrollIntoViewSpy = vi.fn()
+    const origScrollIntoView = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+        />,
+      )
+
+      // Switch to session s2.
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+          />,
+        )
+      })
+
+      // Clear calls from session switch.
+      scrollIntoViewSpy.mockClear()
+
+      // A new message arrives in s2 (streaming update — same first id, count+1).
+      const msgsWithNew = [...msgsB, {
+        id: 'b-m5',
+        entryId: 'b-e5',
+        agentName: 'Assistant',
+        agentStatus: 'completed' as const,
+        timestamp: '2024-06-01 12:00:01',
+        blocks: [{ id: 'b-b5', text: 'New message in s2' }],
+        rawJson: '{}',
+      }]
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsWithNew}
+          />,
+        )
+      })
+
+      // Sticky-bottom scroll should have fired for the new message.
+      expect(scrollIntoViewSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView
+    }
   })
 })

@@ -14,6 +14,63 @@ import { streamClient } from '../lib/streamClient'
 import { fetchPendingQuestions, type PendingQuestion } from './useApi'
 import * as perf from '../lib/perf'
 
+// ── Module-level transcript data cache ──────────────────────────────────
+//
+// Transcripts are append-only and immutable (past entries never change
+// except streaming placeholders). This cache stores the raw
+// TranscriptEntry[] for each session so that switching back to a
+// previously-viewed session is instantaneous — the cached data is shown
+// immediately while only the delta (new entries since the last visit) is
+// fetched via the WS `since` replay parameter.
+//
+// The cache is bounded (MAX_CACHED_TRANSCRIPTS). When full, the
+// least-recently-used session's data is evicted.
+
+const MAX_CACHED_TRANSCRIPTS = 8
+
+/** LRU cache of per-session transcript data. */
+class TranscriptDataCache {
+  private map: Map<string, TranscriptEntry[]> = new Map()
+
+  get(sessionId: string): TranscriptEntry[] | undefined {
+    const data = this.map.get(sessionId)
+    if (data) {
+      // Move to end (most recently used).
+      this.map.delete(sessionId)
+      this.map.set(sessionId, data)
+    }
+    return data
+  }
+
+  set(sessionId: string, entries: TranscriptEntry[]): void {
+    this.map.set(sessionId, entries)
+    if (this.map.size > MAX_CACHED_TRANSCRIPTS) {
+      const oldest = this.map.keys().next().value
+      if (oldest) this.map.delete(oldest)
+    }
+  }
+
+  /** Update cached data for a session — append new entries or replace
+   *  existing ones. Called on every WS entry event so the cache stays
+   *  fresh even when the user is viewing a different session. */
+  update(sessionId: string, entries: TranscriptEntry[]): void {
+    this.set(sessionId, entries)
+  }
+}
+
+let globalDataCache: TranscriptDataCache | null = null
+
+function getGlobalDataCache(): TranscriptDataCache {
+  if (globalDataCache === null) globalDataCache = new TranscriptDataCache()
+  return globalDataCache
+}
+
+/** Reset the global data cache. Test-only — clears all cached transcript
+ *  data so tests start with a clean state. */
+export function _resetDataCacheForTests(): void {
+  globalDataCache = null
+}
+
 async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]> {
   const done = perf.begin('transcript.seed')
   const ttfbDone = perf.begin('transcript.seed.ttfb')
@@ -40,50 +97,61 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
 }
 
 /**
- * Pure reconciler: insert `incoming` into `existing`, dedup by id, sort by
- * timestamp ascending. Replaces the entry with a matching id (always returns
- * a new array), or inserts new entries at the sorted position by timestamp.
+ * Pure reconciler: insert `incoming` into `existing`, dedup by id.
+ * Append-only — new entries (by id) are always appended at the end; existing
+ * entries (id match, e.g. streaming updates) are replaced in place. This
+ * guarantees that nothing already rendered shifts position when a new entry
+ * arrives — the transcript view is a pure append-only function of the
+ * transcript.
  *
  * When `incoming` is a finalized entry (no `streaming` flag), any prior
  * `streaming: true` placeholder is evicted first — the streaming placeholder
  * (id `"streaming"`) uses a sentinel id that won't match the final entry's
  * positional id, so without eviction the streaming placeholder would linger
  * as a duplicate row alongside the real entry.
+ *
+ * The initial HTTP seed provides entries in their final on-disk order; WS
+ * events arrive in append order. Append-only is correct because the backend
+ * writes entries sequentially and the seed is already sorted.
  */
 export function reconcileEntries(
   existing: TranscriptEntry[],
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
   const done = perf.begin('reconcileEntries')
-  // Evict any streaming placeholder when a finalized entry arrives.
+  // When a finalized entry arrives, check if there's a streaming
+  // placeholder with the SAME id — if so, replace it in place (stable
+  // position, no flicker). Only evict streaming placeholders with a
+  // DIFFERENT id (stale placeholders from a different entry).
   let base = existing
   if (!incoming.streaming) {
     const streamingIdx = existing.findIndex((e) => e.streaming)
     if (streamingIdx !== -1) {
+      if (existing[streamingIdx]!.id === incoming.id) {
+        // Same id — replace the streaming placeholder in place with the
+        // finalized entry. This keeps the position stable and prevents
+        // the flicker of evict-then-append.
+        const next = existing.slice()
+        next[streamingIdx] = incoming
+        done({ count: existing.length, meta: { mode: 'replace-streaming' } })
+        return next
+      }
+      // Different id — evict the stale streaming placeholder.
       base = existing.filter((_, i) => i !== streamingIdx)
     }
   }
   for (let i = 0; i < base.length; i++) {
     if (base[i]!.id === incoming.id) {
-      // Replace in place (stable timestamp keeps sort order intact; streaming
-      // entry-update entries carry their original timestamp throughout).
+      // Replace in place (same id, non-streaming entry updated).
       const next = base.slice()
       next[i] = incoming
       done({ count: existing.length, meta: { mode: 'replace' } })
       return next
     }
   }
-  // Find insertion index that keeps the array sorted by timestamp ascending.
-  let insertAt = base.length
-  for (let i = base.length - 1; i >= 0; i--) {
-    if (base[i]!.timestamp.localeCompare(incoming.timestamp) <= 0) {
-      insertAt = i + 1
-      break
-    }
-    insertAt = i
-  }
+  // Append-only: new entries always go at the end.
   const next = base.slice()
-  next.splice(insertAt, 0, incoming)
+  next.push(incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
   return next
 }
@@ -100,14 +168,15 @@ export function useTranscriptStream(
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
   const loadedSessionRef = useRef<string | null>(null)
+  const currentSessionRef = useRef<string | null>(null)
 
   const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
-  // Initial HTTP GET seed + focus the session. Set live focus eagerly BEFORE
-  // the seed fetch (so live events during the GET round-trip aren't dropped),
-  // then upgrade to a `since`-replay focus once the seed lands. Also fetch
-  // any pending questions (recovered on reconnect) so the user can answer
-  // a question that arrived during a WS gap.
+  // Session load effect: seed the transcript via HTTP GET, or serve from
+  // the transcript data cache on session switch for instant display.
+  // Uses the WS `since` parameter to replay only entries that arrived
+  // since the last visit. On refresh-after-send, always re-fetches (the
+  // refresh is a consistency check, not a session switch).
   useEffect(() => {
     if (sessionId === null) {
       setEntries([])
@@ -116,39 +185,65 @@ export function useTranscriptStream(
       loadedSessionRef.current = null
       return
     }
+    currentSessionRef.current = sessionId
     sc.focus(sessionId)
     let cancelled = false
-    // Only show "Loading transcript..." on the FIRST load for a session —
-    // NOT on refresh-after-send (which fires `refresh` via `useSendMessage`'s
-    // `onComplete`). At refresh time the WS stream has already delivered the
-    // new entries live, so setting `loading=true` would flash "Loading
-    // transcript..." and clear the visible entries for the round-trip.
+
+    const dataCache = getGlobalDataCache()
+    const cached = dataCache.get(sessionId)
     const isFirstLoad = loadedSessionRef.current !== sessionId
-    if (isFirstLoad) setLoading(true)
-    fetchTranscriptSeed(sessionId).then((seed) => {
-      if (cancelled) return
-      setEntries(seed)
+
+    if (cached !== undefined && cached.length > 0 && isFirstLoad) {
+      // Cache hit on session switch — instantly show cached data, no
+      // loading spinner. Focus with `since` = last cached entry id so
+      // the WS replay delivers only new entries. No background re-seed —
+      // the WS `since` replay is the sole mechanism for catching entries
+      // that arrived since the last visit. A background re-seed would
+      // race with WS-delivered entries and cause flickering (the re-seed
+      // overwrites newer WS entries with stale HTTP data).
+      setEntries(cached)
       setLoading(false)
       loadedSessionRef.current = sessionId
-      const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
-      if (lastId !== undefined) {
-        sc.focus(sessionId, lastId)
-      }
-    })
-    fetchPendingQuestions(sessionId).then((qs) => {
-      if (cancelled) return
-      setPendingQuestions(qs)
-    })
-    return () => {
-      cancelled = true
+      const lastId = cached[cached.length - 1]!.id
+      sc.focus(sessionId, lastId)
+      fetchPendingQuestions(sessionId).then((qs) => {
+        if (cancelled) return
+        setPendingQuestions(qs)
+      })
+    } else {
+      // Cache miss or refresh — full HTTP GET seed.
+      if (isFirstLoad) setLoading(true)
+      fetchTranscriptSeed(sessionId).then((seed) => {
+        if (cancelled) return
+        setEntries(seed)
+        dataCache.set(sessionId, seed)
+        setLoading(false)
+        loadedSessionRef.current = sessionId
+        const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
+        if (lastId !== undefined) sc.focus(sessionId, lastId)
+      })
+      fetchPendingQuestions(sessionId).then((qs) => {
+        if (cancelled) return
+        setPendingQuestions(qs)
+      })
     }
+    return () => { cancelled = true }
   }, [sessionId, sc, refreshCount])
 
   // WS entry subscription (focused session only).
   useEffect(() => {
     if (sessionId === null) return
     const unsub = sc.onEntry((e) => {
-      setEntries((prev) => reconcileEntries(prev, e))
+      setEntries((prev) => {
+        const next = reconcileEntries(prev, e)
+        if (next.length !== prev.length || (next.length > 0 && prev.length > 0 && next[next.length-1]!.id !== prev[prev.length-1]!.id)) {
+          console.log("[ws] entries " + prev.length + " -> " + next.length + " mode=" + (next.length === prev.length ? "replace" : next.length > prev.length ? "append" : "evict") + " lastId=" + (next.length > 0 ? next[next.length-1]!.id : "none") + " streaming=" + !!e.streaming)
+        }
+        // Update the data cache so it stays fresh for this session.
+        const sid = currentSessionRef.current
+        if (sid !== null) getGlobalDataCache().update(sid, next)
+        return next
+      })
     })
     return unsub
   }, [sessionId, sc])

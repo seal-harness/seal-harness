@@ -1492,7 +1492,7 @@ const ChatMessage = memo(function ChatMessage({
       {jsonOpen && message.rawJson !== undefined && (
         <RawJsonModal
           title={`${message.agentName} · raw JSON`}
-          body={message.rawJson}
+          body={typeof message.rawJson === 'function' ? message.rawJson() : message.rawJson}
           onClose={() => setJsonOpen(false)}
         />
       )}
@@ -1647,7 +1647,7 @@ function SessionSetup({
 
 // ── transcriptToMessages + helpers ───────────────────────────────────────
 
-interface ToolResultRecord {
+export interface ToolResultRecord {
   content: string
   isError: boolean | undefined
   exitCode: number | null
@@ -1752,7 +1752,7 @@ function tryParseJson(s: string): Record<string, unknown> | null {
  *  - the legacy string shape (the old `teLineToFrontend` path and WS stream
  *    entries still encode `payload` as a JSON string, so we `JSON.parse` it).
  *  Returns `null` for an unparseable string or a non-object value. */
-function tryParsePayload(p: TranscriptEntry['payload']): Record<string, unknown> | null {
+export function tryParsePayload(p: TranscriptEntry['payload']): Record<string, unknown> | null {
   if (typeof p === 'string') return tryParseJson(p)
   if (p != null && typeof p === 'object') return p as Record<string, unknown>
   return null
@@ -1765,7 +1765,7 @@ function payloadStrLen(p: TranscriptEntry['payload']): number {
   try { return JSON.stringify(p).length } catch { return 0 }
 }
 
-function extractTextFromContent(content: Array<{ type: string; text?: string }> | undefined): string | null {
+export function extractTextFromContent(content: Array<{ type: string; text?: string }> | undefined): string | null {
   if (!content) return null
   const texts = content
     .filter((b) => b.type === 'text' && b.text)
@@ -1777,14 +1777,14 @@ function extractTextFromContent(content: Array<{ type: string; text?: string }> 
  *  reasoning text in its `thinking` field (shape
  *  `{type:"thinking", thinking: string, signature?: string}`). Returns the
  *  non-empty thinking texts in document order, or [] when none are present. */
-function extractThinking(content: Array<{ type: string; thinking?: string }> | undefined): string[] {
+export function extractThinking(content: Array<{ type: string; thinking?: string }> | undefined): string[] {
   if (!content) return []
   return content
     .filter((b) => b.type === 'thinking' && b.thinking)
     .map((b) => b.thinking!)
 }
 
-function extractToolCalls(
+export function extractToolCalls(
   content: Array<{ type: string; name?: string; id?: string; input?: unknown }> | undefined,
   results: Map<string, ToolResultRecord>,
 ): ToolCallInfo[] {
@@ -1810,7 +1810,7 @@ function extractToolCalls(
  *  strings when absent). Handles both the Anthropic wire shape
  *  ({name, description, input_schema}) and the Ollama wire shape
  *  ({type:"function", function:{name, description, parameters}}). */
-function extractToolDefs(tools: unknown[]): { names: string[]; descriptions: string[] } {
+export function extractToolDefs(tools: unknown[]): { names: string[]; descriptions: string[] } {
   const names: string[] = []
   const descriptions: string[] = []
   for (const t of tools) {
@@ -1854,6 +1854,8 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
   const toolResults = buildToolResultIndex(entries)
+  const seenSystem = new Set<string>()
+  const seenTools = new Set<string>()
 
   for (const e of entries) {
     const ts = formatTimestamp(e.timestamp)
@@ -1861,12 +1863,10 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     // prompt appended after a StopMaxTokens truncation). These are
     // system-injected messages that should not appear as user bubbles.
     if (e.internal === true) continue
-    // The "View raw JSON" modal uses `rawJson`. For the reconstructed path,
-    // `raw` is empty — fall back to the `payload` so the modal still works.
-    // `payload` is now an object (for the reconstructed path) or a string
-    // (for the legacy path); the modal calls `JSON.parse(body)` so we need
-    // a string. When `payload` is an object, stringify it for the modal.
-    const rawJson = e.raw || (typeof e.payload === 'string' ? e.payload : JSON.stringify(e.payload, null, 2))
+    // Lazy rawJson provider — only called when the user clicks "View raw
+    // JSON". Defers the JSON.stringify until needed, avoiding O(N) string
+    // construction on every render for payloads that are never inspected.
+    const rawJson: () => string = () => e.raw || (typeof e.payload === 'string' ? e.payload : JSON.stringify(e.payload, null, 2))
 
     if (e.direction === 'request') {
       const parsed = tryParsePayload(e.payload)
@@ -1964,21 +1964,29 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // System Prompt and Tools rows: render every occurrence as it
-        // appears in the transcript. No deduplication — the user should
-        // see the true transcript, including when the system prompt or
-        // tools change between turns.
+        // System Prompt and Tools rows: deduplicate by content. The
+        // backend's delta encoding only includes `system` and `tools` when
+        // they CHANGE from the prior request. The frontend deduplicates by
+        // content: the first occurrence of each unique system prompt /
+        // tools array renders a row; subsequent identical values are
+        // skipped. This keeps System Prompt and Tools rows at their
+        // first-occurrence positions (typically the top of the
+        // transcript) and prevents them from shifting when new entries
+        // arrive. Changed values DO render a new row at their change
+        // position, so the user can see when the system prompt or tools
+        // changed mid-conversation.
         const sysPrompt = parsed.system as string | undefined
         const tools = parsed.tools
         const hasTools = Array.isArray(tools) && tools.length > 0
-        const toolsJson = hasTools ? JSON.stringify(tools, null, 2) : ''
+        const toolsKey = hasTools ? JSON.stringify(tools) : ''
         const toolDefsBlock = hasTools
           ? (() => {
               const { names, descriptions } = extractToolDefs(tools)
-              return { count: names.length, names, descriptions, json: toolsJson }
+              return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
             })()
           : undefined
-        if (sysPrompt) {
+        if (sysPrompt && !seenSystem.has(sysPrompt)) {
+          seenSystem.add(sysPrompt)
           messages.push({
             id: e.id + '-sys',
             agentName: 'System Prompt',
@@ -1988,7 +1996,8 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
             rawJson,
           })
         }
-        if (toolDefsBlock) {
+        if (toolDefsBlock && !seenTools.has(toolsKey)) {
+          seenTools.add(toolsKey)
           messages.push({
             id: e.id + '-tools',
             agentName: 'Tools',
@@ -2486,8 +2495,8 @@ export function ChatArea({
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [hasFragment])
 
+  }, [hasFragment])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2511,18 +2520,30 @@ export function ChatArea({
     })
   }, [messages])
 
+  // Track the previous session id so we can detect session changes within
+  // the auto-scroll effect. Always update it here so sessionChanged is
+  // only true on the render where the session actually changed.
+  const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
+
   useEffect(() => {
     if (hasFragment) return
+    const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
+    prevSessionIdRef.current = selectedSession?.id
+    if (sessionChanged) {
+      // Session switched — scroll to the bottom of whatever is currently
+      // rendered. If the new session's messages are already in props
+      // (cache hit), this scrolls to the right place. If they haven't
+      // arrived yet (HTTP fetch), this scrolls to the bottom of the
+      // loading/empty view, and the sticky-bottom scroll on the next
+      // render (when the real messages arrive) will scroll again.
+      wasAtBottom.current = true
+      messagesEndRef.current?.scrollIntoView({ block: 'end' })
+      return
+    }
     if (wasAtBottom.current) {
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
-  }, [messages, hasFragment])
-
-  // When the user clicks a different session in the sidebar, force the next
-  // render to auto-scroll to the most recent message.
-  useEffect(() => {
-    wasAtBottom.current = true
-  }, [selectedSession?.id])
+  }, [messages, hasFragment, selectedSession?.id])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
@@ -2624,6 +2645,7 @@ export function ChatArea({
               onClick={() => {
                 const el = scrollerRef.current
                 if (el) el.scrollTo({ top: el.scrollHeight })
+                wasAtBottom.current = true
               }}
             >
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none"

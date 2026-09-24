@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
-import { ChatArea, transcriptToMessages, computeTokensUsed } from './components/ChatArea'
+import { ChatArea, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
+import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
   useSendMessage,
   useSessionAgents,
@@ -352,6 +353,11 @@ export default function App() {
   // output never bleeds into another's view.
   useEffect(() => { setSlashBubbles([]) }, [currentSessionId])
 
+  // Clear the optimistic pending message on session switch so a prior
+  // session's in-flight user message + thinking indicator never bleeds
+  // into another session's transcript view.
+  useEffect(() => { setPendingMessage(null); setPendingMessageModel(null) }, [currentSessionId])
+
   // ── Per-session model override (frontend-only, never persisted) ────────
   const [modelOverride, setModelOverride] = useState<string | null>(null)
   useEffect(() => { setModelOverride(null) }, [currentSessionId])
@@ -543,7 +549,7 @@ export default function App() {
     return false
   }, [syncPath])
 
-  const transcriptMessages = useMemo(() => transcriptToMessages(entries), [entries])
+  const transcriptMessages = useTranscriptMessages(entries, currentSessionId)
   // Keep the ref in sync so handleSendResult can read the current count
   // without depending on transcriptMessages in its callback deps.
   transcriptMsgCountRef.current = transcriptMessages.length

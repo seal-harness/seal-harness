@@ -791,3 +791,72 @@ describe('App — slash bubble inline ordering', () => {
     expect(rel & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
   })
 })
+
+// ── Pending message must not cross sessions ──────────────────────────────
+// When the user sends a message in session A and switches to session B
+// before the response arrives, the optimistic pending message (and its
+// thinking indicator) must NOT appear in session B's transcript. The
+// pending state is session-scoped: it belongs to the session that was
+// focused when the send was initiated.
+
+describe('App — pending message does not cross sessions', () => {
+  it('optimistic pending message from session A does not appear when switching to session B', async () => {
+    // Two sessions in the sidebar. The user selects sess-A, types a message,
+    // and sends it (creating a pendingMessage). Before the POST resolves,
+    // the user clicks sess-B in the sidebar. The pending message "hello
+    // from A" must NOT appear in sess-B's transcript view.
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      if (url === '/api/agents') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers') return new globalThis.Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers/anthropic/models') return new globalThis.Response(JSON.stringify([{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/tabs') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/sessions' && method === 'GET') {
+        return new globalThis.Response(JSON.stringify([
+          makeSession({ id: 'sess-A', description: 'Session A' }),
+          makeSession({ id: 'sess-B', description: 'Session B' }),
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/sessions/archived') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/harnesses') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/harnesses/discover') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url.includes('/transcript')) return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url.includes('/questions')) return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      // The send POST — return slowly (but we don't need to actually delay;
+      // we just need the pending state to exist when we switch sessions).
+      if (url === '/api/sessions/sess-A/send' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ response: 'ok', kind: 'assistant' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new globalThis.Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<App />)
+
+    // Wait for both sessions to render in the sidebar.
+    const rowA = await screen.findByText('Session A')
+    await screen.findByText('Session B')
+
+    // Select session A.
+    fireEvent.click(rowA)
+    // Wait for the textarea to appear.
+    const textarea = await screen.findByPlaceholderText(/Message/) as HTMLTextAreaElement
+    // Type a message and send it.
+    fireEvent.change(textarea, { target: { value: 'hello from A' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+
+    // The optimistic pending message "hello from A" should appear in A's view.
+    await screen.findByText('hello from A')
+
+    // Now switch to session B.
+    act(() => {
+      fireEvent.click(screen.getByText('Session B'))
+    })
+
+    // CRITICAL ASSERTION: The pending message from session A must NOT
+    // appear in session B's transcript. Give React time to flush all
+    // updates from the session switch, then check the DOM.
+    await act(async () => { /* flush */ })
+    await act(async () => { /* flush again for async fetches */ })
+    expect(screen.queryByText('hello from A')).toBeNull()
+  })
+})

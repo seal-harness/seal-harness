@@ -453,7 +453,11 @@ export interface Message {
    *  the local optimistic-pending UI. */
   streaming?: boolean
   meta?: string            // e.g. model name, token usage
-  rawJson?: string         // full transcript-entry payload (pretty-printed when JSON)
+  /** Full transcript-entry payload for the "View raw JSON" modal. A
+   *  provider function so the pretty-printed string is only computed when
+   *  the user actually clicks the "View raw JSON" button — not on every
+   *  render. A plain string is also accepted (for test fixtures). */
+  rawJson?: string | (() => string)
   /** Marks a TRANSIENT slash-command output bubble (kind:"slash" send
    *  response). These rows are NOT persisted — they never enter the
   *  transcript and vanish on reload. Rendered in a muted "command output"
