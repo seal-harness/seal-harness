@@ -48,6 +48,8 @@ module Seal.Config.File
   , ChatStreamingFileConfig (..)
   , chatStreamingConfig
   , chatStreamingConfigCodec
+  , ChatChannelsConfig (..)
+  , useNewChatChannels
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -148,6 +150,10 @@ data RuntimeConfig = RuntimeConfig
   , rcChatStreaming :: Maybe ChatStreamingFileConfig
     -- ^ Optional @[chat_streaming]@ section (chat channel streaming +
     -- tool-call progress). Absent means the feature is disabled.
+  , rcChatChannels :: Maybe ChatChannelsConfig
+    -- ^ Optional @[chat_channels]@ section. When @implementation = "new"@,
+    -- the new gateway-API-client chat channels are used. Absent or
+    -- @implementation = "old"@ uses the existing in-process channels.
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
@@ -297,6 +303,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcSkills           = Nothing
   , rcAgent            = Nothing
   , rcChatStreaming    = Nothing
+  , rcChatChannels     = Nothing
   , rcMaxTurns         = Nothing
   , rcToolTimeout      = Nothing
   , rcEmbedding        = Nothing
@@ -443,6 +450,23 @@ data ChatStreamingFileConfig = ChatStreamingFileConfig
 -- | Resolve the effective 'StreamProgressConfig' from the optional
 -- @[chat_streaming]@ section. Absent = def (disabled). Present but partial
 -- = fields filled from def.
+-- | The @[chat_channels]@ section. Controls which chat channel
+-- implementation is used: @"old"@ (the existing in-process channels) or
+-- @"new"@ (the gateway-API-client channels from 'seal-chat-channels').
+-- Absent defaults to @"old"@.
+newtype ChatChannelsConfig = ChatChannelsConfig
+  { cccImplementation :: Maybe Text
+    -- ^ @"old"@ (default) or @"new"@.
+  } deriving stock (Eq, Show)
+
+-- | Resolve whether the new chat channels should be used. Returns 'True'
+-- when @[chat_channels] implementation = "new"@.
+useNewChatChannels :: RuntimeConfig -> Bool
+useNewChatChannels cfg =
+  case rcChatChannels cfg of
+    Just c -> cccImplementation c == Just "new"
+    Nothing -> False
+
 chatStreamingConfig :: RuntimeConfig -> StreamProgressConfig
 chatStreamingConfig cfg = case rcChatStreaming cfg of
   Nothing   -> def
@@ -467,6 +491,11 @@ chatStreamingConfigCodec = ChatStreamingFileConfig
   <*> Toml.dioptional (Toml.int  "buffer_threshold") .= csfcBufferThreshold
   <*> Toml.dioptional (Toml.text "cursor")           .= csfcCursor
 
+
+-- | Bidirectional tomland codec for the @[chat_channels]@ section.
+chatChannelsConfigCodec :: Toml.TomlCodec ChatChannelsConfig
+chatChannelsConfigCodec = ChatChannelsConfig
+  <$> Toml.dioptional (Toml.text "implementation") .= cccImplementation
 
 -- ---------------------------------------------------------------------------
 -- Codec
@@ -493,6 +522,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
   <*> Toml.dioptional (Toml.table agentConfigCodec "agent")     .= rcAgent
   <*> Toml.dioptional (Toml.table chatStreamingConfigCodec "chat_streaming") .= rcChatStreaming
+  <*> Toml.dioptional (Toml.table chatChannelsConfigCodec "chat_channels")  .= rcChatChannels
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
   <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
   <*> Toml.dioptional (Toml.table embeddingConfigCodec "embedding")       .= rcEmbedding

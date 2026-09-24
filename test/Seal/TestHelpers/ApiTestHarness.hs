@@ -24,6 +24,7 @@ module Seal.TestHelpers.ApiTestHarness
   , sendMsgToSession
   , sendMsgToSessionRaw
   , getTranscript
+  , waitForTranscript
   , assertTranscriptContains
   , setScript
   , uemLabel
@@ -41,6 +42,7 @@ module Seal.TestHelpers.ApiTestHarness
   ) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (threadDelay)
 import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Monad (when, void, unless)
 import Control.Exception (catch, SomeException)
@@ -709,7 +711,29 @@ sendMsgToSession env sid msg = do
     (A.encode (A.object ["message" .= msg]))
   (st, body) <- runAppBody (ateApp env) req
   when (st /= 200) (error ("sendMsgToSession: expected 200, got " <> show st <> ": " <> show body))
+  -- The turn runs async; wait for it to complete by polling the
+  -- transcript for a stable entry count (the turn is done when no
+  -- new entries appear for 50ms). The ScriptProvider returns
+  -- instantly, so this typically resolves in 1-2 polls.
+  waitForTurnComplete env sid
   pure body
+
+-- | Poll the transcript until the entry count stabilizes (same count
+-- on two consecutive reads 50ms apart), or timeout after 5 seconds.
+waitForTurnComplete :: ApiTestEnv -> Text -> IO ()
+waitForTurnComplete env sid = go 5000000 Nothing
+  where
+    gapUs = 50000
+    go remaining mLastCount
+      | remaining <= 0 = pure ()
+      | otherwise = do
+          entries <- getTranscript env sid
+          let count = length entries
+          case mLastCount of
+            Just prev | prev == count -> pure ()  -- stable
+            _ -> do
+              threadDelay gapUs
+              go (remaining - gapUs) (Just count)
 
 -- | Like 'sendMsgToSession' but returns the (status, body) for debugging.
 sendMsgToSessionRaw :: ApiTestEnv -> Text -> Text -> IO (Int, BL.ByteString)
@@ -738,10 +762,29 @@ getTranscript env sid = do
       Just (A.Array a) -> pure (toList a)
       _ -> pure []
 
+-- | Poll the transcript until the predicate holds, or timeout after 5
+-- seconds. The turn runs asynchronously, so the transcript may not be
+-- on disk yet when this is called.
+waitForTranscript :: ApiTestEnv -> Text -> ([A.Value] -> Bool) -> IO [A.Value]
+waitForTranscript env sid predicate = go 5000000
+  where
+    stepUs = 10000
+    go remaining
+      | remaining <= 0 = getTranscript env sid  -- last attempt
+      | otherwise = do
+          entries <- getTranscript env sid
+          if predicate entries
+            then pure entries
+            else do
+              threadDelay stepUs
+              go (remaining - stepUs)
+
 -- | Assert the transcript contains the given text substring.
+-- The turn runs asynchronously (forked by handleSend), so the reply
+-- may not be on disk yet. Poll up to 5 seconds (10ms intervals).
 assertTranscriptContains :: ApiTestEnv -> Text -> Text -> IO ()
 assertTranscriptContains env sid needle = do
-  entries <- getTranscript env sid
+  entries <- waitForTranscript env sid (\es -> needle `T.isInfixOf` T.pack (show es))
   let bodyText = T.pack (show entries)
   unless (needle `T.isInfixOf` bodyText)
     (error ("assertTranscriptContains: \"" <> T.unpack needle <> "\" not found in transcript"))

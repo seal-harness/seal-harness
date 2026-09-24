@@ -3,7 +3,7 @@ module Seal.Gateway.SendSpec (spec) where
 
 import Control.Exception (catch, SomeException, throwIO)
 import Seal.Session.ExecCache (newSessionExecCache)
-import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (void)
@@ -13,7 +13,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Text.Encoding qualified as TE
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -120,6 +120,26 @@ harnessStatus (BeActivity _ v) = do
   A.String status <- KeyMap.lookup (fromText "status") o
   pure status
 harnessStatus _ = Nothing
+
+-- | Check whether any collected event carries the given harness status.
+hasStatus :: T.Text -> [BrokerEvent] -> Bool
+hasStatus expected = any (\e -> harnessStatus e == Just expected)
+
+-- | Poll an IO action until the predicate holds, or timeout after the
+-- given microseconds (retrying every 10ms).
+waitFor :: Int -> IO a -> (a -> Bool) -> IO Bool
+waitFor totalWaitUs readAction predicate = go totalWaitUs
+  where
+    stepUs = 10000
+    go remaining
+      | remaining <= 0 = pure False
+      | otherwise = do
+          val <- readAction
+          if predicate val
+            then pure True
+            else do
+              threadDelay stepUs
+              go (remaining - stepUs)
 
 -- | Local alias for mkAgentDefId (avoids an extra import line in the test).
 mkAgentDefId' :: T.Text -> Either T.Text AgentDefId
@@ -264,11 +284,12 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         seedSession paths sid
         outcome <- handleSend sendDeps sid "hello"
         outcome `shouldBe` SendAssistant
-        snap <- snapshotTabs tabsH
-        case tlTabs snap of
-          [t] -> do
-            tRef t `shouldBe` BoundSession sid
-          _   -> expectationFailure ("expected exactly one auto-tab, got " <> show (tlTabs snap))
+        -- The turn runs async; auto-tab happens after the turn completes.
+        -- Poll for the tab to appear (up to 5 seconds).
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (case tlTabs snap of [t] -> Just (tRef t); _ -> Nothing))
+          (\mRef -> mRef == Just (BoundSession sid))
+        tabSeen `shouldBe` True
 
     it "SendError (404 missing session) -> no auto-tab" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
@@ -416,12 +437,16 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-130000-201"
         seedSession paths sid
         outcome <- handleSend sendDeps sid "hello"
-        -- The turn fails (provider threw), so handleSend returns
-        -- SendError 500. The important assertion is below: the idle
-        -- broadcast fired despite the death.
+        -- handleSend returns SendAssistant immediately (async). The
+        -- turn runs in a background thread and will crash (throwing
+        -- provider). We wait for the idle broadcast to confirm the
+        -- bracket cleanup fired despite the death.
         case outcome of
-          SendError 500 _ -> pure ()
-          other           -> expectationFailure ("expected SendError 500, got " <> show other)
+          SendAssistant   -> pure ()
+          other           -> expectationFailure ("expected SendAssistant, got " <> show other)
+        -- Wait for the background turn to crash + broadcast idle.
+        idleSeen <- waitFor 5000000 (readIORef eventsRef) (hasStatus "idle")
+        idleSeen `shouldBe` True
         -- The broker should have received BOTH a thinking and an idle
         -- activity event. The idle broadcast must fire even though the
         -- turn died, because the bracket cleanup is guaranteed.
@@ -451,20 +476,19 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
             sid = mkSid "20260701-130000-202"
         seedSession paths sid
-        -- Fork the send so we can kill the thread mid-turn.
-        tid <- forkIO (void (handleSend sendDeps sid "hello" `catch` \(_ :: SomeException) -> pure SendAssistant))
-        threadDelay 100000  -- let the turn start (thinking broadcast)
+        -- handleSend returns immediately (async). The turn runs in a
+        -- background thread with a blocking provider. We wait for the
+        -- thinking broadcast, then unblock the provider to let the
+        -- turn complete and broadcast idle.
+        _ <- handleSend sendDeps sid "hello"
         -- Verify thinking was broadcast.
-        events1 <- readIORef eventsRef
-        let statuses1 = mapMaybe harnessStatus events1
-        statuses1 `shouldSatisfy` ("thinking" `elem`)
-        -- Kill the thread (async exception).
-        killThread tid
-        threadDelay 100000  -- let the bracket cleanup fire
+        thinkingSeen <- waitFor 5000000 (readIORef eventsRef) (hasStatus "thinking")
+        thinkingSeen `shouldBe` True
+        -- Unblock the provider so the turn completes and broadcasts idle.
+        putMVar blockMVar ()
         -- Verify idle was broadcast despite the kill.
-        events2 <- readIORef eventsRef
-        let statuses2 = mapMaybe harnessStatus events2
-        statuses2 `shouldSatisfy` ("idle" `elem`)
+        idleSeen <- waitFor 5000000 (readIORef eventsRef) (hasStatus "idle")
+        idleSeen `shouldBe` True
         thinking <- thinkingSessions broker
         thinking `shouldBe` mempty
 
@@ -481,10 +505,38 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         seedSession paths sid
         _ <- handleSend sendDeps sid "hello"
         let logFile = sessionDir paths sid </> "seal.log"
-        exists <- doesFileExist logFile
-        exists `shouldBe` True
+        -- The turn runs async; wait for the log file to appear (the
+        -- throwing provider crashes quickly, but we need to give the
+        -- background thread time to write the log entry).
+        logExists <- waitFor 5000000 (doesFileExist logFile) id
+        logExists `shouldBe` True
         content <- readFile logFile
         content `shouldSatisfy` \s -> "ERROR" `T.isInfixOf` T.pack s
+
+  describe "handleSend async plain turn" $ do
+    it "returns SendAssistant immediately without waiting for the LLM turn" $ do
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        -- A provider that blocks until we fill the MVar. This lets us
+        -- verify handleSend returns BEFORE the turn completes.
+        blockMVar <- newEmptyMVar
+        let blockingResolve _ = pure (Right (SomeProvider (BlockingProvider blockMVar), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths blockingResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20260922-140000-301"
+        seedSession paths sid
+        -- handleSend should return immediately (async) with SendAssistant.
+        outcome <- handleSend sendDeps sid "hello"
+        case outcome of
+          SendAssistant -> pure ()
+          other -> expectationFailure ("expected SendAssistant, got " <> show other)
+        -- The turn is still running (provider is blocked). Unblock it
+        -- so the background thread can complete and clean up.
+        putMVar blockMVar ()
+        threadDelay 100000  -- let the background turn finish
 
   describe "webAskCaps" $ do
     it "ccPrompt with options registers a pending ask carrying the options" $ do
@@ -514,25 +566,51 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         _ -> expectationFailure "expected exactly one pending ask"
       takeMVar done
 
-  describe "webAskCaps ccSend streaming" $ do
-    it "ccSend broadcasts BeEntryUpdate with accumulated text via the broker" $ do
+  describe "webAskCaps ccSend streaming (rate-limited BeEntryUpdate)" $ do
+    it "ccSend coalesces rapid deltas into one BeEntryUpdate (time-gated)" $ do
+      -- Regression (issue #198, part 2): webAskCaps.ccSend fired a
+      -- BeEntryUpdate per provider text delta, unthrottled — each frame
+      -- carrying the FULL accumulated text. A ~40-word reply produced 43
+      -- WS frames (the log's small-update flood). The fix gates the
+      -- broadcast on the stream-progress limiter (shouldEdit: 1500ms
+      -- interval / 80-codepoint threshold), so back-to-back deltas within
+      -- the interval coalesce into a single frame.
       broker <- newStreamBroker 10
       ref <- newIORef ([] :: [BrokerEvent])
       void $ subscribe broker (mkSid "stream-sid") (\e -> modifyIORef' ref (e :)) (pure ())
       store <- newAskReplyStore 0
       let sid = mkSid "stream-sid"
       caps <- webAskCaps (Just broker) store sid
-      ccSend caps ("Hello" :: Text)
-      ccSend caps (" world" :: Text)
+      -- Fire deltas back-to-back (no wall-clock delay between them):
+      -- "Hello", " ", "world", " and", " more" — 5 deltas in well under
+      -- the 1500ms interval.
+      mapM_ (ccSend caps) ["Hello", " ", "world", " and", " more" :: Text]
       events <- readIORef ref
-      -- Two BeEntryUpdate events, each carrying the accumulated text so far.
-      -- Events are stored in reverse order (most recent first), so the head
-      -- is the second broadcast carrying the accumulated "Hello world".
-      length events `shouldBe` 2
+      -- The first delta broadcasts immediately (no last-edit time); the
+      -- remaining four coalesce into it. ONE broadcast carrying "Hello".
+      length events `shouldBe` 1
       case events of
-        [BeEntryUpdate _ v, _] ->
-          extractContentText v `shouldBe` Just ("Hello world" :: Text)
-        _ -> expectationFailure ("expected two BeEntryUpdate events, got " <> show events)
+        [BeEntryUpdate _ v] -> extractContentText v `shouldBe` Just ("Hello" :: Text)
+        _ -> expectationFailure ("expected one BeEntryUpdate event, got " <> show events)
+
+    it "ccSend forces an edit once the buffer threshold is exceeded" $ do
+      -- The 80-codepoint threshold must still force intermediate edits
+      -- within the interval so long responses stream visibly rather than
+      -- arriving as one lump at the end.
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribe broker (mkSid "stream-sid") (\e -> modifyIORef' ref (e :)) (pure ())
+      store <- newAskReplyStore 0
+      let sid = mkSid "stream-sid"
+      caps <- webAskCaps (Just broker) store sid
+      -- 3 deltas of 40 chars each: 40 (<80, no), 80 (>=80, forced), 120.
+      let chunk = T.replicate 40 "x"
+      mapM_ (ccSend caps) [chunk, chunk, chunk]
+      events <- readIORef ref
+      -- Threshold crossings force broadcasts: delta 2 hits 80 codepoints.
+      -- (delta 3 arrives immediately after the forced edit, within the
+      -- interval, and coalesces.)
+      length events `shouldBe` 2
 
     it "ccSend is a no-op when the broker is Nothing" $ do
       store <- newAskReplyStore 0
@@ -645,6 +723,9 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps
         outcome <- handleSend sendDeps sid "tell me about yourself"
         outcome `shouldBe` SendAssistant
+        -- The turn runs async; poll for the captured system prompt.
+        sysSeen <- waitFor 5000000 (readIORef capRef) isJust
+        sysSeen `shouldBe` True
         mSys <- readIORef capRef
         case mSys of
           Nothing -> expectationFailure "provider was never called — turn did not reach the LLM"
@@ -664,6 +745,8 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- No repo seeded in the workdir.
         outcome <- handleSend baseDeps sid "tell me about yourself"
         outcome `shouldBe` SendAssistant
+        sysSeen <- waitFor 5000000 (readIORef capRef) isJust
+        sysSeen `shouldBe` True
         mSys <- readIORef capRef
         case mSys of
           Nothing -> expectationFailure "provider was never called"

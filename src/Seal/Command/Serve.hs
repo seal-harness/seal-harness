@@ -13,6 +13,7 @@ import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
+import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
 
@@ -23,6 +24,13 @@ import qualified Seal.Telegram.Config
 import qualified Data.Text.Encoding as TE
 import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
+import Seal.Channels.Chat.Loop (runChatChannel, defaultChatChannelConfig)
+import Seal.Channels.Chat.Types qualified as ChatTypes
+  (GatewayConfig (..))
+import Seal.Channels.Chat.Signal as ChatSignal
+  (withSignalChatChannel, mkRealSignalChatTransport)
+import Seal.Channels.Chat.Telegram as ChatTelegram
+  (withTelegramChatChannel, mkRealTelegramChatTransport)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Cursor
@@ -46,7 +54,7 @@ import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
 import Seal.Logging.Logger (SealLogger, logIO)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, useNewChatChannels)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
@@ -350,8 +358,14 @@ runServeMain autonomy logger = do
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'
   -- so the agent loop is identical to the standalone modes.
-  forkSignalListener chanDeps cfg registry
-  forkTelegramListener chanDeps cfg registry
+  if Seal.Config.File.useNewChatChannels cfg
+    then do
+      logIO logger InfoS "chat_channels: using new gateway-API-client implementation"
+      forkNewSignalChatChannel logger gwCfg mgr cfg
+      forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle
+    else do
+      forkSignalListener chanDeps cfg registry
+      forkTelegramListener chanDeps cfg registry
   -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
   -- mode=remote (design V6: prevents network access to the unauthenticated
   -- updateRuntimeConfig caller).
@@ -493,3 +507,75 @@ forkTelegramListener deps cfg registry = do
       _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH
                      (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply)))
       pure ()
+
+-- ---------------------------------------------------------------------------
+-- New chat-channel fork functions (gateway-API-client implementation)
+-- ---------------------------------------------------------------------------
+
+-- | Fork the new Signal chat channel if @[signal]@ is configured.
+forkNewSignalChatChannel
+  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> IO ()
+forkNewSignalChatChannel logger gwCfg mgr cfg =
+  case Seal.Signal.Config.resolveSignalConfig (rcSignal cfg) Nothing of
+    Left _ -> pure ()
+    Right (account, chunkLimit, allow) -> do
+      -- The chat channels connect to the gateway as clients. When the
+      -- gateway binds to 0.0.0.0, use 127.0.0.1 for client connections.
+      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
+                         then "127.0.0.1" :: T.Text
+                         else Seal.Gateway.Config.gcHost gwCfg
+      let chatGwCfg = ChatTypes.GatewayConfig
+            { ChatTypes.gcHost = clientHost
+            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            , ChatTypes.gcApiBase = "http://" <> clientHost
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
+            , ChatTypes.gcWsUrl = "ws://" <> clientHost
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+            }
+          chanCfg = defaultChatChannelConfig mgr chatGwCfg
+          accountText = Seal.Signal.Config.signalAccountText account
+      eTransport <- ChatSignal.mkRealSignalChatTransport accountText
+      case eTransport of
+        Left err -> logIO logger WarningS ("signal chat channel: " <> ls err)
+        Right transport ->
+          void (forkIO (withSignalChatChannel
+                          allow
+                          chunkLimit
+                          transport
+                          (runChatChannel chanCfg)))
+
+-- | Fork the new Telegram chat channel if @[telegram]@ is configured.
+forkNewTelegramChatChannel
+  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> IO ()
+forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle = do
+  mVaultToken <- case mHandle of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
+      pure (case r of
+        Right bs -> Just (TE.decodeUtf8 bs)
+        Left _   -> Nothing)
+  case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) mVaultToken of
+    Left err -> logIO logger WarningS ("telegram chat channel: " <> ls err)
+    Right (token, chunkLimit, allow) -> do
+      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
+                         then "127.0.0.1" :: T.Text
+                         else Seal.Gateway.Config.gcHost gwCfg
+      let chatGwCfg = ChatTypes.GatewayConfig
+            { ChatTypes.gcHost = clientHost
+            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            , ChatTypes.gcApiBase = "http://" <> clientHost
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
+            , ChatTypes.gcWsUrl = "ws://" <> clientHost
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+            }
+          chanCfg = defaultChatChannelConfig mgr chatGwCfg
+          tokenText = Seal.Telegram.Config.telegramTokenText token
+      transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
+      void (forkIO (withTelegramChatChannel
+                      allow
+                      chunkLimit
+                      transport
+                      (runChatChannel chanCfg)))

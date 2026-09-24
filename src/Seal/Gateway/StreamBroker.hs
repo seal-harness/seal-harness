@@ -15,6 +15,8 @@ module Seal.Gateway.StreamBroker
   , subscribe
   , updateSubscriberSession
   , broadcast
+  , takeNewEntries
+  , readEntryCursor
   , broadcastLists
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
@@ -25,11 +27,12 @@ module Seal.Gateway.StreamBroker
   , reconcileStaleThinking
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (when, unless, filterM, forM_)
 import Data.Aeson (Value, object, (.=))
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -63,12 +66,49 @@ data StreamBroker = StreamBroker
   { sbSubs :: TVar [Subscriber]
   , sbCap :: Int
   , sbThinking :: TVar (Map.Map SessionId UTCTime)
+  , sbEntryCursors :: TVar (Map.Map SessionId Int)
   }
 
 -- | Build a new broker with the given subscriber cap.
 newStreamBroker :: Int -> IO StreamBroker
 newStreamBroker cap =
-  StreamBroker <$> newTVarIO [] <*> pure cap <*> newTVarIO Map.empty
+  StreamBroker <$> newTVarIO [] <*> pure cap <*> newTVarIO Map.empty <*> newTVarIO Map.empty
+
+-- | Read the per-session entry broadcast cursor: the number of entries
+-- already fanned out for this session. Zero for a never-broadcast session.
+readEntryCursor :: StreamBroker -> SessionId -> IO Int
+readEntryCursor broker sid =
+  fromMaybe 0 . Map.lookup sid <$> readTVarIO (sbEntryCursors broker)
+
+-- | Incremental entry broadcast (issue #198): given the session's FULL
+-- frontend-shaped transcript (as 'readTranscriptEntries' returns it),
+-- return only the entries that have not been broadcast for this session
+-- yet, and advance the per-session cursor. The cursor is positional
+-- (the number of entries already sent), so successive calls during a
+-- turn fan out each entry exactly once — linear broadcast volume instead
+-- of the historical O(N²) full-transcript re-send per recorded entry.
+--
+-- A cursor AHEAD of the transcript (the session was rebuilt / the
+-- transcript shrank) clamps to zero and resends everything: subscribers
+-- see an idempotent replay rather than silently missing entries. The web
+-- frontend dedupes by entry id, and idempotent replays are the failure
+-- mode every consumer already tolerates.
+--
+-- Concurrency: 'Seal.Core.TurnEngine.runTurnBody' runs turns under
+-- 'withSessionLock' so per-session calls are serialized; the atomic
+-- stateTVar below keeps the cursor consistent even when the
+-- slash-command writers ('mkModelTranscriptWriter',
+-- 'mkStopTranscriptWriter') race a turn.
+takeNewEntries
+  :: StreamBroker -> SessionId -> [(Int, a)] -> IO [(Int, a)]
+takeNewEntries broker sid entries = do
+  let total = length entries
+  start <- atomically $ stateTVar (sbEntryCursors broker) $ \cursors ->
+    let prior = fromMaybe 0 (Map.lookup sid cursors)
+    in if prior > total
+         then (0, Map.insert sid total cursors)
+         else (prior, Map.insert sid total cursors)
+  pure (drop start entries)
 
 -- | Subscribe a new connection. If the global cap is exceeded, the subscribe
 -- is a no-op (the over-cap subscriber is never added — it should close).
