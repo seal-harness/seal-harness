@@ -21,7 +21,7 @@ module Seal.Channels.Chat.Loop
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVarIO)
-import Control.Monad (void, when, unless)
+import Control.Monad (when, unless)
 import Data.Foldable (for_)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
@@ -50,7 +50,7 @@ import Seal.Channels.Chat.Types
   (InboundMessage (..), ConversationKey (..),
    convKeyFromSource, SessionMap, newSessionMap, sessionLookup,
    sessionInsert, GatewayConfig (..), StreamingState (..),
-   newStreamingState)
+   newStreamingState, resetStreamingState)
 import Seal.Channels.Chat.WsClient
   (WsClient (..), startWsClient)
 
@@ -257,10 +257,18 @@ handleEntryUpdate cfg chan key wsConns val = do
       if T.null text
         then pure ()
         else do
-          writeIORef (ssAccumulated ss) text
-          now <- getCurrentTime
-          mLastEdit <- readIORef (ssLastEdit ss)
-          mMsgId <- readIORef (ssMsgId ss)
+          -- Post-finalize guard (issue #198 follow-up): a late
+          -- entry-update can arrive AFTER the turn's recorded entry
+          -- (the server's streaming path and the post-turn broadcast
+          -- are unsynchronized). Editing now would overwrite the
+          -- finalized text and re-add the cursor. Ignore updates
+          -- entirely while the turn is finalized.
+          finalized <- readIORef (ssFinalized ss)
+          unless finalized $ do
+            writeIORef (ssAccumulated ss) text
+            now <- getCurrentTime
+            mLastEdit <- readIORef (ssLastEdit ss)
+            mMsgId <- readIORef (ssMsgId ss)
           -- Gate on NEW text since the last edit, not the total length
           -- (issue #198, part 3). The accumulator only grows within a
           -- response, so a total-length threshold degenerates to an edit
@@ -269,26 +277,50 @@ handleEntryUpdate cfg chan key wsConns val = do
           -- 'lots of small updates' flood). Measuring the delta since
           -- the last edit keeps the cadence the config intends: an edit
           -- per interval, or per 80 NEW codepoints, whichever first.
-          lastLen <- readIORef (ssLastLen ss)
-          when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
-            let content = addCursor streamCfg text
-            case mMsgId of
-              Nothing -> do
-                mId <- ccSendWithId chan content
-                case mId of
-                  Just id' -> do
-                    writeIORef (ssMsgId ss) (Just id')
+            lastLen <- readIORef (ssLastLen ss)
+            when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
+              let content = addCursor streamCfg text
+              case mMsgId of
+                Nothing -> do
+                  mId <- ccSendWithId chan content
+                  case mId of
+                    Just id' -> do
+                      writeIORef (ssMsgId ss) (Just id')
+                      writeIORef (ssLastEdit ss) (Just now)
+                      writeIORef (ssLastLen ss) (T.length text)
+                    Nothing -> pure ()
+                Just id' -> do
+                  ok <- ccEditMessage chan id' content
+                  when ok $ do
                     writeIORef (ssLastEdit ss) (Just now)
                     writeIORef (ssLastLen ss) (T.length text)
-                  Nothing -> pure ()
-              Just id' -> do
-                ok <- ccEditMessage chan id' content
-                when ok $ do
-                  writeIORef (ssLastEdit ss) (Just now)
-                  writeIORef (ssLastLen ss) (T.length text)
+
+-- | Finalize the current streaming bubble for one conversation: edit it
+-- without the cursor (or, if the edit fails, send the full text as a new
+-- message), then reset the bubble state so the next entry-update starts
+-- a fresh bubble. Does nothing when no bubble exists or nothing was
+-- streamed. When @markFinal@ is 'True' (the turn's recorded response
+-- entry — the definitive delivery), sets 'ssFinalized' so late
+-- entry-updates are ignored until the next turn starts.
+finalizeBubble
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> StreamingState -> Text -> Bool -> IO ()
+finalizeBubble cfg chan ss text markFinal = do
+  let streamCfg = cccStreamCfg cfg
+      finalText = stripCursor streamCfg text
+  mMsgId <- readIORef (ssMsgId ss)
+  delivered <- case mMsgId of
+    Nothing -> isJust <$> ccSendWithId chan finalText
+    Just id' -> do
+      ok <- ccEditMessage chan id' finalText
+      if ok
+        then pure True
+        else isJust <$> ccSendWithId chan finalText
+  when (markFinal && delivered) $ writeIORef (ssFinalized ss) True
+  resetStreamingState ss
 
 -- | Handle an @entry@ event (complete transcript entry): finalize the
--- streaming bubble (edit without cursor).
+-- streaming bubble with the definitive text (mark the turn final).
 handleEntry
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
@@ -305,18 +337,13 @@ handleEntry cfg chan key wsConns val = do
       case Map.lookup key conns of
         Nothing -> pure ()
         Just (_, ss) -> do
-          let streamCfg = cccStreamCfg cfg
-              text = extractEntryText val
+          let text = extractEntryText val
           if T.null text
             then pure ()
             else do
-              mMsgId <- readIORef (ssMsgId ss)
-              let finalText = stripCursor streamCfg text
-              case mMsgId of
-                Nothing -> void (ccSendWithId chan finalText)
-                Just id' -> do
-                  ok <- ccEditMessage chan id' finalText
-                  unless ok $ void (ccSendWithId chan finalText)
+              -- The recorded entry is the definitive delivery: mark the
+              -- turn finalized so late entry-updates are ignored.
+              finalizeBubble cfg chan ss text True
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
@@ -329,11 +356,14 @@ handleActivity cfg chan key wsConns val = do
   let kind = extractActivityKind val
   case kind of
     "harness-status" -> handleHarnessStatus cfg chan key wsConns val
-    "tool-call" -> handleToolCallActivity cfg chan key val
+    "tool-call" -> handleToolCallActivity cfg chan key wsConns val
     _ -> pure ()
 
--- | Handle a @harness-status@ activity: if status is idle, finalize any
--- in-progress streaming bubble.
+-- | Handle a @harness-status@ activity: on @thinking@ (turn start),
+-- clear the finalized flag so the new turn streams. On @idle@ (turn
+-- end), finalize any in-progress streaming bubble with the accumulated
+-- text (a safety net — the recorded entry is the normal finalize path)
+-- and reset all streaming state.
 handleHarnessStatus
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
@@ -341,35 +371,45 @@ handleHarnessStatus
   -> Value -> IO ()
 handleHarnessStatus cfg chan key wsConns val = do
     let status = extractActivityStatus val
-    when (status == "idle") $ do
-      conns <- readTVarIO wsConns
-      case Map.lookup key conns of
-        Nothing -> pure ()
-        Just (_, ss) -> do
-          mMsgId <- readIORef (ssMsgId ss)
-          accum <- readIORef (ssAccumulated ss)
-          when (isJust mMsgId && not (T.null accum)) $ do
-            let streamCfg = cccStreamCfg cfg
-                finalText = stripCursor streamCfg accum
-            case mMsgId of
-              Just id' -> do
-                ok <- ccEditMessage chan id' finalText
-                unless ok $ void (ccSendWithId chan finalText)
-              Nothing -> pure ()
-          writeIORef (ssMsgId ss) Nothing
-          writeIORef (ssAccumulated ss) ""
-          writeIORef (ssLastEdit ss) Nothing
-          writeIORef (ssLastLen ss) 0
+    case status of
+      "thinking" -> do
+        conns <- readTVarIO wsConns
+        for_ (Map.lookup key conns) $ \(_, ss) ->
+          writeIORef (ssFinalized ss) False
+      "idle" -> do
+        conns <- readTVarIO wsConns
+        case Map.lookup key conns of
+          Nothing -> pure ()
+          Just (_, ss) -> do
+            mMsgId <- readIORef (ssMsgId ss)
+            accum <- readIORef (ssAccumulated ss)
+            when (isJust mMsgId && not (T.null accum)) $
+              finalizeBubble cfg chan ss accum False
+            resetStreamingState ss
+            writeIORef (ssFinalized ss) True
+      _ -> pure ()
 
--- | Handle a @tool-call@ activity: send the tool-progress line to the
--- platform as a separate message. This renders the tool-call progress
--- bubble (tool name + truncated/redacted input) that the user sees while
--- the agent is executing tools.
+-- | Handle a @tool-call@ activity: finalize the current text bubble
+-- (segment break — the pre-tool text stays its own message, and the
+-- next entry-update starts a NEW bubble below the tool line), then send
+-- the tool-progress line as its own platform message.
 handleToolCallActivity
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey -> Value
-  -> IO ()
-handleToolCallActivity _cfg chan _key val = do
+  => ChatChannelConfig -> c -> ConversationKey
+  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> Value -> IO ()
+handleToolCallActivity cfg chan key wsConns val = do
+  -- Segment break (issue #198 follow-up, symptom 1): the pre-tool
+  -- streamed text and the post-tool streamed text must be SEPARATE
+  -- platform messages, with the tool line between them. Without this,
+  -- the next entry-update edits the pre-tool bubble (ssMsgId is still
+  -- set) and appends the post-tool text onto the pre-tool text.
+  conns <- readTVarIO wsConns
+  for_ (Map.lookup key conns) $ \(_, ss) -> do
+    mMsgId <- readIORef (ssMsgId ss)
+    accum <- readIORef (ssAccumulated ss)
+    when (isJust mMsgId && not (T.null accum)) $
+      finalizeBubble cfg chan ss accum False
   case extractToolName val of
     Nothing -> pure ()
     Just toolName -> do

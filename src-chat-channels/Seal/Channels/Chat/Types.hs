@@ -21,11 +21,12 @@ module Seal.Channels.Chat.Types
     -- * Streaming
   , StreamingState (..)
   , newStreamingState
+  , resetStreamingState
   ) where
 
 import Control.Concurrent.STM
   (TVar, atomically, newTVarIO, readTVarIO, modifyTVar')
-import Data.IORef (IORef, newIORef)
+import Data.IORef (IORef, newIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -128,6 +129,12 @@ data StreamingState = StreamingState
   , ssLastLen     :: IORef Int
     -- ^ Codepoints in the accumulated text at the last platform edit.
     -- The edit gate measures NEW text since the last edit, not the total.
+  , ssFinalized   :: IORef Bool
+    -- ^ 'True' once the turn's final entry has been delivered (the
+    -- bubble was finalized). Late entry-updates — which can arrive after
+    -- the recorded entry, because the server's streaming path and the
+    -- post-turn broadcast are unsynchronized — are ignored while set.
+    -- Cleared when a new turn starts (harness-status: thinking).
   }
 
 -- | Create fresh streaming state for one conversation.
@@ -137,9 +144,24 @@ newStreamingState = do
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
   lastLen <- newIORef 0
+  finalized <- newIORef False
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
     , ssLastLen = lastLen
+    , ssFinalized = finalized
     }
+
+-- | Reset the streaming state for a new segment/turn: the bubble id is
+-- cleared (the next entry-update creates a new bubble), the accumulated
+-- text is dropped, and the rate-limit clock is reset. Does NOT clear
+-- 'ssFinalized' — the finalize paths set it /after/ resetting, so a
+-- blanket clear here would race. Callers that start a new turn (the
+-- @thinking@ harness-status) clear it explicitly.
+resetStreamingState :: StreamingState -> IO ()
+resetStreamingState ss = do
+  writeIORef (ssMsgId ss) Nothing
+  writeIORef (ssAccumulated ss) ""
+  writeIORef (ssLastEdit ss) Nothing
+  writeIORef (ssLastLen ss) 0
