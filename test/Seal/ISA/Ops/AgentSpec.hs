@@ -94,6 +94,13 @@ maxConcurrent state = withMVar state (\(_, m) -> pure m)
 errorWorker :: Del.AgentWorkerBuilder
 errorWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
 
+-- | A worker that captures the 'ChildTask' it received (so tests can assert
+-- on parsed fields like 'ctIsolateWorkdir'). Returns a completed outcome.
+taskCapturingWorker :: IORef (Maybe Del.ChildTask) -> Del.AgentWorkerBuilder
+taskCapturingWorker ref _ _ task _ = do
+  writeIORef ref (Just task)
+  pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Agent" $ do
   describe "AGENT_DEF_WRITE" $ do
@@ -502,6 +509,93 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       _ <- setSpawnPaused pauseFlag False
       pure ()
 
+    it "AGENT_START parses isolate_workdir=true (single-task mode)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      taskRef <- newIORef (Nothing :: Maybe Del.ChildTask)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = taskCapturingWorker taskRef
+            , aswGate = gateOpen
+            , aswPaths = samplePaths
+            , aswParentSession = sampleSession
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True]))
+      orIsError r `shouldBe` False
+      threadDelay 100000  -- 100ms for the async worker
+      mt <- readIORef taskRef
+      case mt of
+        Just t  -> Del.ctIsolateWorkdir t `shouldBe` True
+        Nothing -> expectationFailure "worker did not receive a ChildTask"
+
+    it "AGENT_START defaults isolate_workdir to false when omitted (single-task mode)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      taskRef <- newIORef (Nothing :: Maybe Del.ChildTask)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = taskCapturingWorker taskRef
+            , aswGate = gateOpen
+            , aswPaths = samplePaths
+            , aswParentSession = sampleSession
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
+      orIsError r `shouldBe` False
+      threadDelay 100000  -- 100ms for the async worker
+      mt <- readIORef taskRef
+      case mt of
+        Just t  -> Del.ctIsolateWorkdir t `shouldBe` False
+        Nothing -> expectationFailure "worker did not receive a ChildTask"
+
+    it "AGENT_START parses isolate_workdir=true in batch mode (tasks array)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      taskRef <- newIORef (Nothing :: Maybe Del.ChildTask)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = taskCapturingWorker taskRef
+            , aswGate = gateOpen
+            , aswPaths = samplePaths
+            , aswParentSession = sampleSession
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True] ]]))
+      orIsError r `shouldBe` False
+      threadDelay 100000  -- 100ms for the async worker
+      mt <- readIORef taskRef
+      case mt of
+        Just t  -> Del.ctIsolateWorkdir t `shouldBe` True
+        Nothing -> expectationFailure "worker did not receive a ChildTask"
+
   describe "AGENT_INSTANCES / STATUS / STOP / INTERRUPT (subagent-id keyed)" $ do
     it "AGENT_INSTANCES reports (no agents running) when the synchronous model has finished" $ do
       rt <- newAgentRuntime
@@ -545,7 +639,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran
                                         , mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
@@ -568,7 +662,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran
                                         , mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsCompleted
@@ -581,7 +675,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       let cfg = defaultDelegationConfig
           callback = putMVar resultMVar
           resolver _task = pure (Left "agent def not found: nope")
-          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
@@ -595,7 +689,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           crashingWorker :: Del.AgentWorkerBuilder
           crashingWorker _ _ _ _ = ioError (userError "boom")
           resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
@@ -613,7 +707,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             threadDelay 31000000  -- 31s, just over the 30s timeout
             pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, slowWorker, mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsTimeout
@@ -627,7 +721,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           dummyWorker :: Del.AgentWorkerBuilder
           dummyWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, dummyWorker, mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> T.isInfixOf "paused" err `shouldBe` True
@@ -640,7 +734,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       concurrencyState <- newMVar (0 :: Int, 0 :: Int)
       let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
           callback = const (pure ())
-          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
           tasks = [mkTask i | i <- [1..5 :: Int]]
           input = DiBatch tasks
           resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState, mkSystemSessionId "child"))

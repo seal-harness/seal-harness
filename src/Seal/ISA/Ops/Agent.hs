@@ -44,6 +44,7 @@ module Seal.ISA.Ops.Agent
   , gateOpen
   ) where
 
+import Control.Monad (join)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
@@ -115,6 +116,11 @@ textFieldMaybe name v =
   case parseMaybe (withObject "in" (.:? fromText name)) v :: Maybe (Maybe Text) of
     Just (Just t) -> Just t
     _             -> Nothing
+
+-- | Extract an optional boolean field (defaults to 'Nothing' when absent
+-- or non-boolean). Mirrors 'Seal.ISA.Ops.Session.boolField'.
+boolField :: Value -> Text -> Maybe Bool
+boolField v key = join (parseMaybe (withObject "in" (.:? fromText key)) v)
 
 -- | Decode the @tools@ field: @\"all\"@ (or absent) -> 'AllowAll'; an array of
 -- opcode-name strings -> 'AllowOnly'. Malformed -> 'AllowAll' (permissive).
@@ -544,7 +550,7 @@ parseInput v =
           mGoal  = textFieldMaybe "goal" v
       case (mDefId, mGoal) of
         (Just defId, Just goal) | not (T.null goal) ->
-          pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v))))
+          pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir")))))
         (Just _, Just _) -> pure (Left "AGENT_START requires a non-empty 'goal'.")
         (Just _, Nothing) -> pure (Left "AGENT_START single-task mode requires a 'goal'.")
         (Nothing, _) -> pure (Left "AGENT_START requires an 'id' (agent def id) in single-task mode, or a 'tasks' array in batch mode.")
@@ -558,7 +564,7 @@ parseTask v =
       case textFieldMaybe "goal" v of
         Nothing -> pure (Left "Each task requires a 'goal'.")
         Just goal | T.null goal -> pure (Left "Each task requires a non-empty 'goal'.")
-                 | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v)))
+                 | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir"))))
 
 -- | Resolve a task to its def + worker + fresh session id. Returns Left if
 -- the def id is invalid, the def doesn't exist, or the effective-role /

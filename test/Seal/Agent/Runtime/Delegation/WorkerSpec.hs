@@ -5,16 +5,42 @@
 -- depth plumb) lives in Gateway.AgentIntegrationSpec.
 module Seal.Agent.Runtime.Delegation.WorkerSpec (spec) where
 
+import Control.Exception (SomeException, catch)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.QuickCheck
 
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..))
+import Seal.Agent.Runtime.Delegation
+  ( ChildExitReason (..)
+  , ChildRunHooks (..)
+  , ChildTask (..)
+  , ChildWorkerOutcome (..)
+  )
 import Seal.Agent.Runtime.Delegation.Worker
-import Seal.Core.Types (OpName (..))
-import Seal.Security.Policy (AllowList (..))
+import Seal.Channel.Caps (ChannelCaps)
+import Seal.Config.Paths (SealPaths (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId)
+import Seal.Handles.AskReply (newApprovalCache)
+import Seal.ISA.Registry (mkRegistry)
+import Seal.Logging.Logger (testSealLogger)
+import Seal.Providers.Class (SomeProvider (..))
+import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.TestHelpers.Arbitrary ()
+import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
+import Seal.Tools.Exec.Abort (newAbortFlag)
+import Seal.Tools.Exec.UIO.Internal
+  (mkRemoteUntrustedIOStub, mkTestUIOEnv)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
+import Seal.Types.Config (defaultConfig)
+import Seal.Types.Env (mkEnv)
+import System.FilePath ((</>))
 
 agentStart :: OpName
 agentStart = OpName "AGENT_START"
@@ -100,6 +126,38 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
           AllowOnly xs -> Set.isSubsetOf xs baseSet
           AllowAll     -> True
 
+  describe "mkDelegateWorker workdir anchoring (WU-4)" $ do
+    it "calls dwdMkUIOEnv with Just parentWorkdir when ctIsolateWorkdir=False" $ do
+      withSystemTempDirectory "seal-worker-anchor" $ \tmp -> do
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        deps <- mkAnchorDepsIO tmp anchorRef
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        -- The worker may fail (no real provider round-trip is wired),
+        -- but dwdMkUIOEnv is called BEFORE runTurn, so the anchor is
+        -- captured regardless.
+        _ <- worker sampleAgentDef childSid task hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        captured <- readIORef anchorRef
+        captured `shouldSatisfy` isJust
+        captured `shouldBe` Just (Just "/fake/parent/workdir")
+
+    it "calls dwdMkUIOEnv with Nothing when ctIsolateWorkdir=True" $ do
+      withSystemTempDirectory "seal-worker-anchor" $ \tmp -> do
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        deps <- mkAnchorDepsIO tmp anchorRef
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing True
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        captured <- readIORef anchorRef
+        captured `shouldSatisfy` isJust
+        captured `shouldBe` Just Nothing
+
   where
     roleText :: Text -> Text
     roleText t = case T.strip t of
@@ -111,3 +169,80 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
 baseSet :: Set.Set OpName
 baseSet = Set.fromList
   [ agentStart, OpName "FILE_READ", OpName "FILE_WRITE", OpName "MEMORY_READ" ]
+
+-- ---------------------------------------------------------------------------
+-- WU-4 workdir anchoring test helpers
+-- ---------------------------------------------------------------------------
+
+sampleSession :: SessionId
+sampleSession = mkSystemSessionId "parent"
+
+sampleAgentDef :: AgentDef
+sampleAgentDef = AgentDef
+  { adId = AgentDefId "a1"
+  , adName = "test-agent"
+  , adProvider = "ollama"
+  , adModel = ModelId "llama3"
+  , adSystem = Nothing
+  , adTools = AllowAll
+  , adGroup = Nothing
+  , adRole = Nothing
+  , adDescription = Nothing
+  , adCreatedAt = read "1970-01-01 00:00:00 UTC"
+  , adUpdatedAt = read "1970-01-01 00:00:00 UTC"
+  , adSession = sampleSession
+  }
+
+-- | Build the 'DelegationWorkerDeps' for the anchoring test. The
+-- 'dwdMkUIOEnv' records the anchor arg to the IORef and returns a stub
+-- 'UIOEnv'. The provider resolver returns a 'ScriptProvider' that
+-- immediately yields @\"done\"@ so runTurn completes (or at least reaches
+-- the dwdMkUIOEnv call before any failure).
+mkAnchorDepsIO :: FilePath -> IORef (Maybe (Maybe FilePath)) -> IO DelegationWorkerDeps
+mkAnchorDepsIO tmp anchorRef = do
+  logger <- testSealLogger
+  appEnv <- mkEnv logger defaultConfig
+  approvals <- newApprovalCache
+  pure DelegationWorkerDeps
+    { dwdPaths = samplePaths tmp
+    , dwdParentSid = sampleSession
+    , dwdAppEnv = appEnv
+    , dwdMkUIOEnv = \anchor _childSid -> do
+        writeIORef anchorRef (Just anchor)
+        pure (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
+    , dwdParentWorkdir = Just "/fake/parent/workdir"
+    , dwdAutonomy = Full
+    , dwdApprovals = approvals
+    , dwdOnDemand = False
+    , dwdParentDepth = 0
+    , dwdResolveProvider = \_def -> do
+        ref <- newIORef []
+        pure (Right (SomeProvider (ScriptProvider ref), ModelId "llama3"))
+    , dwdResolveProviderOverride = Nothing
+    , dwdUnionDefBackend = error "dwdUnionDefBackend: unused (no nested AGENT_START in this test)"
+    , dwdChildRegistry = \_def _depth _role _sid (_caps :: ChannelCaps) -> pure (mkRegistry [])
+    , dwdChildSystemPrompt = \_ _ -> pure Nothing
+    , dwdOnEntry = pure ()
+    , dwdChannel = "test"
+    , dwdAbortFlag = const newAbortFlag
+    , dwdToolTimeout = defaultToolTimeoutConfig
+    }
+
+-- | A minimal 'SealPaths' fixture rooted at @tmp@.
+samplePaths :: FilePath -> SealPaths
+samplePaths tmp = SealPaths
+  { spHome = tmp
+  , spConfig = tmp </> "config"
+  , spState = tmp </> "state"
+  , spKeys = tmp </> "keys"
+  , spCache = tmp </> "cache"
+  }
+
+-- | Construct the 'ChildRunHooks' accumulators (all empty/fresh).
+mkHooks :: IO ChildRunHooks
+mkHooks = do
+  traceRef <- newIORef []
+  readRef <- newIORef []
+  writtenRef <- newIORef []
+  interruptedRef <- newIORef False
+  pure (ChildRunHooks traceRef readRef writtenRef interruptedRef)

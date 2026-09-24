@@ -260,6 +260,11 @@ data ChildTask = ChildTask
     -- DEF-authoritative — a leaf def can never be widened by task input
     -- (issue #154: the effective role is computed in W2; this field is
     -- parsed but not yet dispatched on).
+  , ctIsolateWorkdir :: !Bool
+    -- ^ When 'True', the child gets a fresh empty workdir at
+    -- @cache/workdirs/<child-session>@. When 'False' (the default), the
+    -- child inherits the parent's workdir (WU-4: repo clones and plan
+    -- files visible to children without re-cloning).
   } deriving stock (Eq, Show)
 
 -- | Why a child stopped.

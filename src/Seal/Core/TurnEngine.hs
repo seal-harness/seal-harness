@@ -68,7 +68,7 @@ import Seal.Config.File
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
    sessionDir,
-   sessionLogPath, sessionRequestsPath)
+   sessionLogPath, sessionRequestsPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
@@ -1025,12 +1025,20 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdMkUIOEnv = \childSid -> do
+    , dwdMkUIOEnv = \mAnchor childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
+        -- WU-4: when anchoring (mAnchor = Just _), reuse the PARENT's
+        -- cached SessionExec (same workdir, same UIOEnv) so the child
+        -- sees the parent's repo clones + plan files. When isolated
+        -- (Nothing), build a fresh child workdir keyed by the child sid.
+        let execSid = case mAnchor of
+              Just _  -> parentSid
+              Nothing -> childSid
         seUIOEnv <$> either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
+                            (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner)
                             eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+    , dwdParentWorkdir = Just (sessionWorkdir (tdPaths td) parentSid)
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
