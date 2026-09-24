@@ -150,24 +150,26 @@ spec = do
             frame i = streamingJsonFor (T.replicate (frameLen i) "x")
         pendingAsks <- newTVarIO Map.empty
         tabTracker <- newTVarIO Map.empty
-        _ <- handleServerEvent cfg ch key conns pendingAsks tabTracker (mkSid "stream")
-                (SeEntryUpdate (mkSid "stream") (frame 1))
+        -- Signal has ccSupportsStreaming = False, so entry-updates
+        -- accumulate text WITHOUT sending intermediate edits. The text
+        -- is delivered as a single message when the turn finalizes
+        -- (idle or entry event).
         mapM_ (handleServerEvent cfg ch key conns pendingAsks tabTracker (mkSid "stream")
                  . SeEntryUpdate (mkSid "stream") . frame)
-              [2 .. 40]
+              [1 .. 40]
         edits <- getEdits
-        -- FIXED semantics: frame 1 creates the bubble (a send, not an
-        -- edit). Then an edit fires only when 80 NEW codepoints
-        -- accumulate: at frame 17 (79 + 80 new) and frame 33 (159 + 80
-        -- new). 2 edits total.
-        -- TOTAL-LENGTH bug: every frame from frame 2 onward (total >= 80)
-        -- forces an edit — 39 edits.
-        length edits `shouldBe` 2
+        -- No streaming edits: Signal doesn't support progressive edits.
+        length edits `shouldBe` 0
+        -- Fire idle to finalize the turn — the accumulated text should
+        -- be sent as a single new message.
+        handleServerEvent cfg ch key conns pendingAsks tabTracker (mkSid "stream")
+          (SeActivity (mkSid "stream") (A.object ["kind" .= ("harness-status" :: T.Text), "status" .= ("idle" :: T.Text)]))
         sends <- getCaptured
-        -- The bubble-creation send carries the first frame's text.
-        case sends of
+        -- The final send carries the last frame's full text (274 chars).
+        -- It's sent as a new message (no streaming bubble was created).
+        case reverse sends of
           (s : _) -> s `shouldSatisfy` T.isPrefixOf (T.replicate 79 "x")
-          []     -> expectationFailure "expected a bubble-creation send"
+          []     -> expectationFailure "expected a final send"
       where
         streamingJsonFor t = A.object
           [ "id" .= ("streaming" :: T.Text)

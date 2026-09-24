@@ -290,34 +290,39 @@ handleEntryUpdate cfg chan key wsConns val = do
           finalized <- readIORef (ssFinalized ss)
           unless finalized $ do
             writeIORef (ssAccumulated ss) text
-            now <- getCurrentTime
-            mLastEdit <- readIORef (ssLastEdit ss)
-            mMsgId <- readIORef (ssMsgId ss)
-          -- Gate on NEW text since the last edit, not the total length
-          -- (issue #198, part 3). The accumulator only grows within a
-          -- response, so a total-length threshold degenerates to an edit
-          -- on EVERY frame once the text passes spcBufferThreshold —
-          -- one outbound platform edit per arriving WS frame (the
-          -- 'lots of small updates' flood). Measuring the delta since
-          -- the last edit keeps the cadence the config intends: an edit
-          -- per interval, or per 80 NEW codepoints, whichever first.
-            lastLen <- readIORef (ssLastLen ss)
-            when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
-              let content = addCursor streamCfg text
-              case mMsgId of
-                Nothing -> do
-                  mId <- ccSendWithId chan content
-                  case mId of
-                    Just id' -> do
-                      writeIORef (ssMsgId ss) (Just id')
+            -- For channels that don't support streaming (Signal), just
+            -- accumulate the text without sending intermediate edits.
+            -- The final text is sent as a single message when the
+            -- recorded entry or idle status arrives (finalizeBubble).
+            when (ccSupportsStreaming chan) $ do
+              now <- getCurrentTime
+              mLastEdit <- readIORef (ssLastEdit ss)
+              mMsgId <- readIORef (ssMsgId ss)
+              -- Gate on NEW text since the last edit, not the total length
+              -- (issue #198, part 3). The accumulator only grows within a
+              -- response, so a total-length threshold degenerates to an edit
+              -- on EVERY frame once the text passes spcBufferThreshold —
+              -- one outbound platform edit per arriving WS frame (the
+              -- 'lots of small updates' flood). Measuring the delta since
+              -- the last edit keeps the cadence the config intends: an edit
+              -- per interval, or per 80 NEW codepoints, whichever first.
+              lastLen <- readIORef (ssLastLen ss)
+              when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
+                let content = addCursor streamCfg text
+                case mMsgId of
+                  Nothing -> do
+                    mId <- ccSendWithId chan content
+                    case mId of
+                      Just id' -> do
+                        writeIORef (ssMsgId ss) (Just id')
+                        writeIORef (ssLastEdit ss) (Just now)
+                        writeIORef (ssLastLen ss) (T.length text)
+                      Nothing -> pure ()
+                  Just id' -> do
+                    ok <- ccEditMessage chan id' content
+                    when ok $ do
                       writeIORef (ssLastEdit ss) (Just now)
                       writeIORef (ssLastLen ss) (T.length text)
-                    Nothing -> pure ()
-                Just id' -> do
-                  ok <- ccEditMessage chan id' content
-                  when ok $ do
-                    writeIORef (ssLastEdit ss) (Just now)
-                    writeIORef (ssLastLen ss) (T.length text)
 
 -- | Finalize the current streaming bubble for one conversation: edit it
 -- without the cursor (or, if the edit fails, send the full text as a new
@@ -367,7 +372,16 @@ handleEntry cfg chan key wsConns val = do
             else do
               -- The recorded entry is the definitive delivery: mark the
               -- turn finalized so late entry-updates are ignored.
-              finalizeBubble cfg chan ss text True
+              -- For non-streaming channels, the recorded entry's text
+              -- is the authoritative full response — send it even if
+              -- we already sent the accumulated text via idle (the
+              -- recorded entry is the canonical source). Skip if we
+              -- already delivered via finalizeBubble (mMsgId was set
+              -- and finalized).
+              alreadyDelivered <- readIORef (ssFinalized ss)
+              if alreadyDelivered
+                then pure ()
+                else finalizeBubble cfg chan ss text True
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
@@ -407,7 +421,15 @@ handleHarnessStatus cfg chan key wsConns val = do
           Just (_, ss) -> do
             mMsgId <- readIORef (ssMsgId ss)
             accum <- readIORef (ssAccumulated ss)
-            when (isJust mMsgId && not (T.null accum)) $
+            -- For non-streaming channels (Signal), the accumulated text
+            -- is the full response. Send it as a new message (mMsgId is
+            -- Nothing because no streaming bubble was created). For
+            -- streaming channels, only finalize if there's an active
+            -- streaming bubble (mMsgId is Just).
+            -- Don't mark as finalized — the recorded entry is the
+            -- canonical finalize path. This is just a safety net.
+            when (not (T.null accum) &&
+                  (not (ccSupportsStreaming chan) || isJust mMsgId)) $
               finalizeBubble cfg chan ss accum False
             resetStreamingState ss
             writeIORef (ssFinalized ss) True
@@ -432,7 +454,11 @@ handleToolCallActivity cfg chan key wsConns val = do
   for_ (Map.lookup key conns) $ \(_, ss) -> do
     mMsgId <- readIORef (ssMsgId ss)
     accum <- readIORef (ssAccumulated ss)
-    when (isJust mMsgId && not (T.null accum)) $
+    -- For non-streaming channels, finalize when there's accumulated text
+    -- even without a streaming bubble (mMsgId is Nothing). For streaming
+    -- channels, only finalize when there's an in-progress bubble.
+    when (not (T.null accum) &&
+          (not (ccSupportsStreaming chan) || isJust mMsgId)) $
       finalizeBubble cfg chan ss accum False
   case extractToolName val of
     Nothing -> pure ()

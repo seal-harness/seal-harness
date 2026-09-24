@@ -17,6 +17,7 @@ import Network.HTTP.Client (newManager, defaultManagerSettings)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)

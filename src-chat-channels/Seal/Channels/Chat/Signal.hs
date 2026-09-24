@@ -407,6 +407,11 @@ instance ChatChannel SignalChatChannel where
 
   ccLabel _ = "signal"
 
+  -- Signal doesn't reliably support message editing (signal-cli's
+  -- editTimestamp is flaky in practice). Disable streaming: send the
+  -- final text as a single message after the turn completes.
+  ccSupportsStreaming _ = False
+
 -- | Send one chunk verbatim to the last sender.
 sendRaw :: SignalChatChannel -> Text -> IO ()
 sendRaw ch t = do

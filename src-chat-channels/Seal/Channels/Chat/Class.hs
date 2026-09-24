@@ -51,6 +51,14 @@ class ChatChannel c where
   -- | The channel's label (e.g. @"signal"@, @"telegram"@).
   ccLabel :: c -> Text
 
+  -- | Whether the channel supports progressive message editing (streaming
+  -- text bubbles). When 'False', the loop sends the final text as a single
+  -- message after the turn completes instead of creating/editing a
+  -- streaming bubble per delta. Default: 'True' (most channels support
+  -- editing). Signal sets this to 'False' to match the old behavior.
+  ccSupportsStreaming :: c -> Bool
+  ccSupportsStreaming _ = True
+
   -- | Send a question with multiple-choice options as an inline keyboard
   -- (one button per option). The @askIdPrefix@ is the 8-hex prefix of the
   -- ask id — the channel embeds it in the callback_data
