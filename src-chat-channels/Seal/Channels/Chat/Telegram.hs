@@ -6,6 +6,7 @@ module Seal.Channels.Chat.Telegram
   ( TelegramChatChannel (..)
   , withTelegramChatChannel
   , TelegramChatTransport (..)
+  , TelegramButton (..)
   , mkMockTelegramChatTransport
   , mkRealTelegramChatTransport
   , chunkMessage
@@ -20,7 +21,7 @@ import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
 import Data.Text qualified as T
 
-import Seal.Channels.Chat.Class (ChatChannel (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Types
   (InboundMessage (..), ChatMessageId (..), ReceivedMessage (..))
 import Seal.Gateway.Types.AllowList (AllowList (..))
@@ -49,10 +50,32 @@ data TelegramChatTransport = TelegramChatTransport
     -- ^ Send a message: chat id, body.
   , tctSendWithId :: Text -> Text -> IO (Maybe Text)
     -- ^ Send a message and return the message_id.
+  , tctSendWithKeyboard :: Text -> Text -> [[TelegramButton]] -> IO (Maybe Text)
+    -- ^ Send a message with an inline keyboard: chat id, body, keyboard
+    -- rows. Returns the message_id (for later keyboard removal).
+  , tctAnswerCallback :: Text -> IO ()
+    -- ^ Acknowledge a callback_query (dismiss the button's loading spinner).
+  , tctEditReplyMarkup :: Text -> Text -> IO ()
+    -- ^ Remove the inline keyboard from a message: chat id, message_id.
   , tctEditMessage :: Text -> Text -> Text -> IO Bool
     -- ^ Edit a previously sent message: chat id, message_id, new content.
   , tctClose   :: IO ()
   }
+
+-- | One inline-keyboard button: the visible text + the callback_data (sent
+-- back to the bot when the human taps the button). Mirrors
+-- 'Seal.Channels.Telegram.Transport.TelegramButton'.
+data TelegramButton = TelegramButton
+  { tbText         :: !Text
+  , tbCallbackData :: !Text
+  } deriving stock (Eq, Show)
+
+-- | ToJSON for 'TelegramButton' — encodes as @{\"text\":..., \"callback_data\":...}@.
+instance A.ToJSON TelegramButton where
+  toJSON (TelegramButton txt cbd) = A.object
+    [ "text" A..= txt
+    , "callback_data" A..= cbd
+    ]
 
 -- | Chunk a message to the given character limit. Telegram's hard limit
 -- is 4096; we leave headroom.
@@ -85,6 +108,12 @@ mkMockTelegramChatTransport scripted = do
             n <- readIORef msgIdRef
             writeIORef msgIdRef (n + 1)
             pure (Just (T.pack (show (n + 1))))
+        , tctSendWithKeyboard = \_c _b _kb -> do
+            n <- readIORef msgIdRef
+            writeIORef msgIdRef (n + 1)
+            pure (Just (T.pack (show (n + 1))))
+        , tctAnswerCallback = \_cbId -> pure ()
+        , tctEditReplyMarkup = \_c _mid -> pure ()
         , tctEditMessage = \_c _mid _content -> pure True
         , tctClose = pure ()
         }
@@ -112,6 +141,9 @@ mkRealTelegramChatTransport token mgr = do
     { tctReceive = fillAndReceive buffer offsetRef
     , tctSend = sendViaApi mgr token
     , tctSendWithId = tgSendWithIdViaApi mgr token
+    , tctSendWithKeyboard = tgSendWithKeyboardViaApi mgr token
+    , tctAnswerCallback = answerCallbackQueryViaApi mgr token
+    , tctEditReplyMarkup = editReplyMarkupViaApi mgr token
     , tctEditMessage = tgEditMessageViaApi mgr token
     , tctClose = pure ()
     }
@@ -180,6 +212,25 @@ instance ChatChannel TelegramChatChannel where
 
   ccLabel _ = "telegram"
 
+  ccSendWithOptions ch body opts askIdPrefix = do
+    mChat <- readIORef (tccLastChat ch)
+    case mChat of
+      Nothing -> pure Nothing
+      Just chatId -> do
+        let keyboard = buildKeyboard askIdPrefix opts
+        mId <- tctSendWithKeyboard (tccTransport ch) chatId body keyboard
+        pure (ChatMessageId <$> mId)
+
+  ccAnswerCallback ch = tctAnswerCallback (tccTransport ch)
+
+  ccEditReplyMarkup ch (ChatMessageId msgId) = do
+    mChat <- readIORef (tccLastChat ch)
+    case mChat of
+      Nothing -> pure ()
+      Just chatId -> tctEditReplyMarkup (tccTransport ch) chatId msgId
+
+  ccLastChatId ch = readIORef (tccLastChat ch)
+
 -- | Send one chunk verbatim to the last chat.
 sendRaw :: TelegramChatChannel -> Text -> IO ()
 sendRaw ch t = do
@@ -187,6 +238,16 @@ sendRaw ch t = do
   case mChat of
     Nothing -> pure ()
     Just chatId -> tctSend (tccTransport ch) chatId t
+
+-- | Build the inline keyboard: one row per option (button label = the
+-- option's 'qoLabel', callback_data = @\"<prefix>:<idx>\"@). Pure. The
+-- callback_data is always ≤ 64 bytes (8 hex + 1 colon + ≤ 1 char = ≤ 10
+-- bytes). Mirrors the old 'Seal.Channels.Telegram.Run.buildKeyboard'.
+buildKeyboard :: Text -> [QuestionOption] -> [[TelegramButton]]
+buildKeyboard prefix opts =
+  [ [TelegramButton (qoLabel o) (prefix <> ":" <> T.pack (show i))]
+  | (i, o) <- zip [0 :: Int ..] opts
+  ]
 
 -- | Run the reader thread with cleanup. Spawns a background thread that
 -- loops 'tctReceive', allow-lists the sender, and pushes 'InboundMessage's
@@ -229,12 +290,12 @@ readerLoop ch = go
       case eVal of
         Left _ -> writeIORef (tccReaderAlive ch) False
         Right (Left _) -> writeIORef (tccReaderAlive ch) False
-        Right (Right (ReceivedMessage cid mSender replyTo body))
+        Right (Right (ReceivedMessage cid mSender replyTo body mCbData _mCbId _mCbMsgId))
           | not (T.null body) -> do
               case mkMessageSource cid Telegram (mkSender <$> mSender) mempty of
                 Right ms -> do
                   writeIORef (tccLastChat ch) (Just replyTo)
-                  atomically (writeTQueue (tccInbox ch) (InboundMessage ms body))
+                  atomically (writeTQueue (tccInbox ch) (InboundMessage ms body mCbData))
                 Left _ -> pure ()
               go
           | otherwise -> go
@@ -256,7 +317,7 @@ mkSender t = case mkUserId t of
 getUpdates :: Manager -> Text -> Int -> IO (Either Text ([(Int, ReceivedMessage)], [Int]))
 getUpdates mgr token offset = do
   let url = T.unpack (telegramApiBase <> token <> "/getUpdates")
-             <> "?offset=" <> show offset <> "&timeout=30"
+             <> "?offset=" <> show offset <> "&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
   eReq <- try @SomeException (parseRequest url)
   case eReq of
     Left ex -> pure (Left ("getUpdates request error: " <> T.pack (show ex)))
@@ -317,9 +378,12 @@ updateId v =
 parseTelegramUpdate :: Value -> Either Text ReceivedMessage
 parseTelegramUpdate v =
   case v of
-    A.Object o -> case KeyMap.lookup (Key.fromString "message") o of
-      Just m  -> parseMessage m
-      Nothing -> Left "update has no message field"
+    A.Object o ->
+      case KeyMap.lookup (Key.fromString "callback_query") o of
+        Just cq -> parseCallbackQuery cq
+        Nothing -> case KeyMap.lookup (Key.fromString "message") o of
+          Just m  -> parseMessage m
+          Nothing -> Left "update has no message or callback_query field"
     _ -> Left "update not an object"
   where
     parseMessage msg =
@@ -336,8 +400,45 @@ parseTelegramUpdate v =
             , rmSender = mSender
             , rmReplyTo = chatId
             , rmBody = body
+            , rmCallbackData = Nothing
+            , rmCallbackId = Nothing
+            , rmCallbackMessageId = Nothing
             }
         _ -> Left "message not an object"
+    parseCallbackQuery cq =
+      case cq of
+        A.Object cqo -> do
+          callbackId <- case KeyMap.lookup (Key.fromString "id") cqo of
+            Just (A.String t) -> Right t
+            Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
+            _ -> Left "callback_query.id missing"
+          callbackData <- case KeyMap.lookup (Key.fromString "data") cqo of
+            Just (A.String t) -> Right t
+            _ -> Left "callback_query.data missing"
+          msg <- case KeyMap.lookup (Key.fromString "message") cqo of
+            Just m -> Right m
+            Nothing -> Left "callback_query has no message field"
+          case msg of
+            A.Object mo -> do
+              chatId <- requireChatId mo
+              cid <- case mkConversationId ("tg:" <> chatId) of
+                Right c -> Right c
+                Left err -> Left ("conversation id construction failed: " <> err)
+              let mSender = extractSenderId cqo
+                  mMsgId = case KeyMap.lookup (Key.fromString "message_id") mo of
+                    Just (A.Number n) -> Just (T.pack (show (round n :: Int)))
+                    _ -> Nothing
+              Right ReceivedMessage
+                { rmConversationId = cid
+                , rmSender = mSender
+                , rmReplyTo = chatId
+                , rmBody = callbackData
+                , rmCallbackData = Just callbackData
+                , rmCallbackId = Just callbackId
+                , rmCallbackMessageId = mMsgId
+                }
+            _ -> Left "callback_query.message not an object"
+        _ -> Left "callback_query not an object"
 
 -- | Extract @chat.id@ from a message object.
 requireChatId :: A.Object -> Either Text Text
@@ -449,3 +550,76 @@ parseOk bs =
       Just (A.Bool b) -> b
       _ -> False
     _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Inline keyboard + callback API functions
+-- ---------------------------------------------------------------------------
+
+-- | Send a message with an inline keyboard via @sendMessage@. The payload
+-- includes @reply_markup: {inline_keyboard: ...}@. MUST NOT set
+-- @parse_mode@ (plain text — no markdown/HTML interpretation). Returns the
+-- @message_id@ so the caller can remove the keyboard later.
+tgSendWithKeyboardViaApi :: Manager -> Text -> Text -> Text -> [[TelegramButton]] -> IO (Maybe Text)
+tgSendWithKeyboardViaApi mgr token chatId body keyboard = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
+  case eReq of
+    Left _ -> pure Nothing
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" .= chatId
+            , "text" .= body
+            , "reply_markup" A..= A.object
+                [ "inline_keyboard" A..= map (map A.toJSON) keyboard
+                ]
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> pure Nothing
+        Right resp ->
+          if statusCode (responseStatus resp) == 200
+            then pure (parseMessageId (responseBody resp))
+            else pure Nothing
+
+-- | Acknowledge a @callback_query@ via @answerCallbackQuery@. Stops the
+-- button's loading spinner. Best-effort: never throws.
+answerCallbackQueryViaApi :: Manager -> Text -> Text -> IO ()
+answerCallbackQueryViaApi mgr token callbackQueryId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/answerCallbackQuery")))
+  case eReq of
+    Left _ -> pure ()
+    Right req0 -> do
+      let payload = A.object [ "callback_query_id" .= callbackQueryId ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Remove the inline keyboard from a message via
+-- @editMessageReplyMarkup@ with an empty @reply_markup@. Disables buttons
+-- after a tap. Best-effort: never throws.
+editReplyMarkupViaApi :: Manager -> Text -> Text -> Text -> IO ()
+editReplyMarkupViaApi mgr token chatId messageId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/editMessageReplyMarkup")))
+  case eReq of
+    Left _ -> pure ()
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" .= chatId
+            , "message_id" .= messageId
+            , "reply_markup" A..= A.object [ "inline_keyboard" A..= ([] :: [[A.Value]]) ]
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()

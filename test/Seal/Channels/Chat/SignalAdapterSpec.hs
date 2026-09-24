@@ -55,6 +55,9 @@ dummyMsg = ReceivedMessage
   , rmSender = Just "+15551234567"
   , rmReplyTo = "+15551234567"
   , rmBody = "init"
+  , rmCallbackData = Nothing
+  , rmCallbackId = Nothing
+  , rmCallbackMessageId = Nothing
   }
 
 -- | Wait briefly for the reader thread to process the seed message.
@@ -145,9 +148,11 @@ spec = do
                       { cccStreamCfg = defaultStreamProgressConfig }
             frameLen i = 79 + 5 * (i - 1)  -- frame i (1-based) total length
             frame i = streamingJsonFor (T.replicate (frameLen i) "x")
-        _ <- handleServerEvent cfg ch key conns (mkSid "stream")
+        pendingAsks <- newTVarIO Map.empty
+        tabTracker <- newTVarIO Map.empty
+        _ <- handleServerEvent cfg ch key conns pendingAsks tabTracker (mkSid "stream")
                 (SeEntryUpdate (mkSid "stream") (frame 1))
-        mapM_ (handleServerEvent cfg ch key conns (mkSid "stream")
+        mapM_ (handleServerEvent cfg ch key conns pendingAsks tabTracker (mkSid "stream")
                  . SeEntryUpdate (mkSid "stream") . frame)
               [2 .. 40]
         edits <- getEdits

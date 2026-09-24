@@ -78,6 +78,7 @@ library seal-chat-channels
         Seal.Channels.Chat.WsClient
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
+        Seal.Channels.Chat.ToolRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
     build-depends:
