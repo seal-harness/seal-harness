@@ -75,12 +75,10 @@ spec = describe "Seal.Routing.Route" $ do
           Right (Focus _) -> True
           _               -> False
     prop "/N payload for valid N always routes to Inject" $
-      \c payload ->
-        (c `elem` ("0123456789abcdefghij" :: String))
-          && not (T.null payload)
-          && not (T.null (T.strip payload)) ==>
-        case route (T.singleton '/' <> T.singleton c <> " " <> payload) of
-          Right (Inject _ _) -> True
-          _                  -> False
+      forAll (elements (['0'..'9'] ++ ['a'..'j'])) $ \c ->
+        forAll (arbitrary `suchThat` (\t -> not (T.null t) && not (T.null (T.strip t)))) $ \payload ->
+          case route (T.singleton '/' <> T.singleton c <> " " <> payload) of
+            Right (Inject _ _) -> True
+            _                  -> False
     prop "plain text (no leading /) always routes to Plain" $
       \t -> not (T.isPrefixOf "/" t) ==> route t === Right (Plain t)

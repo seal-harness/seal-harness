@@ -16,6 +16,7 @@ import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
 import qualified Seal.Gateway.BroadcastSpec
+import qualified Seal.Gateway.EntryCursorSpec
 import qualified Seal.Gateway.OpenApiSpec
 import qualified Seal.Gateway.PatIngestionSpec
 import qualified Seal.Gateway.SendSpec
@@ -89,6 +90,14 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.ClassSpec
+import qualified Seal.Channels.Chat.TypesSpec
+import qualified Seal.Channels.Chat.RouteSpec
+import qualified Seal.Channels.Chat.RateLimitSpec
+import qualified Seal.Channels.Chat.HttpClientSpec
+import qualified Seal.Channels.Chat.WsClientSpec
+import qualified Seal.Channels.Chat.LoopSpec
+import qualified Seal.Channels.Chat.SignalAdapterSpec
+import qualified Seal.Channels.Chat.TelegramAdapterSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
@@ -204,6 +213,7 @@ specs = do
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
   Seal.Gateway.BroadcastSpec.spec
+  Seal.Gateway.EntryCursorSpec.spec
   Seal.Gateway.PatIngestionSpec.spec
   Seal.Gateway.SendSpec.spec
   Seal.Gateway.ServerSpec.spec
@@ -277,6 +287,14 @@ specs = do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.ClassSpec.spec
+  Seal.Channels.Chat.TypesSpec.spec
+  Seal.Channels.Chat.RouteSpec.spec
+  Seal.Channels.Chat.RateLimitSpec.spec
+  Seal.Channels.Chat.HttpClientSpec.spec
+  Seal.Channels.Chat.WsClientSpec.spec
+  Seal.Channels.Chat.LoopSpec.spec
+  Seal.Channels.Chat.SignalAdapterSpec.spec
+  Seal.Channels.Chat.TelegramAdapterSpec.spec
   Seal.Channels.LoopSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.SignalSpec.spec

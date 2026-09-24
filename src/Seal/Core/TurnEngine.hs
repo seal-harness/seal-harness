@@ -79,7 +79,7 @@ import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Gateway.Broadcast
   (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
-import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
+import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, takeNewEntries)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
@@ -760,8 +760,17 @@ shouldAutoTab meta = smChannel meta /= "bg"
 
 -- | Broadcast new transcript entries over the WS broker so the frontend
 -- updates live without a page refresh. Reads the full transcript from disk
--- and broadcasts every entry — the frontend dedupes by id. 'Nothing' broker
--- (tests) is a no-op.
+-- and broadcasts only the entries not yet sent for this session: the
+-- broker's per-session cursor ('takeNewEntries') tracks the position, so
+-- within a turn each entry is fanned out exactly once (linear volume).
+-- Historically this re-broadcast the entire transcript on every recorded
+-- entry — O(N²) per turn — which re-delivered the full history after every
+-- tool call (issue #198: the Telegram chat channel churned its streaming
+-- bubble with stale text). The web frontend dedupes by id, but the
+-- bandwidth cost and non-deduping subscribers do not. A session whose
+-- transcript shrank (rebuilt) resends everything (cursor clamps to zero) —
+-- subscribers tolerate idempotent replays. 'Nothing' broker (tests) is a
+-- no-op.
 broadcastNewEntries
   :: Maybe StreamBroker -> SealPaths -> SessionId -> Text -> UTCTime -> IO ()
 broadcastNewEntries mBroker paths sid model createdAt =
@@ -769,7 +778,8 @@ broadcastNewEntries mBroker paths sid model createdAt =
     Nothing -> pure ()
     Just broker -> do
       entries <- readTranscriptEntries paths model (showIso createdAt) sid
-      mapM_ (broadcast broker . BeEntryRecorded sid) entries
+      new <- takeNewEntries broker sid (zip [0 ..] entries)
+      mapM_ (broadcast broker . BeEntryRecorded sid . snd) new
 
 -- | Fan out the last assistant reply to subscribed chat channels, and emit
 -- a @reply-delivered@ signal when ≥1 chat channel received it (so the web
