@@ -124,6 +124,7 @@ roleText Assistant = "assistant"
 
 encBlock :: ContentBlock -> Value
 encBlock (CbText t) = object ["type" .= ("text" :: Text), "text" .= t]
+encBlock (CbThinking t) = object ["type" .= ("thinking" :: Text), "thinking" .= t]
 encBlock (CbToolUse (ToolCallId i) (OpName n) inp) =
   object ["type" .= ("tool_use" :: Text), "id" .= i, "name" .= n, "input" .= inp]
 encBlock (CbToolResult (ToolCallId i) parts isErr) =
@@ -164,6 +165,7 @@ parseBlock = withObject "block" $ \o -> do
   ty <- o .: "type" :: Parser Text
   case ty of
     "text"     -> CbText <$> o .: "text"
+    "thinking" -> CbThinking <$> o .: "thinking"
     "tool_use" -> CbToolUse . ToolCallId <$> o .: "id"
                   <*> (OpName <$> o .: "name")
                   <*> o .: "input"

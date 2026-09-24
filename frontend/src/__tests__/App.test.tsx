@@ -90,6 +90,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: 'claude-sonnet-4-20250514',
     channel: null,
+    internal: null,
     raw: '{}',
     ...overrides,
   }

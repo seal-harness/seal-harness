@@ -83,6 +83,28 @@ spec = describe "Seal.Providers.Anthropic" $ do
                          (object ["path" .= ("a.txt" :: String)])]
               StopToolUse (Usage 5 2))
 
+  it "decodeResponse parses a thinking block" $ do
+    let body = object
+          [ "content"     .= [object ["type" .= ("thinking" :: String), "thinking" .= ("let me reason" :: String)]]
+          , "stop_reason" .= ("end_turn" :: String)
+          , "usage"       .= object ["input_tokens" .= (3 :: Int), "output_tokens" .= (1 :: Int)]
+          ]
+    decodeResponse body `shouldBe`
+      Right (CompletionResponse [CbThinking "let me reason"] StopEnd (Usage 3 1))
+
+  it "decodeResponse parses thinking + text blocks (preserving order)" $ do
+    let body = object
+          [ "content"     .= [ object ["type" .= ("thinking" :: String), "thinking" .= ("reasoning" :: String)]
+                             , object ["type" .= ("text" :: String), "text" .= ("answer" :: String)]
+                             ]
+          , "stop_reason" .= ("end_turn" :: String)
+          , "usage"       .= object ["input_tokens" .= (3 :: Int), "output_tokens" .= (1 :: Int)]
+          ]
+    decodeResponse body `shouldBe`
+      Right (CompletionResponse
+              [CbThinking "reasoning", CbText "answer"]
+              StopEnd (Usage 3 1))
+
   it "live completion (opt-in)" $ pendingWith "needs ANTHROPIC_API_KEY"
 
   describe "apiKeyHeaders" $

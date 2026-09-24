@@ -328,6 +328,11 @@ teLineToFrontend rawLine =
           Just (A.String ch) -> Just ch
           _                  -> Nothing
         _ -> Nothing
+      mInternal = case KeyMap.lookup (k "meta") o of
+        Just (A.Object mo) -> case KeyMap.lookup (k "internal") mo of
+          Just (A.Bool b) -> Just b
+          _               -> Nothing
+        _ -> Nothing
   in object
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
@@ -336,6 +341,7 @@ teLineToFrontend rawLine =
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
      , "channel"   .= mChannel
+    , "internal"  .= mInternal
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
 
@@ -373,6 +379,7 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
        , "harness"   .= (Nothing :: Maybe Text)
        , "model"     .= model
        , "channel"   .= (Nothing :: Maybe Text)
+      , "internal"  .= (Nothing :: Maybe Bool)
       , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
       ]
 
@@ -397,6 +404,9 @@ cbToFrontend blk =
   in case tag of
        Just "CbText" -> case contents of
          Just (A.String t) -> object ["type" .= ("text" :: Text), "text" .= t]
+         _                 -> fallback
+       Just "CbThinking" -> case contents of
+         Just (A.String t) -> object ["type" .= ("thinking" :: Text), "thinking" .= t]
          _                 -> fallback
        Just "CbToolUse" -> object
          [ "type"  .= ("tool_use" :: Text)
@@ -533,6 +543,9 @@ reconEntryToFrontend idx te =
           mChannel = case Map.lookup "channel" (teMeta te) of
             Just (A.String ch) -> Just ch
             _                  -> Nothing
+          mInternal = case Map.lookup "internal" (teMeta te) of
+            Just (A.Bool b) -> Just b
+            _               -> Nothing
       in object
          [ "id"        .= entryId
          , "timestamp" .= T.pack (showIso (teTimestamp te))
@@ -550,6 +563,7 @@ reconEntryToFrontend idx te =
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
          , "channel"   .= mChannel
+        , "internal"  .= mInternal
          -- The `raw` field carries the full rewritten payload with tool
          -- input_schemas preserved, so the frontend's "View raw JSON"
          -- modal shows the verbatim schemas the LLM was sent. The legacy

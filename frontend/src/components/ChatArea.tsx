@@ -1857,6 +1857,10 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
 
   for (const e of entries) {
     const ts = formatTimestamp(e.timestamp)
+    // Skip harness-internal entries (e.g. the synthetic continuation
+    // prompt appended after a StopMaxTokens truncation). These are
+    // system-injected messages that should not appear as user bubbles.
+    if (e.internal === true) continue
     // The "View raw JSON" modal uses `rawJson`. For the reconstructed path,
     // `raw` is empty — fall back to the `payload` so the modal still works.
     // `payload` is now an object (for the reconstructed path) or a string
@@ -2069,7 +2073,20 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           blocks.push({ id: 'r-' + e.id + '-tk-' + i, thinkingText: tk }))
         if (textParts) blocks.push({ id: 'r-' + e.id + '-text', text: textParts })
         for (const tc of toolCalls) blocks.push({ id: 'tc-' + tc.id, toolCall: tc })
-        if (blocks.length === 0) blocks.push({ id: 'r-' + e.id + '-empty', text: '(empty response)' })
+        // When the response is empty and the stop reason is "max_tokens",
+        // the model hit the output token limit before emitting any visible
+        // text (e.g. all tokens spent on thinking). Show a truncation
+        // notice instead of the generic "(empty response)" so the user
+        // understands what happened. The loop's auto-continuation handles
+        // the resume; this label just explains the gap.
+        if (blocks.length === 0) {
+          const stopReason = parsed.stop as string | undefined
+          const isEmptyMaxTokens = stopReason === 'max_tokens'
+          blocks.push({
+            id: 'r-' + e.id + '-empty',
+            text: isEmptyMaxTokens ? '(truncated — continuing…)' : '(empty response)',
+          })
+        }
 
         messages.push({
           id: e.id,
