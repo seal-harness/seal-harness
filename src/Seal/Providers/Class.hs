@@ -60,8 +60,11 @@ instance FromJSON ToolResultPart where parseJSON = stripPrefixParseJSON
 -- @cbIsError@→@isError@. The constructor tag (@CbText@/@CbToolUse@/
 -- @CbToolResult@) is emitted by aeson's default 'TaggedObject' sum encoding
 -- unchanged.
+-- @CbThinking@ is serialized as @{"tag":"CbThinking","contents":"..."}@
+-- and rewritten to @{"type":"thinking","thinking":"..."}@ for the frontend.
 data ContentBlock
   = CbText Text
+  | CbThinking Text
   | CbToolUse    { cbId :: ToolCallId, cbName :: OpName, cbInput :: Value }
   | CbToolResult { cbForId :: ToolCallId, cbParts :: [ToolResultPart], cbIsError :: Bool }
   deriving stock (Eq, Show, Generic)
@@ -181,6 +184,8 @@ emitBlock :: (StreamEvent -> IO Bool) -> ContentBlock -> IO ()
 emitBlock k block = case block of
   CbText t -> unless (T.null t) $
     void (k (StreamTextChunk t))
+  CbThinking t -> unless (T.null t) $
+    void (k (StreamThinkingChunk t))
   CbToolUse tcid (OpName name) args ->
     void (k (StreamToolStart tcid (OpName name)) >>
           k (StreamToolEnd tcid (OpName name) args))
@@ -198,6 +203,9 @@ data StreamEvent
   = StreamTextChunk Text
   -- ^ A chunk of assistant text. Multiple chunks concatenate to form the
   -- final 'CbText' block(s).
+  | StreamThinkingChunk Text
+  -- ^ A chunk of model reasoning (extended thinking). Multiple chunks
+  -- concatenate to form the final 'CbThinking' block.
   | StreamToolStart ToolCallId OpName
   -- ^ The model began emitting a tool call. The id is synthesized by the
   -- provider (Ollama carries no ids; the provider assigns sequential ones).

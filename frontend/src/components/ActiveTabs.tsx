@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type { TabInfo, TabStatus } from '../types'
+import { tabIndexToChar } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import { ActivityDot } from './StatusDot'
@@ -132,9 +133,10 @@ export function TabRow({
       <div className="flex items-center gap-2">
         <span
           className="text-xs"
+          data-testid={`tab-index-${tab.index}`}
           style={{ color: 'var(--text-faint)', minWidth: 12, textAlign: 'right' }}
         >
-          {tab.index}
+          {tabIndexToChar(tab.index)}
         </span>
         {isThinking && !isDead ? (
           <ActivityDot activity="thinking" />

@@ -71,7 +71,7 @@ data SignalConfig = SignalConfig
   } deriving stock (Eq, Show)
 
 -- | Signal's text-message character limit. Replies longer than this are
--- chunked via 'Seal.Channels.Signal.Transport.chunkMessage'.
+-- chunked via 'Seal.Channels.Chat.Signal.chunkMessage'.
 defaultSignalChunkLimit :: Int
 defaultSignalChunkLimit = 1998
 

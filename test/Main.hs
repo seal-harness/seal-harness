@@ -89,7 +89,6 @@ import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
-import qualified Seal.Channels.ClassSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.Chat.RouteSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
@@ -98,21 +97,6 @@ import qualified Seal.Channels.Chat.WsClientSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
-import qualified Seal.Channels.CursorSpec
-import qualified Seal.Channels.LoopSpec
-import qualified Seal.Channels.SignalSpec
-import qualified Seal.Channels.Signal.EnvelopeSpec
-import qualified Seal.Channels.TabFocusSpec
-import qualified Seal.Channels.StreamProgressSpec
-import qualified Seal.Channels.Signal.RunSpec
-import qualified Seal.Channels.Signal.TransportSpec
-import qualified Seal.Channels.Signal.TransportEditSpec
-import qualified Seal.Channels.Signal.TransportLockSpec
-import qualified Seal.Channels.TelegramSpec
-import qualified Seal.Channels.Telegram.ButtonsSpec
-import qualified Seal.Channels.Telegram.CommandsSpec
-import qualified Seal.Channels.Telegram.TransportEditSpec
-import qualified Seal.Channels.Telegram.TransportSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
@@ -160,8 +144,6 @@ import qualified Seal.SourceControl.RegistrySpec
 import qualified Seal.SourceControl.AgentRegistrySpec
 import qualified Seal.TestHelpers.SshAgentGuardSpec
 import qualified Seal.SourceControl.CloneSpec
-import qualified Seal.Phase2aSpec
-import qualified Seal.Phase2bSpec
 import qualified Seal.Phase6aSpec
 import qualified Seal.Phase6bSpec
 import qualified Seal.Phase7aSpec
@@ -286,7 +268,6 @@ specs = do
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
-  Seal.Channels.ClassSpec.spec
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
@@ -295,21 +276,6 @@ specs = do
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
-  Seal.Channels.LoopSpec.spec
-  Seal.Channels.CursorSpec.spec
-  Seal.Channels.SignalSpec.spec
-  Seal.Channels.TabFocusSpec.spec
-  Seal.Channels.TelegramSpec.spec
-  Seal.Channels.Telegram.ButtonsSpec.spec
-  Seal.Channels.Telegram.CommandsSpec.spec
-  Seal.Channels.Telegram.TransportEditSpec.spec
-  Seal.Channels.StreamProgressSpec.spec
-  Seal.Channels.Telegram.TransportSpec.spec
-  Seal.Channels.Signal.EnvelopeSpec.spec
-  Seal.Channels.Signal.RunSpec.spec
-  Seal.Channels.Signal.TransportEditSpec.spec
-  Seal.Channels.Signal.TransportLockSpec.spec
-  Seal.Channels.Signal.TransportSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.EntriesSpec.spec
@@ -357,8 +323,6 @@ specs = do
   Seal.SourceControl.AgentRegistrySpec.spec
   Seal.TestHelpers.SshAgentGuardSpec.spec
   Seal.SourceControl.CloneSpec.spec
-  Seal.Phase2aSpec.spec
-  Seal.Phase2bSpec.spec
   Seal.Phase6aSpec.spec
   Seal.Phase6bSpec.spec
   Seal.Phase7aSpec.spec

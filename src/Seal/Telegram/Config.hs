@@ -85,7 +85,7 @@ data TelegramConfig = TelegramConfig
   } deriving stock (Eq, Show)
 
 -- | Telegram's text-message character limit. Replies longer than this are
--- chunked via 'Seal.Channels.Telegram.Transport.chunkMessage'. Telegram's
+-- chunked via 'Seal.Channels.Chat.Telegram.chunkMessage'. Telegram's
 -- hard limit is 4096; we leave headroom for the @model> @ prefix.
 defaultTelegramChunkLimit :: Int
 defaultTelegramChunkLimit = 3900

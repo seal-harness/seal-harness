@@ -5,8 +5,7 @@
 --
 -- This module is deliberately thin: the @/bg@ 'CommandAction' just delegates
 -- to a channel-supplied 'BgRunner'. Each channel implements its own
--- 'BgRunner' (in 'Seal.Channels.Loop' for inbox-driven channels,
--- 'Seal.Channel.Cli' for the TUI) so that:
+-- 'BgRunner' ('Seal.Channel.Cli' for the TUI) so that:
 --
 --   * the turn is forked (the receive loop keeps running so confirmation
 --     answers can be delivered asynchronously);

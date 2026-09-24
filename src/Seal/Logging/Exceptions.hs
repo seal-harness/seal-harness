@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | Unified exception handling helper. Replaces the 6 duplicated @catch@
--- patterns across 'Seal.Channels.Loop', 'Seal.Gateway.Send', and
+-- patterns across 'Seal.Gateway.Send', and
 -- 'Seal.Channel.Cli' with a single function that:
 --
 -- 1. Catches /synchronous/ exceptions only. 'AsyncException' (including

@@ -14,7 +14,6 @@ import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
   , SkillsConfig (..)
   , AgentConfig (..)
-  , ChatStreamingFileConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
@@ -45,8 +44,6 @@ spec = describe "Seal.Config.File" $ do
         , rcWorkdir          = Nothing
         , rcSkills           = Nothing
         , rcAgent            = Nothing
-        , rcChatStreaming    = Nothing
-        , rcChatChannels     = Nothing
         , rcMaxTurns         = Nothing
         , rcToolTimeout      = Nothing
         , rcEmbedding        = Nothing
@@ -102,8 +99,6 @@ spec = describe "Seal.Config.File" $ do
               , rcWorkdir         = Nothing
               , rcSkills          = Nothing
               , rcAgent           = Nothing
-              , rcChatStreaming   = Nothing
-              , rcChatChannels    = Nothing
               , rcMaxTurns        = Nothing
               , rcToolTimeout     = Nothing
              , rcEmbedding       = Nothing
@@ -154,23 +149,6 @@ spec = describe "Seal.Config.File" $ do
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
         let cfg = defaultRuntimeConfig { rcMaxTurns = Just 120 }
-        saveRuntimeConfig path cfg
-        result <- loadRuntimeConfig path
-        result `shouldBe` Right cfg
-
-    it "round-trips a [chat_streaming] section" $
-      withSystemTempDirectory "seal-config-test" $ \dir -> do
-        let path = dir </> "config.toml"
-        let cfg = defaultRuntimeConfig
-              { rcChatStreaming = Just ChatStreamingFileConfig
-                  { csfcEnabled = Just True
-                  , csfcToolProgress = Nothing
-                  , csfcTextStreaming = Nothing
-                  , csfcEditIntervalMs = Just 3000
-                  , csfcBufferThreshold = Nothing
-                  , csfcCursor = Nothing
-                  }
-              }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
         result `shouldBe` Right cfg

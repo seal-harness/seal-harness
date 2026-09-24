@@ -16,7 +16,7 @@ import Data.Vector qualified as V
 import Network.HTTP.Client (newManager, defaultManagerSettings)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
-import Seal.Channels.Chat.Class (ChatChannel (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
@@ -135,14 +135,16 @@ spec = do
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
       let sid = mkSid "sess1"
-          fire t = handleServerEvent cfg chan key conns sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       fire "pre-tool text streams in here"
       -- A tool call fires.
-      handleServerEvent cfg chan key conns sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
       -- Post-tool text streams in.
-      handleServerEvent cfg chan key conns sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
       -- The tool line was sent as its own platform message.
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
@@ -168,13 +170,15 @@ spec = do
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
       let sid = mkSid "sess2"
-          fire t = handleServerEvent cfg chan key conns sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Stream some text (creates the bubble), then the final recorded
       -- entry arrives (finalize), then a LATE entry-update arrives.
       fire "partial text"
-      handleServerEvent cfg chan key conns sid
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
         (SeEntry sid (entryJsonFor "the complete final text"))
       editsAfterFinalize0 <- getEdits chan
       -- A LATE update arrives with enough NEW codepoints to pass the
@@ -201,17 +205,19 @@ spec = do
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
       let sid = mkSid "sess3"
-          fire t = handleServerEvent cfg chan key conns sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Turn 1: stream + go idle (finalize path).
       fire "turn one text"
-      handleServerEvent cfg chan key conns sid (SeActivity sid (statusJson "idle"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (statusJson "idle"))
       -- Turn 2: fresh text must create a NEW bubble.
       -- (Production sequence: the server broadcasts harness-status
       -- "thinking" at turn start, which clears the finalized flag —
       -- then entry-updates stream. The test mirrors that.)
-      handleServerEvent cfg chan key conns sid (SeActivity sid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (statusJson "thinking"))
       sendIdsBefore <- getSendIds chan
       fire "turn two text"
       sendIdsAfter <- getSendIds chan
@@ -313,3 +319,101 @@ spec = do
 
     it "returns Nothing for empty list" $ do
       lastAssistantText [] `shouldBe` (Nothing :: Maybe Text)
+
+  describe "tool call emoji rendering" $ do
+    it "sends a tool line with the emoji prefix when a tool-call activity fires" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      let sid = mkSid "emoji-test"
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+        (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "\x1F4BB")
+      sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
+
+    it "sends a tool line with the gear emoji for BIN_EXEC" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      let sid = mkSid "emoji-test2"
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+        (SeActivity sid (toolCallJson "BIN_EXEC"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "\x2699\xFE0F")
+
+    it "sends a tool line with the brain emoji for MEMORY_MANAGE" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      let sid = mkSid "emoji-test3"
+      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+        (SeActivity sid (toolCallJson "MEMORY_MANAGE"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "\x1F9E0")
+
+  describe "parseCallbackData" $ do
+    it "parses a valid callback_data string" $ do
+      parseCallbackData "abcdef12:0" `shouldBe` Just ("abcdef12", 0)
+      parseCallbackData "a1b2c3d4:3" `shouldBe` Just ("a1b2c3d4", 3)
+
+    it "returns Nothing for invalid prefix length" $ do
+      parseCallbackData "abc:0" `shouldBe` Nothing
+      parseCallbackData "abcdefgh:0" `shouldBe` Nothing
+
+    it "returns Nothing for invalid format" $ do
+      parseCallbackData "abcdef12" `shouldBe` Nothing
+      parseCallbackData "abcdef12:abc" `shouldBe` Nothing
+      parseCallbackData "abcdef12:-1" `shouldBe` Nothing
+
+  describe "extractAskId" $ do
+    it "extracts the id field from an ask event payload" $ do
+      let val = A.object ["id" .= ("q123" :: Text), "question" .= ("hello?" :: Text)]
+      extractAskId val `shouldBe` "q123"
+
+    it "returns empty for missing id" $ do
+      let val = A.object ["question" .= ("hello?" :: Text)]
+      extractAskId val `shouldBe` ""
+
+  describe "extractAskOptions" $ do
+    it "extracts options with label and description" $ do
+      let val = A.object
+            [ "options" .= A.Array (V.fromList
+              [ A.object ["label" .= ("yes" :: Text), "description" .= ("proceed" :: Text)]
+              , A.object ["label" .= ("no" :: Text), "description" .= ("" :: Text)]
+              ])
+            ]
+      extractAskOptions val `shouldBe`
+        [ QuestionOption "yes" "proceed"
+        , QuestionOption "no" ""
+        ]
+
+    it "returns empty list for missing options" $ do
+      let val = A.object ["question" .= ("hello?" :: Text)]
+      extractAskOptions val `shouldBe` []
+
+  describe "formatQuestionWithOptions" $ do
+    it "formats a question with options as a numbered list" $ do
+      formatQuestionWithOptions "Which?" [QuestionOption "yes" "proceed", QuestionOption "no" ""]
+        `shouldBe` "Which?\n\n1) yes \8212 proceed\n2) no\n\nReply with a number or type your own answer."
+
+    it "returns just the question when no options" $ do
+      formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?"

@@ -18,8 +18,6 @@ import Seal.Types.Command
 import Seal.Types.Env
 import Seal.Types.App
 import qualified Seal.Tui
-import qualified Seal.Channels.Signal.Run
-import qualified Seal.Channels.Telegram.Run
 import qualified Seal.Command.Serve
 import qualified Seal.Gateway.OpenApi
 
@@ -44,8 +42,6 @@ dispatch cfg =
     runApp env $ case _config_command cfg of
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
-      CommandSignal autonomy -> liftIO (Seal.Channels.Signal.Run.runSignalMain autonomy logger)
-      CommandTelegram autonomy -> liftIO (Seal.Channels.Telegram.Run.runTelegramMain autonomy logger)
       CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy logger)
       CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 

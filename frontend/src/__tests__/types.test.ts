@@ -6,6 +6,7 @@ import {
   sessionSubtitle,
   tabDisplayLabel,
   findSession,
+  tabIndexToChar,
 } from '../types'
 
 /** Build a fully-populated SessionInfo with sensible nulls, overridable. */
@@ -138,5 +139,29 @@ describe('findSession', () => {
 
   it('returns undefined for an unknown id', () => {
     expect(findSession('zzz', [a, b], [c], [])).toBeUndefined()
+  })
+})
+
+describe('tabIndexToChar', () => {
+  it('maps 0-9 to digit characters', () => {
+    for (let i = 0; i <= 9; i++) {
+      expect(tabIndexToChar(i)).toBe(String(i))
+    }
+  })
+
+  it('maps 10 to "a" and 35 to "z"', () => {
+    expect(tabIndexToChar(10)).toBe('a')
+    expect(tabIndexToChar(35)).toBe('z')
+  })
+
+  it('maps 10..35 to a-z sequentially', () => {
+    for (let i = 10; i <= 35; i++) {
+      expect(tabIndexToChar(i)).toBe(String.fromCharCode('a'.charCodeAt(0) + i - 10))
+    }
+  })
+
+  it('falls back to decimal string for out-of-range indices', () => {
+    expect(tabIndexToChar(-1)).toBe('-1')
+    expect(tabIndexToChar(36)).toBe('36')
   })
 })

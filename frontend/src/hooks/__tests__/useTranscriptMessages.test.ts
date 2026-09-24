@@ -23,6 +23,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: null,
     channel: null,
+    internal: null,
     raw: '{}',
     ...overrides,
   }

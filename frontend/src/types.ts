@@ -158,6 +158,18 @@ export function findSession(
     ?? tabSessions.find((s) => s.id === id)
 }
 
+/** Convert a numeric tab index (0..35) to its single-character display label,
+ *  mirroring the backend's `tabIndexToChar` (0→'0', 9→'9', 10→'a', 35→'z').
+ *  This keeps the web frontend's tab badges in sync with the `/tab list` CLI
+ *  and the chat-channel routing grammar, which all use this single-char
+ *  scheme. Indices outside 0..35 are returned as their decimal string (they
+ *  should never occur from the backend, but we fail soft rather than crash). */
+export function tabIndexToChar(index: number): string {
+  if (index >= 0 && index <= 9) return String(index)
+  if (index >= 10 && index <= 35) return String.fromCharCode('a'.charCodeAt(0) + index - 10)
+  return String(index)
+}
+
 // ── Discovery (harness adoption) ───────────────────────────────────────
 
 /** An external (unmanaged) tmux window that Seal discovered via an on-demand
@@ -356,6 +368,13 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** Whether this is a harness-internal entry (e.g. the synthetic
+   *  continuation prompt appended after a StopMaxTokens truncation).
+   *  When true, the frontend hides the entry from the chat view so the
+   *  user doesn't see system-injected messages as user bubbles. Null
+   *  for entries that don't carry the internal flag (the common case:
+   *  real user messages, responses, harness entries). */
+  internal: boolean | null
   /** The full, verbatim on-disk transcript.jsonl line for this entry — all 9
    *  `_te_*` fields including `_te_metadata`, byte-faithful to disk. Surfaced in
    *  the "View raw JSON (message)" modal. Required, never optional, per the

@@ -500,6 +500,7 @@ renderMessage offset relIdx msg =
 -- | Render a content block as readable text.
 renderBlock :: ContentBlock -> Text
 renderBlock (CbText t) = t
+renderBlock (CbThinking t) = "[thinking] " <> t
 renderBlock (CbToolUse{cbName = OpName n}) = "[tool call: " <> n <> "]"
 renderBlock (CbToolResult{cbParts = parts, cbIsError = isErr}) =
   let label = if isErr then "[tool error]" else "[tool result]"

@@ -42,7 +42,7 @@ import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import Seal.Agent.Def.Types (AgentDef)
-import Seal.Channels.StreamProgress (StreamProgressConfig (..), shouldEdit)
+import Seal.Channels.Chat.RateLimit (StreamProgressConfig (..), shouldEdit)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
@@ -635,8 +635,6 @@ webAskCaps mBroker store sid = do
 streamUpdateConfig :: StreamProgressConfig
 streamUpdateConfig = StreamProgressConfig
   { spcEnabled = True
-  , spcToolProgress = True
-  , spcTextStreaming = True
   , spcEditIntervalMs = 1500
   , spcBufferThreshold = 80
   , spcCursor = "\x2589"
@@ -660,6 +658,7 @@ streamingEntryJson text = object
   , "harness"   .= (Nothing :: Maybe Text)
   , "model"     .= (Nothing :: Maybe Text)
   , "channel"   .= (Nothing :: Maybe Text)
+  , "internal"  .= (Nothing :: Maybe Bool)
   , "raw"       .= ("" :: Text)
   ]
 
