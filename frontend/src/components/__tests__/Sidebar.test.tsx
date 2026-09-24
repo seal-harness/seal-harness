@@ -527,7 +527,7 @@ describe('Sidebar — tab status indicator', () => {
     // Expected: Unread new, Unread old, Read, Thinking (with model suffix).
     expect(labels).toEqual(['Idle Unread·m', 'Idle Unread·m', 'Idle Read·m', 'Thinking·m'])
     // And the tab index badges (rendered first per row) follow the same order.
-    const indexBadges = screen.getAllByText(/^([0-9]+)$/).map((el) => el.textContent)
+    const indexBadges = screen.getAllByTestId(/^tab-index-\d+$/).map((el) => el.textContent)
     // The Active Tabs section renders tab.index badges; verify the sorted
     // order: Unread new (2), Unread old (1), Read (0), Thinking (3).
     expect(indexBadges).toEqual(['2', '1', '0', '3'])
