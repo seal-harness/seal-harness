@@ -151,11 +151,13 @@ encMsg (Message User blocks) =
   in userMsg <> toolMsgs
 encMsg (Message Assistant blocks) =
   let content = T.intercalate "\n" [t | CbText t <- blocks]
+      thinking = T.intercalate "\n" [t | CbThinking t <- blocks]
       toolCalls =
         [ object ["function" .= object ["name" .= n, "arguments" .= inp]]
         | CbToolUse _ (OpName n) inp <- blocks ]
       tc = ["tool_calls" .= toolCalls | not (null toolCalls)]
-  in [object (["role" .= ("assistant" :: Text), "content" .= content] <> tc)]
+      th = ["thinking" .= thinking | not (T.null thinking)]
+  in [object (["role" .= ("assistant" :: Text), "content" .= content] <> th <> tc)]
 
 -- | Ollama's tool role carries no structured error flag, so an errored result
 -- is marked in-band: its text is prefixed so the model can see the call failed.
@@ -195,13 +197,15 @@ parseRespFrom :: Int -> Value -> Parser CompletionResponse
 parseRespFrom start = withObject "ollama response" $ \o -> do
   msg        <- o .: "message"
   content    <- msg .:? "content" .!= ""
+  thinking   <- msg .:? "thinking" .!= ""
   rawCalls   <- msg .:? "tool_calls" .!= ([] :: [Value])
   toolBlocks <- traverse parseToolCall (zip [start ..] rawCalls)
   doneReason <- o .:? "done_reason"
   promptTok  <- o .:? "prompt_eval_count" .!= 0
   evalTok    <- o .:? "eval_count" .!= 0
-  let textBlocks = [CbText content | not (T.null content)]
-      blocks     = textBlocks <> toolBlocks
+  let thinkingBlocks = [CbThinking thinking | not (T.null thinking)]
+      textBlocks = [CbText content | not (T.null content)]
+      blocks     = thinkingBlocks <> textBlocks <> toolBlocks
       stop       = if not (null toolBlocks) then StopToolUse else stopFromDone doneReason
   pure (CompletionResponse blocks stop (Usage promptTok evalTok))
 
@@ -281,10 +285,11 @@ parseStreamChunk st = withObject "ollama stream chunk" $ \o -> do
       pure (st, [StreamDone stop (Usage promptTok evalTok)])
     else do
       msgVal <- o .:? "message" .!= object []
-      (content, rawCalls) <- parseMsgFields msgVal
+      (content, thinking, rawCalls) <- parseMsgFields msgVal
       let textEvents = [StreamTextChunk content | not (T.null content)]
+          thinkingEvents = [StreamThinkingChunk thinking | not (T.null thinking)]
           (st', toolEvents) = foldl processTool (st, []) rawCalls
-      pure (st', textEvents <> toolEvents)
+      pure (st', thinkingEvents <> textEvents <> toolEvents)
   where
     processTool (s, evs) rawCall = case parseEither parseToolCallRaw rawCall of
       Left _ -> (s, evs)
@@ -299,11 +304,12 @@ parseStreamChunk st = withObject "ollama stream chunk" $ \o -> do
                        }
             in (s', evs <> [StreamToolStart tcid name, StreamToolEnd tcid name args])
 
-parseMsgFields :: Value -> Parser (Text, [Value])
+parseMsgFields :: Value -> Parser (Text, Text, [Value])
 parseMsgFields = withObject "stream message" $ \msg -> do
   content <- msg .:? "content" .!= ""
+  thinking <- msg .:? "thinking" .!= ""
   rawCalls <- msg .:? "tool_calls" .!= ([] :: [Value])
-  pure (content, rawCalls)
+  pure (content, thinking, rawCalls)
 
 parseToolCallRaw :: Value -> Parser (Maybe ToolCallId, OpName, Value)
 parseToolCallRaw = withObject "tool_call" $ \o -> do

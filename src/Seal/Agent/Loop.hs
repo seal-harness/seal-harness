@@ -357,7 +357,9 @@ runTurn env userText = do
                       , erDurationMs = Nothing
                       , erHarness = Nothing
                       , erCorrelation = Nothing
-                      , erMeta = Map.empty
+                      -- Mark as internal so the frontend hides the
+                      -- synthetic continuation prompt from the chat view.
+                      , erMeta = Map.singleton "internal" (Bool True)
                       }
                 tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
                 aeOnEntry env'
@@ -634,11 +636,16 @@ aggregateStreamEvents events outcome =
   CompletionResponse blocks (soStop outcome) (soUsage outcome)
   where
     textChunks = [t | StreamTextChunk t <- events]
+    thinkingChunks = [t | StreamThinkingChunk t <- events]
     textBlocks = [CbText (stripToolCallXml (T.intercalate "" textChunks))
                  | not (null textChunks)]
+    thinkingBlocks = [CbThinking (T.intercalate "" thinkingChunks)
+                     | not (null thinkingChunks)]
     toolBlocks = [CbToolUse tcid name args
                 | StreamToolEnd tcid name args <- events]
-    blocks = textBlocks <> toolBlocks
+    -- Thinking blocks come before text blocks (matching the model's
+    -- generation order: reasoning first, then visible output).
+    blocks = thinkingBlocks <> textBlocks <> toolBlocks
 
 -- | Upper bound on how far back a truncation-tail scan looks (chars). The
 -- tail of a StopMaxTokens response can contain a partial tool-call XML

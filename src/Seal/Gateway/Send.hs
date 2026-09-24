@@ -660,6 +660,7 @@ streamingEntryJson text = object
   , "harness"   .= (Nothing :: Maybe Text)
   , "model"     .= (Nothing :: Maybe Text)
   , "channel"   .= (Nothing :: Maybe Text)
+  , "internal"  .= (Nothing :: Maybe Bool)
   , "raw"       .= ("" :: Text)
   ]
 

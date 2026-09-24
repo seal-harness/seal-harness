@@ -356,6 +356,13 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** Whether this is a harness-internal entry (e.g. the synthetic
+   *  continuation prompt appended after a StopMaxTokens truncation).
+   *  When true, the frontend hides the entry from the chat view so the
+   *  user doesn't see system-injected messages as user bubbles. Null
+   *  for entries that don't carry the internal flag (the common case:
+   *  real user messages, responses, harness entries). */
+  internal: boolean | null
   /** The full, verbatim on-disk transcript.jsonl line for this entry — all 9
    *  `_te_*` fields including `_te_metadata`, byte-faithful to disk. Surfaced in
    *  the "View raw JSON (message)" modal. Required, never optional, per the

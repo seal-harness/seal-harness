@@ -4,12 +4,13 @@ module Seal.Agent.LoopSpec (spec) where
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
+import Data.Map qualified as Map
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
-import Data.Maybe (mapMaybe, fromJust)
+import Data.Maybe (mapMaybe, fromJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesFileExist)
@@ -31,7 +32,7 @@ import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Transcript.Conv (readConversation)
-import Seal.Transcript.Entries (EntryRecord (..), EntryKind (EKResponse))
+import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Logging.Logger (testSealLogger)
@@ -1458,6 +1459,58 @@ spec = describe "Seal.Agent.Loop" $ do
     let assistantTexts = [ t | Message Assistant blocks <- conv, CbText t <- blocks ]
     assistantTexts `shouldSatisfy` any ("partial" `T.isInfixOf`)
     assistantTexts `shouldSatisfy` any ("done" `T.isInfixOf`)
+
+  -- The synthetic continuation prompt entry (EKRequest) must be marked
+  -- internal via erMeta so the frontend hides it from the chat view.
+  it "marks the StopMaxTokens continuation entry as internal" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
+        script =
+          [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
+          , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
+          ]
+    ref <- newIORef script
+    (h, readBack) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnStop = Nothing
+                , aeStopFanoutDone = stopFanoutDoneRef
+                    , aeOnToolCall = \_ _ -> pure ()
+                    , aeOnTextDelta = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
+                }
+    runTestApp (runTurn env "hi")
+    (_, entries) <- readBack
+    -- 3 entries: Request (user "hi"), Response (partial), Request (continuation)
+    -- The continuation request entry must have internal=true in erMeta.
+    let contEntries = [ e | e <- entries, erKind e == EKRequest, isNothing (erEnvelope e) ]
+    length contEntries `shouldSatisfy` (>= 1)
+    case contEntries of
+     (contEntry : _) -> Map.lookup "internal" (erMeta contEntry) `shouldBe` Just (Bool True)
+     []              -> expectationFailure "expected at least one continuation request entry"
 
   -- The truncation event must be logged to seal.log when aeLogPath is set.
   it "logs StopMaxTokens continuation to seal.log" $

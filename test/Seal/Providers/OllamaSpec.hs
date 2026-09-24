@@ -181,6 +181,30 @@ spec = describe "Seal.Providers.Ollama" $ do
       decodeResponse body `shouldBe`
         Right (CompletionResponse [] StopEnd (Usage 0 0))
 
+    it "parses thinking content from message.thinking" $ do
+      let body = object
+            [ "message" .= object
+                [ "role" .= ("assistant" :: String)
+                , "content" .= ("the answer" :: String)
+                , "thinking" .= ("reasoning here" :: String)
+                ]
+            ]
+      decodeResponse body `shouldBe`
+        Right (CompletionResponse
+                [CbThinking "reasoning here", CbText "the answer"]
+                StopEnd (Usage 0 0))
+
+    it "parses thinking-only response (no text content)" $ do
+      let body = object
+            [ "message" .= object
+                [ "role" .= ("assistant" :: String)
+                , "content" .= ("" :: String)
+                , "thinking" .= ("just thinking" :: String)
+                ]
+            ]
+      decodeResponse body `shouldBe`
+        Right (CompletionResponse [CbThinking "just thinking"] StopEnd (Usage 0 0))
+
   -- Regression: when the model emits a tool call, the streaming path must
   -- label the stop reason 'StopToolUse' (not 'StopEnd'). The non-streaming
   -- path already does this (see the "parses tool_calls" test above), but
