@@ -784,7 +784,7 @@ agentManageOp :: AgentStartWiring -> Opcode
 agentManageOp wiring = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents), status (check one agent), stop (kill agent), interrupt (cooperative stop)."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — returns immediately with per-child subagent_id + child_session, results arrive via AGENT_STATUS), status (check one agent — includes summary + child_session + exit_reason after completion), stop (kill agent), interrupt (cooperative stop)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -811,7 +811,7 @@ agentManageOp wiring = TrustedOpcode
               ]
           , fromText "tasks" .= object
               [ "type" .= ("array" :: Text)
-              , "description" .= ("Batch: [{id, goal, context?, role?}] (start)." :: Text)
+              , "description" .= ("Batch: [{id, goal, context?, role?, isolate_workdir?}] (start)." :: Text)
               ]
           , fromText "subagent_id" .= object
               [ "type" .= ("string" :: Text)
@@ -859,7 +859,7 @@ agentStartOp :: AgentStartWiring -> Opcode
 agentStartOp wiring = TrustedOpcode
   { toName = OpName "AGENT_START"
   , toTrust = Trusted
-  , toDesc = "Spawn one or more child agents, run each against a goal to completion, return a JSON result per child. Single mode: {id, goal, context?, role?}. Batch mode: {tasks: [{id, goal, context?, role?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
+  , toDesc = "Spawn one or more child agents asynchronously. Returns immediately with per-child subagent_id + child_session (status=running). Results arrive via AGENT_STATUS or the parent transcript. Single mode: {id, goal, context?, role?, isolate_workdir?}. Batch mode: {tasks: [{id, goal, context?, role?, isolate_workdir?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
