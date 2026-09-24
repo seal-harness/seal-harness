@@ -74,12 +74,15 @@ chunkMessage limit msg
       | otherwise = T.take limit t : go (T.drop limit t)
 
 -- | A mock transport backed by a 'TQueue' of inbound messages and an
--- 'IORef' of captured sends. For testing.
-mkMockSignalChatTransport :: [ReceivedMessage] -> IO (SignalChatTransport, IO [Text])
+-- 'IORef's of captured sends and captured edits. For testing. The third
+-- return value exposes the captured @(timestamp, content)@ edit pairs so
+-- streaming-edit cadence is observable in tests.
+mkMockSignalChatTransport :: [ReceivedMessage] -> IO (SignalChatTransport, IO [Text], IO [(Text, Text)])
 mkMockSignalChatTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
+  editRef <- newIORef ([] :: [(Text, Text)])
   tsRef <- newIORef (1000 :: Int)
   let transport = SignalChatTransport
         { sctReceive = do
@@ -88,15 +91,19 @@ mkMockSignalChatTransport scripted = do
               Just msg -> pure (Right msg)
               Nothing -> pure (Left "inbox empty")
         , sctSend = \_r b -> modifyIORef' capRef (b :)
-        , sctSendWithId = \_r _b -> do
+        , sctSendWithId = \_r b -> do
             n <- readIORef tsRef
             writeIORef tsRef (n + 1)
+            modifyIORef' capRef (b :)  -- sendWithId is also a visible send
             pure (Just (T.pack (show (n + 1))))
-        , sctEditMessage = \_r _ts _content -> pure True
+        , sctEditMessage = \_r ts content -> do
+            modifyIORef' editRef ((ts, content) :)
+            pure True
         , sctClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
-  pure (transport, getCaptured)
+      getEdits = reverse <$> readIORef editRef
+  pure (transport, getCaptured, getEdits)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — signal-cli subprocess via JSON-RPC

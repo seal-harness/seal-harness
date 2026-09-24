@@ -566,25 +566,51 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         _ -> expectationFailure "expected exactly one pending ask"
       takeMVar done
 
-  describe "webAskCaps ccSend streaming" $ do
-    it "ccSend broadcasts BeEntryUpdate with accumulated text via the broker" $ do
+  describe "webAskCaps ccSend streaming (rate-limited BeEntryUpdate)" $ do
+    it "ccSend coalesces rapid deltas into one BeEntryUpdate (time-gated)" $ do
+      -- Regression (issue #198, part 2): webAskCaps.ccSend fired a
+      -- BeEntryUpdate per provider text delta, unthrottled — each frame
+      -- carrying the FULL accumulated text. A ~40-word reply produced 43
+      -- WS frames (the log's small-update flood). The fix gates the
+      -- broadcast on the stream-progress limiter (shouldEdit: 1500ms
+      -- interval / 80-codepoint threshold), so back-to-back deltas within
+      -- the interval coalesce into a single frame.
       broker <- newStreamBroker 10
       ref <- newIORef ([] :: [BrokerEvent])
       void $ subscribe broker (mkSid "stream-sid") (\e -> modifyIORef' ref (e :)) (pure ())
       store <- newAskReplyStore 0
       let sid = mkSid "stream-sid"
       caps <- webAskCaps (Just broker) store sid
-      ccSend caps ("Hello" :: Text)
-      ccSend caps (" world" :: Text)
+      -- Fire deltas back-to-back (no wall-clock delay between them):
+      -- "Hello", " ", "world", " and", " more" — 5 deltas in well under
+      -- the 1500ms interval.
+      mapM_ (ccSend caps) ["Hello", " ", "world", " and", " more" :: Text]
       events <- readIORef ref
-      -- Two BeEntryUpdate events, each carrying the accumulated text so far.
-      -- Events are stored in reverse order (most recent first), so the head
-      -- is the second broadcast carrying the accumulated "Hello world".
-      length events `shouldBe` 2
+      -- The first delta broadcasts immediately (no last-edit time); the
+      -- remaining four coalesce into it. ONE broadcast carrying "Hello".
+      length events `shouldBe` 1
       case events of
-        [BeEntryUpdate _ v, _] ->
-          extractContentText v `shouldBe` Just ("Hello world" :: Text)
-        _ -> expectationFailure ("expected two BeEntryUpdate events, got " <> show events)
+        [BeEntryUpdate _ v] -> extractContentText v `shouldBe` Just ("Hello" :: Text)
+        _ -> expectationFailure ("expected one BeEntryUpdate event, got " <> show events)
+
+    it "ccSend forces an edit once the buffer threshold is exceeded" $ do
+      -- The 80-codepoint threshold must still force intermediate edits
+      -- within the interval so long responses stream visibly rather than
+      -- arriving as one lump at the end.
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribe broker (mkSid "stream-sid") (\e -> modifyIORef' ref (e :)) (pure ())
+      store <- newAskReplyStore 0
+      let sid = mkSid "stream-sid"
+      caps <- webAskCaps (Just broker) store sid
+      -- 3 deltas of 40 chars each: 40 (<80, no), 80 (>=80, forced), 120.
+      let chunk = T.replicate 40 "x"
+      mapM_ (ccSend caps) [chunk, chunk, chunk]
+      events <- readIORef ref
+      -- Threshold crossings force broadcasts: delta 2 hits 80 codepoints.
+      -- (delta 3 arrives immediately after the forced edit, within the
+      -- interval, and coalesces.)
+      length events `shouldBe` 2
 
     it "ccSend is a no-op when the broker is Nothing" $ do
       store <- newAskReplyStore 0

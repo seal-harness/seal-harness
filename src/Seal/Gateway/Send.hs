@@ -32,15 +32,17 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import Seal.Agent.Def.Types (AgentDef)
+import Seal.Channels.StreamProgress (StreamProgressConfig (..), shouldEdit)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
@@ -574,12 +576,40 @@ webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> IO ChannelCaps
 webAskCaps mBroker store sid = do
   accRef <- newIORef ("" :: Text)
+  lastEditRef <- newIORef (Nothing :: Maybe UTCTime)
+  lastLenRef <- newIORef (0 :: Int)
   let caps = def
         { ccSend = \delta -> case mBroker of
             Nothing -> pure ()
             Just broker -> do
               acc <- atomicModifyIORef' accRef (\a -> (a <> delta, a <> delta))
-              broadcast broker (BeEntryUpdate sid (streamingEntryJson acc))
+              -- Rate-limit the broadcast (issue #198, part 2): gate on
+              -- shouldEdit (1500ms interval / 80-codepoint threshold) so
+              -- rapid deltas coalesce instead of one BeEntryUpdate per
+              -- provider token chunk. Each frame carries the FULL
+              -- accumulated text, so unthrottled emission was O(N²) bytes
+              -- per response and flooded WS subscribers (the chat-channel
+              -- loop logged 43 entry-updates for a ~40-word reply).
+              -- The web frontend re-renders the same "streaming" sentinel
+              -- placeholder at whatever cadence frames arrive, so
+              -- coalescing loses nothing; the final entry arrives via the
+              -- normal BeEntryRecorded path regardless.
+              --
+              -- The threshold measures NEW codepoints since the last
+              -- broadcast (accLen - lastLen), not the total: the
+              -- accumulator only grows within a response, so a
+              -- total-length threshold would force an edit on EVERY delta
+              -- once the text passed 80 codepoints — degenerating back to
+              -- per-delta emission for any response longer than a
+              -- sentence.
+              now <- getCurrentTime
+              mLast <- readIORef lastEditRef
+              lastLen <- readIORef lastLenRef
+              let newLen = T.length acc - lastLen
+              when (shouldEdit streamUpdateConfig now mLast newLen) $ do
+                broadcast broker (BeEntryUpdate sid (streamingEntryJson acc))
+                writeIORef lastEditRef (Just now)
+                writeIORef lastLenRef (T.length acc)
         , ccPrompt = \(AskPrompt q opts) -> do
             outcome <- askHumanWithOptions store sid q opts (\qid ->
               case mBroker of
@@ -595,6 +625,22 @@ webAskCaps mBroker store sid = do
               Right t -> t)
         }
   pure caps
+
+-- | The stream-progress limiter config for web streaming updates.
+-- Matches the chat-channel client's 'Seal.Channels.Chat.RateLimit'
+-- defaults (1500ms edit interval, 80-codepoint threshold) so the server
+-- emits entry-updates at the same cadence subscribers render them. Pure
+-- constant; the config is not user-tunable (the thresholds are the
+-- observed-good defaults from the CLI's streaming implementation).
+streamUpdateConfig :: StreamProgressConfig
+streamUpdateConfig = StreamProgressConfig
+  { spcEnabled = True
+  , spcToolProgress = True
+  , spcTextStreaming = True
+  , spcEditIntervalMs = 1500
+  , spcBufferThreshold = 80
+  , spcCursor = "\x2589"
+  }
 
 -- | Build a synthetic streaming @entry-update@ JSON envelope for the
 -- accumulated text so far. The entry id is the fixed sentinel @"streaming"@

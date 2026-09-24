@@ -7,6 +7,8 @@ module Seal.Channels.Chat.Loop
   ( runChatChannel
   , ChatChannelConfig (..)
   , defaultChatChannelConfig
+    -- * Event handlers (for testing)
+  , handleServerEvent
     -- * Pure helpers (for testing)
   , extractEntryText
   , extractActivityKind
@@ -214,7 +216,7 @@ handleServerEvent
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> SessionId -> ServerEvent -> IO ()
 handleServerEvent cfg chan key wsConns focusedSid ev =
-  dbg ("handleServerEvent: " <> T.pack (show ev)) >>
+  logEvent ev >>
   (case ev of
     SeEntryUpdate sid val
       | sid == focusedSid -> handleEntryUpdate cfg chan key wsConns val
@@ -228,6 +230,16 @@ handleServerEvent cfg chan key wsConns focusedSid ev =
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key sid val
     _ -> pure ())  -- ignore events for other sessions or irrelevant types
+  where
+    -- Log each event, but summarize streaming entry-updates: they fire
+    -- many times per response (once per rate-limited frame), and each
+    -- carried JSON is the FULL accumulated text — dumping every frame
+    -- swamped the log (the 810KB/117-line output.log). One compact line
+    -- per update keeps the cadence observable without the flood.
+    logEvent (SeEntryUpdate sid val) =
+      dbg ("handleServerEvent: SeEntryUpdate " <> sessionIdText sid
+           <> " len=" <> T.pack (show (T.length (extractEntryText val))))
+    logEvent e = dbg ("handleServerEvent: " <> T.pack (show e))
 
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
@@ -249,7 +261,16 @@ handleEntryUpdate cfg chan key wsConns val = do
           now <- getCurrentTime
           mLastEdit <- readIORef (ssLastEdit ss)
           mMsgId <- readIORef (ssMsgId ss)
-          when (shouldEdit streamCfg now mLastEdit (T.length text)) $ do
+          -- Gate on NEW text since the last edit, not the total length
+          -- (issue #198, part 3). The accumulator only grows within a
+          -- response, so a total-length threshold degenerates to an edit
+          -- on EVERY frame once the text passes spcBufferThreshold —
+          -- one outbound platform edit per arriving WS frame (the
+          -- 'lots of small updates' flood). Measuring the delta since
+          -- the last edit keeps the cadence the config intends: an edit
+          -- per interval, or per 80 NEW codepoints, whichever first.
+          lastLen <- readIORef (ssLastLen ss)
+          when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
             let content = addCursor streamCfg text
             case mMsgId of
               Nothing -> do
@@ -258,10 +279,13 @@ handleEntryUpdate cfg chan key wsConns val = do
                   Just id' -> do
                     writeIORef (ssMsgId ss) (Just id')
                     writeIORef (ssLastEdit ss) (Just now)
+                    writeIORef (ssLastLen ss) (T.length text)
                   Nothing -> pure ()
               Just id' -> do
                 ok <- ccEditMessage chan id' content
-                when ok $ writeIORef (ssLastEdit ss) (Just now)
+                when ok $ do
+                  writeIORef (ssLastEdit ss) (Just now)
+                  writeIORef (ssLastLen ss) (T.length text)
 
 -- | Handle an @entry@ event (complete transcript entry): finalize the
 -- streaming bubble (edit without cursor).
@@ -335,6 +359,7 @@ handleHarnessStatus cfg chan key wsConns val = do
           writeIORef (ssMsgId ss) Nothing
           writeIORef (ssAccumulated ss) ""
           writeIORef (ssLastEdit ss) Nothing
+          writeIORef (ssLastLen ss) 0
 
 -- | Handle a @tool-call@ activity: send the tool-progress line to the
 -- platform as a separate message. This renders the tool-call progress

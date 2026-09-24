@@ -125,6 +125,9 @@ data StreamingState = StreamingState
   { ssMsgId       :: IORef (Maybe ChatMessageId)
   , ssAccumulated :: IORef Text
   , ssLastEdit    :: IORef (Maybe UTCTime)
+  , ssLastLen     :: IORef Int
+    -- ^ Codepoints in the accumulated text at the last platform edit.
+    -- The edit gate measures NEW text since the last edit, not the total.
   }
 
 -- | Create fresh streaming state for one conversation.
@@ -133,8 +136,10 @@ newStreamingState = do
   msgId <- newIORef Nothing
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
+  lastLen <- newIORef 0
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
+    , ssLastLen = lastLen
     }
