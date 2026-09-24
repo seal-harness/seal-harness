@@ -49,6 +49,7 @@ import Seal.Providers.Class
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( listSessions, listArchivedSessions, newSession, saveSessionMeta )
+import Seal.Session.Search (SessionSearchBackend (..))
 import Seal.Util.StrictIO (readFileTextStrict, decodeFileStrict)
 
 -- ---------------------------------------------------------------------------
@@ -122,18 +123,15 @@ handleList paths v = do
         ]
   pure (OpResult [TrpText rendered] False recorded)
 
-handleSearch :: SealPaths -> Value -> App OpResult
-handleSearch paths v = do
+handleSearch :: SessionSearchBackend -> SealPaths -> Value -> App OpResult
+handleSearch searchBackend paths v = do
   let q = fromMaybe "" (textField v "query")
   if T.null (T.strip q)
     then pure (OpResult [TrpText "search: query is empty"] True (object []))
     else do
-      let qLower = T.toCaseFold (T.strip q)
-          archived = fromMaybe False (boolField v "archived")
-      metas <- liftIO (if archived then listArchivedSessions paths else listSessions paths)
-      results <- liftIO (mapM (searchSession paths qLower) metas)
-      let matched = [ (m, snip) | (m, Just snip) <- results ]
-          rendered = case matched of
+      let archived = fromMaybe False (boolField v "archived")
+      matched <- liftIO (ssbSearch searchBackend paths q archived)
+      let rendered = case matched of
             [] -> "(no sessions found)"
             _ -> T.intercalate "\n\n" $
                    [ renderSessionMeta m <> "\n  snippet: " <> snip
@@ -219,8 +217,8 @@ authorizeManage v =
 -- ---------------------------------------------------------------------------
 
 -- | SESSION_MANAGE: action-based entry point for all session operations.
-sessionManageOp :: SealPaths -> Opcode
-sessionManageOp paths = TrustedOpcode
+sessionManageOp :: SealPaths -> SessionSearchBackend -> Opcode
+sessionManageOp paths searchBackend = TrustedOpcode
   { toName = OpName "SESSION_MANAGE"
   , toTrust = Trusted
   , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination)."
@@ -280,7 +278,7 @@ sessionManageOp paths = TrustedOpcode
         Right action -> case action of
           SessNew    -> handleNew paths v
           SessList   -> handleList paths v
-          SessSearch -> handleSearch paths v
+          SessSearch -> handleSearch searchBackend paths v
           SessGet    -> handleGet paths v
   }
 
@@ -343,11 +341,11 @@ sessionListOp paths = TrustedOpcode
   }
 
 -- | SESSION_SEARCH (legacy shim): delegates to the search handler.
-sessionSearchOp :: SealPaths -> Opcode
-sessionSearchOp paths = TrustedOpcode
+sessionSearchOp :: SealPaths -> SessionSearchBackend -> Opcode
+sessionSearchOp paths searchBackend = TrustedOpcode
   { toName = OpName "SESSION_SEARCH"
   , toTrust = Trusted
-  , toDesc = "Search sessions by text query. Matches session descriptions and first user message snippets. Case-insensitive substring match. (Legacy — prefer SESSION_MANAGE with action=\"search\".)"
+  , toDesc = "Search sessions by text query. Full-transcript search across all messages (user, assistant, tool calls, tool results) and session descriptions. Case-insensitive. Uses engram semantic search when available, falls back to ripgrep literal search, then in-memory scan. (Legacy — prefer SESSION_MANAGE with action=\"search\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -365,7 +363,7 @@ sessionSearchOp paths = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = authorizeSearch
   , toBlocking = False
-  , toRun = \_ v -> handleSearch paths v
+  , toRun = \_ v -> handleSearch searchBackend paths v
   }
 
 -- | SESSION_GET (legacy shim): delegates to the get handler.
@@ -425,50 +423,6 @@ renderSessionMeta m =
   in sid <> " | " <> smProvider m <> "/" <> smModel m
        <> " | " <> desc
        <> " | created: " <> created <> " | last active: " <> active
-
--- | Search a single session for the query string. Returns 'Just snippet'
--- if the session matches (description or first user message), 'Nothing'
--- otherwise. The snippet is the matched text for context.
-searchSession :: SealPaths -> Text -> SessionMeta -> IO (SessionMeta, Maybe Text)
-searchSession paths qLower meta = do
-  let descLower = maybe "" T.toCaseFold (smDescription meta)
-      descMatch = qLower `T.isInfixOf` descLower
-  mSnippet <- firstUserSnippet paths (smId meta)
-  let snippetLower = maybe "" T.toCaseFold mSnippet
-      snippetMatch = qLower `T.isInfixOf` snippetLower
-  if descMatch || snippetMatch
-    then pure (meta, Just (fromMaybe (fromMaybe "(no description)" (smDescription meta)) mSnippet))
-    else pure (meta, Nothing)
-
--- | Extract the first user message's text from a session's
--- @conversation.jsonl@. Returns 'Nothing' when the session has no
--- conversation or no user message with text content.
-firstUserSnippet :: SealPaths -> SessionId -> IO (Maybe Text)
-firstUserSnippet paths sid = do
-  let convPath = sessionConversationPath paths sid
-  exists <- doesFileExist convPath
-  if not exists
-    then pure Nothing
-    else do
-      raw <- readFileTextStrict convPath
-      let msgs = mapMaybe decodeMsg (T.lines raw)
-      pure (snippetFromMessages msgs)
-
--- | Extract the first user message's text from a list of messages.
-snippetFromMessages :: [Message] -> Maybe Text
-snippetFromMessages msgs =
-  case filter (\m -> msgRole m == User) msgs of
-    (m : _) -> case [t | CbText t <- msgContent m] of
-      (t : _) -> Just (truncateSnippet 120 t)
-      []      -> Nothing
-    [] -> Nothing
-
--- | Truncate a snippet to at most @n@ characters, appending an ellipsis.
-truncateSnippet :: Int -> Text -> Text
-truncateSnippet n t
-  | T.length t <= n = t
-  | otherwise       = T.take n t <> "…"
-
 -- | Read all messages from a session's @conversation.jsonl@. Returns @[]@
 -- when the session has no conversation file.
 readSessionMessages :: SealPaths -> SessionId -> IO [Message]
