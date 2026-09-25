@@ -5,12 +5,15 @@
 -- @done@ response. This lets tests script multi-turn tool-call round-trips
 -- (e.g. @CbToolUse FILE_WRITE@ → @CbToolResult@ → @CbText "done"@) without
 -- a real LLM or API key.
+--
+-- The pop is via 'atomicModifyIORef'' so concurrent children sharing the
+-- same 'ScriptProvider' ref (e.g. batch-spawned subagents with
+-- @atoChildProvider = True@) don't lose responses to a read/write race.
 module Seal.TestHelpers.ScriptProvider
   ( ScriptProvider (..)
   ) where
 
-import Data.IORef (IORef, readIORef, writeIORef)
-import Test.Hspec () -- no-op; keeps hspec available for downstream
+import Data.IORef (IORef, atomicModifyIORef')
 
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
@@ -23,8 +26,11 @@ import Seal.Providers.Class
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
 instance Provider ScriptProvider where
   complete (ScriptProvider ref) _ = do
-    responses <- readIORef ref
-    case responses of
-      (r : rest) -> writeIORef ref rest >> pure (Right r)
-      []         -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+    let pop rs = case rs of
+          (r : rest) -> (rest, Just r)
+          []         -> ([], Nothing)
+    mResp <- atomicModifyIORef' ref pop
+    case mResp of
+      Just r  -> pure (Right r)
+      Nothing -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])

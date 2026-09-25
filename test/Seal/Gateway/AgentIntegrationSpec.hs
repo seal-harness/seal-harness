@@ -29,6 +29,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (toList)
 import Data.Maybe (mapMaybe)
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Stack (HasCallStack)
@@ -60,6 +61,7 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   orchestrationGroupSpec
   w3CatalogSpec
   w2GateSpec
+  concurrentSubagentSpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -501,6 +503,163 @@ crossGroupSpec = describe "cross-group sequencing" $ do
       length defListResults `shouldBe` 2
       countOf (firstResult defListResults) `shouldBe` countOf (defListResults !! 1)
       idsOf (firstResult defListResults) `shouldBe` idsOf (defListResults !! 1)
+
+-- ---------------------------------------------------------------------------
+-- Concurrent subagent group — batch AGENT_START with real concurrent
+-- children. Uses 'runOrchestrationTest' (atoChildProvider = True,
+-- stub threshold = 2) so depth-1 children run REAL scripted turns,
+-- popping from the shared ScriptProvider queue. The ScriptProvider's
+-- atomicModifyIORef' pop ensures concurrent access is race-free.
+-- ---------------------------------------------------------------------------
+
+concurrentSubagentSpec :: Spec
+concurrentSubagentSpec = describe "concurrent subagent (batch AGENT_START, real child turns)" $ do
+
+  -- #C1: Batch-spawn 3 children. Each child pops a "done" response from
+  -- the shared script queue and completes immediately. Verifies the
+  -- AGENT_START result contains 3 completed children with summaries.
+  describe "#C1 Batch spawn 3 children — all run real turns, all complete with summaries" $
+    runOrchestrationTest Nothing $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write the worker def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsFor "a-worker" "Worker") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: batch-spawn 3 children. The dispatch forks 3
+          -- threads; each child pops one "done" response concurrently.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_START")
+                (A.object ["tasks" .=
+                  [ A.object ["id" .= ("a-worker" :: Text), "goal" .= ("work 1" :: Text)]
+                  , A.object ["id" .= ("a-worker" :: Text), "goal" .= ("work 2" :: Text)]
+                  , A.object ["id" .= ("a-worker" :: Text), "goal" .= ("work 3" :: Text)]
+                  ]])]
+            StopToolUse (Usage 0 0)
+        , -- (popped by CHILD 1) done.
+          doneTurn
+        , -- (popped by CHILD 2) done.
+          doneTurn
+        , -- (popped by CHILD 3) done.
+          doneTurn
+        , -- Parent resumes: check instances.
+          toolUseTurn "p3" (OpName "AGENT_INSTANCES") (A.object [])
+        , doneTurn
+        ]
+      _ <- sendMsgToSession env sid "batch spawn 3"
+      entries <- getTranscript env sid
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldBe` 1
+      let startText = textOf (firstResult startResults)
+      -- 3 result lines (one per child), all CsCompleted, all with "done" summary
+      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls == 3)
+      startText `shouldSatisfy` ("CsCompleted" `T.isInfixOf`)
+      startText `shouldSatisfy` ("done" `T.isInfixOf`)
+      -- No errors
+      isErrorOf (firstResult startResults) `shouldBe` False
+      -- AGENT_INSTANCES shows the children
+      let instResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
+      length instResults `shouldBe` 1
+      countOf (firstResult instResults) `shouldSatisfy` (>= 3)
+
+  -- #C2: Batch-spawn 3 children that each run SHELL_EXEC "sleep 0.2".
+  -- If the children run concurrently (as they should), total wall time
+  -- is ~0.2s. If they were serialized, it would be ~0.6s. The threshold
+  -- of 0.5s distinguishes the two (with generous slack for CI overhead).
+  describe "#C2 Batch spawn 3 children with SHELL_EXEC sleep — concurrent timing" $
+    runOrchestrationTest Nothing $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write the worker def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsFor "a-worker" "Worker") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: batch-spawn 3 children.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_START")
+                (A.object ["tasks" .=
+                  [ A.object ["id" .= ("a-worker" :: Text), "goal" .= ("sleep work 1" :: Text)]
+                  , A.object ["id" .= ("a-worker" :: Text), "goal" .= ("sleep work 2" :: Text)]
+                  , A.object ["id" .= ("a-worker" :: Text), "goal" .= ("sleep work 3" :: Text)]
+                  ]])]
+            StopToolUse (Usage 0 0)
+        , -- (popped by CHILD 1) SHELL_EXEC sleep 0.2
+          toolUseTurn "c1a" (OpName "SHELL_EXEC")
+            (A.object ["command" .= ("sleep 0.2" :: Text)])
+        , -- (popped by CHILD 2) SHELL_EXEC sleep 0.2
+          toolUseTurn "c2a" (OpName "SHELL_EXEC")
+            (A.object ["command" .= ("sleep 0.2" :: Text)])
+        , -- (popped by CHILD 3) SHELL_EXEC sleep 0.2
+          toolUseTurn "c3a" (OpName "SHELL_EXEC")
+            (A.object ["command" .= ("sleep 0.2" :: Text)])
+        , -- (popped by CHILD 1 after sleep) done.
+          doneTurn
+        , -- (popped by CHILD 2 after sleep) done.
+          doneTurn
+        , -- (popped by CHILD 3 after sleep) done.
+          doneTurn
+        , -- Parent resumes: done.
+          doneTurn
+        ]
+      start <- getCurrentTime
+      -- Use sendMsgToSessionRaw + waitForTranscript (not
+      -- sendMsgToSession): waitForTurnComplete polls for stable entry
+      -- count, but the children's 0.2s sleep causes a false stable
+      -- reading before the turn is actually done. waitForTranscript
+      -- polls for a predicate at 10ms intervals, correctly waiting for
+      -- the AGENT_START result to appear.
+      _ <- sendMsgToSessionRaw env sid "batch spawn 3 with sleep"
+      entries <- waitForTranscript env sid
+        (not . null . filterAgentResults (OpName "AGENT_START"))
+      end <- getCurrentTime
+      let elapsed = realToFrac (end `diffUTCTime` start) :: Double
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldBe` 1
+      let startText = textOf (firstResult startResults)
+      -- 3 result lines, all CsCompleted
+      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls == 3)
+      startText `shouldSatisfy` ("CsCompleted" `T.isInfixOf`)
+      isErrorOf (firstResult startResults) `shouldBe` False
+      -- Timing: concurrent (3 × 0.2s parallel = ~0.2s + polling overhead)
+      -- vs serial (3 × 0.2s = ~0.6s). The 0.5s threshold separates them
+      -- with generous slack for CI scheduling and the 50ms polling
+      -- with generous slack for CI scheduling and the 10ms polling
+      -- interval in waitForTranscript.
+      elapsed `shouldSatisfy` (< 0.500)
+
+  -- #C3: Single (non-batch) AGENT_START — one child runs a real turn.
+  -- Verifies the single-task path works through the gateway with the
+  -- real worker (not the stub).
+  describe "#C3 Single spawn — one child runs a real turn, completes with summary" $
+    runOrchestrationTest Nothing $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write the def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsFor "a-worker" "Worker") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: single spawn.
+          toolUseTurn "p2" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-worker" :: Text), "goal" .= ("do the thing" :: Text)])
+        , -- (popped by the CHILD) done.
+          doneTurn
+        , -- Parent resumes: done.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "single spawn"
+      entries <- getTranscript env sid
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldBe` 1
+      let startText = textOf (firstResult startResults)
+      -- 1 result line, CsCompleted, with "done" summary (not the stub's
+      -- "child done" — the real worker's summary from the scripted turn).
+      startText `shouldSatisfy` ("CsCompleted" `T.isInfixOf`)
+      startText `shouldSatisfy` ("done" `T.isInfixOf`)
+      startText `shouldNotSatisfy` ("(no summary)" `T.isInfixOf`)
+      isErrorOf (firstResult startResults) `shouldBe` False
 
 -- ---------------------------------------------------------------------------
 -- Test runners
