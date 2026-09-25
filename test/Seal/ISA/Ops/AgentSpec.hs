@@ -637,8 +637,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       let cfg = defaultDelegationConfig
           callback = putMVar resultMVar
           resolver _task = pure (Right ( undefined
-                                        , recordingWorker ran
-                                        , mkSystemSessionId "child"))
+                                        , recordingWorker ran))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
@@ -660,8 +659,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       let cfg = defaultDelegationConfig
           callback = putMVar resultMVar
           resolver _task = pure (Right ( undefined
-                                        , recordingWorker ran
-                                        , mkSystemSessionId "child"))
+                                        , recordingWorker ran))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
@@ -688,7 +686,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           callback = putMVar resultMVar
           crashingWorker :: Del.AgentWorkerBuilder
           crashingWorker _ _ _ _ = ioError (userError "boom")
-          resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
+          resolver _task = pure (Right (undefined, crashingWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
@@ -706,7 +704,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           slowWorker _ _ _ _ = do
             threadDelay 31000000  -- 31s, just over the 30s timeout
             pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
-          resolver _task = pure (Right (undefined, slowWorker, mkSystemSessionId "child"))
+          resolver _task = pure (Right (undefined, slowWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
@@ -720,7 +718,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           callback = const (pure ())
           dummyWorker :: Del.AgentWorkerBuilder
           dummyWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
-          resolver _task = pure (Right (undefined, dummyWorker, mkSystemSessionId "child"))
+          resolver _task = pure (Right (undefined, dummyWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
@@ -737,7 +735,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
           tasks = [mkTask i | i <- [1..5 :: Int]]
           input = DiBatch tasks
-          resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState, mkSystemSessionId "child"))
+          resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState))
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       -- Wait a bit for all workers to finish
       threadDelay 500000  -- 500ms

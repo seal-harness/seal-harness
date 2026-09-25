@@ -86,6 +86,7 @@ import Seal.Agent.Runtime.Registry
   , registerCompletedAgentResult, registerRunningAgent, stopAgent )
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
+import Seal.Handles.Transcript (appendCompletionToSidecar)
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -566,19 +567,20 @@ parseTask v =
         Just goal | T.null goal -> pure (Left "Each task requires a non-empty 'goal'.")
                  | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir"))))
 
--- | Resolve a task to its def + worker + fresh session id. Returns Left if
--- the def id is invalid, the def doesn't exist, or the effective-role /
--- kill-switch gate rejects the spawn.
+-- | Resolve a task to its def + worker. Returns Left if the def id is
+-- invalid, the def doesn't exist, or the effective-role / kill-switch gate
+-- rejects the spawn. The session id is NOT minted here — 'spawnOne' in
+-- 'runDelegateAsync' mints the session before calling the resolver,
+-- eliminating the double-mint that doubled the collision surface.
 resolveTask
   :: AgentDefBackend
   -> AgentRuntime
-  -> IO SessionId
   -> Int
   -> Bool
   -> AgentWorkerBuilder
   -> ChildTask
-  -> IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId))
-resolveTask defBackend _runtime mintSession _parentDepth orchEnabled worker task = do
+  -> IO (Either Text (AgentDef, AgentWorkerBuilder))
+resolveTask defBackend _runtime _parentDepth orchEnabled worker task = do
   case mkAgentDefId (ctDefId task) of
     Left err -> pure (Left err)
     Right aid -> do
@@ -589,9 +591,7 @@ resolveTask defBackend _runtime mintSession _parentDepth orchEnabled worker task
           let role = effectiveRole (adRole def) (ctRole task)
           if role == Just "orchestrator" && not orchEnabled
             then pure (Left killSwitchMsg)
-            else do
-              sid <- mintSession
-              pure (Right (def, worker, sid))
+            else pure (Right (def, worker))
 
 -- | The dedicated kill-switch error. Distinct from the depth/leaf/pause
 -- messages so the parent transcript distinguishes all spawn-failure causes.
@@ -684,17 +684,19 @@ handleStart wiring v = do
       cfg <- liftIO (aswConfig wiring)
       let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           runtime = aswRuntime wiring
+          parentSid = aswParentSession wiring
+          paths = aswPaths wiring
           callback :: AgentCompletionCallback
           callback result = do
             registerCompletedAgentResult runtime (crSubagentId result) result
-            -- TODO: append completion message to parent's conversation.jsonl.
-            -- Disabled for now: the direct O_APPEND write conflicts with the
-            -- single-writer daemon's in-memory diff state (tfsWritten),
-            -- corrupting the transcript. A proper fix requires either:
-            -- (a) a queue drained by the turn engine, or
-            -- (b) writing to a sidecar file that the next turn reads.
-            -- The completion result IS stored in the registry via
-            -- registerCompletedAgentResult, so AGENT_STATUS works.
+            -- Append the completion message to a sidecar file. The turn
+            -- engine reads this file at the start of the parent's next turn
+            -- and injects the messages into the conversation. This avoids
+            -- interfering with the single-writer daemon's in-memory diff
+            -- state (tfsWritten) during the ongoing turn — writing directly
+            -- to conversation.jsonl while the daemon is active causes the
+            -- daemon's diff to desynchronize, corrupting the transcript.
+            appendCompletionToSidecar paths parentSid (completionMessage result)
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =
             registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)
@@ -706,7 +708,6 @@ handleStart wiring v = do
                                di
                                (resolveTask (aswDefBackend wiring)
                                             runtime
-                                            (aswMintSession wiring)
                                             (aswParentDepth wiring)
                                             orchEnabled
                                             (aswWorker wiring))
@@ -1036,3 +1037,27 @@ toJSONSpawnInfo si = object
   , "child_session" .= sessionIdText (siChildSession si)
   , "status"        .= ("running" :: Text)
   ]
+
+-- | Build the user-role harness message appended to the parent's
+-- @conversation.jsonl@ when a child completes. The parent's next turn sees
+-- this as a user message, so the model learns the child finished without
+-- polling 'AGENT_STATUS'. The message is secret-free (only the summary,
+-- status, child session, and exit reason — never @crParts@).
+completionMessage :: ChildResult -> Text
+completionMessage r =
+  let sid = subagentIdText (crSubagentId r)
+      status = T.pack (show (crStatus r))
+      mSummary = crSummary r
+      mChildSession = sessionIdText <$> crChildSession r
+      exitReason = T.pack (show (crExitReason r))
+      header = "[subagent " <> sid <> " completed] status=" <> status
+                 <> " exit=" <> exitReason
+      sessionLine = case mChildSession of
+        Just cs -> " child_session=" <> cs
+        Nothing -> ""
+      summaryLine = case mSummary of
+        Just s  -> "\n" <> s
+        Nothing -> case crError r of
+          Just e  -> "\nerror: " <> e
+          Nothing -> ""
+  in header <> sessionLine <> summaryLine

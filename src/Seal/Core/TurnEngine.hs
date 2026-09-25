@@ -45,6 +45,7 @@ import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
+import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
@@ -84,8 +85,9 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
   ( TwoFileHandle, withTwoFileTranscript, tfwSetSecretOps, tfwReadEntries
-  , tfwRecordAndAck, TwoFileWrite (..) )
-import Seal.Harness.Id (newHarnessId)
+  , tfwRecordAndAck, tfwRecordAsync, tfwReadConversation, TwoFileWrite (..)
+  , readAndClearCompletions )
+import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.ISA.Dispatch
@@ -680,6 +682,31 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               })
             { aeMessageSource = mSrc }
+  -- Inject subagent completion messages from the sidecar file. These are
+  -- user-role harness messages appended by forked child threads when
+  -- subagents complete. We write them through the daemon (via
+  -- tfwRecordAsync) so tfsWritten is updated correctly, then runTurn reads
+  -- the updated conversation from tfwReadConversation.
+  completions <- readAndClearCompletions paths sid
+  unless (null completions) $ do
+    prior <- tfwReadConversation tHandle
+    now <- getCurrentTime
+    hid <- newHarnessId
+    let fullMsgs = prior <> completions
+        entry = EntryRecord
+          { erId = harnessIdToText hid
+          , erTimestamp = now
+          , erKind = EKHarness
+          , erConvLen = length fullMsgs
+          , erEnvelope = Nothing
+          , erUsage = Nothing
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Just "subagent-completion"
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+    tfwRecordAsync tHandle (TwoFileWrite fullMsgs entry)
   eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
   case eResult of
@@ -998,13 +1025,34 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
--- @*MintSession@ helpers). Each start gets its own timestamped id.
+-- @*MintSession@ helpers). Each start gets its own timestamped id with a
+-- 4-hex-char random suffix so concurrent calls within the same millisecond
+-- produce distinct session ids (without the suffix, a batch of N children
+-- forked in the same ms all share one session id — their transcripts collide
+-- and their turns interleave, which is the bug observed in session
+-- 20260924-210820-422).
 mintSession :: SessionId -> IO SessionId
 mintSession fallback = do
   now <- getCurrentTime
-  case mkSessionId (formatSessionId now) of
+  suffix <- randomRIO (0 :: Int, 0xFFFF)
+  let sidText = formatSessionId now <> "-" <> hexSuffix4 suffix
+  case mkSessionId sidText of
     Right s  -> pure s
     Left _e  -> pure fallback
+
+-- | Show an 'Int' as 4-char zero-padded lowercase hex.
+hexSuffix4 :: Int -> Text
+hexSuffix4 n = T.justifyRight 4 '0' (T.pack (go n))
+  where
+    go x
+      | x <= 0    = "0"
+      | otherwise = loop x ""
+    loop y acc
+      | y == 0    = acc
+      | otherwise = let (q, r) = y `divMod` 16
+                        c = if r < 10 then toEnum (r + fromEnum '0')
+                                      else toEnum (r - 10 + fromEnum 'a')
+                    in loop q (c : acc)
 
 -- | The unified AGENT_START worker-builder (design §5.3 — replaces
 -- @webMkWorker@, @channelMkWorker@, @cliMkWorker@). Resolves the def's

@@ -636,12 +636,10 @@ runDelegateAsync
   -> Int
      -- ^ the parent's current delegation depth (0 = top-level parent)
   -> DelegateInput
-  -> (ChildTask -> IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId)))
-     -- ^ resolver: look up the def, build the worker, mint a fresh child
-     -- 'SessionId'. 'Left' = def not found / invalid / depth exceeded.
-     -- The session id returned by the resolver is REPLACED by the
-     -- pre-minted session from the 'mintSession' parameter (so 'SpawnInfo'
-     -- and the worker use the same session).
+  -> (ChildTask -> IO (Either Text (AgentDef, AgentWorkerBuilder)))
+     -- ^ resolver: look up the def, build the worker. 'Left' = def not
+     -- found / invalid / depth exceeded. The session id is NOT minted by
+     -- the resolver — 'spawnOne' mints the session before calling it.
   -> AgentCompletionCallback
      -- ^ completion callback (called from forked child threads)
   -> SpawnCallback
@@ -687,35 +685,45 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
 
     -- Spawn one child: resolve synchronously, register via spawnCallback,
     -- then fork the worker execution. Returns SpawnInfo immediately.
+    -- The session is minted INSIDE the semaphore (when present) so that
+    -- concurrent spawns don't mint in the same microsecond — the random
+    -- suffix in 'mintSession' makes collisions vanishingly unlikely, but
+    -- serializing the mint through the semaphore is a belt-and-suspenders
+    -- guarantee.
     spawnOne :: Int -> ChildTask -> Double -> Maybe (TVar Int) -> IO SpawnInfo
     spawnOne idx task childTimeout mSem = do
       subagentId <- mkSubagentId (ctDefId task)
-      childSid <- mintSession
       let micros = round (childTimeout * 1000000) :: Int
-      start <- getCurrentTime
-      traceRef     <- newIORef []
-      readRef     <- newIORef []
-      writtenRef  <- newIORef []
-      interruptedRef <- newIORef False
-      let hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef
-      mResolve <- resolveTask task
-      case mResolve of
-        Left err -> do
-          -- Resolve error: fork the error callback (async).
-          end <- getCurrentTime
-          let dur = realToFrac (end `diffUTCTime` start) :: Double
-              result = mkErrorResult idx subagentId dur err Nothing
-          void (forkIO (callback result))
-        Right (def, worker, _resolverSid) -> do
-          -- Register the child synchronously (before forking the worker).
-          spawnCallback subagentId def childSid
-          -- Fork the worker execution (async).
-          void (forkIO $ do
-            case mSem of
-              Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
-              Just sem -> bracketSem sem $
-                runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks)
-      pure (SpawnInfo subagentId childSid idx)
+          mkChild :: IO SpawnInfo
+          mkChild = do
+            childSid <- mintSession
+            start <- getCurrentTime
+            traceRef     <- newIORef []
+            readRef     <- newIORef []
+            writtenRef  <- newIORef []
+            interruptedRef <- newIORef False
+            let hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef
+            mResolve <- resolveTask task
+            case mResolve of
+              Left err -> do
+                -- Resolve error: fork the error callback (async).
+                end <- getCurrentTime
+                let dur = realToFrac (end `diffUTCTime` start) :: Double
+                    result = mkErrorResult idx subagentId dur err Nothing
+                void (forkIO (callback result))
+              Right (def, worker) -> do
+                -- Register the child synchronously (before forking the worker).
+                spawnCallback subagentId def childSid
+                -- Fork the worker execution (async).
+                void (forkIO $ do
+                  case mSem of
+                    Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
+                    Just sem -> bracketSem sem $
+                      runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks)
+            pure (SpawnInfo subagentId childSid idx)
+      case mSem of
+        Nothing -> mkChild
+        Just sem -> bracketSem sem mkChild
 
     -- Run the worker to completion (called from a forked thread).
     runWorker :: Int -> ChildTask -> Double -> SubagentId -> SessionId -> Int
