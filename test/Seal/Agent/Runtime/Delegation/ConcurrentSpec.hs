@@ -118,11 +118,11 @@ safeHead []    = error "safeHead: empty list (caller should have asserted length
 
 -- | Build a batch of N identical tasks with the given goal.
 mkBatch :: Int -> Text -> DelegateInput
-mkBatch n goal = DiBatch [ ChildTask "test-def" goal Nothing Nothing | _ <- [1..n] ]
+mkBatch n goal = DiBatch [ ChildTask "test-def" goal Nothing Nothing False | _ <- [1..n] ]
 
 -- | Build a batch of tasks with distinct goals (for variable-delay tests).
 mkVariableBatch :: [Text] -> DelegateInput
-mkVariableBatch goals = DiBatch [ ChildTask "test-def" g Nothing Nothing | g <- goals ]
+mkVariableBatch goals = DiBatch [ ChildTask "test-def" g Nothing Nothing False | g <- goals ]
 
 -- | Run 'runDelegate' with default config (no concurrency cap override) and
 -- the given input + worker. Returns the results.
@@ -328,7 +328,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Concurrent" $ do
   ------------------------------------------------------------------
   describe "single-task — no thread pool, synchronous result" $ do
     it "returns 1 result with CsCompleted" $ do
-      let input = DiSingle (ChildTask "test-def" "solo work" Nothing Nothing)
+      let input = DiSingle (ChildTask "test-def" "solo work" Nothing Nothing False)
       eResults <- runWith input (delayedWorker 50)
       case eResults of
         Left err -> expectationFailure ("expected Right, got Left: " <> T.unpack err)
@@ -357,7 +357,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Concurrent" $ do
       pauseFlag <- newSpawnPauseFlag
       _ <- setSpawnPaused pauseFlag True
       resolver <- mkResolver (delayedWorker 10)
-      let input = DiSingle (ChildTask "test-def" "work" Nothing Nothing)
+      let input = DiSingle (ChildTask "test-def" "work" Nothing Nothing False)
       eResults <- runDelegate defaultDelegationConfig pauseFlag Nothing 0 input resolver
       case eResults of
         Left err -> err `shouldSatisfy` ("paused" `T.isInfixOf`)

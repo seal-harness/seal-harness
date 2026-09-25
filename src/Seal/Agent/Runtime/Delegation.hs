@@ -81,7 +81,7 @@ module Seal.Agent.Runtime.Delegation
   , touchParentActivity
   ) where
 
-import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent (forkIO, killThread, threadDelay, ThreadId)
 import Control.Concurrent.STM
   ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar
   , modifyTVar', retry )
@@ -465,12 +465,13 @@ data SpawnInfo = SpawnInfo
 -- 'ChildResult' to the parent's transcript and updating the registry.
 type AgentCompletionCallback = ChildResult -> IO ()
 
--- | The callback called from a forked child thread AFTER resolve success
--- but BEFORE the worker runs. The opcode layer uses this to register the
--- child in the 'AgentRuntime' (so 'AGENT_INSTANCES' lists it while
--- running). Receives the 'SubagentId', the resolved 'AgentDef', and the
--- pre-minted 'SessionId'.
-type SpawnCallback = SubagentId -> AgentDef -> SessionId -> IO ()
+-- | The callback called from the parent thread AFTER the child worker
+-- thread is forked. The opcode layer uses this to register the child in
+-- the 'AgentRuntime' (so 'AGENT_INSTANCES' lists it while running, and
+-- 'AGENT_STOP' can kill the correct thread). Receives the 'SubagentId',
+-- the resolved 'AgentDef', the pre-minted 'SessionId', and the child's
+-- forked 'ThreadId'.
+type SpawnCallback = SubagentId -> AgentDef -> SessionId -> ThreadId -> IO ()
 
 -- | The top-level delegation runner. Spawns one or more child agents, runs
 -- each against its goal to completion (synchronously), and returns a
@@ -712,14 +713,15 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
                     result = mkErrorResult idx subagentId dur err Nothing
                 void (forkIO (callback result))
               Right (def, worker) -> do
-                -- Register the child synchronously (before forking the worker).
-                spawnCallback subagentId def childSid
-                -- Fork the worker execution (async).
-                void (forkIO $ do
+                -- Fork the worker execution (async), then register the
+                -- child with the forked ThreadId so AGENT_STOP can kill
+                -- the correct thread (not the parent's).
+                childTid <- forkIO $ do
                   case mSem of
                     Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
                     Just sem -> bracketSem sem $
-                      runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks)
+                      runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
+                spawnCallback subagentId def childSid childTid
             pure (SpawnInfo subagentId childSid idx)
       case mSem of
         Nothing -> mkChild

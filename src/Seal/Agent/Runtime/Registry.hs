@@ -111,13 +111,12 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
 -- | Register a running agent instance WITHOUT forking a worker thread.
 -- Used by 'runDelegateAsync' which forks its own threads (via 'forkIO')
 -- and needs the instance in the registry at spawn time so 'AGENT_INSTANCES'
--- lists it while running. The 'ThreadId' is the calling thread's (the
--- parent's) — 'stopAgent' will kill it (a no-op if the child has already
--- finished). Idempotent: re-registering overwrites.
+-- lists it while running. The 'ThreadId' is the CHILD's forked thread id
+-- (passed in by 'spawnOne' after the fork) so 'stopAgent' can kill the
+-- correct thread. Idempotent: re-registering overwrites.
 registerRunningAgent
-  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> IO ()
-registerRunningAgent (AgentRuntime tv) aid subagentId session depth = do
-  tid <- myThreadId
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> ThreadId -> IO ()
+registerRunningAgent (AgentRuntime tv) aid subagentId session depth tid =
   atomically $ do
     let inst = AgentInstance aid subagentId session Running tid depth Nothing
     modifyTVar' tv (Map.insert subagentId inst)
