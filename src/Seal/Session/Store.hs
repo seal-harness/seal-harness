@@ -11,6 +11,7 @@ module Seal.Session.Store
   , saveSessionMeta
   , listSessions
   , listArchivedSessions
+  , listChildSessions
   , updateSessionArchived
   , defaultSessionSelection
   , resolveDefaultAgent
@@ -157,6 +158,38 @@ listArchivedSessions paths = do
         archived <- doesFileExist marker
         if not ok || not archived then pure Nothing else decodeFileStrict mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
+
+-- | Enumerate all child (sub-agent) sessions across every parent session:
+-- @sessions\/\<parent\>\/agents\/\<child\>@. Returns @[(parentSid, childSid)]@
+-- for each @agents\/@ subdir whose name parses as a 'SessionId'. Parent dirs
+-- without an @agents\/@ subdir are skipped. Order is unspecified (callers
+-- sort as needed). A corrupt/invalid child dir name is silently skipped.
+listChildSessions :: SealPaths -> IO [(SessionId, SessionId)]
+listChildSessions paths = do
+  let root = sessionsRoot paths
+  exists <- doesDirectoryExist root
+  if not exists
+    then pure []
+    else do
+      entries <- listDirectory root
+      dirs <- filterM (doesDirectoryExist . (root </>)) entries
+      children <- forM dirs $ \e -> do
+        case mkSessionId (T.pack e) of
+          Left _ -> pure []
+          Right parentSid -> do
+            let agentsDir = root </> e </> "agents"
+            agentsOk <- doesDirectoryExist agentsDir
+            if not agentsOk
+              then pure []
+              else do
+                childEntries <- listDirectory agentsDir
+                childDirs <- filterM (doesDirectoryExist . (agentsDir </>)) childEntries
+                pure
+                  [ (parentSid, childSid)
+                  | ce <- childDirs
+                  , Right childSid <- [mkSessionId (T.pack ce)]
+                  ]
+      pure (concat children)
 
 -- | Set or clear the archived flag on a session by creating/removing the
 -- @archived@ marker file. Returns 'False' when the session's @session.json@

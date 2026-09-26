@@ -11,8 +11,9 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir)
-import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Config.Paths
+  ( SealPaths (..), agentSessionDir, sessionConversationPath, sessionDir )
+import Seal.Core.Types (SessionId, mkSessionId, sessionIdText)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Session
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
@@ -24,6 +25,8 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Logging.Logger (testSealLogger)
+
+import Data.Either (fromRight)
 
 runTestApp :: App a -> IO a
 runTestApp act = do
@@ -55,6 +58,20 @@ userMsg t = TE.decodeUtf8 (encodeConvLine (ConvLine (Message User [CbText t])))
 -- | An assistant message JSON line (proper encoding via encodeConvLine).
 assistantMsg :: Text -> Text
 assistantMsg t = TE.decodeUtf8 (encodeConvLine (ConvLine (Message Assistant [CbText t])))
+
+-- | Mint a fixed, valid SessionId from a literal text (for tests that need
+-- deterministic child ids without going through 'newSession').
+fixedSessionId :: Text -> SessionId
+fixedSessionId t = fromRight (error "invalid fixed session id") (mkSessionId t)
+
+-- | Write a conversation.jsonl into a child (sub-agent) transcript dir
+-- nested under a parent session: @sessions\/\<parent\>\/agents\/\<child\>@.
+seedChildConversation :: SealPaths -> SessionId -> SessionId -> [Text] -> IO ()
+seedChildConversation paths parentSid childSid msgLines = do
+  let dir = agentSessionDir paths parentSid childSid
+  createDirectoryIfMissing True dir
+  writeFile (dir </> "conversation.jsonl") $
+    T.unpack (T.intercalate "\n" msgLines <> "\n")
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Session" $ do
@@ -394,3 +411,83 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("frobnicate" :: Text)])
           `shouldBe` Left "unknown session action: frobnicate"
+
+  -- -----------------------------------------------------------------------
+  -- Child (sub-agent) session visibility
+  -- -----------------------------------------------------------------------
+  describe "child session visibility" $ do
+    it "SESSION_GET returns the child's messages for a child session id" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-001"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ userMsg "child hello world"
+          , assistantMsg "child response"
+          ]
+        let op = sessionGetOp paths
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText childSid]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "child hello world" t `shouldBe` True
+            T.isInfixOf "child response" t `shouldBe` True
+            T.isInfixOf "child session of" t `shouldBe` True
+            T.isInfixOf (sessionIdText (smId parentMeta)) t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "SESSION_SEARCH finds child transcript content" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-002"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ userMsg "debug the subagent grpc pool"
+          ]
+        let op = sessionSearchOp paths inMemorySessionSearchBackend
+        r <- runTestApp (opRun op localBackend
+          (object ["query" .= ("grpc" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "grpc" t `shouldBe` True
+            T.isInfixOf "child of" t `shouldBe` True
+            T.isInfixOf (sessionIdText (smId parentMeta)) t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "SESSION_LIST with include_children=true shows the child with attribution" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-003"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ userMsg "child work"
+          ]
+        let op = sessionListOp paths
+        r <- runTestApp (opRun op localBackend
+          (object ["include_children" .= True]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "child of" t `shouldBe` True
+            T.isInfixOf (sessionIdText childSid) t `shouldBe` True
+            T.isInfixOf (sessionIdText (smId parentMeta)) t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "SESSION_LIST without include_children omits child sessions" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-004"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ userMsg "child work"
+          ]
+        let op = sessionListOp paths
+        r <- runTestApp (opRun op localBackend (object []))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf (sessionIdText childSid) t `shouldBe` False
+            T.isInfixOf (sessionIdText (smId parentMeta)) t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"

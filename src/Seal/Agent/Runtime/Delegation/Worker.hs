@@ -145,12 +145,24 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdAppEnv       :: Env
     -- ^ The top-level app env (katip logging, config) — re-used for the
     -- child's 'runApp'.
-  , dwdMkUIOEnv :: SessionId -> IO UIOEnv
+  , dwdMkUIOEnv :: Maybe FilePath -> SessionId -> IO UIOEnv
     -- ^ Construct the child's 'UIOEnv' (carrying the 'UntrustedIO'
-    -- capability handle + Git 'CloneDeps') from the child's session id.
-    -- The wiring layer creates the child's workdir (per-session isolation)
-    -- and resolves the security config into the env. Called at child-start
-    -- time (after the child's sid is minted).
+    -- capability handle + Git 'CloneDeps') from an optional anchor
+    -- workdir + the child's session id. When the anchor is 'Just path'
+    -- (WU-4: the parent's workdir, @ctIsolateWorkdir = False@), the
+    -- child reuses that workdir so repo clones and plan files are
+    -- visible without re-cloning. When 'Nothing' (WU-4:
+    -- @ctIsolateWorkdir = True@), the child gets a fresh empty workdir
+    -- at @cache/workdirs/<child-session>@. The wiring layer resolves
+    -- the security config into the env. Called at child-start time
+    -- (after the child's sid is minted).
+  , dwdParentWorkdir :: Maybe FilePath
+    -- ^ The parent's workdir (WU-4). 'Just' the parent's
+    -- @sessionWorkdir paths parentSid@ in production wiring; 'Nothing'
+    -- in tests that don't exercise anchoring. Used by
+    -- 'mkDelegateWorker' to compute the anchor: when the task's
+    -- 'ctIsolateWorkdir' is 'False', the child inherits this workdir;
+    -- when 'True', the child is isolated (anchor = 'Nothing').
   , dwdAutonomy     :: AutonomyLevel
   , dwdApprovals    :: ApprovalCache
   , dwdOnDemand     :: Bool
@@ -243,7 +255,8 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         childReg <- dwdChildRegistry deps agentDef childDepth
                                      (effectiveRole (adRole agentDef) (ctRole task))
                                      childSid capturingCaps
-        childUioEnv <- dwdMkUIOEnv deps childSid
+        let anchor = if ctIsolateWorkdir task then Nothing else dwdParentWorkdir deps
+        childUioEnv <- dwdMkUIOEnv deps anchor childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
         childAbortFlag <- dwdAbortFlag deps childSid
         -- Capture the final answer via 'aeOnStop': the loop's
