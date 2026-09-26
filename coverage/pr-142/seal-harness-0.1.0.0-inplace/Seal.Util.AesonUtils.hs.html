@@ -1,0 +1,206 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE FlexibleContexts #-}
+<span class="lineno">    2 </span>-- | Aeson encoding helpers shared across Seal's JSON serializations.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Vendored from @~/code/equitek/baldr/src/AesonUtils.hs@ (kept as a
+<span class="lineno">    5 </span>-- stand-alone utility so this repo has no cross-repo dependency). The
+<span class="lineno">    6 </span>-- original @lensy*@ helpers target the @\\_&lt;field&gt;@ (underscore-prefixed)
+<span class="lineno">    7 </span>-- lens convention; Seal's record fields use a leading-lowercase prefix
+<span class="lineno">    8 </span>-- instead (@teId@, @crModel@, @cbInputSchema@, @msgRole@, @uInput@, …),
+<span class="lineno">    9 </span>-- so the original helpers don't strip the prefix. The @stripPrefix*@
+<span class="lineno">   10 </span>-- family below handles that convention: drop the leading run of
+<span class="lineno">   11 </span>-- lowercase letters (the lens prefix) and lowercase the first remaining
+<span class="lineno">   12 </span>-- char, yielding @id@, @model@, @inputSchema@, @role@, @input@, …
+<span class="lineno">   13 </span>-- matching the camelCase keys the hand-written @EntryRecord@ /
+<span class="lineno">   14 </span>-- @EnvelopeDelta@ / @SessionMeta@ instances already use.
+<span class="lineno">   15 </span>module Seal.Util.AesonUtils
+<span class="lineno">   16 </span>  ( -- * Original lensy helpers (underscore-prefixed convention)
+<span class="lineno">   17 </span>    lensyLenToJSON
+<span class="lineno">   18 </span>  , lensyLenParseJSON
+<span class="lineno">   19 </span>  , lensyLenOptions
+<span class="lineno">   20 </span>  , lensySnakeToJSON
+<span class="lineno">   21 </span>  , lensySnakeParseJSON
+<span class="lineno">   22 </span>  , lensySnakeOptions
+<span class="lineno">   23 </span>  , lensyToJSON
+<span class="lineno">   24 </span>  , lensyParseJSON
+<span class="lineno">   25 </span>  , lensyOptions
+<span class="lineno">   26 </span>  , lensyKebabToJSON
+<span class="lineno">   27 </span>  , lensyKebabParseJSON
+<span class="lineno">   28 </span>  , lensyKebabOptions
+<span class="lineno">   29 </span>  , lensyFieldNameToNiceJson
+<span class="lineno">   30 </span>  , lensyFieldNameToSnakeJson
+<span class="lineno">   31 </span>  , lensyFieldNameToKebabJson
+<span class="lineno">   32 </span>  , lensyConstructorToNiceJson
+<span class="lineno">   33 </span>  , lensyLenConstructorToNiceJson
+<span class="lineno">   34 </span>    -- * Strip-leading-lowercase-prefix helpers (Seal's convention)
+<span class="lineno">   35 </span>  , stripPrefixToJSON
+<span class="lineno">   36 </span>  , stripPrefixParseJSON
+<span class="lineno">   37 </span>  , stripPrefixOptions
+<span class="lineno">   38 </span>  , stripLensPrefixCamel
+<span class="lineno">   39 </span>  ) where
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Data.Aeson
+<span class="lineno">   42 </span>import Data.Aeson.Types
+<span class="lineno">   43 </span>import Data.Char
+<span class="lineno">   44 </span>import GHC.Generics
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   47 </span>-- Minimal inline of the bits of @Text.Casing@ the @lensy*Snake@/@lensy*Kebab@
+<span class="lineno">   48 </span>-- helpers need. Vendored here so this module stays dependency-free (the
+<span class="lineno">   49 </span>-- @text-casing@ Hackage package isn't in the pinned haskell.nix index).
+<span class="lineno">   50 </span>-- @fromHumps@ splits @FooBarBaz@ / @fooBarBaz@ into @[Foo, Bar, Baz]@ /
+<span class="lineno">   51 </span>-- @[foo, Bar, Baz]@; @toQuietSnake@ joins with @_@ and lowercases;
+<span class="lineno">   52 </span>-- @toKebab@ joins with @-@ and lowercases.
+<span class="lineno">   53 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>fromHumps :: String -&gt; [String]
+<span class="lineno">   56 </span><span class="decl"><span class="nottickedoff">fromHumps = foldr go []</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="nottickedoff">go c []          = [[c]]</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="nottickedoff">go c (w:ws)</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="nottickedoff">| isUpper c    = [c] : w : ws</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="nottickedoff">| otherwise    = (c:w) : ws</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>toQuietSnake :: [String] -&gt; String
+<span class="lineno">   64 </span><span class="decl"><span class="nottickedoff">toQuietSnake = concatWith '_' . map (map toLower)</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="nottickedoff">where concatWith _ []       = &quot;&quot;</span>
+<span class="lineno">   66 </span><span class="spaces">        </span><span class="nottickedoff">concatWith sep (x:xs) = x &lt;&gt; foldr (\a acc -&gt; sep : a &lt;&gt; acc) &quot;&quot; xs</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>toKebab :: [String] -&gt; String
+<span class="lineno">   69 </span><span class="decl"><span class="nottickedoff">toKebab = concatWith '-' . map (map toLower)</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="nottickedoff">where concatWith _ []       = &quot;&quot;</span>
+<span class="lineno">   71 </span><span class="spaces">        </span><span class="nottickedoff">concatWith sep (x:xs) = x &lt;&gt; foldr (\a acc -&gt; sep : a &lt;&gt; acc) &quot;&quot; xs</span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>lensyLenToJSON
+<span class="lineno">   74 </span>  :: (Generic a, GToJSON Zero (Rep a)) =&gt; Int -&gt; a -&gt; Value
+<span class="lineno">   75 </span><span class="decl"><span class="nottickedoff">lensyLenToJSON n = genericToJSON (lensyLenOptions n)</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>lensyLenParseJSON
+<span class="lineno">   78 </span>  :: (Generic a, GFromJSON Zero (Rep a)) =&gt; Int -&gt; Value -&gt; Parser a
+<span class="lineno">   79 </span><span class="decl"><span class="nottickedoff">lensyLenParseJSON n = genericParseJSON (lensyLenOptions n)</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>lensyLenOptions :: Int -&gt; Options
+<span class="lineno">   82 </span><span class="decl"><span class="nottickedoff">lensyLenOptions n = defaultOptions { fieldLabelModifier = lensyLenConstructorToNiceJson n }</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>lensyLenConstructorToNiceJson :: Int -&gt; String -&gt; String
+<span class="lineno">   85 </span><span class="decl"><span class="nottickedoff">lensyLenConstructorToNiceJson n fieldName = firstToLower $ drop n fieldName</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="nottickedoff">firstToLower (c:cs) = toLower c : cs</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="nottickedoff">firstToLower _ = error $ &quot;lensyLenConstructorToNiceJson: bad arguments: &quot; &lt;&gt; show (n,fieldName)</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>lensySnakeToJSON
+<span class="lineno">   91 </span>  :: (Generic a, GToJSON Zero (Rep a)) =&gt; a -&gt; Value
+<span class="lineno">   92 </span><span class="decl"><span class="nottickedoff">lensySnakeToJSON = genericToJSON lensySnakeOptions</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>lensySnakeParseJSON
+<span class="lineno">   95 </span>  :: (Generic a, GFromJSON Zero (Rep a)) =&gt; Value -&gt; Parser a
+<span class="lineno">   96 </span><span class="decl"><span class="nottickedoff">lensySnakeParseJSON = genericParseJSON lensySnakeOptions</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>lensyToJSON
+<span class="lineno">   99 </span>  :: (Generic a, GToJSON Zero (Rep a)) =&gt; a -&gt; Value
+<span class="lineno">  100 </span><span class="decl"><span class="nottickedoff">lensyToJSON = genericToJSON lensyOptions</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>lensyParseJSON
+<span class="lineno">  103 </span>  :: (Generic a, GFromJSON Zero (Rep a)) =&gt; Value -&gt; Parser a
+<span class="lineno">  104 </span><span class="decl"><span class="nottickedoff">lensyParseJSON = genericParseJSON lensyOptions</span></span>
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>lensyOptions :: Options
+<span class="lineno">  107 </span><span class="decl"><span class="nottickedoff">lensyOptions = defaultOptions</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="nottickedoff">{ fieldLabelModifier = lensyFieldNameToNiceJson</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="nottickedoff">, constructorTagModifier = lensyConstructorToNiceJson</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>lensySnakeOptions :: Options
+<span class="lineno">  113 </span><span class="decl"><span class="nottickedoff">lensySnakeOptions = defaultOptions { fieldLabelModifier = lensyFieldNameToSnakeJson }</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>lensyFieldNameToNiceJson :: String -&gt; String
+<span class="lineno">  116 </span><span class="decl"><span class="nottickedoff">lensyFieldNameToNiceJson fieldName = dropWhile (=='_') $ dropWhile (/='_') $ dropWhile (=='_') fieldName</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>lensyFieldNameToSnakeJson :: String -&gt; String
+<span class="lineno">  119 </span><span class="decl"><span class="nottickedoff">lensyFieldNameToSnakeJson fieldName = toQuietSnake $ fromHumps $ dropWhile (=='_') $ dropWhile (/='_') $ dropWhile (=='_') fieldName</span></span>
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>lensyConstructorToNiceJson :: String -&gt; String
+<span class="lineno">  122 </span><span class="decl"><span class="nottickedoff">lensyConstructorToNiceJson constructorName = dropWhile (=='_') $ dropWhile (/='_') constructorName</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- Kebab-case JSON serialization (e.g., &quot;base-spread-bips&quot;)
+<span class="lineno">  125 </span>lensyKebabToJSON
+<span class="lineno">  126 </span>  :: (Generic a, GToJSON Zero (Rep a)) =&gt; a -&gt; Value
+<span class="lineno">  127 </span><span class="decl"><span class="nottickedoff">lensyKebabToJSON = genericToJSON lensyKebabOptions</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>lensyKebabParseJSON
+<span class="lineno">  130 </span>  :: (Generic a, GFromJSON Zero (Rep a)) =&gt; Value -&gt; Parser a
+<span class="lineno">  131 </span><span class="decl"><span class="nottickedoff">lensyKebabParseJSON = genericParseJSON lensyKebabOptions</span></span>
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>lensyKebabOptions :: Options
+<span class="lineno">  134 </span><span class="decl"><span class="nottickedoff">lensyKebabOptions = defaultOptions { fieldLabelModifier = lensyFieldNameToKebabJson }</span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>lensyFieldNameToKebabJson :: String -&gt; String
+<span class="lineno">  137 </span><span class="decl"><span class="nottickedoff">lensyFieldNameToKebabJson fieldName = toKebab $ fromHumps $ dropWhile (=='_') $ dropWhile (/='_') $ dropWhile (=='_') fieldName</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  140 </span>-- Strip-leading-lowercase-prefix helpers (Seal's convention)
+<span class="lineno">  141 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Generic 'ToJSON' using 'stripPrefixOptions' — strips the leading run
+<span class="lineno">  144 </span>-- of lowercase letters (the lens prefix) from each record field and
+<span class="lineno">  145 </span>-- lowercases the first remaining char, keeping camelCase for the rest.
+<span class="lineno">  146 </span>--   @teId → id@, @crMaxTokens → maxTokens@, @cbInputSchema → inputSchema@,
+<span class="lineno">  147 </span>--   @msgRole → role@, @uInput → input@, @tdName → name@.
+<span class="lineno">  148 </span>stripPrefixToJSON
+<span class="lineno">  149 </span>  :: (Generic a, GToJSON Zero (Rep a)) =&gt; a -&gt; Value
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">stripPrefixToJSON = genericToJSON stripPrefixOptions</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Generic 'FromJSON' using 'stripPrefixOptions'. See 'stripPrefixToJSON'.
+<span class="lineno">  153 </span>stripPrefixParseJSON
+<span class="lineno">  154 </span>  :: (Generic a, GFromJSON Zero (Rep a)) =&gt; Value -&gt; Parser a
+<span class="lineno">  155 </span><span class="decl"><span class="istickedoff">stripPrefixParseJSON = genericParseJSON stripPrefixOptions</span></span>
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>-- | 'Options' that strip the leading lowercase lens prefix from record
+<span class="lineno">  158 </span>-- field names (camelCase preserved). Constructor tags are left as-is
+<span class="lineno">  159 </span>-- (Seal's enums encode as bare tags like @&quot;User&quot;@ / @&quot;Request&quot;@).
+<span class="lineno">  160 </span>stripPrefixOptions :: Options
+<span class="lineno">  161 </span><span class="decl"><span class="istickedoff">stripPrefixOptions = defaultOptions { fieldLabelModifier = stripLensPrefixCamel }</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Drop the leading run of lowercase letters, then lowercase the first
+<span class="lineno">  164 </span>-- remaining character. Examples:
+<span class="lineno">  165 </span>--
+<span class="lineno">  166 </span>--   * @teId       → id@
+<span class="lineno">  167 </span>--   * @teTimestamp → timestamp@
+<span class="lineno">  168 </span>--   * @crMaxTokens → maxTokens@
+<span class="lineno">  169 </span>--   * @cbInputSchema → inputSchema@
+<span class="lineno">  170 </span>--   * @cbForId    → forId@
+<span class="lineno">  171 </span>--   * @msgRole    → role@
+<span class="lineno">  172 </span>--   * @uInput     → input@
+<span class="lineno">  173 </span>--   * @tdName     → name@
+<span class="lineno">  174 </span>--   * @rsContent  → content@
+<span class="lineno">  175 </span>--
+<span class="lineno">  176 </span>-- Field names with no leading lowercase run (e.g. already-@lowerCamel@
+<span class="lineno">  177 </span>-- keys produced by hand-written instances) are returned unchanged except
+<span class="lineno">  178 </span>-- for the (no-op) first-char lowercasing.
+<span class="lineno">  179 </span>stripLensPrefixCamel :: String -&gt; String
+<span class="lineno">  180 </span><span class="decl"><span class="istickedoff">stripLensPrefixCamel fieldName =</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">case dropWhile isLower fieldName of</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff">&quot;&quot;           -&gt; <span class="nottickedoff">fieldName</span></span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">firstUpper:rest -&gt; toLower firstUpper : rest</span></span>
+
+</pre>
+</body>
+</html>

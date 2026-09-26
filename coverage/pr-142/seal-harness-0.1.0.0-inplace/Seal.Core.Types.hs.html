@@ -1,0 +1,97 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | Shared leaf vocabulary imported across the spine. Subset only: the types
+<span class="lineno">    5 </span>-- the running CLI agent loop touches. (Harness/Tabs/MessageSource land later.)
+<span class="lineno">    6 </span>module Seal.Core.Types
+<span class="lineno">    7 </span>  ( TrustLevel (..)
+<span class="lineno">    8 </span>  , ProviderId (..)
+<span class="lineno">    9 </span>  , ModelId (..)
+<span class="lineno">   10 </span>  , ToolCallId (..)
+<span class="lineno">   11 </span>  , OpName (..)
+<span class="lineno">   12 </span>  , SessionId
+<span class="lineno">   13 </span>  , mkSessionId
+<span class="lineno">   14 </span>  , mkSystemSessionId
+<span class="lineno">   15 </span>  , sessionIdText
+<span class="lineno">   16 </span>  , isValidSessionId
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>import GHC.Generics (Generic)
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>data TrustLevel = Untrusted | Trusted | Audited
+<span class="lineno">   25 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Bounded</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   26 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>newtype ProviderId = ProviderId Text
+<span class="lineno">   29 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   30 </span>  deriving newtype (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>newtype ModelId = ModelId Text
+<span class="lineno">   33 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   34 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>newtype ToolCallId = ToolCallId Text
+<span class="lineno">   37 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   38 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>newtype OpName = OpName Text
+<span class="lineno">   41 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   42 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Opaque session label. No parse invariant on construction history, but a
+<span class="lineno">   45 </span>-- single strict predicate guards every path-join / network boundary.
+<span class="lineno">   46 </span>newtype SessionId = SessionId Text
+<span class="lineno">   47 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   48 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>isValidSessionId :: Text -&gt; Bool
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">isValidSessionId t =</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head t /= '.'</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all (`elem` chars) t</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">chars = ['A' .. 'Z'] &lt;&gt; ['a' .. 'z'] &lt;&gt; ['0' .. '9'] &lt;&gt; &quot;_-&quot;</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>mkSessionId :: Text -&gt; Either Text SessionId
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">mkSessionId t</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">| isValidSessionId t = Right (SessionId t)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>          = Left (&quot;invalid session id: &quot; &lt;&gt; T.pack (show t))</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Total constructor for known-safe system strings (e.g. @&quot;web&quot;@,
+<span class="lineno">   64 </span>-- @&quot;manual&quot;@). Calls 'isValidSessionId' internally and errors on
+<span class="lineno">   65 </span>-- failure — it does NOT bypass validation. Use only for compile-time-
+<span class="lineno">   66 </span>-- known literals; runtime-derived strings should use 'mkSessionId' (the
+<span class="lineno">   67 </span>-- 'Either'-returning variant).
+<span class="lineno">   68 </span>mkSystemSessionId :: Text -&gt; SessionId
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">mkSystemSessionId t</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">isValidSessionId t</span> = SessionId t</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>          = <span class="nottickedoff">error (&quot;mkSystemSessionId: invalid session id: &quot; &lt;&gt; T.unpack t)</span></span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>sessionIdText :: SessionId -&gt; Text
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">sessionIdText (SessionId t) = t</span></span>
+
+</pre>
+</body>
+</html>

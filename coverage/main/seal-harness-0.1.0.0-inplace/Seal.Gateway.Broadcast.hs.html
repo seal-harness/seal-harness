@@ -1,0 +1,204 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The broadcast helper for the WS @lists@ frame. Builds the partitioned
+<span class="lineno">    3 </span>-- snapshot, wraps it with the WS @{&quot;type&quot;: &quot;lists&quot;, ...}@ envelope, and
+<span class="lineno">    4 </span>-- pushes it to every WS subscriber via 'broadcastLists'. Called after
+<span class="lineno">    5 </span>-- every state change that affects the sidebar partition (tab
+<span class="lineno">    6 </span>-- insert/remove/rebind/rename/acknowledge/release, archive/unarchive,
+<span class="lineno">    7 </span>-- session create, auto-tab insert).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The REST @GET /api/lists@ returns the bare 'ListsSnapshotWire' (no
+<span class="lineno">   10 </span>-- @type@ field); this wrapper adds the WS envelope for the broadcast path
+<span class="lineno">   11 </span>-- (the frontend's @useListsStream@ discriminates on @type: &quot;lists&quot;@).
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- NOTE: the design's 50ms debounce/coalesce is deferred to a follow-up —
+<span class="lineno">   14 </span>-- at the expected single-user scale, bursts are rare and the direct
+<span class="lineno">   15 </span>-- broadcast is correct (if occasionally redundant). A debounce helper
+<span class="lineno">   16 </span>-- can be layered in here without changing the call sites.
+<span class="lineno">   17 </span>module Seal.Gateway.Broadcast
+<span class="lineno">   18 </span>  ( broadcastListsSnapshot
+<span class="lineno">   19 </span>  , broadcastHarnessStatus
+<span class="lineno">   20 </span>  , broadcastReplyDelivered
+<span class="lineno">   21 </span>  , broadcastAgentDefsChanged
+<span class="lineno">   22 </span>  , broadcastSkillsChanged
+<span class="lineno">   23 </span>  , broadcastReposChanged
+<span class="lineno">   24 </span>  , broadcastToolCall
+<span class="lineno">   25 </span>  , wrapCapsForAskStatus
+<span class="lineno">   26 </span>  ) where
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Data.Aeson (object, (.=))
+<span class="lineno">   29 </span>import Data.Aeson qualified as A
+<span class="lineno">   30 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   31 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   32 </span>import Data.Foldable (for_)
+<span class="lineno">   33 </span>import Data.Text (Text)
+<span class="lineno">   34 </span>import Data.Text qualified as T
+<span class="lineno">   35 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   36 </span>import Data.Set (Set)
+<span class="lineno">   37 </span>import Data.Set qualified as Set
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Control.Exception (onException)
+<span class="lineno">   40 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   41 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   42 </span>import Seal.Core.Types (OpName (..), SessionId)
+<span class="lineno">   43 </span>import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+<span class="lineno">   44 </span>import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
+<span class="lineno">   45 </span>import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
+<span class="lineno">   46 </span>import Seal.Gateway.Transcript (showIso)
+<span class="lineno">   47 </span>import Seal.Tabs (TabsHandle)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Build the WS @lists@ envelope (@{&quot;type&quot;: &quot;lists&quot;, ...}@) from the
+<span class="lineno">   50 </span>-- current state and push it to every WS subscriber via 'broadcastLists'.
+<span class="lineno">   51 </span>-- Includes the broker's current thinking-session set so a freshly-connected
+<span class="lineno">   52 </span>-- web client hydrates its sidebar (mid-turn tabs show Thinking immediately).
+<span class="lineno">   53 </span>broadcastListsSnapshot :: StreamBroker -&gt; TabsHandle -&gt; SealPaths -&gt; IO ()
+<span class="lineno">   54 </span><span class="decl"><span class="istickedoff">broadcastListsSnapshot broker tabsH paths = do</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">thinkingSids &lt;- thinkingSessions broker</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">snap &lt;- buildListsSnapshot tabsH paths thinkingSids</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">-- Merge the &quot;type&quot;: &quot;lists&quot; tag into the snapshot object so the WS frame</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">-- carries the discriminator the frontend's useListsStream dispatches on.</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">let snapObj = case A.toJSON snap of</span>
+<span class="lineno">   60 </span><span class="spaces">        </span><span class="istickedoff">A.Object o -&gt; o</span>
+<span class="lineno">   61 </span><span class="spaces">        </span><span class="istickedoff">other      -&gt; <span class="nottickedoff">KeyMap.singleton (Key.fromText &quot;snapshot&quot;) other</span></span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">envelope = A.Object (KeyMap.insert (Key.fromText &quot;type&quot;) (A.String &quot;lists&quot;) snapObj)</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">broadcastLists broker envelope</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Push a per-session @harness-status@ activity signal to every WS
+<span class="lineno">   66 </span>-- subscriber focused on the session. The frontend's
+<span class="lineno">   67 </span>-- @useSessionActivityStream@ consumes the @activity@ envelope to drive the
+<span class="lineno">   68 </span>-- tab status indicator (Thinking while the LLM is actively processing,
+<span class="lineno">   69 </span>-- Idle otherwise). 'Nothing' broker (tests) is a no-op. @status@ is
+<span class="lineno">   70 </span>-- @&quot;thinking&quot;@ at turn start and @&quot;idle&quot;@ at turn end (including failures).
+<span class="lineno">   71 </span>-- Also updates the broker's in-memory thinking set so a freshly-connected
+<span class="lineno">   72 </span>-- web client can hydrate its sidebar from the lists snapshot without
+<span class="lineno">   73 </span>-- waiting for the next harness-status event.
+<span class="lineno">   74 </span>broadcastHarnessStatus :: Maybe StreamBroker -&gt; SessionId -&gt; Text -&gt; IO ()
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">broadcastHarnessStatus mBroker sid status =</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">case mBroker of</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt; do</span>
+<span class="lineno">   79 </span><span class="spaces">      </span><span class="istickedoff">setThinking broker sid (status == &quot;thinking&quot;)</span>
+<span class="lineno">   80 </span><span class="spaces">      </span><span class="istickedoff">broadcast broker (BeActivity <span class="nottickedoff">sid</span> (object</span>
+<span class="lineno">   81 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;kind&quot; .= (&quot;harness-status&quot; :: Text)</span>
+<span class="lineno">   82 </span><span class="spaces">        </span><span class="istickedoff">, &quot;status&quot; .= status</span>
+<span class="lineno">   83 </span><span class="spaces">        </span><span class="istickedoff">]))</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Push a per-session @reply-delivered@ activity signal to every WS
+<span class="lineno">   86 </span>-- subscriber focused on the session. Marks the last assistant reply as
+<span class="lineno">   87 </span>-- &quot;seen&quot; because it was delivered to ≥1 subscribed chat channel
+<span class="lineno">   88 </span>-- (Signal/Telegram/CLI), so the frontend transitions the tab to Idle Read.
+<span class="lineno">   89 </span>-- 'Nothing' broker (tests) is a no-op. The timestamp defaults to now.
+<span class="lineno">   90 </span>broadcastReplyDelivered :: Maybe StreamBroker -&gt; SessionId -&gt; IO ()
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">broadcastReplyDelivered mBroker sid =</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">case mBroker of</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt; do</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">broadcast broker (BeActivity <span class="nottickedoff">sid</span> (object</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;kind&quot; .= (&quot;reply-delivered&quot; :: Text)</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff">, &quot;timestamp&quot; .= T.pack (showIso now)</span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">]))</span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | Push a per-session @tool-call@ activity signal to every WS subscriber.
+<span class="lineno">  102 </span>-- The chat-channel WS client receives this as an @activity@ event and
+<span class="lineno">  103 </span>-- renders a tool-progress bubble. The tool input is redacted for opcodes
+<span class="lineno">  104 </span>-- in the @secretOps@ set (e.g. @SECRET_GET@) and truncated to 120
+<span class="lineno">  105 </span>-- characters for non-secret opcodes. 'Nothing' broker (tests) is a no-op.
+<span class="lineno">  106 </span>-- Pure input formatting (no IO beyond the broadcast itself).
+<span class="lineno">  107 </span>broadcastToolCall
+<span class="lineno">  108 </span>  :: Maybe StreamBroker
+<span class="lineno">  109 </span>  -&gt; SessionId
+<span class="lineno">  110 </span>  -&gt; OpName
+<span class="lineno">  111 </span>  -&gt; Text
+<span class="lineno">  112 </span>  -&gt; Set OpName
+<span class="lineno">  113 </span>  -&gt; IO ()
+<span class="lineno">  114 </span><span class="decl"><span class="istickedoff">broadcastToolCall mBroker sid opName input secretOps =</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">for_ mBroker $ \broker -&gt;</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">broadcast broker (BeActivity <span class="nottickedoff">sid</span> (object</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;kind&quot; .= (&quot;tool-call&quot; :: Text)</span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">, &quot;tool&quot; .= opNameText</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">, &quot;input&quot; .= inputDisplay</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">]))</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">OpName opNameText = opName</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">inputDisplay</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">| opName `Set.member` secretOps = &quot;&lt;redacted&gt;&quot; :: Text</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = truncateInput input</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">truncateInput t =</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">if T.length t &gt; 120</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">then T.take 120 t &lt;&gt; &quot;...&quot;</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">else t</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Push an @agent-defs-changed@ signal to every WS subscriber. The
+<span class="lineno">  132 </span>-- frontend re-fetches GET /api/agents on receipt (invalidation, not
+<span class="lineno">  133 </span>-- payload — the full list is too large to inline). 'Nothing' broker
+<span class="lineno">  134 </span>-- (tests) is a no-op.
+<span class="lineno">  135 </span>broadcastAgentDefsChanged :: Maybe StreamBroker -&gt; IO ()
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">broadcastAgentDefsChanged mBroker =</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">for_ mBroker <span class="nottickedoff">SB.broadcastAgentDefsChanged</span></span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Push a @skills-changed@ signal to every WS subscriber. The frontend
+<span class="lineno">  140 </span>-- re-fetches GET /api/skills on receipt. 'Nothing' broker (tests) is a
+<span class="lineno">  141 </span>-- no-op.
+<span class="lineno">  142 </span>broadcastSkillsChanged :: Maybe StreamBroker -&gt; IO ()
+<span class="lineno">  143 </span><span class="decl"><span class="istickedoff">broadcastSkillsChanged mBroker =</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">for_ mBroker <span class="nottickedoff">SB.broadcastSkillsChanged</span></span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Push a @repos-changed@ signal to every WS subscriber. The frontend
+<span class="lineno">  147 </span>-- re-fetches GET /api/repos on receipt. 'Nothing' broker (tests) is a
+<span class="lineno">  148 </span>-- no-op.
+<span class="lineno">  149 </span>broadcastReposChanged :: Maybe StreamBroker -&gt; IO ()
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">broadcastReposChanged mBroker =</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">for_ mBroker <span class="nottickedoff">SB.broadcastReposChanged</span></span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | Wrap a 'ChannelCaps' so that 'ccPrompt' (the blocking ask primitive
+<span class="lineno">  154 </span>-- used by @ASK_HUMAN@ and the Untrusted confirmation gate) broadcasts a
+<span class="lineno">  155 </span>-- harness-status transition: @idle@ /before/ blocking on the human's
+<span class="lineno">  156 </span>-- reply, and @thinking@ /after/ the reply arrives (the turn is resuming).
+<span class="lineno">  157 </span>-- This ensures the web frontend shows the session as idle (not thinking)
+<span class="lineno">  158 </span>-- while it is waiting for human input — the core fix for the recurring
+<span class="lineno">  159 </span>-- \&quot;stuck on thinking during ASK_HUMAN\&quot; bug.
+<span class="lineno">  160 </span>--
+<span class="lineno">  161 </span>-- The wrapper uses 'onException' so the @thinking@ broadcast fires even
+<span class="lineno">  162 </span>-- if the inner 'ccPrompt' throws (e.g. a timeout/cancel from the
+<span class="lineno">  163 </span>-- AskReplyStore). Without this, an exception in the inner prompt would
+<span class="lineno">  164 </span>-- leave the session permanently idle in the broker's in-memory state
+<span class="lineno">  165 </span>-- (the turn's bracket cleanup would still broadcast idle at turn end,
+<span class="lineno">  166 </span>-- but the broker's thinking set would be inconsistent until then).
+<span class="lineno">  167 </span>--
+<span class="lineno">  168 </span>-- 'Nothing' broker (tests, standalone CLI) is a passthrough: the caps
+<span class="lineno">  169 </span>-- are returned unchanged except for the 'ccPrompt' wrapper which is a
+<span class="lineno">  170 </span>-- direct delegate (no broadcast, no overhead).
+<span class="lineno">  171 </span>--
+<span class="lineno">  172 </span>-- All other 'ChannelCaps' fields ('ccSend', 'ccShowHuman',
+<span class="lineno">  173 </span>-- 'ccPromptSecret', 'ccStreaming') are passed through unchanged.
+<span class="lineno">  174 </span>wrapCapsForAskStatus :: Maybe StreamBroker -&gt; SessionId -&gt; ChannelCaps -&gt; ChannelCaps
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">wrapCapsForAskStatus mBroker sid caps =</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">caps { ccPrompt = \prompt -&gt; do</span>
+<span class="lineno">  177 </span><span class="spaces">           </span><span class="istickedoff">broadcastHarnessStatus mBroker sid &quot;idle&quot;</span>
+<span class="lineno">  178 </span><span class="spaces">           </span><span class="istickedoff">ans &lt;- ccPrompt caps <span class="nottickedoff">prompt</span> `onException` broadcastHarnessStatus mBroker sid &quot;thinking&quot;</span>
+<span class="lineno">  179 </span><span class="spaces">           </span><span class="istickedoff">broadcastHarnessStatus mBroker sid &quot;thinking&quot;</span>
+<span class="lineno">  180 </span><span class="spaces">           </span><span class="istickedoff">pure ans</span>
+<span class="lineno">  181 </span><span class="spaces">       </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

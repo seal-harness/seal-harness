@@ -1,0 +1,108 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Tool-call rendering helpers for chat channels. Ports the per-opcode
+<span class="lineno">    3 </span>-- emoji mapping and 'formatToolLine' from
+<span class="lineno">    4 </span>-- 'Seal.Channels.StreamProgress' so the chat-channel package can render
+<span class="lineno">    5 </span>-- tool-progress lines with the same emoji prefixes the old channel
+<span class="lineno">    6 </span>-- implementation used, without depending on server internals.
+<span class="lineno">    7 </span>module Seal.Channels.Chat.ToolRender
+<span class="lineno">    8 </span>  ( opEmoji
+<span class="lineno">    9 </span>  , formatToolLine
+<span class="lineno">   10 </span>  ) where
+<span class="lineno">   11 </span>
+<span class="lineno">   12 </span>import Data.Set (Set)
+<span class="lineno">   13 </span>import Data.Set qualified as Set
+<span class="lineno">   14 </span>import Data.Text (Text)
+<span class="lineno">   15 </span>import Data.Text qualified as T
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>-- | A local opaque type standing in for 'OpName' — the chat-channel
+<span class="lineno">   18 </span>-- package does not depend on 'Seal.Core.Types', so we use 'Text' wrapped
+<span class="lineno">   19 </span>-- in a newtype to keep the signature self-consistent. The loop passes
+<span class="lineno">   20 </span>-- the raw opcode name text.
+<span class="lineno">   21 </span>newtype OpName = OpName Text
+<span class="lineno">   22 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>-- | Format a tool-call progress line: the per-opcode emoji, the opcode
+<span class="lineno">   25 </span>-- name, and a truncated input. For secret-bearing opcodes (in the
+<span class="lineno">   26 </span>-- 'secretOps' set), the input is replaced with @&quot;&lt;redacted&gt;&quot;@. Pure.
+<span class="lineno">   27 </span>formatToolLine :: Set OpName -&gt; Text -&gt; Text -&gt; Text
+<span class="lineno">   28 </span><span class="decl"><span class="istickedoff">formatToolLine secretOps name input =</span>
+<span class="lineno">   29 </span><span class="spaces">  </span><span class="istickedoff">opEmoji name &lt;&gt; &quot; &quot; &lt;&gt; name &lt;&gt; &quot; &quot; &lt;&gt; inputDisplay</span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   31 </span><span class="spaces">    </span><span class="istickedoff">inputDisplay</span>
+<span class="lineno">   32 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">OpName name `Set.member` secretOps</span> = <span class="nottickedoff">&quot;&lt;redacted&gt;&quot;</span></span>
+<span class="lineno">   33 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = truncateInput input</span>
+<span class="lineno">   34 </span><span class="spaces">    </span><span class="istickedoff">truncateInput t =</span>
+<span class="lineno">   35 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">T.length t &gt; 120</span></span>
+<span class="lineno">   36 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">T.take 120 t &lt;&gt; &quot;...&quot;</span></span>
+<span class="lineno">   37 </span><span class="spaces">        </span><span class="istickedoff">else t</span></span>
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | Map an opcode name to a display emoji for tool-progress lines.
+<span class="lineno">   40 </span>-- Mirrors 'Seal.Channels.StreamProgress.opEmoji' exactly. Unknown
+<span class="lineno">   41 </span>-- opcodes fall back to the high-voltage sign (@⚡@). Pure.
+<span class="lineno">   42 </span>opEmoji :: Text -&gt; Text
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">opEmoji name = case name of</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">&quot;SHELL_EXEC&quot;       -&gt; &quot;\x1F4BB&quot;  -- 💻 laptop</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">&quot;BIN_EXEC&quot;         -&gt; &quot;\x2699\xFE0F&quot;  -- ⚙️ gear</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">&quot;FILE_READ&quot;        -&gt; <span class="nottickedoff">&quot;\x1F4D6&quot;</span>  -- 📖 open book</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">&quot;FILE_WRITE&quot;       -&gt; <span class="nottickedoff">&quot;\x270D\xFE0F&quot;</span>  -- ✍️ writing hand</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">&quot;FILE_PATCH&quot;       -&gt; <span class="nottickedoff">&quot;\x1F527&quot;</span>  -- 🔧 wrench</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">&quot;SEARCH_FILES&quot;     -&gt; <span class="nottickedoff">&quot;\x1F50E&quot;</span>  -- 🔎 magnifying glass tilted right</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">&quot;WEB_SEARCH&quot;       -&gt; <span class="nottickedoff">&quot;\x1F50D&quot;</span>  -- 🔍 magnifying glass</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">&quot;WEB_FETCH&quot;        -&gt; <span class="nottickedoff">&quot;\x1F4C4&quot;</span>  -- 📄 page facing up</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">&quot;SETUP_REPO&quot;       -&gt; <span class="nottickedoff">&quot;\x1F4E5&quot;</span>  -- 📥 inbox tray</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">&quot;SECRET_GET&quot;       -&gt; <span class="nottickedoff">&quot;\x1F5DD&quot;</span>  -- 🗝 old key</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_WRITE&quot;     -&gt; <span class="nottickedoff">&quot;\x1F9E0&quot;</span>  -- 🧠 brain</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_READ&quot;      -&gt; <span class="nottickedoff">&quot;\x1F9E0&quot;</span>  -- 🧠 brain</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_LIST&quot;      -&gt; <span class="nottickedoff">&quot;\x1F9E0&quot;</span>  -- 🧠 brain</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_SEARCH&quot;    -&gt; <span class="nottickedoff">&quot;\x1F9E0&quot;</span>  -- 🧠 brain</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_ARCHIVE&quot;   -&gt; <span class="nottickedoff">&quot;\x1F9E0&quot;</span>  -- 🧠 brain</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">&quot;MEMORY_MANAGE&quot;    -&gt; &quot;\x1F9E0&quot;  -- 🧠 brain</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">&quot;SKILL_WRITE&quot;      -&gt; <span class="nottickedoff">&quot;\x1F4DD&quot;</span>  -- 📝 memo</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">&quot;SKILL_LOAD&quot;       -&gt; <span class="nottickedoff">&quot;\x1F4DA&quot;</span>  -- 📚 books</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">&quot;SKILL_LIST&quot;       -&gt; <span class="nottickedoff">&quot;\x1F4DA&quot;</span>  -- 📚 books</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">&quot;SKILL_DELETE&quot;     -&gt; <span class="nottickedoff">&quot;\x1F4DA&quot;</span>  -- 📚 books</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">&quot;SKILL_MANAGE&quot;     -&gt; <span class="nottickedoff">&quot;\x1F4DA&quot;</span>  -- 📚 books</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_DEF_WRITE&quot;  -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_DEF_READ&quot;   -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_DEF_LIST&quot;   -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_DEF_DELETE&quot; -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_DEF_MANAGE&quot; -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_INSTANCES&quot;  -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_MANAGE&quot;     -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_START&quot;      -&gt; <span class="nottickedoff">&quot;\x1F680&quot;</span>  -- 🚀 rocket</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_STATUS&quot;     -&gt; <span class="nottickedoff">&quot;\x1F916&quot;</span>  -- 🤖 robot face</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_STOP&quot;       -&gt; <span class="nottickedoff">&quot;\x1F6D1&quot;</span>  -- 🛑 stop sign</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">&quot;AGENT_INTERRUPT&quot;  -&gt; <span class="nottickedoff">&quot;\x270B&quot;</span>   -- ✋ raised hand</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">&quot;SHOW_HUMAN&quot;       -&gt; <span class="nottickedoff">&quot;\x1F4E2&quot;</span>  -- 📢 loudspeaker</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">&quot;ASK_HUMAN&quot;        -&gt; <span class="nottickedoff">&quot;\x2753&quot;</span>   -- ❓ question mark</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">&quot;PROCESS_MANAGE&quot;   -&gt; <span class="nottickedoff">&quot;\x2699\xFE0F&quot;</span>  -- ⚙️ gear</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">&quot;HARNESS_LIST&quot;     -&gt; <span class="nottickedoff">&quot;\x1F5A5\xFE0F&quot;</span>  -- 🖥️ desktop computer</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">&quot;HARNESS_START&quot;    -&gt; <span class="nottickedoff">&quot;\x1F5A5\xFE0F&quot;</span>  -- 🖥️ desktop computer</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">&quot;HARNESS_STOP&quot;     -&gt; <span class="nottickedoff">&quot;\x1F5A5\xFE0F&quot;</span>  -- 🖥️ desktop computer</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">&quot;OPCODE_DESCRIBE&quot;  -&gt; <span class="nottickedoff">&quot;\x1F50E&quot;</span>  -- 🔎 magnifying glass tilted right</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">&quot;OPCODE_LIST&quot;      -&gt; <span class="nottickedoff">&quot;\x1F4CB&quot;</span>  -- 📋 clipboard</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">&quot;SESSION_MANAGE&quot;   -&gt; <span class="nottickedoff">&quot;\x1F4AC&quot;</span>  -- 💬 speech balloon</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">&quot;\x26A1&quot;</span></span></span>   -- ⚡ high voltage
+
+</pre>
+</body>
+</html>

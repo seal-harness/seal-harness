@@ -1,0 +1,410 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>module Seal.Security.Path
+<span class="lineno">    2 </span>  ( SafePath
+<span class="lineno">    3 </span>  , getSafePath
+<span class="lineno">    4 </span>  , WorkspaceRoot (..)
+<span class="lineno">    5 </span>  , PathError (..)
+<span class="lineno">    6 </span>  , mkSafePath
+<span class="lineno">    7 </span>  , mkSafePathForWrite
+<span class="lineno">    8 </span>  , mkSafePathRemote
+<span class="lineno">    9 </span>  , mkSafePathAllowAbs
+<span class="lineno">   10 </span>  , mkSafePathForWriteAllowAbs
+<span class="lineno">   11 </span>  , mkSafePathRemoteAllowAbs
+<span class="lineno">   12 </span>  , KeysRoot (..)
+<span class="lineno">   13 </span>  , ensureKeysRoot
+<span class="lineno">   14 </span>  , SafeKeyPath
+<span class="lineno">   15 </span>  , getSafeKeyPath
+<span class="lineno">   16 </span>  , mkSafeKeyPath
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Exception (IOException, try)
+<span class="lineno">   20 </span>import Data.List (isPrefixOf)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import qualified Data.Text as T
+<span class="lineno">   23 </span>import System.Directory (canonicalizePath, createDirectoryIfMissing, doesPathExist)
+<span class="lineno">   24 </span>import System.FilePath (isAbsolute, joinPath, splitDirectories, (&lt;/&gt;))
+<span class="lineno">   25 </span>import System.Posix.Files
+<span class="lineno">   26 </span>  ( fileMode
+<span class="lineno">   27 </span>  , fileOwner
+<span class="lineno">   28 </span>  , getFileStatus
+<span class="lineno">   29 </span>  , intersectFileModes
+<span class="lineno">   30 </span>  , setFileMode
+<span class="lineno">   31 </span>  )
+<span class="lineno">   32 </span>import System.Posix.User (getEffectiveUserID)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>newtype SafePath = SafePath FilePath
+<span class="lineno">   35 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>getSafePath :: SafePath -&gt; FilePath
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">getSafePath (SafePath p) = p</span></span>
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>newtype WorkspaceRoot = WorkspaceRoot FilePath
+<span class="lineno">   41 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>data PathError
+<span class="lineno">   44 </span>  = PathEscapesWorkspace FilePath
+<span class="lineno">   45 </span>  | PathIsBlocked Text
+<span class="lineno">   46 </span>  | PathDoesNotExist FilePath
+<span class="lineno">   47 </span>  | PathInsecureMode FilePath
+<span class="lineno">   48 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>blockedNames :: [FilePath]
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">blockedNames = [&quot;.env&quot;, &quot;.ssh&quot;, &quot;.gnupg&quot;, &quot;.netrc&quot;, &quot;.seal&quot;]</span></span>
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | Lexically collapse @.@ and @..@ segments without touching the filesystem.
+<span class="lineno">   54 </span>-- A @..@ removes the preceding ordinary segment; if there is none (or the
+<span class="lineno">   55 </span>-- predecessor is itself an un-collapsible @..@) the @..@ is retained, so an
+<span class="lineno">   56 </span>-- attempt to climb above the root survives into the containment check and is
+<span class="lineno">   57 </span>-- rejected there rather than being silently normalised away.
+<span class="lineno">   58 </span>lexicalCollapse :: [FilePath] -&gt; [FilePath]
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">lexicalCollapse = reverse . foldl' step []</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">step acc &quot;.&quot; = acc</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">step (x : xs) &quot;..&quot; | <span class="tickonlytrue">x /= &quot;..&quot;</span> = xs</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">step acc seg = seg : acc</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Validate that a requested path is safely confined within the workspace.
+<span class="lineno">   66 </span>--
+<span class="lineno">   67 </span>-- Steps (in order):
+<span class="lineno">   68 </span>--   1. Reject if any segment of the requested path is a blocked name.
+<span class="lineno">   69 </span>--   2. Lexically collapse @..@/@.@ in the joined path (no filesystem access)
+<span class="lineno">   70 </span>--      and reject with 'PathEscapesWorkspace' if it leaves the root. This is a
+<span class="lineno">   71 </span>--      purely lexical determination, so a @..@ escape is caught BEFORE any
+<span class="lineno">   72 </span>--      filesystem call — independent of whether the target exists.
+<span class="lineno">   73 </span>--   3. Canonicalize the joined path (follows symlinks); a missing final
+<span class="lineno">   74 </span>--      component makes @canonicalizePath@ throw, caught as 'PathDoesNotExist'.
+<span class="lineno">   75 </span>--   4. Re-run the containment check on the canonical path to catch symlinks
+<span class="lineno">   76 </span>--      that resolve outside the workspace.
+<span class="lineno">   77 </span>--   5. Confirm the path exists; return 'SafePath' on success.
+<span class="lineno">   78 </span>--
+<span class="lineno">   79 </span>-- Containment check approach: component-wise prefix test via
+<span class="lineno">   80 </span>-- @splitDirectories canonRoot \`isPrefixOf\` splitDirectories candidate@,
+<span class="lineno">   81 </span>-- which correctly rejects @\/ws\/barbaz@ as not inside @\/ws\/bar@.
+<span class="lineno">   82 </span>mkSafePath :: WorkspaceRoot -&gt; FilePath -&gt; IO (Either PathError SafePath)
+<span class="lineno">   83 </span><span class="decl"><span class="istickedoff">mkSafePath (WorkspaceRoot root) requested = do</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">canonRoot &lt;- canonicalizePath root</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">-- 1. Blocked-name check (pure, on the segments of the requested path).</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">if any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">then pure $ Left $ PathIsBlocked $ <span class="nottickedoff">T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span></span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">let joined = if isAbsolute requested then requested else canonRoot &lt;/&gt; requested</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">rootDirs = splitDirectories canonRoot</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">-- 2. Lexically resolve `..`/`.` and check containment, no filesystem access.</span>
+<span class="lineno">   92 </span><span class="spaces">          </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">   94 </span><span class="spaces">        </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">   95 </span><span class="spaces">        </span><span class="istickedoff">else resolveAndCheck rootDirs joined <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">   96 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">resolveAndCheck rootDirs joined lexical = do</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">-- 3. Canonicalize (follows symlinks). Throws IOException if path is missing.</span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">canonResult &lt;- try (canonicalizePath joined) :: IO (Either IOException FilePath)</span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff">case canonResult of</span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure $ Left $ PathDoesNotExist lexical</span></span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff">Right canon -&gt;</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">-- 4. Post-canonicalization containment check: catches symlink escapes.</span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">if not (rootDirs `isPrefixOf` splitDirectories canon)</span>
+<span class="lineno">  106 </span><span class="spaces">            </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">canon</span></span>
+<span class="lineno">  107 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  108 </span><span class="spaces">              </span><span class="istickedoff">exists &lt;- doesPathExist canon</span>
+<span class="lineno">  109 </span><span class="spaces">              </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  110 </span><span class="spaces">                </span><span class="istickedoff">then pure $ Left $ PathDoesNotExist <span class="nottickedoff">canon</span></span>
+<span class="lineno">  111 </span><span class="spaces">                </span><span class="istickedoff">else pure $ Right $ SafePath canon</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | Like 'mkSafePath' but allows the final path component to NOT exist
+<span class="lineno">  114 </span>-- (for FILE_WRITE: the file may be created fresh). Steps 1-2 (blocked-name
+<span class="lineno">  115 </span>-- + lexical collapse + containment) are identical. Step 3 canonicalizes
+<span class="lineno">  116 </span>-- the PARENT (which must exist), then re-joins the final component. Step 4
+<span class="lineno">  117 </span>-- confirms the parent is contained; the final component's existence is
+<span class="lineno">  118 </span>-- irrelevant (it may or may not exist).
+<span class="lineno">  119 </span>mkSafePathForWrite :: WorkspaceRoot -&gt; FilePath -&gt; IO (Either PathError SafePath)
+<span class="lineno">  120 </span><span class="decl"><span class="nottickedoff">mkSafePathForWrite (WorkspaceRoot root) requested = do</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="nottickedoff">canonRoot &lt;- canonicalizePath root</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="nottickedoff">if any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="nottickedoff">then pure $ Left $ PathIsBlocked $ T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="nottickedoff">else do</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="nottickedoff">let joined = if isAbsolute requested then requested else canonRoot &lt;/&gt; requested</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="nottickedoff">rootDirs = splitDirectories canonRoot</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="nottickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="nottickedoff">if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="nottickedoff">then pure $ Left $ PathEscapesWorkspace (joinPath lexicalDirs)</span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="nottickedoff">else do</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="nottickedoff">-- Canonicalize the parent (must exist), then re-join the final</span>
+<span class="lineno">  132 </span><span class="spaces">          </span><span class="nottickedoff">-- component. If the parent doesn't exist, the canonicalization</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="nottickedoff">-- fails → PathDoesNotExist (the parent must exist for a write).</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="nottickedoff">let lexicalPath = joinPath lexicalDirs</span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="nottickedoff">case splitDirectories lexicalPath of</span>
+<span class="lineno">  136 </span><span class="spaces">            </span><span class="nottickedoff">[] -&gt; pure $ Left $ PathEscapesWorkspace lexicalPath</span>
+<span class="lineno">  137 </span><span class="spaces">            </span><span class="nottickedoff">[_] -&gt;</span>
+<span class="lineno">  138 </span><span class="spaces">              </span><span class="nottickedoff">-- The path is a single component (the root itself); writing</span>
+<span class="lineno">  139 </span><span class="spaces">              </span><span class="nottickedoff">-- the root is not meaningful, but the root exists.</span>
+<span class="lineno">  140 </span><span class="spaces">              </span><span class="nottickedoff">resolveParentAndCheck rootDirs lexicalPath canonRoot</span>
+<span class="lineno">  141 </span><span class="spaces">            </span><span class="nottickedoff">segments -&gt;</span>
+<span class="lineno">  142 </span><span class="spaces">              </span><span class="nottickedoff">let parentLex = joinPath (init segments)</span>
+<span class="lineno">  143 </span><span class="spaces">              </span><span class="nottickedoff">in resolveParentAndCheck rootDirs lexicalPath</span>
+<span class="lineno">  144 </span><span class="spaces">                   </span><span class="nottickedoff">=&lt;&lt; canonicalizePath parentLex</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="nottickedoff">resolveParentAndCheck rootDirs lexicalPath canonParent = do</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="nottickedoff">-- Step 4: confirm the canonical parent is contained.</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="nottickedoff">if not (rootDirs `isPrefixOf` splitDirectories canonParent)</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="nottickedoff">then pure $ Left $ PathEscapesWorkspace canonParent</span>
+<span class="lineno">  150 </span><span class="spaces">        </span><span class="nottickedoff">else do</span>
+<span class="lineno">  151 </span><span class="spaces">          </span><span class="nottickedoff">parentExists &lt;- doesPathExist canonParent</span>
+<span class="lineno">  152 </span><span class="spaces">          </span><span class="nottickedoff">if not parentExists</span>
+<span class="lineno">  153 </span><span class="spaces">            </span><span class="nottickedoff">then pure $ Left $ PathDoesNotExist canonParent</span>
+<span class="lineno">  154 </span><span class="spaces">            </span><span class="nottickedoff">else pure $ Right $ SafePath lexicalPath</span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  157 </span>-- Remote path confinement (lexical-only — no local FS canonicalization)
+<span class="lineno">  158 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>-- | Lexically validate a workspace-relative path for the REMOTE untrusted
+<span class="lineno">  161 </span>-- executor. This is the remote-safe counterpart of 'mkSafePath'/'mkSafePathForWrite':
+<span class="lineno">  162 </span>-- it performs ONLY the lexical confinement steps (blocked-name check +
+<span class="lineno">  163 </span>-- '..'/@.@ collapse + component-wise containment under the root) and skips
+<span class="lineno">  164 </span>-- the local-FS 'canonicalizePath' (the file lives on the remote machine;
+<span class="lineno">  165 </span>-- the harness cannot canonicalize it locally). The validated 'SafePath' is
+<span class="lineno">  166 </span>-- the lexically-resolved path anchored under the (remote) workspace root.
+<span class="lineno">  167 </span>--
+<span class="lineno">  168 </span>-- Use this for all remote-arm 'UntrustedIO' file methods. The returned
+<span class="lineno">  169 </span>-- 'SafePath' is what gets passed to the SSH call as a single argv element
+<span class="lineno">  170 </span>-- after @--@, so no shell on the remote ever interprets it as a flag.
+<span class="lineno">  171 </span>--
+<span class="lineno">  172 </span>-- Pure: no IO, no symlink resolution. Symlink confinement on the remote is
+<span class="lineno">  173 </span>-- the remote OS's responsibility (the workspace root is the agent's
+<span class="lineno">  174 </span>-- confined directory; the SSH user has no access outside it by policy).
+<span class="lineno">  175 </span>mkSafePathRemote :: WorkspaceRoot -&gt; FilePath -&gt; Either PathError SafePath
+<span class="lineno">  176 </span><span class="decl"><span class="istickedoff">mkSafePathRemote (WorkspaceRoot root) requested =</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">if any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">then Left $ PathIsBlocked $ <span class="nottickedoff">T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span></span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">else</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">let joined      = if isAbsolute requested then requested else root &lt;/&gt; requested</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff">rootDirs    = splitDirectories root</span>
+<span class="lineno">  182 </span><span class="spaces">          </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">in if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  184 </span><span class="spaces">           </span><span class="istickedoff">then Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  185 </span><span class="spaces">           </span><span class="istickedoff">else Right $ SafePath (joinPath lexicalDirs)</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  188 </span>-- Absolute-path-allowing variants
+<span class="lineno">  189 </span>--
+<span class="lineno">  190 </span>-- These are the same as 'mkSafePath' / 'mkSafePathForWrite' /
+<span class="lineno">  191 </span>-- 'mkSafePathRemote' but with one difference: when the requested path is
+<span class="lineno">  192 </span>-- ABSOLUTE, the workspace-containment check is SKIPPED. The blocked-name
+<span class="lineno">  193 </span>-- check, lexical '..'/@.@ collapse, canonicalization (local arm), and
+<span class="lineno">  194 </span>-- existence checks all still apply. Relative paths are confined exactly as
+<span class="lineno">  195 </span>-- in the original functions.
+<span class="lineno">  196 </span>--
+<span class="lineno">  197 </span>-- Use these for the agent-facing FILE_READ / FILE_WRITE / FILE_PATCH
+<span class="lineno">  198 </span>-- opcodes so an agent can operate on files outside the session workdir
+<span class="lineno">  199 </span>-- (e.g. persistent files across sessions). Internal harness operations
+<span class="lineno">  200 </span>-- (WorkdirFs, skills, memory, agent defs) continue to use the confining
+<span class="lineno">  201 </span>-- originals.
+<span class="lineno">  202 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  203 </span>
+<span class="lineno">  204 </span>-- | Like 'mkSafePath' but allows absolute paths to escape the workspace.
+<span class="lineno">  205 </span>-- Relative paths are confined as usual; absolute paths are canonicalized
+<span class="lineno">  206 </span>-- and existence-checked but NOT workspace-confined.
+<span class="lineno">  207 </span>mkSafePathAllowAbs :: WorkspaceRoot -&gt; FilePath -&gt; IO (Either PathError SafePath)
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">mkSafePathAllowAbs (WorkspaceRoot root) requested = do</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">canonRoot &lt;- canonicalizePath root</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">if any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">then pure $ Left $ PathIsBlocked $ <span class="nottickedoff">T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span></span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">else if isAbsolute requested</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">then resolveAbs</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">else do</span>
+<span class="lineno">  215 </span><span class="spaces">        </span><span class="istickedoff">let joined = canonRoot &lt;/&gt; requested</span>
+<span class="lineno">  216 </span><span class="spaces">            </span><span class="istickedoff">rootDirs = splitDirectories canonRoot</span>
+<span class="lineno">  217 </span><span class="spaces">            </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  218 </span><span class="spaces">        </span><span class="istickedoff">if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  219 </span><span class="spaces">          </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  220 </span><span class="spaces">          </span><span class="istickedoff">else resolveAndCheck rootDirs joined <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">resolveAbs = do</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">canonResult &lt;- try (canonicalizePath requested) :: IO (Either IOException FilePath)</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">case canonResult of</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure $ Left $ PathDoesNotExist requested</span></span>
+<span class="lineno">  226 </span><span class="spaces">        </span><span class="istickedoff">Right canon -&gt; do</span>
+<span class="lineno">  227 </span><span class="spaces">          </span><span class="istickedoff">exists &lt;- doesPathExist canon</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  229 </span><span class="spaces">            </span><span class="istickedoff">then pure $ Left $ PathDoesNotExist <span class="nottickedoff">canon</span></span>
+<span class="lineno">  230 </span><span class="spaces">            </span><span class="istickedoff">else pure $ Right $ SafePath canon</span>
+<span class="lineno">  231 </span><span class="spaces">    </span><span class="istickedoff">resolveAndCheck rootDirs joined lexical = do</span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">canonResult &lt;- try (canonicalizePath joined) :: IO (Either IOException FilePath)</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">case canonResult of</span>
+<span class="lineno">  234 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure $ Left $ PathDoesNotExist lexical</span></span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">Right canon -&gt;</span>
+<span class="lineno">  236 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">not (rootDirs `isPrefixOf` splitDirectories canon)</span></span>
+<span class="lineno">  237 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure $ Left $ PathEscapesWorkspace canon</span></span>
+<span class="lineno">  238 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  239 </span><span class="spaces">              </span><span class="istickedoff">exists &lt;- doesPathExist canon</span>
+<span class="lineno">  240 </span><span class="spaces">              </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  241 </span><span class="spaces">                </span><span class="istickedoff">then pure $ Left $ <span class="nottickedoff">PathDoesNotExist canon</span></span>
+<span class="lineno">  242 </span><span class="spaces">                </span><span class="istickedoff">else pure $ Right $ SafePath canon</span></span>
+<span class="lineno">  243 </span>
+<span class="lineno">  244 </span>-- | Like 'mkSafePathForWrite' but allows absolute paths to escape the
+<span class="lineno">  245 </span>-- workspace. Relative paths are confined as usual; absolute paths have
+<span class="lineno">  246 </span>-- their parent canonicalized and existence-checked but are NOT
+<span class="lineno">  247 </span>-- workspace-confined.
+<span class="lineno">  248 </span>mkSafePathForWriteAllowAbs :: WorkspaceRoot -&gt; FilePath -&gt; IO (Either PathError SafePath)
+<span class="lineno">  249 </span><span class="decl"><span class="istickedoff">mkSafePathForWriteAllowAbs (WorkspaceRoot root) requested = do</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">canonRoot &lt;- canonicalizePath root</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">if any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">then pure $ Left $ PathIsBlocked $ <span class="nottickedoff">T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span></span>
+<span class="lineno">  253 </span><span class="spaces">    </span><span class="istickedoff">else if isAbsolute requested</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">then resolveAbsForWrite</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">else do</span>
+<span class="lineno">  256 </span><span class="spaces">        </span><span class="istickedoff">let joined = canonRoot &lt;/&gt; requested</span>
+<span class="lineno">  257 </span><span class="spaces">            </span><span class="istickedoff">rootDirs = splitDirectories canonRoot</span>
+<span class="lineno">  258 </span><span class="spaces">            </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  259 </span><span class="spaces">        </span><span class="istickedoff">if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  260 </span><span class="spaces">          </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  261 </span><span class="spaces">          </span><span class="istickedoff">else do</span>
+<span class="lineno">  262 </span><span class="spaces">            </span><span class="istickedoff">let lexicalPath = joinPath lexicalDirs</span>
+<span class="lineno">  263 </span><span class="spaces">            </span><span class="istickedoff">case splitDirectories lexicalPath of</span>
+<span class="lineno">  264 </span><span class="spaces">              </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">pure $ Left $ PathEscapesWorkspace lexicalPath</span></span>
+<span class="lineno">  265 </span><span class="spaces">              </span><span class="istickedoff">[_] -&gt; <span class="nottickedoff">resolveParentAndCheck rootDirs lexicalPath canonRoot</span></span>
+<span class="lineno">  266 </span><span class="spaces">              </span><span class="istickedoff">segments -&gt;</span>
+<span class="lineno">  267 </span><span class="spaces">                </span><span class="istickedoff">let parentLex = joinPath (init segments)</span>
+<span class="lineno">  268 </span><span class="spaces">                </span><span class="istickedoff">in resolveParentAndCheck rootDirs lexicalPath</span>
+<span class="lineno">  269 </span><span class="spaces">                     </span><span class="istickedoff">=&lt;&lt; canonicalizePath parentLex</span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">resolveAbsForWrite = do</span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">let lexicalDirs = lexicalCollapse (splitDirectories requested)</span>
+<span class="lineno">  273 </span><span class="spaces">          </span><span class="istickedoff">lexicalPath = joinPath lexicalDirs</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">case splitDirectories lexicalPath of</span>
+<span class="lineno">  275 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">pure $ Left $ PathEscapesWorkspace lexicalPath</span></span>
+<span class="lineno">  276 </span><span class="spaces">        </span><span class="istickedoff">[_] -&gt; <span class="nottickedoff">pure $ Right $ SafePath lexicalPath</span></span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff">segments -&gt; do</span>
+<span class="lineno">  278 </span><span class="spaces">          </span><span class="istickedoff">let parentLex = joinPath (init segments)</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="istickedoff">canonParentResult &lt;- try (canonicalizePath parentLex) :: IO (Either IOException FilePath)</span>
+<span class="lineno">  280 </span><span class="spaces">          </span><span class="istickedoff">case canonParentResult of</span>
+<span class="lineno">  281 </span><span class="spaces">            </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure $ Left $ PathDoesNotExist lexicalPath</span></span>
+<span class="lineno">  282 </span><span class="spaces">            </span><span class="istickedoff">Right canonParent -&gt; do</span>
+<span class="lineno">  283 </span><span class="spaces">              </span><span class="istickedoff">parentExists &lt;- doesPathExist canonParent</span>
+<span class="lineno">  284 </span><span class="spaces">              </span><span class="istickedoff">if not parentExists</span>
+<span class="lineno">  285 </span><span class="spaces">                </span><span class="istickedoff">then pure $ Left $ PathDoesNotExist <span class="nottickedoff">canonParent</span></span>
+<span class="lineno">  286 </span><span class="spaces">                </span><span class="istickedoff">else pure $ Right $ SafePath lexicalPath</span>
+<span class="lineno">  287 </span><span class="spaces">    </span><span class="istickedoff">resolveParentAndCheck rootDirs lexicalPath canonParent = do</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">not (rootDirs `isPrefixOf` splitDirectories canonParent)</span></span>
+<span class="lineno">  289 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure $ Left $ PathEscapesWorkspace canonParent</span></span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  291 </span><span class="spaces">          </span><span class="istickedoff">parentExists &lt;- doesPathExist canonParent</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">not parentExists</span></span>
+<span class="lineno">  293 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure $ Left $ PathDoesNotExist canonParent</span></span>
+<span class="lineno">  294 </span><span class="spaces">            </span><span class="istickedoff">else pure $ Right $ SafePath lexicalPath</span></span>
+<span class="lineno">  295 </span>
+<span class="lineno">  296 </span>-- | Like 'mkSafePathRemote' but allows absolute paths to escape the
+<span class="lineno">  297 </span>-- workspace. Relative paths are confined as usual; absolute paths are
+<span class="lineno">  298 </span>-- lexically collapsed and returned as-is (no containment check). Pure.
+<span class="lineno">  299 </span>mkSafePathRemoteAllowAbs :: WorkspaceRoot -&gt; FilePath -&gt; Either PathError SafePath
+<span class="lineno">  300 </span><span class="decl"><span class="istickedoff">mkSafePathRemoteAllowAbs (WorkspaceRoot root) requested</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">| any (`elem` blockedNames) (splitDirectories requested)</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">= Left $ PathIsBlocked $ <span class="nottickedoff">T.pack $ &quot;path touches a blocked location: &quot; &lt;&gt; requested</span></span>
+<span class="lineno">  303 </span><span class="spaces">  </span><span class="istickedoff">| isAbsolute requested</span>
+<span class="lineno">  304 </span><span class="spaces">  </span><span class="istickedoff">= Right $ SafePath (joinPath (lexicalCollapse (splitDirectories requested)))</span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span></span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="istickedoff">= let joined      = root &lt;/&gt; requested</span>
+<span class="lineno">  307 </span><span class="spaces">        </span><span class="istickedoff">rootDirs    = splitDirectories root</span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  309 </span><span class="spaces">    </span><span class="istickedoff">in if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  310 </span><span class="spaces">         </span><span class="istickedoff">then Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  311 </span><span class="spaces">         </span><span class="istickedoff">else Right $ SafePath (joinPath lexicalDirs)</span></span>
+<span class="lineno">  312 </span>
+<span class="lineno">  313 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  314 </span>-- Key-material confinement
+<span class="lineno">  315 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>newtype KeysRoot = KeysRoot FilePath
+<span class="lineno">  318 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>-- | Create (mkdir -p) and harden (chmod 0700) a keys directory, returning a
+<span class="lineno">  321 </span>-- typed 'KeysRoot'. Idempotent — safe to call on an already-existing directory.
+<span class="lineno">  322 </span>ensureKeysRoot :: FilePath -&gt; IO KeysRoot
+<span class="lineno">  323 </span><span class="decl"><span class="istickedoff">ensureKeysRoot dir = do</span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True dir</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">setFileMode dir 0o700</span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="istickedoff">pure (KeysRoot dir)</span></span>
+<span class="lineno">  327 </span>
+<span class="lineno">  328 </span>-- | An absolute path that has been verified to be safely confined within a
+<span class="lineno">  329 </span>-- 'KeysRoot' directory (no @..@ escape, no symlink escape, and — if the file
+<span class="lineno">  330 </span>-- already exists — owned by the effective user with mode 0600 or 0400). The
+<span class="lineno">  331 </span>-- constructor is intentionally not exported; obtain a value via 'mkSafeKeyPath'.
+<span class="lineno">  332 </span>newtype SafeKeyPath = SafeKeyPath FilePath
+<span class="lineno">  333 </span>
+<span class="lineno">  334 </span>-- | The 'Show' instance deliberately omits the path to prevent accidental
+<span class="lineno">  335 </span>-- disclosure in logs or error messages.
+<span class="lineno">  336 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show SafeKeyPath</span></span></span></span> where
+<span class="lineno">  337 </span>  <span class="decl"><span class="istickedoff">show _ = &quot;SafeKeyPath &lt;redacted&gt;&quot;</span></span>
+<span class="lineno">  338 </span>
+<span class="lineno">  339 </span>getSafeKeyPath :: SafeKeyPath -&gt; FilePath
+<span class="lineno">  340 </span><span class="decl"><span class="istickedoff">getSafeKeyPath (SafeKeyPath p) = p</span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>-- | Validate that a requested path is safely confined within the 'KeysRoot'.
+<span class="lineno">  343 </span>--
+<span class="lineno">  344 </span>-- Steps (in order):
+<span class="lineno">  345 </span>--   1. Lexically collapse @..@\/@.@ and check containment under the root —
+<span class="lineno">  346 </span>--      identical to 'mkSafePath' (reuses 'lexicalCollapse' + component-wise
+<span class="lineno">  347 </span>--      @splitDirectories@ prefix check).
+<span class="lineno">  348 </span>--   2. Canonicalize (follows symlinks); re-run the containment check to catch
+<span class="lineno">  349 </span>--      symlink escapes.
+<span class="lineno">  350 </span>--   3. If the target does not yet exist (key to be written later): return
+<span class="lineno">  351 </span>--      @Right@ with the lexically-resolved path.
+<span class="lineno">  352 </span>--   4. If the target exists: require @fileOwner == getEffectiveUserID@ and
+<span class="lineno">  353 </span>--      @fileMode &amp; 0o777 ∈ {0o600, 0o400}@; otherwise return
+<span class="lineno">  354 </span>--      @Left (PathInsecureMode path)@.
+<span class="lineno">  355 </span>mkSafeKeyPath :: KeysRoot -&gt; FilePath -&gt; IO (Either PathError SafeKeyPath)
+<span class="lineno">  356 </span><span class="decl"><span class="istickedoff">mkSafeKeyPath (KeysRoot root) requested = do</span>
+<span class="lineno">  357 </span><span class="spaces">  </span><span class="istickedoff">canonRoot &lt;- canonicalizePath root</span>
+<span class="lineno">  358 </span><span class="spaces">  </span><span class="istickedoff">let joined = if isAbsolute requested then requested else canonRoot &lt;/&gt; requested</span>
+<span class="lineno">  359 </span><span class="spaces">      </span><span class="istickedoff">rootDirs = splitDirectories canonRoot</span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff">lexicalDirs = lexicalCollapse (splitDirectories joined)</span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">if not (rootDirs `isPrefixOf` lexicalDirs)</span>
+<span class="lineno">  362 </span><span class="spaces">    </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">(joinPath lexicalDirs)</span></span>
+<span class="lineno">  363 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  364 </span><span class="spaces">      </span><span class="istickedoff">canonResult &lt;- try (canonicalizePath joined) :: IO (Either IOException FilePath)</span>
+<span class="lineno">  365 </span><span class="spaces">      </span><span class="istickedoff">case canonResult of</span>
+<span class="lineno">  366 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt;</span>
+<span class="lineno">  367 </span><span class="spaces">          </span><span class="istickedoff">-- Path does not exist yet — allowed; the caller will create it.</span>
+<span class="lineno">  368 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure $ Right $ SafeKeyPath (joinPath lexicalDirs)</span></span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="istickedoff">Right canon -&gt;</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="istickedoff">if not (rootDirs `isPrefixOf` splitDirectories canon)</span>
+<span class="lineno">  371 </span><span class="spaces">            </span><span class="istickedoff">then pure $ Left $ PathEscapesWorkspace <span class="nottickedoff">canon</span></span>
+<span class="lineno">  372 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  373 </span><span class="spaces">              </span><span class="istickedoff">exists &lt;- doesPathExist canon</span>
+<span class="lineno">  374 </span><span class="spaces">              </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  375 </span><span class="spaces">                </span><span class="istickedoff">-- canonicalizePath resolved the parent but the file is absent —</span>
+<span class="lineno">  376 </span><span class="spaces">                </span><span class="istickedoff">-- still allowed; the caller will create it.</span>
+<span class="lineno">  377 </span><span class="spaces">                </span><span class="istickedoff">then pure $ Right $ SafeKeyPath canon</span>
+<span class="lineno">  378 </span><span class="spaces">                </span><span class="istickedoff">else checkSecurity canon</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="istickedoff">checkSecurity canon = do</span>
+<span class="lineno">  381 </span><span class="spaces">      </span><span class="istickedoff">status &lt;- getFileStatus canon</span>
+<span class="lineno">  382 </span><span class="spaces">      </span><span class="istickedoff">euid &lt;- getEffectiveUserID</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="istickedoff">let owner = fileOwner status</span>
+<span class="lineno">  384 </span><span class="spaces">          </span><span class="istickedoff">mode = fileMode status `intersectFileModes` 0o777</span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="istickedoff">if (owner /= euid) || (mode `notElem` [0o600, 0o400])</span>
+<span class="lineno">  386 </span><span class="spaces">        </span><span class="istickedoff">then pure $ Left $ PathInsecureMode <span class="nottickedoff">canon</span></span>
+<span class="lineno">  387 </span><span class="spaces">        </span><span class="istickedoff">else pure $ Right $ <span class="nottickedoff">SafeKeyPath canon</span></span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,865 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The delegation pipeline — the Seal analog of Hermes' @delegate_task@.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- 'runDelegate' spawns one or more child agents with isolated context, runs each
+<span class="lineno">    5 </span>-- against a goal to completion (synchronously), and returns a structured
+<span class="lineno">    6 </span>-- result per child. The parent blocks until all children finish (or time out).
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- Each child gets:
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>--   * a fresh 'SessionId' and its own two-file transcript nested under
+<span class="lineno">   11 </span>--     @\&lt;parent-session\&gt;\/agents\/\&lt;child-id\&gt;@ (the worker-builder opens it);
+<span class="lineno">   12 </span>--   * a focused system prompt built from the def's @adSystem@ + the goal +
+<span class="lineno">   13 </span>--     optional context (the worker-builder assembles it);
+<span class="lineno">   14 </span>--   * a narrowed tool set: the def's @adTools@ allow-list with the delegation
+<span class="lineno">   15 </span>--     blocklist always stripped (no recursive spawning, no def mutation, no
+<span class="lineno">   16 </span>--     lifecycle introspection) — the worker-builder is responsible for
+<span class="lineno">   17 </span>--     applying the blocklist when it constructs the child ISA registry.
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- Features ported from @delegate_task@:
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>--   * batch mode ('tasks' array) with a concurrency cap
+<span class="lineno">   22 </span>--     (@delegation.max_concurrent_children@);
+<span class="lineno">   23 </span>--   * depth cap (@delegation.max_spawn_depth@, default 1, clamped to [1,3])
+<span class="lineno">   24 </span>--     + @orchestrator_enabled@ kill switch (the role field is accepted but the
+<span class="lineno">   25 </span>--     wiring layer enforces the effective role when it builds the child's
+<span class="lineno">   26 </span>--     ISA registry);
+<span class="lineno">   27 </span>--   * timeout (@delegation.child_timeout_seconds@, default 600s, floor 30s)
+<span class="lineno">   28 </span>--     via 'System.Timeout.timeout';
+<span class="lineno">   29 </span>--   * a heartbeat thread that touches a parent-activity cell every 30s so a
+<span class="lineno">   30 </span>--     gateway inactivity timeout doesn't fire while the child works;
+<span class="lineno">   31 </span>--   * a spawn-pause flag so an operator can freeze new fan-out without
+<span class="lineno">   32 </span>--     interrupting running children;
+<span class="lineno">   33 </span>--   * per-child provider\/model override via @[delegation] provider/model/base_url@
+<span class="lineno">   34 </span>--     (the worker-builder reads the override and resolves the child provider
+<span class="lineno">   35 </span>--     from it instead of inheriting the parent's);
+<span class="lineno">   36 </span>--   * rich result aggregation: summary, status, exit_reason, tokens,
+<span class="lineno">   37 </span>--     tool_trace, files read/written (the worker reports via the
+<span class="lineno">   38 </span>--     'ChildRunHooks' accumulators).
+<span class="lineno">   39 </span>--
+<span class="lineno">   40 </span>-- Differences from @delegate_task@ (by design):
+<span class="lineno">   41 </span>--
+<span class="lineno">   42 </span>--   * Children are /transcripted/ — each child's conversation + entries land
+<span class="lineno">   43 </span>--     on disk under the parent's @agents\/\&lt;child-id\&gt;@ dir, surviving restart.
+<span class="lineno">   44 </span>--   * The child run is the existing 'Seal.Agent.Loop.runTurn' with the goal as
+<span class="lineno">   45 </span>--     the first user message — there is no separate child AIAgent class.
+<span class="lineno">   46 </span>module Seal.Agent.Runtime.Delegation
+<span class="lineno">   47 </span>  ( -- * Config
+<span class="lineno">   48 </span>    DelegationConfig (..)
+<span class="lineno">   49 </span>  , defaultDelegationConfig
+<span class="lineno">   50 </span>  , resolveDelegationConfig
+<span class="lineno">   51 </span>  , fromFileConfig
+<span class="lineno">   52 </span>    -- * Identity
+<span class="lineno">   53 </span>  , SubagentId (..)
+<span class="lineno">   54 </span>  , mkSubagentId
+<span class="lineno">   55 </span>  , subagentIdText
+<span class="lineno">   56 </span>    -- * Tasks &amp; results
+<span class="lineno">   57 </span>  , ChildTask (..)
+<span class="lineno">   58 </span>  , ChildResult (..)
+<span class="lineno">   59 </span>  , ChildExitReason (..)
+<span class="lineno">   60 </span>  , ChildStatus (..)
+<span class="lineno">   61 </span>  , ToolTraceEntry (..)
+<span class="lineno">   62 </span>    -- * Worker builder
+<span class="lineno">   63 </span>  , AgentWorkerBuilder
+<span class="lineno">   64 </span>  , ChildRunHooks (..)
+<span class="lineno">   65 </span>  , ChildWorkerOutcome (..)
+<span class="lineno">   66 </span>    -- * Run
+<span class="lineno">   67 </span>    , DelegateInput (..)
+<span class="lineno">   68 </span>    , runDelegate
+<span class="lineno">   69 </span>    , runDelegateAsync
+<span class="lineno">   70 </span>    , SpawnInfo (..)
+<span class="lineno">   71 </span>    , AgentCompletionCallback
+<span class="lineno">   72 </span>    , SpawnCallback
+<span class="lineno">   73 </span>     -- * Pause control
+<span class="lineno">   74 </span>  , SpawnPauseFlag (..)
+<span class="lineno">   75 </span>  , newSpawnPauseFlag
+<span class="lineno">   76 </span>  , setSpawnPaused
+<span class="lineno">   77 </span>  , isSpawnPaused
+<span class="lineno">   78 </span>    -- * Parent activity heartbeat
+<span class="lineno">   79 </span>  , ParentActivity (..)
+<span class="lineno">   80 </span>  , newParentActivity
+<span class="lineno">   81 </span>  , touchParentActivity
+<span class="lineno">   82 </span>  ) where
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>import Control.Concurrent (forkIO, killThread, threadDelay, ThreadId)
+<span class="lineno">   85 </span>import Control.Concurrent.STM
+<span class="lineno">   86 </span>  ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar
+<span class="lineno">   87 </span>  , modifyTVar', retry )
+<span class="lineno">   88 </span>import Control.Concurrent.MVar
+<span class="lineno">   89 </span>  ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar
+<span class="lineno">   90 </span>  , tryTakeMVar )
+<span class="lineno">   91 </span>import Control.Exception (SomeException, bracket, catch)
+<span class="lineno">   92 </span>import Control.Monad (forM, void, when)
+<span class="lineno">   93 </span>import Data.Foldable (for_)
+<span class="lineno">   94 </span>import Data.IORef (IORef, newIORef, readIORef)
+<span class="lineno">   95 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   96 </span>import Data.Aeson (object, ToJSON (..), (.=))
+<span class="lineno">   97 </span>import Data.Text (Text)
+<span class="lineno">   98 </span>import Data.Text qualified as T
+<span class="lineno">   99 </span>import Data.Time.Clock (diffUTCTime, getCurrentTime, UTCTime)
+<span class="lineno">  100 </span>import System.Random (randomRIO)
+<span class="lineno">  101 </span>import System.Timeout (timeout)
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>import Seal.Agent.Def.Types (AgentDef (..))
+<span class="lineno">  104 </span>import Seal.Core.Types (SessionId, sessionIdText)
+<span class="lineno">  105 </span>import qualified Seal.Config.File as ConfigFile
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  108 </span>-- Config
+<span class="lineno">  109 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | The @[delegation]@ section of @config.toml@. Every field is optional; a
+<span class="lineno">  112 </span>-- missing key decodes as 'Nothing' and the resolver falls back to a default.
+<span class="lineno">  113 </span>data DelegationConfig = DelegationConfig
+<span class="lineno">  114 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">dcMaxConcurrentChildren</span></span></span> :: Maybe Int
+<span class="lineno">  115 </span>    -- ^ Cap on parallel children per 'runDelegate' batch. Default 3, floor 1.
+<span class="lineno">  116 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dcChildTimeoutSeconds</span></span></span> :: Maybe Double
+<span class="lineno">  117 </span>    -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
+<span class="lineno">  118 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dcMaxSpawnDepth</span></span></span> :: Maybe Int
+<span class="lineno">  119 </span>    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+<span class="lineno">  120 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dcOrchestratorEnabled</span></span></span> :: Maybe Bool
+<span class="lineno">  121 </span>    -- ^ Kill switch for the orchestrator role. Default True.
+<span class="lineno">  122 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcProvider</span></span></span> :: Maybe Text
+<span class="lineno">  123 </span>    -- ^ Per-child provider override (e.g. route subagents to a cheaper model).
+<span class="lineno">  124 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcModel</span></span></span> :: Maybe Text
+<span class="lineno">  125 </span>    -- ^ Per-child model override.
+<span class="lineno">  126 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcBaseUrl</span></span></span> :: Maybe Text
+<span class="lineno">  127 </span>    -- ^ Per-child base URL override (OpenAI-compatible direct endpoint).
+<span class="lineno">  128 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcApiKey</span></span></span> :: Maybe Text
+<span class="lineno">  129 </span>    -- ^ Per-child API key override (when @dcBaseUrl@ is set).
+<span class="lineno">  130 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcApiMode</span></span></span> :: Maybe Text
+<span class="lineno">  131 </span>    -- ^ Per-child API mode override (@chat_completions@ / @anthropic_messages@).
+<span class="lineno">  132 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dcSubagentAutoApprove</span></span></span> :: Maybe Bool
+<span class="lineno">  133 </span>    -- ^ Whether subagent dangerous-command approvals auto-approve. Default
+<span class="lineno">  134 </span>    -- False (auto-deny). Not yet wired (no approval callback in the child
+<span class="lineno">  135 </span>    -- worker); reserved for future use.
+<span class="lineno">  136 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | All fields absent — the operator did not set them.
+<span class="lineno">  139 </span>defaultDelegationConfig :: DelegationConfig
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">defaultDelegationConfig = DelegationConfig</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">{ dcMaxConcurrentChildren = Nothing</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">, dcChildTimeoutSeconds   = Nothing</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">, dcMaxSpawnDepth          = Nothing</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">, dcOrchestratorEnabled    = Nothing</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">, dcProvider               = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">, dcModel                  = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">, dcBaseUrl                 = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">, dcApiKey                  = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">, dcApiMode                 = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">, dcSubagentAutoApprove    = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | Compiled-in defaults used when the config is absent.
+<span class="lineno">  154 </span>defaultMaxConcurrentChildren :: Int
+<span class="lineno">  155 </span><span class="decl"><span class="istickedoff">defaultMaxConcurrentChildren = 3</span></span>
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>defaultChildTimeoutSeconds :: Double
+<span class="lineno">  158 </span><span class="decl"><span class="istickedoff">defaultChildTimeoutSeconds = 600</span></span>
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>defaultMaxSpawnDepth :: Int
+<span class="lineno">  161 </span><span class="decl"><span class="istickedoff">defaultMaxSpawnDepth = 1</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>minSpawnDepth :: Int
+<span class="lineno">  164 </span><span class="decl"><span class="istickedoff">minSpawnDepth = 1</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>maxSpawnDepthCap :: Int
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">maxSpawnDepthCap = 3</span></span>
+<span class="lineno">  168 </span>
+<span class="lineno">  169 </span>minChildTimeoutSeconds :: Double
+<span class="lineno">  170 </span><span class="decl"><span class="istickedoff">minChildTimeoutSeconds = 30</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | Resolve a loaded 'DelegationConfig' to its effective numeric knobs, with
+<span class="lineno">  173 </span>-- the documented clamps applied. Provider/model/base_url/api_key/api_mode
+<span class="lineno">  174 </span>-- overrides are read directly from the config (they're 'Maybe'-typed).
+<span class="lineno">  175 </span>resolveDelegationConfig :: DelegationConfig
+<span class="lineno">  176 </span>                       -&gt; (Int, Double, Int, Bool)
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">resolveDelegationConfig cfg =</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">( maxConc</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">, childTimeout</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">, maxDepth</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">, orchEnabled</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">)</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  184 </span><span class="spaces">    </span><span class="istickedoff">maxConc = max 1 $ fromMaybe defaultMaxConcurrentChildren (dcMaxConcurrentChildren cfg)</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">childTimeout = max minChildTimeoutSeconds $</span>
+<span class="lineno">  186 </span><span class="spaces">                     </span><span class="istickedoff">fromMaybe defaultChildTimeoutSeconds (dcChildTimeoutSeconds cfg)</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">rawDepth = fromMaybe defaultMaxSpawnDepth (dcMaxSpawnDepth cfg)</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">maxDepth = max minSpawnDepth (min maxSpawnDepthCap rawDepth)</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">orchEnabled = fromMaybe True (dcOrchestratorEnabled cfg)</span></span>
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>-- | Convert a loaded 'DelegationFileConfig' (from 'Seal.Config.File') to a
+<span class="lineno">  192 </span>-- 'DelegationConfig'. 'Nothing' maps to 'defaultDelegationConfig'.
+<span class="lineno">  193 </span>fromFileConfig :: Maybe ConfigFile.DelegationFileConfig -&gt; DelegationConfig
+<span class="lineno">  194 </span><span class="decl"><span class="istickedoff">fromFileConfig Nothing = defaultDelegationConfig</span>
+<span class="lineno">  195 </span><span class="spaces"></span><span class="istickedoff">fromFileConfig (Just dfc) = <span class="nottickedoff">DelegationConfig</span></span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">{ dcMaxConcurrentChildren = ConfigFile.dfcMaxConcurrentChildren dfc</span></span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcChildTimeoutSeconds   = ConfigFile.dfcChildTimeoutSeconds dfc</span></span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcMaxSpawnDepth          = ConfigFile.dfcMaxSpawnDepth dfc</span></span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcOrchestratorEnabled    = ConfigFile.dfcOrchestratorEnabled dfc</span></span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcProvider               = ConfigFile.dfcProvider dfc</span></span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcModel                  = ConfigFile.dfcModel dfc</span></span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcBaseUrl                 = ConfigFile.dfcBaseUrl dfc</span></span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcApiKey                  = ConfigFile.dfcApiKey dfc</span></span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcApiMode                 = ConfigFile.dfcApiMode dfc</span></span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">, dcSubagentAutoApprove    = ConfigFile.dfcSubagentAutoApprove dfc</span></span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">}</span></span></span>
+<span class="lineno">  207 </span>
+<span class="lineno">  208 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  209 </span>-- Identity
+<span class="lineno">  210 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  211 </span>
+<span class="lineno">  212 </span>-- | Opaque identifier for one live subagent. Smart-constructed from the def
+<span class="lineno">  213 </span>-- id + a short random suffix so multiple concurrent children of the same def
+<span class="lineno">  214 </span>-- don't collide.
+<span class="lineno">  215 </span>newtype SubagentId = SubagentId { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">unSubagentId</span></span></span> :: Text }
+<span class="lineno">  216 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>-- | Mint a fresh 'SubagentId' from a def-id text + 8 hex chars. The def id is
+<span class="lineno">  219 </span>-- embedded for debuggability (the TUI can show which def a subagent ran);
+<span class="lineno">  220 </span>-- the random suffix disambiguates concurrent spawns.
+<span class="lineno">  221 </span>mkSubagentId :: Text -&gt; IO SubagentId
+<span class="lineno">  222 </span><span class="decl"><span class="istickedoff">mkSubagentId defIdText = do</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">suffix &lt;- randomRIO (0 :: Int, 0xFFFFFFFF)</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">pure (SubagentId (defIdText &lt;&gt; &quot;-&quot; &lt;&gt; showHexI32 suffix))</span></span>
+<span class="lineno">  225 </span>
+<span class="lineno">  226 </span>subagentIdText :: SubagentId -&gt; Text
+<span class="lineno">  227 </span><span class="decl"><span class="istickedoff">subagentIdText (SubagentId t) = t</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Show an 'Int' as 8-char zero-padded lowercase hex.
+<span class="lineno">  230 </span>showHexI32 :: Int -&gt; Text
+<span class="lineno">  231 </span><span class="decl"><span class="istickedoff">showHexI32 n = T.justifyRight 8 '0' (T.pack (go n))</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">go x</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">x &lt;= 0</span>    = <span class="nottickedoff">&quot;0&quot;</span></span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = loop x &quot;&quot;</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="istickedoff">loop y acc</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">| y == 0    = acc</span>
+<span class="lineno">  238 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = let (q, r) = y `divMod` 16</span>
+<span class="lineno">  239 </span><span class="spaces">                        </span><span class="istickedoff">c = if r &lt; 10 then toEnum (r + fromEnum '0')</span>
+<span class="lineno">  240 </span><span class="spaces">                                      </span><span class="istickedoff">else toEnum (r - 10 + fromEnum 'a')</span>
+<span class="lineno">  241 </span><span class="spaces">                    </span><span class="istickedoff">in loop q (c : acc)</span></span>
+<span class="lineno">  242 </span>
+<span class="lineno">  243 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  244 </span>-- Tasks &amp; results
+<span class="lineno">  245 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  246 </span>
+<span class="lineno">  247 </span>-- | One task to delegate. The def id resolves the provider/model/system/tools
+<span class="lineno">  248 </span>-- template; the goal is the first user message; the context is optional
+<span class="lineno">  249 </span>-- background appended to the system prompt.
+<span class="lineno">  250 </span>data ChildTask = ChildTask
+<span class="lineno">  251 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ctDefId</span></span></span>   :: !Text
+<span class="lineno">  252 </span>    -- ^ The agent def id to spawn from (must already exist via AGENT_DEF_WRITE).
+<span class="lineno">  253 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ctGoal</span></span></span>    :: !Text
+<span class="lineno">  254 </span>    -- ^ The task goal — becomes the first user message in the child's turn.
+<span class="lineno">  255 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ctContext</span></span></span> :: !(Maybe Text)
+<span class="lineno">  256 </span>    -- ^ Optional background context appended to the system prompt.
+<span class="lineno">  257 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ctRole</span></span></span>    :: !(Maybe Text)
+<span class="lineno">  258 </span>    -- ^ Narrow-only per-task hint: @\&quot;leaf\&quot;@ downgrades an orchestrator
+<span class="lineno">  259 </span>    -- def's child to a leaf (no spawning). Spawning capability is
+<span class="lineno">  260 </span>    -- DEF-authoritative — a leaf def can never be widened by task input
+<span class="lineno">  261 </span>    -- (issue #154: the effective role is computed in W2; this field is
+<span class="lineno">  262 </span>    -- parsed but not yet dispatched on).
+<span class="lineno">  263 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ctIsolateWorkdir</span></span></span> :: !Bool
+<span class="lineno">  264 </span>    -- ^ When 'True', the child gets a fresh empty workdir at
+<span class="lineno">  265 </span>    -- @cache/workdirs/&lt;child-session&gt;@. When 'False' (the default), the
+<span class="lineno">  266 </span>    -- child inherits the parent's workdir (WU-4: repo clones and plan
+<span class="lineno">  267 </span>    -- files visible to children without re-cloning).
+<span class="lineno">  268 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  269 </span>
+<span class="lineno">  270 </span>-- | Why a child stopped.
+<span class="lineno">  271 </span>data ChildExitReason
+<span class="lineno">  272 </span>  = CerCompleted
+<span class="lineno">  273 </span>    -- ^ The child produced a final text response with no further tool calls.
+<span class="lineno">  274 </span>  | CerMaxIterations
+<span class="lineno">  275 </span>    -- ^ The child exhausted its per-run iteration budget (aeMaxTurns).
+<span class="lineno">  276 </span>  | CerTimeout
+<span class="lineno">  277 </span>    -- ^ The child hit @child_timeout_seconds@.
+<span class="lineno">  278 </span>  | CerInterrupted
+<span class="lineno">  279 </span>    -- ^ The parent (or operator) requested an interrupt.
+<span class="lineno">  280 </span>  | CerError
+<span class="lineno">  281 </span>    -- ^ The child raised an exception or the provider failed.
+<span class="lineno">  282 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  283 </span>
+<span class="lineno">  284 </span>-- | Aggregate status for the result entry.
+<span class="lineno">  285 </span>data ChildStatus
+<span class="lineno">  286 </span>  = CsCompleted
+<span class="lineno">  287 </span>  | CsFailed
+<span class="lineno">  288 </span>  | CsTimeout
+<span class="lineno">  289 </span>  | CsInterrupted
+<span class="lineno">  290 </span>  | CsError
+<span class="lineno">  291 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  292 </span>
+<span class="lineno">  293 </span>-- | One entry in the per-child tool-call trace.
+<span class="lineno">  294 </span>data ToolTraceEntry = ToolTraceEntry
+<span class="lineno">  295 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tteTool</span></span></span>        :: !Text
+<span class="lineno">  296 </span>    -- ^ The opcode name.
+<span class="lineno">  297 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tteArgsBytes</span></span></span>   :: !Int
+<span class="lineno">  298 </span>    -- ^ Size of the JSON-encoded input in bytes.
+<span class="lineno">  299 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tteResultBytes</span></span></span> :: !Int
+<span class="lineno">  300 </span>    -- ^ Size of the tool-result content in bytes.
+<span class="lineno">  301 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tteIsError</span></span></span>     :: !Bool
+<span class="lineno">  302 </span>    -- ^ Whether the tool result carried an error.
+<span class="lineno">  303 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ToolTraceEntry</span></span></span></span></span></span></span></span> where
+<span class="lineno">  306 </span>  <span class="decl"><span class="nottickedoff">toJSON t = object</span>
+<span class="lineno">  307 </span><span class="spaces">    </span><span class="nottickedoff">[ &quot;tool&quot;         .= tteTool t</span>
+<span class="lineno">  308 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;args_bytes&quot;   .= tteArgsBytes t</span>
+<span class="lineno">  309 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;result_bytes&quot; .= tteResultBytes t</span>
+<span class="lineno">  310 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;is_error&quot;     .= tteIsError t</span>
+<span class="lineno">  311 </span><span class="spaces">    </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  312 </span>
+<span class="lineno">  313 </span>-- | The structured result of one delegated child. Mirrors the @entry@ dict
+<span class="lineno">  314 </span>-- returned by @delegate_task@'s @_run_single_child@.
+<span class="lineno">  315 </span>data ChildResult = ChildResult
+<span class="lineno">  316 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">crTaskIndex</span></span></span>       :: !Int
+<span class="lineno">  317 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crStatus</span></span></span>          :: !ChildStatus
+<span class="lineno">  318 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crSummary</span></span></span>         :: !(Maybe Text)
+<span class="lineno">  319 </span>    -- ^ The child's final text response (or an error message).
+<span class="lineno">  320 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crExitReason</span></span></span>      :: !ChildExitReason
+<span class="lineno">  321 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crDurationSeconds</span></span></span> :: !Double
+<span class="lineno">  322 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crSubagentId</span></span></span>      :: !SubagentId
+<span class="lineno">  323 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crTokensInput</span></span></span>     :: !Int
+<span class="lineno">  324 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crTokensOutput</span></span></span>    :: !Int
+<span class="lineno">  325 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crToolTrace</span></span></span>       :: ![ToolTraceEntry]
+<span class="lineno">  326 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crError</span></span></span>           :: !(Maybe Text)
+<span class="lineno">  327 </span>    -- ^ Present only when status is CsError / CsTimeout / CsInterrupted.
+<span class="lineno">  328 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crFilesRead</span></span></span>       :: ![Text]
+<span class="lineno">  329 </span>    -- ^ File paths the child read (worker reports via hooks; may be empty).
+<span class="lineno">  330 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crFilesWritten</span></span></span>    :: ![Text]
+<span class="lineno">  331 </span>    -- ^ File paths the child wrote (worker reports via hooks; may be empty).
+<span class="lineno">  332 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crChildSession</span></span></span>    :: !(Maybe SessionId)
+<span class="lineno">  333 </span>    -- ^ The fresh 'SessionId' the child ran under (for transcript lookup).
+<span class="lineno">  334 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ChildResult</span></span></span></span></span></span></span></span> where
+<span class="lineno">  337 </span>  <span class="decl"><span class="nottickedoff">toJSON r = object</span>
+<span class="lineno">  338 </span><span class="spaces">    </span><span class="nottickedoff">[ &quot;task_index&quot;       .= crTaskIndex r</span>
+<span class="lineno">  339 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;subagent_id&quot;      .= subagentIdText (crSubagentId r)</span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;status&quot;           .= T.pack (show (crStatus r))</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;summary&quot;          .= crSummary r</span>
+<span class="lineno">  342 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;exit_reason&quot;      .= T.pack (show (crExitReason r))</span>
+<span class="lineno">  343 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;duration_seconds&quot; .= crDurationSeconds r</span>
+<span class="lineno">  344 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;tokens_input&quot;     .= crTokensInput r</span>
+<span class="lineno">  345 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;tokens_output&quot;    .= crTokensOutput r</span>
+<span class="lineno">  346 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;tool_trace&quot;       .= crToolTrace r</span>
+<span class="lineno">  347 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;error&quot;            .= crError r</span>
+<span class="lineno">  348 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;files_read&quot;       .= crFilesRead r</span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;files_written&quot;    .= crFilesWritten r</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;child_session&quot;    .= fmap sessionIdText (crChildSession r)</span>
+<span class="lineno">  351 </span><span class="spaces">    </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  352 </span>
+<span class="lineno">  353 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  354 </span>-- Worker builder
+<span class="lineno">  355 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  356 </span>
+<span class="lineno">  357 </span>-- | A worker-builder: given a def + fresh session id + the task + the run
+<span class="lineno">  358 </span>-- hooks, run the child turn to completion and return the outcome.
+<span class="lineno">  359 </span>--
+<span class="lineno">  360 </span>-- The wiring layer (Cli.hs, Channels.Loop.hs, Gateway.Send.hs) closes over
+<span class="lineno">  361 </span>-- the per-turn 'AgentEnv' deps (caps, execBackend, appEnv, eCfg, parent
+<span class="lineno">  362 </span>-- session id, parent depth) and produces the IO action. Keeping this as a
+<span class="lineno">  363 </span>-- parameter decouples the opcode from 'Seal.Agent.Loop.runTurn' / provider
+<span class="lineno">  364 </span>-- resolution so the opcode is unit-testable with a fake worker.
+<span class="lineno">  365 </span>type AgentWorkerBuilder
+<span class="lineno">  366 </span>  =  AgentDef
+<span class="lineno">  367 </span>  -&gt; SessionId
+<span class="lineno">  368 </span>  -&gt; ChildTask
+<span class="lineno">  369 </span>  -&gt; ChildRunHooks
+<span class="lineno">  370 </span>  -&gt; IO ChildWorkerOutcome
+<span class="lineno">  371 </span>
+<span class="lineno">  372 </span>-- | Thread-safe accumulators the worker-builder writes to during the child
+<span class="lineno">  373 </span>-- run. 'runDelegate' reads them after the worker returns to populate the
+<span class="lineno">  374 </span>-- 'ChildResult'. The worker appends to these via 'atomicModifyIORef'' (the
+<span class="lineno">  375 </span>-- IORefs are single-writer-per-child, but atomicModify is cheap and safe).
+<span class="lineno">  376 </span>data ChildRunHooks = ChildRunHooks
+<span class="lineno">  377 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crhToolTrace</span></span></span>    :: IORef [ToolTraceEntry]
+<span class="lineno">  378 </span>    -- ^ Append-only tool-trace accumulator.
+<span class="lineno">  379 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crhFilesRead</span></span></span>    :: IORef [Text]
+<span class="lineno">  380 </span>    -- ^ Append-only file-read accumulator.
+<span class="lineno">  381 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crhFilesWritten</span></span></span> :: IORef [Text]
+<span class="lineno">  382 </span>    -- ^ Append-only file-written accumulator.
+<span class="lineno">  383 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">crhInterrupted</span></span></span>  :: IORef Bool
+<span class="lineno">  384 </span>    -- ^ Polled by the worker between iterations; when 'True' the worker
+<span class="lineno">  385 </span>    -- should stop at its next turn boundary and return 'CwoInterrupted'.
+<span class="lineno">  386 </span>  }
+<span class="lineno">  387 </span>
+<span class="lineno">  388 </span>-- | What the worker-builder reports back to 'runDelegate'. The builder does
+<span class="lineno">  389 </span>-- NOT fill @crTaskIndex@ / @crSubagentId@ / @crDurationSeconds@ — those are
+<span class="lineno">  390 </span>-- filled in by the orchestrator. It DOES fill in the summary, tokens, exit
+<span class="lineno">  391 </span>-- reason, and child session id it observed.
+<span class="lineno">  392 </span>data ChildWorkerOutcome = ChildWorkerOutcome
+<span class="lineno">  393 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cwoSummary</span></span></span>      :: !(Maybe Text)
+<span class="lineno">  394 </span>    -- ^ The final text response from the child (or an error message).
+<span class="lineno">  395 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cwoExitReason</span></span></span>   :: !ChildExitReason
+<span class="lineno">  396 </span>    -- ^ How the child's run ended (from the worker's perspective).
+<span class="lineno">  397 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cwoTokensInput</span></span></span>  :: !Int
+<span class="lineno">  398 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cwoTokensOutput</span></span></span> :: !Int
+<span class="lineno">  399 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cwoChildSession</span></span></span> :: !(Maybe SessionId)
+<span class="lineno">  400 </span>    -- ^ The 'SessionId' the worker ran under (so the parent can look up the
+<span class="lineno">  401 </span>    -- child's transcript later).
+<span class="lineno">  402 </span>  }
+<span class="lineno">  403 </span>
+<span class="lineno">  404 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  405 </span>-- Pause control
+<span class="lineno">  406 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  407 </span>
+<span class="lineno">  408 </span>-- | A process-global flag that, when paused, makes 'runDelegate' reject new
+<span class="lineno">  409 </span>-- spawns with a structured error. Running children keep running; only NEW
+<span class="lineno">  410 </span>-- 'runDelegate' calls fail fast until 'setSpawnPaused' clears the flag.
+<span class="lineno">  411 </span>newtype SpawnPauseFlag = SpawnPauseFlag (TVar Bool)
+<span class="lineno">  412 </span>
+<span class="lineno">  413 </span>newSpawnPauseFlag :: IO SpawnPauseFlag
+<span class="lineno">  414 </span><span class="decl"><span class="istickedoff">newSpawnPauseFlag = SpawnPauseFlag &lt;$&gt; newTVarIO False</span></span>
+<span class="lineno">  415 </span>
+<span class="lineno">  416 </span>setSpawnPaused :: SpawnPauseFlag -&gt; Bool -&gt; IO Bool
+<span class="lineno">  417 </span><span class="decl"><span class="istickedoff">setSpawnPaused (SpawnPauseFlag tv) paused = do</span>
+<span class="lineno">  418 </span><span class="spaces">  </span><span class="istickedoff">atomically (writeTVar tv paused)</span>
+<span class="lineno">  419 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">paused</span></span></span>
+<span class="lineno">  420 </span>
+<span class="lineno">  421 </span>isSpawnPaused :: SpawnPauseFlag -&gt; IO Bool
+<span class="lineno">  422 </span><span class="decl"><span class="istickedoff">isSpawnPaused (SpawnPauseFlag tv) = readTVarIO tv</span></span>
+<span class="lineno">  423 </span>
+<span class="lineno">  424 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  425 </span>-- Parent activity heartbeat
+<span class="lineno">  426 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  427 </span>
+<span class="lineno">  428 </span>-- | A mutable cell the parent's gateway/loop touches to record \&quot;the parent
+<span class="lineno">  429 </span>-- is alive and working\&quot;. 'runDelegate' starts a heartbeat thread that
+<span class="lineno">  430 </span>-- periodically touches this while a child runs, so the parent's gateway
+<span class="lineno">  431 </span>-- inactivity timeout doesn't fire during a long delegation.
+<span class="lineno">  432 </span>newtype ParentActivity = ParentActivity (MVar ())
+<span class="lineno">  433 </span>
+<span class="lineno">  434 </span>newParentActivity :: IO ParentActivity
+<span class="lineno">  435 </span><span class="decl"><span class="istickedoff">newParentActivity = ParentActivity &lt;$&gt; newMVar <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  436 </span>
+<span class="lineno">  437 </span>-- | Touch the parent-activity cell (idempotent, never blocks).
+<span class="lineno">  438 </span>touchParentActivity :: ParentActivity -&gt; IO ()
+<span class="lineno">  439 </span><span class="decl"><span class="istickedoff">touchParentActivity (ParentActivity mv) =</span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="istickedoff">void (tryPutMVar mv <span class="nottickedoff">()</span> &gt;&gt; tryTakeMVar mv)</span></span>
+<span class="lineno">  441 </span>
+<span class="lineno">  442 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  443 </span>-- Run
+<span class="lineno">  444 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  445 </span>
+<span class="lineno">  446 </span>-- | The input to 'runDelegate' — one task to run (single mode) or many
+<span class="lineno">  447 </span>-- (batch mode). The caller (the AGENT_START opcode) normalizes the model's
+<span class="lineno">  448 </span>-- input to this before calling.
+<span class="lineno">  449 </span>data DelegateInput
+<span class="lineno">  450 </span>  = DiSingle !ChildTask
+<span class="lineno">  451 </span>  | DiBatch ![ChildTask]
+<span class="lineno">  452 </span>
+<span class="lineno">  453 </span>-- | Spawn-time info for one async-forked child. Returned immediately by
+<span class="lineno">  454 </span>-- 'runDelegateAsync' so the parent can track the child via 'subagent_id'
+<span class="lineno">  455 </span>-- and 'child_session' before it finishes.
+<span class="lineno">  456 </span>data SpawnInfo = SpawnInfo
+<span class="lineno">  457 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">siSubagentId</span></span></span>   :: !SubagentId
+<span class="lineno">  458 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siChildSession</span></span></span> :: !SessionId
+<span class="lineno">  459 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siTaskIndex</span></span></span>    :: !Int
+<span class="lineno">  460 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  461 </span>
+<span class="lineno">  462 </span>-- | The callback the opcode layer provides to 'runDelegateAsync'. Called
+<span class="lineno">  463 </span>-- from a forked child thread when the child completes (or errors/times
+<span class="lineno">  464 </span>-- out). The callback is responsible for durably appending the
+<span class="lineno">  465 </span>-- 'ChildResult' to the parent's transcript and updating the registry.
+<span class="lineno">  466 </span>type AgentCompletionCallback = ChildResult -&gt; IO ()
+<span class="lineno">  467 </span>
+<span class="lineno">  468 </span>-- | The callback called from the parent thread AFTER the child worker
+<span class="lineno">  469 </span>-- thread is forked. The opcode layer uses this to register the child in
+<span class="lineno">  470 </span>-- the 'AgentRuntime' (so 'AGENT_INSTANCES' lists it while running, and
+<span class="lineno">  471 </span>-- 'AGENT_STOP' can kill the correct thread). Receives the 'SubagentId',
+<span class="lineno">  472 </span>-- the resolved 'AgentDef', the pre-minted 'SessionId', and the child's
+<span class="lineno">  473 </span>-- forked 'ThreadId'.
+<span class="lineno">  474 </span>type SpawnCallback = SubagentId -&gt; AgentDef -&gt; SessionId -&gt; ThreadId -&gt; IO ()
+<span class="lineno">  475 </span>
+<span class="lineno">  476 </span>-- | The top-level delegation runner. Spawns one or more child agents, runs
+<span class="lineno">  477 </span>-- each against its goal to completion (synchronously), and returns a
+<span class="lineno">  478 </span>-- 'ChildResult' per task. The parent blocks until all children finish (or
+<span class="lineno">  479 </span>-- time out). See the module header for the feature list.
+<span class="lineno">  480 </span>runDelegate
+<span class="lineno">  481 </span>  :: DelegationConfig
+<span class="lineno">  482 </span>  -&gt; SpawnPauseFlag
+<span class="lineno">  483 </span>  -&gt; Maybe ParentActivity
+<span class="lineno">  484 </span>  -&gt; Int
+<span class="lineno">  485 </span>     -- ^ the parent's current delegation depth (0 = top-level parent)
+<span class="lineno">  486 </span>  -&gt; DelegateInput
+<span class="lineno">  487 </span>  -&gt; (ChildTask -&gt; IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId)))
+<span class="lineno">  488 </span>     -- ^ resolver: look up the def, build the worker, mint a fresh child
+<span class="lineno">  489 </span>     -- 'SessionId'. 'Left' = def not found / invalid / depth would be
+<span class="lineno">  490 </span>     -- exceeded. Per-task so the caller can cache or re-resolve.
+<span class="lineno">  491 </span>  -&gt; IO (Either Text [ChildResult])
+<span class="lineno">  492 </span><span class="decl"><span class="istickedoff">runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do</span>
+<span class="lineno">  493 </span><span class="spaces">  </span><span class="istickedoff">paused &lt;- isSpawnPaused pauseFlag</span>
+<span class="lineno">  494 </span><span class="spaces">  </span><span class="istickedoff">if paused</span>
+<span class="lineno">  495 </span><span class="spaces">    </span><span class="istickedoff">then pure (Left &quot;Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying.&quot;)</span>
+<span class="lineno">  496 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  497 </span><span class="spaces">      </span><span class="istickedoff">let (maxConc, childTimeout, maxDepth, _orchEnabled) = resolveDelegationConfig cfg</span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">parentDepth &gt;= maxDepth</span></span>
+<span class="lineno">  499 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (&quot;Delegation depth limit reached (depth=&quot; &lt;&gt; T.pack (show parentDepth)</span></span>
+<span class="lineno">  500 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;, max_spawn_depth=&quot; &lt;&gt; T.pack (show maxDepth)</span></span>
+<span class="lineno">  501 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;). Raise delegation.max_spawn_depth in config.toml if deeper nesting is required (cap: &quot;</span></span>
+<span class="lineno">  502 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show maxSpawnDepthCap) &lt;&gt; &quot;).&quot;))</span></span>
+<span class="lineno">  503 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  504 </span><span class="spaces">          </span><span class="istickedoff">tasks &lt;- case input of</span>
+<span class="lineno">  505 </span><span class="spaces">            </span><span class="istickedoff">DiSingle t -&gt; pure [t]</span>
+<span class="lineno">  506 </span><span class="spaces">            </span><span class="istickedoff">DiBatch ts -&gt; pure ts</span>
+<span class="lineno">  507 </span><span class="spaces">          </span><span class="istickedoff">if null tasks</span>
+<span class="lineno">  508 </span><span class="spaces">            </span><span class="istickedoff">then pure (Left &quot;No tasks provided.&quot;)</span>
+<span class="lineno">  509 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  510 </span><span class="spaces">              </span><span class="istickedoff">when (length tasks &gt; maxConc) $</span>
+<span class="lineno">  511 </span><span class="spaces">                </span><span class="istickedoff">-- We don't reject oversize batches; the semaphore caps</span>
+<span class="lineno">  512 </span><span class="spaces">                </span><span class="istickedoff">-- parallelism. (delegate_task rejects; we cap.)</span>
+<span class="lineno">  513 </span><span class="spaces">                </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  514 </span><span class="spaces">              </span><span class="istickedoff">runBatch maxConc childTimeout tasks</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  516 </span><span class="spaces">    </span><span class="istickedoff">-- Run all tasks with a concurrency cap. Single-task short-cut avoids the</span>
+<span class="lineno">  517 </span><span class="spaces">    </span><span class="istickedoff">-- thread-pool overhead.</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="istickedoff">runBatch :: Int -&gt; Double -&gt; [ChildTask] -&gt; IO (Either Text [ChildResult])</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="istickedoff">runBatch maxConc childTimeout tasks =</span>
+<span class="lineno">  520 </span><span class="spaces">      </span><span class="istickedoff">case tasks of</span>
+<span class="lineno">  521 </span><span class="spaces">        </span><span class="istickedoff">[t] -&gt; do</span>
+<span class="lineno">  522 </span><span class="spaces">          </span><span class="istickedoff">r &lt;- runOne 0 t childTimeout</span>
+<span class="lineno">  523 </span><span class="spaces">          </span><span class="istickedoff">pure (Right [r])</span>
+<span class="lineno">  524 </span><span class="spaces">        </span><span class="istickedoff">_   -&gt; do</span>
+<span class="lineno">  525 </span><span class="spaces">          </span><span class="istickedoff">sem &lt;- newTVarIO maxConc</span>
+<span class="lineno">  526 </span><span class="spaces">          </span><span class="istickedoff">mvars &lt;- forM (zip [0 ..] tasks) $ \(idx, task) -&gt; do</span>
+<span class="lineno">  527 </span><span class="spaces">            </span><span class="istickedoff">resMVar &lt;- newEmptyMVar</span>
+<span class="lineno">  528 </span><span class="spaces">            </span><span class="istickedoff">void (forkIO $</span>
+<span class="lineno">  529 </span><span class="spaces">              </span><span class="istickedoff">bracketSem sem $</span>
+<span class="lineno">  530 </span><span class="spaces">                </span><span class="istickedoff">runOne idx task childTimeout &gt;&gt;= putMVar resMVar)</span>
+<span class="lineno">  531 </span><span class="spaces">            </span><span class="istickedoff">pure resMVar</span>
+<span class="lineno">  532 </span><span class="spaces">          </span><span class="istickedoff">results &lt;- forM mvars readMVar</span>
+<span class="lineno">  533 </span><span class="spaces">          </span><span class="istickedoff">pure (Right results)</span>
+<span class="lineno">  534 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  535 </span><span class="spaces">    </span><span class="istickedoff">-- Acquire / release the counting semaphore around an IO action. The</span>
+<span class="lineno">  536 </span><span class="spaces">    </span><span class="istickedoff">-- semaphore is a 'TVar Int' initialized to @maxConc@: each acquire</span>
+<span class="lineno">  537 </span><span class="spaces">    </span><span class="istickedoff">-- atomically decrements (blocking if zero via 'retry'), each release</span>
+<span class="lineno">  538 </span><span class="spaces">    </span><span class="istickedoff">-- atomically increments. This allows up to @maxConc@ concurrent holders,</span>
+<span class="lineno">  539 </span><span class="spaces">    </span><span class="istickedoff">-- unlike the previous 'MVar'-based approach which was a binary semaphore</span>
+<span class="lineno">  540 </span><span class="spaces">    </span><span class="istickedoff">-- (mutex) that serialized all children regardless of @maxConc@.</span>
+<span class="lineno">  541 </span><span class="spaces">    </span><span class="istickedoff">bracketSem :: TVar Int -&gt; IO a -&gt; IO a</span>
+<span class="lineno">  542 </span><span class="spaces">    </span><span class="istickedoff">bracketSem sem act = bracket acquire release (const act)</span>
+<span class="lineno">  543 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  544 </span><span class="spaces">        </span><span class="istickedoff">acquire = atomically $ do</span>
+<span class="lineno">  545 </span><span class="spaces">          </span><span class="istickedoff">n &lt;- readTVar sem</span>
+<span class="lineno">  546 </span><span class="spaces">          </span><span class="istickedoff">if n &gt; 0</span>
+<span class="lineno">  547 </span><span class="spaces">            </span><span class="istickedoff">then writeTVar sem (n - 1)</span>
+<span class="lineno">  548 </span><span class="spaces">            </span><span class="istickedoff">else retry</span>
+<span class="lineno">  549 </span><span class="spaces">        </span><span class="istickedoff">release _ = atomically (modifyTVar' sem (+1))</span>
+<span class="lineno">  550 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  551 </span><span class="spaces">    </span><span class="istickedoff">-- Run a single task to completion with a hard timeout and a heartbeat</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">-- thread that touches the parent-activity cell.</span>
+<span class="lineno">  553 </span><span class="spaces">    </span><span class="istickedoff">runOne :: Int -&gt; ChildTask -&gt; Double -&gt; IO ChildResult</span>
+<span class="lineno">  554 </span><span class="spaces">    </span><span class="istickedoff">runOne idx task childTimeout = do</span>
+<span class="lineno">  555 </span><span class="spaces">      </span><span class="istickedoff">subagentId &lt;- mkSubagentId (ctDefId task)</span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="istickedoff">let micros = round (childTimeout * 1000000) :: Int</span>
+<span class="lineno">  557 </span><span class="spaces">      </span><span class="istickedoff">start &lt;- getCurrentTime</span>
+<span class="lineno">  558 </span><span class="spaces">      </span><span class="istickedoff">-- Thread-safe accumulators the worker writes to.</span>
+<span class="lineno">  559 </span><span class="spaces">      </span><span class="istickedoff">traceRef     &lt;- newIORef []</span>
+<span class="lineno">  560 </span><span class="spaces">      </span><span class="istickedoff">readRef     &lt;- newIORef []</span>
+<span class="lineno">  561 </span><span class="spaces">      </span><span class="istickedoff">writtenRef  &lt;- newIORef []</span>
+<span class="lineno">  562 </span><span class="spaces">      </span><span class="istickedoff">interruptedRef &lt;- newIORef <span class="nottickedoff">False</span></span>
+<span class="lineno">  563 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef</span></span>
+<span class="lineno">  564 </span><span class="spaces">      </span><span class="istickedoff">mRes &lt;- resolveTask <span class="nottickedoff">task</span> &gt;&gt;= \case</span>
+<span class="lineno">  565 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  566 </span><span class="spaces">        </span><span class="istickedoff">Right (def, worker, childSid) -&gt; do</span>
+<span class="lineno">  567 </span><span class="spaces">          </span><span class="istickedoff">-- Start the heartbeat thread.</span>
+<span class="lineno">  568 </span><span class="spaces">          </span><span class="istickedoff">hbStop &lt;- newEmptyMVar</span>
+<span class="lineno">  569 </span><span class="spaces">          </span><span class="istickedoff">hbThreadId &lt;- forkIO (heartbeatLoop mParentActivity hbStop)</span>
+<span class="lineno">  570 </span><span class="spaces">          </span><span class="istickedoff">let runWithCatch =</span>
+<span class="lineno">  571 </span><span class="spaces">                </span><span class="istickedoff">worker <span class="nottickedoff">def</span> <span class="nottickedoff">childSid</span> task <span class="nottickedoff">hooks</span></span>
+<span class="lineno">  572 </span><span class="spaces">                  </span><span class="istickedoff">`catch` \e -&gt; pure (ChildWorkerOutcome</span>
+<span class="lineno">  573 </span><span class="spaces">                                       </span><span class="istickedoff">(Just (T.pack (show (e :: SomeException))))</span>
+<span class="lineno">  574 </span><span class="spaces">                                       </span><span class="istickedoff">CerError 0 0 (Just <span class="nottickedoff">childSid</span>))</span>
+<span class="lineno">  575 </span><span class="spaces">          </span><span class="istickedoff">mOutcome &lt;- timeout micros runWithCatch</span>
+<span class="lineno">  576 </span><span class="spaces">          </span><span class="istickedoff">-- Stop the heartbeat.</span>
+<span class="lineno">  577 </span><span class="spaces">          </span><span class="istickedoff">void (tryPutMVar hbStop <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  578 </span><span class="spaces">          </span><span class="istickedoff">killThread hbThreadId</span>
+<span class="lineno">  579 </span><span class="spaces">          </span><span class="istickedoff">pure (maybe <span class="nottickedoff">(Left &quot;timeout&quot;)</span> Right mOutcome)</span>
+<span class="lineno">  580 </span><span class="spaces">      </span><span class="istickedoff">end &lt;- getCurrentTime</span>
+<span class="lineno">  581 </span><span class="spaces">      </span><span class="istickedoff">let dur = realToFrac (end `diffUTCTime` start) :: Double</span>
+<span class="lineno">  582 </span><span class="spaces">      </span><span class="istickedoff">case mRes of</span>
+<span class="lineno">  583 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt;</span>
+<span class="lineno">  584 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure (ChildResult</span></span>
+<span class="lineno">  585 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">{ crTaskIndex = idx</span></span>
+<span class="lineno">  586 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crStatus = if err == &quot;timeout&quot; then CsTimeout else CsError</span></span>
+<span class="lineno">  587 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crSummary = Nothing</span></span>
+<span class="lineno">  588 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crExitReason = if err == &quot;timeout&quot; then CerTimeout else CerError</span></span>
+<span class="lineno">  589 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crDurationSeconds = dur</span></span>
+<span class="lineno">  590 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crSubagentId = subagentId</span></span>
+<span class="lineno">  591 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crTokensInput = 0</span></span>
+<span class="lineno">  592 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crTokensOutput = 0</span></span>
+<span class="lineno">  593 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crToolTrace = []</span></span>
+<span class="lineno">  594 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crError = Just (if err == &quot;timeout&quot;</span></span>
+<span class="lineno">  595 </span><span class="spaces">                                      </span><span class="istickedoff"><span class="nottickedoff">then &quot;Subagent timed out after &quot; &lt;&gt; T.pack (show childTimeout) &lt;&gt; &quot;s.&quot;</span></span>
+<span class="lineno">  596 </span><span class="spaces">                                      </span><span class="istickedoff"><span class="nottickedoff">else err)</span></span>
+<span class="lineno">  597 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crFilesRead = []</span></span>
+<span class="lineno">  598 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crFilesWritten = []</span></span>
+<span class="lineno">  599 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, crChildSession = Nothing</span></span>
+<span class="lineno">  600 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">})</span></span>
+<span class="lineno">  601 </span><span class="spaces">        </span><span class="istickedoff">Right outcome -&gt; do</span>
+<span class="lineno">  602 </span><span class="spaces">          </span><span class="istickedoff">traceList &lt;- readIORef traceRef</span>
+<span class="lineno">  603 </span><span class="spaces">          </span><span class="istickedoff">filesRead &lt;- readIORef readRef</span>
+<span class="lineno">  604 </span><span class="spaces">          </span><span class="istickedoff">filesWritten &lt;- readIORef writtenRef</span>
+<span class="lineno">  605 </span><span class="spaces">          </span><span class="istickedoff">pure (ChildResult</span>
+<span class="lineno">  606 </span><span class="spaces">                  </span><span class="istickedoff">{ crTaskIndex = idx</span>
+<span class="lineno">  607 </span><span class="spaces">                  </span><span class="istickedoff">, crStatus = childStatusFor (cwoExitReason outcome)</span>
+<span class="lineno">  608 </span><span class="spaces">                  </span><span class="istickedoff">, crSummary = cwoSummary outcome</span>
+<span class="lineno">  609 </span><span class="spaces">                  </span><span class="istickedoff">, crExitReason = cwoExitReason outcome</span>
+<span class="lineno">  610 </span><span class="spaces">                  </span><span class="istickedoff">, crDurationSeconds = dur</span>
+<span class="lineno">  611 </span><span class="spaces">                  </span><span class="istickedoff">, crSubagentId = subagentId</span>
+<span class="lineno">  612 </span><span class="spaces">                  </span><span class="istickedoff">, crTokensInput = cwoTokensInput outcome</span>
+<span class="lineno">  613 </span><span class="spaces">                  </span><span class="istickedoff">, crTokensOutput = cwoTokensOutput outcome</span>
+<span class="lineno">  614 </span><span class="spaces">                  </span><span class="istickedoff">, crToolTrace = reverse traceList</span>
+<span class="lineno">  615 </span><span class="spaces">                  </span><span class="istickedoff">, crError = Nothing</span>
+<span class="lineno">  616 </span><span class="spaces">                  </span><span class="istickedoff">, crFilesRead = reverse filesRead</span>
+<span class="lineno">  617 </span><span class="spaces">                  </span><span class="istickedoff">, crFilesWritten = reverse filesWritten</span>
+<span class="lineno">  618 </span><span class="spaces">                  </span><span class="istickedoff">, crChildSession = cwoChildSession outcome</span>
+<span class="lineno">  619 </span><span class="spaces">                   </span><span class="istickedoff">})</span></span>
+<span class="lineno">  620 </span>
+<span class="lineno">  621 </span>-- | The async delegation runner. Forks one worker per task (respecting
+<span class="lineno">  622 </span>-- 'max_concurrent_children'), registers each child in the 'AgentRuntime'
+<span class="lineno">  623 </span>-- at spawn time, and returns immediately with per-child 'SpawnInfo'.
+<span class="lineno">  624 </span>-- Children run in parallel in forked threads; when a child finishes, its
+<span class="lineno">  625 </span>-- 'ChildResult' is passed to the 'AgentCompletionCallback' (which the
+<span class="lineno">  626 </span>-- opcode layer uses to append the result to the parent's transcript and
+<span class="lineno">  627 </span>-- update the registry).
+<span class="lineno">  628 </span>--
+<span class="lineno">  629 </span>-- The pause check and depth check are synchronous (before any forking);
+<span class="lineno">  630 </span>-- resolve errors and worker completion are async (in the forked threads).
+<span class="lineno">  631 </span>-- Per-child timeout is governed solely by
+<span class="lineno">  632 </span>-- 'dcChildTimeoutSeconds' (default 600s).
+<span class="lineno">  633 </span>runDelegateAsync
+<span class="lineno">  634 </span>  :: DelegationConfig
+<span class="lineno">  635 </span>  -&gt; SpawnPauseFlag
+<span class="lineno">  636 </span>  -&gt; Maybe ParentActivity
+<span class="lineno">  637 </span>  -&gt; Int
+<span class="lineno">  638 </span>     -- ^ the parent's current delegation depth (0 = top-level parent)
+<span class="lineno">  639 </span>  -&gt; DelegateInput
+<span class="lineno">  640 </span>  -&gt; (ChildTask -&gt; IO (Either Text (AgentDef, AgentWorkerBuilder)))
+<span class="lineno">  641 </span>     -- ^ resolver: look up the def, build the worker. 'Left' = def not
+<span class="lineno">  642 </span>     -- found / invalid / depth exceeded. The session id is NOT minted by
+<span class="lineno">  643 </span>     -- the resolver — 'spawnOne' mints the session before calling it.
+<span class="lineno">  644 </span>  -&gt; AgentCompletionCallback
+<span class="lineno">  645 </span>     -- ^ completion callback (called from forked child threads)
+<span class="lineno">  646 </span>  -&gt; SpawnCallback
+<span class="lineno">  647 </span>     -- ^ spawn callback (called after resolve success, before the worker
+<span class="lineno">  648 </span>     -- runs — used to register the child in the 'AgentRuntime').
+<span class="lineno">  649 </span>  -&gt; IO SessionId
+<span class="lineno">  650 </span>     -- ^ mint a fresh 'SessionId' for each child (called before forking
+<span class="lineno">  651 </span>     -- so the session is available in 'SpawnInfo' immediately).
+<span class="lineno">  652 </span>  -&gt; IO (Either Text [SpawnInfo])
+<span class="lineno">  653 </span><span class="decl"><span class="istickedoff">runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask callback spawnCallback mintSession = do</span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">paused &lt;- isSpawnPaused pauseFlag</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">if paused</span>
+<span class="lineno">  656 </span><span class="spaces">    </span><span class="istickedoff">then pure (Left &quot;Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying.&quot;)</span>
+<span class="lineno">  657 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  658 </span><span class="spaces">      </span><span class="istickedoff">let (maxConc, childTimeout, maxDepth, _orchEnabled) = resolveDelegationConfig cfg</span>
+<span class="lineno">  659 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">parentDepth &gt;= maxDepth</span></span>
+<span class="lineno">  660 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (&quot;Delegation depth limit reached (depth=&quot; &lt;&gt; T.pack (show parentDepth)</span></span>
+<span class="lineno">  661 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;, max_spawn_depth=&quot; &lt;&gt; T.pack (show maxDepth)</span></span>
+<span class="lineno">  662 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;). Raise delegation.max_spawn_depth in config.toml if deeper nesting is required (cap: &quot;</span></span>
+<span class="lineno">  663 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show maxSpawnDepthCap) &lt;&gt; &quot;).&quot;))</span></span>
+<span class="lineno">  664 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  665 </span><span class="spaces">          </span><span class="istickedoff">tasks &lt;- case input of</span>
+<span class="lineno">  666 </span><span class="spaces">            </span><span class="istickedoff">DiSingle t -&gt; pure [t]</span>
+<span class="lineno">  667 </span><span class="spaces">            </span><span class="istickedoff">DiBatch ts -&gt; pure ts</span>
+<span class="lineno">  668 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">null tasks</span></span>
+<span class="lineno">  669 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure (Left &quot;No tasks provided.&quot;)</span></span>
+<span class="lineno">  670 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  671 </span><span class="spaces">              </span><span class="istickedoff">spawnInfos &lt;- runBatchAsync maxConc childTimeout tasks</span>
+<span class="lineno">  672 </span><span class="spaces">              </span><span class="istickedoff">pure (Right spawnInfos)</span>
+<span class="lineno">  673 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  674 </span><span class="spaces">    </span><span class="istickedoff">-- Fork all tasks with a concurrency cap. Returns immediately after</span>
+<span class="lineno">  675 </span><span class="spaces">    </span><span class="istickedoff">-- forking (each forked thread runs the child to completion).</span>
+<span class="lineno">  676 </span><span class="spaces">    </span><span class="istickedoff">runBatchAsync :: Int -&gt; Double -&gt; [ChildTask] -&gt; IO [SpawnInfo]</span>
+<span class="lineno">  677 </span><span class="spaces">    </span><span class="istickedoff">runBatchAsync maxConc childTimeout tasks =</span>
+<span class="lineno">  678 </span><span class="spaces">      </span><span class="istickedoff">case tasks of</span>
+<span class="lineno">  679 </span><span class="spaces">        </span><span class="istickedoff">[t] -&gt; do</span>
+<span class="lineno">  680 </span><span class="spaces">          </span><span class="istickedoff">si &lt;- spawnOne 0 t childTimeout Nothing</span>
+<span class="lineno">  681 </span><span class="spaces">          </span><span class="istickedoff">pure [si]</span>
+<span class="lineno">  682 </span><span class="spaces">        </span><span class="istickedoff">_   -&gt; do</span>
+<span class="lineno">  683 </span><span class="spaces">          </span><span class="istickedoff">sem &lt;- newTVarIO maxConc</span>
+<span class="lineno">  684 </span><span class="spaces">          </span><span class="istickedoff">forM (zip [0 ..] tasks) $ \(idx, task) -&gt; do</span>
+<span class="lineno">  685 </span><span class="spaces">            </span><span class="istickedoff">spawnOne idx task childTimeout (Just sem)</span>
+<span class="lineno">  686 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  687 </span><span class="spaces">    </span><span class="istickedoff">-- Spawn one child: resolve synchronously, register via spawnCallback,</span>
+<span class="lineno">  688 </span><span class="spaces">    </span><span class="istickedoff">-- then fork the worker execution. Returns SpawnInfo immediately.</span>
+<span class="lineno">  689 </span><span class="spaces">    </span><span class="istickedoff">-- The session is minted INSIDE the semaphore (when present) so that</span>
+<span class="lineno">  690 </span><span class="spaces">    </span><span class="istickedoff">-- concurrent spawns don't mint in the same microsecond — the random</span>
+<span class="lineno">  691 </span><span class="spaces">    </span><span class="istickedoff">-- suffix in 'mintSession' makes collisions vanishingly unlikely, but</span>
+<span class="lineno">  692 </span><span class="spaces">    </span><span class="istickedoff">-- serializing the mint through the semaphore is a belt-and-suspenders</span>
+<span class="lineno">  693 </span><span class="spaces">    </span><span class="istickedoff">-- guarantee.</span>
+<span class="lineno">  694 </span><span class="spaces">    </span><span class="istickedoff">spawnOne :: Int -&gt; ChildTask -&gt; Double -&gt; Maybe (TVar Int) -&gt; IO SpawnInfo</span>
+<span class="lineno">  695 </span><span class="spaces">    </span><span class="istickedoff">spawnOne idx task childTimeout mSem = do</span>
+<span class="lineno">  696 </span><span class="spaces">      </span><span class="istickedoff">subagentId &lt;- mkSubagentId (ctDefId task)</span>
+<span class="lineno">  697 </span><span class="spaces">      </span><span class="istickedoff">let micros = round (childTimeout * 1000000) :: Int</span>
+<span class="lineno">  698 </span><span class="spaces">          </span><span class="istickedoff">mkChild :: IO SpawnInfo</span>
+<span class="lineno">  699 </span><span class="spaces">          </span><span class="istickedoff">mkChild = do</span>
+<span class="lineno">  700 </span><span class="spaces">            </span><span class="istickedoff">childSid &lt;- mintSession</span>
+<span class="lineno">  701 </span><span class="spaces">            </span><span class="istickedoff">start &lt;- getCurrentTime</span>
+<span class="lineno">  702 </span><span class="spaces">            </span><span class="istickedoff">traceRef     &lt;- newIORef []</span>
+<span class="lineno">  703 </span><span class="spaces">            </span><span class="istickedoff">readRef     &lt;- newIORef []</span>
+<span class="lineno">  704 </span><span class="spaces">            </span><span class="istickedoff">writtenRef  &lt;- newIORef []</span>
+<span class="lineno">  705 </span><span class="spaces">            </span><span class="istickedoff">interruptedRef &lt;- newIORef <span class="nottickedoff">False</span></span>
+<span class="lineno">  706 </span><span class="spaces">            </span><span class="istickedoff">let <span class="nottickedoff">hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef</span></span>
+<span class="lineno">  707 </span><span class="spaces">            </span><span class="istickedoff">mResolve &lt;- resolveTask task</span>
+<span class="lineno">  708 </span><span class="spaces">            </span><span class="istickedoff">case mResolve of</span>
+<span class="lineno">  709 </span><span class="spaces">              </span><span class="istickedoff">Left err -&gt; do</span>
+<span class="lineno">  710 </span><span class="spaces">                </span><span class="istickedoff">-- Resolve error: fork the error callback (async).</span>
+<span class="lineno">  711 </span><span class="spaces">                </span><span class="istickedoff">end &lt;- getCurrentTime</span>
+<span class="lineno">  712 </span><span class="spaces">                </span><span class="istickedoff">let dur = realToFrac (end `diffUTCTime` start) :: Double</span>
+<span class="lineno">  713 </span><span class="spaces">                    </span><span class="istickedoff">result = mkErrorResult idx subagentId dur err Nothing</span>
+<span class="lineno">  714 </span><span class="spaces">                </span><span class="istickedoff">void (forkIO (callback result))</span>
+<span class="lineno">  715 </span><span class="spaces">              </span><span class="istickedoff">Right (def, worker) -&gt; do</span>
+<span class="lineno">  716 </span><span class="spaces">                </span><span class="istickedoff">-- Fork the worker execution (async), then register the</span>
+<span class="lineno">  717 </span><span class="spaces">                </span><span class="istickedoff">-- child with the forked ThreadId so AGENT_STOP can kill</span>
+<span class="lineno">  718 </span><span class="spaces">                </span><span class="istickedoff">-- the correct thread (not the parent's).</span>
+<span class="lineno">  719 </span><span class="spaces">                </span><span class="istickedoff">childTid &lt;- forkIO $ do</span>
+<span class="lineno">  720 </span><span class="spaces">                  </span><span class="istickedoff">case mSem of</span>
+<span class="lineno">  721 </span><span class="spaces">                    </span><span class="istickedoff">Nothing -&gt; runWorker idx task <span class="nottickedoff">childTimeout</span> subagentId childSid micros start traceRef readRef writtenRef def worker <span class="nottickedoff">hooks</span></span>
+<span class="lineno">  722 </span><span class="spaces">                    </span><span class="istickedoff">Just sem -&gt; bracketSem sem $</span>
+<span class="lineno">  723 </span><span class="spaces">                      </span><span class="istickedoff">runWorker idx task <span class="nottickedoff">childTimeout</span> subagentId childSid micros start traceRef readRef writtenRef def worker <span class="nottickedoff">hooks</span></span>
+<span class="lineno">  724 </span><span class="spaces">                </span><span class="istickedoff">spawnCallback subagentId def <span class="nottickedoff">childSid</span> <span class="nottickedoff">childTid</span></span>
+<span class="lineno">  725 </span><span class="spaces">            </span><span class="istickedoff">pure (SpawnInfo subagentId childSid idx)</span>
+<span class="lineno">  726 </span><span class="spaces">      </span><span class="istickedoff">case mSem of</span>
+<span class="lineno">  727 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; mkChild</span>
+<span class="lineno">  728 </span><span class="spaces">        </span><span class="istickedoff">Just sem -&gt; bracketSem sem mkChild</span>
+<span class="lineno">  729 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  730 </span><span class="spaces">    </span><span class="istickedoff">-- Run the worker to completion (called from a forked thread).</span>
+<span class="lineno">  731 </span><span class="spaces">    </span><span class="istickedoff">runWorker :: Int -&gt; ChildTask -&gt; Double -&gt; SubagentId -&gt; SessionId -&gt; Int</span>
+<span class="lineno">  732 </span><span class="spaces">             </span><span class="istickedoff">-&gt; UTCTime -&gt; IORef [ToolTraceEntry] -&gt; IORef [Text] -&gt; IORef [Text]</span>
+<span class="lineno">  733 </span><span class="spaces">             </span><span class="istickedoff">-&gt; AgentDef -&gt; AgentWorkerBuilder -&gt; ChildRunHooks -&gt; IO ()</span>
+<span class="lineno">  734 </span><span class="spaces">    </span><span class="istickedoff">runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks = do</span>
+<span class="lineno">  735 </span><span class="spaces">      </span><span class="istickedoff">-- Start the heartbeat thread.</span>
+<span class="lineno">  736 </span><span class="spaces">      </span><span class="istickedoff">hbStop &lt;- newEmptyMVar</span>
+<span class="lineno">  737 </span><span class="spaces">      </span><span class="istickedoff">hbThreadId &lt;- forkIO (heartbeatLoop mParentActivity hbStop)</span>
+<span class="lineno">  738 </span><span class="spaces">      </span><span class="istickedoff">let runWithCatch =</span>
+<span class="lineno">  739 </span><span class="spaces">            </span><span class="istickedoff">worker def childSid task <span class="nottickedoff">hooks</span></span>
+<span class="lineno">  740 </span><span class="spaces">              </span><span class="istickedoff">`catch` \e -&gt; pure (ChildWorkerOutcome</span>
+<span class="lineno">  741 </span><span class="spaces">                                   </span><span class="istickedoff">(Just <span class="nottickedoff">(T.pack (show (e :: SomeException)))</span>)</span>
+<span class="lineno">  742 </span><span class="spaces">                                   </span><span class="istickedoff">CerError 0 0 (Just <span class="nottickedoff">childSid</span>))</span>
+<span class="lineno">  743 </span><span class="spaces">      </span><span class="istickedoff">mOutcome &lt;- timeout micros runWithCatch</span>
+<span class="lineno">  744 </span><span class="spaces">      </span><span class="istickedoff">-- Stop the heartbeat.</span>
+<span class="lineno">  745 </span><span class="spaces">      </span><span class="istickedoff">void (tryPutMVar hbStop <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  746 </span><span class="spaces">      </span><span class="istickedoff">killThread hbThreadId</span>
+<span class="lineno">  747 </span><span class="spaces">      </span><span class="istickedoff">end &lt;- getCurrentTime</span>
+<span class="lineno">  748 </span><span class="spaces">      </span><span class="istickedoff">let dur = realToFrac (end `diffUTCTime` start) :: Double</span>
+<span class="lineno">  749 </span><span class="spaces">      </span><span class="istickedoff">case mOutcome of</span>
+<span class="lineno">  750 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  751 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let result = mkTimeoutResult idx subagentId dur childSid childTimeout</span></span>
+<span class="lineno">  752 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">callback result</span></span>
+<span class="lineno">  753 </span><span class="spaces">        </span><span class="istickedoff">Just outcome -&gt; do</span>
+<span class="lineno">  754 </span><span class="spaces">          </span><span class="istickedoff">traceList &lt;- readIORef traceRef</span>
+<span class="lineno">  755 </span><span class="spaces">          </span><span class="istickedoff">filesRead &lt;- readIORef readRef</span>
+<span class="lineno">  756 </span><span class="spaces">          </span><span class="istickedoff">filesWritten &lt;- readIORef writtenRef</span>
+<span class="lineno">  757 </span><span class="spaces">          </span><span class="istickedoff">let result = ChildResult</span>
+<span class="lineno">  758 </span><span class="spaces">                </span><span class="istickedoff">{ crTaskIndex = idx</span>
+<span class="lineno">  759 </span><span class="spaces">                </span><span class="istickedoff">, crStatus = childStatusFor (cwoExitReason outcome)</span>
+<span class="lineno">  760 </span><span class="spaces">                </span><span class="istickedoff">, crSummary = cwoSummary outcome</span>
+<span class="lineno">  761 </span><span class="spaces">                </span><span class="istickedoff">, crExitReason = cwoExitReason outcome</span>
+<span class="lineno">  762 </span><span class="spaces">                </span><span class="istickedoff">, crDurationSeconds = dur</span>
+<span class="lineno">  763 </span><span class="spaces">                </span><span class="istickedoff">, crSubagentId = subagentId</span>
+<span class="lineno">  764 </span><span class="spaces">                </span><span class="istickedoff">, crTokensInput = cwoTokensInput outcome</span>
+<span class="lineno">  765 </span><span class="spaces">                </span><span class="istickedoff">, crTokensOutput = cwoTokensOutput outcome</span>
+<span class="lineno">  766 </span><span class="spaces">                </span><span class="istickedoff">, crToolTrace = reverse traceList</span>
+<span class="lineno">  767 </span><span class="spaces">                </span><span class="istickedoff">, crError = Nothing</span>
+<span class="lineno">  768 </span><span class="spaces">                </span><span class="istickedoff">, crFilesRead = reverse filesRead</span>
+<span class="lineno">  769 </span><span class="spaces">                </span><span class="istickedoff">, crFilesWritten = reverse filesWritten</span>
+<span class="lineno">  770 </span><span class="spaces">                </span><span class="istickedoff">, crChildSession = cwoChildSession outcome</span>
+<span class="lineno">  771 </span><span class="spaces">                </span><span class="istickedoff">}</span>
+<span class="lineno">  772 </span><span class="spaces">          </span><span class="istickedoff">callback result</span>
+<span class="lineno">  773 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  774 </span><span class="spaces">    </span><span class="istickedoff">-- Acquire / release the counting semaphore around an IO action.</span>
+<span class="lineno">  775 </span><span class="spaces">    </span><span class="istickedoff">bracketSem :: TVar Int -&gt; IO a -&gt; IO a</span>
+<span class="lineno">  776 </span><span class="spaces">    </span><span class="istickedoff">bracketSem sem act = bracket acquire release (const act)</span>
+<span class="lineno">  777 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  778 </span><span class="spaces">        </span><span class="istickedoff">acquire = atomically $ do</span>
+<span class="lineno">  779 </span><span class="spaces">          </span><span class="istickedoff">n &lt;- readTVar sem</span>
+<span class="lineno">  780 </span><span class="spaces">          </span><span class="istickedoff">if n &gt; 0</span>
+<span class="lineno">  781 </span><span class="spaces">            </span><span class="istickedoff">then writeTVar sem (n - 1)</span>
+<span class="lineno">  782 </span><span class="spaces">            </span><span class="istickedoff">else retry</span>
+<span class="lineno">  783 </span><span class="spaces">        </span><span class="istickedoff">release _ = atomically (modifyTVar' sem (+1))</span></span>
+<span class="lineno">  784 </span>
+<span class="lineno">  785 </span>-- | Build a 'ChildResult' for a resolve error (def not found, invalid
+<span class="lineno">  786 </span>-- role, etc.).
+<span class="lineno">  787 </span>mkErrorResult :: Int -&gt; SubagentId -&gt; Double -&gt; Text -&gt; Maybe SessionId -&gt; ChildResult
+<span class="lineno">  788 </span><span class="decl"><span class="istickedoff">mkErrorResult idx sid dur err mChildSession = ChildResult</span>
+<span class="lineno">  789 </span><span class="spaces">  </span><span class="istickedoff">{ crTaskIndex = idx</span>
+<span class="lineno">  790 </span><span class="spaces">  </span><span class="istickedoff">, crStatus = CsError</span>
+<span class="lineno">  791 </span><span class="spaces">  </span><span class="istickedoff">, crSummary = Nothing</span>
+<span class="lineno">  792 </span><span class="spaces">  </span><span class="istickedoff">, crExitReason = CerError</span>
+<span class="lineno">  793 </span><span class="spaces">  </span><span class="istickedoff">, crDurationSeconds = dur</span>
+<span class="lineno">  794 </span><span class="spaces">  </span><span class="istickedoff">, crSubagentId = sid</span>
+<span class="lineno">  795 </span><span class="spaces">  </span><span class="istickedoff">, crTokensInput = 0</span>
+<span class="lineno">  796 </span><span class="spaces">  </span><span class="istickedoff">, crTokensOutput = 0</span>
+<span class="lineno">  797 </span><span class="spaces">  </span><span class="istickedoff">, crToolTrace = []</span>
+<span class="lineno">  798 </span><span class="spaces">  </span><span class="istickedoff">, crError = Just err</span>
+<span class="lineno">  799 </span><span class="spaces">  </span><span class="istickedoff">, crFilesRead = []</span>
+<span class="lineno">  800 </span><span class="spaces">  </span><span class="istickedoff">, crFilesWritten = []</span>
+<span class="lineno">  801 </span><span class="spaces">  </span><span class="istickedoff">, crChildSession = mChildSession</span>
+<span class="lineno">  802 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  803 </span>
+<span class="lineno">  804 </span>-- | Build a 'ChildResult' for a timeout.
+<span class="lineno">  805 </span>mkTimeoutResult :: Int -&gt; SubagentId -&gt; Double -&gt; SessionId -&gt; Double -&gt; ChildResult
+<span class="lineno">  806 </span><span class="decl"><span class="nottickedoff">mkTimeoutResult idx sid dur childSid childTimeout = ChildResult</span>
+<span class="lineno">  807 </span><span class="spaces">  </span><span class="nottickedoff">{ crTaskIndex = idx</span>
+<span class="lineno">  808 </span><span class="spaces">  </span><span class="nottickedoff">, crStatus = CsTimeout</span>
+<span class="lineno">  809 </span><span class="spaces">  </span><span class="nottickedoff">, crSummary = Nothing</span>
+<span class="lineno">  810 </span><span class="spaces">  </span><span class="nottickedoff">, crExitReason = CerTimeout</span>
+<span class="lineno">  811 </span><span class="spaces">  </span><span class="nottickedoff">, crDurationSeconds = dur</span>
+<span class="lineno">  812 </span><span class="spaces">  </span><span class="nottickedoff">, crSubagentId = sid</span>
+<span class="lineno">  813 </span><span class="spaces">  </span><span class="nottickedoff">, crTokensInput = 0</span>
+<span class="lineno">  814 </span><span class="spaces">  </span><span class="nottickedoff">, crTokensOutput = 0</span>
+<span class="lineno">  815 </span><span class="spaces">  </span><span class="nottickedoff">, crToolTrace = []</span>
+<span class="lineno">  816 </span><span class="spaces">  </span><span class="nottickedoff">, crError = Just (&quot;Subagent timed out after &quot; &lt;&gt; T.pack (show childTimeout) &lt;&gt; &quot;s.&quot;)</span>
+<span class="lineno">  817 </span><span class="spaces">  </span><span class="nottickedoff">, crFilesRead = []</span>
+<span class="lineno">  818 </span><span class="spaces">  </span><span class="nottickedoff">, crFilesWritten = []</span>
+<span class="lineno">  819 </span><span class="spaces">  </span><span class="nottickedoff">, crChildSession = Just childSid</span>
+<span class="lineno">  820 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  821 </span>
+<span class="lineno">  822 </span>childStatusFor :: ChildExitReason -&gt; ChildStatus
+<span class="lineno">  823 </span><span class="decl"><span class="istickedoff">childStatusFor = \case</span>
+<span class="lineno">  824 </span><span class="spaces">  </span><span class="istickedoff">CerCompleted    -&gt; CsCompleted</span>
+<span class="lineno">  825 </span><span class="spaces">  </span><span class="istickedoff">CerMaxIterations -&gt; <span class="nottickedoff">CsFailed</span></span>
+<span class="lineno">  826 </span><span class="spaces">  </span><span class="istickedoff">CerTimeout      -&gt; CsTimeout</span>
+<span class="lineno">  827 </span><span class="spaces">  </span><span class="istickedoff">CerInterrupted  -&gt; <span class="nottickedoff">CsInterrupted</span></span>
+<span class="lineno">  828 </span><span class="spaces">  </span><span class="istickedoff">CerError        -&gt; CsError</span></span>
+<span class="lineno">  829 </span>
+<span class="lineno">  830 </span>-- | A 30s heartbeat that touches the parent-activity cell while the child
+<span class="lineno">  831 </span>-- runs. Stops when the stop-MVar is filled.
+<span class="lineno">  832 </span>heartbeatLoop :: Maybe ParentActivity -&gt; MVar () -&gt; IO ()
+<span class="lineno">  833 </span><span class="decl"><span class="istickedoff">heartbeatLoop mParentActivity stopRef = loop</span>
+<span class="lineno">  834 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  835 </span><span class="spaces">    </span><span class="istickedoff">loop = do</span>
+<span class="lineno">  836 </span><span class="spaces">      </span><span class="istickedoff">stop &lt;- tryTakeMVar stopRef</span>
+<span class="lineno">  837 </span><span class="spaces">      </span><span class="istickedoff">case stop of</span>
+<span class="lineno">  838 </span><span class="spaces">        </span><span class="istickedoff">Just ()  -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  839 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; do</span>
+<span class="lineno">  840 </span><span class="spaces">          </span><span class="istickedoff">for_ mParentActivity touchParentActivity</span>
+<span class="lineno">  841 </span><span class="spaces">          </span><span class="istickedoff">threadDelay 30000000  -- 30s</span>
+<span class="lineno">  842 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">loop</span></span></span>
+
+</pre>
+</body>
+</html>

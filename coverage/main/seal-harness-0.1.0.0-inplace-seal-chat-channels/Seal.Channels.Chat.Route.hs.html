@@ -1,0 +1,136 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Layer-1 terse-grammar routing for chat channels. A pure reimplementation
+<span class="lineno">    3 </span>-- of 'Seal.Routing.Route.route' using only 'Seal.Gateway.Types.Tab' for
+<span class="lineno">    4 </span>-- 'TabIndex' + 'tabIndexFromChar' (no dependency on 'Seal.Handles.Tab' or
+<span class="lineno">    5 </span>-- 'Seal.Tabs.Types').
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The routing logic matches the existing 'Seal.Routing.Route.route' exactly
+<span class="lineno">    8 </span>-- so behavior is identical between old and new channel implementations.
+<span class="lineno">    9 </span>module Seal.Channels.Chat.Route
+<span class="lineno">   10 </span>  ( ChatRoute (..)
+<span class="lineno">   11 </span>  , RouteError (..)
+<span class="lineno">   12 </span>  , route
+<span class="lineno">   13 </span>  , parseTabFocus
+<span class="lineno">   14 </span>  , terseSynopsis
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Data.Char (isDigit, isAsciiLower)
+<span class="lineno">   18 </span>import Data.Text (Text)
+<span class="lineno">   19 </span>import Data.Text qualified as T
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Seal.Gateway.Types.Tab
+<span class="lineno">   22 </span>  ( TabIndex, tabIndexFromChar )
+<span class="lineno">   23 </span>import Seal.Gateway.Types.TabList
+<span class="lineno">   24 </span>  ( TabSlashCommand (..) )
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | A routing error (invalid tab index char).
+<span class="lineno">   27 </span>newtype RouteError = RouteError Text
+<span class="lineno">   28 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | The Layer-1 routing decision for chat channels. Mirrors
+<span class="lineno">   31 </span>-- 'Seal.Routing.Route.RoutingDecision' but lives in the chat-channels
+<span class="lineno">   32 </span>-- package so it has no dependency on server internals.
+<span class="lineno">   33 </span>data ChatRoute
+<span class="lineno">   34 </span>  = ChatFocus TabIndex                 -- ^ /N
+<span class="lineno">   35 </span>  | ChatInject TabIndex Text           -- ^ /N payload
+<span class="lineno">   36 </span>  | ChatPlain Text                     -- ^ plain text to the focused session
+<span class="lineno">   37 </span>  | ChatTabCommand TabSlashCommand     -- ^ /tab &lt;subcommand&gt; …
+<span class="lineno">   38 </span>  | ChatCurrentTab                     -- ^ bare /tab — show the current tab
+<span class="lineno">   39 </span>  | ChatNewSession Text                -- ^ /new [args] — the raw arg string
+<span class="lineno">   40 </span>  | ChatSlash Text                     -- ^ other /commands (deferred to the HTTP API)
+<span class="lineno">   41 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | Route one inbound line. The Layer-1 terse grammar:
+<span class="lineno">   44 </span>--
+<span class="lineno">   45 </span>-- * @\/N@          -&gt; 'ChatFocus' N (N is a single char 0-9a-z, at end-of-string
+<span class="lineno">   46 </span>--                   or followed by a space)
+<span class="lineno">   47 </span>-- * @\/N payload@  -&gt; 'ChatInject' N payload
+<span class="lineno">   48 </span>-- * @\/tab@        -&gt; 'ChatCurrentTab' (show the current tab)
+<span class="lineno">   49 </span>-- * @\/new [args]@ -&gt; 'ChatNewSession' (the raw text after @/new @)
+<span class="lineno">   50 </span>-- * @\/&lt;other&gt;…@   -&gt; 'ChatSlash' (deferred to the HTTP API — the gateway
+<span class="lineno">   51 </span>--                   server routes slash commands for the web frontend)
+<span class="lineno">   52 </span>-- * anything else  -&gt; 'ChatPlain'
+<span class="lineno">   53 </span>route :: Text -&gt; Either RouteError ChatRoute
+<span class="lineno">   54 </span><span class="decl"><span class="istickedoff">route t</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">| T.null t             = Right (ChatPlain t)</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">| T.head t /= '/'      = Right (ChatPlain t)</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>            =</span>
+<span class="lineno">   58 </span><span class="spaces">      </span><span class="istickedoff">let rest = T.drop 1 t  -- drop the leading '/'</span>
+<span class="lineno">   59 </span><span class="spaces">      </span><span class="istickedoff">in case T.uncons rest of</span>
+<span class="lineno">   60 </span><span class="spaces">           </span><span class="istickedoff">Nothing -&gt; Right (ChatPlain &quot;/&quot;)  -- a bare &quot;/&quot; — treat as plain</span>
+<span class="lineno">   61 </span><span class="spaces">           </span><span class="istickedoff">Just (c, after)</span>
+<span class="lineno">   62 </span><span class="spaces">              </span><span class="istickedoff">| isTabChar c &amp;&amp; (T.null after || T.head after == ' ') -&gt;</span>
+<span class="lineno">   63 </span><span class="spaces">                  </span><span class="istickedoff">-- single-char /N or /N payload (the tab grammar)</span>
+<span class="lineno">   64 </span><span class="spaces">                  </span><span class="istickedoff">case tabIndexFromChar c of</span>
+<span class="lineno">   65 </span><span class="spaces">                    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">Left (RouteError e)</span></span>
+<span class="lineno">   66 </span><span class="spaces">                    </span><span class="istickedoff">Right idx -&gt; Right (focusOrInject idx after)</span>
+<span class="lineno">   67 </span><span class="spaces">               </span><span class="istickedoff">| rest == &quot;tab&quot; -&gt;</span>
+<span class="lineno">   68 </span><span class="spaces">                  </span><span class="istickedoff">Right ChatCurrentTab</span>
+<span class="lineno">   69 </span><span class="spaces">               </span><span class="istickedoff">| rest == &quot;new&quot; || T.isPrefixOf &quot;new &quot; rest -&gt;</span>
+<span class="lineno">   70 </span><span class="spaces">                  </span><span class="istickedoff">Right (ChatNewSession (stripNewPrefix rest))</span>
+<span class="lineno">   71 </span><span class="spaces">               </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">   72 </span><span class="spaces">                  </span><span class="istickedoff">Right (ChatSlash rest)</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">isTabChar c = isDigit c || isAsciiLower c</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Extract the argument text from the @new@ prefix. @\&quot;new\&quot;@ yields
+<span class="lineno">   77 </span>-- @\&quot;\&quot;@; @\&quot;new -p anthropic\&quot;@ yields @\&quot;-p anthropic\&quot;@.
+<span class="lineno">   78 </span>stripNewPrefix :: Text -&gt; Text
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">stripNewPrefix rest =</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">if rest == &quot;new&quot;</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">then &quot;&quot;</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">else T.drop 1 (snd (T.breakOn &quot; &quot; rest))</span></span>  -- everything after the first space
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Given a valid tab index + the text after it: if the rest is empty (or
+<span class="lineno">   85 </span>-- whitespace-only), it's a Focus; otherwise it's an Inject (the payload is
+<span class="lineno">   86 </span>-- the text after the first space, preserving internal spaces verbatim).
+<span class="lineno">   87 </span>focusOrInject :: TabIndex -&gt; Text -&gt; ChatRoute
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">focusOrInject idx after</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">| T.null (T.strip after) = ChatFocus idx</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>               =</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff">let payload = T.drop 1 (snd (T.breakOn &quot; &quot; after))  -- everything after the first space</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">in ChatInject idx payload</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Parse @\/tab focus \&lt;N\&gt;@ from the inbound body. Returns 'Just' the
+<span class="lineno">   95 </span>-- 'TabIndex' if the body is @\/tab focus \&lt;N\&gt;@ (case-insensitive, N is a
+<span class="lineno">   96 </span>-- single tab-index char 0-9a-z), 'Nothing' otherwise. Used by the loop to
+<span class="lineno">   97 </span>-- intercept @\/tab focus@ locally (send a 'FocusOp' over WS, not an HTTP
+<span class="lineno">   98 </span>-- send).
+<span class="lineno">   99 </span>parseTabFocus :: Text -&gt; Maybe TabIndex
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">parseTabFocus body =</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">case route body of</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">Right (ChatSlash rest) -&gt;</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">let parts = T.words (T.toCaseFold rest)</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">in case parts of</span>
+<span class="lineno">  105 </span><span class="spaces">           </span><span class="istickedoff">[&quot;tab&quot;, &quot;focus&quot;, idxStr] -&gt; case T.uncons idxStr of</span>
+<span class="lineno">  106 </span><span class="spaces">             </span><span class="istickedoff">Just (c, _) -&gt; either <span class="nottickedoff">(const Nothing)</span> Just (tabIndexFromChar c)</span>
+<span class="lineno">  107 </span><span class="spaces">             </span><span class="istickedoff">Nothing     -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  108 </span><span class="spaces">           </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | The terse-grammar synopsis (for /help). One line.
+<span class="lineno">  112 </span>terseSynopsis :: Text
+<span class="lineno">  113 </span><span class="decl"><span class="nottickedoff">terseSynopsis = &quot;/N [payload]  Switch to tab N (0-9a-z), or inject payload into it&quot;</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,439 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Session lifecycle over the @\&lt;state\&gt;\/sessions@ tree: id minting, creation,
+<span class="lineno">    3 </span>-- atomic persistence (dir 0700, session.json 0600), and listing (newest first,
+<span class="lineno">    4 </span>-- corrupt files skipped). No manifest file — the list is derived by enumerating
+<span class="lineno">    5 </span>-- the directory. 'SessionRuntime' bundles the mutable active-session ref shared
+<span class="lineno">    6 </span>-- between the /session and /model commands and the chat handler.
+<span class="lineno">    7 </span>module Seal.Session.Store
+<span class="lineno">    8 </span>  ( formatSessionId
+<span class="lineno">    9 </span>  , newSession
+<span class="lineno">   10 </span>  , newSessionMeta
+<span class="lineno">   11 </span>  , saveSessionMeta
+<span class="lineno">   12 </span>  , listSessions
+<span class="lineno">   13 </span>  , listArchivedSessions
+<span class="lineno">   14 </span>  , updateSessionArchived
+<span class="lineno">   15 </span>  , defaultSessionSelection
+<span class="lineno">   16 </span>  , resolveDefaultAgent
+<span class="lineno">   17 </span>  , initSession
+<span class="lineno">   18 </span>  , initSessionMeta
+<span class="lineno">   19 </span>  , updateSessionAgent
+<span class="lineno">   20 </span>  , updateSessionSystemOverride
+<span class="lineno">   21 </span>  , updateSessionDescription
+<span class="lineno">   22 </span>  , autoBindRepoAgent
+<span class="lineno">   23 </span>  , autoBindRepoAgentWith
+<span class="lineno">   24 </span>  , SessionRuntime (..)
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Monad (filterM, forM, unless, void, when)
+<span class="lineno">   28 </span>import Data.Aeson (encode)
+<span class="lineno">   29 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   30 </span>import Data.IORef (IORef)
+<span class="lineno">   31 </span>import Data.List (sortOn)
+<span class="lineno">   32 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   33 </span>import Data.Maybe (catMaybes, fromMaybe)
+<span class="lineno">   34 </span>import Data.Ord (Down (..))
+<span class="lineno">   35 </span>import Data.Text (Text)
+<span class="lineno">   36 </span>import Data.Text qualified as T
+<span class="lineno">   37 </span>import Data.Time
+<span class="lineno">   38 </span>  ( UTCTime (..), defaultTimeLocale, diffTimeToPicoseconds, formatTime, getCurrentTime )
+<span class="lineno">   39 </span>import System.Directory
+<span class="lineno">   40 </span>  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+<span class="lineno">   41 </span>  , listDirectory, removeFile, renameFile )
+<span class="lineno">   42 </span>import System.FilePath ((&lt;/&gt;), takeBaseName)
+<span class="lineno">   43 </span>import System.IO
+<span class="lineno">   44 </span>  ( hClose, openBinaryTempFile )
+<span class="lineno">   45 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
+<span class="lineno">   48 </span>import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
+<span class="lineno">   49 </span>import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
+<span class="lineno">   50 </span>import Seal.Config.Paths
+<span class="lineno">   51 </span>  ( SealPaths, sessionArchivedMarkerPath, sessionDir, sessionMetaPath, sessionsRoot )
+<span class="lineno">   52 </span>import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
+<span class="lineno">   53 </span>import Seal.Providers.Registry (resolveDefaultModel)
+<span class="lineno">   54 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   55 </span>import Seal.Store.Markdown (decodeDoc, fmLookup)
+<span class="lineno">   56 </span>import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
+<span class="lineno">   57 </span>import Seal.Util.StrictIO (decodeFileStrict)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- | The mutable active-session ref plus the paths the commands need.
+<span class="lineno">   60 </span>data SessionRuntime = SessionRuntime
+<span class="lineno">   61 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">srPaths</span></span></span>      :: SealPaths
+<span class="lineno">   62 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srConfigPath</span></span></span> :: FilePath
+<span class="lineno">   63 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srActive</span></span></span>     :: IORef SessionMeta
+<span class="lineno">   64 </span>  }
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | @YYYYMMDD-HHMMSS-mmm@. Timestamp-leading so a lexicographic sort of ids is
+<span class="lineno">   67 </span>-- chronological; only digits and dashes, so it is a valid 'SessionId'.
+<span class="lineno">   68 </span>formatSessionId :: UTCTime -&gt; Text
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">formatSessionId t =</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">let base   = formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y%m%d-%H%M%S&quot; t</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">millis = (diffTimeToPicoseconds (utctDayTime t) `div` 1000000000) `mod` 1000</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">s      = show millis</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">mmm    = replicate (3 - length s) '0' &lt;&gt; s</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">in T.pack (base &lt;&gt; &quot;-&quot; &lt;&gt; mmm)</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Mint a fresh 'SessionMeta' (id + timestamps) for the given selection,
+<span class="lineno">   77 </span>-- without writing anything to disk. Used by channels that want an
+<span class="lineno">   78 </span>-- in-memory active session without polluting the sessions list — the
+<span class="lineno">   79 </span>-- session is only persisted when the user actually sends a message.
+<span class="lineno">   80 </span>newSessionMeta :: SealPaths -&gt; Text -&gt; Text -&gt; Text -&gt; Maybe AgentDefId -&gt; IO SessionMeta
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">newSessionMeta _paths provider model channel mAgent = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">sid &lt;- case mkSessionId (formatSessionId now) of</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">Right s -&gt; pure s</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">ioError (userError (&quot;session id generation failed: &quot; &lt;&gt; T.unpack e))</span></span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">pure SessionMeta</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">{ smId = sid, smProvider = provider, smModel = model</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">, smChannel = channel, smAgent = mAgent</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">, smSystemOverride = Nothing, smAgentName = Nothing</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">, smDescription = Nothing</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">, smCreatedAt = now, smLastActive = now }</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Create a fresh session directory + session.json for the given selection.
+<span class="lineno">   94 </span>newSession :: SealPaths -&gt; Text -&gt; Text -&gt; Text -&gt; Maybe AgentDefId -&gt; IO SessionMeta
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">newSession paths provider model channel mAgent = do</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">meta &lt;- newSessionMeta <span class="nottickedoff">paths</span> provider model channel mAgent</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">saveSessionMeta paths meta</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">pure meta</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | Persist @session.json@ atomically: dir 0700, write a unique temp file,
+<span class="lineno">  101 </span>-- chmod 0600, rename. The temp file is unique per call (via 'openBinaryTempFile')
+<span class="lineno">  102 </span>-- so concurrent saves from multiple threads (channel loop + gateway API +
+<span class="lineno">  103 </span>-- /model command) don't collide on a shared @.tmp@ path (&quot;resource busy&quot;
+<span class="lineno">  104 </span>-- / &quot;does not exist&quot; rename race). The rename is atomic on POSIX.
+<span class="lineno">  105 </span>saveSessionMeta :: SealPaths -&gt; SessionMeta -&gt; IO ()
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">saveSessionMeta paths meta = do</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">let dir  = sessionDir paths (smId meta)</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="istickedoff">path = sessionMetaPath paths (smId meta)</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True dir</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">setFileMode dir 0o700</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">(tmp, h) &lt;- openBinaryTempFile dir (takeBaseName path &lt;&gt; &quot;.tmp&quot;)</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">BL.hPut h (encode meta)</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>-- | All non-archived sessions, newest 'smLastActive' first. Corrupt/undecodable
+<span class="lineno">  118 </span>-- session.json files are silently skipped (a partial write never breaks the
+<span class="lineno">  119 </span>-- list). A session is archived when an @archived@ marker file exists in its
+<span class="lineno">  120 </span>-- session directory (see 'sessionArchivedMarkerPath'); archived sessions are
+<span class="lineno">  121 </span>-- returned by 'listArchivedSessions' instead.
+<span class="lineno">  122 </span>listSessions :: SealPaths -&gt; IO [SessionMeta]
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">listSessions paths = do</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">let root = sessionsRoot paths</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist root</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- listDirectory root</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">dirs    &lt;- filterM (doesDirectoryExist . (root &lt;/&gt;)) entries</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="istickedoff">metas   &lt;- forM dirs $ \e -&gt; do</span>
+<span class="lineno">  132 </span><span class="spaces">        </span><span class="istickedoff">let mp = root &lt;/&gt; e &lt;/&gt; &quot;session.json&quot;</span>
+<span class="lineno">  133 </span><span class="spaces">            </span><span class="istickedoff">marker = root &lt;/&gt; e &lt;/&gt; &quot;archived&quot;</span>
+<span class="lineno">  134 </span><span class="spaces">        </span><span class="istickedoff">ok &lt;- doesFileExist mp</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="istickedoff">archived &lt;- doesFileExist marker</span>
+<span class="lineno">  136 </span><span class="spaces">        </span><span class="istickedoff">if not ok || archived then pure Nothing else decodeFileStrict mp</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">pure (sortOn (Down . smLastActive) (catMaybes metas))</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | All archived sessions (those with an @archived@ marker file), newest
+<span class="lineno">  140 </span>-- 'smLastActive' first. Corrupt/undecodable session.json files are silently
+<span class="lineno">  141 </span>-- skipped. The marker file's presence is the source of truth; a missing
+<span class="lineno">  142 </span>-- session.json with a marker is also skipped (defensive against a stale
+<span class="lineno">  143 </span>-- marker left by an out-of-band delete).
+<span class="lineno">  144 </span>listArchivedSessions :: SealPaths -&gt; IO [SessionMeta]
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">listArchivedSessions paths = do</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">let root = sessionsRoot paths</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist root</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- listDirectory root</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">dirs    &lt;- filterM (doesDirectoryExist . (root &lt;/&gt;)) entries</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">metas   &lt;- forM dirs $ \e -&gt; do</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">let mp = root &lt;/&gt; e &lt;/&gt; &quot;session.json&quot;</span>
+<span class="lineno">  155 </span><span class="spaces">            </span><span class="istickedoff">marker = root &lt;/&gt; e &lt;/&gt; &quot;archived&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">ok &lt;- doesFileExist mp</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">archived &lt;- doesFileExist marker</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="istickedoff">if not ok || not archived then pure Nothing else decodeFileStrict mp</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">pure (sortOn (Down . smLastActive) (catMaybes metas))</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>-- | Set or clear the archived flag on a session by creating/removing the
+<span class="lineno">  162 </span>-- @archived@ marker file. Returns 'False' when the session's @session.json@
+<span class="lineno">  163 </span>-- can't be found (the caller surfaces a 404); 'True' on success. The
+<span class="lineno">  164 </span>-- transcript and session.json are never touched — archiving is a pure UI
+<span class="lineno">  165 </span>-- hint. Idempotent: archiving an already-archived session (or unarchiving a
+<span class="lineno">  166 </span>-- non-archived one) is a no-op success.
+<span class="lineno">  167 </span>updateSessionArchived :: SealPaths -&gt; SessionId -&gt; Bool -&gt; IO Bool
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">updateSessionArchived paths sid archived = do</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionMetaPath paths sid</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">marker = sessionArchivedMarkerPath paths sid</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">then pure False</span>
+<span class="lineno">  174 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">markerExists &lt;- doesFileExist marker</span>
+<span class="lineno">  176 </span><span class="spaces">      </span><span class="istickedoff">if archived</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="istickedoff">then unless markerExists (writeFile marker &quot;&quot;)</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="istickedoff">else when markerExists (removeFile marker)</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">pure True</span></span>
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | The provider label + model a new session should start with: the configured
+<span class="lineno">  182 </span>-- defaults, falling back to the configured provider's own default model (or
+<span class="lineno">  183 </span>-- Anthropic when no provider is configured).
+<span class="lineno">  184 </span>defaultSessionSelection :: RuntimeConfig -&gt; (Text, Text)
+<span class="lineno">  185 </span><span class="decl"><span class="istickedoff">defaultSessionSelection cfg =</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">( provLabel</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">, fromMaybe fallbackModel (rcDefaultModel cfg) )</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">provLabel = fromMaybe &quot;anthropic&quot; (rcDefaultProvider cfg)</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel</span></span>
+<span class="lineno">  191 </span>
+<span class="lineno">  192 </span>-- | Resolve the default agent for a new session. Returns 'Nothing' if
+<span class="lineno">  193 </span>-- @default_agent@ is unset, the id fails validation, or the def is not on
+<span class="lineno">  194 </span>-- disk (a warning is emitted in the latter case). Otherwise returns the
+<span class="lineno">  195 </span>-- bound 'AgentDefId' and the def's provider/model overrides (non-empty
+<span class="lineno">  196 </span>-- values that should replace the config defaults).
+<span class="lineno">  197 </span>resolveDefaultAgent
+<span class="lineno">  198 </span>  :: AgentDefBackend -&gt; RuntimeConfig -&gt; IO (Maybe AgentDefId, Maybe Text, Maybe Text)
+<span class="lineno">  199 </span><span class="decl"><span class="istickedoff">resolveDefaultAgent backend cfg =</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">case rcDefaultAgent cfg of</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Nothing, Nothing, Nothing)</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">Just raw -&gt;</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">case mkAgentDefId raw of</span>
+<span class="lineno">  204 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  205 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">putStrLn (&quot;warning: default_agent &quot; &lt;&gt; T.unpack raw &lt;&gt; &quot; is not a valid id; proceeding without one&quot;)</span></span>
+<span class="lineno">  206 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure (Nothing, Nothing, Nothing)</span></span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">Right aid -&gt; do</span>
+<span class="lineno">  208 </span><span class="spaces">          </span><span class="istickedoff">mDef &lt;- adbRead backend aid</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="istickedoff">case mDef of</span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  211 </span><span class="spaces">              </span><span class="istickedoff">putStrLn (&quot;warning: default agent &quot; &lt;&gt; T.unpack raw &lt;&gt; &quot; not found; proceeding without one&quot;)</span>
+<span class="lineno">  212 </span><span class="spaces">              </span><span class="istickedoff">pure (Nothing, Nothing, Nothing)</span>
+<span class="lineno">  213 </span><span class="spaces">            </span><span class="istickedoff">Just d  -&gt; pure (Just aid, override (adProvider d), overrideModel (adModel d))</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">override t = if <span class="tickonlyfalse">T.null t</span> then <span class="nottickedoff">Nothing</span> else Just t</span>
+<span class="lineno">  216 </span><span class="spaces">    </span><span class="istickedoff">overrideModel (ModelId m) = if <span class="tickonlyfalse">T.null m</span> then <span class="nottickedoff">Nothing</span> else Just m</span></span>
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>-- | Create a new session from the config defaults, on the @cli@ channel.
+<span class="lineno">  219 </span>-- If @default_agent@ is set and the def exists, its id is persisted in
+<span class="lineno">  220 </span>-- 'smAgent' and its non-empty provider/model override the config defaults
+<span class="lineno">  221 </span>-- (PureClaw @resolveOverride@ precedence: frontmatter &gt; config &gt; default).
+<span class="lineno">  222 </span>initSession :: SealPaths -&gt; RuntimeConfig -&gt; AgentDefBackend -&gt; IO SessionMeta
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">initSession paths cfg backend = do</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">(mAgent, mProv, mModel) &lt;- resolveDefaultAgent backend cfg</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">let (cfgProv, cfgModel) = defaultSessionSelection cfg</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">provider = fromMaybe cfgProv mProv</span>
+<span class="lineno">  227 </span><span class="spaces">      </span><span class="istickedoff">model    = fromMaybe cfgModel mModel</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">newSession paths provider model &quot;cli&quot; mAgent</span></span>
+<span class="lineno">  229 </span>
+<span class="lineno">  230 </span>-- | Build an in-memory 'SessionMeta' from the config defaults, on the @web@
+<span class="lineno">  231 </span>-- channel, WITHOUT persisting to disk. The web gateway uses this so the
+<span class="lineno">  232 </span>-- active-session ref has a valid meta (provider/model fallbacks) without
+<span class="lineno">  233 </span>-- polluting the sessions list. The session is persisted only when the user
+<span class="lineno">  234 </span>-- actually sends the first message (which writes the transcript).
+<span class="lineno">  235 </span>initSessionMeta :: SealPaths -&gt; RuntimeConfig -&gt; AgentDefBackend -&gt; IO SessionMeta
+<span class="lineno">  236 </span><span class="decl"><span class="nottickedoff">initSessionMeta paths cfg backend = do</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="nottickedoff">(mAgent, mProv, mModel) &lt;- resolveDefaultAgent backend cfg</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="nottickedoff">let (cfgProv, cfgModel) = defaultSessionSelection cfg</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="nottickedoff">provider = fromMaybe cfgProv mProv</span>
+<span class="lineno">  240 </span><span class="spaces">      </span><span class="nottickedoff">model    = fromMaybe cfgModel mModel</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="nottickedoff">newSessionMeta paths provider model &quot;web&quot; mAgent</span></span>
+<span class="lineno">  242 </span>
+<span class="lineno">  243 </span>-- | Update the bound agent for an existing session. Loads the current
+<span class="lineno">  244 </span>-- 'SessionMeta' from disk, replaces 'smAgent' (Nothing when the supplied id
+<span class="lineno">  245 </span>-- is empty/invalid), and persists atomically. Returns 'False' when the
+<span class="lineno">  246 </span>-- session's @session.json@ can't be found or parsed (the caller surfaces a
+<span class="lineno">  247 </span>-- 404/400); 'True' on a successful write.
+<span class="lineno">  248 </span>--
+<span class="lineno">  249 </span>-- /Mutual exclusion/: binding an agent clears any 'smSystemOverride'
+<span class="lineno">  250 </span>-- (one-off uploaded file) — the two are alternative sources of the system
+<span class="lineno">  251 </span>-- prompt, and the backend enforces they never coexist so the UI never
+<span class="lineno">  252 </span>-- shows a stale \&quot;agent X\&quot; label while an uploaded file is actually
+<span class="lineno">  253 </span>-- driving the prompt. The frontend only needs to fire this single PUT.
+<span class="lineno">  254 </span>-- 'smAgentName' is set to the agent's id so the sidebar has a stable
+<span class="lineno">  255 </span>-- display label.
+<span class="lineno">  256 </span>updateSessionAgent :: SealPaths -&gt; SessionId -&gt; Maybe AgentDefId -&gt; IO Bool
+<span class="lineno">  257 </span><span class="decl"><span class="istickedoff">updateSessionAgent paths sid mAgent = do</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionMetaPath paths sid</span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  260 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  261 </span><span class="spaces">    </span><span class="istickedoff">then pure False</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- decodeFileStrict mp :: IO (Maybe SessionMeta)</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  265 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  266 </span><span class="spaces">        </span><span class="istickedoff">Just meta -&gt; do</span>
+<span class="lineno">  267 </span><span class="spaces">          </span><span class="istickedoff">-- Clear the override + set the display name when binding an</span>
+<span class="lineno">  268 </span><span class="spaces">          </span><span class="istickedoff">-- agent; clear both when clearing the agent.</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff">let next = case mAgent of</span>
+<span class="lineno">  270 </span><span class="spaces">                </span><span class="istickedoff">Just aid -&gt; meta { smAgent = mAgent</span>
+<span class="lineno">  271 </span><span class="spaces">                                 </span><span class="istickedoff">, smSystemOverride = Nothing</span>
+<span class="lineno">  272 </span><span class="spaces">                                 </span><span class="istickedoff">, smAgentName = Just (agentDefIdText aid) }</span>
+<span class="lineno">  273 </span><span class="spaces">                </span><span class="istickedoff">Nothing  -&gt; meta { smAgent = Nothing, smAgentName = Nothing }</span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff">saveSessionMeta paths next</span>
+<span class="lineno">  275 </span><span class="spaces">          </span><span class="istickedoff">pure True</span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>-- | Update (or clear) the ad-hoc system prompt override for a session.
+<span class="lineno">  278 </span>-- 'Nothing' clears the override (fall back to the bound agent's
+<span class="lineno">  279 </span>-- 'adSystem'); 'Just t' sets it so 'plainTurn' uses @t@ verbatim as the
+<span class="lineno">  280 </span>-- system prompt. Returns 'False' when the session's @session.json@ can't
+<span class="lineno">  281 </span>-- be found or parsed; 'True' on a successful write.
+<span class="lineno">  282 </span>--
+<span class="lineno">  283 </span>-- The display label is resolved in this order:
+<span class="lineno">  284 </span>-- 1. The @id@ field in the file's TOML frontmatter (when parseable).
+<span class="lineno">  285 </span>-- 2. The caller-supplied @mFallbackName@ (e.g. the uploaded filename).
+<span class="lineno">  286 </span>-- 3. 'Nothing' — no label.
+<span class="lineno">  287 </span>--
+<span class="lineno">  288 </span>-- /Mutual exclusion/: setting an override clears 'smAgent' so the session
+<span class="lineno">  289 </span>-- doesn't display a stale agent label in the UI while an uploaded file is
+<span class="lineno">  290 </span>-- actually driving the prompt. Clearing the override leaves 'smAgent'
+<span class="lineno">  291 </span>-- untouched (the caller can re-bind an agent in a follow-up PUT if
+<span class="lineno">  292 </span>-- desired). The frontend only needs to fire this single PUT.
+<span class="lineno">  293 </span>updateSessionSystemOverride
+<span class="lineno">  294 </span>  :: SealPaths
+<span class="lineno">  295 </span>  -&gt; SessionId
+<span class="lineno">  296 </span>  -&gt; Maybe Text          -- ^ the file content (Nothing = clear)
+<span class="lineno">  297 </span>  -&gt; Maybe Text          -- ^ fallback display label (e.g. filename) when no frontmatter id
+<span class="lineno">  298 </span>  -&gt; IO Bool
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">updateSessionSystemOverride paths sid mOverride mFallbackName = do</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionMetaPath paths sid</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">then pure False</span>
+<span class="lineno">  304 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  305 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- decodeFileStrict mp :: IO (Maybe SessionMeta)</span>
+<span class="lineno">  306 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  307 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="istickedoff">Just meta -&gt; do</span>
+<span class="lineno">  309 </span><span class="spaces">          </span><span class="istickedoff">let next = case mOverride of</span>
+<span class="lineno">  310 </span><span class="spaces">                </span><span class="istickedoff">Just content -&gt;</span>
+<span class="lineno">  311 </span><span class="spaces">                  </span><span class="istickedoff">let label = parseAgentFileId content &lt;|&gt; mFallbackName</span>
+<span class="lineno">  312 </span><span class="spaces">                  </span><span class="istickedoff">in meta { smSystemOverride = Just content</span>
+<span class="lineno">  313 </span><span class="spaces">                          </span><span class="istickedoff">, smAgent = Nothing</span>
+<span class="lineno">  314 </span><span class="spaces">                          </span><span class="istickedoff">, smAgentName = label }</span>
+<span class="lineno">  315 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  316 </span><span class="spaces">                  </span><span class="istickedoff">-- Clearing: leave smAgentName untouched (the follow-up</span>
+<span class="lineno">  317 </span><span class="spaces">                  </span><span class="istickedoff">-- updateSessionAgent from the Remove button will reset</span>
+<span class="lineno">  318 </span><span class="spaces">                  </span><span class="istickedoff">-- it to the default agent's id).</span>
+<span class="lineno">  319 </span><span class="spaces">                  </span><span class="istickedoff">meta { smSystemOverride = Nothing }</span>
+<span class="lineno">  320 </span><span class="spaces">          </span><span class="istickedoff">saveSessionMeta paths next</span>
+<span class="lineno">  321 </span><span class="spaces">          </span><span class="istickedoff">pure True</span></span>
+<span class="lineno">  322 </span>
+<span class="lineno">  323 </span>-- | Update (or clear) the user-set display description for a session.
+<span class="lineno">  324 </span>-- 'Nothing' clears it (the UI then falls back to the auto-summary /
+<span class="lineno">  325 </span>-- first-message snippet / agent name); 'Just t' sets it (a blank or
+<span class="lineno">  326 </span>-- all-whitespace string is normalized to 'Nothing' so the caller can pass
+<span class="lineno">  327 </span>-- the raw input). Returns 'False' when the session's @session.json@ can't
+<span class="lineno">  328 </span>-- be found or parsed; 'True' on a successful write. Only touches
+<span class="lineno">  329 </span>-- 'smDescription' — all other fields (agent binding, override, etc.) are
+<span class="lineno">  330 </span>-- preserved.
+<span class="lineno">  331 </span>updateSessionDescription :: SealPaths -&gt; SessionId -&gt; Maybe Text -&gt; IO Bool
+<span class="lineno">  332 </span><span class="decl"><span class="istickedoff">updateSessionDescription paths sid mDesc = do</span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionMetaPath paths sid</span>
+<span class="lineno">  334 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  336 </span><span class="spaces">    </span><span class="istickedoff">then pure False</span>
+<span class="lineno">  337 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  338 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- decodeFileStrict mp :: IO (Maybe SessionMeta)</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  340 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  341 </span><span class="spaces">        </span><span class="istickedoff">Just meta -&gt; do</span>
+<span class="lineno">  342 </span><span class="spaces">          </span><span class="istickedoff">let next = meta { smDescription = normalized }</span>
+<span class="lineno">  343 </span><span class="spaces">          </span><span class="istickedoff">saveSessionMeta paths next</span>
+<span class="lineno">  344 </span><span class="spaces">          </span><span class="istickedoff">pure True</span>
+<span class="lineno">  345 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  346 </span><span class="spaces">    </span><span class="istickedoff">normalized = case mDesc of</span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff">Just t</span>
+<span class="lineno">  348 </span><span class="spaces">        </span><span class="istickedoff">| not (T.null (T.strip t)) -&gt; Just t</span>
+<span class="lineno">  349 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>                -&gt; Nothing</span>
+<span class="lineno">  350 </span><span class="spaces">      </span><span class="istickedoff">Nothing                      -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  351 </span>
+<span class="lineno">  352 </span>-- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
+<span class="lineno">  353 </span>-- Returns 'Nothing' when the file has no frontmatter or no @id@ key.
+<span class="lineno">  354 </span>parseAgentFileId :: Text -&gt; Maybe Text
+<span class="lineno">  355 </span><span class="decl"><span class="istickedoff">parseAgentFileId content =</span>
+<span class="lineno">  356 </span><span class="spaces">  </span><span class="istickedoff">let (fm, _body) = decodeDoc content</span>
+<span class="lineno">  357 </span><span class="spaces">  </span><span class="istickedoff">in case fmLookup &quot;id&quot; fm of</span>
+<span class="lineno">  358 </span><span class="spaces">       </span><span class="istickedoff">Just t | <span class="tickonlytrue">not (T.null (T.strip t))</span> -&gt; Just (T.strip t)</span>
+<span class="lineno">  359 </span><span class="spaces">       </span><span class="istickedoff">_                                 -&gt; Nothing</span></span>
+<span class="lineno">  360 </span>
+<span class="lineno">  361 </span>-- | After a successful SETUP_REPO, rebind the session's 'smAgent' to the
+<span class="lineno">  362 </span>-- cloned repo's project-level @.agents\/agents.md@ def (id
+<span class="lineno">  363 </span>-- @\&lt;repo\&gt;--agents-md@) when the repo ships one. This makes the repo's
+<span class="lineno">  364 </span>-- project instructions the effective system prompt on the next turn,
+<span class="lineno">  365 </span>-- superseding the @default_agent@ stamped at session creation.
+<span class="lineno">  366 </span>--
+<span class="lineno">  367 </span>-- The discovery runs over the 'WorkdirFs' handle (the single
+<span class="lineno">  368 </span>-- 'mkSessionExec'-constructed chokepoint), so the behavior is identical
+<span class="lineno">  369 </span>-- for @mode=local@ and @mode=remote@ — the workdir is scanned through the
+<span class="lineno">  370 </span>-- same handle in both arms, never via direct filesystem access.
+<span class="lineno">  371 </span>--
+<span class="lineno">  372 </span>-- /Idempotence / non-clobber/: the bind is skipped when the session's
+<span class="lineno">  373 </span>-- current 'smAgent' is already a repo-prefixed def (its id text contains
+<span class="lineno">  374 </span>-- the @&quot;--&quot;@ repo-prefix separator). So a user who has explicitly picked a
+<span class="lineno">  375 </span>-- repo agent (or another repo's agent) via the dropdown is left alone on a
+<span class="lineno">  376 </span>-- re-clone / subsequent SETUP_REPO. A session still on its creation-time
+<span class="lineno">  377 </span>-- @default_agent@ (e.g. @zoe@, which has no @&quot;--&quot;@) is rebound to the
+<span class="lineno">  378 </span>-- repo's @agents-md@; a session with no bound agent ('Nothing') is also
+<span class="lineno">  379 </span>-- rebound. Missing @session.json@, no @.agents\/agents.md@ in the workdir,
+<span class="lineno">  380 </span>-- or a discovery error → no-op (fail-closed, never throws).
+<span class="lineno">  381 </span>autoBindRepoAgent :: WorkdirFs -&gt; SealPaths -&gt; SessionId -&gt; IO ()
+<span class="lineno">  382 </span><span class="decl"><span class="istickedoff">autoBindRepoAgent wfs paths sid = do</span>
+<span class="lineno">  383 </span><span class="spaces">  </span><span class="istickedoff">backend &lt;- workdirAgentDefBackend wfs</span>
+<span class="lineno">  384 </span><span class="spaces">  </span><span class="istickedoff">defs &lt;- adbList backend</span>
+<span class="lineno">  385 </span><span class="spaces">  </span><span class="istickedoff">autoBindRepoAgentWith defs paths sid</span></span>
+<span class="lineno">  386 </span>
+<span class="lineno">  387 </span>-- | 'autoBindRepoAgent' over PRE-COMPUTED defs — the turn engine calls this
+<span class="lineno">  388 </span>-- with the discovery cache's scan result so no extra scan is issued.
+<span class="lineno">  389 </span>autoBindRepoAgentWith :: [AgentDef] -&gt; SealPaths -&gt; SessionId -&gt; IO ()
+<span class="lineno">  390 </span><span class="decl"><span class="istickedoff">autoBindRepoAgentWith defs paths sid =</span>
+<span class="lineno">  391 </span><span class="spaces">  </span><span class="istickedoff">case agentsMdDef defs of</span>
+<span class="lineno">  392 </span><span class="spaces">    </span><span class="istickedoff">Nothing      -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  393 </span><span class="spaces">    </span><span class="istickedoff">Just agentsMdAid -&gt; do</span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)</span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  396 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  397 </span><span class="spaces">        </span><span class="istickedoff">Just meta</span>
+<span class="lineno">  398 </span><span class="spaces">          </span><span class="istickedoff">| alreadyRepoBound (smAgent meta) -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  399 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; void (updateSessionAgent paths sid (Just agentsMdAid))</span>
+<span class="lineno">  400 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  401 </span><span class="spaces">    </span><span class="istickedoff">-- The repo default is the prefixed agents-md def (e.g.</span>
+<span class="lineno">  402 </span><span class="spaces">    </span><span class="istickedoff">-- @my-repo--agents-md@). The prefix varies per repo, so match by the</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="istickedoff">-- @&quot;--agents-md&quot;@ suffix (same rule as 'handleSessionAgents' in the</span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">-- gateway). Returns the first match (alphabetical repo order, matching</span>
+<span class="lineno">  405 </span><span class="spaces">    </span><span class="istickedoff">-- 'listWorkdirAgentDefs' determinism).</span>
+<span class="lineno">  406 </span><span class="spaces">    </span><span class="istickedoff">agentsMdDef ds =</span>
+<span class="lineno">  407 </span><span class="spaces">      </span><span class="istickedoff">case [ adId d | d &lt;- ds, <span class="tickonlytrue">&quot;--agents-md&quot; `T.isSuffixOf` agentDefIdText (adId d)</span> ] of</span>
+<span class="lineno">  408 </span><span class="spaces">        </span><span class="istickedoff">(aid:_) -&gt; Just aid</span>
+<span class="lineno">  409 </span><span class="spaces">        </span><span class="istickedoff">[]      -&gt; Nothing</span>
+<span class="lineno">  410 </span><span class="spaces">    </span><span class="istickedoff">-- A def is repo-prefixed when its id text contains the @&quot;--&quot;@ separator</span>
+<span class="lineno">  411 </span><span class="spaces">    </span><span class="istickedoff">-- ('prefixWorkdirDef' uses @&quot;--&quot;@ between the repo dir name and the</span>
+<span class="lineno">  412 </span><span class="spaces">    </span><span class="istickedoff">-- def id). User-store ids never contain @&quot;--&quot;@ (they're single-segment</span>
+<span class="lineno">  413 </span><span class="spaces">    </span><span class="istickedoff">-- ids). This is a deliberate superset: any repo-prefixed binding counts</span>
+<span class="lineno">  414 </span><span class="spaces">    </span><span class="istickedoff">-- as &quot;user already chose a repo agent&quot; so we don't clobber it.</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="istickedoff">alreadyRepoBound Nothing = <span class="nottickedoff">False</span></span>
+<span class="lineno">  416 </span><span class="spaces">    </span><span class="istickedoff">alreadyRepoBound (Just aid) = &quot;--&quot; `T.isInfixOf` agentDefIdText aid</span></span>
+
+</pre>
+</body>
+</html>

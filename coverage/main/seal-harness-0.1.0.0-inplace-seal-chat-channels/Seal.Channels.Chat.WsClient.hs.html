@@ -1,0 +1,132 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | WebSocket client for the gateway's stream server. Connects, sends
+<span class="lineno">    3 </span>-- @FocusOp@s to change the focused session, and spawns a background thread
+<span class="lineno">    4 </span>-- that decodes incoming @ServerEvent@s and calls a callback for each.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- One WS connection per conversation (per the design's open question #4).
+<span class="lineno">    7 </span>-- The connection's focused session changes on @/N@ focus.
+<span class="lineno">    8 </span>module Seal.Channels.Chat.WsClient
+<span class="lineno">    9 </span>  ( WsClient (..)
+<span class="lineno">   10 </span>  , startWsClient
+<span class="lineno">   11 </span>  , WsEventCallback
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Control.Concurrent (forkIO)
+<span class="lineno">   15 </span>import Control.Monad (void)
+<span class="lineno">   16 </span>import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+<span class="lineno">   17 </span>import Control.Exception (SomeException, try)
+<span class="lineno">   18 </span>import Data.Aeson qualified as A
+<span class="lineno">   19 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   20 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import Network.WebSockets
+<span class="lineno">   24 </span>  (ClientApp, Connection, receiveData, runClient, sendTextData, sendClose)
+<span class="lineno">   25 </span>import System.Timeout (timeout)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Seal.Gateway.Types.Core (SessionId, sessionIdText)
+<span class="lineno">   28 </span>import Seal.Gateway.Types.Stream
+<span class="lineno">   29 </span>  (FocusOp (..), ServerEvent, decodeServerEvent)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | The callback the background reader calls for each decoded 'ServerEvent'.
+<span class="lineno">   32 </span>type WsEventCallback = ServerEvent -&gt; IO ()
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | A handle to a running WS client connection.
+<span class="lineno">   35 </span>data WsClient = WsClient
+<span class="lineno">   36 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wcFocus</span></span></span>      :: SessionId -&gt; IO ()
+<span class="lineno">   37 </span>    -- ^ Send a 'FocusOp' for the given session (change focus).
+<span class="lineno">   38 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wcFocusSince</span></span></span> :: SessionId -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">   39 </span>    -- ^ Send a 'FocusOp' with an optional @since@ entry id (for replay).
+<span class="lineno">   40 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wcClose</span></span></span>      :: IO ()
+<span class="lineno">   41 </span>    -- ^ Close the WS connection and stop the background reader.
+<span class="lineno">   42 </span>  }
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Connect to the gateway's WS server. Forks the connection in a
+<span class="lineno">   45 </span>-- background thread and returns a 'WsClient' handle immediately. Returns
+<span class="lineno">   46 </span>-- 'Left' if the connection fails within 5 seconds.
+<span class="lineno">   47 </span>startWsClient
+<span class="lineno">   48 </span>  :: Text    -- ^ Host (e.g. @&quot;127.0.0.1&quot;@)
+<span class="lineno">   49 </span>  -&gt; Int     -- ^ Port (e.g. 8081)
+<span class="lineno">   50 </span>  -&gt; WsEventCallback
+<span class="lineno">   51 </span>  -&gt; IO (Either Text WsClient)
+<span class="lineno">   52 </span><span class="decl"><span class="nottickedoff">startWsClient host port callback = do</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="nottickedoff">connRef &lt;- newIORef Nothing</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="nottickedoff">readyVar &lt;- newEmptyMVar</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="nottickedoff">let app :: ClientApp ()</span>
+<span class="lineno">   56 </span><span class="spaces">      </span><span class="nottickedoff">app conn = do</span>
+<span class="lineno">   57 </span><span class="spaces">        </span><span class="nottickedoff">writeIORef connRef (Just conn)</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="nottickedoff">putMVar readyVar ()</span>
+<span class="lineno">   59 </span><span class="spaces">        </span><span class="nottickedoff">readerLoop conn callback</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="nottickedoff">-- Fork the client connection so we can return immediately.</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="nottickedoff">_ &lt;- forkIO $ void (try (runClient (T.unpack host) port &quot;/&quot; app) :: IO (Either SomeException ()))</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="nottickedoff">-- Wait up to 5s for the connection to be established.</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="nottickedoff">mReady &lt;- timeout 5000000 (takeMVar readyVar)</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="nottickedoff">case mReady of</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (Left (&quot;WS connect timeout: &quot; &lt;&gt; host &lt;&gt; &quot;:&quot; &lt;&gt; T.pack (show port)))</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="nottickedoff">Just () -&gt; do</span>
+<span class="lineno">   67 </span><span class="spaces">      </span><span class="nottickedoff">let client = WsClient</span>
+<span class="lineno">   68 </span><span class="spaces">            </span><span class="nottickedoff">{ wcFocus = \sid -&gt; sendFocusOpRef connRef sid Nothing</span>
+<span class="lineno">   69 </span><span class="spaces">            </span><span class="nottickedoff">, wcFocusSince = sendFocusOpRef connRef</span>
+<span class="lineno">   70 </span><span class="spaces">            </span><span class="nottickedoff">, wcClose = closeConnRef connRef</span>
+<span class="lineno">   71 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="nottickedoff">pure (Right client)</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | The read loop: decode incoming frames, call the callback for each.
+<span class="lineno">   75 </span>-- Exits when the connection closes or an error occurs.
+<span class="lineno">   76 </span>readerLoop :: Connection -&gt; WsEventCallback -&gt; IO ()
+<span class="lineno">   77 </span><span class="decl"><span class="nottickedoff">readerLoop conn callback = go</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="nottickedoff">go = do</span>
+<span class="lineno">   80 </span><span class="spaces">      </span><span class="nottickedoff">eData &lt;- try (receiveData conn) :: IO (Either SomeException BL.ByteString)</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="nottickedoff">case eData of</span>
+<span class="lineno">   82 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; pure ()  -- connection closed</span>
+<span class="lineno">   83 </span><span class="spaces">        </span><span class="nottickedoff">Right bs -&gt;</span>
+<span class="lineno">   84 </span><span class="spaces">          </span><span class="nottickedoff">case decodeServerEvent bs of</span>
+<span class="lineno">   85 </span><span class="spaces">            </span><span class="nottickedoff">Just ev -&gt; callback ev &gt;&gt; go</span>
+<span class="lineno">   86 </span><span class="spaces">            </span><span class="nottickedoff">Nothing -&gt; go</span></span>  -- unparseable frame; skip
+<span class="lineno">   87 </span>
+<span class="lineno">   88 </span>-- | Send a 'FocusOp' via the connection stored in the 'IORef'.
+<span class="lineno">   89 </span>sendFocusOpRef :: IORef (Maybe Connection) -&gt; SessionId -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">   90 </span><span class="decl"><span class="nottickedoff">sendFocusOpRef ref sid mSince = do</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="nottickedoff">mConn &lt;- readIORef ref</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="nottickedoff">case mConn of</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure ()  -- connection not established or closed</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="nottickedoff">Just conn -&gt; sendFocusOp conn sid mSince</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Close the connection stored in the 'IORef'.
+<span class="lineno">   97 </span>closeConnRef :: IORef (Maybe Connection) -&gt; IO ()
+<span class="lineno">   98 </span><span class="decl"><span class="nottickedoff">closeConnRef ref = do</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="nottickedoff">mConn &lt;- readIORef ref</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="nottickedoff">case mConn of</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="nottickedoff">Just conn -&gt; do</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- try (sendClose conn (&quot;client closed&quot; :: Text)) :: IO (Either SomeException ())</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="nottickedoff">writeIORef ref Nothing</span></span>
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>-- | Send a 'FocusOp' over the WS connection.
+<span class="lineno">  107 </span>sendFocusOp :: Connection -&gt; SessionId -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">  108 </span><span class="decl"><span class="nottickedoff">sendFocusOp conn sid mSince =</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="nottickedoff">sendTextData conn (A.encode (FocusOp (sessionIdText sid) mSince))</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,130 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The per-conversation tab cursor store. Each conversation (a Telegram
+<span class="lineno">    3 </span>-- chat, a Signal conversation, a TUI session) has a cursor pointing at the
+<span class="lineno">    4 </span>-- tab it's currently focused on. The tab list is shared (one
+<span class="lineno">    5 </span>-- 'TabsHandle' in the gateway); the cursor is per-conversation so
+<span class="lineno">    6 </span>-- @/tab focus N@ on Telegram only affects that Telegram conversation,
+<span class="lineno">    7 </span>-- not other conversations or the TUI.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The store is a 'TVar' backed 'Map' from 'ConversationKey' to 'TabRef'.
+<span class="lineno">   10 </span>-- 'ConversationKey' is 'ChannelKind' × 'ConversationId' — the
+<span class="lineno">   11 </span>-- server-derived conversation identity (never user-supplied), so a sender
+<span class="lineno">   12 </span>-- cannot forge a cursor key to hijack another conversation's tab.
+<span class="lineno">   13 </span>--
+<span class="lineno">   14 </span>-- == Persistence
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- The cursor store survives a @seal serve@ restart via the optional 'csSave'
+<span class="lineno">   17 </span>-- hook (mirroring 'Seal.Tabs.TabsHandle.thSave'). A persisting store
+<span class="lineno">   18 </span>-- ('newPersistingCursorStore') writes the full current map to
+<span class="lineno">   19 </span>-- @\&lt;state\&gt;\/cursors.json@ atomically (0600) after every mutation, and is
+<span class="lineno">   20 </span>-- loaded + seeded at boot so an existing conversation re-resolves to its
+<span class="lineno">   21 </span>-- prior session (carrying the user's @\/model use@ choice) instead of a
+<span class="lineno">   22 </span>-- fresh default session.
+<span class="lineno">   23 </span>module Seal.Channels.Cursor
+<span class="lineno">   24 </span>  ( CursorStore
+<span class="lineno">   25 </span>  , newPersistingCursorStore
+<span class="lineno">   26 </span>  , seedCursorStore
+<span class="lineno">   27 </span>  , cursorClearAll
+<span class="lineno">   28 </span>  , snapshotCursor
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+<span class="lineno">   32 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   33 </span>import Data.Map.Strict (Map)
+<span class="lineno">   34 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   35 </span>import Data.Text (Text)
+<span class="lineno">   36 </span>import Data.Text qualified as T
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>import Katip (Severity (..), ls)
+<span class="lineno">   39 </span>import Seal.Channels.Cursor.Persist (saveCursorMap)
+<span class="lineno">   40 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   41 </span>import Seal.Tabs.Types (TabRef)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | The live cursor store. Backed by a 'TVar' so concurrent reads/writes
+<span class="lineno">   44 </span>-- are race-safe (each STM operation is one transaction). The optional
+<span class="lineno">   45 </span>-- 'csSave' action is invoked after a successful mutation so the map
+<span class="lineno">   46 </span>-- persists to disk; @Just (... saveCursorMap path ...)@ for
+<span class="lineno">   47 </span>-- 'newPersistingCursorStore'. Mirrors 'Seal.Tabs.TabsHandle'.
+<span class="lineno">   48 </span>data CursorStore = CursorStore
+<span class="lineno">   49 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csVar</span></span></span>  :: TVar (Map ConversationKey TabRef)
+<span class="lineno">   50 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csSave</span></span></span> :: Maybe (IO ())
+<span class="lineno">   51 </span>  }
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | A conversation identity: 'ChannelKind' × 'ConversationId'.
+<span class="lineno">   54 </span>-- Re-exported here for convenience; the key type is 'ConversationKey'.
+<span class="lineno">   55 </span>type ConversationKey = (Text, Text)
+<span class="lineno">   56 </span>  -- ^ (channel-kind-text, conversation-id-text). We use the text forms
+<span class="lineno">   57 </span>  -- rather than the structured types so the store doesn't depend on
+<span class="lineno">   58 </span>  -- 'ChannelKind' or 'ConversationId' directly (keeping the module
+<span class="lineno">   59 </span>  -- lightweight). Callers mint the key from 'MessageSource'.
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | Create a 'CursorStore' that persists every mutation to @path@ (atomic
+<span class="lineno">   62 </span>-- write, 0600, MVar-serialized via 'Seal.Util.AtomicJson.saveJsonAtomic').
+<span class="lineno">   63 </span>-- Used by 'Seal.Command.Serve.runServeMain' so the cursor map survives
+<span class="lineno">   64 </span>-- a restart. The save action snapshots the current map inside itself
+<span class="lineno">   65 </span>-- (so the last writer wins with a consistent view, even if mutations
+<span class="lineno">   66 </span>-- interleave the save).
+<span class="lineno">   67 </span>newPersistingCursorStore :: FilePath -&gt; IO CursorStore
+<span class="lineno">   68 </span><span class="decl"><span class="nottickedoff">newPersistingCursorStore path = do</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="nottickedoff">tv &lt;- newTVarIO Map.empty</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="nottickedoff">let store = CursorStore { csVar = tv, csSave = Just (saveAction store) }</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="nottickedoff">saveAction s = saveCursorMap path =&lt;&lt; snapshotCursor s</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="nottickedoff">pure store</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | Replace the handle's map in one STM transaction. Used at boot to
+<span class="lineno">   75 </span>-- seed the in-memory store from the persisted @cursors.json@ (after the
+<span class="lineno">   76 </span>-- caller has dropped stale entries, if desired). Does NOT persist (the
+<span class="lineno">   77 </span>-- caller is loading FROM disk — writing back would be a redundant no-op).
+<span class="lineno">   78 </span>seedCursorStore :: CursorStore -&gt; Map ConversationKey TabRef -&gt; IO ()
+<span class="lineno">   79 </span><span class="decl"><span class="nottickedoff">seedCursorStore s m = atomically (writeTVar (csVar s) m)</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Snapshot the current map. Used by the save action.
+<span class="lineno">   82 </span>snapshotCursor :: CursorStore -&gt; IO (Map ConversationKey TabRef)
+<span class="lineno">   83 </span><span class="decl"><span class="nottickedoff">snapshotCursor s = readTVarIO (csVar s)</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Clear every conversation whose cursor points at @ref@. Used when a tab
+<span class="lineno">   86 </span>-- is closed: the closed tab's 'TabRef' is stale, so any conversation still
+<span class="lineno">   87 </span>-- focused on it should drop the cursor (the next message will create a
+<span class="lineno">   88 </span>-- fresh tab). Single STM transaction — race-safe. Persists via 'csSave'.
+<span class="lineno">   89 </span>cursorClearAll :: CursorStore -&gt; TabRef -&gt; IO ()
+<span class="lineno">   90 </span><span class="decl"><span class="nottickedoff">cursorClearAll s ref = do</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="nottickedoff">atomically $ do</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="nottickedoff">m &lt;- readTVar (csVar s)</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="nottickedoff">writeTVar (csVar s) (Map.filter (/= ref) m)</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="nottickedoff">persistCursor s</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Run the persist action (if any) after a successful mutation. A save
+<span class="lineno">   97 </span>-- failure is logged to stderr (ids + error only — no conversation content)
+<span class="lineno">   98 </span>-- and swallowed — the in-memory store stays authoritative within the
+<span class="lineno">   99 </span>-- session; the next successful mutation will retry the save (writing the
+<span class="lineno">  100 </span>-- full current map, so a missed save self-heals). Mirrors
+<span class="lineno">  101 </span>-- 'Seal.Tabs.persistIf'.
+<span class="lineno">  102 </span>persistCursor :: CursorStore -&gt; IO ()
+<span class="lineno">  103 </span><span class="decl"><span class="nottickedoff">persistCursor s =</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="nottickedoff">case csSave s of</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="nottickedoff">Nothing  -&gt; pure ()</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="nottickedoff">Just act -&gt; act `catch` \e -&gt;</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="nottickedoff">globalLogIO WarningS (&quot;[persist] cursors.json save failed: &quot; &lt;&gt; ls (T.pack (show (e :: SomeException))))</span></span>
+
+</pre>
+</body>
+</html>

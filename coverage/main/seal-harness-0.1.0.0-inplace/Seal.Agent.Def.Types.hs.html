@@ -1,0 +1,215 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The agent-definition model. 'AgentDefId' is a smart-constructed newtype with
+<span class="lineno">    3 </span>-- the same charset predicate as 'Seal.Core.Types.SessionId'
+<span class="lineno">    4 </span>-- (@[A-Za-z0-9_-]+@, non-empty, no leading dot). An 'AgentDef' is a named
+<span class="lineno">    5 </span>-- configuration (provider + model + system prompt + tool exposure) that a
+<span class="lineno">    6 </span>-- running agent instance is bound to. The definition store is canonical in the
+<span class="lineno">    7 </span>-- Audited log; this module's backend is a materialized view.
+<span class="lineno">    8 </span>module Seal.Agent.Def.Types
+<span class="lineno">    9 </span>  ( AgentDefId (..)
+<span class="lineno">   10 </span>  , mkAgentDefId
+<span class="lineno">   11 </span>  , isValidAgentDefId
+<span class="lineno">   12 </span>  , agentDefIdText
+<span class="lineno">   13 </span>  , AgentDef (..)
+<span class="lineno">   14 </span>  , sanitizeAgentTextField
+<span class="lineno">   15 </span>  , sanitizeAgentDefFields
+<span class="lineno">   16 </span>  , agentFieldCapSmall
+<span class="lineno">   17 </span>  , agentFieldCapName
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Data.Aeson
+<span class="lineno">   21 </span>  ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   22 </span>import Data.Aeson.Types (Value (..))
+<span class="lineno">   23 </span>import Data.Set qualified as Set
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>import Data.Text qualified as T
+<span class="lineno">   26 </span>import Data.Time (UTCTime)
+<span class="lineno">   27 </span>import Data.Vector qualified as V
+<span class="lineno">   28 </span>import GHC.Generics (Generic)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
+<span class="lineno">   31 </span>import Seal.Security.Policy (AllowList (..))
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | Opaque agent-definition key. Smart-constructed via 'mkAgentDefId'.
+<span class="lineno">   34 </span>newtype AgentDefId = AgentDefId Text
+<span class="lineno">   35 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   36 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | @[A-Za-z0-9_-]+@, non-empty, no leading dot. Mirrors 'isValidMemoryId'.
+<span class="lineno">   39 </span>-- | @[A-Za-z0-9_-]+@, non-empty, no leading dot. Mirrors 'isValidMemoryPath'.
+<span class="lineno">   40 </span>isValidAgentDefId :: Text -&gt; Bool
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">isValidAgentDefId t =</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head t /= '.'</span>
+<span class="lineno">   44 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all (`elem` chars) t</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">chars = ['A' .. 'Z'] &lt;&gt; ['a' .. 'z'] &lt;&gt; ['0' .. '9'] &lt;&gt; &quot;_-&quot;</span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>mkAgentDefId :: Text -&gt; Either Text AgentDefId
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">mkAgentDefId t</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">| isValidAgentDefId t = Right (AgentDefId t)</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Left (&quot;invalid agent def id: &quot; &lt;&gt; T.pack (show t))</span></span>
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>agentDefIdText :: AgentDefId -&gt; Text
+<span class="lineno">   54 </span><span class="decl"><span class="istickedoff">agentDefIdText (AgentDefId t) = t</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | One agent definition. 'adProvider' is a provider label (e.g. @\&quot;ollama\&quot;@);
+<span class="lineno">   57 </span>-- 'adTools' is the opcode allow-list (which opcodes this agent may call). The
+<span class="lineno">   58 </span>-- system prompt and tool list are agent-visible data (not vault secrets); they
+<span class="lineno">   59 </span>-- are recorded in full in both the session transcript and the Audited log.
+<span class="lineno">   60 </span>-- 'adSession' is the originating session (provenance). 'adUpdatedAt' is bumped
+<span class="lineno">   61 </span>-- on each 'AGENT_DEF_UPDATE'.
+<span class="lineno">   62 </span>--
+<span class="lineno">   63 </span>-- 'adGroup' is an optional category for display grouping, mirroring 'skGroup'
+<span class="lineno">   64 </span>-- on 'Seal.Skills.Types.Skill'. It is derived from the on-disk parent
+<span class="lineno">   65 </span>-- directory name (@config\/agents\/\&lt;group\&gt;\/\&lt;id\&gt;.md@) and may be
+<span class="lineno">   66 </span>-- overridden via a @group:@ frontmatter key. 'Nothing' means the def belongs
+<span class="lineno">   67 </span>-- to the default (ungrouped) section. The def /id/ stays flat regardless of
+<span class="lineno">   68 </span>-- group (the charset predicate forbids @\/@), so group is purely display
+<span class="lineno">   69 </span>-- metadata — opcodes, file mapping, and lookups all key on 'adId'.
+<span class="lineno">   70 </span>data AgentDef = AgentDef
+<span class="lineno">   71 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">adId</span></span></span>        :: AgentDefId
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adName</span></span></span>      :: Text
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adProvider</span></span></span>  :: Text
+<span class="lineno">   74 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adModel</span></span></span>     :: ModelId
+<span class="lineno">   75 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adSystem</span></span></span>    :: Maybe Text
+<span class="lineno">   76 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adTools</span></span></span>     :: AllowList OpName
+<span class="lineno">   77 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adGroup</span></span></span>     :: Maybe Text
+<span class="lineno">   78 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adRole</span></span></span>      :: Maybe Text
+<span class="lineno">   79 </span>    -- ^ @\&quot;orchestrator\&quot;@ | @\&quot;leaf\&quot;@ | 'Nothing' (≡ leaf). Authoritative —
+<span class="lineno">   80 </span>    -- the def author (or operator) decides; AGENT_START's per-task role may
+<span class="lineno">   81 </span>    -- only NARROW (orchestrator → leaf), never widen. Validated at
+<span class="lineno">   82 </span>    -- AGENT_DEF_WRITE (rejects anything else) and passed through the
+<span class="lineno">   83 </span>    -- field validators at decode time.
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adDescription</span></span></span> :: Maybe Text
+<span class="lineno">   85 </span>    -- ^ One-line human/model-facing summary rendered into the
+<span class="lineno">   86 </span>    -- @\&lt;available_agents\&gt;@ catalog and AGENT_DEF_LIST output.
+<span class="lineno">   87 </span>    -- Sanitized (single line, no control chars, no catalog-fence tokens,
+<span class="lineno">   88 </span>    -- capped) — the same injection defense as every other def field.
+<span class="lineno">   89 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adCreatedAt</span></span></span> :: UTCTime
+<span class="lineno">   90 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adUpdatedAt</span></span></span> :: UTCTime
+<span class="lineno">   91 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adSession</span></span></span>   :: SessionId
+<span class="lineno">   92 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | The small per-field cap (role, description, group, provider, model):
+<span class="lineno">   95 </span>-- these render into prompt catalogs / tool output, so they are bounded
+<span class="lineno">   96 </span>-- tightly. 256 chars.
+<span class="lineno">   97 </span>agentFieldCapSmall :: Int
+<span class="lineno">   98 </span><span class="decl"><span class="istickedoff">agentFieldCapSmall = 256</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | The name cap. 1024 chars (names may be longer than the small cap).
+<span class="lineno">  101 </span>agentFieldCapName :: Int
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">agentFieldCapName = 1024</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Catalog-fence tokens a def field must never carry (they would let a
+<span class="lineno">  105 </span>-- def field forge or close the @\&lt;available_agents\&gt;@ /
+<span class="lineno">  106 </span>-- @\&lt;available_skills\&gt;@ catalog block, or forge frontmatter fences on
+<span class="lineno">  107 </span>-- re-encode).
+<span class="lineno">  108 </span>agentFenceTokens :: [Text]
+<span class="lineno">  109 </span><span class="decl"><span class="istickedoff">agentFenceTokens = [&quot;&lt;/available_agents&gt;&quot;, &quot;&lt;/available_skills&gt;&quot;, &quot;---&quot;]</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | Sanitize one agent-def text field for prompt/catalog rendering:
+<span class="lineno">  112 </span>-- newlines, carriage returns, and tabs become spaces, C0 control
+<span class="lineno">  113 </span>-- characters are stripped, the catalog fence tokens become underscores,
+<span class="lineno">  114 </span>-- and the result is truncated at @cap@ characters with a truncation
+<span class="lineno">  115 </span>-- marker. Pure; used by both decode paths and AGENT_DEF_WRITE (single
+<span class="lineno">  116 </span>-- chokepoint each).
+<span class="lineno">  117 </span>sanitizeAgentTextField :: Int -&gt; Text -&gt; Text
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">sanitizeAgentTextField cap = truncateField cap . T.strip . replaceFences . stripControl . singleLine</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">singleLine = T.replace &quot;\r&quot; &quot; &quot; . T.replace &quot;\n&quot; &quot; &quot; . T.replace &quot;\t&quot; &quot; &quot;</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">stripControl = T.filter (&gt;= ' ')</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">replaceFences t = foldl' (\acc tok -&gt; T.replace tok &quot;_&quot; acc) t agentFenceTokens</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">truncateField n txt</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">| T.length txt &lt;= n = txt</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = T.take n txt &lt;&gt; &quot;[...truncated]&quot;</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Sanitize every renderable field of an 'AgentDef' (role, description,
+<span class="lineno">  128 </span>-- group, provider, model, name) with the per-field cap matrix:
+<span class="lineno">  129 </span>-- @agentFieldCapSmall@ (256) for role/description/group/provider/model,
+<span class="lineno">  130 </span>-- @agentFieldCapName@ (1024) for name. Pure; applied by both decode paths
+<span class="lineno">  131 </span>-- and AGENT_DEF_WRITE so no unsanitized field can reach a prompt or tool
+<span class="lineno">  132 </span>-- output.
+<span class="lineno">  133 </span>sanitizeAgentDefFields :: AgentDef -&gt; AgentDef
+<span class="lineno">  134 </span><span class="decl"><span class="istickedoff">sanitizeAgentDefFields d = d</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">{ adName        = sanitizeAgentTextField agentFieldCapName (adName d)</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">, adProvider    = sanitizeAgentTextField agentFieldCapSmall (adProvider d)</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">, adModel       = ModelId (sanitizeAgentTextField agentFieldCapSmall m)</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">, adGroup       = sanitizeMaybe agentFieldCapSmall (adGroup d)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">, adRole        = sanitizeMaybe agentFieldCapSmall (adRole d)</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">, adDescription = sanitizeMaybe agentFieldCapSmall (adDescription d)</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="istickedoff">m = case adModel d of ModelId t -&gt; t</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">sanitizeMaybe cap = fmap (sanitizeAgentTextField cap)</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Encode an 'AllowList OpName' as a JSON value: @\&quot;all\&quot;@ for 'AllowAll', or
+<span class="lineno">  147 </span>-- an array of opcode-name strings for 'AllowOnly'.
+<span class="lineno">  148 </span>allowListToValue :: AllowList OpName -&gt; Value
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">allowListToValue AllowAll       = String &quot;all&quot;</span>
+<span class="lineno">  150 </span><span class="spaces"></span><span class="istickedoff">allowListToValue (AllowOnly xs) = toJSON (map unOpNameText (Set.toList xs))</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">unOpNameText (OpName t) = t</span></span>
+<span class="lineno">  153 </span>
+<span class="lineno">  154 </span>-- | Decode an 'AllowList OpName' from @\&quot;all\&quot;@ or an array of opcode-name
+<span class="lineno">  155 </span>-- strings. Unknown shapes default to 'AllowAll' (fail-closed would block the
+<span class="lineno">  156 </span>-- agent from calling anything; the wiring layer validates input before
+<span class="lineno">  157 </span>-- construction, so a malformed stored def is treated permissively).
+<span class="lineno">  158 </span>allowListFromValue :: Value -&gt; AllowList OpName
+<span class="lineno">  159 </span><span class="decl"><span class="istickedoff">allowListFromValue (String &quot;all&quot;) = AllowAll</span>
+<span class="lineno">  160 </span><span class="spaces"></span><span class="istickedoff">allowListFromValue (Array xs)     = AllowOnly (Set.fromList [ OpName t | String t &lt;- V.toList xs ])</span>
+<span class="lineno">  161 </span><span class="spaces"></span><span class="istickedoff">allowListFromValue _               = <span class="nottickedoff">AllowAll</span></span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON AgentDef</span></span></span></span></span></span></span></span> where
+<span class="lineno">  164 </span>  <span class="decl"><span class="istickedoff">toJSON d = object</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;id&quot;         .= adId d</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">, &quot;name&quot;       .= adName d</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">, &quot;provider&quot;   .= adProvider d</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">, &quot;model&quot;      .= adModel d</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">, &quot;system&quot;     .= adSystem d</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">, &quot;tools&quot;      .= allowListToValue (adTools d)</span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">, &quot;group&quot;      .= adGroup d</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">, &quot;role&quot;       .= adRole d</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">, &quot;description&quot; .= adDescription d</span>
+<span class="lineno">  174 </span><span class="spaces">    </span><span class="istickedoff">, &quot;created_at&quot; .= adCreatedAt d</span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">, &quot;updated_at&quot; .= adUpdatedAt d</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff">, &quot;session&quot;    .= adSession d</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  178 </span>
+<span class="lineno">  179 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON AgentDef</span></span></span></span> where
+<span class="lineno">  180 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;AgentDef&quot;</span> $ \o -&gt; AgentDef</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o .:  &quot;id&quot;</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;name&quot;</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;provider&quot;</span>
+<span class="lineno">  184 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;model&quot;</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;system&quot;</span>
+<span class="lineno">  186 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; (allowListFromValue &lt;$&gt; o .: &quot;tools&quot;)</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;group&quot;</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;role&quot;</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;description&quot;</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;created_at&quot;</span>
+<span class="lineno">  191 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;updated_at&quot;</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;session&quot;</span></span>
+
+</pre>
+</body>
+</html>

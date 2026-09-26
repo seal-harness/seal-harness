@@ -1,0 +1,217 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Static behavioral guidance blocks injected into the system prompt.
+<span class="lineno">    3 </span>-- Each block is a few sentences of operational guidance that improves
+<span class="lineno">    4 </span>-- model behavior across providers without being model-specific. The
+<span class="lineno">    5 </span>-- blocks are config-gated (see 'Seal.Config.File': @[agent]@
+<span class="lineno">    6 </span>-- @parallel_tool_guidance@, @tool_use_enforcement@,
+<span class="lineno">    7 </span>-- @task_completion_guidance@); each defaults to injected (true).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The blocks are appended /before/ the dynamic @\&lt;available_skills\&gt;@
+<span class="lineno">   10 </span>-- catalog so the stable text precedes the volatile catalog (cache-
+<span class="lineno">   11 </span>-- friendly ordering: stable identity prefix → static guidance →
+<span class="lineno">   12 </span>-- autoload body → available-skills catalog).
+<span class="lineno">   13 </span>module Seal.Agent.PromptParts
+<span class="lineno">   14 </span>  ( parallelToolGuidance
+<span class="lineno">   15 </span>  , toolUseEnforcement
+<span class="lineno">   16 </span>  , taskCompletionGuidance
+<span class="lineno">   17 </span>  , credentialToolGuidance
+<span class="lineno">   18 </span>  , staticGuidanceBlock
+<span class="lineno">   19 </span>  , injectStaticGuidance
+<span class="lineno">   20 </span>  , availableAgentsBlock
+<span class="lineno">   21 </span>  , injectAvailableAgents
+<span class="lineno">   22 </span>  , leafAgentNote
+<span class="lineno">   23 </span>  ) where
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Data.List (groupBy, sortOn)
+<span class="lineno">   26 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   27 </span>import Data.Text (Text)
+<span class="lineno">   28 </span>import Data.Text qualified as T
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>-- | Parallel tool-call guidance. Tells the model to batch independent
+<span class="lineno">   33 </span>-- tool calls into one turn rather than running them sequentially across
+<span class="lineno">   34 </span>-- turns. A real latency/token win with no risk.
+<span class="lineno">   35 </span>parallelToolGuidance :: Text
+<span class="lineno">   36 </span><span class="decl"><span class="istickedoff">parallelToolGuidance =</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Parallel tool calls\n\n\</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">\When several tool calls are independent (no output of one is needed to \</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">\call another), batch them into a single turn. Do not call them \</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">\sequentially across turns when you could have called them together.&quot;</span></span>
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | Tool-use enforcement. Tells the model to actually call tools instead
+<span class="lineno">   43 </span>-- of describing actions. Improves reliability on weaker models that tend
+<span class="lineno">   44 </span>-- to narrate instead of act.
+<span class="lineno">   45 </span>toolUseEnforcement :: Text
+<span class="lineno">   46 </span><span class="decl"><span class="istickedoff">toolUseEnforcement =</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Tool use\n\n\</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">\When a task requires a tool, actually call the tool. Do not describe \</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">\or narrate the action you would take (\&quot;I would run X\&quot;) and then stop \</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">\— call it. Do not answer from memory when a current tool call could \</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">\get the real state.&quot;</span></span>
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | Task-completion / anti-fabrication guidance. Tells the model not to
+<span class="lineno">   54 </span>-- stop after a stub and not to fabricate output when a path is blocked.
+<span class="lineno">   55 </span>taskCompletionGuidance :: Text
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">taskCompletionGuidance =</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Task completion\n\n\</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">\Do not stop after producing a stub, TODO, or skeleton and report the \</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">\task done. Complete the implementation through to working, tested \</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">\code. If a path is genuinely blocked (missing input, failed tool, \</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">\permission denied), say so explicitly and ask for what you need — do \</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">\not fabricate output to fill the gap.&quot;</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Credential-bearing-tool guidance. Tells the model to use @BIN_EXEC@
+<span class="lineno">   65 </span>-- (not @SHELL_EXEC@) for @git@ and @gh@, because Seal Harness injects
+<span class="lineno">   66 </span>-- credentials from the vault only through the @BIN_EXEC@ path.
+<span class="lineno">   67 </span>credentialToolGuidance :: Text
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">credentialToolGuidance =</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Credential-bearing tools\n\n\</span>
+<span class="lineno">   70 </span><span class="spaces"> </span><span class="istickedoff">\Use `BIN_EXEC` (not `SHELL_EXEC`) for `git` and `gh` — Seal Harness \</span>
+<span class="lineno">   71 </span><span class="spaces"> </span><span class="istickedoff">\injects credentials from the vault only through `BIN_EXEC`. Running \</span>
+<span class="lineno">   72 </span><span class="spaces"> </span><span class="istickedoff">\`gh` via `SHELL_EXEC` gets no credential injection and will fail with \</span>
+<span class="lineno">   73 </span><span class="spaces"> </span><span class="istickedoff">\an opaque authentication error on push, PR creation, or any operation \</span>
+<span class="lineno">   74 </span><span class="spaces"> </span><span class="istickedoff">\that requires auth.&quot;</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Render the enabled guidance blocks as a single section, joined with
+<span class="lineno">   77 </span>-- blank lines. Returns the empty 'Text' when no block is enabled (so the
+<span class="lineno">   78 </span>-- caller can skip emitting anything). Each enabled block is a
+<span class="lineno">   79 </span>-- @## header@ + body, so the whole section reads as a sequence of
+<span class="lineno">   80 </span>-- short guidance notes.
+<span class="lineno">   81 </span>staticGuidanceBlock :: Bool -&gt; Bool -&gt; Bool -&gt; Bool -&gt; Text
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">staticGuidanceBlock parallel toolUse taskCompletion credentialTool =</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">let parts = [ parallelToolGuidance    | parallel ]</span>
+<span class="lineno">   84 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; [ toolUseEnforcement      | toolUse ]</span>
+<span class="lineno">   85 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; [ taskCompletionGuidance  | taskCompletion ]</span>
+<span class="lineno">   86 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; [ credentialToolGuidance  | credentialTool ]</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">in if null parts then &quot;&quot; else T.intercalate &quot;\n\n&quot; parts</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Append the enabled static guidance blocks to the resolved system
+<span class="lineno">   90 </span>-- prompt. The blocks go /before/ the auto-loaded skill body and the
+<span class="lineno">   91 </span>-- available-skills catalog (the caller runs this first, then
+<span class="lineno">   92 </span>-- 'Seal.Skills.Autoload.injectAutoloadSkill', then
+<span class="lineno">   93 </span>-- 'Seal.Skills.Prompt.injectAvailableSkills'). Returns the prompt
+<span class="lineno">   94 </span>-- unchanged when no block is enabled.
+<span class="lineno">   95 </span>injectStaticGuidance
+<span class="lineno">   96 </span>  :: Bool    -- ^ parallel tool-call guidance
+<span class="lineno">   97 </span>  -&gt; Bool    -- ^ tool-use enforcement
+<span class="lineno">   98 </span>  -&gt; Bool    -- ^ task-completion guidance
+<span class="lineno">   99 </span>  -&gt; Bool    -- ^ credential-bearing-tool guidance
+<span class="lineno">  100 </span>  -&gt; Maybe Text
+<span class="lineno">  101 </span>  -&gt; Maybe Text
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">injectStaticGuidance parallel toolUse taskCompletion credentialTool mPrompt =</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">let block = staticGuidanceBlock parallel toolUse taskCompletion credentialTool</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">in if T.null block</span>
+<span class="lineno">  105 </span><span class="spaces">       </span><span class="istickedoff">then mPrompt</span>
+<span class="lineno">  106 </span><span class="spaces">       </span><span class="istickedoff">else Just (case mPrompt of</span>
+<span class="lineno">  107 </span><span class="spaces">                    </span><span class="istickedoff">Nothing  -&gt; block</span>
+<span class="lineno">  108 </span><span class="spaces">                    </span><span class="istickedoff">Just base -&gt; base &lt;&gt; &quot;\n\n&quot; &lt;&gt; block)</span></span>
+<span class="lineno">  109 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  110 </span>-- W3 (issue #154): the &lt;available_agents&gt; catalog
+<span class="lineno">  111 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | The per-def catalog budget (chars). Matches the skills catalog
+<span class="lineno">  114 </span>-- (4096) — with repo-prefixed ids and 256-char descriptions, ~19
+<span class="lineno">  115 </span>-- metaswarm agents fit comfortably; truncation is observable via the
+<span class="lineno">  116 </span>-- marker, and AGENT_DEF_LIST always stays complete.
+<span class="lineno">  117 </span>availableAgentsBudget :: Int
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">availableAgentsBudget = 4096</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | The one-line note injected into a LEAF child's prompt instead of the
+<span class="lineno">  121 </span>-- catalog (the child's registry has no spawn capability, so advertising
+<span class="lineno">  122 </span>-- agents it cannot delegate to would waste turns).
+<span class="lineno">  123 </span>leafAgentNote :: Text
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">leafAgentNote = &quot;You are a leaf agent; delegation is not available.&quot;</span></span>
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>-- | The untruncated @\&lt;available_agents\&gt;@ catalog block: one bullet per
+<span class="lineno">  127 </span>-- def (@- \&lt;full-id\&gt; [\&lt;role\&gt;]: \&lt;description|name-fallback\&gt;@), grouped
+<span class="lineno">  128 </span>-- by 'adGroup' with @## \&lt;group\&gt;@ headers (ungrouped defs fall under
+<span class="lineno">  129 </span>-- @## Agents@), ending with the AGENT_START nudge line. The block is
+<span class="lineno">  130 </span>-- truncated to 'availableAgentsBudget' with the elided-count marker.
+<span class="lineno">  131 </span>-- The empty list renders @\&quot;\&quot;@ (the caller skips injection — no empty
+<span class="lineno">  132 </span>-- tags are ever emitted). Bullets always use the FULL merged-backend id
+<span class="lineno">  133 </span>-- (workdir-prefixed where applicable) — that is what AGENT_START accepts.
+<span class="lineno">  134 </span>availableAgentsBlock :: [AgentDef] -&gt; Text
+<span class="lineno">  135 </span><span class="decl"><span class="istickedoff">availableAgentsBlock [] = &quot;&quot;</span>
+<span class="lineno">  136 </span><span class="spaces"></span><span class="istickedoff">availableAgentsBlock defs = truncateBlock budget (fullBlock defs)</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">budget = availableAgentsBudget</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">fullBlock ds =</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">&quot;&lt;available_agents&gt;\n&quot;</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; T.intercalate &quot;\n\n&quot; (map renderGroup grouped)</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n\nDelegate with AGENT_START using an id before relying on an agent.&quot;</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n&lt;/available_agents&gt;&quot;</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff">sorted = sortOn (\d -&gt; (groupKey d, agentDefIdText (adId d))) ds</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">grouped = groupBy (\a b -&gt; groupKey a == groupKey b) sorted</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">groupKey d = fromMaybe &quot;&quot; (adGroup d)</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | Render one group's section: a header line (the group name, or
+<span class="lineno">  150 </span>-- \&quot;Agents\&quot; for the ungrouped section) followed by the @- id [role]: text@
+<span class="lineno">  151 </span>-- bullets.
+<span class="lineno">  152 </span>renderGroup :: [AgentDef] -&gt; Text
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">renderGroup [] = <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  154 </span><span class="spaces"></span><span class="istickedoff">renderGroup group@(d0:_) =</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">header &lt;&gt; &quot;\n&quot; &lt;&gt; T.intercalate &quot;\n&quot; (map bullet group)</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">header = case adGroup d0 of</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">Just g  -&gt; &quot;## &quot; &lt;&gt; g</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; &quot;## Agents&quot;</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">bullet d = &quot;- &quot; &lt;&gt; agentDefIdText (adId d) &lt;&gt; roleSuffix (adRole d)</span>
+<span class="lineno">  161 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; &quot;: &quot; &lt;&gt; primaryText d</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">primaryText d = case adDescription d of</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">Just desc | not (T.null (T.strip desc)) -&gt; desc</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">_         -&gt; adName d</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">roleSuffix (Just r) = &quot; [&quot; &lt;&gt; r &lt;&gt; &quot;]&quot;</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">roleSuffix Nothing  = &quot;&quot;</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | Truncate the block to the budget, appending the elided count when
+<span class="lineno">  169 </span>-- truncation occurs (character boundary — 'Text' is Unicode-correct).
+<span class="lineno">  170 </span>truncateBlock :: Int -&gt; Text -&gt; Text
+<span class="lineno">  171 </span><span class="decl"><span class="istickedoff">truncateBlock budget block</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">| T.length block &lt;= budget = block</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">T.take budget block</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;\n[...catalog truncated at &quot;</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; T.pack (show budget)</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; chars; &quot;</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; T.pack (show (T.length block - budget))</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; more chars elided...]&quot;</span></span>
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | Append the @\&lt;available_agents\&gt;@ catalog to the resolved system
+<span class="lineno">  182 </span>-- prompt. Pure over the def list (the caller passes 'adbList' from the
+<span class="lineno">  183 </span>-- per-turn union backend). Returns the prompt unchanged (no catalog)
+<span class="lineno">  184 </span>-- when the list is empty, so no empty tags are ever emitted. The catalog
+<span class="lineno">  185 </span>-- is appended AFTER everything else (skills catalog last per the
+<span class="lineno">  186 </span>-- cache-friendly ordering; agents follow).
+<span class="lineno">  187 </span>injectAvailableAgents :: [AgentDef] -&gt; Maybe Text -&gt; Maybe Text
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">injectAvailableAgents defs mPrompt =</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">let block = availableAgentsBlock defs</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">in if T.null block</span>
+<span class="lineno">  191 </span><span class="spaces">       </span><span class="istickedoff">then mPrompt</span>
+<span class="lineno">  192 </span><span class="spaces">       </span><span class="istickedoff">else pure (case mPrompt of</span>
+<span class="lineno">  193 </span><span class="spaces">                    </span><span class="istickedoff">Nothing  -&gt; block</span>
+<span class="lineno">  194 </span><span class="spaces">                    </span><span class="istickedoff">Just base -&gt; base &lt;&gt; &quot;\n\n&quot; &lt;&gt; block)</span></span>
+
+</pre>
+</body>
+</html>

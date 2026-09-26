@@ -1,0 +1,644 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Sessions opcode group. The consolidated entry point is
+<span class="lineno">    3 </span>-- 'sessionManageOp' (\&quot;SESSION_MANAGE\&quot;), which dispatches on an @action@
+<span class="lineno">    4 </span>-- field to one of four handlers: @new@, @list@, @search@, @get@.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- The legacy opcodes ('sessionNewOp', 'sessionListOp', 'sessionSearchOp',
+<span class="lineno">    7 </span>-- 'sessionGetOp') remain as thin shims that delegate to the same handlers.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- All session opcodes are 'Trusted' — harness-internal operations that
+<span class="lineno">   10 </span>-- manage the on-disk session store. 'orRecorded' carries secret-free
+<span class="lineno">   11 </span>-- metadata only (session ids, provider/model labels, entry counts);
+<span class="lineno">   12 </span>-- transcript content returned by the @get@ action goes in 'orParts'
+<span class="lineno">   13 </span>-- (agent-visible) but never in 'orRecorded'.
+<span class="lineno">   14 </span>module Seal.ISA.Ops.Session
+<span class="lineno">   15 </span>  ( -- * Consolidated opcode
+<span class="lineno">   16 </span>    sessionManageOp
+<span class="lineno">   17 </span>    -- * Legacy shims
+<span class="lineno">   18 </span>  , sessionNewOp
+<span class="lineno">   19 </span>  , sessionListOp
+<span class="lineno">   20 </span>  , sessionSearchOp
+<span class="lineno">   21 </span>  , sessionGetOp
+<span class="lineno">   22 </span>  ) where
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Control.Monad (join)
+<span class="lineno">   25 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   26 </span>import Data.Aeson
+<span class="lineno">   27 </span>  ( Value (..), object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   28 </span>import Data.Aeson qualified as A
+<span class="lineno">   29 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   30 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   31 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   32 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   33 </span>import Data.Text (Text)
+<span class="lineno">   34 </span>import Data.Text qualified as T
+<span class="lineno">   35 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   36 </span>import Data.Time (formatTime, defaultTimeLocale)
+<span class="lineno">   37 </span>import Seal.Types.App (App)
+<span class="lineno">   38 </span>import System.Directory (doesFileExist)
+<span class="lineno">   39 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Seal.Config.Paths
+<span class="lineno">   42 </span>  ( SealPaths, sessionConversationPath, sessionDir, sessionMetaPath
+<span class="lineno">   43 </span>  , resolveChildSessionPath )
+<span class="lineno">   44 </span>import Seal.Core.Paging
+<span class="lineno">   45 </span>  ( Page (..), PageParams (..), paginate )
+<span class="lineno">   46 </span>import Seal.Core.Types
+<span class="lineno">   47 </span>  ( OpName (..), SessionId, TrustLevel (..), mkSessionId, sessionIdText )
+<span class="lineno">   48 </span>import Seal.ISA.Opcode
+<span class="lineno">   49 </span>import Seal.Providers.Class
+<span class="lineno">   50 </span>  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..) )
+<span class="lineno">   51 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   52 </span>import Seal.Session.Store
+<span class="lineno">   53 </span>  ( listChildSessions, listSessions, listArchivedSessions, newSession, saveSessionMeta )
+<span class="lineno">   54 </span>import Seal.Util.StrictIO (readFileTextStrict, decodeFileStrict)
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   57 </span>-- Action enum
+<span class="lineno">   58 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>data SessionAction
+<span class="lineno">   61 </span>  = SessNew
+<span class="lineno">   62 </span>  | SessList
+<span class="lineno">   63 </span>  | SessSearch
+<span class="lineno">   64 </span>  | SessGet
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>parseSessionAction :: Value -&gt; Either Text SessionAction
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">parseSessionAction v =</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;action&quot;)) v of</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">Just t -&gt; case t :: Text of</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">&quot;new&quot;    -&gt; Right SessNew</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">&quot;list&quot;   -&gt; Right SessList</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">&quot;search&quot; -&gt; Right SessSearch</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">&quot;get&quot;    -&gt; Right SessGet</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">other    -&gt; Left (&quot;unknown session action: &quot; &lt;&gt; other)</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;missing or invalid action field&quot;</span></span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   78 </span>-- Page parameters
+<span class="lineno">   79 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Page parameters for the @get@ action transcript pagination. A flat
+<span class="lineno">   82 </span>-- 50-message default with a 200-message hard ceiling.
+<span class="lineno">   83 </span>sessionPageParams :: PageParams
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">sessionPageParams = PageParams { ppFloor = 50, ppCeiling = 200, ppCoeff = 0.0 }</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   87 </span>-- Handlers (shared between SESSION_MANAGE and legacy shims)
+<span class="lineno">   88 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>handleNew :: SealPaths -&gt; Value -&gt; App OpResult
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">handleNew paths v = do</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">let provider = fromMaybe &quot;anthropic&quot; (textField v &quot;provider&quot;)</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">model = fromMaybe &quot;claude-sonnet-4-20250514&quot; (textField v &quot;model&quot;)</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">channel = fromMaybe &quot;api&quot; (textField v &quot;channel&quot;)</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">mDesc = textField v &quot;description&quot;</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">meta &lt;- liftIO (newSession paths provider model channel Nothing)</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">let meta' = case mDesc of</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff">Just d | <span class="tickonlytrue">not (T.null (T.strip d))</span> -&gt; meta { smDescription = Just d }</span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; meta</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">case mDesc of</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">Just d | <span class="tickonlytrue">not (T.null (T.strip d))</span> -&gt; liftIO (saveSessionMeta paths meta')</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">let rendered = renderSessionMeta meta'</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  105 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[ &quot;session_id&quot; .= sessionIdText (smId meta')</span></span>
+<span class="lineno">  106 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;provider&quot; .= smProvider meta'</span></span>
+<span class="lineno">  107 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;model&quot; .= smModel meta'</span></span>
+<span class="lineno">  108 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;channel&quot; .= smChannel meta'</span></span>
+<span class="lineno">  109 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= smDescription meta'</span></span>
+<span class="lineno">  110 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>handleList :: SealPaths -&gt; Value -&gt; App OpResult
+<span class="lineno">  114 </span><span class="decl"><span class="istickedoff">handleList paths v = do</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">let archived = fromMaybe False (boolField v &quot;archived&quot;)</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">includeChildren = fromMaybe False (boolField v &quot;include_children&quot;)</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">metas &lt;- liftIO (if <span class="tickonlyfalse">archived</span> then <span class="nottickedoff">listArchivedSessions paths</span> else listSessions paths)</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">children &lt;- if includeChildren</span>
+<span class="lineno">  119 </span><span class="spaces">                </span><span class="istickedoff">then liftIO (listChildSessions paths)</span>
+<span class="lineno">  120 </span><span class="spaces">                </span><span class="istickedoff">else pure []</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">let parentLines = map renderSessionMeta metas</span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="istickedoff">childLines = [ renderChildSummary parentSid childSid</span>
+<span class="lineno">  123 </span><span class="spaces">                   </span><span class="istickedoff">| (parentSid, childSid) &lt;- children ]</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">allLines = parentLines &lt;&gt; childLines</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">rendered = case allLines of</span>
+<span class="lineno">  126 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; &quot;(no sessions found)&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; T.intercalate &quot;\n&quot; allLines</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[ &quot;count&quot; .= length metas</span></span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;archived&quot; .= archived</span></span>
+<span class="lineno">  131 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;include_children&quot; .= includeChildren</span></span>
+<span class="lineno">  132 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;child_count&quot; .= length children</span></span>
+<span class="lineno">  133 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;session_ids&quot; .= fmap (sessionIdText . smId) metas</span></span>
+<span class="lineno">  134 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>handleSearch :: SealPaths -&gt; Value -&gt; App OpResult
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">handleSearch paths v = do</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">let q = fromMaybe &quot;&quot; (textField v &quot;query&quot;)</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">if T.null (T.strip q)</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">then pure (OpResult <span class="nottickedoff">[TrpText &quot;search: query is empty&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  142 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">let qLower = T.toCaseFold (T.strip q)</span>
+<span class="lineno">  144 </span><span class="spaces">          </span><span class="istickedoff">archived = fromMaybe False (boolField v &quot;archived&quot;)</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">metas &lt;- liftIO (if <span class="tickonlyfalse">archived</span> then <span class="nottickedoff">listArchivedSessions paths</span> else listSessions paths)</span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">results &lt;- liftIO (mapM (searchSession paths qLower) metas)</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">let matched = [ (m, snip) | (m, Just snip) &lt;- results ]</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">children &lt;- liftIO (listChildSessions paths)</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">childResults &lt;- liftIO (mapM (searchChildSession paths qLower) children)</span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">let childMatched = [ (p, c, snip) | (p, c, Just snip) &lt;- childResults ]</span>
+<span class="lineno">  151 </span><span class="spaces">          </span><span class="istickedoff">rendered</span>
+<span class="lineno">  152 </span><span class="spaces">            </span><span class="istickedoff">| null matched &amp;&amp; null childMatched = &quot;(no sessions found)&quot;</span>
+<span class="lineno">  153 </span><span class="spaces">            </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = T.intercalate <span class="nottickedoff">&quot;\n\n&quot;</span> $</span>
+<span class="lineno">  154 </span><span class="spaces">                 </span><span class="istickedoff">[ renderSessionMeta m &lt;&gt; &quot;\n  snippet: &quot; &lt;&gt; snip</span>
+<span class="lineno">  155 </span><span class="spaces">                 </span><span class="istickedoff">| (m, snip) &lt;- matched ]</span>
+<span class="lineno">  156 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; [ renderChildSummary p c &lt;&gt; &quot;\n  snippet: &quot; &lt;&gt; snip</span>
+<span class="lineno">  157 </span><span class="spaces">                 </span><span class="istickedoff">| (p, c, snip) &lt;- childMatched ]</span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  159 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;query&quot; .= q</span></span>
+<span class="lineno">  160 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;archived&quot; .= archived</span></span>
+<span class="lineno">  161 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;match_count&quot; .= (length matched + length childMatched)</span></span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;session_ids&quot; .= fmap (sessionIdText . smId . fst) matched</span></span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>handleGet :: SealPaths -&gt; Value -&gt; App OpResult
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">handleGet paths v = do</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">let mSidText = textField v &quot;session_id&quot;</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">offset = fromMaybe 0 (intField v &quot;offset&quot;)</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">mLimit = intField v &quot;limit&quot;</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">case mSidText &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkSessionId . T.strip of</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;invalid session id&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">metaExists &lt;- liftIO (doesFileExist (sessionMetaPath paths sid))</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- if not metaExists</span>
+<span class="lineno">  176 </span><span class="spaces">                 </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  177 </span><span class="spaces">                 </span><span class="istickedoff">else liftIO (decodeFileStrict (sessionMetaPath paths sid))</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff">Just meta -&gt; do</span>
+<span class="lineno">  180 </span><span class="spaces">          </span><span class="istickedoff">msgs &lt;- liftIO (readSessionMessages paths sid)</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff">let total = length msgs</span>
+<span class="lineno">  182 </span><span class="spaces">              </span><span class="istickedoff">page = paginate sessionPageParams offset mLimit msgs</span>
+<span class="lineno">  183 </span><span class="spaces">              </span><span class="istickedoff">windowMsgs = pgItems page</span>
+<span class="lineno">  184 </span><span class="spaces">              </span><span class="istickedoff">header = renderSessionMeta meta</span>
+<span class="lineno">  185 </span><span class="spaces">              </span><span class="istickedoff">body = T.intercalate &quot;\n\n&quot;</span>
+<span class="lineno">  186 </span><span class="spaces">                </span><span class="istickedoff">(zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)</span>
+<span class="lineno">  187 </span><span class="spaces">              </span><span class="istickedoff">footer = renderPageFooter (pgOffset page) (length windowMsgs) total (pgHasMore page)</span>
+<span class="lineno">  188 </span><span class="spaces">              </span><span class="istickedoff">rendered = T.intercalate &quot;\n\n&quot; (filter (not . T.null) [header, body, footer])</span>
+<span class="lineno">  189 </span><span class="spaces">              </span><span class="istickedoff">recorded = object</span>
+<span class="lineno">  190 </span><span class="spaces">                </span><span class="istickedoff">[ &quot;session_id&quot; .= sessionIdText sid</span>
+<span class="lineno">  191 </span><span class="spaces">                </span><span class="istickedoff">, &quot;provider&quot; .= smProvider meta</span>
+<span class="lineno">  192 </span><span class="spaces">                </span><span class="istickedoff">, &quot;model&quot; .= smModel meta</span>
+<span class="lineno">  193 </span><span class="spaces">                </span><span class="istickedoff">, &quot;offset&quot; .= pgOffset page</span>
+<span class="lineno">  194 </span><span class="spaces">                </span><span class="istickedoff">, &quot;limit&quot; .= length windowMsgs</span>
+<span class="lineno">  195 </span><span class="spaces">                </span><span class="istickedoff">, &quot;total_messages&quot; .= total</span>
+<span class="lineno">  196 </span><span class="spaces">                </span><span class="istickedoff">, &quot;has_more&quot; .= pgHasMore page</span>
+<span class="lineno">  197 </span><span class="spaces">                </span><span class="istickedoff">]</span>
+<span class="lineno">  198 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText rendered] False recorded)</span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="istickedoff">mChild &lt;- liftIO (resolveChildSessionPath paths sid)</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="istickedoff">case mChild of</span>
+<span class="lineno">  202 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure (OpResult</span>
+<span class="lineno">  203 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[TrpText (&quot;session not found: &quot; &lt;&gt; sessionIdText sid)]</span> True</span>
+<span class="lineno">  204 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">(object [&quot;session_id&quot; .= sessionIdText sid])</span>)</span>
+<span class="lineno">  205 </span><span class="spaces">            </span><span class="istickedoff">Just (parentSid, childDir) -&gt; do</span>
+<span class="lineno">  206 </span><span class="spaces">              </span><span class="istickedoff">msgs &lt;- liftIO (readMessagesFromDir childDir)</span>
+<span class="lineno">  207 </span><span class="spaces">              </span><span class="istickedoff">let total = length msgs</span>
+<span class="lineno">  208 </span><span class="spaces">                  </span><span class="istickedoff">page = paginate sessionPageParams offset mLimit msgs</span>
+<span class="lineno">  209 </span><span class="spaces">                  </span><span class="istickedoff">windowMsgs = pgItems page</span>
+<span class="lineno">  210 </span><span class="spaces">                  </span><span class="istickedoff">header = &quot;[child session of &quot; &lt;&gt; sessionIdText parentSid &lt;&gt; &quot;] &quot; &lt;&gt; sessionIdText sid</span>
+<span class="lineno">  211 </span><span class="spaces">                  </span><span class="istickedoff">body = T.intercalate &quot;\n\n&quot;</span>
+<span class="lineno">  212 </span><span class="spaces">                    </span><span class="istickedoff">(zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)</span>
+<span class="lineno">  213 </span><span class="spaces">                  </span><span class="istickedoff">footer = renderPageFooter (pgOffset page) (length windowMsgs) total (pgHasMore page)</span>
+<span class="lineno">  214 </span><span class="spaces">                  </span><span class="istickedoff">rendered = T.intercalate &quot;\n\n&quot; (filter (not . T.null) [header, body, footer])</span>
+<span class="lineno">  215 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  216 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">[ &quot;session_id&quot; .= sessionIdText sid</span></span>
+<span class="lineno">  217 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;child_of&quot; .= sessionIdText parentSid</span></span>
+<span class="lineno">  218 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;offset&quot; .= pgOffset page</span></span>
+<span class="lineno">  219 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;limit&quot; .= length windowMsgs</span></span>
+<span class="lineno">  220 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;total_messages&quot; .= total</span></span>
+<span class="lineno">  221 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;has_more&quot; .= pgHasMore page</span></span>
+<span class="lineno">  222 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  223 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  224 </span>
+<span class="lineno">  225 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  226 </span>-- Authorize gate helpers
+<span class="lineno">  227 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>authorizeSearch :: Value -&gt; Either Text ()
+<span class="lineno">  230 </span><span class="decl"><span class="istickedoff">authorizeSearch v =</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">case textField v &quot;query&quot; of</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;search requires {query:string}&quot;</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">Just q</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">T.null (T.strip q)</span> -&gt; <span class="nottickedoff">Left &quot;search: query is empty&quot;</span></span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">Right ()</span></span></span>
+<span class="lineno">  236 </span>
+<span class="lineno">  237 </span>authorizeGet :: Value -&gt; Either Text ()
+<span class="lineno">  238 </span><span class="decl"><span class="istickedoff">authorizeGet v =</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">case textField v &quot;session_id&quot; of</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;get requires {session_id:string}&quot;</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">Just sid</span>
+<span class="lineno">  242 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">T.null (T.strip sid)</span> -&gt; <span class="nottickedoff">Left &quot;get: session_id is empty&quot;</span></span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">Right ()</span></span></span>
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>-- | Authorize gate for SESSION_MANAGE — dispatches per-action validation.
+<span class="lineno">  246 </span>authorizeManage :: Value -&gt; Either Text ()
+<span class="lineno">  247 </span><span class="decl"><span class="istickedoff">authorizeManage v =</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">case parseSessionAction v of</span>
+<span class="lineno">  249 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; Left e</span>
+<span class="lineno">  250 </span><span class="spaces">    </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  251 </span><span class="spaces">      </span><span class="istickedoff">SessNew    -&gt; Right ()</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">SessList   -&gt; Right ()</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">SessSearch -&gt; authorizeSearch v</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">SessGet    -&gt; authorizeGet v</span></span>
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  257 </span>-- Consolidated opcode: SESSION_MANAGE
+<span class="lineno">  258 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  259 </span>
+<span class="lineno">  260 </span>-- | SESSION_MANAGE: action-based entry point for all session operations.
+<span class="lineno">  261 </span>sessionManageOp :: SealPaths -&gt; Opcode
+<span class="lineno">  262 </span><span class="decl"><span class="istickedoff">sessionManageOp paths = TrustedOpcode</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SESSION_MANAGE&quot;</span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination).&quot;</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;action&quot; .= object</span>
+<span class="lineno">  270 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  271 </span><span class="spaces">              </span><span class="istickedoff">, &quot;enum&quot; .= ([&quot;new&quot;, &quot;list&quot;, &quot;search&quot;, &quot;get&quot;] :: [Text])</span>
+<span class="lineno">  272 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Operation to perform.&quot; :: Text)</span>
+<span class="lineno">  273 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;provider&quot; .= object</span>
+<span class="lineno">  275 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  276 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Provider label (new). Default: \&quot;anthropic\&quot;.&quot; :: Text)</span>
+<span class="lineno">  277 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  278 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;model&quot; .= object</span>
+<span class="lineno">  279 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  280 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Model id (new).&quot; :: Text)</span>
+<span class="lineno">  281 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  282 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;channel&quot; .= object</span>
+<span class="lineno">  283 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  284 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Channel label (new). Default: \&quot;api\&quot;.&quot; :: Text)</span>
+<span class="lineno">  285 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  286 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;description&quot; .= object</span>
+<span class="lineno">  287 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  288 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Session title (new).&quot; :: Text)</span>
+<span class="lineno">  289 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  290 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;archived&quot; .= object</span>
+<span class="lineno">  291 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  292 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;List/search archived sessions (list/search). Default: false.&quot; :: Text)</span>
+<span class="lineno">  293 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;include_children&quot; .= object</span>
+<span class="lineno">  295 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  296 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Also enumerate child (sub-agent) transcripts nested under sessions/*/agents/ (list). Default: false.&quot; :: Text)</span>
+<span class="lineno">  297 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  298 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;query&quot; .= object</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  300 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Search query (search).&quot; :: Text)</span>
+<span class="lineno">  301 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  302 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;session_id&quot; .= object</span>
+<span class="lineno">  303 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  304 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Session id to read (get).&quot; :: Text)</span>
+<span class="lineno">  305 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  306 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;offset&quot; .= object</span>
+<span class="lineno">  307 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  308 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Message offset, 0-based (get). Default: 0.&quot; :: Text)</span>
+<span class="lineno">  309 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  310 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;limit&quot; .= object</span>
+<span class="lineno">  311 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  312 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Max messages to return (get). Default: 50, max: 200.&quot; :: Text)</span>
+<span class="lineno">  313 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  314 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;action&quot;] :: [Text])</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeManage</span>
+<span class="lineno">  319 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  320 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt;</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff">case parseSessionAction v of</span>
+<span class="lineno">  322 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText e] True (object []))</span></span>
+<span class="lineno">  323 </span><span class="spaces">        </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  324 </span><span class="spaces">          </span><span class="istickedoff">SessNew    -&gt; handleNew paths v</span>
+<span class="lineno">  325 </span><span class="spaces">          </span><span class="istickedoff">SessList   -&gt; handleList paths v</span>
+<span class="lineno">  326 </span><span class="spaces">          </span><span class="istickedoff">SessSearch -&gt; handleSearch paths v</span>
+<span class="lineno">  327 </span><span class="spaces">          </span><span class="istickedoff">SessGet    -&gt; handleGet paths v</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  329 </span>
+<span class="lineno">  330 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  331 </span>-- Legacy shims (backward compatibility)
+<span class="lineno">  332 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  333 </span>
+<span class="lineno">  334 </span>-- | SESSION_NEW (legacy shim): delegates to the new handler.
+<span class="lineno">  335 </span>sessionNewOp :: SealPaths -&gt; Opcode
+<span class="lineno">  336 </span><span class="decl"><span class="istickedoff">sessionNewOp paths = TrustedOpcode</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">{ toName = <span class="nottickedoff">OpName &quot;SESSION_NEW&quot;</span></span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Create a new session with its own transcript and working directory. Returns the session id and metadata. (Legacy — prefer SESSION_MANAGE with action=\&quot;new\&quot;.)&quot;</span></span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  341 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  343 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;provider&quot; .= object</span></span>
+<span class="lineno">  344 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  345 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Provider label (e.g. \&quot;anthropic\&quot;, \&quot;ollama\&quot;). Defaults to \&quot;anthropic\&quot;.&quot; :: Text)</span></span>
+<span class="lineno">  346 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  347 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;model&quot; .= object</span></span>
+<span class="lineno">  348 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  349 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Model id (e.g. \&quot;claude-sonnet-4-20250514\&quot;). Defaults to the provider's default model.&quot; :: Text)</span></span>
+<span class="lineno">  350 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  351 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;channel&quot; .= object</span></span>
+<span class="lineno">  352 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  353 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Channel label for the session (e.g. \&quot;cli\&quot;, \&quot;web\&quot;). Defaults to \&quot;api\&quot;.&quot; :: Text)</span></span>
+<span class="lineno">  354 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  355 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;description&quot; .= object</span></span>
+<span class="lineno">  356 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  357 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Optional human-readable description / title for the session.&quot; :: Text)</span></span>
+<span class="lineno">  358 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  359 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  362 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">const (Right ())</span></span>
+<span class="lineno">  363 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleNew paths v</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  366 </span>
+<span class="lineno">  367 </span>-- | SESSION_LIST (legacy shim): delegates to the list handler.
+<span class="lineno">  368 </span>sessionListOp :: SealPaths -&gt; Opcode
+<span class="lineno">  369 </span><span class="decl"><span class="istickedoff">sessionListOp paths = TrustedOpcode</span>
+<span class="lineno">  370 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SESSION_LIST&quot;</span>
+<span class="lineno">  371 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  372 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;List all sessions (newest first). Set archived=true to list archived sessions instead of active ones. (Legacy — prefer SESSION_MANAGE with action=\&quot;list\&quot;.)&quot;</span></span>
+<span class="lineno">  373 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  374 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  375 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  376 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;archived&quot; .= object</span></span>
+<span class="lineno">  377 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span></span>
+<span class="lineno">  378 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;When true, list archived sessions instead of active ones. Default: false.&quot; :: Text)</span></span>
+<span class="lineno">  379 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  380 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;include_children&quot; .= object</span></span>
+<span class="lineno">  381 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span></span>
+<span class="lineno">  382 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Also enumerate child (sub-agent) transcripts nested under sessions/*/agents/. Default: false.&quot; :: Text)</span></span>
+<span class="lineno">  383 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  384 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  387 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">const (Right ())</span></span>
+<span class="lineno">  388 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleList paths v</span>
+<span class="lineno">  390 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  391 </span>
+<span class="lineno">  392 </span>-- | SESSION_SEARCH (legacy shim): delegates to the search handler.
+<span class="lineno">  393 </span>sessionSearchOp :: SealPaths -&gt; Opcode
+<span class="lineno">  394 </span><span class="decl"><span class="istickedoff">sessionSearchOp paths = TrustedOpcode</span>
+<span class="lineno">  395 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SESSION_SEARCH&quot;</span>
+<span class="lineno">  396 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  397 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Search sessions by text query. Matches session descriptions and first user message snippets. Case-insensitive substring match. (Legacy — prefer SESSION_MANAGE with action=\&quot;search\&quot;.)&quot;</span></span>
+<span class="lineno">  398 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  401 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;query&quot; .= object</span></span>
+<span class="lineno">  402 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  403 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;The search query (case-insensitive substring match).&quot; :: Text)</span></span>
+<span class="lineno">  404 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  405 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;archived&quot; .= object</span></span>
+<span class="lineno">  406 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span></span>
+<span class="lineno">  407 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;When true, search archived sessions instead of active ones. Default: false.&quot; :: Text)</span></span>
+<span class="lineno">  408 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  409 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  410 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;query&quot;] :: [Text])</span></span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  412 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  413 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">authorizeSearch</span></span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleSearch paths v</span>
+<span class="lineno">  416 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  417 </span>
+<span class="lineno">  418 </span>-- | SESSION_GET (legacy shim): delegates to the get handler.
+<span class="lineno">  419 </span>sessionGetOp :: SealPaths -&gt; Opcode
+<span class="lineno">  420 </span><span class="decl"><span class="istickedoff">sessionGetOp paths = TrustedOpcode</span>
+<span class="lineno">  421 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SESSION_GET&quot;</span>
+<span class="lineno">  422 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  423 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Read a session's transcript (conversation messages) with pagination. Returns a metadata header followed by rendered messages. Use offset/limit to page through long transcripts. (Legacy — prefer SESSION_MANAGE with action=\&quot;get\&quot;.)&quot;</span></span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  425 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  426 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  427 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;session_id&quot; .= object</span></span>
+<span class="lineno">  428 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  429 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;The session id to read.&quot; :: Text)</span></span>
+<span class="lineno">  430 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  431 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;offset&quot; .= object</span></span>
+<span class="lineno">  432 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span></span>
+<span class="lineno">  433 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;0-based message offset to start reading from. Default: 0.&quot; :: Text)</span></span>
+<span class="lineno">  434 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  435 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;limit&quot; .= object</span></span>
+<span class="lineno">  436 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span></span>
+<span class="lineno">  437 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Maximum number of messages to return. Default: 50, max: 200.&quot; :: Text)</span></span>
+<span class="lineno">  438 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  439 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  440 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;session_id&quot;] :: [Text])</span></span>
+<span class="lineno">  441 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  442 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">authorizeGet</span></span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleGet paths v</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  447 </span>
+<span class="lineno">  448 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  449 </span>-- Helpers
+<span class="lineno">  450 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  451 </span>
+<span class="lineno">  452 </span>-- | Extract a string field from a JSON object. Returns 'Nothing' when the
+<span class="lineno">  453 </span>-- field is absent or the value is not a string.
+<span class="lineno">  454 </span>textField :: Value -&gt; Text -&gt; Maybe Text
+<span class="lineno">  455 </span><span class="decl"><span class="istickedoff">textField v key = join (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText key)) v)</span></span>
+<span class="lineno">  456 </span>
+<span class="lineno">  457 </span>-- | Extract a boolean field from a JSON object.
+<span class="lineno">  458 </span>boolField :: Value -&gt; Text -&gt; Maybe Bool
+<span class="lineno">  459 </span><span class="decl"><span class="istickedoff">boolField v key = join (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText key)) v)</span></span>
+<span class="lineno">  460 </span>
+<span class="lineno">  461 </span>-- | Extract an integer field from a JSON object.
+<span class="lineno">  462 </span>intField :: Value -&gt; Text -&gt; Maybe Int
+<span class="lineno">  463 </span><span class="decl"><span class="istickedoff">intField v key = join (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText key)) v)</span></span>
+<span class="lineno">  464 </span>
+<span class="lineno">  465 </span>-- | Render a SessionMeta as a compact one-line summary.
+<span class="lineno">  466 </span>renderSessionMeta :: SessionMeta -&gt; Text
+<span class="lineno">  467 </span><span class="decl"><span class="istickedoff">renderSessionMeta m =</span>
+<span class="lineno">  468 </span><span class="spaces">  </span><span class="istickedoff">let sid = sessionIdText (smId m)</span>
+<span class="lineno">  469 </span><span class="spaces">      </span><span class="istickedoff">desc = fromMaybe &quot;(no description)&quot; (smDescription m)</span>
+<span class="lineno">  470 </span><span class="spaces">      </span><span class="istickedoff">created = T.pack (formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%d %H:%M&quot; (smCreatedAt m))</span>
+<span class="lineno">  471 </span><span class="spaces">      </span><span class="istickedoff">active = T.pack (formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%d %H:%M&quot; (smLastActive m))</span>
+<span class="lineno">  472 </span><span class="spaces">  </span><span class="istickedoff">in sid &lt;&gt; &quot; | &quot; &lt;&gt; smProvider m &lt;&gt; &quot;/&quot; &lt;&gt; smModel m</span>
+<span class="lineno">  473 </span><span class="spaces">       </span><span class="istickedoff">&lt;&gt; &quot; | &quot; &lt;&gt; desc</span>
+<span class="lineno">  474 </span><span class="spaces">       </span><span class="istickedoff">&lt;&gt; &quot; | created: &quot; &lt;&gt; created &lt;&gt; &quot; | last active: &quot; &lt;&gt; active</span></span>
+<span class="lineno">  475 </span>
+<span class="lineno">  476 </span>-- | Search a single session for the query string. Returns 'Just snippet'
+<span class="lineno">  477 </span>-- if the session matches (description or first user message), 'Nothing'
+<span class="lineno">  478 </span>-- otherwise. The snippet is the matched text for context.
+<span class="lineno">  479 </span>searchSession :: SealPaths -&gt; Text -&gt; SessionMeta -&gt; IO (SessionMeta, Maybe Text)
+<span class="lineno">  480 </span><span class="decl"><span class="istickedoff">searchSession paths qLower meta = do</span>
+<span class="lineno">  481 </span><span class="spaces">  </span><span class="istickedoff">let descLower = maybe &quot;&quot; T.toCaseFold (smDescription meta)</span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="istickedoff">descMatch = qLower `T.isInfixOf` descLower</span>
+<span class="lineno">  483 </span><span class="spaces">  </span><span class="istickedoff">mSnippet &lt;- firstUserSnippet paths (smId meta)</span>
+<span class="lineno">  484 </span><span class="spaces">  </span><span class="istickedoff">let snippetLower = maybe &quot;&quot; T.toCaseFold mSnippet</span>
+<span class="lineno">  485 </span><span class="spaces">      </span><span class="istickedoff">snippetMatch = qLower `T.isInfixOf` snippetLower</span>
+<span class="lineno">  486 </span><span class="spaces">  </span><span class="istickedoff">if descMatch || snippetMatch</span>
+<span class="lineno">  487 </span><span class="spaces">    </span><span class="istickedoff">then pure (meta, Just (fromMaybe (fromMaybe <span class="nottickedoff">&quot;(no description)&quot;</span> (smDescription meta)) mSnippet))</span>
+<span class="lineno">  488 </span><span class="spaces">    </span><span class="istickedoff">else pure (<span class="nottickedoff">meta</span>, Nothing)</span></span>
+<span class="lineno">  489 </span>
+<span class="lineno">  490 </span>-- | Search a child (sub-agent) session's transcript for the query string.
+<span class="lineno">  491 </span>-- Returns 'Just snippet' when the first user message matches, 'Nothing'
+<span class="lineno">  492 </span>-- otherwise. The child is identified by its parent + child SessionId pair.
+<span class="lineno">  493 </span>searchChildSession
+<span class="lineno">  494 </span>  :: SealPaths -&gt; Text -&gt; (SessionId, SessionId) -&gt; IO (SessionId, SessionId, Maybe Text)
+<span class="lineno">  495 </span><span class="decl"><span class="istickedoff">searchChildSession paths qLower (parentSid, childSid) = do</span>
+<span class="lineno">  496 </span><span class="spaces">  </span><span class="istickedoff">mSnippet &lt;- firstUserSnippet paths childSid</span>
+<span class="lineno">  497 </span><span class="spaces">  </span><span class="istickedoff">let snippetLower = maybe <span class="nottickedoff">&quot;&quot;</span> T.toCaseFold mSnippet</span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="istickedoff">snippetMatch = qLower `T.isInfixOf` snippetLower</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">pure (parentSid, childSid, if <span class="tickonlytrue">snippetMatch</span> then mSnippet else <span class="nottickedoff">Nothing</span>)</span></span>
+<span class="lineno">  500 </span>
+<span class="lineno">  501 </span>-- | Render a one-line summary for a child (sub-agent) session, attributing it
+<span class="lineno">  502 </span>-- to its parent. The marker @[child of \&lt;parent\&gt;]@ distinguishes child
+<span class="lineno">  503 </span>-- sessions from top-level ones in SESSION_LIST / SESSION_SEARCH output.
+<span class="lineno">  504 </span>renderChildSummary :: SessionId -&gt; SessionId -&gt; Text
+<span class="lineno">  505 </span><span class="decl"><span class="istickedoff">renderChildSummary parentSid childSid =</span>
+<span class="lineno">  506 </span><span class="spaces">  </span><span class="istickedoff">&quot;[child of &quot; &lt;&gt; sessionIdText parentSid &lt;&gt; &quot;] &quot; &lt;&gt; sessionIdText childSid</span></span>
+<span class="lineno">  507 </span>
+<span class="lineno">  508 </span>-- | Extract the first user message's text from a session's
+<span class="lineno">  509 </span>-- @conversation.jsonl@. Returns 'Nothing' when the session has no
+<span class="lineno">  510 </span>-- conversation or no user message with text content. Falls back to the
+<span class="lineno">  511 </span>-- child (sub-agent) transcript path when the top-level conversation file
+<span class="lineno">  512 </span>-- does not exist.
+<span class="lineno">  513 </span>firstUserSnippet :: SealPaths -&gt; SessionId -&gt; IO (Maybe Text)
+<span class="lineno">  514 </span><span class="decl"><span class="istickedoff">firstUserSnippet paths sid = do</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="istickedoff">let convPath = sessionConversationPath paths sid</span>
+<span class="lineno">  516 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  517 </span><span class="spaces">  </span><span class="istickedoff">if exists</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="istickedoff">then firstUserSnippetFromDir (sessionDir paths sid)</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  520 </span><span class="spaces">      </span><span class="istickedoff">mChild &lt;- resolveChildSessionPath paths sid</span>
+<span class="lineno">  521 </span><span class="spaces">      </span><span class="istickedoff">case mChild of</span>
+<span class="lineno">  522 </span><span class="spaces">        </span><span class="istickedoff">Just (_, childDir) -&gt; firstUserSnippetFromDir childDir</span>
+<span class="lineno">  523 </span><span class="spaces">        </span><span class="istickedoff">Nothing            -&gt; pure Nothing</span></span>
+<span class="lineno">  524 </span>
+<span class="lineno">  525 </span>-- | Extract the first user message's text from a @conversation.jsonl@ in the
+<span class="lineno">  526 </span>-- given directory. Returns 'Nothing' when the file is absent or has no user
+<span class="lineno">  527 </span>-- message with text content.
+<span class="lineno">  528 </span>firstUserSnippetFromDir :: FilePath -&gt; IO (Maybe Text)
+<span class="lineno">  529 </span><span class="decl"><span class="istickedoff">firstUserSnippetFromDir dir = do</span>
+<span class="lineno">  530 </span><span class="spaces">  </span><span class="istickedoff">let convPath = dir &lt;/&gt; &quot;conversation.jsonl&quot;</span>
+<span class="lineno">  531 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  532 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  533 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  534 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  535 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- readFileTextStrict convPath</span>
+<span class="lineno">  536 </span><span class="spaces">      </span><span class="istickedoff">let msgs = mapMaybe decodeMsg (T.lines raw)</span>
+<span class="lineno">  537 </span><span class="spaces">      </span><span class="istickedoff">pure (snippetFromMessages msgs)</span></span>
+<span class="lineno">  538 </span>
+<span class="lineno">  539 </span>-- | Extract the first user message's text from a list of messages.
+<span class="lineno">  540 </span>snippetFromMessages :: [Message] -&gt; Maybe Text
+<span class="lineno">  541 </span><span class="decl"><span class="istickedoff">snippetFromMessages msgs =</span>
+<span class="lineno">  542 </span><span class="spaces">  </span><span class="istickedoff">case filter (\m -&gt; msgRole m == User) msgs of</span>
+<span class="lineno">  543 </span><span class="spaces">    </span><span class="istickedoff">(m : _) -&gt; case [t | CbText t &lt;- msgContent m] of</span>
+<span class="lineno">  544 </span><span class="spaces">      </span><span class="istickedoff">(t : _) -&gt; Just (truncateSnippet 120 t)</span>
+<span class="lineno">  545 </span><span class="spaces">      </span><span class="istickedoff">[]      -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  546 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  547 </span>
+<span class="lineno">  548 </span>-- | Truncate a snippet to at most @n@ characters, appending an ellipsis.
+<span class="lineno">  549 </span>truncateSnippet :: Int -&gt; Text -&gt; Text
+<span class="lineno">  550 </span><span class="decl"><span class="istickedoff">truncateSnippet n t</span>
+<span class="lineno">  551 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">T.length t &lt;= n</span> = t</span>
+<span class="lineno">  552 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>       = <span class="nottickedoff">T.take n t &lt;&gt; &quot;…&quot;</span></span></span>
+<span class="lineno">  553 </span>
+<span class="lineno">  554 </span>-- | Read all messages from a session's @conversation.jsonl@. Returns @[]@
+<span class="lineno">  555 </span>-- when the session has no conversation file. Falls back to the child
+<span class="lineno">  556 </span>-- (sub-agent) transcript path when the top-level conversation file does not
+<span class="lineno">  557 </span>-- exist.
+<span class="lineno">  558 </span>readSessionMessages :: SealPaths -&gt; SessionId -&gt; IO [Message]
+<span class="lineno">  559 </span><span class="decl"><span class="istickedoff">readSessionMessages paths sid = do</span>
+<span class="lineno">  560 </span><span class="spaces">  </span><span class="istickedoff">let convPath = sessionConversationPath paths sid</span>
+<span class="lineno">  561 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlytrue">exists</span></span>
+<span class="lineno">  563 </span><span class="spaces">    </span><span class="istickedoff">then readMessagesFromDir (sessionDir paths sid)</span>
+<span class="lineno">  564 </span><span class="spaces">    </span><span class="istickedoff">else <span class="nottickedoff">do</span></span>
+<span class="lineno">  565 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">mChild &lt;- resolveChildSessionPath paths sid</span></span>
+<span class="lineno">  566 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case mChild of</span></span>
+<span class="lineno">  567 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just (_, childDir) -&gt; readMessagesFromDir childDir</span></span>
+<span class="lineno">  568 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing            -&gt; pure []</span></span></span>
+<span class="lineno">  569 </span>
+<span class="lineno">  570 </span>-- | Read all messages from a @conversation.jsonl@ in the given directory.
+<span class="lineno">  571 </span>-- Returns @[]@ when the file is absent.
+<span class="lineno">  572 </span>readMessagesFromDir :: FilePath -&gt; IO [Message]
+<span class="lineno">  573 </span><span class="decl"><span class="istickedoff">readMessagesFromDir dir = do</span>
+<span class="lineno">  574 </span><span class="spaces">  </span><span class="istickedoff">let convPath = dir &lt;/&gt; &quot;conversation.jsonl&quot;</span>
+<span class="lineno">  575 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  576 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  577 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  578 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  579 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- readFileTextStrict convPath</span>
+<span class="lineno">  580 </span><span class="spaces">      </span><span class="istickedoff">pure (mapMaybe decodeMsg (T.lines raw))</span></span>
+<span class="lineno">  581 </span>
+<span class="lineno">  582 </span>-- | Decode a JSON line into a Message.
+<span class="lineno">  583 </span>decodeMsg :: Text -&gt; Maybe Message
+<span class="lineno">  584 </span><span class="decl"><span class="istickedoff">decodeMsg line = A.decode (BL.fromStrict (TE.encodeUtf8 line))</span></span>
+<span class="lineno">  585 </span>
+<span class="lineno">  586 </span>-- | Render a single message as readable text. The index is the 0-based
+<span class="lineno">  587 </span>-- position within the full transcript (offset + relative index), shown
+<span class="lineno">  588 </span>-- so the model can reference specific messages.
+<span class="lineno">  589 </span>renderMessage :: Int -&gt; Int -&gt; Message -&gt; Text
+<span class="lineno">  590 </span><span class="decl"><span class="istickedoff">renderMessage offset relIdx msg =</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">let globalIdx = offset + relIdx</span>
+<span class="lineno">  592 </span><span class="spaces">      </span><span class="istickedoff">roleStr = case msgRole msg of</span>
+<span class="lineno">  593 </span><span class="spaces">        </span><span class="istickedoff">User      -&gt; &quot;User&quot;</span>
+<span class="lineno">  594 </span><span class="spaces">        </span><span class="istickedoff">Assistant -&gt; &quot;Assistant&quot;</span>
+<span class="lineno">  595 </span><span class="spaces">      </span><span class="istickedoff">contentText = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> (map renderBlock (msgContent msg))</span>
+<span class="lineno">  596 </span><span class="spaces">  </span><span class="istickedoff">in &quot;## [&quot; &lt;&gt; roleStr &lt;&gt; &quot;] (#&quot; &lt;&gt; T.pack (show globalIdx) &lt;&gt; &quot;)\n&quot; &lt;&gt; contentText</span></span>
+<span class="lineno">  597 </span>
+<span class="lineno">  598 </span>-- | Render a content block as readable text.
+<span class="lineno">  599 </span>renderBlock :: ContentBlock -&gt; Text
+<span class="lineno">  600 </span><span class="decl"><span class="istickedoff">renderBlock (CbText t) = t</span>
+<span class="lineno">  601 </span><span class="spaces"></span><span class="istickedoff">renderBlock (CbThinking t) = <span class="nottickedoff">&quot;[thinking] &quot; &lt;&gt; t</span></span>
+<span class="lineno">  602 </span><span class="spaces"></span><span class="istickedoff">renderBlock (CbToolUse{cbName = OpName n}) = <span class="nottickedoff">&quot;[tool call: &quot; &lt;&gt; n &lt;&gt; &quot;]&quot;</span></span>
+<span class="lineno">  603 </span><span class="spaces"></span><span class="istickedoff">renderBlock (CbToolResult{cbParts = parts, cbIsError = isErr}) =</span>
+<span class="lineno">  604 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">let label = if isErr then &quot;[tool error]&quot; else &quot;[tool result]&quot;</span></span>
+<span class="lineno">  605 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">content = T.intercalate &quot;\n&quot; [t | TrpText t &lt;- parts]</span></span>
+<span class="lineno">  606 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">in if T.null content then label else label &lt;&gt; &quot; &quot; &lt;&gt; content</span></span></span>
+<span class="lineno">  607 </span>
+<span class="lineno">  608 </span>-- | Render the pagination footer, telling the model how to page forward.
+<span class="lineno">  609 </span>renderPageFooter :: Int -&gt; Int -&gt; Int -&gt; Bool -&gt; Text
+<span class="lineno">  610 </span><span class="decl"><span class="istickedoff">renderPageFooter offset count total hasMore</span>
+<span class="lineno">  611 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">total == 0</span> = <span class="nottickedoff">&quot;(0 messages in transcript)&quot;</span></span>
+<span class="lineno">  612 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">offset &gt;= total &amp;&amp; <span class="nottickedoff">count == 0</span></span></span>
+<span class="lineno">  613 </span><span class="spaces">  </span><span class="istickedoff">= <span class="nottickedoff">&quot;[offset &quot; &lt;&gt; T.pack (show offset) &lt;&gt; &quot; is past end of transcript (&quot;</span></span>
+<span class="lineno">  614 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show total) &lt;&gt; &quot; messages); read with offset=0 to start over]&quot;</span></span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">hasMore</span></span>
+<span class="lineno">  616 </span><span class="spaces">  </span><span class="istickedoff">= <span class="nottickedoff">&quot;[messages &quot; &lt;&gt; T.pack (show (offset + 1)) &lt;&gt; &quot;-&quot; &lt;&gt; T.pack (show (offset + count))</span></span>
+<span class="lineno">  617 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; of &quot; &lt;&gt; T.pack (show total) &lt;&gt; &quot;; &quot; &lt;&gt; T.pack (show (total - offset - count))</span></span>
+<span class="lineno">  618 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; more - read with offset=&quot; &lt;&gt; T.pack (show (offset + count)) &lt;&gt; &quot; for the next window]&quot;</span></span>
+<span class="lineno">  619 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span></span>
+<span class="lineno">  620 </span><span class="spaces">  </span><span class="istickedoff">= &quot;[messages &quot; &lt;&gt; T.pack (show (offset + 1)) &lt;&gt; &quot;-&quot; &lt;&gt; T.pack (show (offset + count))</span>
+<span class="lineno">  621 </span><span class="spaces">       </span><span class="istickedoff">&lt;&gt; &quot; of &quot; &lt;&gt; T.pack (show total) &lt;&gt; &quot; (end of transcript)]&quot;</span></span>
+
+</pre>
+</body>
+</html>

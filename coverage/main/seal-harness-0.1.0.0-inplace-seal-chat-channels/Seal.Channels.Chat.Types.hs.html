@@ -1,0 +1,205 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Shared types for the chat-channel package. These types depend only on
+<span class="lineno">    3 </span>-- 'seal-gateway-types' — no access to server internals. The 'ChatChannel'
+<span class="lineno">    4 </span>-- type class lives in 'Seal.Channels.Chat.Class' (added in WU-3); this
+<span class="lineno">    5 </span>-- module carries the leaf types both the class and the loop need.
+<span class="lineno">    6 </span>module Seal.Channels.Chat.Types
+<span class="lineno">    7 </span>  ( -- * Inbound messages
+<span class="lineno">    8 </span>    InboundMessage (..)
+<span class="lineno">    9 </span>  , ChatMessageId (..)
+<span class="lineno">   10 </span>    -- * Session tracking
+<span class="lineno">   11 </span>  , ConversationKey (..)
+<span class="lineno">   12 </span>  , ReceivedMessage (..)
+<span class="lineno">   13 </span>  , convKeyFromSource
+<span class="lineno">   14 </span>  , SessionMap
+<span class="lineno">   15 </span>  , newSessionMap
+<span class="lineno">   16 </span>  , sessionLookup
+<span class="lineno">   17 </span>  , sessionInsert
+<span class="lineno">   18 </span>    -- * Gateway config
+<span class="lineno">   19 </span>  , GatewayConfig (..)
+<span class="lineno">   20 </span>  , defaultGatewayConfig
+<span class="lineno">   21 </span>    -- * Streaming
+<span class="lineno">   22 </span>  , StreamingState (..)
+<span class="lineno">   23 </span>  , newStreamingState
+<span class="lineno">   24 </span>  , resetStreamingState
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Concurrent.STM
+<span class="lineno">   28 </span>  (TVar, atomically, newTVarIO, readTVarIO, modifyTVar')
+<span class="lineno">   29 </span>import Data.IORef (IORef, newIORef, writeIORef)
+<span class="lineno">   30 </span>import Data.Map.Strict (Map)
+<span class="lineno">   31 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   32 </span>import Data.Text (Text)
+<span class="lineno">   33 </span>import Data.Time (UTCTime)
+<span class="lineno">   34 </span>import Seal.Gateway.Types.Core (SessionId)
+<span class="lineno">   35 </span>import Seal.Gateway.Types.ChannelKind (channelKindToText)
+<span class="lineno">   36 </span>import Seal.Gateway.Types.MessageSource
+<span class="lineno">   37 </span>  ( ConversationId
+<span class="lineno">   38 </span>  , MessageSource
+<span class="lineno">   39 </span>  , msChannelKind
+<span class="lineno">   40 </span>  , msConversationId
+<span class="lineno">   41 </span>  , conversationIdText
+<span class="lineno">   42 </span>  )
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | One inbound message from the platform (Signal, Telegram).
+<span class="lineno">   45 </span>data InboundMessage = InboundMessage
+<span class="lineno">   46 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">imSource</span></span></span> :: MessageSource
+<span class="lineno">   47 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">imBody</span></span></span>   :: Text
+<span class="lineno">   48 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">imCallbackData</span></span></span> :: Maybe Text
+<span class="lineno">   49 </span>    -- ^ @Just data@ when this message is a @callback_query@ (button tap);
+<span class="lineno">   50 </span>    -- @Nothing@ for a regular text message. The loop uses this to route
+<span class="lineno">   51 </span>    -- callback taps to the ASK_HUMAN answer-delivery path.
+<span class="lineno">   52 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | A raw received message from the transport: the conversation id, the
+<span class="lineno">   55 </span>-- sender's user id (if available), and the message body. The transport
+<span class="lineno">   56 </span>-- derives these from authenticated transport metadata (e.g. Telegram's
+<span class="lineno">   57 </span>-- @chat.id@ + @from.id@, Signal's peer phone number + UUID). The body is
+<span class="lineno">   58 </span>-- the message text. Pure data; the adapter's reader loop constructs a
+<span class="lineno">   59 </span>-- 'MessageSource' from these fields.
+<span class="lineno">   60 </span>data ReceivedMessage = ReceivedMessage
+<span class="lineno">   61 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmConversationId</span></span></span> :: ConversationId
+<span class="lineno">   62 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmSender</span></span></span>         :: Maybe Text
+<span class="lineno">   63 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmReplyTo</span></span></span>        :: Text
+<span class="lineno">   64 </span>    -- ^ The platform-specific reply target (Telegram chat id, Signal
+<span class="lineno">   65 </span>    -- phone number). Used by the adapter to address sends/edits.
+<span class="lineno">   66 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmBody</span></span></span>           :: Text
+<span class="lineno">   67 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmCallbackData</span></span></span>   :: Maybe Text
+<span class="lineno">   68 </span>    -- ^ @Just data@ when the message is a @callback_query@ (button tap);
+<span class="lineno">   69 </span>    -- @Nothing@ for a regular text message. The data is the
+<span class="lineno">   70 </span>    -- @callback_data@ string the keyboard was built with.
+<span class="lineno">   71 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmCallbackId</span></span></span>     :: Maybe Text
+<span class="lineno">   72 </span>    -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@
+<span class="lineno">   73 </span>    -- for regular messages.
+<span class="lineno">   74 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rmCallbackMessageId</span></span></span> :: Maybe Text
+<span class="lineno">   75 </span>    -- ^ @Just msgId@ for callback_query (the message holding the
+<span class="lineno">   76 </span>    -- keyboard, so the adapter can remove it after a tap); @Nothing@
+<span class="lineno">   77 </span>    -- for regular messages.
+<span class="lineno">   78 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>-- | A platform message identifier (opaque: a Telegram @message_id@ or a
+<span class="lineno">   81 </span>-- Signal timestamp). Used for editing streaming bubbles.
+<span class="lineno">   82 </span>newtype ChatMessageId = ChatMessageId Text
+<span class="lineno">   83 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | The per-conversation routing key: (channel-kind-text, conversation-id-text).
+<span class="lineno">   86 </span>-- Derived from the 'MessageSource' (both fields are server-derived, never
+<span class="lineno">   87 </span>-- user-supplied, so a sender cannot forge a key).
+<span class="lineno">   88 </span>data ConversationKey = ConversationKey
+<span class="lineno">   89 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ckChannel</span></span></span> :: Text
+<span class="lineno">   90 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ckConv</span></span></span>    :: Text
+<span class="lineno">   91 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Derive the conversation key from a 'MessageSource'.
+<span class="lineno">   94 </span>convKeyFromSource :: MessageSource -&gt; ConversationKey
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">convKeyFromSource ms = ConversationKey</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">{ ckChannel = channelKindToText (msChannelKind ms)</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">, ckConv = conversationIdText (msConversationId ms)</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | A client-side session map: conversation key → session id. Replaces the
+<span class="lineno">  101 </span>-- server-side 'CursorStore'. Thread-safe via 'TVar'.
+<span class="lineno">  102 </span>newtype SessionMap = SessionMap (TVar (Map ConversationKey SessionId))
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Create a new empty session map.
+<span class="lineno">  105 </span>newSessionMap :: IO SessionMap
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">newSessionMap = SessionMap &lt;$&gt; newTVarIO Map.empty</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | Look up the session id for a conversation key.
+<span class="lineno">  109 </span>sessionLookup :: SessionMap -&gt; ConversationKey -&gt; IO (Maybe SessionId)
+<span class="lineno">  110 </span><span class="decl"><span class="istickedoff">sessionLookup (SessionMap tv) key =</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">Map.lookup key &lt;$&gt; readTVarIO tv</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | Insert (or replace) a conversation's session id.
+<span class="lineno">  114 </span>sessionInsert :: SessionMap -&gt; ConversationKey -&gt; SessionId -&gt; IO ()
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">sessionInsert (SessionMap tv) key sid =</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">atomically (modifyTVar' tv (Map.insert key sid))</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>-- | The gateway connection config: where the HTTP API and WS server live.
+<span class="lineno">  119 </span>data GatewayConfig = GatewayConfig
+<span class="lineno">  120 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">gcHost</span></span></span>     :: Text    -- ^ e.g. @&quot;127.0.0.1&quot;@
+<span class="lineno">  121 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcHttpPort</span></span></span> :: Int     -- ^ e.g. 8080
+<span class="lineno">  122 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcWsPort</span></span></span>   :: Int     -- ^ e.g. 8081
+<span class="lineno">  123 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">gcApiBase</span></span></span>  :: Text    -- ^ e.g. @&quot;http://127.0.0.1:8080/api&quot;@
+<span class="lineno">  124 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">gcWsUrl</span></span></span>    :: Text    -- ^ e.g. @&quot;ws://127.0.0.1:8081&quot;@
+<span class="lineno">  125 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Default config for localhost with typical ports.
+<span class="lineno">  128 </span>defaultGatewayConfig :: GatewayConfig
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">defaultGatewayConfig = GatewayConfig</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">{ gcHost = &quot;127.0.0.1&quot;</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, gcHttpPort = 8080</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">, gcWsPort = 8081</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, gcApiBase = <span class="nottickedoff">&quot;http://127.0.0.1:8080/api&quot;</span></span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">, gcWsUrl = <span class="nottickedoff">&quot;ws://127.0.0.1:8081&quot;</span></span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | Mutable streaming state for one conversation's streaming bubble. Lives
+<span class="lineno">  138 </span>-- in 'IORef's so the WS event handler can call create/edit without passing
+<span class="lineno">  139 </span>-- state around.
+<span class="lineno">  140 </span>data StreamingState = StreamingState
+<span class="lineno">  141 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ssMsgId</span></span></span>       :: IORef (Maybe ChatMessageId)
+<span class="lineno">  142 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssAccumulated</span></span></span> :: IORef Text
+<span class="lineno">  143 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssLastEdit</span></span></span>    :: IORef (Maybe UTCTime)
+<span class="lineno">  144 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssLastLen</span></span></span>     :: IORef Int
+<span class="lineno">  145 </span>    -- ^ Codepoints in the accumulated text at the last platform edit.
+<span class="lineno">  146 </span>    -- The edit gate measures NEW text since the last edit, not the total.
+<span class="lineno">  147 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssFinalized</span></span></span>   :: IORef Bool
+<span class="lineno">  148 </span>    -- ^ 'True' once the turn's final entry has been delivered (the
+<span class="lineno">  149 </span>    -- bubble was finalized). Late entry-updates — which can arrive after
+<span class="lineno">  150 </span>    -- the recorded entry, because the server's streaming path and the
+<span class="lineno">  151 </span>    -- post-turn broadcast are unsynchronized — are ignored while set.
+<span class="lineno">  152 </span>    -- Cleared when a new turn starts (harness-status: thinking).
+<span class="lineno">  153 </span>  }
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | Create fresh streaming state for one conversation.
+<span class="lineno">  156 </span>newStreamingState :: IO StreamingState
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">newStreamingState = do</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">msgId &lt;- newIORef Nothing</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">accum &lt;- newIORef &quot;&quot;</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">lastEdit &lt;- newIORef Nothing</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">lastLen &lt;- newIORef 0</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">finalized &lt;- newIORef False</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">pure StreamingState</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">{ ssMsgId = msgId</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">, ssAccumulated = accum</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">, ssLastEdit = lastEdit</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">, ssLastLen = lastLen</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">, ssFinalized = finalized</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | Reset the streaming state for a new segment/turn: the bubble id is
+<span class="lineno">  172 </span>-- cleared (the next entry-update creates a new bubble), the accumulated
+<span class="lineno">  173 </span>-- text is dropped, and the rate-limit clock is reset. Does NOT clear
+<span class="lineno">  174 </span>-- 'ssFinalized' — the finalize paths set it /after/ resetting, so a
+<span class="lineno">  175 </span>-- blanket clear here would race. Callers that start a new turn (the
+<span class="lineno">  176 </span>-- @thinking@ harness-status) clear it explicitly.
+<span class="lineno">  177 </span>resetStreamingState :: StreamingState -&gt; IO ()
+<span class="lineno">  178 </span><span class="decl"><span class="istickedoff">resetStreamingState ss = do</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">writeIORef (ssMsgId ss) Nothing</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">writeIORef (ssAccumulated ss) <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">writeIORef (ssLastEdit ss) Nothing</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">writeIORef (ssLastLen ss) 0</span></span>
+
+</pre>
+</body>
+</html>
