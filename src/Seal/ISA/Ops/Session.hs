@@ -36,9 +36,11 @@ import Data.Text.Encoding qualified as TE
 import Data.Time (formatTime, defaultTimeLocale)
 import Seal.Types.App (App)
 import System.Directory (doesFileExist)
+import System.FilePath ((</>))
 
 import Seal.Config.Paths
-  ( SealPaths, sessionConversationPath, sessionMetaPath )
+  ( SealPaths, sessionConversationPath, sessionDir, sessionMetaPath
+  , resolveChildSessionPath )
 import Seal.Core.Paging
   ( Page (..), PageParams (..), paginate )
 import Seal.Core.Types
@@ -48,7 +50,7 @@ import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..) )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( listSessions, listArchivedSessions, newSession, saveSessionMeta )
+  ( listChildSessions, listSessions, listArchivedSessions, newSession, saveSessionMeta )
 import Seal.Util.StrictIO (readFileTextStrict, decodeFileStrict)
 
 -- ---------------------------------------------------------------------------
@@ -111,13 +113,23 @@ handleNew paths v = do
 handleList :: SealPaths -> Value -> App OpResult
 handleList paths v = do
   let archived = fromMaybe False (boolField v "archived")
+      includeChildren = fromMaybe False (boolField v "include_children")
   metas <- liftIO (if archived then listArchivedSessions paths else listSessions paths)
-  let rendered = case metas of
+  children <- if includeChildren
+                then liftIO (listChildSessions paths)
+                else pure []
+  let parentLines = map renderSessionMeta metas
+      childLines = [ renderChildSummary parentSid childSid
+                   | (parentSid, childSid) <- children ]
+      allLines = parentLines <> childLines
+      rendered = case allLines of
         [] -> "(no sessions found)"
-        _ -> T.intercalate "\n" (map renderSessionMeta metas)
+        _ -> T.intercalate "\n" allLines
       recorded = object
         [ "count" .= length metas
         , "archived" .= archived
+        , "include_children" .= includeChildren
+        , "child_count" .= length children
         , "session_ids" .= fmap (sessionIdText . smId) metas
         ]
   pure (OpResult [TrpText rendered] False recorded)
@@ -133,15 +145,20 @@ handleSearch paths v = do
       metas <- liftIO (if archived then listArchivedSessions paths else listSessions paths)
       results <- liftIO (mapM (searchSession paths qLower) metas)
       let matched = [ (m, snip) | (m, Just snip) <- results ]
-          rendered = case matched of
-            [] -> "(no sessions found)"
-            _ -> T.intercalate "\n\n" $
-                   [ renderSessionMeta m <> "\n  snippet: " <> snip
-                   | (m, snip) <- matched ]
+      children <- liftIO (listChildSessions paths)
+      childResults <- liftIO (mapM (searchChildSession paths qLower) children)
+      let childMatched = [ (p, c, snip) | (p, c, Just snip) <- childResults ]
+          rendered
+            | null matched && null childMatched = "(no sessions found)"
+            | otherwise = T.intercalate "\n\n" $
+                 [ renderSessionMeta m <> "\n  snippet: " <> snip
+                 | (m, snip) <- matched ]
+              <> [ renderChildSummary p c <> "\n  snippet: " <> snip
+                 | (p, c, snip) <- childMatched ]
           recorded = object
             [ "query" .= q
             , "archived" .= archived
-            , "match_count" .= length matched
+            , "match_count" .= (length matched + length childMatched)
             , "session_ids" .= fmap (sessionIdText . smId . fst) matched
             ]
       pure (OpResult [TrpText rendered] False recorded)
@@ -159,9 +176,6 @@ handleGet paths v = do
                  then pure Nothing
                  else liftIO (decodeFileStrict (sessionMetaPath paths sid))
       case mMeta of
-        Nothing -> pure (OpResult
-          [TrpText ("session not found: " <> sessionIdText sid)] True
-          (object ["session_id" .= sessionIdText sid]))
         Just meta -> do
           msgs <- liftIO (readSessionMessages paths sid)
           let total = length msgs
@@ -182,6 +196,31 @@ handleGet paths v = do
                 , "has_more" .= pgHasMore page
                 ]
           pure (OpResult [TrpText rendered] False recorded)
+        Nothing -> do
+          mChild <- liftIO (resolveChildSessionPath paths sid)
+          case mChild of
+            Nothing -> pure (OpResult
+              [TrpText ("session not found: " <> sessionIdText sid)] True
+              (object ["session_id" .= sessionIdText sid]))
+            Just (parentSid, childDir) -> do
+              msgs <- liftIO (readMessagesFromDir childDir)
+              let total = length msgs
+                  page = paginate sessionPageParams offset mLimit msgs
+                  windowMsgs = pgItems page
+                  header = "[child session of " <> sessionIdText parentSid <> "] " <> sessionIdText sid
+                  body = T.intercalate "\n\n"
+                    (zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)
+                  footer = renderPageFooter (pgOffset page) (length windowMsgs) total (pgHasMore page)
+                  rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
+                  recorded = object
+                    [ "session_id" .= sessionIdText sid
+                    , "child_of" .= sessionIdText parentSid
+                    , "offset" .= pgOffset page
+                    , "limit" .= length windowMsgs
+                    , "total_messages" .= total
+                    , "has_more" .= pgHasMore page
+                    ]
+              pure (OpResult [TrpText rendered] False recorded)
 
 -- ---------------------------------------------------------------------------
 -- Authorize gate helpers
@@ -251,6 +290,10 @@ sessionManageOp paths = TrustedOpcode
           , fromText "archived" .= object
               [ "type" .= ("boolean" :: Text)
               , "description" .= ("List/search archived sessions (list/search). Default: false." :: Text)
+              ]
+          , fromText "include_children" .= object
+              [ "type" .= ("boolean" :: Text)
+              , "description" .= ("Also enumerate child (sub-agent) transcripts nested under sessions/*/agents/ (list). Default: false." :: Text)
               ]
           , fromText "query" .= object
               [ "type" .= ("string" :: Text)
@@ -333,6 +376,10 @@ sessionListOp paths = TrustedOpcode
           [ fromText "archived" .= object
               [ "type" .= ("boolean" :: Text)
               , "description" .= ("When true, list archived sessions instead of active ones. Default: false." :: Text)
+              ]
+          , fromText "include_children" .= object
+              [ "type" .= ("boolean" :: Text)
+              , "description" .= ("Also enumerate child (sub-agent) transcripts nested under sessions/*/agents/. Default: false." :: Text)
               ]
           ]
       ]
@@ -440,12 +487,47 @@ searchSession paths qLower meta = do
     then pure (meta, Just (fromMaybe (fromMaybe "(no description)" (smDescription meta)) mSnippet))
     else pure (meta, Nothing)
 
+-- | Search a child (sub-agent) session's transcript for the query string.
+-- Returns 'Just snippet' when the first user message matches, 'Nothing'
+-- otherwise. The child is identified by its parent + child SessionId pair.
+searchChildSession
+  :: SealPaths -> Text -> (SessionId, SessionId) -> IO (SessionId, SessionId, Maybe Text)
+searchChildSession paths qLower (parentSid, childSid) = do
+  mSnippet <- firstUserSnippet paths childSid
+  let snippetLower = maybe "" T.toCaseFold mSnippet
+      snippetMatch = qLower `T.isInfixOf` snippetLower
+  pure (parentSid, childSid, if snippetMatch then mSnippet else Nothing)
+
+-- | Render a one-line summary for a child (sub-agent) session, attributing it
+-- to its parent. The marker @[child of \<parent\>]@ distinguishes child
+-- sessions from top-level ones in SESSION_LIST / SESSION_SEARCH output.
+renderChildSummary :: SessionId -> SessionId -> Text
+renderChildSummary parentSid childSid =
+  "[child of " <> sessionIdText parentSid <> "] " <> sessionIdText childSid
+
 -- | Extract the first user message's text from a session's
 -- @conversation.jsonl@. Returns 'Nothing' when the session has no
--- conversation or no user message with text content.
+-- conversation or no user message with text content. Falls back to the
+-- child (sub-agent) transcript path when the top-level conversation file
+-- does not exist.
 firstUserSnippet :: SealPaths -> SessionId -> IO (Maybe Text)
 firstUserSnippet paths sid = do
   let convPath = sessionConversationPath paths sid
+  exists <- doesFileExist convPath
+  if exists
+    then firstUserSnippetFromDir (sessionDir paths sid)
+    else do
+      mChild <- resolveChildSessionPath paths sid
+      case mChild of
+        Just (_, childDir) -> firstUserSnippetFromDir childDir
+        Nothing            -> pure Nothing
+
+-- | Extract the first user message's text from a @conversation.jsonl@ in the
+-- given directory. Returns 'Nothing' when the file is absent or has no user
+-- message with text content.
+firstUserSnippetFromDir :: FilePath -> IO (Maybe Text)
+firstUserSnippetFromDir dir = do
+  let convPath = dir </> "conversation.jsonl"
   exists <- doesFileExist convPath
   if not exists
     then pure Nothing
@@ -470,10 +552,26 @@ truncateSnippet n t
   | otherwise       = T.take n t <> "…"
 
 -- | Read all messages from a session's @conversation.jsonl@. Returns @[]@
--- when the session has no conversation file.
+-- when the session has no conversation file. Falls back to the child
+-- (sub-agent) transcript path when the top-level conversation file does not
+-- exist.
 readSessionMessages :: SealPaths -> SessionId -> IO [Message]
 readSessionMessages paths sid = do
   let convPath = sessionConversationPath paths sid
+  exists <- doesFileExist convPath
+  if exists
+    then readMessagesFromDir (sessionDir paths sid)
+    else do
+      mChild <- resolveChildSessionPath paths sid
+      case mChild of
+        Just (_, childDir) -> readMessagesFromDir childDir
+        Nothing            -> pure []
+
+-- | Read all messages from a @conversation.jsonl@ in the given directory.
+-- Returns @[]@ when the file is absent.
+readMessagesFromDir :: FilePath -> IO [Message]
+readMessagesFromDir dir = do
+  let convPath = dir </> "conversation.jsonl"
   exists <- doesFileExist convPath
   if not exists
     then pure []

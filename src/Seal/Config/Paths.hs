@@ -20,20 +20,26 @@ module Seal.Config.Paths
   , sessionRequestsPath
   , sessionLogPath
   , agentSessionDir
+  , resolveChildSessionPath
   , workdirsRoot
   , sessionWorkdir
   , tabListPath
   , cursorMapPath
   ) where
 
-import System.Directory (createDirectoryIfMissing, getHomeDirectory)
+import System.Directory
+  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+  , getHomeDirectory, listDirectory )
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeDirectory)
 import System.Posix.Files (setFileMode)
 
+import Control.Monad (filterM, forM)
+import Data.Maybe (catMaybes, listToMaybe)
+
 import Data.Text qualified as T
 
-import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
+import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId, mkSessionId)
 
 -- | All paths derived from the seal home directory.
 --
@@ -217,6 +223,39 @@ cursorMapPath paths = spState paths </> "cursors.json"
 agentSessionDir :: SealPaths -> SessionId -> SessionId -> FilePath
 agentSessionDir paths parentSid childSid =
   sessionDir paths parentSid </> "agents" </> T.unpack (sessionIdText childSid)
+
+-- | Locate a child session's directory by scanning every parent session's
+-- @agents\/@ subtree: @\<state\>\/sessions\/\<parent\>\/agents\/\<sid\>@.
+-- Returns the first @parentSid@ whose @agents\/\<sid\>\/conversation.jsonl@
+-- exists, paired with the child directory path. Returns 'Nothing' when no
+-- parent nests such a child. Used by the session opcodes to make forked
+-- sub-agent transcripts visible to SESSION_GET / SESSION_SEARCH / SESSION_LIST.
+resolveChildSessionPath :: SealPaths -> SessionId -> IO (Maybe (SessionId, FilePath))
+resolveChildSessionPath paths sid = do
+  let root = sessionsRoot paths
+      sidText = sessionIdText sid
+  exists <- doesDirectoryExist root
+  if not exists
+    then pure Nothing
+    else do
+      entries <- listDirectory root
+      dirs <- filterM (doesDirectoryExist . (root </>)) entries
+      matches <- forM dirs $ \e -> do
+        let parentDir = root </> e
+            agentsDir = parentDir </> "agents"
+            childDir = agentsDir </> T.unpack sidText
+            convPath = childDir </> "conversation.jsonl"
+        agentsOk <- doesDirectoryExist agentsDir
+        if not agentsOk
+          then pure Nothing
+          else do
+            convOk <- doesFileExist convPath
+            if not convOk
+              then pure Nothing
+              else case mkSessionId (T.pack e) of
+                Left _ -> pure Nothing
+                Right parentSid -> pure (Just (parentSid, childDir))
+      pure (listToMaybe (catMaybes matches))
 
 -- | Root for per-session working directories: @\<cache\>\/workdirs@.
 workdirsRoot :: SealPaths -> FilePath

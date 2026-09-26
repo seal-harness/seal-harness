@@ -24,7 +24,9 @@ module Seal.Agent.Runtime.Registry
   , AgentRuntime
   , newAgentRuntime
   , startAgent
+  , registerRunningAgent
   , registerCompletedAgent
+  , registerCompletedAgentResult
   , stopAgent
   , interruptAgent
   , listAgents
@@ -37,12 +39,12 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 
 import Seal.Agent.Def.Types (AgentDefId)
-import Seal.Agent.Runtime.Delegation (SubagentId (..))
+import Seal.Agent.Runtime.Delegation (SubagentId (..), ChildResult (..), ChildStatus (..))
 import Seal.Core.Types (SessionId)
 
 -- | The lifecycle status of a running agent instance. 'Crashed' carries the
@@ -67,6 +69,11 @@ data AgentInstance = AgentInstance
     -- ^ The parent's delegation depth (0 = top-level parent). The child's
     -- depth is @aiDepth + 1@; checked against @max_spawn_depth@ before
     -- spawning.
+  , aiResult     :: Maybe ChildResult
+    -- ^ The 'ChildResult' when the child has completed ('Nothing' while
+    -- running, 'Just' after completion). Populated by
+    -- 'registerCompletedAgentResult'. Allows 'AGENT_STATUS' to return
+    -- summary + child_session + exit_reason after the child finishes.
   } deriving stock (Eq, Show)
 
 -- | The STM-backed registry of running instances, keyed by 'SubagentId'. No
@@ -92,7 +99,7 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
     if Map.member subagentId insts
       then pure Nothing  -- lost the race; shouldn't happen with random ids
       else do
-        let inst = AgentInstance aid subagentId session Running tid depth
+        let inst = AgentInstance aid subagentId session Running tid depth Nothing
         writeTVar tv (Map.insert subagentId inst insts)
         pure (Just inst)
   case mInst of
@@ -100,6 +107,19 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
     Nothing   -> do
       killThread tid
       pure (Left "agent already running for this subagent id")
+
+-- | Register a running agent instance WITHOUT forking a worker thread.
+-- Used by 'runDelegateAsync' which forks its own threads (via 'forkIO')
+-- and needs the instance in the registry at spawn time so 'AGENT_INSTANCES'
+-- lists it while running. The 'ThreadId' is the CHILD's forked thread id
+-- (passed in by 'spawnOne' after the fork) so 'stopAgent' can kill the
+-- correct thread. Idempotent: re-registering overwrites.
+registerRunningAgent
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> ThreadId -> IO ()
+registerRunningAgent (AgentRuntime tv) aid subagentId session depth tid =
+  atomically $ do
+    let inst = AgentInstance aid subagentId session Running tid depth Nothing
+    modifyTVar' tv (Map.insert subagentId inst)
 
 -- | Register a synchronously-completed child in the runtime registry. The
 -- synchronous delegation model runs the worker to completion BEFORE this is
@@ -117,8 +137,30 @@ registerCompletedAgent (AgentRuntime tv) aid subagentId session depth = do
   tid <- myThreadId
   atomically $ do
     insts <- readTVar tv
-    let inst = AgentInstance aid subagentId session Stopped tid depth
+    let inst = AgentInstance aid subagentId session Stopped tid depth Nothing
     writeTVar tv (Map.insert subagentId inst insts)
+
+-- | Register a completed async child's result in the runtime registry.
+-- Updates the existing entry's status to 'Stopped' (or 'Crashed' if the
+-- result status is 'CsError') and stores the full 'ChildResult' in
+-- 'aiResult' so 'AGENT_STATUS' can return summary + child_session +
+-- exit_reason after the child finishes. If no entry exists for this
+-- subagent id (e.g. the child was a resolve error that never registered),
+-- this is a no-op.
+registerCompletedAgentResult
+  :: AgentRuntime -> SubagentId -> ChildResult -> IO ()
+registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
+  tid <- myThreadId
+  atomically $ do
+    insts <- readTVar tv
+    case Map.lookup subagentId insts of
+      Nothing -> pure ()  -- resolve-error child never registered
+      Just inst -> do
+        let newStatus = case crStatus result of
+              CsError -> Crashed (fromMaybe "unknown error" (crError result))
+              _       -> Stopped
+            inst' = inst { aiStatus = newStatus, aiResult = Just result, aiThreadId = tid }
+        writeTVar tv (Map.insert subagentId inst' insts)
 
 -- | Run the worker action, transitioning the instance to 'Crashed' on
 -- exception. A normal completion leaves the status as 'Running' until the

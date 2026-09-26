@@ -30,6 +30,9 @@ module Seal.Handles.Transcript
   , TwoFileWrite (..)
   , TranscriptError (..)
   , defaultAckTimeoutUs
+  , appendConversationMessage
+  , appendCompletionToSidecar
+  , readAndClearCompletions
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -38,7 +41,7 @@ import Control.Concurrent.STM
   ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
   , orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry, takeTMVar
   , tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
-import Control.Exception (bracket, catch, Exception, SomeException, throwIO)
+import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
 import Control.Monad (void)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
@@ -48,10 +51,11 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, renameFile, removeFile)
 import System.FilePath ((</>))
 import System.Posix.IO
   ( OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags
@@ -60,10 +64,11 @@ import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
 
 import Katip (Severity (..), ls)
-import Seal.Core.Types (OpName, ToolCallId, ModelId (..))
+import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir)
+import Seal.Core.Types (OpName, ToolCallId, ModelId (..), SessionId)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), ToolResultPart (..), ToolChoice (..) )
+  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), ToolChoice (..) )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
@@ -530,3 +535,92 @@ minimalDelta mPrior next = case mPrior of
           , edMaxTokens = if envMaxTokens next == envMaxTokens prior then Nothing else Just (envMaxTokens next)
           }
     in if d == emptyEnvelopeDelta then Nothing else Just d
+
+-- | Append a single 'Message' to a session's @conversation.jsonl@ file
+-- using direct @O_APPEND@ + @fsync@. This is used by the async delegation
+-- completion callback — which runs in a forked child thread that may
+-- outlive the parent's 'withTwoFileTranscript' bracket (and its
+-- single-writer daemon). POSIX @O_APPEND@ guarantees each @write()@
+-- atomically seeks to end-of-file, so concurrent writes (from the daemon
+-- during the parent's turn, or from another completion callback) do not
+-- interleave.
+--
+-- IO errors are swallowed (best-effort): a completion write failure must
+-- not crash the forked child thread. The error is logged via the global
+-- katip scribe.
+appendConversationMessage :: SealPaths -> SessionId -> Message -> IO ()
+appendConversationMessage paths sid msg =
+  catch @IOException
+    ( do
+        let convPath = sessionConversationPath paths sid
+        let flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }
+        fd <- openFd convPath ReadWrite flags
+        let bs = encodeConvLine (ConvLine msg) <> "\n"
+        BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -> do
+          _ <- fdWriteBuf fd (castPtr ptr) (fromIntegral len)
+          pure ()
+        fileSynchronise fd
+        closeFd fd
+    )
+    ( \e -> globalLogIO ErrorS
+              (ls ("appendConversationMessage failed: " <> T.pack (show e)))
+    )
+
+-- | The sidecar file for agent completion messages. Each line is a
+-- JSON-encoded 'Message' (user role, text content). The turn engine reads
+-- and clears this file at the start of each turn, injecting the messages
+-- into the conversation. This avoids interfering with the single-writer
+-- daemon's in-memory diff state during the ongoing turn.
+completionSidecarPath :: SealPaths -> SessionId -> FilePath
+completionSidecarPath paths sid = sessionDir paths sid </> "agent-completions.jsonl"
+
+-- | Append a completion message to the sidecar file. Called from forked
+-- child threads when a subagent completes. The message is a plain text
+-- string (the 'completionMessage' from the opcode layer). It is encoded as
+-- a JSON 'Message' (user role, 'CbText' content) so the turn engine can
+-- decode and inject it directly. IO errors are swallowed (best-effort).
+appendCompletionToSidecar :: SealPaths -> SessionId -> Text -> IO ()
+appendCompletionToSidecar paths sid text =
+  catch @IOException
+    ( do
+        let sidecarPath = completionSidecarPath paths sid
+            flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }
+        fd <- openFd sidecarPath ReadWrite flags
+        let msg = Message User [CbText text]
+            bs = encodeConvLine (ConvLine msg) <> "\n"
+        BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -> do
+          _ <- fdWriteBuf fd (castPtr ptr) (fromIntegral len)
+          pure ()
+        fileSynchronise fd
+        closeFd fd
+    )
+    ( \e -> globalLogIO ErrorS
+              (ls ("appendCompletionToSidecar failed: " <> T.pack (show e)))
+    )
+
+-- | Read and clear the completion sidecar file. Returns the 'Message' list
+-- (user-role messages from completed subagents). The file is atomically
+-- renamed to a temp file, read, and deleted — so concurrent appends during
+-- the read don't lose messages (they go to the new sidecar file). Called
+-- by the turn engine at the start of each turn.
+readAndClearCompletions :: SealPaths -> SessionId -> IO [Message]
+readAndClearCompletions paths sid =
+  catch @IOException
+    ( do
+        let sidecarPath = completionSidecarPath paths sid
+        exists <- doesFileExist sidecarPath
+        if not exists
+          then pure []
+          else do
+            -- Atomic rename so concurrent appends go to a new file
+            let tmpPath = sidecarPath <> ".read"
+            System.Directory.renameFile sidecarPath tmpPath
+            raw <- BS.readFile tmpPath
+            System.Directory.removeFile tmpPath
+            pure (readConversation raw)
+    )
+    ( \e -> do
+        globalLogIO ErrorS
+          (ls ("readAndClearCompletions failed: " <> T.pack (show e)))
+        pure []
+    )

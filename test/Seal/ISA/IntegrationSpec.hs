@@ -16,6 +16,7 @@
 -- on each opcode's contract.
 module Seal.ISA.IntegrationSpec (spec) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), encode, object, (.=))
@@ -742,6 +743,13 @@ spec = describe "Seal.ISA.Integration" $ do
                                   , "provider" .= ("ollama" :: Text)
                                   , "model" .= ("llama3" :: Text) ]))
       let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+          testPaths = SealPaths
+            { spHome = "/tmp/seal-test"
+            , spConfig = "/tmp/seal-test/config"
+            , spState = "/tmp/seal-test/state"
+            , spKeys = "/tmp/seal-test/keys"
+            , spCache = "/tmp/seal-test/cache"
+            }
           wiring = AgentStartWiring
             { aswDefBackend = backend
             , aswRuntime = rt
@@ -752,6 +760,8 @@ spec = describe "Seal.ISA.Integration" $ do
             , aswParentDepth = 0
             , aswWorker = worker
             , aswGate = gateOpen
+            , aswPaths = testPaths
+            , aswParentSession = sid
             }
           op = agentStartOp wiring
           reg = Registry.mkRegistry [op]
@@ -760,10 +770,12 @@ spec = describe "Seal.ISA.Integration" $ do
       case r of
         Right res -> do
           orIsError res `shouldBe` False
-          -- Synchronous: the worker has already run by the time dispatch returns.
+          -- Async: the worker runs in a forked thread. Wait for it.
+          threadDelay 100000  -- 100ms
           readIORef ran `shouldReturn` 1
+          -- The result text shows "running" (SpawnInfo), not "hi".
           case orParts res of
-            [TrpText t] -> T.isInfixOf "hi" t `shouldBe` True
+            [TrpText t] -> T.isInfixOf "running" t `shouldBe` True
             _           -> expectationFailure "expected a single text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
