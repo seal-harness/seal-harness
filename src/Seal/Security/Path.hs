@@ -6,6 +6,9 @@ module Seal.Security.Path
   , mkSafePath
   , mkSafePathForWrite
   , mkSafePathRemote
+  , mkSafePathAllowAbs
+  , mkSafePathForWriteAllowAbs
+  , mkSafePathRemoteAllowAbs
   , KeysRoot (..)
   , ensureKeysRoot
   , SafeKeyPath
@@ -180,6 +183,132 @@ mkSafePathRemote (WorkspaceRoot root) requested =
       in if not (rootDirs `isPrefixOf` lexicalDirs)
            then Left $ PathEscapesWorkspace (joinPath lexicalDirs)
            else Right $ SafePath (joinPath lexicalDirs)
+
+-- ---------------------------------------------------------------------------
+-- Absolute-path-allowing variants
+--
+-- These are the same as 'mkSafePath' / 'mkSafePathForWrite' /
+-- 'mkSafePathRemote' but with one difference: when the requested path is
+-- ABSOLUTE, the workspace-containment check is SKIPPED. The blocked-name
+-- check, lexical '..'/@.@ collapse, canonicalization (local arm), and
+-- existence checks all still apply. Relative paths are confined exactly as
+-- in the original functions.
+--
+-- Use these for the agent-facing FILE_READ / FILE_WRITE / FILE_PATCH
+-- opcodes so an agent can operate on files outside the session workdir
+-- (e.g. persistent files across sessions). Internal harness operations
+-- (WorkdirFs, skills, memory, agent defs) continue to use the confining
+-- originals.
+-- ---------------------------------------------------------------------------
+
+-- | Like 'mkSafePath' but allows absolute paths to escape the workspace.
+-- Relative paths are confined as usual; absolute paths are canonicalized
+-- and existence-checked but NOT workspace-confined.
+mkSafePathAllowAbs :: WorkspaceRoot -> FilePath -> IO (Either PathError SafePath)
+mkSafePathAllowAbs (WorkspaceRoot root) requested = do
+  canonRoot <- canonicalizePath root
+  if any (`elem` blockedNames) (splitDirectories requested)
+    then pure $ Left $ PathIsBlocked $ T.pack $ "path touches a blocked location: " <> requested
+    else if isAbsolute requested
+      then resolveAbs
+      else do
+        let joined = canonRoot </> requested
+            rootDirs = splitDirectories canonRoot
+            lexicalDirs = lexicalCollapse (splitDirectories joined)
+        if not (rootDirs `isPrefixOf` lexicalDirs)
+          then pure $ Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+          else resolveAndCheck rootDirs joined (joinPath lexicalDirs)
+  where
+    resolveAbs = do
+      canonResult <- try (canonicalizePath requested) :: IO (Either IOException FilePath)
+      case canonResult of
+        Left _ -> pure $ Left $ PathDoesNotExist requested
+        Right canon -> do
+          exists <- doesPathExist canon
+          if not exists
+            then pure $ Left $ PathDoesNotExist canon
+            else pure $ Right $ SafePath canon
+    resolveAndCheck rootDirs joined lexical = do
+      canonResult <- try (canonicalizePath joined) :: IO (Either IOException FilePath)
+      case canonResult of
+        Left _ -> pure $ Left $ PathDoesNotExist lexical
+        Right canon ->
+          if not (rootDirs `isPrefixOf` splitDirectories canon)
+            then pure $ Left $ PathEscapesWorkspace canon
+            else do
+              exists <- doesPathExist canon
+              if not exists
+                then pure $ Left $ PathDoesNotExist canon
+                else pure $ Right $ SafePath canon
+
+-- | Like 'mkSafePathForWrite' but allows absolute paths to escape the
+-- workspace. Relative paths are confined as usual; absolute paths have
+-- their parent canonicalized and existence-checked but are NOT
+-- workspace-confined.
+mkSafePathForWriteAllowAbs :: WorkspaceRoot -> FilePath -> IO (Either PathError SafePath)
+mkSafePathForWriteAllowAbs (WorkspaceRoot root) requested = do
+  canonRoot <- canonicalizePath root
+  if any (`elem` blockedNames) (splitDirectories requested)
+    then pure $ Left $ PathIsBlocked $ T.pack $ "path touches a blocked location: " <> requested
+    else if isAbsolute requested
+      then resolveAbsForWrite
+      else do
+        let joined = canonRoot </> requested
+            rootDirs = splitDirectories canonRoot
+            lexicalDirs = lexicalCollapse (splitDirectories joined)
+        if not (rootDirs `isPrefixOf` lexicalDirs)
+          then pure $ Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+          else do
+            let lexicalPath = joinPath lexicalDirs
+            case splitDirectories lexicalPath of
+              [] -> pure $ Left $ PathEscapesWorkspace lexicalPath
+              [_] -> resolveParentAndCheck rootDirs lexicalPath canonRoot
+              segments ->
+                let parentLex = joinPath (init segments)
+                in resolveParentAndCheck rootDirs lexicalPath
+                     =<< canonicalizePath parentLex
+  where
+    resolveAbsForWrite = do
+      let lexicalDirs = lexicalCollapse (splitDirectories requested)
+          lexicalPath = joinPath lexicalDirs
+      case splitDirectories lexicalPath of
+        [] -> pure $ Left $ PathEscapesWorkspace lexicalPath
+        [_] -> pure $ Right $ SafePath lexicalPath
+        segments -> do
+          let parentLex = joinPath (init segments)
+          canonParentResult <- try (canonicalizePath parentLex) :: IO (Either IOException FilePath)
+          case canonParentResult of
+            Left _ -> pure $ Left $ PathDoesNotExist lexicalPath
+            Right canonParent -> do
+              parentExists <- doesPathExist canonParent
+              if not parentExists
+                then pure $ Left $ PathDoesNotExist canonParent
+                else pure $ Right $ SafePath lexicalPath
+    resolveParentAndCheck rootDirs lexicalPath canonParent = do
+      if not (rootDirs `isPrefixOf` splitDirectories canonParent)
+        then pure $ Left $ PathEscapesWorkspace canonParent
+        else do
+          parentExists <- doesPathExist canonParent
+          if not parentExists
+            then pure $ Left $ PathDoesNotExist canonParent
+            else pure $ Right $ SafePath lexicalPath
+
+-- | Like 'mkSafePathRemote' but allows absolute paths to escape the
+-- workspace. Relative paths are confined as usual; absolute paths are
+-- lexically collapsed and returned as-is (no containment check). Pure.
+mkSafePathRemoteAllowAbs :: WorkspaceRoot -> FilePath -> Either PathError SafePath
+mkSafePathRemoteAllowAbs (WorkspaceRoot root) requested
+  | any (`elem` blockedNames) (splitDirectories requested)
+  = Left $ PathIsBlocked $ T.pack $ "path touches a blocked location: " <> requested
+  | isAbsolute requested
+  = Right $ SafePath (joinPath (lexicalCollapse (splitDirectories requested)))
+  | otherwise
+  = let joined      = root </> requested
+        rootDirs    = splitDirectories root
+        lexicalDirs = lexicalCollapse (splitDirectories joined)
+    in if not (rootDirs `isPrefixOf` lexicalDirs)
+         then Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+         else Right $ SafePath (joinPath lexicalDirs)
 
 -- ---------------------------------------------------------------------------
 -- Key-material confinement

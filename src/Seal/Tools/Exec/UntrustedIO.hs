@@ -64,8 +64,9 @@ import System.Process
   )
 
 import Seal.Security.Path
-  ( PathError (..), SafePath, WorkspaceRoot (..), getSafePath, mkSafePath
-  , mkSafePathForWrite, mkSafePathRemote
+  ( PathError (..), SafePath, WorkspaceRoot (..), getSafePath
+  , mkSafePathRemote
+  , mkSafePathAllowAbs, mkSafePathForWriteAllowAbs, mkSafePathRemoteAllowAbs
   )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Text.LineFile
@@ -246,7 +247,7 @@ mkLocalUntrustedIO wsRoot =
   in UntrustedIO
   { uioReadFile = \rp scanBytes -> do
       let rel = T.unpack (getRemotePath rp)
-      eSafe <- mkSafePath wsRoot rel
+      eSafe <- mkSafePathAllowAbs wsRoot rel
       case eSafe of
         Left pe  -> pure (Left (UePath pe))
         Right sp -> do
@@ -291,7 +292,7 @@ mkLocalUntrustedIO wsRoot =
       if byteCount > ceiling'
         then pure (Left (UeBounded ceiling'))
         else do
-          eSafe <- mkSafePathForWrite wsRoot rel
+          eSafe <- mkSafePathForWriteAllowAbs wsRoot rel
           case eSafe of
             Left pe  -> pure (Left (UePath pe))
             Right sp -> do
@@ -301,7 +302,7 @@ mkLocalUntrustedIO wsRoot =
                 Right _    -> Right byteCount
   , uioPatchFile = \rp patch -> do
       let rel = T.unpack (getRemotePath rp)
-      eSafe <- mkSafePath wsRoot rel
+      eSafe <- mkSafePathAllowAbs wsRoot rel
       case eSafe of
         Left pe  -> pure (Left (UePath pe))
         Right sp -> patchLocal sp patch
@@ -595,7 +596,7 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
   in UntrustedIO
   { uioReadFile = \rp scanBytes ->
       let rel = T.unpack (getRemotePath rp)
-      in case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
+      in case mkSafePathRemoteAllowAbs (wsRootFromCfg sshCfg) rel of
            Left pe  -> pure (Left (UePath pe))
            Right sp -> do
              -- ssh ... -- head -c <scanBytes> <abspath>  (bounded read).
@@ -609,7 +610,7 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
   , uioWriteFile = \rp content mode _ceiling' -> do
       let rel       = T.unpack (getRemotePath rp)
           byteCount = BS.length (TE.encodeUtf8 content)
-      case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
+      case mkSafePathRemoteAllowAbs (wsRootFromCfg sshCfg) rel of
         Left pe  -> pure (Left (UePath pe))
         Right sp -> do
           -- ssh ... -- tee [-a] <abspath>   with content on stdin.
@@ -622,7 +623,7 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
           pure (either (Left . UeExec) (const (Right byteCount)) res)
   , uioPatchFile = \rp patch -> do
       let rel = T.unpack (getRemotePath rp)
-      case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
+      case mkSafePathRemoteAllowAbs (wsRootFromCfg sshCfg) rel of
         Left pe  -> pure (Left (UePath pe))
         Right sp -> do
           let absPath = getSafePath sp

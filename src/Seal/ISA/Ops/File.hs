@@ -1,7 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | FILE_READ (Untrusted): read a workspace file, confined by SafePath.
--- FILE_WRITE (Untrusted): write/append a workspace file, confined by
--- SafePath, bounded by the operator-configured max write size.
+-- | FILE_READ (Untrusted): read a file (workspace-relative or absolute
+-- path), confined by SafePath (blocked-name check + canonicalization;
+-- relative paths are workspace-confined, absolute paths are allowed
+-- pass-through).
+-- FILE_WRITE (Untrusted): write/append a file (workspace-relative or
+-- absolute), bounded by the operator-configured max write size.
 -- This is the opcode module that exercises the ACK-before-execute path in
 -- the dispatcher. All side-effecting IO is funnelled through the
 -- 'UntrustedIO' capability handle; this module never imports
@@ -43,7 +46,7 @@ fileReadSchema =
     , "properties" .= object
         [ fromText "path" .= object
             [ "type" .= ("string" :: Text)
-            , "description" .= ("Workspace-relative path of the file to read." :: Text)
+            , "description" .= ("Path of the file to read. Relative paths resolve against the session workdir; absolute paths are used verbatim." :: Text)
             ]
         , fromText "offset" .= object
             [ "type" .= ("integer" :: Text)
@@ -138,7 +141,7 @@ scanBytesField v = case intField "max_scan_bytes" v of
 fileReadOp :: WorkspaceRoot -> Int -> Opcode
 fileReadOp _root operatorCeiling = UntrustedOpcode
   { uoName = OpName "FILE_READ"
-  , uoDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
+  , uoDesc = "Read a UTF-8 text file from the workspace or by absolute path."
   , uoInSchema = fileReadSchema
   , uoOutSchema = object []
   , uoAuthorize =
@@ -232,7 +235,7 @@ clampScanBytes operatorCeiling mReq =
 fileWriteOp :: WorkspaceRoot -> Int -> Opcode
 fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
   { uoName = OpName "FILE_WRITE"
-  , uoDesc = "Write or append to a workspace file (path is workspace-relative, bounded)."
+  , uoDesc = "Write or append to a file (workspace-relative or absolute path, bounded)."
   , uoInSchema = fileWriteSchema
   , uoOutSchema = object []
   , uoAuthorize =
@@ -284,7 +287,7 @@ fileWriteSchema =
     , "properties" .= object
         [ fromText "path" .= object
             [ "type" .= ("string" :: Text)
-            , "description" .= ("Workspace-relative path of the file to write." :: Text)
+            , "description" .= ("Path of the file to write. Relative paths resolve against the session workdir; absolute paths are used verbatim." :: Text)
             ]
         , fromText "content" .= object
             [ "type" .= ("string" :: Text)
@@ -319,7 +322,7 @@ modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe T
 filePatchOp :: WorkspaceRoot -> Opcode
 filePatchOp _root = UntrustedOpcode
   { uoName = OpName "FILE_PATCH"
-  , uoDesc = "Apply a unified diff to a workspace file (SafePath-confined, atomic write). \
+  , uoDesc = "Apply a unified diff to a file (workspace-relative or absolute, atomic write). \
              \Input fields are {path: string, patch: string} — the patch field is named \
              \'patch' (not 'diff'). The patch is a standard unified diff as @git diff@ \
              \would emit; both the long hunk header form (@@@ -1,2 +1,2 @@@) and the \
@@ -365,7 +368,7 @@ filePatchSchema =
     , "properties" .= object
         [ fromText "path" .= object
             [ "type" .= ("string" :: Text)
-            , "description" .= ("Workspace-relative path of the file to patch." :: Text)
+            , "description" .= ("Path of the file to patch. Relative paths resolve against the session workdir; absolute paths are used verbatim." :: Text)
             ]
         , fromText "patch" .= object
             [ "type" .= ("string" :: Text)
