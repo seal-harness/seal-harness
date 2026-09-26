@@ -24,6 +24,8 @@ import Seal.Git.Repo (ConfigRepo)
 import Seal.Memory.Embedding qualified as Emb
 import Seal.Memory.Store qualified as Mem
 import Seal.Skills.Backend qualified as Skill
+import Seal.Session.Search qualified as Search
+import System.Directory (findExecutable)
 
 -- | The evolutionary-store backends + the in-process agent runtime, created
 -- once at startup and shared between the command specs (which read them via
@@ -41,6 +43,7 @@ import Seal.Skills.Backend qualified as Skill
 data Backends = Backends
   { bMemory    :: Mem.MemoryStore
   , bEmbedding :: Emb.EmbeddingBackend
+  , bSessionSearch :: Search.SessionSearchBackend
   , bSkills    :: Skill.SkillBackend
   , bAgentDefs :: Def.AgentDefBackend
   , bRuntime   :: AgentRuntime
@@ -76,9 +79,11 @@ newBackends paths repo embedding = do
   memStore    <- Mem.fileMemoryStore memoryDir
   skills      <- Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo
   agentDefs   <- Def.markdownAgentDefBackend agentsDir repo
+  sessionSearch <- Search.resolveSessionSearchBackend embedding paths findExecutable
   pure (Backends
     { bMemory = memStore
     , bEmbedding = embedding
+    , bSessionSearch = sessionSearch
     , bSkills = skills
     , bAgentDefs = agentDefs
     , bRuntime = rt

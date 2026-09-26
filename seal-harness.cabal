@@ -179,6 +179,7 @@ library
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
+        Seal.Session.Search
          Seal.Session.Log
           Seal.SourceControl.Repo
           Seal.SourceControl.Registry
@@ -507,6 +508,7 @@ test-suite tests
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
+        Seal.Session.SearchSpec
         Seal.Session.LockSpec
         Seal.Session.LockFocusSpec
         Seal.SourceControl.RepoSpec

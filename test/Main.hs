@@ -29,6 +29,7 @@ import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
 import qualified Seal.Session.StoreSpec
+import qualified Seal.Session.SearchSpec
 import qualified Seal.Session.LogSpec
 import qualified Seal.Session.LockSpec
 import qualified Seal.Session.LockFocusSpec
@@ -209,6 +210,7 @@ specs = do
   Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec
   Seal.Session.StoreSpec.spec
+  Seal.Session.SearchSpec.spec
   Seal.Session.LogSpec.spec
   Seal.Session.LockSpec.spec
   Seal.Session.LockFocusSpec.spec

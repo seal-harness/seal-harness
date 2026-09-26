@@ -302,9 +302,9 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
       , sessionListOp paths
-      , sessionSearchOp paths
+      , sessionSearchOp paths (bSessionSearch backends)
       , sessionGetOp paths
-      , sessionManageOp paths
+      , sessionManageOp paths (bSessionSearch backends)
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.hideOpcodes legacyHidden
@@ -1169,7 +1169,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)
-       , sessionSearchOp (tdPaths td)
+       , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td))
        , sessionGetOp (tdPaths td)
         , nestedAgentStartOp
         ]

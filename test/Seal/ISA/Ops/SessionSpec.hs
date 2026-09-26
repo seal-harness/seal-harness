@@ -19,6 +19,7 @@ import Seal.ISA.Ops.Session
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (newSession, saveSessionMeta)
+import Seal.Session.Search (inMemorySessionSearchBackend)
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
@@ -130,7 +131,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "returns no matches for an empty session store" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths
+            op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object ["query" .= ("anything" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -140,14 +141,14 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "errors on missing query" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths
+            op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object []))
         orIsError r `shouldBe` True
 
     it "errors on empty query" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths
+            op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object ["query" .= ("" :: Text)]))
         orIsError r `shouldBe` True
 
@@ -156,7 +157,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let paths = mkPaths tmp
         meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-        let op = sessionSearchOp paths
+        let op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object ["query" .= ("auth" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -171,7 +172,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
           ]
-        let op = sessionSearchOp paths
+        let op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object ["query" .= ("database" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -183,7 +184,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let paths = mkPaths tmp
         meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-        let op = sessionSearchOp paths
+        let op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend (object ["query" .= ("kubernetes" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -288,7 +289,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "creates a new session and returns its id + metadata" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths
+              op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend (object ["action" .= ("new" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -298,7 +299,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "accepts optional provider/model/description" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths
+              op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend
             (object
               [ "action" .= ("new" :: Text)
@@ -315,7 +316,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "returns an empty message when no sessions exist" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths
+              op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -326,7 +327,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
           _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
-          let op = sessionManageOp paths
+          let op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -341,7 +342,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           let paths = mkPaths tmp
           meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
           saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-          let op = sessionManageOp paths
+          let op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend
             (object ["action" .= ("search" :: Text), "query" .= ("auth" :: Text)]))
           orIsError r `shouldBe` False
@@ -352,7 +353,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "errors on missing query" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths
+              op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend (object ["action" .= ("search" :: Text)]))
           orIsError r `shouldBe` True
 
@@ -365,7 +366,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             [ userMsg "Hello world"
             , assistantMsg "Hi there"
             ]
-          let op = sessionManageOp paths
+          let op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend
             (object
               [ "action" .= ("get" :: Text)
@@ -381,33 +382,33 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "errors on missing session_id" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths
+              op = sessionManageOp paths inMemorySessionSearchBackend
           r <- runTestApp (opRun op localBackend (object ["action" .= ("get" :: Text)]))
           orIsError r `shouldBe` True
 
     describe "authorize gate" $ do
       it "accepts new with no extra fields" $
-        opAuthorize (sessionManageOp undefined)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("new" :: Text)])
           `shouldBe` Right ()
 
       it "accepts list with no extra fields" $
-        opAuthorize (sessionManageOp undefined)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("list" :: Text)])
           `shouldBe` Right ()
 
       it "rejects search without query" $
-        opAuthorize (sessionManageOp undefined)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("search" :: Text)])
           `shouldBe` Left "search requires {query:string}"
 
       it "rejects get without session_id" $
-        opAuthorize (sessionManageOp undefined)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("get" :: Text)])
           `shouldBe` Left "get requires {session_id:string}"
 
       it "rejects unknown action" $
-        opAuthorize (sessionManageOp undefined)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend)
           (object ["action" .= ("frobnicate" :: Text)])
           `shouldBe` Left "unknown session action: frobnicate"
 
@@ -444,7 +445,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "debug the subagent grpc pool"
           ]
-        let op = sessionSearchOp paths
+        let op = sessionSearchOp paths inMemorySessionSearchBackend
         r <- runTestApp (opRun op localBackend
           (object ["query" .= ("grpc" :: Text)]))
         orIsError r `shouldBe` False
