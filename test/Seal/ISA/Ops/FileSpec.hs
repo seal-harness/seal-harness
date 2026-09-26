@@ -410,6 +410,54 @@ spec = describe "Seal.ISA.Ops.File" $ do
           ]))
         orIsError r `shouldBe` True
 
+  describe "absolute paths" $ do
+
+    it "FILE_READ reads a file at an absolute path outside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          let absFile = outside </> "external.txt"
+          BS.writeFile absFile "external content"
+          let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+          r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= (absFile :: String)]))
+          orIsError r `shouldBe` False
+          orParts r `shouldBe` [TrpText "external content\n\n[lines 1-1 of 1 (end of file)]"]
+
+    it "FILE_WRITE writes a file at an absolute path outside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          let absFile = outside </> "output.txt"
+              op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
+          r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
+            [ "path" .= (absFile :: String)
+            , "content" .= ("from outside" :: String)
+            ]))
+          orIsError r `shouldBe` False
+          bs <- BS.readFile absFile
+          bs `shouldBe` "from outside"
+
+    it "FILE_PATCH patches a file at an absolute path outside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          let absFile = outside </> "patchable.txt"
+          BS.writeFile absFile "hello\nworld\n"
+          let op = filePatchOp (WorkspaceRoot root)
+              diff = "--- patchable.txt\n+++ patchable.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+world!\n"
+          r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
+            [ "path" .= (absFile :: String)
+            , "patch" .= (diff :: String)
+            ]))
+          orIsError r `shouldBe` False
+          bs <- BS.readFile absFile
+          bs `shouldBe` "hello\nworld!\n"
+
+    it "FILE_READ still rejects a blocked .env absolute path" $
+      withSystemTempDirectory "seal-outside" $ \outside -> do
+        createDirectory (outside </> ".env")
+        BS.writeFile (outside </> ".env" </> "secrets") "k"
+        let op = fileReadOp (WorkspaceRoot "/nonexistent") maxScanBytes
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot "/nonexistent")) Nothing op (object ["path" .= ((outside </> ".env" </> "secrets") :: String)]))
+        orIsError r `shouldBe` True
+
   where
     showN :: Int -> Text
     showN = T.pack . show

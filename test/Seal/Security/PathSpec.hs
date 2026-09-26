@@ -176,6 +176,95 @@ spec = describe "Seal.Security.Path" $ do
           Left e  -> expectationFailure ("expected Right, got: " <> show e)
           Right p -> show p `shouldNotContain` "secret.identity"
 
+  describe "mkSafePathAllowAbs" $ do
+
+    it "accepts a relative path inside the workspace (same as mkSafePath)" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        BS.writeFile (root </> "ok.txt") "hi"
+        r <- mkSafePathAllowAbs (WorkspaceRoot root) "ok.txt"
+        r `shouldSatisfy` isOk
+
+    it "accepts an absolute path outside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          let absFile = outside </> "external.txt"
+          BS.writeFile absFile "external-data"
+          r <- mkSafePathAllowAbs (WorkspaceRoot root) absFile
+          r `shouldSatisfy` isOk
+          case r of
+            Right sp -> getSafePath sp `shouldContain` "external.txt"
+            Left e   -> expectationFailure ("expected Right, got: " <> show e)
+
+    it "still rejects blocked .env in an absolute path" $
+      withSystemTempDirectory "seal-outside" $ \outside -> do
+        createDirectoryIfMissing True (outside </> ".env")
+        BS.writeFile (outside </> ".env" </> "secrets") "k"
+        r <- mkSafePathAllowAbs (WorkspaceRoot "/nonexistent") (outside </> ".env" </> "secrets")
+        r `shouldSatisfy` isBlocked
+
+    it "rejects a missing absolute path with PathDoesNotExist" $
+      withSystemTempDirectory "seal-outside" $ \outside -> do
+        r <- mkSafePathAllowAbs (WorkspaceRoot "/nonexistent") (outside </> "no-such-file.txt")
+        r `shouldSatisfy` isMissing
+
+    it "still rejects .. traversal in a relative path" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        r <- mkSafePathAllowAbs (WorkspaceRoot root) "../escape.txt"
+        r `shouldSatisfy` isEscape
+
+  describe "mkSafePathForWriteAllowAbs" $ do
+
+    it "accepts a relative path inside the workspace (same as mkSafePathForWrite)" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        r <- mkSafePathForWriteAllowAbs (WorkspaceRoot root) "new.txt"
+        r `shouldSatisfy` isOk
+
+    it "accepts an absolute path outside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          r <- mkSafePathForWriteAllowAbs (WorkspaceRoot root) (outside </> "external-write.txt")
+          r `shouldSatisfy` isOk
+
+    it "still rejects blocked .ssh in an absolute path" $
+      withSystemTempDirectory "seal-outside" $ \outside -> do
+        createDirectoryIfMissing True (outside </> ".ssh")
+        r <- mkSafePathForWriteAllowAbs (WorkspaceRoot "/nonexistent") (outside </> ".ssh" </> "id_rsa")
+        r `shouldSatisfy` isBlocked
+
+    it "rejects a missing parent in an absolute path" $
+      withSystemTempDirectory "seal-outside" $ \outside -> do
+        r <- mkSafePathForWriteAllowAbs (WorkspaceRoot "/nonexistent") (outside </> "no-such-dir" </> "file.txt")
+        r `shouldSatisfy` isMissing
+
+    it "still rejects .. traversal in a relative path" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        r <- mkSafePathForWriteAllowAbs (WorkspaceRoot root) "../escape.txt"
+        r `shouldSatisfy` isEscape
+
+  describe "mkSafePathRemoteAllowAbs" $ do
+
+    it "accepts a relative path inside the workspace (same as mkSafePathRemote)" $
+      either (const False) (const True) (mkSafePathRemoteAllowAbs (WorkspaceRoot "/srv/ws") "doc.txt")
+        `shouldBe` True
+
+    it "accepts an absolute path outside the workspace" $
+      either (const False) (const True) (mkSafePathRemoteAllowAbs (WorkspaceRoot "/srv/ws") "/etc/hostname")
+        `shouldBe` True
+
+    it "still rejects blocked .env in an absolute path" $
+      let r = mkSafePathRemoteAllowAbs (WorkspaceRoot "/srv/ws") "/home/user/.env"
+      in r `shouldSatisfy` isBlocked
+
+    it "still rejects .. traversal in a relative path" $
+      let r = mkSafePathRemoteAllowAbs (WorkspaceRoot "/srv/ws") "../escape.txt"
+      in r `shouldSatisfy` isEscape
+
+    it "returns the lexically-resolved absolute path" $
+      let r = mkSafePathRemoteAllowAbs (WorkspaceRoot "/srv/ws") "/var/log/../log/app.log"
+      in case r of
+           Right sp -> getSafePath sp `shouldBe` "/var/log/app.log"
+           Left e   -> expectationFailure ("expected Right, got: " <> show e)
+
   where
     isOk     = either (const False) (const True)
     isEscape = either isEsc (const False)

@@ -32,8 +32,10 @@ belongs in your workdir where it's isolated, visible, and auditable.
   you omit the `cwd` argument. You do not need to `cd` anywhere. Both accept
   an optional `cwd`: a relative path is confined to your workdir; an
   absolute path is used verbatim.
-- `FILE_READ`, `FILE_WRITE`, `FILE_PATCH`, and `SEARCH_FILES` are all
-  confined to your workdir. Relative paths resolve there.
+- `FILE_READ`, `FILE_WRITE`, and `FILE_PATCH` accept both relative paths
+  (resolved against your workdir) and absolute paths (used verbatim). This
+  lets you read or write files that persist across sessions. `SEARCH_FILES`
+  is confined to your workdir; relative paths resolve there.
 - `pwd` (with no `cwd` arg) returns your workdir. Run it once to see where
   you are.
 
@@ -203,11 +205,11 @@ resolves the branch against — the explicit refspec is what creates it.
   there by default, you break that isolation and your writes land somewhere
   the operator didn't expect. (Operating outside the workdir deliberately is
   fine — doing it by default is what causes problems.)
-- **Visibility.** Every file opcode (`FILE_READ`, `SEARCH_FILES`, …) looks
-  in your workdir. Files you write outside it are invisible to those
-  opcodes — your next `SEARCH_FILES` won't find them. If you need to work
-  outside the workdir, use absolute paths explicitly so it's clear where
-  things are going.
+- **Visibility.** `SEARCH_FILES` looks in your workdir. `FILE_READ`,
+  `FILE_WRITE`, and `FILE_PATCH` default to your workdir for relative paths
+  but also accept absolute paths. If you need to work outside the workdir,
+  use absolute paths explicitly so it's clear where things are going — and
+  tell the operator what you're doing and why.
 - **Audit.** The transcript records what you did. Escaping the workdir
   *accidentally* produces a confusing audit trail (writes the operator can't
   find in the session's workdir). Deliberate outside-workdir actions are fine
@@ -240,8 +242,9 @@ You don't need to know the path ahead of time. Just run:
 BIN_EXEC { "binary": "pwd" }
 ```
 
-The returned path is your workdir for this session. Use it only for
-reference — you should still pass relative paths to file opcodes.
+The returned path is your workdir for this session. Use it for reference
+when you need to construct an absolute path, or pass relative paths to file
+opcodes to resolve against the workdir.
 
 ## What is NOT in your workdir (by default)
 
