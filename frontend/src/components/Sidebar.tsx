@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
-import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel } from '../types'
+import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel, providerFromRuntime } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
 import { ActiveTabs } from './ActiveTabs'
@@ -247,6 +247,28 @@ export function Sidebar({
     return shortenModel(session.model)
   }
 
+  // The repo URL cloned into the tab's session's workdir, or null when no
+  // repo is associated. Centralized here so both ActiveTabs and
+  // RunningHarnesses share the same session-join.
+  const tabRepoUrl = (tab: TabInfo): string | null => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.repoUrl ?? null
+  }
+
+  // The display name of the agent bound to the tab's session, or null when
+  // no agent is active. Centralized here so both ActiveTabs and
+  // RunningHarnesses share the same session-join.
+  const tabAgent = (tab: TabInfo): string | null => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.agent ?? null
+  }
+
+  // The provider label extracted from the session's runtime field.
+  const tabProvider = (tab: TabInfo): string => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session ? providerFromRuntime(session.runtime) : ''
+  }
+
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
   // uses activity.lastEntryAt ?? session.lastActive. Tabs without a backing
   // session (e.g. raw shell tabs) or any activity frame render no pill.
@@ -295,6 +317,9 @@ export function Sidebar({
           tabLabel={tabLabel}
           tabModel={tabModel}
           tabAgeText={tabAgeText}
+          tabRepoUrl={tabRepoUrl}
+          tabAgent={tabAgent}
+          tabProvider={tabProvider}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -310,6 +335,9 @@ export function Sidebar({
           tabLabel={tabLabel}
           tabModel={tabModel}
           tabAgeText={tabAgeText}
+          tabRepoUrl={tabRepoUrl}
+          tabAgent={tabAgent}
+          tabProvider={tabProvider}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}

@@ -3,6 +3,8 @@ import type { SessionInfo, TabInfo } from '../types'
 import {
   sessionDisplayTitle,
   shortenModel,
+  repoNameFromUrl,
+  providerFromRuntime,
   sessionSubtitle,
   tabDisplayLabel,
   findSession,
@@ -16,6 +18,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     agent: null,
     runtime: 'session:provider',
     model: '',
+    repoUrl: null,
     lastActive: new Date().toISOString(),
     createdAt: new Date().toISOString(),
     description: null,
@@ -75,6 +78,39 @@ describe('shortenModel', () => {
   it('passes through unknown model ids unchanged', () => {
     expect(shortenModel('llama3')).toBe('llama3')
     expect(shortenModel('gpt-4o')).toBe('gpt-4o')
+  })
+})
+
+describe('repoNameFromUrl', () => {
+  it('extracts the repo name from an https URL with .git suffix', () => {
+    expect(repoNameFromUrl('https://github.com/seal-harness/seal-harness.git')).toBe('seal-harness')
+  })
+
+  it('extracts the repo name from an https URL without .git', () => {
+    expect(repoNameFromUrl('https://gitlab.com/group/subgroup/proj')).toBe('proj')
+  })
+
+  it('extracts the repo name from a git@ SSH URL', () => {
+    expect(repoNameFromUrl('git@github.com:foo/bar-baz.git')).toBe('bar-baz')
+  })
+
+  it('returns empty string for null or empty input', () => {
+    expect(repoNameFromUrl(null)).toBe('')
+    expect(repoNameFromUrl('')).toBe('')
+    expect(repoNameFromUrl('  ')).toBe('')
+  })
+})
+
+describe('providerFromRuntime', () => {
+  it('extracts the provider from the runtime field', () => {
+    expect(providerFromRuntime('session:anthropic')).toBe('anthropic')
+    expect(providerFromRuntime('session:ollama')).toBe('ollama')
+  })
+
+  it('returns empty string for missing or malformed runtime', () => {
+    expect(providerFromRuntime(null)).toBe('')
+    expect(providerFromRuntime('')).toBe('')
+    expect(providerFromRuntime('harness')).toBe('')
   })
 })
 

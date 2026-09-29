@@ -11,6 +11,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     agent: null,
     runtime: 'session:anthropic',
     model: 'm',
+    repoUrl: null,
     lastActive: new Date().toISOString(),
     createdAt: new Date().toISOString(),
     description: null,
@@ -46,6 +47,9 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -67,6 +71,9 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -87,6 +94,9 @@ describe('ActiveTabs', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -108,6 +118,9 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -224,6 +237,9 @@ describe('RunningHarnesses', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -242,6 +258,9 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -261,6 +280,9 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoUrl={() => null}
+        tabAgent={() => null}
+        tabProvider={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -470,12 +492,13 @@ describe('Sidebar — tab status indicator', () => {
         onReleaseTab={() => {}}
       />,
     )
-    // The status label now includes the model suffix ("· m") since the
-    // backing sessions have model "m" (the default). shortenModel("m")
-    // returns "m" unchanged.
-    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Thinking·m')
-    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Idle Unread·m')
-    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('Idle Read·m')
+    // The second line now shows provider badge + model (no redundant
+    // status text — the icon on line 1 already conveys thinking/idle/read).
+    // The provider badge renders as "A" (anthropic) and the model is "m",
+    // so the textContent is "Am" for all three live tabs.
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Am')
+    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Am')
+    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('Am')
     // Thinking renders an animated ActivityDot (not the static glyph span).
     expect(document.querySelector('.dot-thinking')).toBeTruthy()
     expect(screen.getByTestId('tab-kind-idle-unread')).toBeTruthy()
@@ -524,8 +547,10 @@ describe('Sidebar — tab status indicator', () => {
     // The status-label testids carry the tab index, so reading them in
     // document order yields the rendered sort.
     const labels = screen.getAllByTestId(/^tab-status-label-\d+$/).map((el) => el.textContent)
-    // Expected: Unread new, Unread old, Read, Thinking (with model suffix).
-    expect(labels).toEqual(['Idle Unread·m', 'Idle Unread·m', 'Idle Read·m', 'Thinking·m'])
+    // All four tabs share the same provider (anthropic → "A") and model
+    // ("m"), so the second line is "Am" for all. The sort is verified by
+    // the index badges below, not by the label text.
+    expect(labels).toEqual(['Am', 'Am', 'Am', 'Am'])
     // And the tab index badges (rendered first per row) follow the same order.
     const indexBadges = screen.getAllByTestId(/^tab-index-\d+$/).map((el) => el.textContent)
     // The Active Tabs section renders tab.index badges; verify the sorted
@@ -556,6 +581,144 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.queryByTestId('tab-kind-idle-read')).toBeNull()
     // No backing session → no model suffix.
     expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Exited')
+  })
+})
+
+// ── Tab second-line info density ───────────────────────────────────────
+
+describe('Sidebar — tab second-line info (repo · provider · model · agent)', () => {
+  it('shows provider badge + model · repo-name — agent suppressed when repo is present', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The second line shows: "A" badge + "sonnet-4" + "·" + "seal-harness"
+    // The agent ("zoe") is NOT shown — when a repo is present, the repo name
+    // takes precedence over the agent for the limited space.
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toContain('sonnet-4')
+    expect(label.textContent).toContain('seal-harness')
+    expect(label.textContent).not.toContain('zoe')
+    expect(screen.getByTestId('provider-badge-anthropic')).toBeTruthy()
+  })
+
+  it('shows provider badge + model only when no repo and no agent', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'llama3.2',
+      runtime: 'session:ollama',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toBe('Ollama3.2')
+    expect(screen.getByTestId('provider-badge-ollama')).toBeTruthy()
+  })
+
+  it('shows provider badge + model + agent when no repo (agent fills the space)', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: null,
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // No repo → agent is shown: "A" badge + "sonnet-4" + "·" + "zoe"
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toBe('Asonnet-4·zoe')
+  })
+
+  it('derives repo name from agent prefix when repoUrl is null (legacy session fallback)', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'glm-5.2:cloud',
+      runtime: 'session:ollama',
+      repoUrl: null,
+      // A repo-bound agent has the "<repo>--<id>" prefix pattern
+      agent: 'seal-harness--agents-md',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // repoUrl is null but agent has "--" prefix → repo name "seal-harness"
+    // is extracted and shown instead of the full agent name.
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toContain('seal-harness')
+    expect(label.textContent).not.toContain('agents-md')
   })
 })
 

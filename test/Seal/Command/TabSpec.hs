@@ -258,6 +258,7 @@ metaWithDescription sid mDesc = SessionMeta
   , smChannel = "cli", smAgent = Nothing
   , smSystemOverride = Nothing, smAgentName = Nothing
   , smDescription = mDesc
+  , smRepoUrl = Nothing
   , smCreatedAt = testTime, smLastActive = testTime
   }
   where
