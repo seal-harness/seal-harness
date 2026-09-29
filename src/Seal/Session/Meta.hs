@@ -44,6 +44,11 @@ data SessionMeta = SessionMeta
     -- @session.json@ so it survives restarts and propagates to the
     -- sidebar (which reads the live session list, not a client-side
     -- override).
+  , smRepoUrl :: Maybe Text
+    -- ^ The URL of the repository cloned into the session's workdir via
+    -- @SETUP_REPO@ (either agent-invoked or the web setup-repo endpoint).
+    -- 'Nothing' when no repo has been cloned. Persisted to @session.json@
+    -- so the sidebar can show the repo name without scanning the workdir.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
   } deriving stock (Eq, Show)
@@ -58,6 +63,7 @@ instance ToJSON SessionMeta where
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
     , "description" .= smDescription m
+    , "repo_url"    .= smRepoUrl m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
     ]
@@ -72,5 +78,6 @@ instance FromJSON SessionMeta where
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
     <*> o .:? "description"
+    <*> o .:? "repo_url"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

@@ -427,7 +427,7 @@ buildTestEnv tmp mode mRepo opts = do
   -- Session runtime.
   let meta0 = SessionMeta
         (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
-        "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing
+        "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing
         (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
   activeRef <- newIORef meta0
   let sr = SessionRuntime

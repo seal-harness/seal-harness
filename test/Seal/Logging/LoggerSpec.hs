@@ -89,6 +89,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smSystemOverride = Nothing
               , smAgentName = Nothing
               , smDescription = Nothing
+              , smRepoUrl = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
               }
@@ -113,6 +114,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smSystemOverride = Nothing
               , smAgentName = Nothing
               , smDescription = Nothing
+              , smRepoUrl = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
               }
@@ -142,6 +144,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smSystemOverride = Nothing
             , smAgentName = Nothing
             , smDescription = Nothing
+            , smRepoUrl = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
             }
@@ -165,6 +168,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smSystemOverride = Nothing
             , smAgentName = Nothing
             , smDescription = Nothing
+            , smRepoUrl = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
             }

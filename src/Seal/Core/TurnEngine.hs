@@ -32,6 +32,7 @@ import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
+import Data.Aeson.Types qualified as AT
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
@@ -130,7 +131,7 @@ import Seal.Session.Lock
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
-  )
+  , updateSessionRepoUrl )
 import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -939,6 +940,13 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
+              -- Persist the cloned repo URL to session.json so the sidebar
+              -- can display it. The URL comes from the opcode's input
+              -- value.
+              let mRepoUrl =
+                    AT.parseMaybe
+                      (AT.withObject "SETUP_REPO input" (AT..: "url")) val
+              _ <- updateSessionRepoUrl paths sid mRepoUrl
               invalidateWorkdirScan (tdExecCache td) sid
               freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
@@ -1118,6 +1126,7 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smDescription = Nothing
+      , smRepoUrl = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's

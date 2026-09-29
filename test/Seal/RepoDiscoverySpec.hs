@@ -579,6 +579,7 @@ spec = do
                 , smChannel = "web", smAgent = Just zoe
                 , smSystemOverride = Nothing, smAgentName = Just "zoe"
                 , smDescription = Nothing
+                , smRepoUrl = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
           pure meta
@@ -622,6 +623,7 @@ spec = do
             , smChannel = "web", smAgent = pickedId
             , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
             , smDescription = Nothing
+            , smRepoUrl = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta
       fs <- mkFs tmp
