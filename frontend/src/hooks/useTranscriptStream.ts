@@ -119,25 +119,25 @@ export function reconcileEntries(
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
   const done = perf.begin('reconcileEntries')
-  // When a finalized entry arrives, check if there's a streaming
-  // placeholder with the SAME id — if so, replace it in place (stable
-  // position, no flicker). Only evict streaming placeholders with a
-  // DIFFERENT id (stale placeholders from a different entry).
+  // When a finalized (non-streaming) entry arrives, replace any existing
+  // streaming placeholder IN PLACE regardless of id. The streaming
+  // placeholder always has the sentinel id "streaming" (assigned by the
+  // backend's streamingEntryJson), while the finalized entry has the real
+  // transcript entry id. Replacing in place — rather than evicting the
+  // placeholder and appending the finalized entry — keeps the array
+  // position stable, which prevents React key changes and the associated
+  // unmount/mount flicker at the bottom of the transcript.
   let base = existing
   if (!incoming.streaming) {
     const streamingIdx = existing.findIndex((e) => e.streaming)
     if (streamingIdx !== -1) {
-      if (existing[streamingIdx]!.id === incoming.id) {
-        // Same id — replace the streaming placeholder in place with the
-        // finalized entry. This keeps the position stable and prevents
-        // the flicker of evict-then-append.
-        const next = existing.slice()
-        next[streamingIdx] = incoming
-        done({ count: existing.length, meta: { mode: 'replace-streaming' } })
-        return next
-      }
-      // Different id — evict the stale streaming placeholder.
-      base = existing.filter((_, i) => i !== streamingIdx)
+      // Replace the streaming placeholder in place with the finalized
+      // entry, regardless of id. This keeps the array position stable
+      // and prevents the flicker of evict-then-append.
+      const next = existing.slice()
+      next[streamingIdx] = incoming
+      done({ count: existing.length, meta: { mode: 'replace-streaming' } })
+      return next
     }
   }
   for (let i = 0; i < base.length; i++) {
@@ -236,9 +236,6 @@ export function useTranscriptStream(
     const unsub = sc.onEntry((e) => {
       setEntries((prev) => {
         const next = reconcileEntries(prev, e)
-        if (next.length !== prev.length || (next.length > 0 && prev.length > 0 && next[next.length-1]!.id !== prev[prev.length-1]!.id)) {
-          console.log("[ws] entries " + prev.length + " -> " + next.length + " mode=" + (next.length === prev.length ? "replace" : next.length > prev.length ? "append" : "evict") + " lastId=" + (next.length > 0 ? next[next.length-1]!.id : "none") + " streaming=" + !!e.streaming)
-        }
         // Update the data cache so it stays fresh for this session.
         const sid = currentSessionRef.current
         if (sid !== null) getGlobalDataCache().update(sid, next)

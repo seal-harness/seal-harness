@@ -124,8 +124,8 @@ describe('reconcileEntries', () => {
     const streaming = { ...makeEntry('streaming', '2026-01-01T00:00:02Z'), streaming: true }
     const finalized = makeEntry('real-1', '2026-01-01T00:00:02Z')
     // A streaming placeholder is in the list, then a finalized entry with a
-    // DIFFERENT id arrives. The streaming placeholder should be evicted (not
-    // left as a duplicate) and the finalized entry inserted.
+    // DIFFERENT id arrives. The streaming placeholder is replaced IN PLACE
+    // (not evicted + appended) to keep the array position stable.
     const result = reconcileEntries([e1, streaming], finalized)
     expect(result).toHaveLength(2)
     expect(result[0]!.id).toBe('e1')

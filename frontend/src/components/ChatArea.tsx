@@ -2707,8 +2707,8 @@ export function ChatArea({
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>
           ) : (
             <Profiler id="ChatArea.messageList" onRender={onMessageListRender}>
-              {messages.map((msg) => (
-                <Profiler key={msg.id} id="ChatMessage" onRender={onChatMessageRender}>
+              {messages.map((msg, index) => (
+                <Profiler key={index} id="ChatMessage" onRender={onChatMessageRender}>
                   <ChatMessage
                     message={msg}
                     onBranch={onBranch}
