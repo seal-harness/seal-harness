@@ -20,6 +20,7 @@ module Seal.Session.Store
   , updateSessionAgent
   , updateSessionSystemOverride
   , updateSessionDescription
+  , updateSessionRepoUrl
   , autoBindRepoAgent
   , autoBindRepoAgentWith
   , SessionRuntime (..)
@@ -89,6 +90,7 @@ newSessionMeta _paths provider model channel mAgent = do
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
     , smDescription = Nothing
+    , smRepoUrl = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -377,6 +379,34 @@ updateSessionDescription paths sid mDesc = do
           pure True
   where
     normalized = case mDesc of
+      Just t
+        | not (T.null (T.strip t)) -> Just t
+        | otherwise                -> Nothing
+      Nothing                      -> Nothing
+
+-- | Record the repo URL cloned into a session's workdir via @SETUP_REPO@.
+-- Called after a successful clone (both the agent-invoked opcode path and
+-- the web @POST /api/sessions/:id/setup-repo@ endpoint, which dispatches
+-- through the same 'callDispatcher'). 'Nothing' or an empty/whitespace
+-- URL clears the field. Returns 'False' when the session's
+-- @session.json@ cannot be found or parsed; 'True' on a successful write.
+-- Only touches 'smRepoUrl' — all other fields are preserved.
+updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepoUrl paths sid mUrl = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smRepoUrl = normalized }
+          saveSessionMeta paths next
+          pure True
+  where
+    normalized = case mUrl of
       Just t
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing

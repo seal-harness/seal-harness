@@ -20,6 +20,7 @@ sampleMeta =
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
        , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
        , smDescription = Nothing
+       , smRepoUrl = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 spec :: Spec
@@ -92,3 +93,16 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smDescription (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smRepoUrl = Just t" $ do
+    let m = sampleMeta { smRepoUrl = Just "https://github.com/seal-harness/seal-harness.git" }
+    fmap smRepoUrl (decode (encode m)) `shouldBe` Just (Just "https://github.com/seal-harness/seal-harness.git")
+
+  it "defaults smRepoUrl to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smRepoUrl (decode (encode j)) `shouldBe` Just Nothing

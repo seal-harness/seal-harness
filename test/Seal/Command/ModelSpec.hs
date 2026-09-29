@@ -41,7 +41,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 mkSR :: FilePath -> IO SessionRuntime
 mkSR root = do
   let sid = fromRight (error "invalid session id") (mkSessionId "20260701-120000-002")
-      m0 = SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing Nothing aTime aTime
+      m0 = SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing Nothing Nothing aTime aTime
       paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
   ref <- newIORef m0
   pure SessionRuntime { srPaths = paths, srConfigPath = root </> "config.toml", srActive = ref }
@@ -268,8 +268,8 @@ spec = describe "Seal.Command.Model" $ do
       -- points at "target". /model use must update "target"'s session.json.
       let activeSid = mkSid "20260825-120000-active"
           targetSid = mkSid "20260825-120000-target"
-      saveSessionMeta paths (SessionMeta activeSid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing aTime aTime)
-      saveSessionMeta paths (SessionMeta targetSid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing aTime aTime)
+      saveSessionMeta paths (SessionMeta activeSid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing aTime aTime)
+      saveSessionMeta paths (SessionMeta targetSid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing aTime aTime)
       (fc, caps) <- makeFakeCaps []
       runModelForSession pr paths (pure targetSid) Nothing ["use","ollama","qwen3.8"] caps
       sent <- getSent fc
@@ -286,7 +286,7 @@ spec = describe "Seal.Command.Model" $ do
       let paths = mkPaths root
       pr <- mkPR (root </> "config.toml") Nothing
       let sid = mkSid "20260825-120000-persist"
-      saveSessionMeta paths (SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing aTime aTime)
+      saveSessionMeta paths (SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing aTime aTime)
       (fc, caps) <- makeFakeCaps []
       runModelForSession pr paths (pure sid) Nothing ["use","ollama","glm-5.2:cloud"] caps
       _ <- getSent fc
@@ -300,7 +300,7 @@ spec = describe "Seal.Command.Model" $ do
       let paths = mkPaths root
       pr <- mkPR (root </> "config.toml") Nothing
       let sid = mkSid "20260825-120000-transcript"
-      saveSessionMeta paths (SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing aTime aTime)
+      saveSessionMeta paths (SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing aTime aTime)
       (fc, caps) <- makeFakeCaps []
       let writer = mkModelTranscriptWriter paths Nothing
       runModelForSession pr paths (pure sid) (Just writer) ["use","ollama","qwen3.8"] caps
