@@ -373,7 +373,7 @@ export function TabRow({
             )}
             {provider && <ProviderBadge provider={provider} />}
             {model && <span style={{ color: 'var(--text-faint)' }}>{model}</span>}
-            {agent && (
+            {!repoName && agent && (
               <>
                 <span style={{ color: 'var(--text-faint)' }}>·</span>
                 <span style={{ color: 'var(--text-faint)' }}>{agent}</span>
