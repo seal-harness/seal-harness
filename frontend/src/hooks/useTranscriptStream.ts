@@ -137,6 +137,7 @@ export function reconcileEntries(
       const next = existing.slice()
       next[streamingIdx] = incoming
       done({ count: existing.length, meta: { mode: 'replace-streaming' } })
+      console.log(`[transcript] RECON replace-streaming idx=${streamingIdx} oldId=${existing[streamingIdx]!.id} newId=${incoming.id} streaming=${!!incoming.streaming} total=${next.length}`)
       return next
     }
   }
@@ -146,6 +147,7 @@ export function reconcileEntries(
       const next = base.slice()
       next[i] = incoming
       done({ count: existing.length, meta: { mode: 'replace' } })
+      console.log(`[transcript] RECON replace idx=${i} id=${incoming.id} streaming=${!!incoming.streaming} total=${next.length}`)
       return next
     }
   }
@@ -153,6 +155,7 @@ export function reconcileEntries(
   const next = base.slice()
   next.push(incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
+  console.log(`[transcript] RECON append id=${incoming.id} dir=${incoming.direction} streaming=${!!incoming.streaming} total=${next.length}`)
   return next
 }
 
@@ -204,6 +207,7 @@ export function useTranscriptStream(
       setEntries(cached)
       setLoading(false)
       loadedSessionRef.current = sessionId
+      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.length}`)
       const lastId = cached[cached.length - 1]!.id
       sc.focus(sessionId, lastId)
       fetchPendingQuestions(sessionId).then((qs) => {
@@ -218,6 +222,7 @@ export function useTranscriptStream(
         setEntries(seed)
         dataCache.set(sessionId, seed)
         setLoading(false)
+        console.log(`[transcript] SEED http-fetch session=${sessionId} count=${seed.length}`)
         loadedSessionRef.current = sessionId
         const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
         if (lastId !== undefined) sc.focus(sessionId, lastId)

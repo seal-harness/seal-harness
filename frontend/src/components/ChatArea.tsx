@@ -2273,6 +2273,48 @@ function onJsonTreeRender(
 
 // ── Main ChatArea component ──────────────────────────────────────────────
 
+// ── Diagnostic logging for transcript visibility debugging ───────────────
+// Tracks when message ranges enter/leave the DOM. Each log line includes
+// a content snippet so individual messages can be identified in the
+// console output. Search for `[transcript]` to filter.
+
+/** Extract a short identifying snippet from a Message. */
+function messageSnippet(msg: Message): string {
+  for (const block of msg.blocks) {
+    if (block.text) return block.text.slice(0, 60).replace(/\n/g, ' ')
+    if (block.thinkingText) return '(thinking) ' + block.thinkingText.slice(0, 50).replace(/\n/g, ' ')
+    if (block.toolCall) {
+      const tc = block.toolCall
+      const r = tc.result ? ' ✓' : ''
+      return `(tool) ${tc.name}${r}`
+    }
+    if (block.collapsedText) return '(system) ' + block.collapsedText.slice(0, 50).replace(/\n/g, ' ')
+    if (block.toolDefs) return `(tools) ${block.toolDefs.count} defs`
+  }
+  return '(empty)'
+}
+
+/** Wrapper that logs mount/unmount of each rendered message. */
+function MountLoggedChatMessage(props: {
+  message: Message
+  absoluteIndex: number
+  onBranch?: (entryId: string) => void
+  sending?: boolean
+  pendingQuestions?: PendingQuestion[]
+  onAnswer?: (qid: string, scope: string) => void
+  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
+  onCancel?: (qid: string) => void
+}) {
+  useEffect(() => {
+    const { absoluteIndex, message } = props
+    console.log(`[transcript] MOUNT  #${absoluteIndex} id=${message.id} agent=${message.agentName} "${messageSnippet(message)}"`)
+    return () => {
+      console.log(`[transcript] UNMOUNT #${absoluteIndex} id=${message.id} agent=${message.agentName} "${messageSnippet(message)}"`)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  return <ChatMessage message={props.message} onBranch={props.onBranch} sending={props.sending} pendingQuestions={props.pendingQuestions} onAnswer={props.onAnswer} onAnswerText={props.onAnswerText} onCancel={props.onCancel} />
+}
+
 export function ChatArea({
   selectedAgent,
   selectedSession,
@@ -2722,29 +2764,24 @@ export function ChatArea({
               <div ref={virtualWindow.contentRef} className="flex flex-col gap-5">
                 {messages.slice(virtualWindow.startIndex, virtualWindow.endIndex).map((msg, i) => (
                   <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
-                    <ChatMessage
-                      message={msg}
-                      onBranch={onBranch}
-                      sending={sending}
-                      pendingQuestions={effectivePendingQuestions}
-                      onAnswer={onAnswerQuestion}
-                      onAnswerText={(qid, answer) => {
-                        if (qid.startsWith('synth:')) {
-                          // Synthesized question (server restart recovery) —
-                          // no live AskReplyStore entry, so send the answer
-                          // as a regular user message.
-                          onSend?.(answer)
-                          return Promise.resolve(true)
-                        }
-                        return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                      }}
-                      onCancel={(qid) => {
-                        // For synthesized questions, cancel is a no-op (the
-                        // agent turn is already dead — there's nothing to
-                        // cancel). Just let the form dismiss.
-                        if (qid.startsWith('synth:')) return
-                        onCancelQuestion?.(qid)
-                      }}
+                    <MountLoggedChatMessage
+                    message={msg}
+                    absoluteIndex={virtualWindow.startIndex + i}
+                    onBranch={onBranch}
+                    sending={sending}
+                    pendingQuestions={effectivePendingQuestions}
+                    onAnswer={onAnswerQuestion}
+                    onAnswerText={(qid, answer) => {
+                      if (qid.startsWith('synth:')) {
+                        onSend?.(answer)
+                        return Promise.resolve(true)
+                      }
+                      return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+                    }}
+                    onCancel={(qid) => {
+                      if (qid.startsWith('synth:')) return
+                      onCancelQuestion?.(qid)
+                    }}
                     />
                   </Profiler>
                 ))}

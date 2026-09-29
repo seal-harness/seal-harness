@@ -58,6 +58,7 @@ export function useVirtualWindow(
   const avgRowHeight = useRef(ESTIMATED_ROW_HEIGHT)
   const contentRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+  const prevRangeRef = useRef<[number, number]>(visibleRange)
 
   // Reset to bottom on session change.
   useEffect(() => {
@@ -65,6 +66,7 @@ export function useVirtualWindow(
     setVisibleRange([start, messageCount])
     avgRowHeight.current = ESTIMATED_ROW_HEIGHT
     wasAtBottom.current = true
+    console.log(`[transcript] RANGE reset (session switch) total=${messageCount} range=[${start}, ${messageCount})`)
   }, [resetKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Measure rendered content height after every render and update the
@@ -147,6 +149,26 @@ export function useVirtualWindow(
     // user scrolls down. But the bottom spacer height changes, which
     // is handled by the spacer calculation below.
   }, [messageCount]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Log all visible-range changes for debugging. Captures scroll-driven,
+  // new-message-driven, and session-switch-driven transitions in one
+  // place. Search console for `[transcript] RANGE` to filter.
+  useEffect(() => {
+    const prev = prevRangeRef.current
+    const [cur0, cur1] = visibleRange
+    if (prev[0] === cur0 && prev[1] === cur1) return
+    const enteredTop = cur0 < prev[0] ? `[${cur0}, ${prev[0]})` : null
+    const enteredBot = cur1 > prev[1] ? `[${prev[1]}, ${cur1})` : null
+    const leftTop = prev[0] < cur0 ? `[${prev[0]}, ${cur0})` : null
+    const leftBot = prev[1] > cur1 ? `[${cur1}, ${prev[1]})` : null
+    const parts: string[] = [`range=[${cur0}, ${cur1}) total=${messageCount}`]
+    if (enteredTop) parts.push(`+top ${enteredTop}`)
+    if (enteredBot) parts.push(`+bot ${enteredBot}`)
+    if (leftTop) parts.push(`-top ${leftTop}`)
+    if (leftBot) parts.push(`-bot ${leftBot}`)
+    console.log(`[transcript] RANGE ${parts.join(' ')}`)
+    prevRangeRef.current = [cur0, cur1]
+  }, [visibleRange, messageCount])
 
   const [startIndex, endIndex] = visibleRange
   const avg = avgRowHeight.current
