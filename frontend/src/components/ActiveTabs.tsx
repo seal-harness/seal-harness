@@ -44,22 +44,6 @@ function ProviderBadge({ provider }: { provider: string }) {
   )
 }
 
-// ── Repo icon ─────────────────────────────────────────────────────────
-
-function RepoIcon() {
-  return (
-    <svg
-      width="11" height="11" viewBox="0 0 16 16" fill="none"
-      stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"
-      aria-hidden="true"
-      style={{ flexShrink: 0, opacity: 0.8 }}
-    >
-      <path d="M3 4 a1 1 0 0 1 1 -1 h5 l3 3 v6 a1 1 0 0 1 -1 1 h-7 a1 1 0 0 1 -1 -1 z" />
-      <path d="M9 3 v3 h3" />
-    </svg>
-  )
-}
-
 const statusIcon: Record<TabStatus, { char: string; color: string }> = {
   running:  { char: '●', color: 'var(--success)' },       // ●
   idle:     { char: '○', color: 'var(--text-muted)' },     // ○
@@ -364,21 +348,19 @@ export function TabRow({
           </>
         ) : (
           <>
-            {repoName && (
-              <>
-                <RepoIcon />
-                <span className="truncate" style={{ color: 'var(--text-muted)' }} title={repoUrl ?? undefined}>{repoName}</span>
-                <span style={{ color: 'var(--text-faint)' }}>·</span>
-              </>
-            )}
             {provider && <ProviderBadge provider={provider} />}
             {model && <span style={{ color: 'var(--text-faint)' }}>{model}</span>}
-            {!repoName && agent && (
+            {repoName ? (
+              <>
+                <span style={{ color: 'var(--text-faint)' }}>·</span>
+                <span className="truncate" style={{ color: 'var(--text-muted)' }} title={repoUrl ?? undefined}>{repoName}</span>
+              </>
+            ) : agent ? (
               <>
                 <span style={{ color: 'var(--text-faint)' }}>·</span>
                 <span style={{ color: 'var(--text-faint)' }}>{agent}</span>
               </>
-            )}
+            ) : null}
           </>
         )}
       </div>

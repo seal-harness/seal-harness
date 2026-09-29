@@ -587,7 +587,7 @@ describe('Sidebar — tab status indicator', () => {
 // ── Tab second-line info density ───────────────────────────────────────
 
 describe('Sidebar — tab second-line info (repo · provider · model · agent)', () => {
-  it('shows repo name, provider badge, model — agent is suppressed when repo is present', () => {
+  it('shows provider badge + model · repo-name — agent suppressed when repo is present', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -614,17 +614,17 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // The second line shows: repo icon + "seal-harness" + "·" + "A" badge + "sonnet-4"
+    // The second line shows: "A" badge + "sonnet-4" + "·" + "seal-harness"
     // The agent ("zoe") is NOT shown — when a repo is present, the repo name
     // takes precedence over the agent for the limited space.
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).toContain('sonnet-4')
+    expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).not.toContain('zoe')
     expect(screen.getByTestId('provider-badge-anthropic')).toBeTruthy()
   })
 
-  it('shows only provider badge + model when no repo or agent', () => {
+  it('shows provider badge + model only when no repo and no agent', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -683,9 +683,7 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
     )
     // No repo → agent is shown: "A" badge + "sonnet-4" + "·" + "zoe"
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toContain('sonnet-4')
-    expect(label.textContent).toContain('zoe')
-    expect(label.textContent).not.toContain('seal-harness')
+    expect(label.textContent).toBe('Asonnet-4·zoe')
   })
 })
 
