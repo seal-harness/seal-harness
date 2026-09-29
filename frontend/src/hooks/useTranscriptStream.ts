@@ -215,17 +215,45 @@ export function useTranscriptStream(
         setPendingQuestions(qs)
       })
     } else {
-      // Cache miss or refresh — full HTTP GET seed.
+      // First load (cache miss) or refresh — HTTP GET seed.
+      // On first load, the seed replaces the (empty) entries array.
+      // On refresh (after send), the seed is MERGED with the current
+      // entries via reconcileEntries — this preserves WS-delivered
+      // entries that arrived between the HTTP request and response.
+      // Replacing the array (setEntries(seed)) would lose those entries
+      // and cause the entire transcript to be rebuilt, producing the
+      // flickering pattern where messages disappear and reappear.
       if (isFirstLoad) setLoading(true)
       fetchTranscriptSeed(sessionId).then((seed) => {
         if (cancelled) return
-        setEntries(seed)
-        dataCache.set(sessionId, seed)
+        if (isFirstLoad) {
+          setEntries(seed)
+          dataCache.set(sessionId, seed)
+        } else {
+          // Refresh: merge seed with existing entries to preserve
+          // WS-delivered entries. reconcileEntries handles dedup by
+          // id — seed entries with matching ids replace in place,
+          // new seed entries are appended, and WS-delivered entries
+          // that aren't in the seed are retained.
+          setEntries((prev) => {
+            let merged = prev
+            for (const e of seed) {
+              merged = reconcileEntries(merged, e)
+            }
+            return merged
+          })
+        }
         setLoading(false)
-        console.log(`[transcript] SEED http-fetch session=${sessionId} count=${seed.length}`)
+        console.log(`[transcript] SEED ${isFirstLoad ? 'http-fetch' : 'http-merge'} session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
         loadedSessionRef.current = sessionId
-        const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
+        // Use the data cache's last id for focus — it includes
+        // WS-delivered entries that may have arrived after the seed.
+        const cachedNow = dataCache.get(sessionId)
+        const lastId = cachedNow && cachedNow.length > 0
+          ? cachedNow[cachedNow.length - 1]!.id
+          : seed.length > 0 ? seed[seed.length - 1]!.id : undefined
         if (lastId !== undefined) sc.focus(sessionId, lastId)
+        else sc.focus(sessionId)
       })
       fetchPendingQuestions(sessionId).then((qs) => {
         if (cancelled) return
