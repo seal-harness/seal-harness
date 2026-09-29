@@ -8,6 +8,7 @@ import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
 import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
+import { useVirtualWindow } from '../hooks/useVirtualWindow'
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -2391,6 +2392,12 @@ export function ChatArea({
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
 
+  // Virtual windowing: only render visible messages + overscan buffer.
+  // Resets to the bottom on session switch (selectedId change).
+  const virtualWindow = useVirtualWindow(
+    messages.length, scrollerRef, selectedId ?? null,
+  )
+
   // Track ASK_HUMAN tool call IDs that had a real pending question which
   // was subsequently removed (answered/cancelled via WS ask_resolved).
   // Without this, synthesizePendingQuestions revives the form from the
@@ -2707,34 +2714,45 @@ export function ChatArea({
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>
           ) : (
             <Profiler id="ChatArea.messageList" onRender={onMessageListRender}>
-              {messages.map((msg, index) => (
-                <Profiler key={index} id="ChatMessage" onRender={onChatMessageRender}>
-                  <ChatMessage
-                    message={msg}
-                    onBranch={onBranch}
-                    sending={sending}
-                    pendingQuestions={effectivePendingQuestions}
-                    onAnswer={onAnswerQuestion}
-                    onAnswerText={(qid, answer) => {
-                      if (qid.startsWith('synth:')) {
-                        // Synthesized question (server restart recovery) —
-                        // no live AskReplyStore entry, so send the answer
-                        // as a regular user message.
-                        onSend?.(answer)
-                        return Promise.resolve(true)
-                      }
-                      return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                    }}
-                    onCancel={(qid) => {
-                      // For synthesized questions, cancel is a no-op (the
-                      // agent turn is already dead — there's nothing to
-                      // cancel). Just let the form dismiss.
-                      if (qid.startsWith('synth:')) return
-                      onCancelQuestion?.(qid)
-                    }}
-                  />
-                </Profiler>
-              ))}
+              {/* Top spacer: stands in for unrendered messages above. */}
+              {virtualWindow.topSpacerHeight > 0 && (
+                <div style={{ height: virtualWindow.topSpacerHeight }} />
+              )}
+              {/* Rendered messages: only the visible slice + overscan. */}
+              <div ref={virtualWindow.contentRef} className="flex flex-col gap-5">
+                {messages.slice(virtualWindow.startIndex, virtualWindow.endIndex).map((msg, i) => (
+                  <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
+                    <ChatMessage
+                      message={msg}
+                      onBranch={onBranch}
+                      sending={sending}
+                      pendingQuestions={effectivePendingQuestions}
+                      onAnswer={onAnswerQuestion}
+                      onAnswerText={(qid, answer) => {
+                        if (qid.startsWith('synth:')) {
+                          // Synthesized question (server restart recovery) —
+                          // no live AskReplyStore entry, so send the answer
+                          // as a regular user message.
+                          onSend?.(answer)
+                          return Promise.resolve(true)
+                        }
+                        return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+                      }}
+                      onCancel={(qid) => {
+                        // For synthesized questions, cancel is a no-op (the
+                        // agent turn is already dead — there's nothing to
+                        // cancel). Just let the form dismiss.
+                        if (qid.startsWith('synth:')) return
+                        onCancelQuestion?.(qid)
+                      }}
+                    />
+                  </Profiler>
+                ))}
+              </div>
+              {/* Bottom spacer: stands in for unrendered messages below. */}
+              {virtualWindow.bottomSpacerHeight > 0 && (
+                <div style={{ height: virtualWindow.bottomSpacerHeight }} />
+              )}
             </Profiler>
           )}
           <div ref={messagesEndRef} />
