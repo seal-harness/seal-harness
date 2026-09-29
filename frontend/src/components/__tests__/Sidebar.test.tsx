@@ -685,6 +685,41 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
     const label = screen.getByTestId('tab-status-label-0')
     expect(label.textContent).toBe('Asonnet-4·zoe')
   })
+
+  it('derives repo name from agent prefix when repoUrl is null (legacy session fallback)', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'glm-5.2:cloud',
+      runtime: 'session:ollama',
+      repoUrl: null,
+      // A repo-bound agent has the "<repo>--<id>" prefix pattern
+      agent: 'seal-harness--agents-md',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // repoUrl is null but agent has "--" prefix → repo name "seal-harness"
+    // is extracted and shown instead of the full agent name.
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toContain('seal-harness')
+    expect(label.textContent).not.toContain('agents-md')
+  })
 })
 
 // ── Tab age pill ───────────────────────────────────────────────────────

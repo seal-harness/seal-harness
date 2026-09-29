@@ -165,7 +165,17 @@ export function TabRow({
   const kind = deriveTabStatusKind(activity)
   const isThinking = kind === 'thinking'
   const kindGlyph = kindIcon[kind]
-  const repoName = repoUrl ? repoNameFromUrl(repoUrl) : ''
+  // Resolve the repo name to display. Primary source is the repo URL
+  // (populated by SETUP_REPO for new sessions). Fallback: derive the repo
+  // name from the agent name's "<repo>--<id>" prefix pattern — this covers
+  // existing sessions whose session.json predates the smRepoUrl field.
+  // When neither yields a repo name, the trailing slot falls back to the
+  // agent display name.
+  const repoName = (() => {
+    if (repoUrl) return repoNameFromUrl(repoUrl)
+    if (agent && agent.includes('--')) return agent.split('--')[0] ?? ''
+    return ''
+  })()
   // Adopted harnesses can be Released — Seal stops managing them without
   // killing the underlying tmux window. Distinct from Close/Dismiss, and
   // only offered on adopted rows.
