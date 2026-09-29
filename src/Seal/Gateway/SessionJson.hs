@@ -83,6 +83,7 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
   , "model" .= smModel m
+  , "repoUrl" .= smRepoUrl m
   , "lastActive" .= smLastActive m
   , "createdAt" .= smCreatedAt m
   , "description" .= smDescription m

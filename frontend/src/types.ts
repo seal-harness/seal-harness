@@ -41,6 +41,9 @@ export interface SessionInfo {
   /** `"session:<provider>"` — the runtime kind + provider label. */
   runtime: string
   model: string
+  /** The URL of the repo cloned into the session's workdir via SETUP_REPO,
+   *  or null when no repo has been cloned. */
+  repoUrl: string | null
   lastActive: string
   createdAt: string
   description: string | null
@@ -77,6 +80,46 @@ export function sessionDisplayTitle(s: SessionInfo): string {
 export function shortenModel(model: string): string {
   const m = model.match(/claude-(\w+-\d+)/)
   return m ? m[1]! : model
+}
+
+/** Derive a short display name from a repo URL by taking the last path
+ *  component and stripping a trailing @.git@. Examples:
+ *    https://github.com/seal-harness/seal-harness.git → seal-harness
+ *    git@github.com:foo/bar-baz                       → bar-baz
+ *    https://gitlab.com/group/proj                    → proj
+ *  Returns an empty string for an empty/whitespace URL. */
+export function repoNameFromUrl(url: string | null | undefined): string {
+  if (!url) return ''
+  const trimmed = url.trim()
+  if (!trimmed) return ''
+  // Strip trailing .git and trailing slash
+  let path = trimmed.replace(/\.git$/, '').replace(/\/$/, '')
+  // Handle git@host:path format — take the part after ':'
+  const colonIdx = path.indexOf(':')
+  if (path.startsWith('git@') && colonIdx >= 0) {
+    path = path.slice(colonIdx + 1)
+  }
+  // Handle scheme://host/path — take the path part
+  const schemeIdx = path.indexOf('://')
+  if (schemeIdx >= 0) {
+    path = path.slice(schemeIdx + 3)
+    // Drop the host
+    const slashIdx = path.indexOf('/')
+    if (slashIdx >= 0) path = path.slice(slashIdx + 1)
+    else return ''
+  }
+  // Take the last path component
+  const parts = path.split('/').filter(Boolean)
+  return parts[parts.length - 1] ?? ''
+}
+
+/** Extract the provider label from the @runtime@ field
+ *  (@"session:<provider>"@ → @<provider>@). Returns an empty string when
+ *  the runtime doesn't match the expected shape. */
+export function providerFromRuntime(runtime: string | null | undefined): string {
+  if (!runtime) return ''
+  const prefix = 'session:'
+  return runtime.startsWith(prefix) ? runtime.slice(prefix.length) : ''
 }
 
 /** Agent + communications channel formatted as "agent · channel:userId"

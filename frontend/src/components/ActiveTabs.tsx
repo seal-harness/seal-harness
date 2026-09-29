@@ -1,9 +1,48 @@
 import type { ReactNode } from 'react'
 import type { TabInfo, TabStatus } from '../types'
-import { tabIndexToChar } from '../types'
+import { tabIndexToChar, repoNameFromUrl } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import { ActivityDot } from './StatusDot'
+
+// ── Provider badge ────────────────────────────────────────────────────
+// A small single-letter colored badge for the LLM provider. Providers are
+// a small enum (anthropic, ollama, ...) so a single glyph + color suffices
+// to communicate the provider without taking space for the full label.
+
+const PROVIDER_BADGE: Record<string, { char: string; color: string; title: string }> = {
+  anthropic: { char: 'A', color: '#d97757', title: 'Anthropic' },
+  ollama:    { char: 'O', color: '#6b8cff', title: 'Ollama' },
+}
+
+const FALLBACK_PROVIDER = { char: '?', color: 'var(--text-faint)', title: 'Unknown provider' }
+
+function ProviderBadge({ provider }: { provider: string }) {
+  const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
+  return (
+    <span
+      data-testid={`provider-badge-${provider || 'unknown'}`}
+      title={badge.title}
+      aria-label={badge.title}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        width: 13,
+        height: 13,
+        borderRadius: 'var(--radius-sm)',
+        fontSize: 8,
+        fontWeight: 700,
+        lineHeight: 1,
+        color: '#fff',
+        background: badge.color,
+        flexShrink: 0,
+      }}
+    >
+      {badge.char}
+    </span>
+  )
+}
 
 const statusIcon: Record<TabStatus, { char: string; color: string }> = {
   running:  { char: '●', color: 'var(--success)' },       // ●
@@ -77,6 +116,9 @@ export function TabRow({
   activity,
   model,
   ageText,
+  repoUrl,
+  agent,
+  provider,
 }: {
   tab: TabInfo
   /** Resolved display label for this tab (session title, harness fallback,
@@ -96,6 +138,16 @@ export function TabRow({
   /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
    *  mirroring the Recent Sessions age pill. Empty string → no pill. */
   ageText?: string
+  /** The repo URL cloned into the session's workdir, or null/empty when no
+   *  repo is associated. The display name is derived from the URL. */
+  repoUrl?: string | null
+  /** The display name of the agent bound to this tab's session, or null/empty
+   *  when no agent is active. */
+  agent?: string | null
+  /** The provider label (e.g. "anthropic", "ollama") extracted from the
+   *  session's runtime field. Empty when unknown. Shown as a single-letter
+   *  colored badge. */
+  provider?: string
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
   // must not crash the render — fall back to a neutral glyph/label.
@@ -113,6 +165,17 @@ export function TabRow({
   const kind = deriveTabStatusKind(activity)
   const isThinking = kind === 'thinking'
   const kindGlyph = kindIcon[kind]
+  // Resolve the repo name to display. Primary source is the repo URL
+  // (populated by SETUP_REPO for new sessions). Fallback: derive the repo
+  // name from the agent name's "<repo>--<id>" prefix pattern — this covers
+  // existing sessions whose session.json predates the smRepoUrl field.
+  // When neither yields a repo name, the trailing slot falls back to the
+  // agent display name.
+  const repoName = (() => {
+    if (repoUrl) return repoNameFromUrl(repoUrl)
+    if (agent && agent.includes('--')) return agent.split('--')[0] ?? ''
+    return ''
+  })()
   // Adopted harnesses can be Released — Seal stops managing them without
   // killing the underlying tmux window. Distinct from Close/Dismiss, and
   // only offered on adopted rows.
@@ -283,11 +346,31 @@ export function TabRow({
         style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
         data-testid={`tab-status-label-${tab.index}`}
       >
-        {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
-        {model && (
+        {isDead ? (
           <>
-            <span style={{ color: 'var(--text-faint)' }}>·</span>
-            <span style={{ color: 'var(--text-faint)' }}>{model}</span>
+            {statusLabel[tab.status] ?? tab.status}
+            {model && (
+              <>
+                <span style={{ color: 'var(--text-faint)' }}>·</span>
+                <span style={{ color: 'var(--text-faint)' }}>{model}</span>
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            {provider && <ProviderBadge provider={provider} />}
+            {model && <span style={{ color: 'var(--text-faint)' }}>{model}</span>}
+            {repoName ? (
+              <>
+                <span style={{ color: 'var(--text-faint)' }}>·</span>
+                <span className="truncate" style={{ color: 'var(--text-muted)' }} title={repoUrl ?? undefined}>{repoName}</span>
+              </>
+            ) : agent ? (
+              <>
+                <span style={{ color: 'var(--text-faint)' }}>·</span>
+                <span style={{ color: 'var(--text-faint)' }}>{agent}</span>
+              </>
+            ) : null}
           </>
         )}
       </div>
@@ -302,6 +385,9 @@ export function ActiveTabs({
   tabModel,
   tabLabel,
   tabAgeText,
+  tabRepoUrl,
+  tabAgent,
+  tabProvider,
   onSelectTab,
   onNewTab,
   onCloseTab,
@@ -326,6 +412,16 @@ export function ActiveTabs({
    *  Centralized by the parent so Active Tabs and Running Harnesses agree
    *  with the Recent Sessions age pill. */
   tabAgeText: (tab: TabInfo) => string
+  /** Resolve a tab to the repo URL cloned into its session's workdir, or
+   *  null when no repo is associated. Centralized by the parent so Active
+   *  Tabs and Running Harnesses agree. */
+  tabRepoUrl: (tab: TabInfo) => string | null
+  /** Resolve a tab to the display name of its session's bound agent, or
+   *  null when no agent is active. */
+  tabAgent: (tab: TabInfo) => string | null
+  /** Resolve a tab to the provider label (e.g. "anthropic") extracted from
+   *  its session's runtime field, or empty string when unknown. */
+  tabProvider: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
@@ -370,6 +466,9 @@ export function ActiveTabs({
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
           model={tabModel(tab)}
           ageText={tabAgeText(tab)}
+          repoUrl={tabRepoUrl(tab)}
+          agent={tabAgent(tab)}
+          provider={tabProvider(tab)}
         />
       ))}
     </>
