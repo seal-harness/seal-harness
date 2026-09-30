@@ -2301,6 +2301,7 @@ export function ChatArea({
   onAnswerQuestion,
   onStop,
   onAnswerQuestionText,
+  isSessionThinking,
   onCancelQuestion,
 }: {
   selectedAgent: Agent
@@ -2384,6 +2385,14 @@ export function ChatArea({
    *  the thinking state. Only rendered when the session is actively
    *  thinking (see `isThinking` below). */
   onStop?: () => void
+ /** Whether the session is actively thinking, as derived by the parent
+  *  from the live activity stream (the `sessionActivity` map's
+  *  `harness === 'thinking'` state) combined with the optimistic
+  *  `sending` flag. Drives the stop button's visibility — the button
+  *  must stay visible for the entire duration of the agent's turn, not
+  *  just the POST /send round-trip (which completes before the agent
+  *  finishes thinking). */
+ isSessionThinking?: boolean
 }) {
   const [input, setInput] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -2457,11 +2466,16 @@ export function ChatArea({
 
   // Whether the session is actively thinking — drives the stop button's
   // visibility. The parent (App.tsx) derives this from the live activity
-  // stream + the optimistic `sending` flag and passes it down via the
-  // `sending` prop (true when the POST /send is in flight and no pending
-  // questions block the agent). We also check the selected agent's status
-  // for harness-driven thinking.
-  const isThinking = sending === true
+ // visibility. The parent (App.tsx) derives `isSessionThinking` from the
+ // live activity stream (`sessionActivity[id].harness === 'thinking'`)
+ // combined with the optimistic `sending` flag, and passes it down so the
+ // button stays visible for the entire turn — not just the POST /send
+ // round-trip (which completes before the agent finishes thinking). The
+ // `sending` prop alone is only true during that round-trip, so we
+ // additionally OR in `isSessionThinking` to cover the post-POST phase.
+ // Fall back to `sending` when the parent doesn't supply
+ // `isSessionThinking` (e.g. in unit tests that only test `sending`).
+ const isThinking = sending === true || isSessionThinking === true
 
   // Focus the message textarea on any user-initiated arrival at a session,
   // so the user can start typing immediately without an extra click.

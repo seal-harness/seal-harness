@@ -972,6 +972,7 @@ export default function App() {
               onSend={currentSessionId ? handleSend : undefined}
               sending={sending}
               onStop={sessionIsThinking ? handleStop : undefined}
+             isSessionThinking={sessionIsThinking}
               tokensUsed={tokensUsed}
               sessionStart={selectedSession?.createdAt ?? null}
               agents={agents}

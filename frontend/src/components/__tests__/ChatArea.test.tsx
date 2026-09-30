@@ -1806,6 +1806,77 @@ describe('AskHumanForm', () => {
       )
       expect(screen.queryByLabelText('Stop the current turn')).toBeNull()
     })
+
+    // ── Activity-stream-driven visibility ───────────────────────────────
+    // The `sending` flag is only true during the POST /send round-trip.
+    // Once the POST completes, the agent is still thinking but `sending`
+    // is false. The stop button must stay visible as long as the session
+    // is actively thinking, driven by the `isSessionThinking` prop (which
+    // the parent derives from the live activity stream).
+    it('renders the stop button when isSessionThinking is true and sending is false', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={false}
+          isSessionThinking={true}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.getByLabelText('Stop the current turn')).toBeTruthy()
+    })
+
+    it('stop button stays visible when sending transitions to false but isSessionThinking stays true', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={true}
+          isSessionThinking={true}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.getByLabelText('Stop the current turn')).toBeTruthy()
+      // POST /send completes → sending flips to false, but the session is
+      // still thinking (activity stream reports 'thinking'). The stop
+      // button must remain visible.
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={false}
+          isSessionThinking={true}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.getByLabelText('Stop the current turn')).toBeTruthy()
+    })
+
+    it('does not render the stop button when both sending and isSessionThinking are false', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'idle' })}
+          selectedSession={session}
+          messages={messages}
+          sending={false}
+          isSessionThinking={false}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.queryByLabelText('Stop the current turn')).toBeNull()
+    })
   })
 })
 
