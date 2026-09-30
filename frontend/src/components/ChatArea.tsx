@@ -2273,48 +2273,6 @@ function onJsonTreeRender(
 
 // ── Main ChatArea component ──────────────────────────────────────────────
 
-// ── Diagnostic logging for transcript visibility debugging ───────────────
-// Tracks when message ranges enter/leave the DOM. Each log line includes
-// a content snippet so individual messages can be identified in the
-// console output. Search for `[transcript]` to filter.
-
-/** Extract a short identifying snippet from a Message. */
-function messageSnippet(msg: Message): string {
-  for (const block of msg.blocks) {
-    if (block.text) return block.text.slice(0, 60).replace(/\n/g, ' ')
-    if (block.thinkingText) return '(thinking) ' + block.thinkingText.slice(0, 50).replace(/\n/g, ' ')
-    if (block.toolCall) {
-      const tc = block.toolCall
-      const r = tc.result ? ' ✓' : ''
-      return `(tool) ${tc.name}${r}`
-    }
-    if (block.collapsedText) return '(system) ' + block.collapsedText.slice(0, 50).replace(/\n/g, ' ')
-    if (block.toolDefs) return `(tools) ${block.toolDefs.count} defs`
-  }
-  return '(empty)'
-}
-
-/** Wrapper that logs mount/unmount of each rendered message. */
-function MountLoggedChatMessage(props: {
-  message: Message
-  absoluteIndex: number
-  onBranch?: (entryId: string) => void
-  sending?: boolean
-  pendingQuestions?: PendingQuestion[]
-  onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
-  onCancel?: (qid: string) => void
-}) {
-  useEffect(() => {
-    const { absoluteIndex, message } = props
-    console.log(`[transcript] MOUNT  #${absoluteIndex} id=${message.id} agent=${message.agentName} "${messageSnippet(message)}"`)
-    return () => {
-      console.log(`[transcript] UNMOUNT #${absoluteIndex} id=${message.id} agent=${message.agentName} "${messageSnippet(message)}"`)
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  return <ChatMessage message={props.message} onBranch={props.onBranch} sending={props.sending} pendingQuestions={props.pendingQuestions} onAnswer={props.onAnswer} onAnswerText={props.onAnswerText} onCancel={props.onCancel} />
-}
-
 export function ChatArea({
   selectedAgent,
   selectedSession,
@@ -2435,10 +2393,12 @@ export function ChatArea({
   const wasAtBottom = useRef(true)
 
   // Virtual windowing: only render visible messages + overscan buffer.
-  // Resets to the bottom on session switch (selectedId change).
+  // Only activated for large transcripts (> VIRTUALIZATION_THRESHOLD);
+  // smaller transcripts render all messages directly for correct scrolling.
   const virtualWindow = useVirtualWindow(
     messages.length, scrollerRef, selectedId ?? null,
   )
+  const useVirtualization = messages.length > 500
 
   // Track ASK_HUMAN tool call IDs that had a real pending question which
   // was subsequently removed (answered/cancelled via WS ask_resolved).
@@ -2756,39 +2716,66 @@ export function ChatArea({
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>
           ) : (
             <Profiler id="ChatArea.messageList" onRender={onMessageListRender}>
-              {/* Top spacer: stands in for unrendered messages above. */}
-              {virtualWindow.topSpacerHeight > 0 && (
-                <div style={{ height: virtualWindow.topSpacerHeight }} />
-              )}
-              {/* Rendered messages: only the visible slice + overscan. */}
-              <div ref={virtualWindow.contentRef} className="flex flex-col gap-5">
-                {messages.slice(virtualWindow.startIndex, virtualWindow.endIndex).map((msg, i) => (
-                  <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
-                    <MountLoggedChatMessage
-                    message={msg}
-                    absoluteIndex={virtualWindow.startIndex + i}
-                    onBranch={onBranch}
-                    sending={sending}
-                    pendingQuestions={effectivePendingQuestions}
-                    onAnswer={onAnswerQuestion}
-                    onAnswerText={(qid, answer) => {
-                      if (qid.startsWith('synth:')) {
-                        onSend?.(answer)
-                        return Promise.resolve(true)
-                      }
-                      return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                    }}
-                    onCancel={(qid) => {
-                      if (qid.startsWith('synth:')) return
-                      onCancelQuestion?.(qid)
-                    }}
+              {useVirtualization ? (
+                <>
+                  {/* Top spacer: stands in for unrendered messages above. */}
+                  {virtualWindow.topSpacerHeight > 0 && (
+                    <div style={{ height: virtualWindow.topSpacerHeight }} />
+                  )}
+                  {/* Rendered messages: only the visible slice + overscan. */}
+                  <div ref={virtualWindow.contentRef} className="flex flex-col gap-5">
+                    {messages.slice(virtualWindow.startIndex, virtualWindow.endIndex).map((msg, i) => (
+                      <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
+                        <ChatMessage
+                          message={msg}
+                          onBranch={onBranch}
+                          sending={sending}
+                          pendingQuestions={effectivePendingQuestions}
+                          onAnswer={onAnswerQuestion}
+                          onAnswerText={(qid, answer) => {
+                            if (qid.startsWith('synth:')) {
+                              onSend?.(answer)
+                              return Promise.resolve(true)
+                            }
+                            return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+                          }}
+                          onCancel={(qid) => {
+                            if (qid.startsWith('synth:')) return
+                            onCancelQuestion?.(qid)
+                          }}
+                        />
+                      </Profiler>
+                    ))}
+                  </div>
+                  {/* Bottom spacer: stands in for unrendered messages below. */}
+                  {virtualWindow.bottomSpacerHeight > 0 && (
+                    <div style={{ height: virtualWindow.bottomSpacerHeight }} />
+                  )}
+                </>
+              ) : (
+                /* Small transcript: render all messages directly. */
+                messages.map((msg, index) => (
+                  <Profiler key={index} id="ChatMessage" onRender={onChatMessageRender}>
+                    <ChatMessage
+                      message={msg}
+                      onBranch={onBranch}
+                      sending={sending}
+                      pendingQuestions={effectivePendingQuestions}
+                      onAnswer={onAnswerQuestion}
+                      onAnswerText={(qid, answer) => {
+                        if (qid.startsWith('synth:')) {
+                          onSend?.(answer)
+                          return Promise.resolve(true)
+                        }
+                        return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+                      }}
+                      onCancel={(qid) => {
+                        if (qid.startsWith('synth:')) return
+                        onCancelQuestion?.(qid)
+                      }}
                     />
                   </Profiler>
-                ))}
-              </div>
-              {/* Bottom spacer: stands in for unrendered messages below. */}
-              {virtualWindow.bottomSpacerHeight > 0 && (
-                <div style={{ height: virtualWindow.bottomSpacerHeight }} />
+                ))
               )}
             </Profiler>
           )}

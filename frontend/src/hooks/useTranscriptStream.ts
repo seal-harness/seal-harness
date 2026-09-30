@@ -137,7 +137,6 @@ export function reconcileEntries(
       const next = existing.slice()
       next[streamingIdx] = incoming
       done({ count: existing.length, meta: { mode: 'replace-streaming' } })
-      console.log(`[transcript] RECON replace-streaming idx=${streamingIdx} oldId=${existing[streamingIdx]!.id} newId=${incoming.id} streaming=${!!incoming.streaming} total=${next.length}`)
       return next
     }
   }
@@ -147,7 +146,6 @@ export function reconcileEntries(
       const next = base.slice()
       next[i] = incoming
       done({ count: existing.length, meta: { mode: 'replace' } })
-      console.log(`[transcript] RECON replace idx=${i} id=${incoming.id} streaming=${!!incoming.streaming} total=${next.length}`)
       return next
     }
   }
@@ -155,7 +153,6 @@ export function reconcileEntries(
   const next = base.slice()
   next.push(incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
-  console.log(`[transcript] RECON append id=${incoming.id} dir=${incoming.direction} streaming=${!!incoming.streaming} total=${next.length}`)
   return next
 }
 
