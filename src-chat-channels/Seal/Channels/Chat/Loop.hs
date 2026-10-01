@@ -73,7 +73,7 @@ import Seal.Gateway.Types.Core
   (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 import Seal.Gateway.Types.MessageSource (MessageSource)
-import Seal.Gateway.Types.Tab (TabIndex, tabIndexToInt, tabIndexToChar)
+import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToChar)
 
 -- | A pending ASK_HUMAN question tracked by the loop: the ask id text +
 -- the offered options (so the callback handler can resolve a button index
@@ -439,7 +439,9 @@ sendWatchNotification cfg chan sid = do
     case eTabs of
       Right tabs ->
         case [ t | t <- tabs, tjSessionId t == Just sidText ] of
-          (t : _) -> pure (T.pack (show (tjIndex t)))
+          (t : _) -> pure (case mkTabIndex (tjIndex t) of
+            Right idx -> T.singleton (tabIndexToChar idx)
+            Left _    -> T.pack (show (tjIndex t)))
           []      -> pure "?"
       Left _ -> pure "?"
   sessionTitle <- do

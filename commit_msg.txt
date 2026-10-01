@@ -1,0 +1,5 @@
+Use single-char tab identifier in watch notifications
+
+Tab indices in notifications now use the same 0-9a-z single-character
+format as the web frontend and /tab commands, instead of raw integers.
+Tab 10 is now displayed as Tab a, Tab 11 as Tab b, etc.
