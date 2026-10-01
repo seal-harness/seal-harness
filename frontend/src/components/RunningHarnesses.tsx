@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TabInfo } from '../types'
+import type { TabLineField } from '../lib/tabLineConfig'
 import type { SessionActivityState } from '../types/stream'
 import { TabRow } from './ActiveTabs'
 
@@ -19,6 +20,8 @@ export function RunningHarnesses({
   tabRepoUrl,
   tabAgent,
   tabProvider,
+  tabChannel,
+  fields,
   onSelectTab,
   onCloseTab,
   onDismiss,
@@ -41,6 +44,10 @@ export function RunningHarnesses({
   tabAgent: (tab: TabInfo) => string | null
   /** Resolve a tab to the provider label — see ActiveTabs.tabProvider. */
   tabProvider: (tab: TabInfo) => string
+  /** Resolve a tab to the starting channel — see ActiveTabs.tabChannel. */
+  tabChannel: (tab: TabInfo) => string | null
+  /** Ordered list of fields to render on each tab's second line. */
+  fields: TabLineField[]
   onSelectTab: (index: number) => void
   onCloseTab: (index: number) => void
   onDismiss: (index: number) => void
@@ -92,6 +99,8 @@ export function RunningHarnesses({
             repoUrl={tabRepoUrl(tab)}
             agent={tabAgent(tab)}
             provider={tabProvider(tab)}
+            channel={tabChannel(tab)}
+            fields={fields}
           />
         ))}
     </div>

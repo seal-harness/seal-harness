@@ -1,9 +1,79 @@
-import type { ReactNode } from 'react'
+import { Fragment, type ReactNode } from 'react'
 import type { TabInfo, TabStatus } from '../types'
 import { tabIndexToChar, repoNameFromUrl } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
+import type { TabLineField } from '../lib/tabLineConfig'
 import { ActivityDot } from './StatusDot'
+
+// ── Tab second-line field rendering ───────────────────────────────────
+// Each field type maps to a small render function that produces JSX (or
+// null when the field has no data). The parent TabRow iterates over the
+// configured field list and joins non-null results with "·" separators.
+
+/** The default field order, matching the pre-config behavior. */
+const DEFAULT_FIELDS: TabLineField[] = ['provider', 'model', 'repo']
+
+interface TabLineData {
+  provider: string
+  model: string
+  repoName: string
+  repoUrl: string | null
+  channel: string | null
+  agent: string | null
+}
+
+/** Render a single field as a React node, or null when the field has no
+ *  data to display. */
+function renderTabLineField(field: TabLineField, data: TabLineData): ReactNode {
+  switch (field) {
+    case 'provider':
+      return data.provider ? <ProviderBadge provider={data.provider} /> : null
+    case 'model':
+      return data.model ? (
+        <span style={{ color: 'var(--text-faint)' }}>{data.model}</span>
+      ) : null
+    case 'repo':
+      return data.repoName ? (
+        <span
+          className="truncate"
+          style={{ color: 'var(--text-muted)' }}
+          title={data.repoUrl ?? undefined}
+        >
+          {data.repoName}
+        </span>
+      ) : null
+    case 'channel':
+      return data.channel ? (
+        <span style={{ color: 'var(--text-faint)' }}>{data.channel}</span>
+      ) : null
+    case 'agent':
+      return data.agent ? (
+        <span style={{ color: 'var(--text-faint)' }}>{data.agent}</span>
+      ) : null
+  }
+}
+
+/** Render the configurable second line for a live tab. Iterates over the
+ *  field list, renders each field that has data, and joins them with "·"
+ *  separators. Returns null when no field has data. */
+function renderConfigurableLine(fields: TabLineField[], data: TabLineData): ReactNode {
+  const ordered = fields.length > 0 ? fields : DEFAULT_FIELDS
+  const parts: { key: string; node: ReactNode }[] = []
+  for (let i = 0; i < ordered.length; i++) {
+    const node = renderTabLineField(ordered[i]!, data)
+    if (node) parts.push({ key: `field-${i}`, node })
+  }
+  if (parts.length === 0) return null
+  return parts.flatMap(({ key, node }, i) =>
+    i === 0 ? [
+      <Fragment key={key}>{node}</Fragment>,
+    ] : [
+      <span key={`sep-${i}`} style={{ color: 'var(--text-faint)' }}>·</span>,
+      <Fragment key={key}>{node}</Fragment>,
+    ],
+  )
+}
 
 // ── Provider badge ────────────────────────────────────────────────────
 // A small single-letter colored badge for the LLM provider. Providers are
@@ -119,6 +189,8 @@ export function TabRow({
   repoUrl,
   agent,
   provider,
+  channel,
+  fields,
 }: {
   tab: TabInfo
   /** Resolved display label for this tab (session title, harness fallback,
@@ -148,6 +220,12 @@ export function TabRow({
    *  session's runtime field. Empty when unknown. Shown as a single-letter
    *  colored badge. */
   provider?: string
+  /** The starting channel of this tab's session (e.g. "web", "signal",
+   *  "cli"), or null/empty when no channel was recorded. */
+  channel?: string | null
+  /** Ordered list of fields to render on the second line. When omitted,
+   *  defaults to provider → model → repo (the pre-config behavior). */
+  fields?: TabLineField[]
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
   // must not crash the render — fall back to a neutral glyph/label.
@@ -357,21 +435,14 @@ export function TabRow({
             )}
           </>
         ) : (
-          <>
-            {provider && <ProviderBadge provider={provider} />}
-            {model && <span style={{ color: 'var(--text-faint)' }}>{model}</span>}
-            {repoName ? (
-              <>
-                <span style={{ color: 'var(--text-faint)' }}>·</span>
-                <span className="truncate" style={{ color: 'var(--text-muted)' }} title={repoUrl ?? undefined}>{repoName}</span>
-              </>
-            ) : agent ? (
-              <>
-                <span style={{ color: 'var(--text-faint)' }}>·</span>
-                <span style={{ color: 'var(--text-faint)' }}>{agent}</span>
-              </>
-            ) : null}
-          </>
+          renderConfigurableLine(fields ?? DEFAULT_FIELDS, {
+            provider: provider ?? '',
+            model: model ?? '',
+            repoName,
+            repoUrl: repoUrl ?? null,
+            channel: channel ?? null,
+            agent: agent ?? null,
+          })
         )}
       </div>
     </div>
@@ -388,6 +459,8 @@ export function ActiveTabs({
   tabRepoUrl,
   tabAgent,
   tabProvider,
+  tabChannel,
+  fields,
   onSelectTab,
   onNewTab,
   onCloseTab,
@@ -422,6 +495,11 @@ export function ActiveTabs({
   /** Resolve a tab to the provider label (e.g. "anthropic") extracted from
    *  its session's runtime field, or empty string when unknown. */
   tabProvider: (tab: TabInfo) => string
+  /** Resolve a tab to the starting channel (e.g. "web", "signal", "cli")
+   *  of its session, or null when no channel was recorded. */
+  tabChannel: (tab: TabInfo) => string | null
+  /** Ordered list of fields to render on each tab's second line. */
+  fields: TabLineField[]
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
@@ -469,6 +547,8 @@ export function ActiveTabs({
           repoUrl={tabRepoUrl(tab)}
           agent={tabAgent(tab)}
           provider={tabProvider(tab)}
+          channel={tabChannel(tab)}
+          fields={fields}
         />
       ))}
     </>

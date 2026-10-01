@@ -3,8 +3,10 @@ import type { SessionInfo, TabInfo } from '../types'
 import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel, providerFromRuntime } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
+import { type TabLineField, loadTabLineFields, saveTabLineFields } from '../lib/tabLineConfig'
 import { ActiveTabs } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
+import { TabLineConfigBar } from './TabLineConfigBar'
 import { ActivityDot } from './StatusDot'
 
 /** A "Recent Sessions" section header — plain label, no action button.
@@ -228,6 +230,16 @@ export function Sidebar({
 }) {
   // Harnesses (the harness-registry rows, kind "harness") get their own
   // "Running Harnesses" section; everything else stays under "Active Tabs".
+
+  // Configurable tab second-line fields — loaded once from localStorage on
+  // mount, updated via the TabLineConfigBar at the sidebar bottom, and
+  // persisted on every change so the selection survives reloads.
+  const [tabLineFields, setTabLineFields] = useState<TabLineField[]>(() => loadTabLineFields())
+  const handleTabLineFieldsChange = (fields: TabLineField[]) => {
+    setTabLineFields(fields)
+    saveTabLineFields(fields)
+  }
+
   const harnessTabs = tabs.filter((t) => t.kind === 'harness')
   const otherTabs = tabs.filter((t) => t.kind !== 'harness')
   // A tab's display label = its backing session's title (so it reads
@@ -267,6 +279,14 @@ export function Sidebar({
   const tabProvider = (tab: TabInfo): string => {
     const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
     return session ? providerFromRuntime(session.runtime) : ''
+  }
+
+  // The starting channel of the tab's session (e.g. "web", "signal", "cli"),
+  // or null when no channel was recorded. Centralized here so both
+  // ActiveTabs and RunningHarnesses share the same session-join.
+  const tabChannel = (tab: TabInfo): string | null => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.channel ?? null
   }
 
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
@@ -320,6 +340,8 @@ export function Sidebar({
           tabRepoUrl={tabRepoUrl}
           tabAgent={tabAgent}
           tabProvider={tabProvider}
+          tabChannel={tabChannel}
+          fields={tabLineFields}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -338,6 +360,8 @@ export function Sidebar({
           tabRepoUrl={tabRepoUrl}
           tabAgent={tabAgent}
           tabProvider={tabProvider}
+          tabChannel={tabChannel}
+          fields={tabLineFields}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}
@@ -361,6 +385,10 @@ export function Sidebar({
         selectedId={selectedId}
         onSelectSession={onSelectSession}
         onUnarchive={onUnarchiveSession}
+      />
+      <TabLineConfigBar
+        fields={tabLineFields}
+        onFieldsChange={handleTabLineFieldsChange}
       />
     </div>
   )

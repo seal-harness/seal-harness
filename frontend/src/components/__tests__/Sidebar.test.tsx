@@ -1,8 +1,9 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { ActiveTabs, TabRow } from '../ActiveTabs'
 import { RunningHarnesses } from '../RunningHarnesses'
 import { Sidebar } from '../Sidebar'
+import { DEFAULT_TAB_LINE_FIELDS } from '../../lib/tabLineConfig'
 import type { SessionInfo, TabInfo } from '../../types'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -35,6 +36,12 @@ function makeTab(overrides: Partial<TabInfo> = {}): TabInfo {
   }
 }
 
+// Clear localStorage before each test so the Sidebar's tabLineFields state
+// starts from the default, not a value left by a prior test.
+beforeEach(() => {
+  localStorage.clear()
+})
+
 // ── ActiveTabs ──────────────────────────────────────────────────────────
 
 describe('ActiveTabs', () => {
@@ -50,6 +57,8 @@ describe('ActiveTabs', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -74,6 +83,8 @@ describe('ActiveTabs', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -97,6 +108,8 @@ describe('ActiveTabs', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -121,6 +134,8 @@ describe('ActiveTabs', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -240,6 +255,8 @@ describe('RunningHarnesses', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -261,6 +278,8 @@ describe('RunningHarnesses', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -283,6 +302,8 @@ describe('RunningHarnesses', () => {
         tabRepoUrl={() => null}
         tabAgent={() => null}
         tabProvider={() => ''}
+        tabChannel={() => null}
+        fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -495,10 +516,11 @@ describe('Sidebar — tab status indicator', () => {
     // The second line now shows provider badge + model (no redundant
     // status text — the icon on line 1 already conveys thinking/idle/read).
     // The provider badge renders as "A" (anthropic) and the model is "m",
-    // so the textContent is "Am" for all three live tabs.
-    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Am')
-    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Am')
-    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('Am')
+    // so the textContent is "A·m" for all three live tabs (the · separator
+    // is now inserted between all configured fields).
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('A·m')
+    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('A·m')
+    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('A·m')
     // Thinking renders an animated ActivityDot (not the static glyph span).
     expect(document.querySelector('.dot-thinking')).toBeTruthy()
     expect(screen.getByTestId('tab-kind-idle-unread')).toBeTruthy()
@@ -548,9 +570,9 @@ describe('Sidebar — tab status indicator', () => {
     // document order yields the rendered sort.
     const labels = screen.getAllByTestId(/^tab-status-label-\d+$/).map((el) => el.textContent)
     // All four tabs share the same provider (anthropic → "A") and model
-    // ("m"), so the second line is "Am" for all. The sort is verified by
+    // ("m"), so the second line is "A·m" for all. The sort is verified by
     // the index badges below, not by the label text.
-    expect(labels).toEqual(['Am', 'Am', 'Am', 'Am'])
+    expect(labels).toEqual(['A·m', 'A·m', 'A·m', 'A·m'])
     // And the tab index badges (rendered first per row) follow the same order.
     const indexBadges = screen.getAllByTestId(/^tab-index-\d+$/).map((el) => el.textContent)
     // The Active Tabs section renders tab.index badges; verify the sorted
@@ -650,7 +672,9 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
       />,
     )
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toBe('Ollama3.2')
+    // Default config (provider · model · repo) — no repo data, so just
+    // provider badge + model separated by "·".
+    expect(label.textContent).toBe('O·llama3.2')
     expect(screen.getByTestId('provider-badge-ollama')).toBeTruthy()
   })
 
@@ -681,9 +705,11 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // No repo → agent is shown: "A" badge + "sonnet-4" + "·" + "zoe"
+    // Default config is provider · model · repo — agent is NOT shown
+    // unless the user adds it via the config bar. So: "A" badge + "·" +
+    // "sonnet-4" only.
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toBe('Asonnet-4·zoe')
+    expect(label.textContent).toBe('A·sonnet-4')
   })
 
   it('derives repo name from agent prefix when repoUrl is null (legacy session fallback)', () => {
@@ -719,6 +745,131 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
     const label = screen.getByTestId('tab-status-label-0')
     expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).not.toContain('agents-md')
+  })
+})
+
+// ── Configurable tab second-line fields ───────────────────────────────
+
+describe('Sidebar — configurable tab second-line fields', () => {
+  it('shows channel when the user adds it to the config', () => {
+    localStorage.setItem('seal.tabLineFields', '["provider","model","channel"]')
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      channel: 'signal',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toContain('signal')
+    expect(label.textContent).not.toContain('seal-harness')
+  })
+
+  it('shows agent when the user adds it to the config', () => {
+    localStorage.setItem('seal.tabLineFields', '["provider","model","agent"]')
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // Agent is shown because it's in the config, even though repo is present.
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toContain('zoe')
+  })
+
+  it('respects custom field order', () => {
+    localStorage.setItem('seal.tabLineFields', '["repo","model","provider"]')
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // Custom order: repo → model → provider. The "·" separator appears
+    // between each pair of rendered fields.
+    // "seal-harness·sonnet-4·A" (A is the provider badge text)
+    const label = screen.getByTestId('tab-status-label-0')
+    expect(label.textContent).toBe('seal-harness·sonnet-4·A')
+  })
+
+  it('renders the TabLineConfigBar at the bottom of the sidebar', () => {
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={[]}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('tab-line-config-bar')).toBeTruthy()
+    expect(screen.getByLabelText('Configure tab fields')).toBeTruthy()
   })
 })
 
