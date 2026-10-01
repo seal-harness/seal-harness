@@ -130,7 +130,7 @@ spec = describe "Seal.Providers.Ollama" $ do
                         ["name" .= ("FILE_READ" :: String)
                         , "arguments" .= object ["path" .= ("a.txt" :: String)]]]
                     , object ["function" .= object
-                        ["name" .= ("SECRET_GET" :: String)
+                        ["name" .= ("SECRET_MANAGE" :: String)
                         , "arguments" .= object ["name" .= ("K" :: String)]]]
                     ]
                 ]
@@ -140,7 +140,7 @@ spec = describe "Seal.Providers.Ollama" $ do
         Right (CompletionResponse
                 [ CbToolUse (ToolCallId "call_0") (OpName "FILE_READ")
                     (object ["path" .= ("a.txt" :: String)])
-                , CbToolUse (ToolCallId "call_1") (OpName "SECRET_GET")
+                , CbToolUse (ToolCallId "call_1") (OpName "SECRET_MANAGE")
                     (object ["name" .= ("K" :: String)]) ]
                 StopToolUse
                 (Usage 0 0))

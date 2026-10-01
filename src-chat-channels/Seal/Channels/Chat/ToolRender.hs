@@ -50,7 +50,7 @@ opEmoji name = case name of
   "WEB_SEARCH"       -> "\x1F50D"  -- 🔍 magnifying glass
   "WEB_FETCH"        -> "\x1F4C4"  -- 📄 page facing up
   "SETUP_REPO"       -> "\x1F4E5"  -- 📥 inbox tray
-  "SECRET_GET"       -> "\x1F5DD"  -- 🗝 old key
+  "SECRET_MANAGE"    -> "\x1F5DD"  -- 🗝 old key
   "MEMORY_WRITE"     -> "\x1F9E0"  -- 🧠 brain
   "MEMORY_READ"      -> "\x1F9E0"  -- 🧠 brain
   "MEMORY_LIST"      -> "\x1F9E0"  -- 🧠 brain
