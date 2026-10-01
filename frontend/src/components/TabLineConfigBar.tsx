@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import {
   type TabLineField,
   TAB_LINE_FIELD_LABELS,
@@ -15,10 +15,78 @@ import {
  *  transcript area").
  *
  *  The popover shows:
- *    - A checkbox per available field (toggle visibility)
- *    - Up/down arrows per enabled field (reorder)
+ *    - Enabled (checked) fields at the top, in their configured display order
+ *      — each with a checkbox and up/down reorder arrows.
+ *    - Disabled (unchecked) fields below a divider, in canonical order — each
+ *      with a checkbox only (no reorder arrows).
+ *  When a disabled field is checked, it is appended to the end of the enabled
+ *  list (via toggleField), so it appears at the bottom of the enabled group.
  *  Changes are applied immediately (live preview) and persisted by the
  *  parent via the `onFieldsChange` callback. */
+
+function ConfigRow({
+  field,
+  enabled,
+  index,
+  fieldsLength,
+  onToggle,
+  onMoveUp,
+  onMoveDown,
+}: {
+  field: TabLineField
+  enabled: boolean
+  /** Position in the fields array (for up/down disabled state). -1 when
+   *  the field is not enabled. */
+  index: number
+  fieldsLength: number
+  onToggle: () => void
+  onMoveUp: () => void
+  onMoveDown: () => void
+}) {
+  return (
+    <div
+      className="flex items-center gap-2 px-3 py-1.5"
+      data-testid={`tab-line-config-row-${field}`}
+      style={{ color: 'var(--text-muted)' }}
+    >
+      <label className="flex items-center gap-2 flex-1 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={onToggle}
+          aria-label={TAB_LINE_FIELD_LABELS[field]}
+        />
+        <span className="text-xs">{TAB_LINE_FIELD_LABELS[field]}</span>
+      </label>
+      {enabled && (
+        <span className="flex items-center gap-0.5">
+          <button
+            type="button"
+            className="btn btn-ghost"
+            style={{ width: 20, height: 20, padding: 0, fontSize: 10, lineHeight: 1 }}
+            disabled={index <= 0}
+            onClick={onMoveUp}
+            aria-label={`Move ${TAB_LINE_FIELD_LABELS[field]} up`}
+            data-testid={`tab-line-config-up-${field}`}
+          >
+            ▲
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            style={{ width: 20, height: 20, padding: 0, fontSize: 10, lineHeight: 1 }}
+            disabled={index < 0 || index >= fieldsLength - 1}
+            onClick={onMoveDown}
+            aria-label={`Move ${TAB_LINE_FIELD_LABELS[field]} down`}
+            data-testid={`tab-line-config-down-${field}`}
+          >
+            ▼
+          </button>
+        </span>
+      )}
+    </div>
+  )
+}
 
 export function TabLineConfigBar({
   fields,
@@ -29,6 +97,14 @@ export function TabLineConfigBar({
 }) {
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
+
+  // Disabled fields = all canonical fields not in the enabled list, in
+  // canonical order. Memoized so the filter only re-runs when the enabled
+  // set changes.
+  const disabledFields = useMemo(
+    () => ALL_TAB_LINE_FIELDS.filter((f) => !fields.includes(f)),
+    [fields],
+  )
 
   // Close the popover on outside click.
   useEffect(() => {
@@ -99,54 +175,39 @@ export function TabLineConfigBar({
           >
             Tab Fields
           </div>
-          {ALL_TAB_LINE_FIELDS.map((field) => {
-            const enabled = fields.includes(field)
-            const idx = fields.indexOf(field)
-            return (
-              <div
-                key={field}
-                className="flex items-center gap-2 px-3 py-1.5"
-                data-testid={`tab-line-config-row-${field}`}
-                style={{ color: 'var(--text-muted)' }}
-              >
-                <label className="flex items-center gap-2 flex-1 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={enabled}
-                    onChange={() => onFieldsChange(toggleField(fields, field))}
-                    aria-label={TAB_LINE_FIELD_LABELS[field]}
-                  />
-                  <span className="text-xs">{TAB_LINE_FIELD_LABELS[field]}</span>
-                </label>
-                {enabled && (
-                  <span className="flex items-center gap-0.5">
-                    <button
-                      type="button"
-                      className="btn btn-ghost"
-                      style={{ width: 20, height: 20, padding: 0, fontSize: 10, lineHeight: 1 }}
-                      disabled={idx <= 0}
-                      onClick={() => onFieldsChange(moveFieldUp(fields, field))}
-                      aria-label={`Move ${TAB_LINE_FIELD_LABELS[field]} up`}
-                      data-testid={`tab-line-config-up-${field}`}
-                    >
-                      ▲
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-ghost"
-                      style={{ width: 20, height: 20, padding: 0, fontSize: 10, lineHeight: 1 }}
-                      disabled={idx < 0 || idx >= fields.length - 1}
-                      onClick={() => onFieldsChange(moveFieldDown(fields, field))}
-                      aria-label={`Move ${TAB_LINE_FIELD_LABELS[field]} down`}
-                      data-testid={`tab-line-config-down-${field}`}
-                    >
-                      ▼
-                    </button>
-                  </span>
-                )}
-              </div>
-            )
-          })}
+          {/* Enabled (checked) fields — in configured display order, with
+              reorder arrows. */}
+          {fields.map((field, i) => (
+            <ConfigRow
+              key={field}
+              field={field}
+              enabled={true}
+              index={i}
+              fieldsLength={fields.length}
+              onToggle={() => onFieldsChange(toggleField(fields, field))}
+              onMoveUp={() => onFieldsChange(moveFieldUp(fields, field))}
+              onMoveDown={() => onFieldsChange(moveFieldDown(fields, field))}
+            />
+          ))}
+          {/* Divider between enabled and disabled groups. */}
+          {disabledFields.length > 0 && fields.length > 0 && (
+            <div style={{ borderTop: '1px solid var(--border)', margin: '2px 8px' }} />
+          )}
+          {/* Disabled (unchecked) fields — in canonical order, no reorder
+              arrows. Checking one appends it to the bottom of the enabled
+              group (via toggleField). */}
+          {disabledFields.map((field) => (
+            <ConfigRow
+              key={field}
+              field={field}
+              enabled={false}
+              index={-1}
+              fieldsLength={fields.length}
+              onToggle={() => onFieldsChange(toggleField(fields, field))}
+              onMoveUp={() => {}}
+              onMoveDown={() => {}}
+            />
+          ))}
         </div>
       )}
     </div>

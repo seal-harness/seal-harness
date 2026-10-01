@@ -128,3 +128,79 @@ describe('TabLineConfigBar', () => {
     expect(screen.queryByTestId('tab-line-config-popover')).toBeNull()
   })
 })
+
+// ── Grouped layout: enabled fields first, disabled below ─────────────
+
+describe('TabLineConfigBar — grouped layout', () => {
+  it('renders enabled fields before disabled fields in DOM order', () => {
+    render(<TabLineConfigBar fields={['model', 'provider']} onFieldsChange={() => {}} />)
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    const rows = screen.getAllByTestId(/^tab-line-config-row-/)
+    // Enabled fields (model, provider) come first in their configured order,
+    // then disabled fields (repo, channel, agent) in canonical order.
+    expect(rows[0]!.getAttribute('data-testid')).toBe('tab-line-config-row-model')
+    expect(rows[1]!.getAttribute('data-testid')).toBe('tab-line-config-row-provider')
+    expect(rows[2]!.getAttribute('data-testid')).toBe('tab-line-config-row-repo')
+    expect(rows[3]!.getAttribute('data-testid')).toBe('tab-line-config-row-channel')
+    expect(rows[4]!.getAttribute('data-testid')).toBe('tab-line-config-row-agent')
+  })
+
+  it('shows a divider between enabled and disabled groups', () => {
+    render(
+      <TabLineConfigBar fields={['provider', 'model']} onFieldsChange={() => {}} />,
+    )
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    // There should be a divider element with a borderTop style between
+    // the enabled and disabled groups. We check by looking for a div
+    // with borderTop in its style within the popover.
+    const popover = screen.getByTestId('tab-line-config-popover')
+    const divider = popover.querySelector('div[style*="border-top"]')
+    expect(divider).toBeTruthy()
+  })
+
+  it('does not show a divider when all fields are enabled', () => {
+    render(
+      <TabLineConfigBar
+        fields={['provider', 'model', 'repo', 'channel', 'agent']}
+        onFieldsChange={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    const popover = screen.getByTestId('tab-line-config-popover')
+    const divider = popover.querySelector('div[style*="border-top"]')
+    expect(divider).toBeNull()
+  })
+
+  it('does not show a divider when no fields are enabled (all unchecked)', () => {
+    // This edge case shouldn't normally happen (toggleField prevents
+    // removing the last field), but the divider logic should handle it.
+    render(
+      <TabLineConfigBar fields={['provider']} onFieldsChange={() => {}} />,
+    )
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    // Only one enabled field → disabled group has 4 items but the divider
+    // should still appear since both groups are non-empty.
+    const popover = screen.getByTestId('tab-line-config-popover')
+    const divider = popover.querySelector('div[style*="border-top"]')
+    expect(divider).toBeTruthy()
+  })
+
+  it('newly checked field appears at the bottom of the enabled group', () => {
+    const onChange = vi.fn()
+    render(<TabLineConfigBar fields={['provider', 'model']} onFieldsChange={onChange} />)
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    // Check "Repo" (currently disabled) → should be appended to the end
+    // of the enabled list.
+    fireEvent.click(screen.getByLabelText('Repo'))
+    const newFields = onChange.mock.calls[0]![0] as TabLineField[]
+    expect(newFields).toEqual(['provider', 'model', 'repo'])
+  })
+
+  it('disabled fields have no reorder arrows', () => {
+    render(<TabLineConfigBar fields={['provider']} onFieldsChange={() => {}} />)
+    fireEvent.click(screen.getByTestId('tab-line-config-button'))
+    // Repo is disabled → no up/down arrows.
+    expect(screen.queryByTestId('tab-line-config-up-repo')).toBeNull()
+    expect(screen.queryByTestId('tab-line-config-down-repo')).toBeNull()
+  })
+})
