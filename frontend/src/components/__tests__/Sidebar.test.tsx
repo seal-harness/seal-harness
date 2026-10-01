@@ -967,3 +967,136 @@ describe('Sidebar — tab age pill', () => {
     expect(agePill).toBeNull()
   })
 })
+
+// ── Configurable second line for Recent Sessions + Archived ───────────
+
+describe('Sidebar — session second-line configurable fields', () => {
+  it('Recent Sessions rows show configurable second line with default fields', () => {
+    const sessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // Default config: provider · model · repo.
+    const label = screen.getByTestId('session-status-label-s1')
+    expect(label.textContent).toContain('sonnet-4')
+    expect(label.textContent).toContain('seal-harness')
+    expect(screen.getByTestId('provider-badge-anthropic')).toBeTruthy()
+  })
+
+  it('Recent Sessions rows respect custom field config (channel shown)', () => {
+    localStorage.setItem('seal.tabLineFields', '["provider","model","channel"]')
+    const sessions = [makeSession({
+      id: 's1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      channel: 'signal',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+    })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const label = screen.getByTestId('session-status-label-s1')
+    expect(label.textContent).toContain('signal')
+    // Repo is NOT in the config, so it should not appear.
+    expect(label.textContent).not.toContain('seal-harness')
+  })
+
+  it('Archived rows show configurable second line', () => {
+    const archived = [makeSession({
+      id: 'old1',
+      model: 'llama3.2',
+      runtime: 'session:ollama',
+      repoUrl: null,
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={[]}
+        archivedSessions={archived}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // Expand the archived section.
+    fireEvent.click(screen.getByTestId('collapse-icon'))
+    // Default config: provider · model · repo. No repo → just provider + model.
+    const label = screen.getByTestId('session-status-label-old1')
+    expect(label.textContent).toContain('llama3.2')
+    expect(screen.getByTestId('provider-badge-ollama')).toBeTruthy()
+  })
+
+  it('Archived rows respect custom field config (agent shown)', () => {
+    localStorage.setItem('seal.tabLineFields', '["provider","model","agent"]')
+    const archived = [makeSession({
+      id: 'old1',
+      model: 'claude-sonnet-4-20250514',
+      runtime: 'session:anthropic',
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+      agent: 'zoe',
+    })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={[]}
+        archivedSessions={archived}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('collapse-icon'))
+    // Agent is in the config, so it should appear even though repo is present.
+    const label = screen.getByTestId('session-status-label-old1')
+    expect(label.textContent).toContain('zoe')
+  })
+})

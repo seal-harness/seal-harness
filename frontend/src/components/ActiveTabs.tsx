@@ -14,13 +14,23 @@ import { ActivityDot } from './StatusDot'
 /** The default field order, matching the pre-config behavior. */
 const DEFAULT_FIELDS: TabLineField[] = ['provider', 'model', 'repo']
 
-interface TabLineData {
+export interface TabLineData {
   provider: string
   model: string
   repoName: string
   repoUrl: string | null
   channel: string | null
   agent: string | null
+}
+
+/** Derive the repo display name from the repo URL, with a fallback to the
+ *  agent name's "<repo>--<id>" prefix pattern for legacy sessions whose
+ *  session.json predates the smRepoUrl field. Shared by TabRow and
+ *  SessionRow so both sections agree on repo name derivation. */
+export function deriveRepoName(repoUrl: string | null, agent: string | null): string {
+  if (repoUrl) return repoNameFromUrl(repoUrl)
+  if (agent && agent.includes('--')) return agent.split('--')[0] ?? ''
+  return ''
 }
 
 /** Render a single field as a React node, or null when the field has no
@@ -57,7 +67,7 @@ function renderTabLineField(field: TabLineField, data: TabLineData): ReactNode {
 /** Render the configurable second line for a live tab. Iterates over the
  *  field list, renders each field that has data, and joins them with "·"
  *  separators. Returns null when no field has data. */
-function renderConfigurableLine(fields: TabLineField[], data: TabLineData): ReactNode {
+export function renderConfigurableLine(fields: TabLineField[], data: TabLineData): ReactNode {
   const ordered = fields.length > 0 ? fields : DEFAULT_FIELDS
   const parts: { key: string; node: ReactNode }[] = []
   for (let i = 0; i < ordered.length; i++) {
@@ -243,17 +253,9 @@ export function TabRow({
   const kind = deriveTabStatusKind(activity)
   const isThinking = kind === 'thinking'
   const kindGlyph = kindIcon[kind]
-  // Resolve the repo name to display. Primary source is the repo URL
-  // (populated by SETUP_REPO for new sessions). Fallback: derive the repo
-  // name from the agent name's "<repo>--<id>" prefix pattern — this covers
-  // existing sessions whose session.json predates the smRepoUrl field.
-  // When neither yields a repo name, the trailing slot falls back to the
-  // agent display name.
-  const repoName = (() => {
-    if (repoUrl) return repoNameFromUrl(repoUrl)
-    if (agent && agent.includes('--')) return agent.split('--')[0] ?? ''
-    return ''
-  })()
+  // Resolve the repo name to display — shared helper handles the repo URL
+  // and agent-name prefix fallback.
+  const repoName = deriveRepoName(repoUrl ?? null, agent ?? null)
   // Adopted harnesses can be Released — Seal stops managing them without
   // killing the underlying tmux window. Distinct from Close/Dismiss, and
   // only offered on adopted rows.
