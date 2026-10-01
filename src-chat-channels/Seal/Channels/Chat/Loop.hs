@@ -1,8 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The generic chat-channel main loop. Handles routing (@/N@ focus, slash
 -- commands, plain text), WS focus + streaming, HTTP send, session tracking,
--- and ASK_HUMAN — all through the gateway API. The 'ChatChannel' instance
--- provides the platform-specific I/O.
 module Seal.Channels.Chat.Loop
   ( runChatChannel
   , ChatChannelConfig (..)
@@ -24,10 +22,18 @@ module Seal.Channels.Chat.Loop
   , lastAssistantText
   , formatQuestionWithOptions
   , parseCallbackData
+    -- * Watch-all-tabs (for testing)
+  , WatchState
+  , ThinkingTabs
+  , newWatchState
+  , newThinkingTabs
+  , handleWatchToggle
+  , handleWatchActivity
+  , lookupWatch
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVarIO)
-import Control.Monad (when, unless)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Monad (when, unless, void)
 import Data.Foldable (for_)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
@@ -37,6 +43,8 @@ import Data.IORef (readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Char (isDigit)
 import Data.Text qualified as T
@@ -46,7 +54,7 @@ import Network.HTTP.Client (Manager)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.HttpClient
-  (httpSend, httpGetTabs, httpNewSession, httpGetTranscript, httpAnswerQuestion,
+  (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
    SendResult (..), TabJson (..))
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
@@ -67,7 +75,7 @@ import Seal.Gateway.Types.Core
   (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 import Seal.Gateway.Types.MessageSource (MessageSource)
-import Seal.Gateway.Types.Tab (TabIndex, tabIndexToInt, tabIndexToChar)
+import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToChar)
 
 -- | A pending ASK_HUMAN question tracked by the loop: the ask id text +
 -- the offered options (so the callback handler can resolve a button index
@@ -80,6 +88,41 @@ data PendingAsk = PendingAsk
 -- | The pending-asks store: session id → list of pending asks. Thread-safe
 -- via 'TVar'.
 type PendingAsks = TVar (Map SessionId [PendingAsk])
+
+-- | Per-conversation watch-all-tabs toggle state. When 'True' for a
+-- conversation, the channel receives a notification every time any
+-- non-focused tab finishes thinking (harness-status transitions from
+-- @thinking@ to @idle@). Thread-safe via 'TVar'.
+type WatchState = TVar (Map ConversationKey Bool)
+
+-- | Create a new empty watch-state map (watch mode off for all
+-- conversations).
+newWatchState :: IO WatchState
+newWatchState = newTVarIO Map.empty
+
+-- | Look up whether watch mode is enabled for a conversation. 'False'
+-- when the conversation has no entry (the default).
+lookupWatch :: WatchState -> ConversationKey -> IO Bool
+lookupWatch ws key = fromMaybe False . Map.lookup key <$> readTVarIO ws
+
+-- | Toggle watch mode for a conversation. Returns the new state.
+toggleWatch :: WatchState -> ConversationKey -> IO Bool
+toggleWatch ws key = atomically $ do
+  m <- readTVar ws
+  let newVal = not (fromMaybe False (Map.lookup key m))
+  writeTVar ws (Map.insert key newVal m)
+  pure newVal
+
+-- | Per-conversation set of non-focused sessions currently in a thinking
+-- turn. Used to detect the thinking→idle transition so a watch
+-- notification is sent exactly once per completed turn (not on every
+-- idle activity for a session that was never thinking). Thread-safe via
+-- 'TVar'.
+type ThinkingTabs = TVar (Map ConversationKey (Set SessionId))
+
+-- | Create a new empty thinking-tabs map.
+newThinkingTabs :: IO ThinkingTabs
+newThinkingTabs = newTVarIO Map.empty
 
 -- | Configuration for the generic loop.
 data ChatChannelConfig = ChatChannelConfig
@@ -113,9 +156,11 @@ runChatChannel cfg chan = do
   wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
   pendingAsks <- newTVarIO Map.empty :: IO PendingAsks
   tabTracker <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))
-  loop sessions wsConns pendingAsks tabTracker
+  watchState <- newWatchState
+  thinkingTabs <- newThinkingTabs
+  loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs
   where
-    loop sessions wsConns pendingAsks tabTracker = do
+    loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs = do
       mMsg <- ccReceive chan
       case mMsg of
         Nothing -> pure ()  -- EOF
@@ -129,8 +174,8 @@ runChatChannel cfg chan = do
               handleCallback cfg chan sessions pendingAsks key src cbData
             Nothing ->
               -- Regular text message: route normally.
-              handleInbound cfg chan sessions wsConns pendingAsks tabTracker key body
-          loop sessions wsConns pendingAsks tabTracker
+              handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
+          loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs
 
 -- | Handle one inbound message: resolve the session, route, and dispatch.
 handleInbound
@@ -139,18 +184,33 @@ handleInbound
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState
+  -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleInbound cfg chan sessions wsConns pendingAsks tabTracker key body = do
+handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  -- First, check if this is a /tab focus N (intercepted locally).
-  case parseTabFocus body of
+  -- Intercept /watch (and /watch on|off) before normal routing — it
+  -- toggles per-conversation loop state, not a gateway command.
+  if isWatchCommand body
+    then do
+      dbg ("[watch] /watch command received, key=" <> ckConv key)
+      handleWatchToggle chan watchState key body
+      -- When watch mode is turned ON, ensure a WS connection exists so
+      -- the channel receives BeActivity events for all tabs. Without
+      -- this, /watch as the first message would enable watch mode but
+      -- never receive any events (no WS connection = no event source).
+      watchOn <- lookupWatch watchState key
+      dbg ("[watch] watchOn=" <> (if watchOn then "true" else "false") <> ", ensuring WS conn")
+      when watchOn $
+        void (resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key)
+    else case parseTabFocus body of
     Just idx -> do
-      handleFocus cfg chan sessions wsConns pendingAsks tabTracker key idx
+      handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
     Nothing -> case route body of
       Right (ChatFocus idx) ->
-        handleFocus cfg chan sessions wsConns pendingAsks tabTracker key idx
+        handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
       Right (ChatInject idx payload) -> do
         -- Send the payload to the target tab's session WITHOUT changing
         -- the focused tab (no FocusOp, no "focused tab N" confirmation).
@@ -167,14 +227,14 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker key body = do
           Nothing -> ccSend chan "no current tab"
       Right (ChatNewSession args) -> do
         -- Create a new session via HTTP, update the session map.
-        handleNewSession cfg chan sessions wsConns pendingAsks tabTracker key args
+        handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key args
       Right (ChatSlash _cmd) ->
-        sendSlash cfg chan sessions wsConns pendingAsks tabTracker key body
+        sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
-        sendSlash cfg chan sessions wsConns pendingAsks tabTracker key body
+        sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
       Right (ChatPlain text) ->
-        sendPlain cfg chan sessions wsConns pendingAsks tabTracker key text
+        sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text
       Left _ -> ccSend chan "error: invalid command"
 
 -- | Handle a focus command: resolve the tab index to a session id via
@@ -186,9 +246,11 @@ handleFocus
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState
+  -> ThinkingTabs
   -> ConversationKey -> TabIndex
   -> IO ()
-handleFocus cfg chan sessions wsConns pendingAsks tabTracker key idx = do
+handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eTabs <- httpGetTabs mgr apiBase
@@ -208,7 +270,7 @@ handleFocus cfg chan sessions wsConns pendingAsks tabTracker key idx = do
                 -- Track the focused session + current tab list for tab-close detection.
                 atomically (modifyTVar' tabTracker (Map.insert key (sid, tabs)))
                 -- Ensure a WS connection exists for this conversation.
-                ensureWsConn cfg chan wsConns pendingAsks tabTracker key sid
+                ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
                 -- Send "focused tab N" confirmation.
                 ccSend chan ("focused tab " <> T.singleton (tabIndexToChar idx))
                 -- Fetch and send the last assistant reply for context.
@@ -260,19 +322,22 @@ ensureWsConn
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState
+  -> ThinkingTabs
   -> ConversationKey -> SessionId
   -> IO ()
-ensureWsConn cfg chan wsConns pendingAsks tabTracker key sid = do
+ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid = do
   let gwCfg = cccGateway cfg
   conns <- readTVarIO wsConns
+  dbg ("[watch] ensureWsConn key=" <> ckConv key <> " hasConn=" <> (case Map.lookup key conns of Just _ -> "true"; Nothing -> "false"))
   case Map.lookup key conns of
     Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
     Nothing -> do
       -- Start a new WS connection with the streaming event handler.
-      let callback = handleServerEvent cfg chan key wsConns pendingAsks tabTracker sid
+      let callback = handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs sid
       eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
-        Left _ -> pure ()  -- WS failed; the channel still works via HTTP
+        Left e -> dbg ("[watch] WS connect FAILED: " <> e)
         Right ws -> do
           ss <- newStreamingState
           atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
@@ -287,15 +352,22 @@ handleServerEvent
   -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState
+  -> ThinkingTabs
   -> SessionId -> ServerEvent -> IO ()
-handleServerEvent cfg chan key wsConns pendingAsks tabTracker focusedSid ev =
+handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs focusedSid ev =
   case ev of
     SeEntryUpdate sid val
       | sid == focusedSid -> handleEntryUpdate cfg chan key wsConns val
     SeEntry sid val
       | sid == focusedSid -> handleEntry cfg chan key wsConns val
     SeActivity sid val
-      | sid == focusedSid -> handleActivity cfg chan key wsConns val
+      | sid == focusedSid -> do
+          dbg ("[watch] SeActivity focused sid=" <> sessionIdText sid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
+          handleActivity cfg chan key wsConns val
+      | otherwise         -> do
+          dbg ("[watch] SeActivity non-focused sid=" <> sessionIdText sid <> " focusedSid=" <> sessionIdText focusedSid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
+          handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
     -- Tool-call events are BeActivity with kind="tool-call", broadcast
     -- by the server's aeOnToolCall hook. They arrive as SeActivity.
     -- handleActivity dispatches on kind internally.
@@ -303,6 +375,165 @@ handleServerEvent cfg chan key wsConns pendingAsks tabTracker focusedSid ev =
       | sid == focusedSid -> handleAsk cfg chan key pendingAsks sid val
     SeLists val -> handleLists cfg chan key tabTracker val
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
+
+-- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
+-- or @/watch on@ / @/watch off@). Pure.
+isWatchCommand :: Text -> Bool
+isWatchCommand body =
+  case T.words (T.toLower (T.strip body)) of
+    ["/watch"]       -> True
+    ["/watch", "on"] -> True
+    ["/watch", "off"] -> True
+    _                -> False
+
+-- | Handle the @/watch@ slash command: toggle (or set) watch-all-tabs
+-- mode for the conversation and send a confirmation to the platform.
+-- @/watch@ toggles; @/watch on@ and @/watch off@ set explicitly.
+handleWatchToggle
+  :: ChatChannel c => c -> WatchState -> ConversationKey -> Text -> IO ()
+handleWatchToggle chan watchState key body =
+  case T.words (T.toLower body) of
+    ["/watch", "on"]  -> setWatch True
+    ["/watch", "off"] -> setWatch False
+    _ -> do  -- bare /watch — toggle
+      cur <- lookupWatch watchState key
+      dbg ("[watch] toggle: currently " <> (if cur then "on" else "off"))
+      newVal <- toggleWatch watchState key
+      ccSend chan (watchConfirm newVal)
+  where
+    setWatch v = do
+      atomically (modifyTVar' watchState (Map.insert key v))
+      ccSend chan (watchConfirm v)
+
+-- | The confirmation message for a watch-mode change.
+watchConfirm :: Bool -> Text
+watchConfirm True =
+  "watch mode enabled — you will be notified when any tab finishes thinking"
+watchConfirm False =
+  "watch mode disabled"
+
+-- | Handle a @harness-status@ activity event for a non-focused session.
+-- When watch mode is enabled for the conversation:
+--
+-- * @thinking@ — record the session as thinking (so we can detect the
+--   transition to @idle@).
+-- * @idle@ — if the session was previously thinking, remove it from the
+--   thinking set and send a \"tab finished thinking\" notification with
+--   the last assistant reply.
+--
+-- When watch mode is disabled, this is a no-op.
+handleWatchActivity
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> ConversationKey
+  -> WatchState -> ThinkingTabs
+  -> SessionId -> SessionId -> Value -> IO ()
+handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = do
+  watchOn <- lookupWatch watchState key
+  dbg ("[watch] handleWatchActivity sid=" <> sessionIdText sid <> " watchOn=" <> (if watchOn then "true" else "false"))
+  when watchOn $ do
+    let kind = extractActivityKind val
+    dbg ("[watch] kind=" <> kind <> " status=" <> extractActivityStatus val)
+    case kind of
+      "harness-status" -> do
+        let status = extractActivityStatus val
+        case status of
+          "thinking" -> do
+            dbg ("[watch] adding to thinking set: sid=" <> sessionIdText sid)
+            atomically (modifyTVar' thinkingTabs (Map.insertWith Set.union key (Set.singleton sid)))
+          "idle" -> do
+            wasThinking <- atomically $ do
+              m <- readTVar thinkingTabs
+              case Map.lookup key m of
+                Just sids | sid `Set.member` sids -> do
+                  let sids' = Set.delete sid sids
+                  writeTVar thinkingTabs (if Set.null sids' then Map.delete key m else Map.insert key sids' m)
+                  pure True
+                _ -> pure False
+            dbg ("[watch] idle received, wasThinking=" <> (if wasThinking then "true" else "false") <> " sid=" <> sessionIdText sid)
+            when wasThinking $
+              sendWatchNotification cfg chan sid
+          _ -> pure ()
+      _ -> pure ()
+
+-- | Send a \"tab finished thinking\" notification to the channel. Fetches
+-- the tab list (to resolve the tab label) and the transcript (to get the
+-- last assistant reply). If either fetch fails, the notification is still
+-- sent with whatever information is available — the notification must not
+-- be silently dropped just because a gateway call failed.
+sendWatchNotification
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> SessionId -> IO ()
+sendWatchNotification cfg chan sid = do
+  let apiBase = gcApiBase (cccGateway cfg)
+      mgr = cccHttpManager cfg
+      sidText = sessionIdText sid
+  dbg ("[watch] sendWatchNotification sid=" <> sidText)
+  -- Resolve the tab index (for the "Tab N" prefix) from GET /api/tabs,
+  -- and the session display title (the same label the web frontend's
+  -- sidebar shows) from GET /api/sessions. The title cascade mirrors
+  -- the frontend's sessionDisplayTitle: description, autoSummary,
+  -- firstMessageSnippet, agent, short id.
+  tabIdx <- do
+    eTabs <- httpGetTabs mgr apiBase
+    case eTabs of
+      Right tabs ->
+        case [ t | t <- tabs, tjSessionId t == Just sidText ] of
+          (t : _) -> pure (case mkTabIndex (tjIndex t) of
+            Right idx -> T.singleton (tabIndexToChar idx)
+            Left _    -> T.pack (show (tjIndex t)))
+          []      -> pure "?"
+      Left _ -> pure "?"
+  sessionTitle <- do
+    eSessions <- httpGetSessions mgr apiBase
+    case eSessions of
+      Right sessions ->
+        case [ s | s <- sessions, sessionJsonId s == Just sidText ] of
+          (s : _) -> pure (sessionDisplayTitle s)
+          []      -> pure sidText
+      Left _ -> pure sidText
+  mReply <- do
+    eEntries <- httpGetTranscript mgr apiBase sid
+    case eEntries of
+      Right entries -> pure (lastAssistantText entries)
+      Left _        -> pure Nothing
+  dbg ("[watch] notification tabIdx=" <> tabIdx <> " sessionTitle=" <> sessionTitle <> " hasReply=" <> (case mReply of Just _ -> "true"; Nothing -> "false"))
+  let header = "\x1F4D4 Tab " <> tabIdx <> " (" <> sessionTitle <> ") finished thinking"
+  case mReply of
+    Just reply | not (T.null reply) -> ccSend chan (header <> ":\n" <> reply)
+    _ -> ccSend chan header
+
+-- | Extract the @id@ field from a session info JSON object (from
+-- @GET /api/sessions@). Returns 'Nothing' when the field is missing or
+-- not a string. Pure.
+sessionJsonId :: Value -> Maybe Text
+sessionJsonId (A.Object o) = asText =<< KeyMap.lookup (Key.fromText "id") o
+sessionJsonId _ = Nothing
+
+-- | Derive the display title from a session info JSON object, mirroring
+-- the web frontend's @sessionDisplayTitle@ cascade:
+-- @description -> autoSummary -> firstMessageSnippet -> agent -> short id@.
+-- Pure.
+sessionDisplayTitle :: Value -> Text
+sessionDisplayTitle val =
+  case val of
+    A.Object o ->
+      fromMaybe (shortId o) (firstNonEmpty
+        [ asText =<< KeyMap.lookup (Key.fromText "description") o
+        , asText =<< KeyMap.lookup (Key.fromText "auto_summary") o
+        , asText =<< KeyMap.lookup (Key.fromText "autoSummary") o
+        , asText =<< KeyMap.lookup (Key.fromText "first_message_snippet") o
+        , asText =<< KeyMap.lookup (Key.fromText "firstMessageSnippet") o
+        , asText =<< KeyMap.lookup (Key.fromText "agent") o
+        ])
+    _ -> "?"
+  where
+    firstNonEmpty = foldr (\m acc -> case m of
+      Just t | not (T.null t) -> Just t
+      _                       -> acc) Nothing
+    shortId o =
+      maybe "?" (T.take 12)
+        (asText =<< KeyMap.lookup (Key.fromText "id") o)
+
 
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
@@ -536,10 +767,11 @@ sendPlain
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-sendPlain cfg chan sessions wsConns pendingAsks tabTracker key text = do
-  sid <- resolveSession cfg chan sessions wsConns pendingAsks tabTracker key
+sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text = do
+  sid <- resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eResult <- httpSend mgr apiBase sid text
@@ -554,6 +786,7 @@ sendSlash
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
 sendSlash = sendPlain  -- same mechanism; the gateway routes slash commands
@@ -563,9 +796,10 @@ handleNewSession
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleNewSession cfg chan sessions wsConns pendingAsks tabTracker key _args = do
+handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key _args = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eSid <- httpNewSession mgr apiBase (A.object [])
@@ -576,7 +810,7 @@ handleNewSession cfg chan sessions wsConns pendingAsks tabTracker key _args = do
       Right sid -> do
         sessionInsert sessions key sid
         -- Ensure a WS connection exists for this conversation.
-        ensureWsConn cfg chan wsConns pendingAsks tabTracker key sid
+        ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
         ccSend chan ("new session " <> sessionIdText sid)
 
 -- | Resolve the conversation's session. If the conversation has no session
@@ -584,9 +818,10 @@ handleNewSession cfg chan sessions wsConns pendingAsks tabTracker key _args = do
 resolveSession
   :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
   -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState -> ThinkingTabs
   -> ConversationKey
   -> IO SessionId
-resolveSession cfg chan sessions wsConns pendingAsks tabTracker key = do
+resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key = do
   mSid <- sessionLookup sessions key
   case mSid of
     Just sid -> pure sid
@@ -598,7 +833,7 @@ resolveSession cfg chan sessions wsConns pendingAsks tabTracker key = do
         Right sidText -> case mkSessionId sidText of
           Right sid -> do
             sessionInsert sessions key sid
-            ensureWsConn cfg chan wsConns pendingAsks tabTracker key sid
+            ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
             pure sid
           Left _ -> fallbackSid
         Left _ -> fallbackSid
