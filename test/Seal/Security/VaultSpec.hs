@@ -272,3 +272,52 @@ spec = describe "Seal.Security.Vault" $ do
                   vhGet h "api-key" `shouldReturn` Right "s3cr3t"
                   keys <- vhList h
                   keys `shouldBe` Right ["api-key"]
+  describe "cross-handle freshness (simulates multi-process)" $ do
+    -- Two VaultHandles opened on the same on-disk file simulate two
+    -- processes (e.g. `seal tui` and `seal serve`). A write via one handle
+    -- must be visible to the other without an explicit unlock/restart.
+    let twoHandles :: UnlockMode
+                   -> (VaultHandle -> VaultHandle -> IO a)
+                   -> IO a
+        twoHandles mode k =
+          withSystemTempDirectory "seal-vault" $ \dir -> do
+            let path = dir </> "shared.age"
+                cfg  = VaultConfig path "mock" mode
+            h1 <- openVault cfg mkMockEncryptor
+            h2 <- openVault cfg mkMockEncryptor
+            _ <- vhInit h1
+            _ <- vhUnlock h1
+            _ <- vhUnlock h2
+            k h1 h2
+
+    it "UnlockOnDemand: list sees a secret written by another handle" $
+      twoHandles UnlockOnDemand $ \h1 h2 -> do
+        _ <- vhPut h1 "k1" "v1"
+        keys <- vhList h2
+        fmap sort keys `shouldBe` Right ["k1"]
+
+    it "UnlockOnDemand: get retrieves a secret written by another handle" $
+      twoHandles UnlockOnDemand $ \h1 h2 -> do
+        _ <- vhPut h1 "k1" "v1"
+        vhGet h2 "k1" `shouldReturn` Right "v1"
+
+    it "UnlockOnDemand: a second write is also visible without re-unlock" $
+      twoHandles UnlockOnDemand $ \h1 h2 -> do
+        _ <- vhPut h1 "first" "1"
+        _ <- vhList h2          -- populates cache + records mtime
+        _ <- vhPut h1 "second" "2"
+        keys <- vhList h2
+        fmap sort keys `shouldBe` Right ["first", "second"]
+
+    it "UnlockOnDemand: status reflects secrets written by another handle" $
+      twoHandles UnlockOnDemand $ \h1 h2 -> do
+        _ <- vhPut h1 "k1" "v1"
+        _ <- vhPut h1 "k2" "v2"
+        st <- vhStatus h2
+        vsSecretCount st `shouldBe` 2
+
+    it "UnlockStartup: list sees a secret written by another handle" $
+      twoHandles UnlockStartup $ \h1 h2 -> do
+        _ <- vhPut h1 "k1" "v1"
+        keys <- vhList h2
+        fmap sort keys `shouldBe` Right ["k1"]
