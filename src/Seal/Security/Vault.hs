@@ -15,9 +15,10 @@ module Seal.Security.Vault
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (IOException, try)
-import Control.Monad (void, when)
+import Control.Monad (void, when, unless)
 import Data.Maybe (isNothing)
 import Data.Aeson qualified as Aeson
+import Data.Time (UTCTime)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
@@ -28,7 +29,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (doesFileExist, removeFile, renameFile)
+import System.Directory (doesFileExist, getModificationTime, removeFile, renameFile)
 import System.Posix.Files (setFileMode)
 
 import Seal.Security.Vault.Age (VaultEncryptor (..), VaultError (..))
@@ -65,6 +66,7 @@ data VaultState = VaultState
   { stConfig :: VaultConfig
   , stEncryptor :: IORef VaultEncryptor
   , stKeyType :: IORef Text
+  , stCacheMTime :: IORef (Maybe UTCTime)
   , stCache :: TVar (Maybe (Map Text ByteString))
   , stWriteLock :: MVar ()
   }
@@ -74,12 +76,13 @@ openVault cfg enc = do
   st <- VaultState cfg
           <$> newIORef enc
           <*> newIORef (vcKeyType cfg)
+          <*> newIORef Nothing
           <*> newTVarIO Nothing
           <*> newMVar ()
   pure VaultHandle
     { vhInit   = vaultInit st
     , vhUnlock = vaultUnlock st
-    , vhLock   = atomically (writeTVar (stCache st) Nothing)
+    , vhLock   = vaultLock st
     , vhGet    = withCurrentMap st . lookupKey
     , vhPut    = \k v -> mutate st (Right . Map.insert k v)
     , vhDelete = \k -> mutate st $ \m ->
@@ -108,10 +111,13 @@ vaultUnlock st = do
     Left e  -> pure (Left e)
     Right m -> do
       atomically (writeTVar (stCache st) (Just m))
+      mt <- getVaultMTime st
+      writeIORef (stCacheMTime st) mt
       pure (Right ())
 
 vaultStatus :: VaultState -> IO VaultStatus
 vaultStatus st = do
+  refreshCacheIfStale st
   cache   <- readTVarIO (stCache st)
   keyType <- readIORef (stKeyType st)
   pure VaultStatus
@@ -160,7 +166,9 @@ prepareAccess st = case vcUnlock (stConfig st) of
 currentMap :: VaultState -> IO (Either VaultError (Map Text ByteString))
 currentMap st = case vcUnlock (stConfig st) of
   UnlockPerAccess -> readMap st
-  _ -> maybe (Left VaultLocked) Right <$> readTVarIO (stCache st)
+  _ -> do
+    refreshCacheIfStale st
+    maybe (Left VaultLocked) Right <$> readTVarIO (stCache st)
 
 -- | Write a map to disk without updating the in-memory cache.
 persistToDisk :: VaultState -> Map Text ByteString -> IO (Either VaultError ())
@@ -183,7 +191,10 @@ writeMap st m = do
     Right () -> do
       case vcUnlock (stConfig st) of
         UnlockPerAccess -> pure ()
-        _ -> atomically (writeTVar (stCache st) (Just m))
+        _ -> do
+          atomically (writeTVar (stCache st) (Just m))
+          mt <- getVaultMTime st
+          writeIORef (stCacheMTime st) mt
       pure (Right ())
 
 -- | Read and decrypt the on-disk vault into a map.
@@ -231,7 +242,10 @@ vaultRekey st newEnc newKeyType confirm = withMVar (stWriteLock st) $ \_ -> do
                   writeIORef (stKeyType st) newKeyType
                   case vcUnlock (stConfig st) of
                     UnlockPerAccess -> atomically (writeTVar (stCache st) Nothing)
-                    _ -> atomically (writeTVar (stCache st) (Just plainMap))
+                    _ -> do
+                      atomically (writeTVar (stCache st) (Just plainMap))
+                      mt <- getVaultMTime st
+                      writeIORef (stCacheMTime st) mt
                   pure (Right ())
 
 verifyRekey :: VaultEncryptor -> FilePath -> Map Text ByteString -> IO Bool
@@ -261,6 +275,45 @@ cleanup path = do
 
 lookupKey :: Text -> Map Text ByteString -> Either VaultError ByteString
 lookupKey k = maybe (Left (VaultKeyNotFound k)) Right . Map.lookup k
+
+-- | Clear the in-memory cache and the recorded mtime. Called by 'vhLock'.
+vaultLock :: VaultState -> IO ()
+vaultLock st = do
+  atomically (writeTVar (stCache st) Nothing)
+  writeIORef (stCacheMTime st) Nothing
+
+-- | The on-disk vault file's modification time, or 'Nothing' if the file
+-- does not exist. Used to detect writes from other processes.
+getVaultMTime :: VaultState -> IO (Maybe UTCTime)
+getVaultMTime st = do
+  let path = vcPath (stConfig st)
+  result <- try @IOException (getModificationTime path)
+  case result of
+    Left _   -> pure Nothing
+    Right mt -> pure (Just mt)
+
+-- | For cached unlock modes ('UnlockStartup', 'UnlockOnDemand'), check
+-- whether the on-disk vault file has been modified since the cache was last
+-- populated. If so, re-read and decrypt from disk, updating the cache. This
+-- makes secrets written by another process (e.g. @seal tui@) immediately
+-- visible to a running gateway server without a restart.
+refreshCacheIfStale :: VaultState -> IO ()
+refreshCacheIfStale st = case vcUnlock (stConfig st) of
+  UnlockPerAccess -> pure ()
+  _ -> do
+    cache <- readTVarIO (stCache st)
+    case cache of
+      Nothing -> pure ()
+      Just _  -> do
+        currentMTime <- getVaultMTime st
+        lastMTime    <- readIORef (stCacheMTime st)
+        unless (currentMTime == lastMTime) $ do
+          res <- readMap st
+          case res of
+            Right m -> do
+              atomically (writeTVar (stCache st) (Just m))
+              writeIORef (stCacheMTime st) currentMTime
+            Left _  -> pure ()
 
 -- | Atomic write: tmp file, chmod 0600, rename over the target.
 atomicWrite :: FilePath -> ByteString -> IO ()
