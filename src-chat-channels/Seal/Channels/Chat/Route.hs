@@ -44,7 +44,7 @@ data ChatRoute
 --
 -- * @\/N@          -> 'ChatFocus' N (N is a single char 0-9a-z, at end-of-string
 --                   or followed by a space)
--- * @\/N payload@  -> 'ChatInject' N payload
+-- * @\/N payload@  -> 'ChatInject' N payload (sent without changing focus)
 -- * @\/tab@        -> 'ChatCurrentTab' (show the current tab)
 -- * @\/new [args]@ -> 'ChatNewSession' (the raw text after @/new @)
 -- * @\/<other>…@   -> 'ChatSlash' (deferred to the HTTP API — the gateway
@@ -110,4 +110,4 @@ parseTabFocus body =
 
 -- | The terse-grammar synopsis (for /help). One line.
 terseSynopsis :: Text
-terseSynopsis = "/N [payload]  Switch to tab N (0-9a-z), or inject payload into it"
+terseSynopsis = "/N [payload]  Focus tab N (0-9a-z), or send payload to it without changing focus"
