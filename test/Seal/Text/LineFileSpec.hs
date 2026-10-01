@@ -160,7 +160,11 @@ spec = describe "Seal.Text.LineFile" $ do
             win = LineWindow { lwLines = lines', lwStart = start, lwEnd = end
                              , lwTotal = tot, lwHasMore = True, lwTruncated = trunc }
             rendered = renderWindow win
-        in not (printsRange rendered) || (start + 1 <= end)
+            -- The footer is always the last line of the rendered text; only
+            -- check the footer, not the body (body lines may contain
+            -- digit-hyphen-digit substrings like "0-7" that are not ranges).
+            footer = last (T.lines rendered)
+        in not (printsRange footer) || (start + 1 <= end)
 
   ---------------------------------------------------------------------------
   -- readLineWindow (IO)
