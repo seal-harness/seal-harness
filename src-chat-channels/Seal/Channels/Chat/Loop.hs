@@ -31,7 +31,7 @@ module Seal.Channels.Chat.Loop
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
-import Control.Monad (when, unless)
+import Control.Monad (when, unless, void)
 import Data.Foldable (for_)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
@@ -192,7 +192,15 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
   -- Intercept /watch (and /watch on|off) before normal routing — it
   -- toggles per-conversation loop state, not a gateway command.
   if isWatchCommand body
-    then handleWatchToggle chan watchState key body
+    then do
+      handleWatchToggle chan watchState key body
+      -- When watch mode is turned ON, ensure a WS connection exists so
+      -- the channel receives BeActivity events for all tabs. Without
+      -- this, /watch as the first message would enable watch mode but
+      -- never receive any events (no WS connection = no event source).
+      watchOn <- lookupWatch watchState key
+      when watchOn $
+        void (resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key)
     else case parseTabFocus body of
     Just idx -> do
       handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
