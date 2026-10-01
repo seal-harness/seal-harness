@@ -449,15 +449,6 @@ class TranscriptRenderer {
     return messages
   }
 
-  /** Check whether this renderer is compatible with the given first
-   *  entry id. If the entries belong to a different session (different
-   *  first entry id than what this renderer was built from), the
-   *  renderer should not process them — it would reset and produce
-   *  stale results for one render. */
-  accepts(firstEntryId: string): boolean {
-    return this.lastFirstId === null || this.lastFirstId === firstEntryId
-  }
-
   private reset(): void {
     this.cache.clear()
     this.toolResults.clear()
@@ -531,7 +522,6 @@ class RendererCache {
 
 /** Module-level singleton — survives re-mounts and session switches. */
 let globalRendererCache: RendererCache | null = null
-const globalMsgCountRef: { value: number | null } = { value: null }
 
 function getGlobalRendererCache(): RendererCache {
   if (globalRendererCache === null) {
@@ -539,6 +529,8 @@ function getGlobalRendererCache(): RendererCache {
   }
   return globalRendererCache
 }
+
+const prevMsgCountRef: { value: number } = { value: 0 }
 
 /** React hook: incrementally convert transcript entries to messages.
  *  Uses a multi-session renderer cache (Map<sessionId, TranscriptRenderer>)
@@ -555,21 +547,15 @@ export function useTranscriptMessages(
     ? getGlobalRendererCache().get(sessionId)
     : new TranscriptRenderer() // ephemeral for null session
 
-  // Guard against renderer/entries mismatch on session switch. When the
-  // user switches sessions, entries (from useTranscriptStream) and
-  // renderer (from the cache, keyed by sessionId) might update in
-  // different React renders. If the entries belong to a different session
-  // than the renderer was built from, return an empty array for this
-  // render — the next render will have both in sync.
-  if (entries.length > 0 && !renderer.accepts(entries[0]!.id)) {
-    return []
-  }
-
   return useMemo(() => {
     const msgs = renderer.update(entries)
-    if (msgs.length !== (globalMsgCountRef.value ?? 0)) {
-      console.log("[renderer] msgs " + (globalMsgCountRef.value ?? 0) + " -> " + msgs.length + " entries=" + entries.length + " sig=" + (msgs.length > 0 ? msgs[0]!.id + ":" + msgs.length : "empty"))
-      globalMsgCountRef.value = msgs.length
+    // Log message array changes for debugging. The message array should
+    // only grow (append-only) or stay the same length (in-place updates).
+    // A decrease in length indicates an entry was removed, which would
+    // cause messages to disappear from the DOM. Search `[transcript] MSGS`.
+    if (msgs.length !== prevMsgCountRef.value) {
+      console.log(`[transcript] MSGS ${prevMsgCountRef.value} -> ${msgs.length} entries=${entries.length} first=${msgs.length > 0 ? msgs[0]!.id : 'none'} last=${msgs.length > 0 ? msgs[msgs.length - 1]!.id : 'none'}`)
+      prevMsgCountRef.value = msgs.length
     }
     return msgs
   }, [entries, renderer])
