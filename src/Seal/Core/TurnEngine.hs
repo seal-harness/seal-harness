@@ -983,7 +983,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 catalogAgentDefs' <- Def.adbList (bAgentDefs freshBackends)
                 let injectAgents = either (const True) resolvedAvailableAgents eCfg
                 mSystem <- resolveSystemPrompt
-                  (bAgentDefs freshBackends) sessionSkills
+                  (bAgentDefs freshBackends) freshSessionSkills
                   autoloadId injectCatalog injectAgents catalogAgentDefs'
                   parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
