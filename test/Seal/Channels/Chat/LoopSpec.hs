@@ -5,16 +5,17 @@
 -- breaks on tool calls, late-update handling after finalize, state reset).
 module Seal.Channels.Chat.LoopSpec (spec) where
 
-import Control.Concurrent.STM (newTVarIO)
+import Control.Concurrent.STM (newTVarIO, readTVarIO)
 import Data.IORef
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Network.HTTP.Client (newManager, defaultManagerSettings)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy, expectationFailure)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Loop
@@ -137,14 +138,16 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "sess1"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       fire "pre-tool text streams in here"
       -- A tool call fires.
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
       -- Post-tool text streams in.
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
       -- The tool line was sent as its own platform message.
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
@@ -172,13 +175,15 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "sess2"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Stream some text (creates the bubble), then the final recorded
       -- entry arrives (finalize), then a LATE entry-update arrives.
       fire "partial text"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
         (SeEntry sid (entryJsonFor "the complete final text"))
       editsAfterFinalize0 <- getEdits chan
       -- A LATE update arrives with enough NEW codepoints to pass the
@@ -207,17 +212,19 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "sess3"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Turn 1: stream + go idle (finalize path).
       fire "turn one text"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (statusJson "idle"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "idle"))
       -- Turn 2: fresh text must create a NEW bubble.
       -- (Production sequence: the server broadcasts harness-status
       -- "thinking" at turn start, which clears the finalized flag —
       -- then entry-updates stream. The test mirrors that.)
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid (SeActivity sid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "thinking"))
       sendIdsBefore <- getSendIds chan
       fire "turn two text"
       sendIdsAfter <- getSendIds chan
@@ -331,8 +338,10 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "emoji-test"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "SHELL_EXEC"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x1F4BB")
@@ -348,8 +357,10 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "emoji-test2"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "BIN_EXEC"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x2699\xFE0F")
@@ -364,8 +375,10 @@ spec = do
       conns <- newTVarIO (Map.singleton key (stubWs, ss))
       pendingAsks <- newTVarIO Map.empty
       tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
       let sid = mkSid "emoji-test3"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker sid
+      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "MEMORY_MANAGE"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x1F9E0")
@@ -417,3 +430,170 @@ spec = do
 
     it "returns just the question when no options" $ do
       formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?"
+  describe "watch-all-tabs" $ do
+    it "/watch toggles watch mode on and sends a confirmation" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "watch mode enabled")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` True
+
+    it "/watch toggles watch mode off when already on" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch"
+      _ <- getSends chan
+      handleWatchToggle chan watchState key "/watch"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "watch mode disabled")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
+    it "/watch on sets watch mode explicitly" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch on"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "watch mode enabled")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` True
+
+    it "/watch off disables watch mode explicitly" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleWatchToggle chan watchState key "/watch off"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "watch mode disabled")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
+    it "watch is per-conversation — toggling one does not affect another" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key1 = ConversationKey "signal" "conv1"
+          key2 = ConversationKey "signal" "conv2"
+      handleWatchToggle chan watchState key1 "/watch"
+      _ <- getSends chan
+      watchOn1 <- lookupWatch watchState key1
+      watchOn2 <- lookupWatch watchState key2
+      watchOn1 `shouldBe` True
+      watchOn2 `shouldBe` False
+
+    it "non-focused session thinking then idle sends a notification when watch is on" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "finished thinking")
+
+    it "non-focused session idle does NOT send a notification when watch is off" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+    it "non-focused session idle without prior thinking does NOT notify" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+    it "non-focused session thinking adds to the thinking set when watch is on" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "thinking"))
+      thinkingMap <- readTVarIO thinkingTabs
+      case Map.lookup key thinkingMap of
+        Just sids -> otherSid `shouldSatisfy` (`Set.member` sids)
+        Nothing   -> expectationFailure "expected thinking set to contain the session"
+
+    it "non-focused session tool-call activity does NOT trigger a notification" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (toolCallJson "SHELL_EXEC"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
