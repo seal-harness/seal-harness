@@ -64,7 +64,7 @@ import Seal.ISA.Ops.Human
 import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process
 import Seal.ISA.Ops.Search
-import Seal.ISA.Ops.Secret (secretGetOp)
+import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell
 import Seal.ISA.Ops.Skills
 import Seal.ISA.Registry qualified as Registry
@@ -818,10 +818,10 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------
-  -- SECRET_GET
+  -- SECRET_MANAGE
   -- ----------------------------------------------------------------------
-  describe "SECRET_GET" $ do
-    it "\"Fetch the 'TOKEN' secret from the vault.\" -> SECRET_GET -> value returned, not in orRecorded" $
+  describe "SECRET_MANAGE" $ do
+    it "\"Fetch the 'TOKEN' secret from the vault.\" -> SECRET_MANAGE action=get -> value returned, not in orRecorded" $
       withSystemTempDirectory "seal-int-vault" $ \tmpDir -> do
         let vaultDir = tmpDir </> "config" </> "vault"
             vaultPath = vaultDir </> "vault.age"
@@ -843,15 +843,17 @@ spec = describe "Seal.ISA.Integration" $ do
         _ <- vhUnlock h
         _ <- vhPut h "TOKEN" "s3cr3t"
         ref <- newIORef (Just h)
-        let rt = VaultRuntime
+        sent <- newIORef []
+        let caps = recordCaps sent
+            rt = VaultRuntime
               { vrPaths = paths
               , vrConfigPath = tmpDir </> "config" </> "config.toml"
               , vrHandleRef = ref
               }
-            op = secretGetOp rt
+            op = secretManageOp rt caps
             reg = Registry.mkRegistry [op]
-        r <- runTestApp (dispatchOne reg (OpName "SECRET_GET")
-                          (object ["name" .= ("TOKEN" :: Text)]))
+        r <- runTestApp (dispatchOne reg (OpName "SECRET_MANAGE")
+                          (object ["action" .= ("get" :: Text), "name" .= ("TOKEN" :: Text)]))
         case r of
           Right res -> do
             orIsError res `shouldBe` False

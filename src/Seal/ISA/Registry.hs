@@ -82,7 +82,7 @@ registryToolDefs' useStub (Registry _ order hidden) =
 
 -- | The set of opcode names whose tool results may carry secrets and must be
 -- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a
--- vault secret value in 'orParts' belong here — currently just 'SECRET_GET'.
+-- vault secret value in 'orParts' belong here — currently just 'SECRET_MANAGE'.
 -- Other opcodes (MEMORY_READ, FILE_READ, SHELL_EXEC, etc.) return
 -- agent-visible data that is safe to persist verbatim and display in the
 -- frontend. Using trust level as a proxy was wrong: MEMORY_READ is Trusted
@@ -93,5 +93,8 @@ secretOpNames (Registry m _ _) =
   Set.fromList [ opName o | o <- Map.elems m, opName o `Set.member` secretOpcodes ]
 
 -- | The static set of opcode names that return secret values in 'orParts'.
+-- SECRET_MANAGE's @get@ action returns vault values in 'orParts'; the
+-- @put@ action receives values but never returns them. Both must be
+-- redacted from the on-disk transcript.
 secretOpcodes :: Set OpName
-secretOpcodes = Set.fromList [ OpName "SECRET_GET" ]
+secretOpcodes = Set.fromList [ OpName "SECRET_MANAGE" ]

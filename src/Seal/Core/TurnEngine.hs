@@ -108,7 +108,7 @@ import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
-import Seal.ISA.Ops.Secret (secretGetOp)
+import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp, sessionManageOp)
 import Seal.ISA.Ops.Skills
@@ -265,7 +265,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretGetOp rt
+      , secretManageOp rt caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -1153,7 +1153,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
       baseOps =
         [ showHumanOp childCaps
         , askHumanOp childCaps
-        , secretGetOp (tdVault td)
+        , secretManageOp (tdVault td) childCaps
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
        , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))

@@ -48,7 +48,7 @@ data OpResult = OpResult
   } deriving stock (Eq)
 
 -- | Manual Show that never renders 'orParts': those slots may hold secret values
--- (e.g. vault credentials returned by SECRET_GET) that must not appear in logs.
+-- (e.g. vault credentials returned by SECRET_MANAGE) that must not appear in logs.
 instance Show OpResult where
   show r = "OpResult {orParts = <" <> show (length (orParts r)) <> " part(s) redacted>, orIsError = "
              <> show (orIsError r) <> ", orRecorded = " <> show (orRecorded r) <> "}"

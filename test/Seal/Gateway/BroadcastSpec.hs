@@ -117,14 +117,14 @@ spec = describe "Seal.Gateway.Broadcast" $ do
       broker <- newStreamBroker 10
       let sid = mkSid "tool2"
       (_, ref) <- collectEvents broker sid
-      let secretOps = Set.fromList [OpName "SECRET_GET"] :: Set OpName
-      broadcastToolCall (Just broker) sid (OpName "SECRET_GET") "{\"name\":\"vault-key\"}" secretOps
+      let secretOps = Set.fromList [OpName "SECRET_MANAGE"] :: Set OpName
+      broadcastToolCall (Just broker) sid (OpName "SECRET_MANAGE") "{\"name\":\"vault-key\"}" secretOps
       events <- readIORef ref
       let toolEvents = filter (\e -> activityKind e == Just "tool-call") events
       length toolEvents `shouldBe` 1
       case toolEvents of
         (e : _) -> do
-          activityToolName e `shouldBe` Just "SECRET_GET"
+          activityToolName e `shouldBe` Just "SECRET_MANAGE"
           activityToolInput e `shouldBe` Just "<redacted>"
         [] -> fail "expected at least one tool-call event"
 
