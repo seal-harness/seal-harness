@@ -366,6 +366,7 @@ class TranscriptRenderer {
     const changedIds: Set<string> = new Set()
     const newToolResultIds: Set<string> = new Set()
     const currentIds: Set<string> = new Set()
+    let dedupRebuildNeeded = false
 
     for (const e of entries) {
       currentIds.add(e.id)
@@ -381,6 +382,17 @@ class TranscriptRenderer {
       // Entry is new or changed (different reference or not in cache).
       changedIds.add(e.id)
 
+      // If a changed entry carries system/tools, the dedup sets from the
+      // prior render would skip re-creating the System Prompt / Tools
+      // blocks (seenSystem/seenTools already contain the content). Flag
+      // for a full dedup rebuild so these blocks are re-created in their
+      // correct first-occurrence positions.
+      const changedParsed = tryParsePayload(e.payload)
+      if (changedParsed) {
+        if (changedParsed.system) dedupRebuildNeeded = true
+        if (Array.isArray(changedParsed.tools) && changedParsed.tools.length > 0) dedupRebuildNeeded = true
+      }
+
       // Extract new tool_results from this entry.
       const resultIds = extractToolResultIds(e)
       for (const rid of resultIds) {
@@ -391,7 +403,6 @@ class TranscriptRenderer {
     }
 
     // Remove evicted entries from cache (streaming placeholder eviction).
-    let dedupRebuildNeeded = false
     for (const [id, cached] of this.cache) {
       if (!currentIds.has(id)) {
         // Check if this entry contributed to dedup sets.
