@@ -119,25 +119,25 @@ export function reconcileEntries(
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
   const done = perf.begin('reconcileEntries')
-  // When a finalized entry arrives, check if there's a streaming
-  // placeholder with the SAME id — if so, replace it in place (stable
-  // position, no flicker). Only evict streaming placeholders with a
-  // DIFFERENT id (stale placeholders from a different entry).
+  // When a finalized (non-streaming) entry arrives, replace any existing
+  // streaming placeholder IN PLACE regardless of id. The streaming
+  // placeholder always has the sentinel id "streaming" (assigned by the
+  // backend's streamingEntryJson), while the finalized entry has the real
+  // transcript entry id. Replacing in place — rather than evicting the
+  // placeholder and appending the finalized entry — keeps the array
+  // position stable, which prevents React key changes and the associated
+  // unmount/mount flicker at the bottom of the transcript.
   let base = existing
   if (!incoming.streaming) {
     const streamingIdx = existing.findIndex((e) => e.streaming)
     if (streamingIdx !== -1) {
-      if (existing[streamingIdx]!.id === incoming.id) {
-        // Same id — replace the streaming placeholder in place with the
-        // finalized entry. This keeps the position stable and prevents
-        // the flicker of evict-then-append.
-        const next = existing.slice()
-        next[streamingIdx] = incoming
-        done({ count: existing.length, meta: { mode: 'replace-streaming' } })
-        return next
-      }
-      // Different id — evict the stale streaming placeholder.
-      base = existing.filter((_, i) => i !== streamingIdx)
+      // Replace the streaming placeholder in place with the finalized
+      // entry, regardless of id. This keeps the array position stable
+      // and prevents the flicker of evict-then-append.
+      const next = existing.slice()
+      next[streamingIdx] = incoming
+      done({ count: existing.length, meta: { mode: 'replace-streaming' } })
+      return next
     }
   }
   for (let i = 0; i < base.length; i++) {
@@ -204,6 +204,7 @@ export function useTranscriptStream(
       setEntries(cached)
       setLoading(false)
       loadedSessionRef.current = sessionId
+      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.length}`)
       const lastId = cached[cached.length - 1]!.id
       sc.focus(sessionId, lastId)
       fetchPendingQuestions(sessionId).then((qs) => {
@@ -211,16 +212,45 @@ export function useTranscriptStream(
         setPendingQuestions(qs)
       })
     } else {
-      // Cache miss or refresh — full HTTP GET seed.
+      // First load (cache miss) or refresh — HTTP GET seed.
+      // On first load, the seed replaces the (empty) entries array.
+      // On refresh (after send), the seed is MERGED with the current
+      // entries via reconcileEntries — this preserves WS-delivered
+      // entries that arrived between the HTTP request and response.
+      // Replacing the array (setEntries(seed)) would lose those entries
+      // and cause the entire transcript to be rebuilt, producing the
+      // flickering pattern where messages disappear and reappear.
       if (isFirstLoad) setLoading(true)
       fetchTranscriptSeed(sessionId).then((seed) => {
         if (cancelled) return
-        setEntries(seed)
-        dataCache.set(sessionId, seed)
+        if (isFirstLoad) {
+          setEntries(seed)
+          dataCache.set(sessionId, seed)
+        } else {
+          // Refresh: merge seed with existing entries to preserve
+          // WS-delivered entries. reconcileEntries handles dedup by
+          // id — seed entries with matching ids replace in place,
+          // new seed entries are appended, and WS-delivered entries
+          // that aren't in the seed are retained.
+          setEntries((prev) => {
+            let merged = prev
+            for (const e of seed) {
+              merged = reconcileEntries(merged, e)
+            }
+            return merged
+          })
+        }
         setLoading(false)
+        console.log(`[transcript] SEED ${isFirstLoad ? 'http-fetch' : 'http-merge'} session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
         loadedSessionRef.current = sessionId
-        const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
+        // Use the data cache's last id for focus — it includes
+        // WS-delivered entries that may have arrived after the seed.
+        const cachedNow = dataCache.get(sessionId)
+        const lastId = cachedNow && cachedNow.length > 0
+          ? cachedNow[cachedNow.length - 1]!.id
+          : seed.length > 0 ? seed[seed.length - 1]!.id : undefined
         if (lastId !== undefined) sc.focus(sessionId, lastId)
+        else sc.focus(sessionId)
       })
       fetchPendingQuestions(sessionId).then((qs) => {
         if (cancelled) return
@@ -236,9 +266,6 @@ export function useTranscriptStream(
     const unsub = sc.onEntry((e) => {
       setEntries((prev) => {
         const next = reconcileEntries(prev, e)
-        if (next.length !== prev.length || (next.length > 0 && prev.length > 0 && next[next.length-1]!.id !== prev[prev.length-1]!.id)) {
-          console.log("[ws] entries " + prev.length + " -> " + next.length + " mode=" + (next.length === prev.length ? "replace" : next.length > prev.length ? "append" : "evict") + " lastId=" + (next.length > 0 ? next[next.length-1]!.id : "none") + " streaming=" + !!e.streaming)
-        }
         // Update the data cache so it stays fresh for this session.
         const sid = currentSessionRef.current
         if (sid !== null) getGlobalDataCache().update(sid, next)
