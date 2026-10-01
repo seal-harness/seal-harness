@@ -21,10 +21,9 @@
 > **Status:** Pre-alpha. Active design and development.
 > This is a harness designed from the ground up for security and reliability
 > around the SealOp Instruction Set Architecture (ISA).
-**Seal's mission is to provide guarantees where guarantees are needed.**
+> **Seal's mission is to provide guarantees where guarantees are needed.**
 
 **Seals get the job done!**
-
 
 **Every agent action bears the Seal.**
 
@@ -38,219 +37,204 @@ Seal Harness is the open-source agent runtime that solves this at the
 architectural level — not with policies to remember, but with structural
 guarantees enforced by the system.
 
-## Naming Philosophy
+## Why Seal Harness
 
-User-facing terminology should use **descriptive words**, not metaphors
-that may be unfamiliar to the audience. We prioritize clarity over cleverness.
-A user should understand what an opcode does from its name alone, without
-needing to learn a domain-specific vocabulary first. Internal implementation
-details and developer-facing API names may use specialized terminology, but
-anything an end user or contributor encounters in documentation, CLI output,
-or configuration should be plain and self-explanatory.
+Most agent frameworks are moving in one direction: hiding more of what they
+do. Background steps you can't inspect. Tool calls summarized away. State
+changes that happened somewhere, somehow, with no record you can replay.
+Seal Harness goes the other way.
 
-## What Makes This Different
+### Visibility and Transparency
 
-### Transcript IS the Audit Log
+When an agent acts, you see everything. There is no hidden layer where
+decisions happen off the record.
 
-Every operation an agent performs — memory changes, skill edits, shell
-commands, file writes — is a transcript entry. The transcript is append-only,
-hash-chained, and mirrored off-box. There is no separate audit log to
-reconcile. The transcript *is* the source of truth, and all derived state is
-rebuilt from transcript replay.
+**The transcript is the audit log.** Every operation the agent performs —
+memory changes, skill edits, shell commands, file writes, web requests —
+is a transcript entry. The transcript is append-only, hash-chained, and
+mirrored off-box. There is no separate audit log to reconcile against the
+"real" state; the transcript *is* the source of truth, and all derived
+state (memory, skills, agent definitions) is rebuilt by replaying it.
 
-### Instruction Set Architecture, Not "Tool Calls"
+**ACK-before-execute.** The harness refuses to run any untrusted opcode
+(shell, file I/O, web) until the transcript daemon confirms the audit
+entry is durably written (synchronous fsync). If the audit log can't
+record it, the operation doesn't happen. You can never end up in a state
+where an action ran but no record of it exists.
 
-Every other agent framework has ad-hoc tool calls: `shell`, `read_file`,
-`web_search`, whatever the developer thought of that week. No unifying design.
-No privilege model. No atomicity guarantees.
+**Every tool call is user-visible.** The web frontend renders the
+transcript directly — every message, every tool call, every skill load,
+every permission prompt — with full fidelity: channel attribution,
+timestamps, raw JSON inspection, collapsible structured views. Nothing
+is summarized behind the scenes. When you branch from a point in the
+conversation, you branch from the real record, not a reconstruction.
 
-Seal Harness defines a formal ISA — a complete, closed set of 74 opcodes where
-every instruction has:
+**Cross-channel mirroring.** Every user message is mirrored across all
+subscribed channels (Telegram, Signal, web) with a `[channel]` prefix so
+the origin is visible at a glance. Assistant replies fan out to every
+channel. You always know who said what, from where, and when.
 
-- **Defined input/output schema** — not "whatever JSON the LLM generates"
-- **Privilege classification** — Untrusted (isolated execution, interacts with outside world), Trusted (harness-internal, logged in session transcript), or Audited (harness-internal, logged in session transcript AND in a unified cross-session append-only log)
-- **Atomicity guarantee** — what state is left if the opcode fails mid-execution
-- **Transcript entry format** — how the execution is recorded in the audit log
-- **Authorization gate** — what must be satisfied before execution
+### Safety from the Ground Up
 
-### Trust Levels: Untrusted, Trusted, Audited
+Security isn't a layer bolted on top. It's the foundation the rest is
+built on, enforced at compile time by Haskell's type system and at
+runtime by the ISA's trust model.
 
-Every opcode is classified into one of three trust levels:
+**Encrypted secrets vault.** API keys, bearer tokens, and encryption keys
+don't live in plaintext config files or environment variables any shell
+command can read. They live in an [age](https://age-encryption.org)-encrypted
+vault with public-key cryptography and hardware token support (YubiKey,
+NitroKey via `age-plugin-yubikey`). Three unlock modes: explicit unlock
+at startup, automatic unlock on first access, or decrypt-from-disk on
+every operation. Atomic writes (write to temp, chmod 0600, rename) — no
+partial states. Rekey support re-encrypts the entire vault with a new key,
+verified byte-for-byte before the old vault is replaced.
 
-**Untrusted** opcodes interact with the outside world — shell commands, file
-I/O, web requests, browser automation, code execution. They execute in an isolated, disposable environment with no path to modify agent identity, memory,
-skills, or the audit trail. The harness refuses to act on any untrusted opcode
-until the transcript daemon confirms the audit entry is written
-(**ACK-before-execute**). If the audit log can't record it, the operation
-doesn't happen.
+**Secret values are never logged.** Secret types are opaque — they have
+no serialization path, so there is no code route that accidentally writes
+a secret to the transcript, logs, or API response. Access is scoped to a
+single function call, so a secret can't leak into a binding that persists
+beyond the call. The audit log proves *that* a secret was accessed, never
+*what* it was.
 
-**Trusted** opcodes operate on the agent's own state — sessions, scheduling,
-human interaction, tool management. They execute within the harness itself,
-and every execution is logged in the current session's transcript.
+**Three trust levels, enforced by the type system.** Every opcode is
+classified:
 
-**Audited** opcodes are Trusted opcodes that *also* write to a **unified
-cross-session append-only log**. This log captures every mutation to the
-agent's persistent evolutionary state — memory, skills, agent definitions,
-and configuration. No matter how many concurrent sessions (tabs) are running,
-every change to these four stores lands in one global, append-only,
-hash-chained log.
+- **Untrusted** — interacts with the outside world (shell, files, web,
+  browser). Runs in an isolated, disposable environment with no path to
+  modify agent identity, memory, skills, or the audit trail.
+- **Trusted** — harness-internal (sessions, scheduling, human
+  interaction). In-process, logged in the session transcript.
+- **Audited** — Trusted + writes to a unified cross-session append-only
+  log. This log captures every mutation to the agent's persistent
+  evolutionary state — memory, skills, agent definitions, configuration.
+  It is append-only (the agent cannot delete or rewrite entries, only
+  supersede them), hash-chained, and mirrored off-box. If an agent
+  self-destructs, you replay the audited log forward to reconstruct state
+  at any point in its lifetime.
 
-**Why Audited exists:** An agent can modify its own memory, rewrite its own
-skills, change its own definition, alter its own configuration. These mutations
-transcend any single session — they shape the agent's evolution over its
-entire lifetime. If these were only in per-session transcripts, reconstructing
-the full history would require correlating across all sessions, which becomes
-infeasible with concurrent multi-session use. Worse, an agent that "commits
-suicide" (deletes its memories, lobotomizes its skills, rewrites its own
-definition) could leave you unable to reconstruct what was lost.
-
-The audited log solves this. It is append-only — the agent cannot delete or
-rewrite entries, only supersede them. It spans all sessions. It is
-hash-chained and mirrored off-box, same as the transcript. If an agent
-self-destructs, you replay the audited log forward to reconstruct state at
-any point in the agent's lifetime. **The agent's evolution is permanent and
-recoverable.**
-
-### Secret Protection
-
-Secrets get first-class treatment. API keys, bearer tokens, pairing codes, and
-encryption keys are not stored in plaintext config files or environment
-variables that any shell command can read. They live in an **encrypted vault**
-with proper cryptographic guarantees.
-
-**The vault:**
-
-- Encrypted at rest using [age](https://age-encryption.org) — public-key
-  encryption with support for hardware tokens (YubiKey, NitroKey) via
-  `age-plugin-yubikey`. No software-only keys required.
-- Three unlock modes: explicit unlock at startup, automatic unlock on first
-  access, or decrypt-from-disk on every operation (keys never held in memory
-  longer than needed).
-- Atomic writes (write to temp, chmod 0600, rename) — no partial states.
-- Rekey support: re-encrypt the entire vault with a new key, verified
-  byte-for-byte before the old vault is replaced.
-
-**The secret types:**
-
-All secret values use opaque newtypes with redacted `Show` instances and no
-`ToJSON`/`FromJSON` instances. There is no code path that accidentally
-serializes a secret to the transcript, logs, or API response. Access is via
-CPS-style continuations (`withApiKey`, `withBearerToken`) that limit the
-secret's scope to a single function — it can't leak into a binding that
-persists beyond the call.
-
-**The opcodes:**
-
-The Secrets group provides five opcodes for vault management. All are
-Audited — every vault mutation (save, delete) is recorded in the unified
-cross-session log. But **secret values are never written to the audited log
-or the session transcript.** Only key names and operation metadata are
-recorded. The audited log proves *that* a secret was saved or retrieved,
-not *what* it was.
-
-Vault lock, unlock, and rekey are admin operations handled by the CLI, not
-agent opcodes. Unlocking can require a physical hardware token (YubiKey,
-NitroKey) — that's a human-in-the-loop step, not something the agent does
-autonomously. If the vault is locked when the agent calls `SECRET_MANAGE`, it
-gets a "vault locked" error and can ask the human to unlock it via `ASK_HUMAN`.
-
-| Opcode | What it does |
-|---|---|
-| `SECRET_MANAGE` | Full vault secret CRUD: `get` (decrypt and return), `put` (encrypt and store — upsert), `delete` (remove — ALWAYS prompts human approval), `list` (key names only). Values stay in memory, never logged. |
-
-This isn't a config file with `API_KEY=***`. It's a cryptographically sealed
-vault with hardware token support, atomic operations, and a full audit trail
-of every access — without ever exposing the secrets themselves.
-
-### Security by Construction
-
-Haskell's type system eliminates entire classes of vulnerabilities at compile
-time:
+**Compile-time security guarantees.**
 
 | Security Property | How It's Enforced | What Fails at Compile Time |
 |---|---|---|
-| Command authorization | `AuthorizedCommand` proof type | Executing a shell command without policy approval |
-| Filesystem confinement | `SafePath` validated path | Accessing files outside the workspace |
-| Secret protection | Opaque newtypes, redacted `Show`, no serialization instances, encrypted vault | Logging or serializing API keys, tokens, pairing codes |
+| Command authorization | Authorization proof type required to execute a shell command | Executing a shell command without policy approval |
+| Filesystem confinement | Validated path type (opaque, unexported constructor) | Accessing files outside the workspace |
+| Secret protection | Opaque secret types, no serialization path, encrypted vault | Logging or serializing API keys, tokens, pairing codes |
 | Policy evaluation | Pure functions, no IO | Security checks that depend on external state |
-| Error isolation | `PublicError` channel type | Leaking internal error details to users |
-| Capability scoping | Handle pattern | Accessing capabilities not explicitly provided |
+| Capability scoping | Capability handles — untrusted capabilities only available to untrusted opcodes | A Trusted opcode that shells out |
+| Option injection | Validated argument types, `--` before user-derived args | Raw user input reaching a subprocess argv |
 
 The insecure path is harder to write than the secure path. That's the point.
 
-### Cross-Channel Message Mirroring
+### Built for Concurrent Orchestration
 
-Running multiple agents concurrently is the hard part. Not the coding —
-the *awareness*. A common solution is a tmux TUI that lists agent panes
-and shows a live status next to each one, grouped by project. That helps
-you see *which* agents are idle or stuck on a permission prompt, but it
-doesn't solve the deeper problem: each agent is still an isolated
-conversation. You tab into a pane, type into that agent, tab out. If you
-want to check the same agent from your phone, or let a teammate glance at
-the state, or keep an eye on two agents at once, you're back to tabbing.
+Running multiple agents at once is the hard part — not the coding, the
+*awareness*. A tmux TUI with a list of panes tells you *which* agent is
+idle, but each agent is still an isolated conversation you tab into and
+out of. Check from your phone? Let a teammate glance at the state? Watch
+two agents at once? You're back to tabbing.
 
-Seal Harness approaches this differently. Every agent session is a
-first-class, persistent object — a tab — that multiple communications
-channels can subscribe to simultaneously. You don't tab *into* an agent;
-you *view* it with a channel. Telegram, Signal, and the web UI are all
-live views into the same ground-truth state: the transcript.
-
-Here's how it works:
+Seal Harness treats every agent session as a first-class, persistent
+object — a **tab** — that multiple channels subscribe to simultaneously.
+You don't tab *into* an agent; you *view* it with a channel.
 
 - **The web frontend is the source of truth.** It renders the transcript
-  directly — every message, every tool call, every skill load, every
-  permission prompt — with full fidelity (channel attribution,
-  timestamps, raw JSON inspection). It is NOT append-only; it presents a
-  direct, structured representation of the ground-truth data. This is where
-  you do deep work: scroll the full history, branch from any point,
-  inspect exactly what the agent was sent and what it returned.
-- **Append-only channels (Telegram, Signal) subscribe to the tab.** When
-  a Telegram conversation sends its first message to a session, it
-  subscribes to that session's reply fanout. A Signal conversation can
-  subscribe to the same session later — both accumulate (one handle per
-  channel kind, deduped so re-subscribing the same channel replaces the
-  old handle, not the other channels). Each channel is now a live view:
-  it sees new messages and replies as they happen, without the full
-  history the web frontend renders.
-- **Every user message is mirrored across channels.** When a message
-  arrives on any channel — including the web UI — it is fanned out to
-  every OTHER subscribed append-only channel, prefixed with the sender's
-  channel label: `[telegram] what is your name?` appears in Signal;
-  `[web] fix the failing test` appears in Telegram. The sender never
-  receives its own message back. The web frontend sees the message
-  directly (it's the sender), so it is excluded by construction.
-- **Assistant replies go to all subscribers.** When the LLM responds,
-  the reply is fanned out to every subscribed channel (no exclusion) so
-  every append-only channel sees the answer — no tabbing required.
+  directly with full fidelity — every message, tool call, skill load,
+  and permission prompt, with channel attribution, timestamps, raw JSON
+  inspection, and branching from any point. This is where you do deep
+  work.
+- **Append-only channels (Telegram, Signal) subscribe to the tab.** Each
+  channel is a live view: it sees new messages and replies as they
+  happen, without the full history the web frontend renders. One handle
+  per channel kind, deduped so re-subscribing replaces the old handle,
+  not the other channels.
+- **Every user message is mirrored across channels.** A message from
+  Telegram appears in Signal as `[telegram] what is your name?`; a
+  message from the web appears in Telegram as `[web] fix the failing
+  test`. The sender never receives its own message back.
+- **Assistant replies go to all subscribers** — no tabbing required.
 
-This means a user can start a conversation on Telegram from their phone,
-continue it from the web UI at their desk, and watch the exchange unfold
-on Signal — all three channels stay in sync because they're all views
-into the same transcript. The `[channel]` prefix makes the origin of
-every message visible at a glance. A teammate monitoring the Signal
-conversation sees `[web] fix the failing test` arrive and knows the
-operator is engaged from the web UI — they don't need to ask "did someone
-send that?" or tab through terminals to find out.
+Start a conversation on Telegram from your phone, continue it from the
+web UI at your desk, watch it unfold on Signal — all three stay in sync
+because they're views into the same transcript. The state of every agent
+(idle, thinking, waiting on a permission prompt) is visible from any
+subscribed channel. No conversation is lost when a tmux session dies —
+the transcript is on disk.
 
-This is a fundamentally different model from "a list of agent panes you
-tab into." Every channel is a subscriber to a shared, persistent state.
-The append-only channels get a stream-of-consciousness view (prefixed,
-linear, lightweight — the view you check from your phone); the web
-frontend gets the full structured representation (collapsible tool calls,
-channel attribution, raw JSON, branching — the view you use for deep
-work). The user picks the view that fits the moment. No agent is locked to
-a terminal. No conversation is lost when a tmux session dies (the
-transcript is on disk). And the state of every agent — idle, thinking,
-waiting on a permission prompt — is visible from any subscribed channel,
-not just the one it was started in.
+## The SealOp ISA
+
+Every other agent framework has ad-hoc tool calls: `shell`, `read_file`,
+`web_search`, whatever the developer thought of that week. No unifying
+design. No privilege model. No atomicity guarantees.
+
+Seal Harness defines a formal Instruction Set Architecture — a closed set
+of opcodes where every instruction has:
+
+- **Defined input/output JSON schema** — not "whatever JSON the LLM generates"
+- **Trust classification** — Untrusted, Trusted, or Audited
+- **Atomicity guarantee** — what state is left if the opcode fails mid-execution
+- **Transcript entry format** — how the execution is recorded in the audit log
+- **Authorization gate** — a pure `Value -> Either Text ()` check that must
+  pass before execution
+
+### The Wired Opcode Catalog
+
+The registry currently exposes these opcodes to the model. Legacy
+single-action opcodes (e.g. `MEMORY_WRITE`, `SKILL_LOAD`) still exist for
+backward-compatibility transcript replay but are hidden from the model's
+tool catalog, superseded by the consolidated `*_MANAGE` opcodes.
+
+| Group | Visible Opcodes | Trust |
+|---|---|---|
+| **Memory** | `MEMORY_MANAGE` | Audited |
+| **Skills** | `SKILL_MANAGE` | Audited |
+| **Agent Defs** | `AGENT_DEF_MANAGE` | Audited |
+| **Agent Runtime** | `AGENT_MANAGE` | Trusted |
+| **Sessions** | `SESSION_MANAGE`, `SESSION_NEW` | Trusted |
+| **Secrets** | `SECRET_MANAGE` | Audited |
+| **Human Interaction** | `ASK_HUMAN`, `SHOW_HUMAN` | Trusted |
+| **Harnesses** | `HARNESS_LIST`, `HARNESS_START`, `HARNESS_STOP` | Trusted |
+| **Execution** | `SHELL_EXEC`, `BIN_EXEC`, `PROCESS_MANAGE`, `SETUP_REPO` | Untrusted |
+| **Files** | `FILE_READ`, `FILE_WRITE`, `FILE_PATCH`, `SEARCH_FILES` | Untrusted |
+| **Web** | `WEB_FETCH`, `WEB_SEARCH` | Untrusted |
+| **Introspection** | `OPCODE_DESCRIBE`, `OPCODE_LIST` | Trusted |
+
+Vault management (lock, unlock, rekey) is handled by the `seal vault` CLI —
+admin operations that can require a physical hardware token, not something
+the agent does autonomously. `SECRET_MANAGE` covers vault CRUD (get, put,
+delete, list) with values never logged — only key names and operation
+metadata are recorded. If the vault is locked when the agent calls
+`SECRET_MANAGE`, it gets a "vault locked" error and can ask the human to
+unlock it via `ASK_HUMAN`.
+
+See the [ISA specification](docs/isa.md) for the complete opcode reference
+with input/output schemas, atomicity guarantees, transcript entry
+formats, and authorization gates.
+
+### Dynamic Retrieval Pattern
+
+Data retrieval opcodes (`FILE_READ`, `WEB_FETCH`, `SEARCH_FILES`,
+`MEMORY_SEARCH`, `SESSION_SEARCH`) share a common design pattern:
+**stat first, then adapt.** The opcode inspects the data source's
+dimensions before returning content, then adapts how much to return using
+a principled mathematical function — not hardcoded thresholds or the
+model's guess.
+
+Page size follows the **square root law**:
+`page_size = min(total, max(floor, round(A · total^0.5)), ceiling)`.
+Sublinear growth: a 10× larger file returns √10 ≈ 3.16× more content.
+Coefficients are configurable at three layers: `config.yaml` (persistent),
+per-session, and per-call.
 
 ## Quick Start
 
 ### Prerequisites
 
-- **Nix** (recommended) — [install Nix](https://nixos.org/download) for fully reproducible builds
-- **Or** GHC 9.10+ and Cabal — via [GHCup](https://www.haskell.org/ghcup/)
-- An API key from your AI provider of choice
+- **Nix** (recommended) — [install Nix](https://nixos.org/download) for
+  fully reproducible builds
+- **Or** GHC 9.12+ and Cabal — via [GHCup](https://www.haskell.org/ghcup/)
+- An API key from your AI provider of choice (Anthropic or a local Ollama
+  instance)
 
 ### Install and Run
 
@@ -258,7 +242,8 @@ You can either download a pre-built binary or build from source:
 
 #### Download a pre-built binary (no Nix required)
 
-Pre-built binaries are available on the [Releases page](https://github.com/seal-harness/seal-harness/releases).
+Pre-built binaries are available on the
+[Releases page](https://github.com/seal-harness/seal-harness/releases).
 
 **Stable releases** (versioned, e.g. `v0.1.0`):
 
@@ -278,7 +263,8 @@ chmod +x seal
 ./seal --help
 ```
 
-Verify download integrity with the SHA256 checksums provided alongside each release asset.
+Verify download integrity with the SHA256 checksums provided alongside
+each release asset.
 
 #### Build from source
 
@@ -297,138 +283,101 @@ cabal build
 cabal run seal
 ```
 
-### Start a Chat
+### Pick a Frontend
+
+Seal Harness has four launch modes — pick the one that fits how you work:
 
 ```bash
-# Anthropic (default)
-export ANTHROPIC_API_KEY="***"
-seal
-
-# OpenAI
-seal --provider openai --model gpt-4o
-
-# Ollama (local, no API key needed)
-seal --provider ollama --model llama3
-
-# With tool access and persistent memory
-seal --allow git --allow ls --memory sqlite
-
-# Start a fresh session in the current tab (the old conversation stays in
-# /session list — resume it with /tab resume <id>)
-/new
+seal tui       # interactive terminal UI (single channel, local)
+seal serve     # web gateway + API: multi-tab, multi-channel, browser frontend
+seal signal    # Signal channel (subscribe to tabs from your phone)
+seal telegram  # Telegram channel
 ```
 
-## The Instruction Set
+`seal serve` is the full setup: it launches the web gateway (React 18 + TS
++ Vite + Tailwind, embedded into the binary) with
+multi-tab support, cross-channel mirroring, and the HTTP API. The
+append-only channels (`seal signal`, `seal telegram`) subscribe to tabs
+managed by a running `seal serve` instance.
 
-The ISA defines 77 opcodes organized into 16 groups. Every opcode is classified
-as **Untrusted** (prefer isolated execution, interacts with outside world), **Trusted**
-(harness-internal, logged in session transcript), or **Audited** (harness-internal,
-logged in session transcript AND in a unified cross-session append-only log).
+### Start a Chat
 
-| Group | Key Opcodes | Trust |
-|---|---|---|
-| **Memory** | `MEMORY_WRITE`, `MEMORY_RECALL`, `MEMORY_DELETE` | Audited |
-| **Skills** | `SKILL_WRITE`, `SKILL_LOAD`, `SKILL_LIST`, `SKILL_DELETE` | Audited |
-| **Agents** | `AGENT_DEF_WRITE`, `AGENT_DEF_READ`, `AGENT_DEF_LIST`, `AGENT_DEF_DELETE`, `AGENT_INSTANCES`, `AGENT_START`, `AGENT_STATUS`, `AGENT_STOP` | Audited |
-| **Config** | `CONFIG_VIEW`, `CONFIG_UPDATE`, `TARGET_SET`, `PROVIDER_LIST` | Audited |
-| **Secrets** | `SECRET_MANAGE` | Audited |
-| **Sessions** | `SESSION_NEW`, `SESSION_COMPACT`, `SESSION_SEARCH` | Trusted |
-| **Scheduling** | `CRON`, `HEARTBEAT_WAKEUP` | Trusted |
-| **Human Interaction** | `ASK_HUMAN`, `SHOW_HUMAN` | Trusted |
-| **Tools (Meta)** | `TOOL_SEARCH`, `TOOL_DESCRIBE`, `TOOL_CALL`, `TOOL_LIST` | Trusted |
-| **MCP** | `MCP_LIST`, `MCP_CONNECT`, `MCP_DISCONNECT` | Trusted |
-| **Harnesses** | `HARNESS_LIST`, `HARNESS_START`, `HARNESS_STOP`, `PLAN_MODE` | Trusted |
-| **Execution** | `SHELL_EXEC`, `PROCESS_MANAGE`, `BIN_EXEC` | Untrusted |
-| **Files** | `FILE_READ`, `FILE_WRITE`, `SEARCH_FILES`, `FILE_PATCH` | Untrusted |
-| **Web & Browser** | `WEB_SEARCH`, `WEB_EXTRACT`, `BROWSER_*` | Untrusted |
-| **Media** | `IMAGE_ANALYZE`, `IMAGE_GENERATE`, `TEXT_TO_SPEECH` | Untrusted |
-
-See the [ISA specification](docs/isa.md) for the complete opcode reference
-with input/output schemas, atomicity guarantees, transcript entry formats, and
-authorization gates.
-
-### Dynamic Retrieval Pattern
-
-Data retrieval opcodes (`FILE_READ`, `WEB_EXTRACT`, `BROWSER_SNAPSHOT`,
-`SEARCH_FILES`, `MEMORY_RECALL`, `SESSION_SEARCH`) share a common design
-pattern: **stat first, then adapt.** The opcode inspects the data source's
-dimensions before returning content, then adapts how much to return using a
-principled mathematical function — not hardcoded thresholds or the model's
-guess.
-
-Page size follows the **square root law**: `page_size = min(total, max(floor, round(A · total^0.5)), ceiling)`. Sublinear growth: a 10× larger file returns √10 ≈ 3.16× more content. Coefficients are configurable at three layers: `config.yaml` (persistent), `CONFIG_UPDATE` (per-session), inline `strategy` field (per-call).
-
-## Architecture
+From a running frontend, start a session with the `/new` command:
 
 ```
-seal-harness/
-├── src/Seal/
-│   ├── Core/            Types, Config, Errors
-│   ├── Security/        Path, Command, Policy, Secrets, Crypto, Pairing, Vault
-│   ├── Handles/         File, Shell, Network, Memory, Channel, Log
-│   ├── ISA/             Opcode definitions, dispatcher, registry
-│   ├── Tools/            Opcode implementations
-│   ├── Agent/           Loop, Context, Memory, Identity
-│   ├── Providers/       Anthropic, OpenAI, OpenRouter, Ollama
-│   ├── Channels/        CLI, Telegram, Signal
-│   ├── Memory/          SQLite, Markdown, None
-│   ├── Gateway/         Server, Routes, Auth
-│   ├── Scheduler/       Cron, Heartbeat
-│   └── CLI/             Commands
-├── test/                Test suite
-└── docs/
-    ├── ARCHITECTURE.md
-    ├── isa.md
-    └── SECURITY.md
+/new                              # fresh session in the current tab
+/new -p anthropic -m claude       # Anthropic, explicit model
+/new -p ollama -m llama3          # local Ollama, no API key needed
 ```
 
-### Key Design Decisions
-
-- **No effect systems** — `ReaderT AppEnv IO` and the Handle pattern throughout--explicit decision.
-- **Pure policy evaluation** — `SecurityPolicy` has no IO. Fully testable with QuickCheck.
-- **Capability-based handles** — Each function declares exactly which capabilities it needs.
-- **Static dispatch** — Typeclass resolution at compile time. Existentials only at the CLI wiring boundary.
-- **Transcript as source of truth** — All derived stores (memory, skills, agent defs) are materialized views rebuilt from transcript replay.
+Provider credentials are read from the vault (set them with
+`seal vault save`). Resume old sessions with `/session` and `/tab`.
 
 ## Development
 
-### Running Tests
+Everything runs through the **Nix flake dev shell** — never install GHC,
+cabal, or hlint yourself. Use the Makefile wrappers (all run inside
+`nix develop`; `direnv` users: `echo "use flake" > .envrc && direnv allow`):
 
 ```bash
-# Run the full test suite
-nix develop --command cabal test
-
-# Run with HPC coverage report
-nix develop --command cabal test --enable-coverage
-
-# Run hlint
-nix develop --command hlint src/ test/
+make build    # cabal build all (-Werror clean)
+make test     # cabal test
+make lint     # hlint src/ test/ — must report: No hints
+make check    # build + test + lint — the full local gate; what CI runs
+make serve    # rebuild frontend + launch gateway
+make tui      # interactive TUI
 ```
+
+**SIGPIPE pitfall:** never pipe Haskell binaries (`cabal`, `hlint`,
+`ghcid`) through `head`/`tail`. The RTS sets `SIGPIPE` to `SIG_IGN`, so
+the writer hangs in its exception handler instead of dying and the
+command appears to hang forever. Redirect to a file, then page through
+the file:
+
+```bash
+nix develop --command cabal test >test.log 2>&1; head -80 test.log
+```
+
+(`make`, `rg`, `git` are unaffected — they use the default SIGPIPE handler.)
+
+**Frontend:** React 18 + TS + Vite + Tailwind, embedded into the binary,
+so `frontend/dist` must exist when `cabal build` runs
+(the Makefile gates this).
 
 ### Project Standards
 
-- **GHC flags:** `-Wall -Werror` with strict warnings (incomplete patterns, name shadowing, unused imports)
-- **TDD:** Red-green methodology...failing tests first, implementation second
+- **GHC flags:** `-Wall -Werror` with strict warnings (incomplete
+  patterns, name shadowing, unused imports)
+- **TDD:** Red-green methodology — failing tests first, implementation
+  second. Security-critical pure functions get property-based tests.
 - **Linting:** hlint clean required before merge
-- **CI:** GitHub Actions with Nix builds
+- **CI:** GitHub Actions with Nix builds (Linux + macOS)
 
-### With direnv
+## Naming Philosophy
 
-```bash
-echo "use flake" > .envrc
-direnv allow
-```
+User-facing terminology uses **descriptive words**, not metaphors that
+may be unfamiliar. A user should understand what an opcode does from its
+name alone, without learning a domain-specific vocabulary first. Internal
+implementation details and developer-facing API names may use specialized
+terminology, but anything an end user or contributor encounters in
+documentation, CLI output, or configuration should be plain and
+self-explanatory.
 
 ## TODO Management
 
-The project uses a [TODO.md](TODO.md) at the repo root as a navigation layer — one file showing roadmap progress, active work, and known issues by priority.
+The project uses a [TODO.md](TODO.md) at the repo root as a navigation
+layer — one file showing roadmap progress, active work, and known issues
+by priority.
 
-- [**todo-manager agent**](.agents/agents/todo-manager/agent.md) — Full sync: reconcile with GitHub Issues, update roadmap phases, generate standup reports. Start a fresh session when TODO.md is stale or doesn't exist yet.
-- [**todo-md-maintenance skill**](.agents/skills/todo-md-maintenance/SKILL.md) — Lightweight edits: add an item, update a status, or check the list from any conversation context.
+- [**todo-manager agent**](.agents/agents/todo-manager/agent.md) — Full
+  sync: reconcile with GitHub Issues, update roadmap phases, generate
+  standup reports.
+- [**todo-md-maintenance skill**](.agents/skills/todo-md-maintenance/SKILL.md)
+  — Lightweight edits: add an item, update a status, or check the list
+  from any conversation context.
 
 ## License
 
 **FSL-1.1-MIT** (Functional Source License) — source-available with a
-"Competing Use" restriction. Each version converts to MIT license two years
-after its release date. See [LICENSE](LICENSE) for details.
-
+"Competing Use" restriction. Each version converts to MIT license two
+years after its release date. See [LICENSE](LICENSE) for details.
