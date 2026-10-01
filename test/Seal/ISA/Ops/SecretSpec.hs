@@ -158,7 +158,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
     it "deletes the secret when the human approves" $
       withSystemTempDirectory "seal-secret-delete-yes" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
-        (_fc, caps) <- makeFakeCaps ["yes"]
+        (_fc, caps) <- makeFakeCaps ["once"]
         let op = secretManageOp rt caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("delete" :: String)
@@ -171,7 +171,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
     it "does NOT delete the secret when the human denies" $
       withSystemTempDirectory "seal-secret-delete-no" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
-        (_fc, caps) <- makeFakeCaps ["no"]
+        (_fc, caps) <- makeFakeCaps ["rejected"]
         let op = secretManageOp rt caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("delete" :: String)
@@ -184,9 +184,22 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
     it "is a blocking opcode (toBlocking = True)" $
       withSystemTempDirectory "seal-secret-delete-blocking" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
-        (_fc, caps) <- makeFakeCaps ["yes"]
+        (_fc, caps) <- makeFakeCaps ["once"]
         let op = secretManageOp rt caps
         opBlocking op `shouldBe` True
+
+    it "does NOT delete when the human sends an empty response" $
+      withSystemTempDirectory "seal-secret-delete-empty" $ \tmpDir -> do
+        (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
+        (_fc, caps) <- makeFakeCaps [""]
+        let op = secretManageOp rt caps
+        r <- runTestApp (opRun op localBackend (object
+          [ "action" .= ("delete" :: String)
+          , "name"   .= ("TOKEN" :: String)
+          ]))
+        orIsError r `shouldBe` True
+        result <- vhGet h "TOKEN"
+        result `shouldBe` Right "s3cr3t"
 
   -- -----------------------------------------------------------------------
   -- LIST

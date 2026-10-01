@@ -188,9 +188,12 @@ handlePut rt v = do
 handleDelete :: VaultRuntime -> ChannelCaps -> Value -> App OpResult
 handleDelete rt caps v = do
   let key = fromMaybe "" (nameField v)
-      prompt = "Delete vault secret \"" <> key <> "\"? This cannot be undone. (yes/no)"
+      prompt = "Delete vault secret \"" <> key <> "\"? This cannot be undone."
   ans <- liftIO (ccPrompt caps (AskPrompt prompt []))
-  if T.toLower (T.strip ans) /= "yes"
+  -- The confirmation gate (web UI) returns "once"/"for_session"/"always"
+  -- for approval and "rejected" for denial. The CLI returns typed text.
+  -- Treat any non-empty, non-rejection response as approval.
+  if T.toLower (T.strip ans) `elem` ["rejected", "", "no", "n", "cancel", "denied"]
     then pure (OpResult [TrpText "delete denied by operator"] True (object ["name" .= key]))
     else do
       result <- liftIO (vaultDeleteByName rt key)
