@@ -127,10 +127,10 @@ spec = describe "Seal.Handles.Transcript" $ do
       withSystemTempDirectory "seal-twofile" $ \dir -> do
         e <- mkEntryRecord
         let secret = TrpText "super-secret-api-key"
-            toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_GET") (object [])]
+            toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [secret] False]
         withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
           tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
@@ -143,7 +143,7 @@ spec = describe "Seal.Handles.Transcript" $ do
             toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SHELL_EXEC") (object ["command" .= ("free -h" :: String)])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [output] False]
         withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
           tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         -- Shell output passes through verbatim — NOT redacted.
@@ -270,7 +270,7 @@ spec = describe "Seal.Handles.Transcript" $ do
         e2 <- mkEntryRecord
         let secret = TrpText "super-secret-api-key"
             toolUse = Message Assistant
-              [CbToolUse (ToolCallId "tc1") (OpName "SECRET_GET") (object [])]
+              [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
             resultMsg = Message User
               [CbToolResult (ToolCallId "tc1") [secret] False]
             -- Write A: the full conversation with the unredacted tool result.
@@ -279,7 +279,7 @@ spec = describe "Seal.Handles.Transcript" $ do
             -- The in-memory list still has the UNREDACTED tool result.
             convB = convA <> [Message Assistant [CbText "ok"]]
         withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
           tfwRecordAndAck h (TwoFileWrite convA e1)
           tfwRecordAndAck h (TwoFileWrite convB e2)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")

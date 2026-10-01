@@ -208,14 +208,14 @@ sshToHttps url
 
 -- | The per-op credential dependencies, passed as a closed-over param to
 -- 'resolveCloneTarget' / 'cloneRepo' / 'lsRemoteRepo' (mirrors
--- @secretGetOp (cdVault deps)@ at @Channels/Loop.hs:1094@ — NOT via
+-- @secretManageOp (cdVault deps)@ at @Channels/Loop.hs:1094@ — NOT via
 -- 'Env'/'mkEnv'; the codebase proved 'Env' is the wrong vehicle).
 --
 -- Carries:
 --
 -- * @cdVault@ — the 'VaultRuntime' (yields the live 'VaultHandle' via
 --   'vrHandleRef' at runtime; fail-closed to 'CloneVaultError VaultLocked'
---   if the vault is unconfigured/locked). Mirrors @secretGetOp rt@ which
+--   if the vault is unconfigured/locked). Mirrors @secretManageOp rt@ which
 --   takes 'VaultRuntime', not the raw handle.
 -- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Shared agent:
 --   started once (lazily on first use, cached in 'cdAgentEnvRef'),
@@ -525,7 +525,7 @@ keyfileBaseName :: SourceRepo -> FilePath
 keyfileBaseName repo = T.unpack (repoIdText (srId repo))
 
 -- | Resolve the live 'VaultHandle' from the 'VaultRuntime' (mirrors
--- @secretGetOp@'s pattern at @Seal.ISA.Ops.Secret:73@). Fail-closed to
+-- @secretManageOp@'s pattern at @Seal.ISA.Ops.Secret:73@). Fail-closed to
 -- 'CloneVaultError VaultLocked' if the vault is unconfigured/locked (the
 -- 'IORef' holds 'Nothing'). This is the W3 evolution: @cdVault@ is now
 -- 'VaultRuntime' (not the raw 'VaultHandle') so the opcode can be built once

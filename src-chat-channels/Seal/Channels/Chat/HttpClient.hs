@@ -11,6 +11,8 @@ module Seal.Channels.Chat.HttpClient
     -- * Tabs
   , httpGetTabs
   , TabJson (..)
+    -- * Sessions list
+  , httpGetSessions
     -- * Sessions
   , httpNewSession
   , httpGetTranscript
@@ -82,6 +84,20 @@ httpGetTabs mgr apiBase = do
   doRequest mgr url methodGet Nothing >>= \case
     Left e -> pure (Left e)
     Right body -> pure (parseTabsBody body)
+
+-- | @GET /api/sessions@ — list all sessions (the recent, non-archived
+-- sessions). Returns the raw JSON array (each element is a session info
+-- object with @id@, @description@, @autoSummary@, @firstMessageSnippet@,
+-- @agent@, etc.).
+httpGetSessions :: Manager -> Text -> IO (Either Text [Value])
+httpGetSessions mgr apiBase = do
+  let url = T.unpack apiBase <> "/sessions"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body ->
+      case A.decode body :: Maybe [Value] of
+        Just vs -> pure (Right vs)
+        Nothing -> pure (Left "failed to parse sessions JSON array")
 
 -- | @POST /api/sessions/new@ — create a new session.
 httpNewSession :: Manager -> Text -> Value -> IO (Either Text Text)

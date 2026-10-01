@@ -299,7 +299,7 @@ handleDefDelete backend v = do
 -- discoverable in the audit trail.
 knownOpNames :: Set.Set Text
 knownOpNames = Set.fromList
-  [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_GET"
+  [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_MANAGE"
   , "MEMORY_WRITE", "MEMORY_READ", "MEMORY_LIST", "MEMORY_SEARCH", "MEMORY_ARCHIVE"
   , "MEMORY_MANAGE"
   , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
