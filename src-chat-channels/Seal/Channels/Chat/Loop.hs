@@ -193,12 +193,14 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
   -- toggles per-conversation loop state, not a gateway command.
   if isWatchCommand body
     then do
+      dbg ("[watch] /watch command received, key=" <> ckConv key)
       handleWatchToggle chan watchState key body
       -- When watch mode is turned ON, ensure a WS connection exists so
       -- the channel receives BeActivity events for all tabs. Without
       -- this, /watch as the first message would enable watch mode but
       -- never receive any events (no WS connection = no event source).
       watchOn <- lookupWatch watchState key
+      dbg ("[watch] watchOn=" <> (if watchOn then "true" else "false") <> ", ensuring WS conn")
       when watchOn $
         void (resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key)
     else case parseTabFocus body of
@@ -288,6 +290,7 @@ ensureWsConn
 ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid = do
   let gwCfg = cccGateway cfg
   conns <- readTVarIO wsConns
+  dbg ("[watch] ensureWsConn key=" <> ckConv key <> " hasConn=" <> (case Map.lookup key conns of Just _ -> "true"; Nothing -> "false"))
   case Map.lookup key conns of
     Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
     Nothing -> do
@@ -295,7 +298,7 @@ ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key
       let callback = handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs sid
       eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
-        Left _ -> pure ()  -- WS failed; the channel still works via HTTP
+        Left e -> dbg ("[watch] WS connect FAILED: " <> e)
         Right ws -> do
           ss <- newStreamingState
           atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
@@ -320,8 +323,12 @@ handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkin
     SeEntry sid val
       | sid == focusedSid -> handleEntry cfg chan key wsConns val
     SeActivity sid val
-      | sid == focusedSid -> handleActivity cfg chan key wsConns val
-      | otherwise         -> handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
+      | sid == focusedSid -> do
+          dbg ("[watch] SeActivity focused sid=" <> sessionIdText sid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
+          handleActivity cfg chan key wsConns val
+      | otherwise         -> do
+          dbg ("[watch] SeActivity non-focused sid=" <> sessionIdText sid <> " focusedSid=" <> sessionIdText focusedSid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
+          handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
     -- Tool-call events are BeActivity with kind="tool-call", broadcast
     -- by the server's aeOnToolCall hook. They arrive as SeActivity.
     -- handleActivity dispatches on kind internally.
@@ -350,6 +357,8 @@ handleWatchToggle chan watchState key body =
     ["/watch", "on"]  -> setWatch True
     ["/watch", "off"] -> setWatch False
     _ -> do  -- bare /watch — toggle
+      cur <- lookupWatch watchState key
+      dbg ("[watch] toggle: currently " <> (if cur then "on" else "off"))
       newVal <- toggleWatch watchState key
       ccSend chan (watchConfirm newVal)
   where
@@ -381,13 +390,16 @@ handleWatchActivity
   -> SessionId -> SessionId -> Value -> IO ()
 handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = do
   watchOn <- lookupWatch watchState key
+  dbg ("[watch] handleWatchActivity sid=" <> sessionIdText sid <> " watchOn=" <> (if watchOn then "true" else "false"))
   when watchOn $ do
     let kind = extractActivityKind val
+    dbg ("[watch] kind=" <> kind <> " status=" <> extractActivityStatus val)
     case kind of
       "harness-status" -> do
         let status = extractActivityStatus val
         case status of
-          "thinking" ->
+          "thinking" -> do
+            dbg ("[watch] adding to thinking set: sid=" <> sessionIdText sid)
             atomically (modifyTVar' thinkingTabs (Map.insertWith Set.union key (Set.singleton sid)))
           "idle" -> do
             wasThinking <- atomically $ do
@@ -398,6 +410,7 @@ handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = d
                   writeTVar thinkingTabs (if Set.null sids' then Map.delete key m else Map.insert key sids' m)
                   pure True
                 _ -> pure False
+            dbg ("[watch] idle received, wasThinking=" <> (if wasThinking then "true" else "false") <> " sid=" <> sessionIdText sid)
             when wasThinking $
               sendWatchNotification cfg chan sid
           _ -> pure ()
@@ -415,6 +428,7 @@ sendWatchNotification cfg chan sid = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
       sidText = sessionIdText sid
+  dbg ("[watch] sendWatchNotification sid=" <> sidText)
   tabLabel <- do
     eTabs <- httpGetTabs mgr apiBase
     case eTabs of
@@ -428,6 +442,7 @@ sendWatchNotification cfg chan sid = do
     case eEntries of
       Right entries -> pure (lastAssistantText entries)
       Left _        -> pure Nothing
+  dbg ("[watch] notification tabLabel=" <> tabLabel <> " hasReply=" <> (case mReply of Just _ -> "true"; Nothing -> "false"))
   let header = "\x1F4D4 Tab " <> tabLabel <> " finished thinking"
   case mReply of
     Just reply | not (T.null reply) -> ccSend chan (header <> ":\n" <> reply)
