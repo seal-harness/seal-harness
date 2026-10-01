@@ -5,10 +5,11 @@
 -- breaks on tool calls, late-update handling after finalize, state reset).
 module Seal.Channels.Chat.LoopSpec (spec) where
 
-import Control.Concurrent.STM (newTVarIO, readTVarIO)
+import Control.Concurrent.STM (newTVarIO, readTVarIO, TVar)
 import Data.IORef
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -22,7 +23,9 @@ import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
+  , StreamingState
   , ConversationKey (..)
+  , newSessionMap
   , newStreamingState
   , defaultGatewayConfig
   )
@@ -430,6 +433,59 @@ spec = do
 
     it "returns just the question when no options" $ do
       formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?"
+  describe "handleInbound inject behavior" $ do
+    -- When the user sends "/N payload" (ChatInject), the message should
+    -- be sent to tab N's session WITHOUT changing the focused tab. The
+    -- key observable: the channel must NOT receive "focused tab N" (or
+    -- any "focus failed" message) — handleFocus is not called at all.
+    -- These tests run without a live gateway, so HTTP calls fail; the
+    -- assertion is that no focus-related message is produced.
+    let injectKey = ConversationKey "test" "conv-inject"
+
+    it "does not send 'focused tab' when processing /N payload (ChatInject)" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6 hello world"
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any ("focused tab" `T.isInfixOf`)
+
+    it "does not send 'focus failed' when processing /N payload (ChatInject)" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6 hello world"
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any ("focus" `T.isInfixOf`)
+
+    it "does send 'focus failed' when processing /N without payload (ChatFocus)" $ do
+      -- Sanity check: bare /N (ChatFocus) still produces a focus-related
+      -- message (it fails because no gateway is running, but the
+      -- "focus failed" message proves handleFocus was called).
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6"
+      sends <- getSends chan
+      sends `shouldSatisfy` any ("focus" `T.isInfixOf`)
   describe "watch-all-tabs" $ do
     it "/watch toggles watch mode on and sends a confirmation" $ do
       chan <- mkMockChan
@@ -597,3 +653,4 @@ spec = do
         (SeActivity otherSid (toolCallJson "SHELL_EXEC"))
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+

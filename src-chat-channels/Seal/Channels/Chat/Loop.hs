@@ -6,6 +6,8 @@ module Seal.Channels.Chat.Loop
   , ChatChannelConfig (..)
   , defaultChatChannelConfig
     -- * Event handlers (for testing)
+  , handleInbound
+  , handleFocus
   , handleServerEvent
     -- * Pure helpers (for testing)
   , extractEntryText
@@ -210,9 +212,9 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
       Right (ChatFocus idx) ->
         handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
       Right (ChatInject idx payload) -> do
-        -- Focus the tab, then send the payload as a plain message.
-        handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
-        sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key payload
+        -- Send the payload to the target tab's session WITHOUT changing
+        -- the focused tab (no FocusOp, no "focused tab N" confirmation).
+        handleInject cfg chan idx payload
       Right ChatCurrentTab -> do
         -- Send the current tab info via HTTP (the gateway routes /tab).
         mSid <- sessionLookup sessions key
@@ -273,6 +275,43 @@ handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinking
                 ccSend chan ("focused tab " <> T.singleton (tabIndexToChar idx))
                 -- Fetch and send the last assistant reply for context.
                 sendLastReply cfg chan sid
+
+-- | Handle an inject command (@\/N payload@): resolve the tab index to a
+-- session id via @GET /api/tabs@, then send the payload to that session
+-- via @POST /api/sessions/:id/send@. Unlike 'handleFocus', this does NOT
+-- change the focused tab, send a FocusOp over WS, update the session map,
+-- send a "focused tab N" confirmation, or send the last assistant reply.
+-- The payload is delivered to the target session; any response will be
+-- visible when the user later focuses on that tab.
+handleInject
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> TabIndex -> Text
+  -> IO ()
+handleInject cfg chan idx payload = do
+  let apiBase = gcApiBase (cccGateway cfg)
+      mgr = cccHttpManager cfg
+  eTabs <- httpGetTabs mgr apiBase
+  case eTabs of
+    Left e -> ccSend chan ("inject failed: " <> e)
+    Right tabs ->
+      case [ t | t <- tabs, tjIndex t == tabIndexToInt idx ] of
+        [] -> ccSend chan "inject failed: tab index out of range"
+        (tab : _) ->
+          case tjSessionId tab of
+            Nothing -> ccSend chan "inject failed: tab has no session"
+            Just sidText -> case mkSessionId sidText of
+              Left _ -> ccSend chan "inject failed: invalid session id"
+              Right sid -> do
+                -- Send the payload to the target session via HTTP.
+                -- Do NOT update the session map, send a FocusOp, or
+                -- send a focus confirmation — the current focused tab
+                -- is unchanged.
+                eResult <- httpSend mgr apiBase sid payload
+                case eResult of
+                  Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
+                  Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
+                  Right _ -> pure ()  -- assistant response comes via WS
+                  Left e -> ccSend chan ("error: " <> e)
 
 -- | Ensure a WS connection exists for the conversation. If one exists,
 -- send a FocusOp to change focus. If not, start a new WS connection with
