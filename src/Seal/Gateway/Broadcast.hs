@@ -101,7 +101,7 @@ broadcastReplyDelivered mBroker sid =
 -- | Push a per-session @tool-call@ activity signal to every WS subscriber.
 -- The chat-channel WS client receives this as an @activity@ event and
 -- renders a tool-progress bubble. The tool input is redacted for opcodes
--- in the @secretOps@ set (e.g. @SECRET_GET@) and truncated to 120
+-- in the @secretOps@ set (e.g. @SECRET_MANAGE@) and truncated to 120
 -- characters for non-secret opcodes. 'Nothing' broker (tests) is a no-op.
 -- Pure input formatting (no IO beyond the broadcast itself).
 broadcastToolCall

@@ -27,7 +27,7 @@
 --     boundary.
 --
 -- Credential resolution (W3 — design §4.2/§4.3, rev 3): 'setupRepoOp' takes
--- a 'CloneDeps' closed-over param (mirrors @secretGetOp (cdVault deps)@).
+-- a 'CloneDeps' closed-over param (mirrors @secretManageOp (cdVault deps)@).
 -- 'cloneRepoIO' does @lookupRepoByUrl@ against the registry
 -- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
 -- credential via the no-disk seam ('Seal.SourceControl.Clone.resolveCloneTarget'

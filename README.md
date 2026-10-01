@@ -151,16 +151,12 @@ not *what* it was.
 Vault lock, unlock, and rekey are admin operations handled by the CLI, not
 agent opcodes. Unlocking can require a physical hardware token (YubiKey,
 NitroKey) — that's a human-in-the-loop step, not something the agent does
-autonomously. If the vault is locked when the agent calls `SECRET_GET`, it
+autonomously. If the vault is locked when the agent calls `SECRET_MANAGE`, it
 gets a "vault locked" error and can ask the human to unlock it via `ASK_HUMAN`.
 
 | Opcode | What it does |
 |---|---|
-| `SECRET_SAVE` | Encrypt and store a secret under a key name |
-| `SECRET_GET` | Decrypt and return a secret (value stays in memory, not logged) |
-| `SECRET_LIST` | List key names only — never values |
-| `SECRET_DELETE` | Remove a secret from the vault |
-| `VAULT_STATUS` | Report locked/unlocked state, key type, secret count |
+| `SECRET_MANAGE` | Full vault secret CRUD: `get` (decrypt and return), `put` (encrypt and store — upsert), `delete` (remove — ALWAYS prompts human approval), `list` (key names only). Values stay in memory, never logged. |
 
 This isn't a config file with `API_KEY=***`. It's a cryptographically sealed
 vault with hardware token support, atomic operations, and a full audit trail
@@ -335,7 +331,7 @@ logged in session transcript AND in a unified cross-session append-only log).
 | **Skills** | `SKILL_WRITE`, `SKILL_LOAD`, `SKILL_LIST`, `SKILL_DELETE` | Audited |
 | **Agents** | `AGENT_DEF_WRITE`, `AGENT_DEF_READ`, `AGENT_DEF_LIST`, `AGENT_DEF_DELETE`, `AGENT_INSTANCES`, `AGENT_START`, `AGENT_STATUS`, `AGENT_STOP` | Audited |
 | **Config** | `CONFIG_VIEW`, `CONFIG_UPDATE`, `TARGET_SET`, `PROVIDER_LIST` | Audited |
-| **Secrets** | `SECRET_SAVE`, `SECRET_GET`, `SECRET_LIST`, `SECRET_DELETE`, `VAULT_STATUS` | Audited |
+| **Secrets** | `SECRET_MANAGE` | Audited |
 | **Sessions** | `SESSION_NEW`, `SESSION_COMPACT`, `SESSION_SEARCH` | Trusted |
 | **Scheduling** | `CRON`, `HEARTBEAT_WAKEUP` | Trusted |
 | **Human Interaction** | `ASK_HUMAN`, `SHOW_HUMAN` | Trusted |
