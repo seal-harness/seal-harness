@@ -52,7 +52,7 @@ import Network.HTTP.Client (Manager)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.HttpClient
-  (httpSend, httpGetTabs, httpNewSession, httpGetTranscript, httpAnswerQuestion,
+  (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
    SendResult (..), TabJson (..))
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
@@ -429,12 +429,25 @@ sendWatchNotification cfg chan sid = do
       mgr = cccHttpManager cfg
       sidText = sessionIdText sid
   dbg ("[watch] sendWatchNotification sid=" <> sidText)
-  tabLabel <- do
+  -- Resolve the tab index (for the "Tab N" prefix) from GET /api/tabs,
+  -- and the session display title (the same label the web frontend's
+  -- sidebar shows) from GET /api/sessions. The title cascade mirrors
+  -- the frontend's sessionDisplayTitle: description, autoSummary,
+  -- firstMessageSnippet, agent, short id.
+  tabIdx <- do
     eTabs <- httpGetTabs mgr apiBase
     case eTabs of
       Right tabs ->
         case [ t | t <- tabs, tjSessionId t == Just sidText ] of
-          (t : _) -> pure (tabDisplayLabel t)
+          (t : _) -> pure (T.pack (show (tjIndex t)))
+          []      -> pure "?"
+      Left _ -> pure "?"
+  sessionTitle <- do
+    eSessions <- httpGetSessions mgr apiBase
+    case eSessions of
+      Right sessions ->
+        case [ s | s <- sessions, sessionJsonId s == Just sidText ] of
+          (s : _) -> pure (sessionDisplayTitle s)
           []      -> pure sidText
       Left _ -> pure sidText
   mReply <- do
@@ -442,16 +455,44 @@ sendWatchNotification cfg chan sid = do
     case eEntries of
       Right entries -> pure (lastAssistantText entries)
       Left _        -> pure Nothing
-  dbg ("[watch] notification tabLabel=" <> tabLabel <> " hasReply=" <> (case mReply of Just _ -> "true"; Nothing -> "false"))
-  let header = "\x1F4D4 Tab " <> tabLabel <> " finished thinking"
+  dbg ("[watch] notification tabIdx=" <> tabIdx <> " sessionTitle=" <> sessionTitle <> " hasReply=" <> (case mReply of Just _ -> "true"; Nothing -> "false"))
+  let header = "\x1F4D4 Tab " <> tabIdx <> " (" <> sessionTitle <> ") finished thinking"
   case mReply of
     Just reply | not (T.null reply) -> ccSend chan (header <> ":\n" <> reply)
     _ -> ccSend chan header
 
--- | Resolve a 'TabJson' to a display label: the user-set label if
--- present, otherwise the tab index as text. Pure.
-tabDisplayLabel :: TabJson -> Text
-tabDisplayLabel t = fromMaybe (T.pack (show (tjIndex t))) (tjLabel t)
+-- | Extract the @id@ field from a session info JSON object (from
+-- @GET /api/sessions@). Returns 'Nothing' when the field is missing or
+-- not a string. Pure.
+sessionJsonId :: Value -> Maybe Text
+sessionJsonId (A.Object o) = asText =<< KeyMap.lookup (Key.fromText "id") o
+sessionJsonId _ = Nothing
+
+-- | Derive the display title from a session info JSON object, mirroring
+-- the web frontend's @sessionDisplayTitle@ cascade:
+-- @description -> autoSummary -> firstMessageSnippet -> agent -> short id@.
+-- Pure.
+sessionDisplayTitle :: Value -> Text
+sessionDisplayTitle val =
+  case val of
+    A.Object o ->
+      fromMaybe (shortId o) (firstNonEmpty
+        [ asText =<< KeyMap.lookup (Key.fromText "description") o
+        , asText =<< KeyMap.lookup (Key.fromText "auto_summary") o
+        , asText =<< KeyMap.lookup (Key.fromText "autoSummary") o
+        , asText =<< KeyMap.lookup (Key.fromText "first_message_snippet") o
+        , asText =<< KeyMap.lookup (Key.fromText "firstMessageSnippet") o
+        , asText =<< KeyMap.lookup (Key.fromText "agent") o
+        ])
+    _ -> "?"
+  where
+    firstNonEmpty = foldr (\m acc -> case m of
+      Just t | not (T.null t) -> Just t
+      _                       -> acc) Nothing
+    shortId o =
+      maybe "?" (T.take 12)
+        (asText =<< KeyMap.lookup (Key.fromText "id") o)
+
 
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
