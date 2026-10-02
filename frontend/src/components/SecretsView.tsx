@@ -338,62 +338,66 @@ export function SecretsView() {
               </div>
             )}
 
-            <div className="flex items-center gap-2" style={{ marginTop: 8 }}>
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={handleSubmit}
-                disabled={submitting || !valueLoaded}
-                data-testid="secret-save"
-              >
-                {submitting ? 'Saving…' : creating ? 'Create' : 'Save'}
-              </button>
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={handleCancel}
-              >
-                Cancel
-              </button>
-              {!creating && selected && (
-                <>
-                  <div style={{ flex: 1 }} />
-                  {confirmingDelete === editing ? (
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs" style={{ color: 'var(--needs-input)' }}>
-                        Delete &ldquo;{editing}&rdquo;? This cannot be undone.
-                      </span>
-                      <button
-                        type="button"
-                        className="btn"
-                        style={{ background: 'var(--needs-input)', color: 'white', fontSize: 12 }}
-                        onClick={() => void handleDelete(editing!)}
-                        data-testid="secret-delete-confirm"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-ghost"
-                        style={{ fontSize: 12 }}
-                        onClick={() => setConfirmingDelete(null)}
-                      >
-                        Keep
-                      </button>
-                    </div>
-                  ) : (
+            <div
+              className="flex flex-col gap-2"
+              style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}
+            >
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
+                  onClick={handleSubmit}
+                  disabled={submitting || !valueLoaded}
+                  aria-label={creating ? 'Create secret' : 'Save secret'}
+                  data-testid="secret-save"
+                >
+                  {creating ? 'Create' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                  onClick={handleCancel}
+                >
+                  Cancel
+                </button>
+                {!creating && selected && confirmingDelete !== editing && (
+                  <button
+                    type="button"
+                    className="btn btn-danger-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                    style={{ marginLeft: 'auto' }}
+                    onClick={() => setConfirmingDelete(editing)}
+                    aria-label="Delete secret"
+                    data-testid="secret-delete"
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+              {!creating && selected && confirmingDelete === editing && (
+                <div className="flex flex-col gap-2" data-testid="secret-delete-confirm">
+                  <span className="text-sm" style={{ color: 'var(--needs-input)' }}>
+                    Delete secret <strong>{editing}</strong>? This cannot be undone.
+                  </span>
+                  <div className="flex gap-2">
                     <button
                       type="button"
-                      className="btn btn-ghost"
-                      style={{ color: 'var(--needs-input)', fontSize: 12 }}
-                      onClick={() => setConfirmingDelete(editing)}
-                      aria-label="Delete secret"
-                      data-testid="secret-delete"
+                      className="btn btn-danger-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                      style={{ background: 'var(--needs-input)', color: 'var(--text-primary)' }}
+                      onClick={() => void handleDelete(editing!)}
+                      aria-label="Confirm delete"
+                      data-testid="secret-delete-confirm"
                     >
-                      Delete
+                      Confirm delete
                     </button>
-                  )}
-                </>
+                    <button
+                      type="button"
+                      className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                      onClick={() => setConfirmingDelete(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           </div>
