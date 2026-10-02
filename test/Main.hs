@@ -91,6 +91,7 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
+import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
@@ -273,6 +274,7 @@ specs = do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.Chat.TypesSpec.spec
+  Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
