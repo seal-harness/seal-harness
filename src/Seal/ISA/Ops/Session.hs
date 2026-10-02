@@ -42,7 +42,7 @@ import Seal.Config.Paths
   ( SealPaths, sessionConversationPath, sessionDir, sessionMetaPath
   , resolveChildSessionPath )
 import Seal.Core.Paging
-  ( Page (..), PageParams (..), paginate )
+  ( Page (..), PageParams (..), paginate, paginateDesc )
 import Seal.Core.Types
   ( OpName (..), SessionId, TrustLevel (..), mkSessionId, sessionIdText )
 import Seal.ISA.Opcode
@@ -75,6 +75,35 @@ parseSessionAction v =
       "get"    -> Right SessGet
       other    -> Left ("unknown session action: " <> other)
     Nothing -> Left "missing or invalid action field"
+
+-- ---------------------------------------------------------------------------
+-- Read order (front-to-back vs back-to-front)
+-- ---------------------------------------------------------------------------
+
+-- | Controls whether transcript pagination starts from the beginning
+-- (front-to-back) or the end (back-to-front) of the session.
+data ReadOrder = OrderAsc | OrderDesc
+  deriving stock (Eq, Show)
+
+-- | Parse the @order@ field from the input JSON. Absent → 'OrderDesc'
+-- (back-to-front is the default, since the end of the session is usually
+-- what the caller wants). Unrecognized values also default to 'OrderDesc'.
+parseReadOrder :: Value -> ReadOrder
+parseReadOrder v =
+  case textField v "order" of
+    Just "front-to-back" -> OrderAsc
+    Just "back-to-front" -> OrderDesc
+    _                    -> OrderDesc
+
+-- | Dispatch to 'paginate' (front-to-back) or 'paginateDesc' (back-to-front).
+paginateBy :: ReadOrder -> PageParams -> Int -> Maybe Int -> [a] -> Page a
+paginateBy OrderAsc = paginate
+paginateBy OrderDesc = paginateDesc
+
+-- | Render the order as a JSON string value for the @orRecorded@ metadata.
+renderOrderJson :: ReadOrder -> Text
+renderOrderJson OrderAsc = "front-to-back"
+renderOrderJson OrderDesc = "back-to-front"
 
 -- ---------------------------------------------------------------------------
 -- Page parameters
@@ -168,6 +197,7 @@ handleGet paths v = do
   let mSidText = textField v "session_id"
       offset = fromMaybe 0 (intField v "offset")
       mLimit = intField v "limit"
+      order = parseReadOrder v
   case mSidText >>= either (const Nothing) Just . mkSessionId . T.strip of
     Nothing -> pure (OpResult [TrpText "invalid session id"] True (object []))
     Just sid -> do
@@ -179,17 +209,18 @@ handleGet paths v = do
         Just meta -> do
           msgs <- liftIO (readSessionMessages paths sid)
           let total = length msgs
-              page = paginate sessionPageParams offset mLimit msgs
+              page = paginateBy order sessionPageParams offset mLimit msgs
               windowMsgs = pgItems page
               header = renderSessionMeta meta
               body = T.intercalate "\n\n"
                 (zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)
-              footer = renderPageFooter (pgOffset page) (length windowMsgs) total (pgHasMore page)
+              footer = renderPageFooter order (pgOffset page) offset (length windowMsgs) total (pgHasMore page)
               rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
               recorded = object
                 [ "session_id" .= sessionIdText sid
                 , "provider" .= smProvider meta
                 , "model" .= smModel meta
+                , "order" .= renderOrderJson order
                 , "offset" .= pgOffset page
                 , "limit" .= length windowMsgs
                 , "total_messages" .= total
@@ -205,16 +236,17 @@ handleGet paths v = do
             Just (parentSid, childDir) -> do
               msgs <- liftIO (readMessagesFromDir childDir)
               let total = length msgs
-                  page = paginate sessionPageParams offset mLimit msgs
+                  page = paginateBy order sessionPageParams offset mLimit msgs
                   windowMsgs = pgItems page
                   header = "[child session of " <> sessionIdText parentSid <> "] " <> sessionIdText sid
                   body = T.intercalate "\n\n"
                     (zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)
-                  footer = renderPageFooter (pgOffset page) (length windowMsgs) total (pgHasMore page)
+                  footer = renderPageFooter order (pgOffset page) offset (length windowMsgs) total (pgHasMore page)
                   rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
                   recorded = object
                     [ "session_id" .= sessionIdText sid
                     , "child_of" .= sessionIdText parentSid
+                    , "order" .= renderOrderJson order
                     , "offset" .= pgOffset page
                     , "limit" .= length windowMsgs
                     , "total_messages" .= total
@@ -262,7 +294,7 @@ sessionManageOp :: SealPaths -> SessionSearchBackend -> Opcode
 sessionManageOp paths searchBackend = TrustedOpcode
   { toName = OpName "SESSION_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination)."
+  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination). For get, order defaults to back-to-front (most recent messages first)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -305,11 +337,16 @@ sessionManageOp paths searchBackend = TrustedOpcode
               ]
           , fromText "offset" .= object
               [ "type" .= ("integer" :: Text)
-              , "description" .= ("Message offset, 0-based (get). Default: 0." :: Text)
+              , "description" .= ("Message offset, 0-based (get). In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0." :: Text)
               ]
           , fromText "limit" .= object
               [ "type" .= ("integer" :: Text)
               , "description" .= ("Max messages to return (get). Default: 50, max: 200." :: Text)
+              ]
+          , fromText "order" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["front-to-back", "back-to-front"] :: [Text])
+              , "description" .= ("Read direction (get). front-to-back: offset from start. back-to-front: offset from end. Default: back-to-front." :: Text)
               ]
           ]
       , "required" .= (["action"] :: [Text])
@@ -430,11 +467,16 @@ sessionGetOp paths = TrustedOpcode
               ]
           , fromText "offset" .= object
               [ "type" .= ("integer" :: Text)
-              , "description" .= ("0-based message offset to start reading from. Default: 0." :: Text)
+              , "description" .= ("0-based message offset. In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0." :: Text)
               ]
           , fromText "limit" .= object
               [ "type" .= ("integer" :: Text)
               , "description" .= ("Maximum number of messages to return. Default: 50, max: 200." :: Text)
+              ]
+          , fromText "order" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["front-to-back", "back-to-front"] :: [Text])
+              , "description" .= ("Read direction. front-to-back: offset from start. back-to-front: offset from end. Default: back-to-front." :: Text)
               ]
           ]
       , "required" .= (["session_id"] :: [Text])
@@ -591,17 +633,42 @@ renderBlock (CbToolResult{cbParts = parts, cbIsError = isErr}) =
       content = T.intercalate "\n" [t | TrpText t <- parts]
   in if T.null content then label else label <> " " <> content
 
--- | Render the pagination footer, telling the model how to page forward.
-renderPageFooter :: Int -> Int -> Int -> Bool -> Text
-renderPageFooter offset count total hasMore
+-- | Render the pagination footer, telling the model how to page further.
+-- The @displayOffset@ is the 0-based index in the transcript where the
+-- window starts (used for "messages X-Y"). The @userOffset@ is the offset
+-- value the caller passed (used for "read with offset=Z" guidance) — in
+-- front-to-back mode these are the same; in back-to-front mode they differ.
+renderPageFooter :: ReadOrder -> Int -> Int -> Int -> Int -> Bool -> Text
+renderPageFooter order displayOffset userOffset count total hasMore
   | total == 0 = "(0 messages in transcript)"
-  | offset >= total && count == 0
-  = "[offset " <> T.pack (show offset) <> " is past end of transcript ("
-       <> T.pack (show total) <> " messages); read with offset=0 to start over]"
-  | hasMore
-  = "[messages " <> T.pack (show (offset + 1)) <> "-" <> T.pack (show (offset + count))
-       <> " of " <> T.pack (show total) <> "; " <> T.pack (show (total - offset - count))
-       <> " more - read with offset=" <> T.pack (show (offset + count)) <> " for the next window]"
-  | otherwise
-  = "[messages " <> T.pack (show (offset + 1)) <> "-" <> T.pack (show (offset + count))
-       <> " of " <> T.pack (show total) <> " (end of transcript)]"
+  | count == 0 = pastEndMsg
+  | hasMore    = moreMsg
+  | otherwise  = endMsg
+  where
+    nextOffset = userOffset + count
+    rangeText  = T.pack (show (displayOffset + 1)) <> "-"
+                   <> T.pack (show (displayOffset + count))
+    totalText  = T.pack (show total)
+    pastEndMsg = case order of
+      OrderAsc ->
+        "[offset " <> T.pack (show userOffset) <> " is past end of transcript ("
+          <> totalText <> " messages); read with offset=0 to start over]"
+      OrderDesc ->
+        "[offset " <> T.pack (show userOffset) <> " is past the beginning of transcript ("
+          <> totalText <> " messages); read with offset=0 to start from the end]"
+    moreMsg = case order of
+      OrderAsc ->
+        "[messages " <> rangeText <> " of " <> totalText <> "; "
+          <> T.pack (show (total - displayOffset - count))
+          <> " more - read with offset=" <> T.pack (show nextOffset)
+          <> " for the next window]"
+      OrderDesc ->
+        "[messages " <> rangeText <> " of " <> totalText <> "; "
+          <> T.pack (show displayOffset)
+          <> " earlier - read with offset=" <> T.pack (show nextOffset)
+          <> " for the next page back]"
+    endMsg = case order of
+      OrderAsc ->
+        "[messages " <> rangeText <> " of " <> totalText <> " (end of transcript)]"
+      OrderDesc ->
+        "[messages " <> rangeText <> " of " <> totalText <> " (beginning of transcript)]"
