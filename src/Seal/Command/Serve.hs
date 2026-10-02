@@ -22,13 +22,15 @@ import Katip (Severity (..), ls)
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
 import qualified Data.Text.Encoding as TE
-import Seal.Channels.Chat.Loop (runChatChannel, defaultChatChannelConfig)
+import Seal.Channels.Chat.Loop
+  (runChatChannel, defaultChatChannelConfig, WatchState, newPersistingWatchState, seedWatchState)
 import Seal.Channels.Chat.Types qualified as ChatTypes
   (GatewayConfig (..))
 import Seal.Channels.Chat.Signal as ChatSignal
   (withSignalChatChannel, mkRealSignalChatTransport)
 import Seal.Channels.Chat.Telegram as ChatTelegram
   (withTelegramChatChannel, mkRealTelegramChatTransport)
+import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Cursor
@@ -52,7 +54,7 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -174,6 +176,12 @@ runServeMain autonomy logger = do
   cursorsH <- newPersistingCursorStore (cursorMapPath paths)
   mCursors <- loadCursorMap (cursorMapPath paths)
   for_ mCursors (seedCursorStore cursorsH)
+  -- Persisting watch-state store: load + seed so a conversation's
+  -- watch-all-tabs mode is restored after a @seal serve@ restart.
+  -- Mirrors the cursor-store boot path above.
+  watchState <- newPersistingWatchState (saveWatchMap (watchMapPath paths))
+  mWatch <- loadWatchMap (watchMapPath paths)
+  for_ mWatch (seedWatchState watchState)
   reg     <- newHarnessRegistry
   tmuxR   <- mkRealTmuxRunner
   uiState <- newUiStateHandle paths
@@ -352,8 +360,8 @@ runServeMain autonomy logger = do
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The channels connect to the gateway as clients (HTTP + WS)
   -- via the 'seal-chat-channels' package.
-  forkNewSignalChatChannel logger gwCfg mgr cfg
-  forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle
+  forkNewSignalChatChannel logger gwCfg mgr cfg watchState
+  forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState
   -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
   -- mode=remote (design V6: prevents network access to the unauthenticated
   -- updateRuntimeConfig caller).
@@ -443,8 +451,8 @@ renumberTabs ts = TabList (zipWith renumber [0..] ts)
 -- ---------------------------------------------------------------------------
 -- | Fork the new Signal chat channel if @[signal]@ is configured.
 forkNewSignalChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> IO ()
-forkNewSignalChatChannel logger gwCfg mgr cfg =
+  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> WatchState -> IO ()
+forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
   case Seal.Signal.Config.resolveSignalConfig (rcSignal cfg) Nothing of
     Left _ -> pure ()
     Right (account, chunkLimit, allow) -> do
@@ -472,12 +480,12 @@ forkNewSignalChatChannel logger gwCfg mgr cfg =
                           allow
                           chunkLimit
                           transport
-                          (runChatChannel chanCfg)))
+                          (\chan -> runChatChannel chanCfg chan watchState)))
 
 -- | Fork the new Telegram chat channel if @[telegram]@ is configured.
 forkNewTelegramChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> IO ()
-forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle = do
+  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> WatchState -> IO ()
+forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
   mVaultToken <- case mHandle of
     Nothing -> pure Nothing
     Just vh -> do
@@ -507,4 +515,4 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle = do
                       allow
                       chunkLimit
                       transport
-                      (runChatChannel chanCfg)))
+                      (\chan -> runChatChannel chanCfg chan watchState)))

@@ -81,7 +81,7 @@ module Seal.Agent.Runtime.Delegation
   , touchParentActivity
   ) where
 
-import Control.Concurrent (forkIO, killThread, threadDelay, ThreadId)
+import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay, ThreadId)
 import Control.Concurrent.STM
   ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar
   , modifyTVar', retry )
@@ -713,15 +713,25 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
                     result = mkErrorResult idx subagentId dur err Nothing
                 void (forkIO (callback result))
               Right (def, worker) -> do
-                -- Fork the worker execution (async), then register the
-                -- child with the forked ThreadId so AGENT_STOP can kill
-                -- the correct thread (not the parent's).
-                childTid <- forkIO $ do
+                -- Fork the worker execution (async). The spawn callback
+                -- (which registers the child in the runtime) is called
+                -- INSIDE the forked thread before the worker runs, so the
+                -- agent is always registered before the completion
+                -- callback fires. This fixes a race where an instant
+                -- worker could complete (and call the completion callback)
+                -- before the spawn callback ran in the parent thread,
+                -- causing the result to be silently dropped
+                -- (registerCompletedAgentResult is a no-op when the agent
+                -- isn't in the registry yet). The ThreadId from myThreadId
+                -- inside the forked thread is the same as forkIO's return
+                -- value, so AGENT_STOP can still kill the correct thread.
+                void $ forkIO $ do
+                  tid <- myThreadId
+                  spawnCallback subagentId def childSid tid
                   case mSem of
                     Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
                     Just sem -> bracketSem sem $
                       runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
-                spawnCallback subagentId def childSid childTid
             pure (SpawnInfo subagentId childSid idx)
       case mSem of
         Nothing -> mkChild
