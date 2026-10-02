@@ -28,16 +28,20 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (toList)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Text (Text)
 import Data.Text qualified as T
-import GHC.Stack (HasCallStack)
-import System.Directory (listDirectory)
+import Control.Exception (bracket)
+import Seal.SourceControl.Repo (RepoCredential (..), srUrl)
+import System.Directory (listDirectory, createDirectoryIfMissing)
+import System.Environment (lookupEnv, setEnv)
 import System.FilePath ((</>))
+import System.Posix.Files (setFileMode)
 import Test.Hspec
   ( Spec, describe, expectationFailure, it, pendingWith, shouldBe
   , shouldNotSatisfy, shouldSatisfy )
+import GHC.Stack (HasCallStack)
 
 import Seal.Agent.Def.Backend qualified as AgentDef
 import Seal.Agent.Runtime.Delegation
@@ -62,6 +66,7 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   w3CatalogSpec
   w2GateSpec
   concurrentSubagentSpec
+  preambleConsistencySpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -1177,6 +1182,87 @@ extractToolResultIsError bo =
     Just (A.Bool b) -> b
     _ -> False
 
+-- ---------------------------------------------------------------------------
+-- Preamble system-prompt consistency
+-- ---------------------------------------------------------------------------
+
+-- | When SETUP_REPO clones a repo with skills, the preamble's system
+-- prompt must use the FRESH (post-clone) skills backend, not the stale
+-- @sessionSkills@ (pre-clone). If the preamble uses stale skills, the
+-- available-skills catalog in its system prompt differs from the first
+-- turn's system prompt. The transcript's delta encoding then emits the
+-- system prompt again on the first turn's request entry, and the
+-- frontend's content-based deduplication fails, producing a second
+-- System Prompt block after the first message.
+--
+-- The test uses a PAT-registered dummy repo with a custom @gh@ shim that
+-- fakes the clone AND creates @.agents/skills/@ in the cloned directory,
+-- so the workdir scan discovers the skills after SETUP_REPO. This avoids
+-- needing a live SSH host or real git server.
+preambleConsistencySpec :: Spec
+preambleConsistencySpec =
+  describe "preamble system-prompt consistency" $ do
+    describe "preamble and first turn share the same system prompt when repo has skills" $
+      runApiTestLocal
+        (Just DummyRepoConfig
+          { drcRepoId = "preamble-test"
+          , drcCredential = CredPat "seal-pat-preamble:test-repo"
+          })
+        defaultApiTestOptions $ \env -> do
+          case ateDummyRepo env of
+            Nothing -> expectationFailure "expected dummy repo"
+            Just dr -> do
+              let url = srUrl (drRepo dr)
+              withPreambleShim env $ do
+                sid <- callApiNewTab env "ollama" "llama3.2"
+                (st, _body) <- callSetupRepoRaw env sid url
+                st `shouldBe` 200
+                setScript env [doneTurn]
+                _ <- sendMsgToSession env sid "hello"
+                entries <- waitForTranscript env sid (\es -> length es >= 4)
+                let systemTexts = mapMaybe payloadSystemText entries
+                length systemTexts `shouldBe` 1
+
+-- | Install a custom @gh@ shim for the duration of the action. The shim
+-- fakes @gh repo clone@ by creating a @.git@ directory (so verifyClone
+-- passes) AND creates @.agents/skills/test-skill/SKILL.md@ in the cloned
+-- directory (so the workdir scan discovers the skill after SETUP_REPO).
+withPreambleShim :: ApiTestEnv -> IO a -> IO a
+withPreambleShim env = bracket install uninstall . const
+  where
+    shimDir   = spHome (atePaths env) </> "shim"
+    shimPath  = shimDir </> "gh"
+    install = do
+      createDirectoryIfMissing True shimDir
+      writeFile shimPath (T.unpack preambleShimScript)
+      setFileMode shimPath 0o755
+      origPath <- lookupEnv "PATH"
+      setEnv "PATH" (maybe shimDir (\p -> shimDir <> ":" <> p) origPath)
+      pure origPath
+    uninstall origPath =
+      setEnv "PATH" (fromMaybe "" origPath)
+
+-- | The custom @gh@ shim script: fakes the clone (creates .git/objects)
+-- and creates a skill in .agents/skills/test-skill/ so the workdir scan
+-- discovers it after SETUP_REPO.
+preambleShimScript :: Text
+preambleShimScript = T.unlines
+  [ "#!/bin/sh"
+  , "# seal-test gh shim for preamble consistency test"
+  , "[ \"$1\" = \"repo\" ] && [ \"$2\" = \"clone\" ] || { echo 'unexpected argv' >&2; exit 98; }"
+  , "# $4 is the destination directory (gh repo clone <url> <dest>)."
+  , "mkdir -p \"$4/.git/objects\" || exit 1"
+  , "mkdir -p \"$4/.agents/skills/test-skill\" || exit 1"
+  , "{ echo '---'"
+  , "  echo 'name: test-skill'"
+  , "  echo 'description: A test skill for preamble consistency.'"
+  , "  echo '---'"
+  , "  echo '# Test Skill'"
+  , "  echo ''"
+  , "  echo 'A test skill for preamble consistency.'"
+  , "} > \"$4/.agents/skills/test-skill/SKILL.md\""
+  , "echo \"Cloning into '$4'...\""
+  ]
 -- ---------------------------------------------------------------------------
 -- Aeson shape helpers
 -- ---------------------------------------------------------------------------
