@@ -64,7 +64,6 @@ export function SecretsView() {
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
   const [value, setValue] = useState('')
-  const [showValue, setShowValue] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
@@ -280,26 +279,15 @@ export function SecretsView() {
                 ? undefined
                 : 'Paste a new value to overwrite (the stored value is never shown).'}
             >
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <input
-                  id="secret-value"
-                  type={showValue ? 'text' : 'password'}
-                  value={value}
-                  onChange={(e) => setValue(e.target.value)}
-                  style={inputStyle}
-                  placeholder={creating ? 'Enter the secret value' : 'Paste new value to overwrite'}
-                  autoComplete="off"
-                />
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  style={{ flexShrink: 0, padding: '4px 8px', fontSize: 12 }}
-                  onClick={() => setShowValue((v) => !v)}
-                  title={showValue ? 'Hide value' : 'Show value'}
-                >
-                  {showValue ? 'Hide' : 'Show'}
-                </button>
-              </div>
+              <input
+                id="secret-value"
+                type="password"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                style={inputStyle}
+                placeholder={creating ? 'Enter the secret value' : 'Paste new value to overwrite'}
+                autoComplete="off"
+              />
             </Row>
 
             {formError && (
