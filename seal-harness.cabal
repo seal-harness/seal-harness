@@ -147,6 +147,7 @@ library
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
+        Seal.Channels.Chat.WatchPersist
         Seal.Channels.Cursor
         Seal.Channels.Cursor.Persist
         Seal.Channels.Loop
@@ -471,6 +472,7 @@ test-suite tests
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
         Seal.Channels.Chat.WsClientSpec
+        Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
