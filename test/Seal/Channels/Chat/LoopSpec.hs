@@ -531,6 +531,41 @@ spec = do
       watchOn <- lookupWatch watchState key
       watchOn `shouldBe` False
 
+    it "/watch status shows 'off' when watch is disabled" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch status"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "off")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
+    it "/watch status shows 'on' when watch is enabled" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleWatchToggle chan watchState key "/watch status"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "on")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` True
+
+    it "/watch -h prints help and does not change state" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch -h"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "on")
+      sends `shouldSatisfy` any (T.isInfixOf "off")
+      sends `shouldSatisfy` any (T.isInfixOf "status")
+      sends `shouldSatisfy` any (T.isInfixOf "/watch")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
     it "watch is per-conversation — toggling one does not affect another" $ do
       chan <- mkMockChan
       watchState <- newWatchState
