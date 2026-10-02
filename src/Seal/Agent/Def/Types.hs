@@ -9,6 +9,7 @@ module Seal.Agent.Def.Types
   ( AgentDefId (..)
   , mkAgentDefId
   , isValidAgentDefId
+  , bareAgentDefIdText
   , agentDefIdText
   , AgentDef (..)
   , sanitizeAgentTextField
@@ -52,6 +53,18 @@ mkAgentDefId t
 
 agentDefIdText :: AgentDefId -> Text
 agentDefIdText (AgentDefId t) = t
+
+-- | The bare (unqualified) id component — the text after the first @--@
+-- separator. Workdir-discovered agent defs are prefixed with
+-- @\<repo\>--\<id\>@ (see 'Seal.Agent.Def.Workdir.prefixWorkdirDef'); this
+-- function extracts the @\<id\>@ part. For a non-prefixed id (no @--@),
+-- returns the id unchanged. Mirrors 'Seal.Skills.Types.bareSkillIdText'
+-- but uses @--@ as the separator (the agent-def charset forbids @\/@).
+bareAgentDefIdText :: AgentDefId -> Text
+bareAgentDefIdText (AgentDefId t) =
+  case T.breakOn "--" t of
+    (_, rest) | not (T.null rest) -> T.drop 2 rest
+    _ -> t
 
 -- | One agent definition. 'adProvider' is a provider label (e.g. @\"ollama\"@);
 -- 'adTools' is the opcode allow-list (which opcodes this agent may call). The

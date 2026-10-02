@@ -103,7 +103,7 @@ import Toml qualified
 
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
-  , isValidAgentDefId, sanitizeAgentDefFields
+  , bareAgentDefIdText, isValidAgentDefId, sanitizeAgentDefFields
   )
 import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Security.Policy (AllowList (..))
@@ -587,6 +587,12 @@ listAgentsDotAgents fs = do
 -- ship a def with the same id): the alphabetically-first repo wins
 -- (deterministic; same as the skill backend's policy).
 --
+-- 'adbRead' resolves bare ids: a direct 'Map.lookup' is tried first, then
+-- a bare-id search (finds @myrepo--foo@ when queried with @foo@). This
+-- mirrors 'Seal.Skills.Backend.resolveSkillId' so @AGENT_DEF_MANAGE@ with
+-- a bare id finds the proj-prefixed workdir def before the union falls
+-- through to the user store.
+--
 -- Every file open goes through the 'WorkdirFs' handle (symlink-escape
 -- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
 -- 'maxScanBytes' + 'truncateSection'.
@@ -594,11 +600,26 @@ workdirAgentDefBackend :: WorkdirFs -> IO AgentDefBackend
 workdirAgentDefBackend fs = pure AgentDefBackend
     { adbRead   = \aid -> do
         defs <- listWorkdirAgentDefs fs
-        pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+        pure (resolveAgentDefId aid (Map.fromList [(adId d, d) | d <- defs]))
     , adbUpdate = \_ -> pure ()
     , adbList   = listWorkdirAgentDefs fs
     , adbDelete = \_ -> pure ()
     }
+
+-- | Resolve an 'AgentDefId' against a 'Map' of workdir-discovered defs,
+-- handling bare ids. A direct (fully-qualified) id is a 'Map.lookup';
+-- a bare id (e.g. @foo@) searches all defs whose 'bareAgentDefIdText'
+-- matches. If exactly one matches, it is returned; if zero or multiple
+-- match, 'Nothing' (ambiguous or absent). Mirrors
+-- 'Seal.Skills.Backend.resolveSkillId'.
+resolveAgentDefId :: AgentDefId -> Map.Map AgentDefId AgentDef -> Maybe AgentDef
+resolveAgentDefId aid m =
+  case Map.lookup aid m of
+    Just d  -> Just d
+    Nothing ->
+      case [ d | (aid', d) <- Map.toList m, bareAgentDefIdText aid' == agentDefIdText aid ] of
+        [d] -> Just d
+        _   -> Nothing
 
 -- | Enumerate every agent def found under the conventional locations across
 -- all top-level directories (cloned repos) in the workdir anchored at the
@@ -661,7 +682,7 @@ snapBasename = snd . T.breakOnEnd "/"
 -- are no-ops (repo-local defs are immutable from the model's perspective).
 staticAgentDefBackend :: [AgentDef] -> IO AgentDefBackend
 staticAgentDefBackend defs = pure AgentDefBackend
-  { adbRead   = \aid -> pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+  { adbRead   = \aid -> pure (resolveAgentDefId aid (Map.fromList [(adId d, d) | d <- defs]))
   , adbUpdate = \_ -> pure ()
   , adbList   = pure defs
   , adbDelete = \_ -> pure ()

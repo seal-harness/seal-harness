@@ -59,6 +59,22 @@ spec = describe "Seal.Agent.Def.Types" $ do
       property $ \case
         AgentDefId t -> mkAgentDefId t === Right (AgentDefId t)
 
+  describe "bareAgentDefIdText" $ do
+    it "extracts the bare id from a repo-prefixed id" $
+      bareAgentDefIdText (AgentDefId "myrepo--foo") `shouldBe` "foo"
+
+    it "extracts the bare id when it itself contains --" $
+      bareAgentDefIdText (AgentDefId "myrepo--foo--bar") `shouldBe` "foo--bar"
+
+    it "returns the id unchanged when there is no -- separator" $
+      bareAgentDefIdText (AgentDefId "foo") `shouldBe` "foo"
+
+    it "returns the id unchanged for a multi-segment id with no --" $
+      bareAgentDefIdText (AgentDefId "my_agent-1") `shouldBe` "my_agent-1"
+
+    it "handles a repo name with a single dash" $
+      bareAgentDefIdText (AgentDefId "seal-harness--architect") `shouldBe` "architect"
+
   describe "sanitizeAgentTextField" $ do
     it "replaces newlines and carriage returns with spaces" $
       sanitizeAgentTextField 256 "line one\nline two\r\nline three"
