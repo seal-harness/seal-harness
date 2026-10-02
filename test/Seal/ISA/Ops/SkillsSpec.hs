@@ -126,6 +126,28 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("s1" :: Text)]))
       orIsError r `shouldBe` True
 
+    it "SKILL_MANAGE load surfaces an ambiguity message with matching ids" $ do
+      backend <- noneBackend
+      let mkFq g = case mkSkillId (g <> "/s1") of Right i -> i; Left _ -> sampleSkillId
+          mkS g = Skill
+            { skId = mkFq g, skDescription = g, skBody = "b"
+            , skGroup = Just g
+            , skCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skSession = sampleSession
+            }
+      sbCreate backend (mkS "core")
+      sbCreate backend (mkS "design")
+      let op = skillManageOp backend sampleSession
+      r <- runTestApp (opRun op localBackend (object ["action" .= ("load" :: Text), "id" .= ("s1" :: Text)]))
+      orIsError r `shouldBe` True
+      case orParts r of
+        [TrpText t] -> do
+          "ambiguous" `T.isInfixOf` t `shouldBe` True
+          "core/s1" `T.isInfixOf` t `shouldBe` True
+          "design/s1" `T.isInfixOf` t `shouldBe` True
+        _ -> expectationFailure "expected a single text part"
+
   describe "SKILL_LIST" $ do
     it "returns an empty message when no skills" $ do
       backend <- noneBackend

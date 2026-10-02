@@ -39,6 +39,8 @@
 module Seal.Agent.Def.Workdir
   ( -- * Backend record
     AgentDefBackend (..)
+  , ResolveResult (..)
+  , resolveAgentDefEntry
     -- * Workdir backend
   , workdirAgentDefBackend
   , listWorkdirAgentDefs
@@ -124,6 +126,35 @@ import Seal.Tools.Exec.WorkdirFs
 -- without an import cycle with "Seal.Agent.Def.Backend", which re-exports
 -- this module's workdir API and builds the user store on top of it).
 -- ---------------------------------------------------------------------------
+
+-- | The result of resolving a (possibly bare) agent def id against a
+-- backend. Mirrors 'Seal.Skills.Backend.ResolveResult'.
+data ResolveResult a
+  = ResolveFound a
+  | ResolveAmbiguous [Text]
+  | ResolveNotFound
+  deriving stock (Eq, Show)
+
+-- | Resolve a (possibly bare) agent def id against an 'AgentDefBackend',
+-- with ambiguity detection. First tries 'adbRead' (which handles
+-- fully-qualified ids and bare-id resolution in the workdir/union
+-- backends). If 'adbRead' returns 'Nothing', lists all defs and searches
+-- for bare-id matches to distinguish "not found" from "ambiguous".
+-- When multiple defs share the same bare id, returns 'ResolveAmbiguous'
+-- with their fully-qualified ids so the caller can present them as
+-- disambiguation options. Mirrors 'Seal.Skills.Backend.resolveSkillEntry'.
+resolveAgentDefEntry :: AgentDefBackend -> AgentDefId -> IO (ResolveResult AgentDef)
+resolveAgentDefEntry backend aid = do
+  mDef <- adbRead backend aid
+  case mDef of
+    Just d  -> pure (ResolveFound d)
+    Nothing -> do
+      allDefs <- adbList backend
+      let matches = [d | d <- allDefs, bareAgentDefIdText (adId d) == agentDefIdText aid]
+      case matches of
+        []  -> pure ResolveNotFound
+        [d] -> pure (ResolveFound d)
+        ds  -> pure (ResolveAmbiguous (map (agentDefIdText . adId) ds))
 
 -- | The agent-definition store capability. Each operation is IO; 'adbList'
 -- returns all defs sorted by id.
