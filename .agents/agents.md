@@ -69,8 +69,8 @@ orchestration pipeline is followed regardless of which skill initiated the work.
   force-push. ALWAYS follow TDD. NEVER self-certify — the orchestrator
   validates independently. STAY within declared file scope.
 - **Context recovery**: Approved plans, project context, and execution
-  state persist to `.beads/`. If context is lost mid-execution, run
-  `bd prime --work-type recovery` to reload from disk.
+  state persist to disk. If context is lost mid-execution, reload from
+  the persisted plan and execution-state files.
 
 # Seal Harness — Agent Guide
 
