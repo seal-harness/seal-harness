@@ -24,6 +24,7 @@ module Seal.Config.Paths
   , workdirsRoot
   , sessionWorkdir
   , tabListPath
+  , watchMapPath
   , cursorMapPath
   ) where
 
@@ -215,6 +216,15 @@ cursorMapPath paths = spState paths </> "cursors.json"
 
 -- | Directory for a sub-agent's transcript, nested under its parent session:
 -- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent
+-- | The persisted watch-state map: @\<state\>\/watch_state.json@. Maps each
+-- conversation ('ConversationKey') to whether watch-all-tabs mode is
+-- enabled. Written atomically (0600) by
+-- 'Seal.Channels.Chat.WatchPersist.saveWatchMap' on every watch-mode
+-- mutation; loaded at boot by 'loadWatchMap' so a conversation's watch
+-- mode survives a @seal serve@ restart. Without this, the in-memory watch
+-- state is lost on restart and every conversation resets to watch-off.
+watchMapPath :: SealPaths -> FilePath
+watchMapPath paths = spState paths </> "watch_state.json"
 -- instance gets its own two-file transcript here so the parent's
 -- @conversation.jsonl@ \/ @entries.jsonl@ stay uncontaminated (the two-file
 -- format's @erConvLen@ and envelope-delta fold are per-session; mixing a

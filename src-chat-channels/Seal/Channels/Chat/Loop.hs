@@ -30,9 +30,13 @@ module Seal.Channels.Chat.Loop
   , handleWatchToggle
   , handleWatchActivity
   , lookupWatch
+  , newPersistingWatchState
+  , seedWatchState
+  , snapshotWatch
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Exception (SomeException, catch)
 import Control.Monad (when, unless, void)
 import Data.Foldable (for_)
 import Data.Aeson (Value)
@@ -93,25 +97,66 @@ type PendingAsks = TVar (Map SessionId [PendingAsk])
 -- conversation, the channel receives a notification every time any
 -- non-focused tab finishes thinking (harness-status transitions from
 -- @thinking@ to @idle@). Thread-safe via 'TVar'.
-type WatchState = TVar (Map ConversationKey Bool)
+data WatchState = WatchState
+  { wsVar  :: TVar (Map ConversationKey Bool)
+  , wsSave :: Maybe (IO ())
+  }
 
 -- | Create a new empty watch-state map (watch mode off for all
 -- conversations).
 newWatchState :: IO WatchState
-newWatchState = newTVarIO Map.empty
+newWatchState = do
+  tv <- newTVarIO Map.empty
+  pure (WatchState tv Nothing)
+
+-- | Create a persisting watch-state store. The supplied save function is
+-- called after every mutation (snapshotting the full current map, so the
+-- last writer wins with a consistent view). Mirrors
+-- 'Seal.Channels.Cursor.newPersistingCursorStore'.
+newPersistingWatchState :: (Map ConversationKey Bool -> IO ()) -> IO WatchState
+newPersistingWatchState saveFn = do
+  tv <- newTVarIO Map.empty
+  let ws = WatchState tv (Just (saveAction ws))
+      saveAction s = saveFn =<< snapshotWatch s
+  pure ws
+
+-- | Replace the store's map in one STM transaction. Used at boot to seed
+-- the in-memory store from the persisted @watch_state.json@. Does NOT
+-- persist (the caller is loading FROM disk).
+seedWatchState :: WatchState -> Map ConversationKey Bool -> IO ()
+seedWatchState ws m = atomically (writeTVar (wsVar ws) m)
+
+-- | Snapshot the current map. Used by the save action.
+snapshotWatch :: WatchState -> IO (Map ConversationKey Bool)
+snapshotWatch ws = readTVarIO (wsVar ws)
 
 -- | Look up whether watch mode is enabled for a conversation. 'False'
 -- when the conversation has no entry (the default).
 lookupWatch :: WatchState -> ConversationKey -> IO Bool
-lookupWatch ws key = fromMaybe False . Map.lookup key <$> readTVarIO ws
+lookupWatch ws key = fromMaybe False . Map.lookup key <$> readTVarIO (wsVar ws)
 
 -- | Toggle watch mode for a conversation. Returns the new state.
 toggleWatch :: WatchState -> ConversationKey -> IO Bool
-toggleWatch ws key = atomically $ do
-  m <- readTVar ws
-  let newVal = not (fromMaybe False (Map.lookup key m))
-  writeTVar ws (Map.insert key newVal m)
+toggleWatch ws key = do
+  newVal <- atomically $ do
+    m <- readTVar (wsVar ws)
+    let v = not (fromMaybe False (Map.lookup key m))
+    writeTVar (wsVar ws) (Map.insert key v m)
+    pure v
+  persistWatch ws
   pure newVal
+
+-- | Run the persist action (if any) after a successful mutation. A save
+-- failure is logged to stderr and swallowed — the in-memory store stays
+-- authoritative within the session; the next successful mutation will
+-- retry the save (writing the full current map, so a missed save
+-- self-heals). Mirrors 'Seal.Channels.Cursor.persistCursor'.
+persistWatch :: WatchState -> IO ()
+persistWatch ws =
+  case wsSave ws of
+    Nothing  -> pure ()
+    Just act -> act `catch` \e ->
+      dbg ("[watch] watch_state.json save failed: " <> T.pack (show (e :: SomeException)))
 
 -- | Per-conversation set of non-focused sessions currently in a thinking
 -- turn. Used to detect the thinking→idle transition so a watch
@@ -149,18 +194,17 @@ dbg msg = hPutStrLn stderr ("[chat-channel] " <> T.unpack msg)
 -- | Run the generic chat-channel loop. Blocks until the channel's
 -- 'ccReceive' returns EOF. Each conversation gets its own WS connection
 -- for streaming.
-runChatChannel :: ChatChannel c => ChatChannelConfig -> c -> IO ()
-runChatChannel cfg chan = do
+runChatChannel :: ChatChannel c => ChatChannelConfig -> c -> WatchState -> IO ()
+runChatChannel cfg chan watchState = do
   sessions <- newSessionMap
   -- Map of conversation keys to their WS client + streaming state.
   wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
   pendingAsks <- newTVarIO Map.empty :: IO PendingAsks
   tabTracker <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))
-  watchState <- newWatchState
   thinkingTabs <- newThinkingTabs
   loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs
   where
-    loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs = do
+    loop sessions wsConns pendingAsks tabTracker ws tt = do
       mMsg <- ccReceive chan
       case mMsg of
         Nothing -> pure ()  -- EOF
@@ -174,8 +218,8 @@ runChatChannel cfg chan = do
               handleCallback cfg chan sessions pendingAsks key src cbData
             Nothing ->
               -- Regular text message: route normally.
-              handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
-          loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs
+              handleInbound cfg chan sessions wsConns pendingAsks tabTracker ws tt key body
+          loop sessions wsConns pendingAsks tabTracker ws tt
 
 -- | Handle one inbound message: resolve the session, route, and dispatch.
 handleInbound
@@ -402,7 +446,8 @@ handleWatchToggle chan watchState key body =
       ccSend chan (watchConfirm newVal)
   where
     setWatch v = do
-      atomically (modifyTVar' watchState (Map.insert key v))
+      atomically (modifyTVar' (wsVar watchState) (Map.insert key v))
+      persistWatch watchState
       ccSend chan (watchConfirm v)
 
 -- | The confirmation message for a watch-mode change.
