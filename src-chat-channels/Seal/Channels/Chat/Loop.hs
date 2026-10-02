@@ -421,24 +421,31 @@ handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkin
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
 
 -- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
--- or @/watch on@ / @/watch off@). Pure.
+-- or @/watch on@ / @/watch off@ / @/watch status@ / @/watch -h@). Pure.
 isWatchCommand :: Text -> Bool
 isWatchCommand body =
   case T.words (T.toLower (T.strip body)) of
-    ["/watch"]       -> True
-    ["/watch", "on"] -> True
-    ["/watch", "off"] -> True
-    _                -> False
+    ["/watch"]           -> True
+    ["/watch", "on"]     -> True
+    ["/watch", "off"]    -> True
+    ["/watch", "status"] -> True
+    ["/watch", "-h"]     -> True
+    _                    -> False
 
 -- | Handle the @/watch@ slash command: toggle (or set) watch-all-tabs
 -- mode for the conversation and send a confirmation to the platform.
--- @/watch@ toggles; @/watch on@ and @/watch off@ set explicitly.
+-- @/watch@ toggles; @/watch on@ and @/watch off@ set explicitly;
+-- @/watch status@ prints the current state; @/watch -h@ prints help.
 handleWatchToggle
   :: ChatChannel c => c -> WatchState -> ConversationKey -> Text -> IO ()
 handleWatchToggle chan watchState key body =
   case T.words (T.toLower body) of
     ["/watch", "on"]  -> setWatch True
     ["/watch", "off"] -> setWatch False
+    ["/watch", "status"] -> do
+      cur <- lookupWatch watchState key
+      ccSend chan (watchStatusMsg cur)
+    ["/watch", "-h"] -> ccSend chan watchHelp
     _ -> do  -- bare /watch — toggle
       cur <- lookupWatch watchState key
       dbg ("[watch] toggle: currently " <> (if cur then "on" else "off"))
@@ -456,6 +463,30 @@ watchConfirm True =
   "watch mode enabled — you will be notified when any tab finishes thinking"
 watchConfirm False =
   "watch mode disabled"
+
+-- | The status message for the current watch-mode state.
+watchStatusMsg :: Bool -> Text
+watchStatusMsg True  = "watch mode is on"
+watchStatusMsg False = "watch mode is off"
+
+-- | The help text for @/watch@, rendered in the same style as the
+-- optparse-applicative help used by all other slash commands.
+watchHelp :: Text
+watchHelp = T.unlines
+  [ "Toggle watch-all-tabs notifications for this conversation"
+  , ""
+  , "Usage: /watch [on|off|status]"
+  , ""
+  , "Available commands:"
+  , "  on          Enable watch mode — notify when any tab finishes thinking"
+  , "  off         Disable watch mode"
+  , "  status      Show the current watch mode state"
+  , ""
+  , "Options:"
+  , "  -h          Show this help"
+  , ""
+  , "With no subcommand, /watch toggles the current state."
+  ]
 
 -- | Handle a @harness-status@ activity event for a non-focused session.
 -- When watch mode is enabled for the conversation:
