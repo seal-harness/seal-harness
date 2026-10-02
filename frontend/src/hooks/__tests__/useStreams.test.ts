@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useListsStream } from '../useListsStream'
-import { useTranscriptStream, reconcileEntries } from '../useTranscriptStream'
+import { useTranscriptStream, reconcileEntries, _resetDataCacheForTests } from '../useTranscriptStream'
 import { useSessionActivityStream, applyActivity, clearUnread } from '../useSessionActivityStream'
 import type { StreamClient, ListsSnapshot, ActivityEvent, SessionActivityState } from '../../types/stream'
 import type { TranscriptEntry } from '../../types'
@@ -165,6 +165,56 @@ describe('useTranscriptStream', () => {
     })
     expect(result.current.entries).toHaveLength(1)
     expect(result.current.entries[0]!.id).toBe('e1')
+    vi.unstubAllGlobals()
+  })
+  it('does NOT wipe entries when sessionId transitions to null after having data', async () => {
+    // Regression: when currentSessionId briefly becomes null during a
+    // session switch (e.g., a React batching edge case), the entries
+    // should NOT be cleared to []. Clearing entries causes the transcript
+    // to flicker — messages disappear and reappear. The entries will be
+    // replaced when the new session's data loads.
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e1', '2026-01-01T00:00:00Z'), makeEntry('e2', '2026-01-01T00:00:01Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(seedEntries), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      })
+    }))
+    const { result, rerender } = renderHook(
+      ({ sid }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    // Let the seed fetch resolve (StrictMode double-invoke + fetch + res.text()).
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 10))
+    })
+    expect(result.current.entries).toHaveLength(2)
+
+    // Switch to null — entries should NOT be wiped.
+    rerender({ sid: null })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[0]!.id).toBe('e1')
+
+    // Switch to a new session — entries should be replaced with new seed.
+    const newSeed = [makeEntry('f1', '2026-01-02T00:00:00Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(newSeed), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      })
+    }))
+    rerender({ sid: 's2' })
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 10))
+    })
+    expect(result.current.entries).toHaveLength(1)
+    expect(result.current.entries[0]!.id).toBe('f1')
     vi.unstubAllGlobals()
   })
 })

@@ -27,7 +27,7 @@
  * ones.
  */
 
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import type { Message, MessageContent, ToolCallInfo, TranscriptEntry } from '../types'
 import {
   extractTextFromContent,
@@ -339,22 +339,23 @@ class TranscriptRenderer {
   private toolResults: Map<string, ToolResultRecord> = new Map()
   private seenSystem: Set<string> = new Set()
   private seenTools: Set<string> = new Set()
-  private lastFirstId: string | null = null
+  private lastSessionId: string | null = null
 
   /** Process the full entries array and return the derived messages.
    *  Only new or changed entries are processed; cached entries are reused. */
-  update(entries: TranscriptEntry[]): Message[] {
+  update(entries: TranscriptEntry[], sessionId: string): Message[] {
     if (entries.length === 0) {
       this.reset()
       return []
     }
 
-    // Detect session change: if the first entry id differs, reset everything.
-    const firstId = entries[0]!.id
-    if (this.lastFirstId !== null && firstId !== this.lastFirstId) {
+    // Detect session change by sessionId, not first entry id. All sessions
+    // that clone the same repo share the same first entry id (e.g.,
+    // '1-setuprepo'), so comparing firstEntryId fails to detect the change.
+    if (this.lastSessionId !== null && sessionId !== this.lastSessionId) {
       this.reset()
     }
-    this.lastFirstId = firstId
+    this.lastSessionId = sessionId
 
     const ctx: ProcessContext = {
       toolResults: this.toolResults,
@@ -556,10 +557,21 @@ export function useTranscriptMessages(
 ): Message[] {
   const renderer = sessionId !== null
     ? getGlobalRendererCache().get(sessionId)
-    : new TranscriptRenderer() // ephemeral for null session
+    : null
+  // Preserve the last computed messages across null-session transitions
+  // so the transcript doesn't flicker to empty when sessionId briefly
+  // becomes null during a session switch.
+  const lastMsgsRef = useRef<Message[]>([])
 
   return useMemo(() => {
-    const msgs = renderer.update(entries)
+    if (renderer === null) {
+      // sessionId is null — return the last computed messages to avoid
+      // a flicker to empty. The ChatArea is typically not visible when
+      // no session is selected (composer or harness controls are shown).
+      return lastMsgsRef.current
+    }
+    const msgs = renderer.update(entries, sessionId!)
+    lastMsgsRef.current = msgs
     // Log message array changes for debugging. The message array should
     // only grow (append-only) or stay the same length (in-place updates).
     // A decrease in length indicates an entry was removed, which would
@@ -569,7 +581,7 @@ export function useTranscriptMessages(
       prevMsgCountRef.value = msgs.length
     }
     return msgs
-  }, [entries, renderer])
+  }, [entries, renderer, sessionId])
 }
 
 /** Reset the global renderer cache. Test-only — clears all cached
