@@ -9,7 +9,6 @@ import type {
   ProviderInfo,
   RepoInfo,
   RepoInput,
-  SecretDetail,
   SecretInput,
   SessionInfo,
   SkillInfo,
@@ -1271,12 +1270,6 @@ export function useRepos() {
  *  are NEVER returned by this endpoint — only the key names. */
 export async function fetchSecrets(): Promise<string[] | null> {
   return fetchJson<string[]>('/api/secrets')
-}
-
-/** Fetch a single secret's value by key name. Returns null on any failure
- *  (including 404 when the key is absent or 500 when the vault is locked). */
-export async function fetchSecretValue(name: string): Promise<SecretDetail | null> {
-  return fetchJson<SecretDetail>(`/api/secrets/${encodeURIComponent(name)}`)
 }
 
 /** The outcome of a secret create/update mutation. On success `name`

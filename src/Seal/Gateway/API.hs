@@ -102,7 +102,7 @@ import Seal.SourceControl.Repo
   , repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
-import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
+import Seal.Security.Vault (VaultHandle (vhDelete, vhList, vhPut))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound))
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
@@ -487,11 +487,6 @@ apiApp deps req respond =
     (m', ["api", "secrets"]) | m' == methodPost -> do
       body <- collectBody req
       respond =<< handleSecretPut deps body
-    -- GET /api/secrets/:name -> the secret value. Returns 200 +
-    -- {"name": ..., "value": ...}. 404 when the key is absent. 500 when
-    -- the vault is unconfigured/locked.
-    (m', ["api", "secrets", sname]) | m' == methodGet ->
-      respond =<< handleSecretGet deps sname
     -- PUT /api/secrets/:name -> update a secret (upsert). Body: {value}.
     -- The name is taken from the path. Returns 200 + {"name": ...}.
     -- 400 on a missing/empty value. 500 when the vault is
@@ -2195,24 +2190,6 @@ handleSecretPut deps body =
               case eRes of
                 Left e  -> pure (errJson status500 (T.pack (show e)))
                 Right _ -> pure (jsonLBS status201 (A.encode (object ["name" .= name])))
-
--- | Handle GET /api/secrets/:name — retrieve a secret value. Returns 200 +
--- {"name": ..., "value": ...}. 404 when the key is absent. 500 when the
--- vault is unconfigured/locked.
-handleSecretGet :: ApiDeps -> Text -> IO Response
-handleSecretGet deps name = do
-  mh <- readIORef (vrHandleRef (adVault deps))
-  case mh of
-    Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
-    Just vh -> do
-      eVal <- vhGet vh name
-      case eVal of
-        Left (VaultKeyNotFound _) -> pure (errJson status404 "secret not found")
-        Left e                    -> pure (errJson status500 (T.pack (show e)))
-        Right bs -> pure (jsonOk (object
-          [ "name"  .= name
-          , "value" .= TE.decodeUtf8Lenient bs
-          ]))
 
 -- | Handle PUT /api/secrets/:name — update a secret (upsert). Body:
 -- {value}. The name is taken from the path. Returns 200 + {"name": ...}.

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   createSecret,
   deleteSecret,
-  fetchSecretValue,
   updateSecret,
   useSecrets,
 } from '../hooks/useApi'
@@ -54,9 +53,9 @@ function Row({
  *  editing PUTs /api/secrets/:name (upsert); the trash button DELETEs.
  *
  *  SECURITY: the list endpoint returns key NAMES only — never values. The
- *  value is shown in the editor when an existing secret is selected (fetched
- *  on demand via GET /api/secrets/:name). The value field is a password
- *  input by default with a show/hide toggle. The POST/PUT response never
+ *  value field is WRITE-ONLY: on create the operator types the new value;
+ *  on edit the field is empty (paste a new value to overwrite — the stored
+ *  value is never retrieved or displayed). The POST/PUT response never
  *  echoes the value back. */
 export function SecretsView() {
   const { secrets, loaded, error, refresh } = useSecrets()
@@ -69,50 +68,30 @@ export function SecretsView() {
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
-  const [valueLoaded, setValueLoaded] = useState(false)
-  const [valueError, setValueError] = useState<string | null>(null)
 
   // Ref holding the latest `secrets` list so the seed effect can read it
   // without re-running on every poll tick.
   const secretsRef = useRef(secrets)
   secretsRef.current = secrets
 
-  // Fetch the secret value when the user selects an existing secret to edit.
-  // The list endpoint returns only key names; the value is fetched on demand.
+  // Reset the form when the user picks a secret (or starts creating).
+  // The value field is write-only — the stored value is never fetched.
   useEffect(() => {
     if (creating) {
       setName('')
       setValue('')
       setFormError(null)
-      setValueLoaded(true)
-      setValueError(null)
       return
     }
     if (editing) {
       setName(editing)
       setValue('')
-      setValueLoaded(false)
-      setValueError(null)
       setFormError(null)
-      let cancelled = false
-      void (async () => {
-        const detail = await fetchSecretValue(editing)
-        if (cancelled) return
-        if (detail) {
-          setValue(detail.value)
-          setValueLoaded(true)
-        } else {
-          setValueError('Failed to load secret value — the vault may be locked or the key absent.')
-          setValueLoaded(true)
-        }
-      })()
-      return () => { cancelled = true }
+      return
     }
     // Nothing selected — reset.
     setName('')
     setValue('')
-    setValueLoaded(false)
-    setValueError(null)
   }, [editing, creating])
 
   const validateForm = (): string | null => {
@@ -299,7 +278,7 @@ export function SecretsView() {
               htmlFor="secret-value"
               hint={creating
                 ? undefined
-                : 'Edit the value to update the secret (upsert).'}
+                : 'Paste a new value to overwrite (the stored value is never shown).'}
             >
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <input
@@ -308,9 +287,8 @@ export function SecretsView() {
                   value={value}
                   onChange={(e) => setValue(e.target.value)}
                   style={inputStyle}
-                  placeholder={valueLoaded ? '' : 'Loading…'}
+                  placeholder={creating ? 'Enter the secret value' : 'Paste new value to overwrite'}
                   autoComplete="off"
-                  disabled={!valueLoaded || !creating && !selected}
                 />
                 <button
                   type="button"
@@ -322,11 +300,6 @@ export function SecretsView() {
                   {showValue ? 'Hide' : 'Show'}
                 </button>
               </div>
-              {valueError && (
-                <div style={{ fontSize: 11, color: 'var(--needs-input)', marginTop: 4 }}>
-                  {valueError}
-                </div>
-              )}
             </Row>
 
             {formError && (
@@ -347,7 +320,7 @@ export function SecretsView() {
                   type="button"
                   className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
                   onClick={handleSubmit}
-                  disabled={submitting || !valueLoaded}
+                  disabled={submitting}
                   aria-label={creating ? 'Create secret' : 'Save secret'}
                   data-testid="secret-save"
                 >

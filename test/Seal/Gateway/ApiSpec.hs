@@ -3068,11 +3068,12 @@ spec = describe "Seal.Gateway.API" $ do
         (A.encode (A.object [ "name" .= ("KEY" :: T.Text), "value" .= ("new" :: T.Text) ]))
       (status, _) <- runAppBody app req
       status `shouldBe` 201
-      -- GET should return the new value.
-      (_, getBody) <- runAppBody app (testRequest methodGet ["api", "secrets", "KEY"])
-      case A.decode getBody :: Maybe A.Value of
-        Just (A.Object o) -> lookupK "value" o `shouldBe` Just (A.String "new")
-        _ -> expectationFailure "expected JSON object with value"
+      -- The value is write-only (no GET endpoint); verify the key still
+      -- exists in the list (the upsert did not delete it).
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldMatchList` ["KEY"]
+        Nothing -> expectationFailure "expected a JSON array"
 
     it "POST /api/secrets with missing name returns 400" $ do
       vr <- makeFakeVaultRuntime []
@@ -3095,28 +3096,6 @@ spec = describe "Seal.Gateway.API" $ do
       (status, _) <- runAppBody app req
       status `shouldBe` 400
 
-    it "GET /api/secrets/:name returns the secret value" $ do
-      vr <- makeFakeVaultRuntime [("MY_SECRET", "the_value")]
-      deps <- mkSecretsApp vr
-      let app = apiApp deps
-      (status, body) <- runAppBody app (testRequest methodGet ["api", "secrets", "MY_SECRET"])
-      status `shouldBe` 200
-      case A.decode body :: Maybe A.Value of
-        Just (A.Object o) -> do
-          lookupK "name" o `shouldBe` Just (A.String "MY_SECRET")
-          lookupK "value" o `shouldBe` Just (A.String "the_value")
-        _ -> expectationFailure "expected JSON object with name + value"
-
-    it "GET /api/secrets/:name returns 404 for an absent key" $ do
-      vr <- makeFakeVaultRuntime []
-      deps <- mkSecretsApp vr
-      let app = apiApp deps
-      (status, body) <- runAppBody app (testRequest methodGet ["api", "secrets", "NOPE"])
-      status `shouldBe` 404
-      case A.decode body :: Maybe A.Value of
-        Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
-        _ -> expectationFailure "expected 404 error"
-
     it "PUT /api/secrets/:name updates an existing secret (200)" $ do
       vr <- makeFakeVaultRuntime [("K", "old")]
       deps <- mkSecretsApp vr
@@ -3128,11 +3107,12 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode body :: Maybe A.Value of
         Just (A.Object o) -> lookupK "name" o `shouldBe` Just (A.String "K")
         _ -> expectationFailure "expected JSON object with name"
-      -- Verify the value was updated.
-      (_, getBody) <- runAppBody app (testRequest methodGet ["api", "secrets", "K"])
-      case A.decode getBody :: Maybe A.Value of
-        Just (A.Object o) -> lookupK "value" o `shouldBe` Just (A.String "updated")
-        _ -> expectationFailure "expected updated value"
+      -- The value is write-only (no GET endpoint); verify the key still
+      -- exists in the list after the upsert.
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldMatchList` ["K"]
+        Nothing -> expectationFailure "expected a JSON array"
 
     it "PUT /api/secrets/:name with missing value returns 400" $ do
       vr <- makeFakeVaultRuntime [("K", "old")]

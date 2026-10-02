@@ -883,7 +883,6 @@ describe('useRepos', () => {
 
 import {
   fetchSecrets,
-  fetchSecretValue,
   createSecret,
   updateSecret,
   deleteSecret,
@@ -895,14 +894,6 @@ describe('Vault secrets CRUD', () => {
     setNextResponse(['API_KEY', 'DB_PASS'])
     const res = await fetchSecrets()
     expect(res).toEqual(['API_KEY', 'DB_PASS'])
-  })
-
-  it('fetchSecretValue GETs /api/secrets/:name and returns name + value', async () => {
-    setNextResponse({ name: 'API_KEY', value: 'secret123' })
-    const res = await fetchSecretValue('API_KEY')
-    expect(res?.name).toBe('API_KEY')
-    expect(res?.value).toBe('secret123')
-    expect(fetchCalls.some((c) => c.url === '/api/secrets/API_KEY')).toBe(true)
   })
 
   it('createSecret POSTs /api/secrets with {name, value}', async () => {

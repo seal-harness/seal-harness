@@ -389,14 +389,8 @@ export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
 
 // ── Vault Secret ───────────────────────────────────────────────────────
 
-/** The full secret (name + value) returned by GET /api/secrets/:name.
- *  The value is the decrypted secret content. */
-export interface SecretDetail {
-  name: string
-  value: string
-}
-
-/** The body for POST /api/secrets (create/upsert). */
+/** The body for POST /api/secrets (create/upsert) and PUT /api/secrets/:name
+ *  (update). The value is write-only — never returned by the API. */
 export interface SecretInput {
   name: string
   value: string
