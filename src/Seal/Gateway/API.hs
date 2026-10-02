@@ -6,7 +6,8 @@ module Seal.Gateway.API
   , ApiDeps (..)
   ) where
 
-import Data.Aeson (Value (..), object, (.=))
+import Data.Aeson (Value (..), object, (.:), (.=), withObject)
+import Data.Aeson.Types (parseMaybe)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -101,7 +102,8 @@ import Seal.SourceControl.Repo
   , repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
-import Seal.Security.Vault (VaultHandle (vhDelete, vhPut))
+import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
+import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound))
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
@@ -474,6 +476,34 @@ apiApp deps req respond =
     -- new public key + instructions. 404/400 as above.
     (m', ["api", "repos", rid, "deploy-key", "generate"]) | m' == methodPost ->
       respond =<< handleRepoDeployKeyGenerate deps rid
+    -- GET /api/secrets -> all vault key names (values are NEVER returned).
+    -- 500 when the vault is unconfigured/locked. Trust boundary:
+    -- loopback-only, matching /api/repos.
+    (m', ["api", "secrets"]) | m' == methodGet ->
+      respond =<< handleSecretList deps
+    -- POST /api/secrets -> store a secret (upsert). Body: {name, value}.
+    -- Returns 201 + {"name": ...} (the value is never echoed). 400 on a
+    -- missing/empty name or value. 500 when the vault is unconfigured/locked.
+    (m', ["api", "secrets"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleSecretPut deps body
+    -- GET /api/secrets/:name -> the secret value. Returns 200 +
+    -- {"name": ..., "value": ...}. 404 when the key is absent. 500 when
+    -- the vault is unconfigured/locked.
+    (m', ["api", "secrets", sname]) | m' == methodGet ->
+      respond =<< handleSecretGet deps sname
+    -- PUT /api/secrets/:name -> update a secret (upsert). Body: {value}.
+    -- The name is taken from the path. Returns 200 + {"name": ...}.
+    -- 400 on a missing/empty value. 500 when the vault is
+    -- unconfigured/locked.
+    (m', ["api", "secrets", sname]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleSecretUpdate deps sname body
+    -- DELETE /api/secrets/:name -> remove a secret. Idempotent (204
+    -- whether or not the key existed). 500 when the vault is
+    -- unconfigured/locked.
+    (m', ["api", "secrets", sname]) | m' == methodDelete ->
+      respond =<< handleSecretDelete deps sname
     -- T11: GET /api/providers -> the configured provider list. @isDefault@
     -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
     -- T11, so only @name@ is emitted.
@@ -2124,6 +2154,107 @@ handleRepoDeployKeyGenerate deps ridTxt =
                           broadcastReposChanged (adBroker deps)
                           pure (jsonOk (deployKeyInfoJson newPub (deployKeyInstructions (srUrl r))))
             _ -> pure (errJson status404 "repo is not a deploy-key repo")
+
+----------------------------------------------------------------------------
+-- /api/secrets — vault secrets CRUD
+----------------------------------------------------------------------------
+
+-- | Handle GET /api/secrets — list all vault key names. Values are NEVER
+-- returned. Returns 200 + a JSON array of key-name strings. 500 when the
+-- vault is unconfigured or locked.
+handleSecretList :: ApiDeps -> IO Response
+handleSecretList deps = do
+  mh <- readIORef (vrHandleRef (adVault deps))
+  case mh of
+    Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
+    Just vh -> do
+      eKeys <- vhList vh
+      case eKeys of
+        Left e   -> pure (errJson status500 (T.pack (show e)))
+        Right ks -> pure (jsonLBS status200 (A.encode ks))
+
+-- | Handle POST /api/secrets — store a secret (upsert). Body: {name,
+-- value}. Returns 201 + {"name": ...} (the value is never echoed). 400 on
+-- a missing/empty name or value. 500 when the vault is unconfigured/locked.
+handleSecretPut :: ApiDeps -> BL.ByteString -> IO Response
+handleSecretPut deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case extractSecretName v of
+      Nothing -> pure (errJson status400 "name is required")
+      Just name | T.null name -> pure (errJson status400 "name must not be empty")
+                | otherwise -> case extractSecretValue v of
+        Nothing -> pure (errJson status400 "value is required")
+        Just val | T.null val -> pure (errJson status400 "value must not be empty")
+                 | otherwise -> do
+          mh <- readIORef (vrHandleRef (adVault deps))
+          case mh of
+            Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
+            Just vh -> do
+              eRes <- vhPut vh name (TE.encodeUtf8 val)
+              case eRes of
+                Left e  -> pure (errJson status500 (T.pack (show e)))
+                Right _ -> pure (jsonLBS status201 (A.encode (object ["name" .= name])))
+
+-- | Handle GET /api/secrets/:name — retrieve a secret value. Returns 200 +
+-- {"name": ..., "value": ...}. 404 when the key is absent. 500 when the
+-- vault is unconfigured/locked.
+handleSecretGet :: ApiDeps -> Text -> IO Response
+handleSecretGet deps name = do
+  mh <- readIORef (vrHandleRef (adVault deps))
+  case mh of
+    Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
+    Just vh -> do
+      eVal <- vhGet vh name
+      case eVal of
+        Left (VaultKeyNotFound _) -> pure (errJson status404 "secret not found")
+        Left e                    -> pure (errJson status500 (T.pack (show e)))
+        Right bs -> pure (jsonOk (object
+          [ "name"  .= name
+          , "value" .= TE.decodeUtf8Lenient bs
+          ]))
+
+-- | Handle PUT /api/secrets/:name — update a secret (upsert). Body:
+-- {value}. The name is taken from the path. Returns 200 + {"name": ...}.
+-- 400 on a missing/empty value. 500 when the vault is unconfigured/locked.
+handleSecretUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleSecretUpdate deps name body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case extractSecretValue v of
+      Nothing -> pure (errJson status400 "value is required")
+      Just val | T.null val -> pure (errJson status400 "value must not be empty")
+               | otherwise -> do
+        mh <- readIORef (vrHandleRef (adVault deps))
+        case mh of
+          Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
+          Just vh -> do
+            eRes <- vhPut vh name (TE.encodeUtf8 val)
+            case eRes of
+              Left e  -> pure (errJson status500 (T.pack (show e)))
+              Right _ -> pure (jsonOk (object ["name" .= name]))
+
+-- | Handle DELETE /api/secrets/:name — remove a secret. Idempotent: 204
+-- whether or not the key existed. 500 when the vault is unconfigured/locked.
+handleSecretDelete :: ApiDeps -> Text -> IO Response
+handleSecretDelete deps name = do
+  mh <- readIORef (vrHandleRef (adVault deps))
+  case mh of
+    Nothing -> pure (errJson status500 "vault not configured — run /vault setup")
+    Just vh -> do
+      eRes <- vhDelete vh name
+      case eRes of
+        Left (VaultKeyNotFound _) -> pure noContent
+        Left e                    -> pure (errJson status500 (T.pack (show e)))
+        Right _                   -> pure noContent
+
+-- | Extract the @name@ field from a JSON object (the secret name).
+extractSecretName :: A.Value -> Maybe Text
+extractSecretName = parseMaybe (withObject "secret" (.: "name"))
+
+-- | Extract the @value@ field from a JSON object (the secret value).
+extractSecretValue :: A.Value -> Maybe Text
+extractSecretValue = parseMaybe (withObject "secret" (.: "value"))
 
 -- | Generate a new deploy keypair: random 32-byte passphrase (base64) →
 -- vhPut the passphrase under the vault key → ssh-keygen -t ed25519 -f

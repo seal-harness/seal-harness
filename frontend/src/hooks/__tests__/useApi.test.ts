@@ -878,3 +878,111 @@ describe('useRepos', () => {
     await waitFor(() => expect(result.current.repos).toHaveLength(2))
   })
 })
+
+// ── Vault secrets CRUD ──────────────────────────────────────────────────
+
+import {
+  fetchSecrets,
+  fetchSecretValue,
+  createSecret,
+  updateSecret,
+  deleteSecret,
+  useSecrets,
+} from '../useApi'
+
+describe('Vault secrets CRUD', () => {
+  it('fetchSecrets GETs /api/secrets and returns key names', async () => {
+    setNextResponse(['API_KEY', 'DB_PASS'])
+    const res = await fetchSecrets()
+    expect(res).toEqual(['API_KEY', 'DB_PASS'])
+  })
+
+  it('fetchSecretValue GETs /api/secrets/:name and returns name + value', async () => {
+    setNextResponse({ name: 'API_KEY', value: 'secret123' })
+    const res = await fetchSecretValue('API_KEY')
+    expect(res?.name).toBe('API_KEY')
+    expect(res?.value).toBe('secret123')
+    expect(fetchCalls.some((c) => c.url === '/api/secrets/API_KEY')).toBe(true)
+  })
+
+  it('createSecret POSTs /api/secrets with {name, value}', async () => {
+    setNextResponse({ name: 'NEW_KEY' }, 201)
+    const res = await createSecret({ name: 'NEW_KEY', value: 'secret_val' })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.name).toBe('NEW_KEY')
+    const call = fetchCalls.find((c) => c.url === '/api/secrets' && c.init?.method === 'POST')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ name: 'NEW_KEY', value: 'secret_val' })
+  })
+
+  it('createSecret surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'name is required' }, 400)
+    const res = await createSecret({ name: '', value: 'v' })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('name is required')
+  })
+
+  it('createSecret falls back to HTTP status when the body has no error', async () => {
+    setNextResponse('oops', 500)
+    const res = await createSecret({ name: 'K', value: 'v' })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('HTTP 500')
+  })
+
+  it('updateSecret PUTs /api/secrets/:name with {value}', async () => {
+    setNextResponse({ name: 'K' })
+    const res = await updateSecret('K', 'new_val')
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.name).toBe('K')
+    const call = fetchCalls.find((c) => c.url === '/api/secrets/K' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ value: 'new_val' })
+  })
+
+  it('updateSecret surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'value is required' }, 400)
+    const res = await updateSecret('K', '')
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('value is required')
+  })
+
+  it('deleteSecret DELETEs /api/secrets/:name and returns true on 204', async () => {
+    nextResponse = new Response(null, { status: 204 })
+    const ok = await deleteSecret('gone')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/secrets/gone' && c.init?.method === 'DELETE')
+    expect(call).toBeTruthy()
+  })
+
+  it('deleteSecret returns false on a 500', async () => {
+    setNextResponse('err', 500)
+    const ok = await deleteSecret('bad')
+    expect(ok).toBe(false)
+  })
+})
+
+describe('useSecrets', () => {
+  it('fetches GET /api/secrets on mount and populates state', async () => {
+    setNextResponse(['API_KEY', 'DB_PASS'])
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.secrets).toHaveLength(2))
+    expect(result.current.secrets).toEqual(['API_KEY', 'DB_PASS'])
+    expect(result.current.loaded).toBe(true)
+    expect(result.current.error).toBe(false)
+  })
+
+  it('sets error=true on a 500', async () => {
+    setNextResponse('err', 500)
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.error).toBe(true))
+  })
+
+  it('refresh() triggers a re-fetch', async () => {
+    setNextResponse(['K1'])
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.secrets).toHaveLength(1))
+    const initialCalls = fetchCalls.length
+    act(() => result.current.refresh())
+    await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+})

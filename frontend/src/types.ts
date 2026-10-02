@@ -387,6 +387,21 @@ export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
   machine_user: 'Bot Account',
 }
 
+// ── Vault Secret ───────────────────────────────────────────────────────
+
+/** The full secret (name + value) returned by GET /api/secrets/:name.
+ *  The value is the decrypted secret content. */
+export interface SecretDetail {
+  name: string
+  value: string
+}
+
+/** The body for POST /api/secrets (create/upsert). */
+export interface SecretInput {
+  name: string
+  value: string
+}
+
 // ── Transcript ─────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {

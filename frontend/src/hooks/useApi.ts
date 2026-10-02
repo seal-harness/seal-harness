@@ -9,6 +9,8 @@ import type {
   ProviderInfo,
   RepoInfo,
   RepoInput,
+  SecretDetail,
+  SecretInput,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -1261,6 +1263,112 @@ export function useRepos() {
   }, [refresh])
 
   return { repos, loaded, error, refresh }
+}
+
+// ── Vault secrets ───────────────────────────────────────────────────────
+
+/** Fetch all vault secret key names. Returns null on any failure. Values
+ *  are NEVER returned by this endpoint — only the key names. */
+export async function fetchSecrets(): Promise<string[] | null> {
+  return fetchJson<string[]>('/api/secrets')
+}
+
+/** Fetch a single secret's value by key name. Returns null on any failure
+ *  (including 404 when the key is absent or 500 when the vault is locked). */
+export async function fetchSecretValue(name: string): Promise<SecretDetail | null> {
+  return fetchJson<SecretDetail>(`/api/secrets/${encodeURIComponent(name)}`)
+}
+
+/** The outcome of a secret create/update mutation. On success `name`
+ *  carries the key name returned by the backend; on failure `error`
+ *  carries the backend's error message. The secret value is NEVER echoed
+ *  back — only the key name. */
+export type SecretMutationResult =
+  | { ok: true; name: string }
+  | { ok: false; error: string }
+
+/** Read the backend's `{"error": "..."}` body for a secret mutation,
+ *  falling back to the HTTP status. (Mirrors `repoMutationError`.) */
+async function secretMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new vault secret (upsert). Body: {name, value}. Returns the
+ *  key name on success, or the backend's error message on failure. */
+export async function createSecret(input: SecretInput): Promise<SecretMutationResult> {
+  try {
+    const res = await fetch('/api/secrets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await secretMutationError(res) }
+    const data = (await res.json()) as { name: string }
+    return { ok: true, name: data.name }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing vault secret (upsert). The name is taken from the
+ *  path; the body carries only {value}. Returns the key name on success,
+ *  or the backend's error message on failure. */
+export async function updateSecret(name: string, value: string): Promise<SecretMutationResult> {
+  try {
+    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    })
+    if (!res.ok) return { ok: false, error: await secretMutationError(res) }
+    const data = (await res.json()) as { name: string }
+    return { ok: true, name: data.name }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a vault secret by key name. Returns true when the backend
+ *  accepted the delete (204 — idempotent). */
+export async function deleteSecret(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of vault secret key names. Mirrors `useRepos` — fetches on
+ *  mount and when `refresh` is called. The list endpoint returns only key
+ *  names (never values). The `refresh` action forces an immediate re-fetch
+ *  so callers see their own mutations. */
+export function useSecrets() {
+  const [secrets, setSecrets] = useState<string[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchSecrets().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setSecrets(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { secrets, loaded, error, refresh }
 }
 
 // ── Default agent ────────────────────────────────────────────────────────
