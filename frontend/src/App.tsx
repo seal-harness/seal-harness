@@ -588,6 +588,30 @@ export default function App() {
     && (sessionActivity?.[currentSessionId]?.harness === 'thinking'
         || (sending && pendingQuestions.length === 0))
 
+  // The tool currently being executed (if any). Broadcast by the backend
+  // as a `tool-call` activity event before each tool dispatch. Shown in the
+  // thinking indicator so the user can see what the agent is doing during
+  // long-running tool calls (e.g. SHELL_EXEC running `make lint`).
+  const activeToolCall = currentSessionId !== null
+    ? sessionActivity?.[currentSessionId]?.toolCall ?? null
+    : null
+  // Short label for the thinking indicator: "SHELL_EXEC: make lint" (the
+  // most relevant arg extracted from the JSON input, not the raw JSON).
+  const toolCallLabel = activeToolCall
+    ? (() => {
+        let detail = activeToolCall.input
+        try {
+          const parsed = JSON.parse(activeToolCall.input) as Record<string, unknown>
+          for (const k of ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url']) {
+            const v = parsed[k]
+            if (typeof v === 'string' && v.length > 0) { detail = v; break }
+          }
+        } catch { /* not JSON — use raw input */ }
+        const trimmed = detail.length > 100 ? detail.slice(0, 100) + '…' : detail
+        return `${activeToolCall.tool}: ${trimmed}`
+      })()
+    : null
+
   // Model id to display on the thinking indicator. Prefer the explicit
   // pending-thinking model captured at send-time; fall back to the most
   // recent assistant message's agentName; finally "Assistant".
@@ -647,7 +671,7 @@ export default function App() {
           agentName: thinkingAgentName,
           agentStatus: 'thinking' as const,
           timestamp: now,
-          blocks: [],
+          blocks: toolCallLabel ? [{ text: toolCallLabel }] : [],
           isGenerating: true,
         },
       ]
@@ -660,13 +684,13 @@ export default function App() {
           agentName: thinkingAgentName,
           agentStatus: 'thinking' as const,
           timestamp: now,
-          blocks: [],
+          blocks: toolCallLabel ? [{ text: toolCallLabel }] : [],
           isGenerating: true,
         },
       ]
     }
     return merged
-  }, [transcriptMessages, pendingMessage, sessionIsThinking, thinkingAgentName, slashBubbles])
+  }, [transcriptMessages, pendingMessage, sessionIsThinking, thinkingAgentName, slashBubbles, toolCallLabel])
 
   // Clear the optimistic pending pair once the transcript gains new entries.
   useEffect(() => {
