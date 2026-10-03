@@ -29,12 +29,12 @@ module Seal.Logging.Logger
   , escapeNewlines
   ) where
 
-import Control.Exception (catch, SomeException, bracket)
+import Control.Exception (catch, try, SomeException, bracket)
 import Control.Monad (void)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.IO (stderr)
+import System.IO (stderr, hPutStrLn, openFile, hSetBuffering, BufferMode (..), Handle, IOMode (..))
 
 import Katip
   ( Severity (..), LogEnv, LogContexts, Namespace, Scribe (..)
@@ -56,20 +56,41 @@ data SealLogger = SealLogger
   }
 
 -- | Bracket the logger's lifetime. Creates the stderr scribe at the given
--- severity level, runs the action, closes the scribe on exit. Used at all
--- 4 startup sites ('runServeMain', 'runSignalMain', 'runTelegramMain',
--- 'runTui').
-withSealLogger :: Text -> (SealLogger -> IO a) -> IO a
-withSealLogger logLevel = bracket makeLogEnv' closeLogEnv'
+-- severity level, and optionally a file scribe that mirrors all console
+-- output to a log file (e.g. @seal.log@ in the project directory). Runs the
+-- action, closes both scribes on exit. Used at the startup site in
+-- 'Seal.AppMain.dispatch' (which serves all commands: serve, tui, etc.).
+--
+-- The file scribe uses 'K.ColorLog False' (no ANSI escape codes) so the log file
+-- is plain text and greppable. The file is opened in 'AppendMode' so
+-- restarts don't clobber previous logs. If the file cannot be opened
+-- (permissions, disk full), a warning is printed to stderr and the logger
+-- proceeds with stderr-only output (best-effort — file logging is a
+-- diagnostic aid, never a hard requirement).
+withSealLogger :: Text -> Maybe FilePath -> (SealLogger -> IO a) -> IO a
+withSealLogger logLevel mLogFile = bracket makeLogEnv' closeLogEnv'
   where
     makeLogEnv' = do
       let sev = fromMaybe InfoS (textToSeverity logLevel)
       scribe <- mkHandleScribeWithFormatter bracketFormat
         K.ColorIfTerminal stderr (permitItem sev) K.V2
-      le <- registerScribe "stderr" scribe defaultScribeSettings
-        =<< initLogEnv "seal-harness" "production"
+      le0 <- initLogEnv "seal-harness" "production"
+      le1 <- registerScribe "stderr" scribe defaultScribeSettings le0
+      le2 <- case mLogFile of
+        Nothing -> pure le1
+        Just path -> do
+          eHandle <- try (openFile path AppendMode) :: IO (Either SomeException Handle)
+          case eHandle of
+            Left e -> do
+              hPutStrLn stderr ("Warning: could not open log file " <> path <> ": " <> show e)
+              pure le1
+            Right h -> do
+              hSetBuffering h LineBuffering
+              fileScribe <- mkHandleScribeWithFormatter bracketFormat
+                (K.ColorLog False) h (permitItem sev) K.V2
+              registerScribe "file" fileScribe defaultScribeSettings le1
       pure SealLogger
-        { slLogEnv = le
+        { slLogEnv = le2
         , slContext = mempty
         , slNamespace = "seal-harness"
         }
