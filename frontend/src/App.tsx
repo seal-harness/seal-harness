@@ -38,7 +38,6 @@ import { useListsStream } from './hooks/useListsStream'
 import { useNewTabSpec } from './hooks/useNewTabSpec'
 import { useTranscriptStream } from './hooks/useTranscriptStream'
 import { useSessionActivityStream } from './hooks/useSessionActivityStream'
-import { streamClient } from './lib/streamClient'
 import type { Agent, AgentStatus, Message, SessionInfo, TabInfo } from './types'
 import { findSession, tabDisplayLabel } from './types'
 
@@ -905,12 +904,6 @@ export default function App() {
   })()
 
   const tokensUsed = useMemo(() => computeTokensUsed(entries), [entries])
-
-  // Eagerly focus the WS before any send so the server's _conn_focus matches
-  // when the broker publishes the first entry. (No-op when WS is down.)
-  useEffect(() => {
-    if (currentSessionId) streamClient().focus(currentSessionId)
-  }, [currentSessionId])
 
   // ── Render ────────────────────────────────────────────────────────────
   // The top-level section switches the entire body. "Sessions" is the

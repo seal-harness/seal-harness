@@ -179,7 +179,14 @@ export function useTranscriptStream(
   // refresh is a consistency check, not a session switch).
   useEffect(() => {
     if (sessionId === null) {
-      setEntries([])
+      // Do NOT clear entries when sessionId becomes null. During session
+      // switches, currentSessionId can briefly be null (React batching
+      // edge cases, tab-list mutations), and clearing entries causes the
+      // transcript to flicker — messages disappear and reappear. The
+      // entries will be replaced when the new session's data loads (cache
+      // hit or HTTP fetch). When sessionId is truly null (New Tab, dismiss
+      // tab), the ChatArea is typically not visible (composer or harness
+      // controls are shown), so stale entries are harmless.
       setPendingQuestions([])
       setLoading(false)
       loadedSessionRef.current = null
