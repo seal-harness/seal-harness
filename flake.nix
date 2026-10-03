@@ -15,7 +15,7 @@
       "https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com"
     ];
     extra-trusted-public-keys = [
-      "hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk="
+      "hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ="
       "seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo="
     ];
   };
