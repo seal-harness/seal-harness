@@ -33,9 +33,10 @@ import Data.Text.Read (decimal)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
+  , parseSimpleQuery
   , status200, status201, status204, status400, status403, status404, status500, status501 )
 import Network.Wai
-  ( Application, Request, Response, getRequestBodyChunk, pathInfo
+  ( Application, Request, Response, getRequestBodyChunk, pathInfo, rawQueryString
   , requestMethod, responseLBS )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
@@ -86,7 +87,8 @@ import Seal.Gateway.SessionJson
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
-  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
+  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso
+  , TranscriptTimings(..))
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -192,9 +194,13 @@ apiApp deps req respond =
       respond (jsonLBS status200 (A.encode infos))
     -- T11: GET /api/sessions/:id/transcript -> the parsed @entries.jsonl@
     -- lines, as a JSON array. Missing file -> @[]@; unparseable lines are
-    -- skipped.
+    -- skipped. Supports an optional @?tail=N@ query parameter to return
+    -- only the last N entries (for lazy transcript loading — the frontend
+    -- fetches the tail first for instant display, then background-loads
+    -- the rest). The full entry count is always returned in the
+    -- @X-Transcript-Total@ response header.
     (m', ["api", "sessions", sid, "transcript"]) | m' == methodGet ->
-      respond =<< handleTranscript deps sid
+      respond =<< handleTranscript deps sid (rawQueryString req)
     -- POST /api/sessions/:id/send. When the agent-loop plumbing is wired
     -- ('adSend' = 'Just'), route the message through the real agent loop
     -- (slash registry vs plain turn) and return the outcome. When 'adSend'
@@ -1905,8 +1911,8 @@ tabRefAt h idx = do
 -- entry count. The frontend parses this via @performance.getEntriesByName@ or
 -- by reading the @Server-Timing@ response header directly to direct
 -- optimization work without needing a separate tracing harness.
-handleTranscript :: ApiDeps -> Text -> IO Response
-handleTranscript deps sidTxt =
+handleTranscript :: ApiDeps -> Text -> ByteString -> IO Response
+handleTranscript deps sidTxt qs =
   case mkSessionId sidTxt of
     Left _  -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
     Right sid -> do
@@ -1915,7 +1921,15 @@ handleTranscript deps sidTxt =
       tReadStart <- getCurrentTime
       (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid
       tEncStart <- getCurrentTime
-      let body = A.encode entries
+      -- Apply ?tail=N if present: return only the last N entries, but
+      -- always report the full count in X-Transcript-Total so the frontend
+      -- knows whether to background-fetch the rest.
+      let totalCount = length entries
+          tailLimit  = parseTailParam qs
+          entries'   = case tailLimit of
+            Just n  -> drop (max 0 (totalCount - n)) entries
+            Nothing -> entries
+          body       = A.encode entries'
       tEncEnd <- getCurrentTime
       -- Fold the encode duration + the gap between read-complete and
       -- encode-start (negligible) into the timings so the @en@ token
@@ -1923,11 +1937,21 @@ handleTranscript deps sidTxt =
       -- read+encode cost. This is where the slow tab's time is hiding —
       -- A.encode of a deeply-nested Value tree (web_fetch tool_result
       -- carrying full page HTML) is pathologically slow on large strings.
-      let tt = setEncodeMs (msDiff tEncStart tEncEnd) (msDiff tReadStart tEncEnd) tt0
+      let tt = setEncodeMs (msDiff tEncStart tEncEnd) (msDiff tReadStart tEncEnd) (tt0 { ttEntryCount = totalCount })
           timingHeader = (mkHN "Server-Timing", renderServerTiming tt)
-      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader]) body)
+          totalHeader  = (mkHN "X-Transcript-Total", BC.pack (show totalCount))
+      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader, totalHeader]) body)
   where
     msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
+    -- | Parse @?tail=N@ from the raw query string. Returns 'Nothing' when
+    -- the parameter is absent or unparseable.
+    parseTailParam :: ByteString -> Maybe Int
+    parseTailParam rawQs =
+      case lookup (BC.pack "tail") (parseSimpleQuery rawQs) of
+        Just val -> case decimal (TE.decodeUtf8 val) of
+          Right (n, "") | n > 0 -> Just n
+          _                     -> Nothing
+        Nothing  -> Nothing
 
 -- | Handle GET /api/sessions/:id/questions. Returns the session's pending
 -- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@/@meta?@/
@@ -2291,6 +2315,7 @@ corsHeaders =
   [ (mkHN "Access-Control-Allow-Origin", "*")
   , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
   , (mkHN "Access-Control-Allow-Headers", "Content-Type")
+  , (mkHN "Access-Control-Expose-Headers", "X-Transcript-Total, Server-Timing")
   ]
 
 jsonHeader :: Header

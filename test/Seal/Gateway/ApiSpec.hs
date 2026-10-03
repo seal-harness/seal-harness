@@ -25,7 +25,7 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (Header, methodDelete, methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
-  , setRequestBodyChunks )
+  , rawQueryString, setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, removeDirectoryRecursive)
 import System.FilePath ((</>))
@@ -746,6 +746,84 @@ spec = describe "Seal.Gateway.API" $ do
       let t = BC.unpack (fromJust timing)
       t `shouldContain` "src;desc=\"conv-only\""
       t `shouldContain` "n;desc=\"2\""
+
+  it "GET /api/sessions/<sid>/transcript?tail=N returns only the last N entries + X-Transcript-Total header" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- Write 5 conversation entries (user + assistant pairs).
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "msg-0"]
+                 , Message Assistant [CbText "reply-0"]
+                 , Message User [CbText "msg-1"]
+                 , Message Assistant [CbText "reply-1"]
+                 , Message User [CbText "msg-2"]
+                 ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      deps <- mkDepsFor paths
+      app <- apiApp <$> pure deps
+      -- ?tail=2 should return only the last 2 entries.
+      let req = (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+                  { rawQueryString = "?tail=2" }
+      (status, body, hdrs) <- runAppBodyHeaders app req
+      status `shouldBe` 200
+      -- X-Transcript-Total reports the FULL count (5), not the tail count.
+      let totalHdr = lookup "X-Transcript-Total" hdrs
+      totalHdr `shouldSatisfy` isJust
+      BC.unpack (fromJust totalHdr) `shouldBe` "5"
+      -- Body should contain only 2 entries.
+      let arr = case A.decode body :: Maybe A.Value of
+            Just (A.Array a) -> V.toList a
+            _ -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 2
+      -- The last entry should be "msg-2" (the 5th conversation line).
+      let lastEntry = arr !! 1
+      lastEntry `shouldSatisfy` \v ->
+        case v of
+          A.Object o -> case KeyMap.lookup (Key.fromText "payload") o of
+            Just (A.Object p) -> case KeyMap.lookup (Key.fromText "messages") p of
+              Just (A.Array msgs) -> case msgs V.! 0 of
+                A.Object m -> case KeyMap.lookup (Key.fromText "content") m of
+                  Just (A.Array c) -> case c V.! 0 of
+                    A.Object blk -> case KeyMap.lookup (Key.fromText "text") blk of
+                      Just (A.String t) -> t == "msg-2"
+                      _ -> False
+                    _ -> False
+                  _ -> False
+                _ -> False
+              _ -> False
+            _ -> False
+          _ -> False
+
+  it "GET /api/sessions/<sid>/transcript?tail=N with N >= total returns all entries" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "a"], Message Assistant [CbText "b"] ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      deps <- mkDepsFor paths
+      app <- apiApp <$> pure deps
+      -- ?tail=100 (larger than the 2 entries) should return all 2.
+      let req = (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+                  { rawQueryString = "?tail=100" }
+      (status, body, hdrs) <- runAppBodyHeaders app req
+      status `shouldBe` 200
+      let totalHdr = lookup "X-Transcript-Total" hdrs
+      totalHdr `shouldSatisfy` isJust
+      BC.unpack (fromJust totalHdr) `shouldBe` "2"
+      let arr = case A.decode body :: Maybe A.Value of
+            Just (A.Array a) -> V.toList a
+            _ -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 2
 
   it "GET /api/sessions/<sid>/transcript rewrites conversation.jsonl blocks to Anthropic shape" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do

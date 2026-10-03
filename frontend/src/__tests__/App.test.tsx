@@ -240,9 +240,9 @@ describe('App — send + branch', () => {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (url === '/api/sessions/sess-send/transcript' && method === 'GET') {
+      if (url.startsWith('/api/sessions/sess-send/transcript') && method === 'GET') {
         return new globalThis.Response(JSON.stringify([]), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
+          status: 200, headers: { 'Content-Type': 'application/json', 'X-Transcript-Total': '0' },
         })
       }
       const body: unknown = url === '/api/agents' ? []
@@ -276,9 +276,9 @@ describe('App — send + branch', () => {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (url === '/api/sessions/sess-b/transcript' && method === 'GET') {
+      if (url.startsWith('/api/sessions/sess-b/transcript') && method === 'GET') {
         return new globalThis.Response(JSON.stringify([makeEntry({ id: 'be1' })]), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
+          status: 200, headers: { 'Content-Type': 'application/json', 'X-Transcript-Total': '1' },
         })
       }
       const body: unknown = url === '/api/agents' ? []
@@ -710,9 +710,9 @@ describe('App — slash bubble inline ordering', () => {
       if (url === '/api/sessions/archived') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (url === '/api/tabs') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (url === '/api/harnesses' || url === '/api/harnesses/discover') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
-      if (url === '/api/sessions/sess-slash/transcript' && method === 'GET') {
+      if (url.startsWith('/api/sessions/sess-slash/transcript') && method === 'GET') {
         // Return the current transcript state (grows as sends produce entries).
-        return new globalThis.Response(JSON.stringify(transcript), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        return new globalThis.Response(JSON.stringify(transcript), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Transcript-Total': String(transcript.length) } })
       }
       if (url === '/api/sessions/sess-slash/send' && method === 'POST') {
         sendCallCount++

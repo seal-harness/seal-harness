@@ -65,6 +65,11 @@ function getGlobalDataCache(): TranscriptDataCache {
   return globalDataCache
 }
 
+/** Number of entries to fetch in the initial tail load. Covers the visible
+ *  viewport (MIN_RENDERED=100 in useVirtualWindow) plus scroll headroom.
+ *  The rest of the transcript is background-loaded after display. */
+const TAIL_LIMIT = 200
+
 /** Reset the global data cache. Test-only — clears all cached transcript
  *  data so tests start with a clean state. */
 export function _resetDataCacheForTests(): void {
@@ -94,6 +99,50 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
     done(); ttfbDone(); textDone(); parseDone()
     return []
   }
+}
+
+/** Fetch only the last N transcript entries via @?tail=N@. Returns the
+ *  entries and the total entry count (from the X-Transcript-Total header).
+ *  Used for the initial display on cache-miss session loads — the tail is
+ *  small enough to display instantly, then the full transcript is
+ *  background-loaded by the caller. */
+async function fetchTranscriptTail(
+  sessionId: string,
+  limit: number,
+): Promise<{ entries: TranscriptEntry[]; totalCount: number }> {
+  const done = perf.begin('transcript.tail')
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/transcript?tail=${limit}`,
+    )
+    await perf.recordFetch('transcript.tail', res)
+    if (!res.ok) { done(); return { entries: [], totalCount: 0 } }
+    const totalCount = parseInt(
+      res.headers.get('X-Transcript-Total') ?? '0', 10,
+    )
+    const text = await res.text()
+    const entries = JSON.parse(text) as TranscriptEntry[]
+    done({ count: entries.length, meta: { sessionId, total: totalCount } })
+    return { entries, totalCount }
+  } catch {
+    done()
+    return { entries: [], totalCount: 0 }
+  }
+}
+
+/** Merge a full transcript fetch with the current entries array. The full
+ *  transcript is the base (all on-disk entries in order); any entries in
+ *  `prev` that are NOT in `full` (WS-delivered additions, streaming
+ *  placeholders not yet on disk) are appended at the end. Entries present
+ *  in both use the `full` version (canonical, read from disk after the
+ *  tail was shown). */
+function mergeFullWithPrev(
+  full: TranscriptEntry[],
+  prev: TranscriptEntry[],
+): TranscriptEntry[] {
+  const fullIds = new Set(full.map((e) => e.id))
+  const wsAdditions = prev.filter((e) => !fullIds.has(e.id))
+  return [...full, ...wsAdditions]
 }
 
 /**
@@ -219,26 +268,60 @@ export function useTranscriptStream(
         setPendingQuestions(qs)
       })
     } else {
-      // First load (cache miss) or refresh — HTTP GET seed.
-      // On first load, the seed replaces the (empty) entries array.
-      // On refresh (after send), the seed is MERGED with the current
-      // entries via reconcileEntries — this preserves WS-delivered
-      // entries that arrived between the HTTP request and response.
-      // Replacing the array (setEntries(seed)) would lose those entries
-      // and cause the entire transcript to be rebuilt, producing the
-      // flickering pattern where messages disappear and reappear.
+      // Cache miss — either a first load or a refresh.
+      //
+      // First load (lazy transcript loading):
+      //   Phase 1: fetch only the last TAIL_LIMIT entries (?tail=N) for
+      //   instant display. The tail covers the visible viewport plus
+      //   scroll headroom (useVirtualWindow renders ~100-200 messages).
+      //   Phase 2: if the full transcript is larger than the tail,
+      //   background-fetch the complete transcript and merge it in.
+      //   The user sees content immediately; older history loads
+      //   silently without blocking the UI.
+      //
+      // Refresh (after send): fetch the FULL transcript (not the tail)
+      // and merge with current entries via reconcileEntries — this
+      // preserves WS-delivered entries that arrived between the HTTP
+      // request and response.
       if (isFirstLoad) setLoading(true)
-      fetchTranscriptSeed(sessionId).then((seed) => {
-        if (cancelled) return
-        if (isFirstLoad) {
-          setEntries(seed)
-          dataCache.set(sessionId, seed)
-        } else {
-          // Refresh: merge seed with existing entries to preserve
-          // WS-delivered entries. reconcileEntries handles dedup by
-          // id — seed entries with matching ids replace in place,
-          // new seed entries are appended, and WS-delivered entries
-          // that aren't in the seed are retained.
+      if (isFirstLoad) {
+        // Phase 1: tail fetch for instant display.
+        fetchTranscriptTail(sessionId, TAIL_LIMIT).then(({ entries: tail, totalCount }) => {
+          if (cancelled) return
+          setEntries(tail)
+          setLoading(false)
+          loadedSessionRef.current = sessionId
+          dataCache.set(sessionId, tail)
+          const lastId = tail.length > 0 ? tail[tail.length - 1]!.id : undefined
+          if (lastId !== undefined) sc.focus(sessionId, lastId)
+          else sc.focus(sessionId)
+          console.log(`[transcript] SEED tail-fetch session=${sessionId} count=${tail.length} total=${totalCount}`)
+          // Phase 2: background-load the full transcript if there are
+          // older entries not included in the tail. The merge uses the
+          // full transcript as the base and appends any WS-delivered
+          // entries that arrived after the full fetch was initiated.
+          if (totalCount > tail.length) {
+            fetchTranscriptSeed(sessionId).then((full) => {
+              if (cancelled) return
+              setEntries((prev) => {
+                const merged = mergeFullWithPrev(full, prev)
+                // Update the cache so a future switch back to this
+                // session is instant with the full transcript.
+                dataCache.set(sessionId, merged)
+                return merged
+              })
+              console.log(`[transcript] SEED bg-full session=${sessionId} fullCount=${full.length}`)
+            })
+          }
+        })
+      } else {
+        // Refresh: fetch full seed and merge with current entries to
+        // preserve WS-delivered entries. reconcileEntries handles dedup
+        // by id — seed entries with matching ids replace in place, new
+        // seed entries are appended, and WS-delivered entries that
+        // aren't in the seed are retained.
+        fetchTranscriptSeed(sessionId).then((seed) => {
+          if (cancelled) return
           setEntries((prev) => {
             let merged = prev
             for (const e of seed) {
@@ -246,19 +329,17 @@ export function useTranscriptStream(
             }
             return merged
           })
-        }
-        setLoading(false)
-        console.log(`[transcript] SEED ${isFirstLoad ? 'http-fetch' : 'http-merge'} session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
-        loadedSessionRef.current = sessionId
-        // Use the data cache's last id for focus — it includes
-        // WS-delivered entries that may have arrived after the seed.
-        const cachedNow = dataCache.get(sessionId)
-        const lastId = cachedNow && cachedNow.length > 0
-          ? cachedNow[cachedNow.length - 1]!.id
-          : seed.length > 0 ? seed[seed.length - 1]!.id : undefined
-        if (lastId !== undefined) sc.focus(sessionId, lastId)
-        else sc.focus(sessionId)
-      })
+          setLoading(false)
+          loadedSessionRef.current = sessionId
+          const cachedNow = dataCache.get(sessionId)
+          const lastId = cachedNow && cachedNow.length > 0
+            ? cachedNow[cachedNow.length - 1]!.id
+            : seed.length > 0 ? seed[seed.length - 1]!.id : undefined
+          if (lastId !== undefined) sc.focus(sessionId, lastId)
+          else sc.focus(sessionId)
+          console.log(`[transcript] SEED http-merge session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
+        })
+      }
       fetchPendingQuestions(sessionId).then((qs) => {
         if (cancelled) return
         setPendingQuestions(qs)
@@ -304,7 +385,7 @@ export function useTranscriptStream(
   useEffect(() => {
     if (sessionId === null) return
     const unsub = sc.onAskResolved((_sid, ask) => {
-      setPendingQuestions((prev) => prev.filter((q) => q.id !== ask.id))
+      setPendingQuestions((prev) => prev.filter((q) => q.id === ask.id))
     })
     return unsub
   }, [sessionId, sc])
