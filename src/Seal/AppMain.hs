@@ -36,7 +36,7 @@ programInfo = CUtils.programInfo "seal — secure AI agent execution around the 
 -- 'logIO' reach the same scribe.
 dispatch :: Config -> IO ()
 dispatch cfg =
-  withSealLogger (view config_logLevel cfg) $ \logger -> do
+  withSealLogger (view config_logLevel cfg) (Just "seal.log") $ \logger -> do
     setGlobalLogger logger
     env <- mkEnv logger cfg
     runApp env $ case _config_command cfg of
