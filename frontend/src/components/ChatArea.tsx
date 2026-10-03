@@ -1945,6 +1945,32 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
+        // ASK_HUMAN harness entries: the backend records a harness entry
+        // with op.name='ASK_HUMAN', input.question, and input.options
+        // after the ASK_HUMAN opcode runs. Without this handler, the
+        // entry produces zero messages and the question is invisible in
+        // the transcript. Render the question + options as a text message
+        // so the user can see what was asked even without the interactive
+        // AskHumanForm (which is driven separately by pendingQuestions).
+        if (opName === 'ASK_HUMAN') {
+          const input = parsed.input as { question?: string; options?: Array<{ label: string; description?: string }> } | undefined
+          const question = input?.question ?? ''
+          const options = input?.options ?? []
+          const optionLines = options
+            .map((o, i) => `${i + 1}) ${o.label}${o.description ? ' \u2014 ' + o.description : ''}`)
+            .join('\n')
+          const text = optionLines ? `${question}\n\n${optionLines}` : question
+          messages.push({
+            id: e.id + '-ask',
+            entryId: e.id,
+            agentName: 'Assistant',
+            agentStatus: 'completed',
+            timestamp: ts,
+            blocks: [{ id: 'ask-' + e.id, text }],
+            rawJson,
+          })
+          continue
+        }
         // Approval-evidence entries (EKHarness with an "approval" key in
         // the payload). Render as a distinct "approval" row so the user
         // sees the confirmation decision in the transcript.
