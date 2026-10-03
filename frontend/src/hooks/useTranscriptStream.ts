@@ -169,6 +169,10 @@ export function useTranscriptStream(
   const [refreshCount, setRefreshCount] = useState(0)
   const loadedSessionRef = useRef<string | null>(null)
   const currentSessionRef = useRef<string | null>(null)
+  // Track the previous WS status to detect reconnects (reconnecting → live).
+  // The initial value matches the client's status at hook creation time;
+  // the status-change effect updates it on every transition.
+  const prevStatusRef = useRef<StreamStatus>(sc.status)
 
   const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
@@ -317,6 +321,31 @@ export function useTranscriptStream(
     })
     return unsub
   }, [sc])
+
+  // Re-fetch pending questions on WS reconnect.
+  //
+  // The WS `ask` event is not replayed on reconnect (the server has no
+  // replay mechanism for ask events, only for transcript entries). When
+  // the WebSocket drops and reconnects, any ASK_HUMAN that fired during
+  // the gap is lost. This effect detects the reconnect by watching for
+  // the `reconnecting → live` status transition and re-fetches pending
+  // questions via HTTP to recover them.
+  //
+  // Only `reconnecting → live` triggers a re-fetch — the initial
+  // `connecting → live` and `replaying → live` transitions are skipped
+  // because the session-load effect already fetches on initial load.
+  useEffect(() => {
+    const prevStatus = prevStatusRef.current
+    prevStatusRef.current = status
+    if (sessionId !== null && prevStatus === 'reconnecting' && status === 'live') {
+      let cancelled = false
+      fetchPendingQuestions(sessionId).then((qs) => {
+        if (cancelled) return
+        setPendingQuestions(qs)
+      })
+      return () => { cancelled = true }
+    }
+  }, [status, sessionId])
 
   return { entries, status, lastError, pendingQuestions, loading, refresh }
 }
