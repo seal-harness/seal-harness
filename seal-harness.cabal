@@ -474,6 +474,7 @@ test-suite tests
         Seal.Channels.Chat.WsClientSpec
         Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
         Seal.Command.HelpSpec

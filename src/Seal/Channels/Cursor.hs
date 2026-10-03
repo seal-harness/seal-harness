@@ -23,12 +23,14 @@
 module Seal.Channels.Cursor
   ( CursorStore
   , newPersistingCursorStore
+  , newPersistingCursorStoreWith
   , seedCursorStore
   , cursorClearAll
   , snapshotCursor
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -48,6 +50,9 @@ import Seal.Tabs.Types (TabRef)
 data CursorStore = CursorStore
   { csVar  :: TVar (Map ConversationKey TabRef)
   , csSave :: Maybe (IO ())
+  , csLock :: MVar ()
+  -- ^ Serializes the mutation+persist sequence so a stale snapshot from
+  -- one thread cannot overwrite a newer on-disk write from another.
   }
 
 -- | A conversation identity: 'ChannelKind' × 'ConversationId'.
@@ -63,12 +68,25 @@ type ConversationKey = (Text, Text)
 -- Used by 'Seal.Command.Serve.runServeMain' so the cursor map survives
 -- a restart. The save action snapshots the current map inside itself
 -- (so the last writer wins with a consistent view, even if mutations
--- interleave the save).
+-- interleave the save). The 'csLock' serializes mutation+persist so the
+-- snapshot cannot be stale (see 'cursorClearAll').
 newPersistingCursorStore :: FilePath -> IO CursorStore
 newPersistingCursorStore path = do
   tv <- newTVarIO Map.empty
-  let store = CursorStore { csVar = tv, csSave = Just (saveAction store) }
+  lock <- newMVar ()
+  let store = CursorStore { csVar = tv, csSave = Just (saveAction store), csLock = lock }
       saveAction s = saveCursorMap path =<< snapshotCursor s
+  pure store
+
+-- | Create a 'CursorStore' with a custom save function (for testing).
+-- The save function receives the full current map. Used by
+-- 'Seal.Channels.CursorSpec' to verify persist serialization.
+newPersistingCursorStoreWith :: (Map ConversationKey TabRef -> IO ()) -> IO CursorStore
+newPersistingCursorStoreWith saveFn = do
+  tv <- newTVarIO Map.empty
+  lock <- newMVar ()
+  let store = CursorStore { csVar = tv, csSave = Just (saveAction store), csLock = lock }
+      saveAction s = saveFn =<< snapshotCursor s
   pure store
 
 -- | Replace the handle's map in one STM transaction. Used at boot to
@@ -87,11 +105,15 @@ snapshotCursor s = readTVarIO (csVar s)
 -- focused on it should drop the cursor (the next message will create a
 -- fresh tab). Single STM transaction — race-safe. Persists via 'csSave'.
 cursorClearAll :: CursorStore -> TabRef -> IO ()
-cursorClearAll s ref = do
-  atomically $ do
-    m <- readTVar (csVar s)
-    writeTVar (csVar s) (Map.filter (/= ref) m)
-  persistCursor s
+cursorClearAll s ref =
+  -- Hold the lock through mutation+persist so no concurrent thread can
+  -- mutate the TVar between our snapshot and our save (which would let a
+  -- stale snapshot overwrite a newer on-disk write).
+  withMVar (csLock s) $ \_ -> do
+    atomically $ do
+      m <- readTVar (csVar s)
+      writeTVar (csVar s) (Map.filter (/= ref) m)
+    persistCursor s
 
 -- | Run the persist action (if any) after a successful mutation. A save
 -- failure is logged to stderr (ids + error only — no conversation content)

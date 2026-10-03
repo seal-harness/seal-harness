@@ -7,6 +7,7 @@ import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
+import { SecretsView } from './components/SecretsView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
@@ -62,6 +63,7 @@ function sectionFromPath(): TopSection {
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
+  if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
   return 'sessions'
 }
 
@@ -915,6 +917,8 @@ export default function App() {
         <SkillsView />
       ) : section === 'repos' ? (
         <ReposView />
+      ) : section === 'secrets' ? (
+        <SecretsView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar
