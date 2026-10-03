@@ -561,6 +561,7 @@ test-suite tests
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
+        Seal.Providers.ContextWindowSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec

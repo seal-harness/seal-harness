@@ -23,6 +23,7 @@ modelContextWindow m
   | "gpt-4-turbo"    `T.isPrefixOf` m = 128000
   | "llama3.1"       `T.isPrefixOf` m = 128000
   | "llama3"         `T.isPrefixOf` m = 8192
+  | "glm-5"          `T.isPrefixOf` m = 1048576
   | otherwise                          = 0
 
 -- | The max output tokens for a model id, by prefix match. 0 if unknown.
@@ -31,4 +32,5 @@ modelMaxOutputTokens m
   | "claude-"   `T.isPrefixOf` m = 64000
   | "gpt-4o-"   `T.isPrefixOf` m = 16384
   | "llama3"    `T.isPrefixOf` m = 4096
+  | "glm-5"     `T.isPrefixOf` m = 8192
   | otherwise                     = 0
