@@ -57,9 +57,9 @@ import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 import Data.Vector qualified as V
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Backend (AgentDefBackend (..), ResolveResult (..), resolveAgentDefEntry)
 import Seal.Agent.Def.Types
-  ( AgentDef (..), mkAgentDefId, agentDefIdText
+  ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
   , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
   )
 import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
@@ -248,13 +248,24 @@ handleDefRead backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
     Just aid -> do
-      mDef <- liftIO (adbRead backend aid)
-      case mDef of
-        Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
-        Just d  -> do
+      rDef <- liftIO (resolveAgentDefEntry backend aid)
+      case rDef of
+        ResolveNotFound ->
+          pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousAgentDefMsg aid ids)] True (object ["id" .= agentDefIdText aid]))
+        ResolveFound d  -> do
           let rendered = renderDef d
               recorded = encodeDefRecorded d False []
           pure (OpResult [TrpText rendered] False recorded)
+
+-- | Format an ambiguity error for an agent def id, listing the
+-- fully-qualified ids that matched so the user can disambiguate.
+ambiguousAgentDefMsg :: AgentDefId -> [Text] -> Text
+ambiguousAgentDefMsg aid ids =
+  "ambiguous agent def id \"" <> agentDefIdText aid <> "\". Matching ids: "
+    <> T.intercalate ", " ids
+    <> ". Use the full id to disambiguate."
 
 -- | Handle the list action (shared with the legacy AGENT_DEF_LIST shim).
 handleDefList :: AgentDefBackend -> App OpResult
@@ -281,13 +292,16 @@ handleDefDelete backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
     Just aid -> do
-      mExisting <- liftIO (adbRead backend aid)
-      liftIO (adbDelete backend aid)
-      let msg = case mExisting of
-            Nothing -> "deleted (was not present)"
-            Just _  -> "deleted"
-          recorded = object ["id" .= agentDefIdText aid]
-      pure (OpResult [TrpText msg] False recorded)
+      rExisting <- liftIO (resolveAgentDefEntry backend aid)
+      case rExisting of
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousAgentDefMsg aid ids)] True (object ["id" .= agentDefIdText aid]))
+        ResolveNotFound -> do
+          liftIO (adbDelete backend aid)
+          pure (OpResult [TrpText "deleted (was not present)"] False (object ["id" .= agentDefIdText aid]))
+        ResolveFound _ -> do
+          liftIO (adbDelete backend aid)
+          pure (OpResult [TrpText "deleted"] False (object ["id" .= agentDefIdText aid]))
 
 -- ---------------------------------------------------------------------------
 -- knownOpNames — the universe of opcode names the harness exposes

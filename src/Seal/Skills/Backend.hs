@@ -20,6 +20,8 @@
 -- (the user store is the model's write target).
 module Seal.Skills.Backend
   ( SkillBackend (..)
+  , ResolveResult (..)
+  , resolveSkillEntry
   , noneBackend
   , markdownSkillBackend
   , unionSkillBackend
@@ -70,6 +72,38 @@ import Seal.Tools.Exec.WorkdirFs
   , snapChildDirsAt, snapChildFilesAt, snapIsDirectoryAt, snapTopDirs
   , wfsSnapshot
   )
+-- | The result of resolving a (possibly bare) skill id against a backend.
+-- 'ResolveFound' is the normal case. 'ResolveAmbiguous' carries the
+-- fully-qualified ids that matched a bare id, so the opcode handler can
+-- surface them to the user. 'ResolveNotFound' means no skill matched at
+-- any layer.
+data ResolveResult a
+  = ResolveFound a
+  | ResolveAmbiguous [Text]
+  | ResolveNotFound
+  deriving stock (Eq, Show)
+
+-- | Resolve a (possibly bare) skill id against a 'SkillBackend', with
+-- ambiguity detection. First tries 'sbRead' (which handles fully-qualified
+-- ids and the existing bare-id resolution in the union/triple-union
+-- backends). If 'sbRead' returns 'Nothing', lists all skills and searches
+-- for bare-id matches to distinguish "not found" from "ambiguous".
+-- When multiple skills share the same bare id, returns 'ResolveAmbiguous'
+-- with their fully-qualified ids so the caller can present them as
+-- disambiguation options.
+resolveSkillEntry :: SkillBackend -> SkillId -> IO (ResolveResult Skill)
+resolveSkillEntry backend sid = do
+  mSkill <- sbRead backend sid
+  case mSkill of
+    Just s  -> pure (ResolveFound s)
+    Nothing -> do
+      allSkills <- sbList backend
+      let matches = [s | s <- allSkills, bareSkillIdText (skId s) == bareSkillIdText sid]
+      case matches of
+        []  -> pure ResolveNotFound
+        [s] -> pure (ResolveFound s)
+        ss  -> pure (ResolveAmbiguous (map (skillIdText . skId) ss))
+
 data SkillBackend = SkillBackend
   { sbCreate :: Skill -> IO ()
   -- ^ Insert or replace a skill by id (writes the file + auto-commits).

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.AgentSpec (spec) where
 
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
@@ -27,11 +28,12 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Registry
 import Seal.Config.Paths (SealPaths (..))
-import Seal.Core.Types (SessionId, mkSystemSessionId)
+import Seal.Core.Types (SessionId, mkSystemSessionId, ModelId (..))
 import Seal.ISA.Opcode
   ( OpResult (..), localBackend, opAuthorize, opRun )
 import Seal.ISA.Ops.Agent
 import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Security.Policy (AllowList (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -241,6 +243,29 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       let read' = agentDefReadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("nope" :: Text)]))
       orIsError r `shouldBe` True
+
+  describe "AGENT_DEF_MANAGE read (ambiguous bare id)" $ do
+    it "surfaces an ambiguity message with matching ids" $ do
+      let mkAid t = case mkAgentDefId t of Right a -> a; Left _ -> AgentDefId "fallback"
+          mkD t = AgentDef
+            { adId = mkAid t, adName = t, adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "be nice"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing
+            , adCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , adUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , adSession = sampleSession
+            }
+      backend <- staticAgentDefBackend [mkD "repo1--foo", mkD "repo2--foo"]
+      let op = agentDefManageOp backend sampleSession
+      r <- runTestApp (opRun op localBackend (object ["action" .= ("read" :: Text), "id" .= ("foo" :: Text)]))
+      orIsError r `shouldBe` True
+      case orParts r of
+        [TrpText t] -> do
+          "ambiguous" `T.isInfixOf` t `shouldBe` True
+          "repo1--foo" `T.isInfixOf` t `shouldBe` True
+          "repo2--foo" `T.isInfixOf` t `shouldBe` True
+        _ -> expectationFailure "expected a single text part"
 
   describe "AGENT_DEF_LIST" $ do
     it "returns an empty message when no defs" $ do
