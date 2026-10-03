@@ -1,9 +1,13 @@
 import '@testing-library/jest-dom/vitest'
 
-// jsdom does not implement scrollIntoView; ChatArea's sticky-bottom effect
-// calls it on a ref. Stub it as a no-op so component tests can render.
+// jsdom does not implement scrollIntoView or scrollTo; ChatArea's
+// auto-scroll effects call them on refs. Stub as no-ops so component
+// tests can render.
 if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = function scrollIntoView() {}
+}
+if (typeof Element !== 'undefined' && !Element.prototype.scrollTo) {
+  Element.prototype.scrollTo = function scrollTo() {}
 }
 
 

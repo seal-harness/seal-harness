@@ -2547,22 +2547,58 @@ export function ChatArea({
   // the auto-scroll effect. Always update it here so sessionChanged is
   // only true on the render where the session actually changed.
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
+  // Stays true from a session switch until we've successfully scrolled to
+  // the bottom with real messages rendered. Survives the async gap between
+  // switching to a session (cache miss → loading view) and the messages
+  // arriving (HTTP fetch completes), so the scroll fires at the right time
+  // rather than on the loading view.
+  const pendingScrollToBottom = useRef(false)
 
-  useEffect(() => {
+  // Session-switch scroll: useLayoutEffect fires after DOM commit but
+  // BEFORE paint, so the user never sees a flash of the wrong position.
+  // This is critical for tab clicks — the user expects to see the latest
+  // messages immediately. We use scrollTo on the scroller directly (rather
+  // than scrollIntoView on the sentinel) for reliable, explicit positioning.
+  // A requestAnimationFrame follow-up catches layout shifts from async
+  // content (code highlighting, images, markdown) that render after commit.
+  useLayoutEffect(() => {
     if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
-      // Session switched — scroll to the bottom of whatever is currently
-      // rendered. If the new session's messages are already in props
-      // (cache hit), this scrolls to the right place. If they haven't
-      // arrived yet (HTTP fetch), this scrolls to the bottom of the
-      // loading/empty view, and the sticky-bottom scroll on the next
-      // render (when the real messages arrive) will scroll again.
       wasAtBottom.current = true
-      messagesEndRef.current?.scrollIntoView({ block: 'end' })
-      return
+      pendingScrollToBottom.current = true
     }
+
+    // Scroll to the bottom when a session switch is pending and real
+    // messages are present (not loading, not empty). The pending flag
+    // survives the async gap for cache-miss sessions where messages arrive
+    // via HTTP fetch after the session id has already changed.
+    if (pendingScrollToBottom.current && !loading && messages.length > 0) {
+      const el = scrollerRef.current
+      if (el) {
+        el.scrollTo({ top: el.scrollHeight })
+        // Follow-up scroll on the next frame to catch layout shifts from
+        // async content rendering (code blocks, images, markdown).
+        requestAnimationFrame(() => {
+          const el2 = scrollerRef.current
+          if (el2) el2.scrollTo({ top: el2.scrollHeight })
+        })
+        pendingScrollToBottom.current = false
+      }
+    } else if (pendingScrollToBottom.current && !loading && messages.length === 0) {
+      pendingScrollToBottom.current = false
+    }
+  }, [messages, hasFragment, selectedSession?.id, loading])
+
+  // Sticky-bottom scroll for streaming messages: only auto-scroll when the
+  // user was already near the bottom. Uses scrollIntoView on the sentinel
+  // div (the existing behavior) so tests that spy on scrollIntoView remain
+  // valid. Runs in useEffect (after paint) — less timing-critical than
+  // session switches.
+  useEffect(() => {
+    if (hasFragment) return
+    if (pendingScrollToBottom.current) return
     if (wasAtBottom.current) {
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }

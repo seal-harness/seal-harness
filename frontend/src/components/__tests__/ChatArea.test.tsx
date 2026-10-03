@@ -2099,15 +2099,21 @@ describe('Scroll-to-bottom behavior', () => {
 
   it('switching sessions scrolls to bottom of the new session', () => {
     // When the user switches from session s1 to session s2, the transcript
-    // should scroll to the bottom of s2's messages. We verify this by
-    // checking that scrollIntoView is called after the session switch
-    // completes (the deferred scroll fires once the new messages arrive).
+    // must scroll to the bottom of s2's messages. The session-switch scroll
+    // now uses scrollTo on the scroller directly (in a useLayoutEffect for
+    // pre-paint positioning). We verify by spying on both scrollTo and
+    // scrollIntoView — the session-switch fires scrollTo, and the
+    // sticky-bottom effect also fires scrollIntoView (wasAtBottom is true
+    // after the switch).
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
 
     const scrollIntoViewSpy = vi.fn()
+    const scrollToSpy = vi.fn()
     const origScrollIntoView = Element.prototype.scrollIntoView
+    const origScrollTo = Element.prototype.scrollTo
     Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
 
     try {
       const { rerender } = render(
@@ -2119,6 +2125,7 @@ describe('Scroll-to-bottom behavior', () => {
       )
       // Clear calls from initial render.
       scrollIntoViewSpy.mockClear()
+      scrollToSpy.mockClear()
 
       // Switch to session s2 with different messages.
       act(() => {
@@ -2131,23 +2138,29 @@ describe('Scroll-to-bottom behavior', () => {
         )
       })
 
-      // The deferred scroll should have fired, calling scrollIntoView.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      // The session-switch scroll should have fired via scrollTo.
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
+      Element.prototype.scrollTo = origScrollTo
     }
   })
 
   it('after session switch, subsequent streaming messages auto-scroll (sticky-bottom not broken)', () => {
     // Regression test: after switching sessions, the sticky-bottom state
     // must not be permanently broken. New messages arriving in the new
-    // session should auto-scroll.
+    // session should auto-scroll. The sticky-bottom effect uses
+    // scrollIntoView on the sentinel div (wasAtBottom is true after the
+    // switch), so we spy on scrollIntoView.
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
 
     const scrollIntoViewSpy = vi.fn()
+    const scrollToSpy = vi.fn()
     const origScrollIntoView = Element.prototype.scrollIntoView
+    const origScrollTo = Element.prototype.scrollTo
     Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
 
     try {
       const { rerender } = render(
@@ -2196,6 +2209,62 @@ describe('Scroll-to-bottom behavior', () => {
       expect(scrollIntoViewSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
+     Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('switching to a loading session scrolls to bottom once messages arrive', () => {
+    // Regression test for the cache-miss case: when switching to a session
+    // whose messages haven't loaded yet (loading=true), the scroll must be
+    // deferred until the real messages arrive. The pendingScrollToBottom
+    // ref persists across the loading → messages-ready transition.
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+        />,
+      )
+      // Clear calls from initial render.
+      scrollToSpy.mockClear()
+
+      // Switch to session s2 — messages not loaded yet (loading=true).
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={[]}
+            loading={true}
+          />,
+        )
+      })
+      // scrollTo must NOT have fired during loading (nothing to scroll to).
+      expect(scrollToSpy).not.toHaveBeenCalled()
+
+      // Messages arrive (loading completes).
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            loading={false}
+          />,
+        )
+      })
+      // Now scrollTo should have fired — we scrolled to the bottom.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
     }
   })
 })
