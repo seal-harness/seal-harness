@@ -8,6 +8,7 @@ module Seal.Core.Paging
   ( PageParams (..)
   , Page (..)
   , clamp
+  , paginateDesc
   , pageSize
   , windowSize
   , paginate
@@ -70,6 +71,33 @@ paginate params offset mLimit items =
        , pgHasMore = offset' + length window < total
        }
 
+-- | Back-to-front pagination. @offset@ counts from the end of the list:
+-- @offset=0@ returns the last @size@ items, @offset=size@ returns the
+-- items before that, and so on. Items within the window remain in their
+-- original (input) order — only the window selection is reversed.
+--
+-- @pgOffset@ is the 0-based index in the /original/ list where the window
+-- starts, so message-index rendering stays correct. @pgHasMore@ means
+-- "there are older items before this window" (read with a larger offset
+-- to page further back).
+paginateDesc :: PageParams -> Int -> Maybe Int -> [a] -> Page a
+paginateDesc params offset mLimit items =
+  let total      = length items
+      size       = windowSize params total mLimit
+      offset'    = clamp 0 total offset
+      avail      = max 0 (total - offset')
+      effStart   = max 0 (total - offset' - size)
+      actualSize = min size avail
+      window     = if offset' >= total
+                     then []
+                     else take actualSize (drop effStart items)
+      hasMore    = not (null window) && effStart > 0
+  in Page
+       { pgItems   = window
+       , pgOffset  = effStart
+       , pgTotal   = total
+       , pgHasMore = hasMore
+       }
 -- | 'PageParams' used everywhere in this milestone.
 -- @PageParams { ppFloor = 500, ppCeiling = 2000, ppCoeff = 0.0 }@.
 -- A flat 500-line default (matching Hermes' read_file), with a 2000-line
