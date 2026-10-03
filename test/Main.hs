@@ -162,6 +162,7 @@ import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
+import qualified Seal.Agent.ContextTruncationSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
@@ -346,6 +347,7 @@ specs = do
   Seal.Providers.OllamaSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
+  Seal.Agent.ContextTruncationSpec.spec
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.IntegrationSpec.spec
   Seal.ISA.Ops.HumanSpec.spec

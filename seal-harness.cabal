@@ -239,6 +239,7 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.ContextTruncation
         Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
@@ -566,6 +567,7 @@ test-suite tests
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
+        Seal.Agent.ContextTruncationSpec
         Seal.ISA.DispatchSpec
         Seal.ISA.IntegrationSpec
         Seal.ISA.Ops.HumanSpec
