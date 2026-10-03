@@ -479,9 +479,9 @@ export interface PendingQuestion {
 /** Fetch the session's pending questions (the frontend polls this on
  *  connect/reconnect so questions that arrived during a WS gap are
  *  recovered). */
-export async function fetchPendingQuestions(sessionId: string): Promise<PendingQuestion[]> {
+export async function fetchPendingQuestions(sessionId: string, signal?: AbortSignal): Promise<PendingQuestion[]> {
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/questions`)
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/questions`, { signal })
     if (!res.ok) return []
     return (await res.json()) as PendingQuestion[]
   } catch {

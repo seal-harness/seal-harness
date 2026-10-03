@@ -76,13 +76,13 @@ export function _resetDataCacheForTests(): void {
   globalDataCache = null
 }
 
-async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]> {
+async function fetchTranscriptSeed(sessionId: string, signal?: AbortSignal): Promise<TranscriptEntry[]> {
   const done = perf.begin('transcript.seed')
   const ttfbDone = perf.begin('transcript.seed.ttfb')
   const textDone = perf.begin('transcript.seed.readBody')
   const parseDone = perf.begin('transcript.seed.jsonParse')
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`, { signal })
     await perf.recordFetch('transcript.seed', res)
     ttfbDone({ meta: { sessionId, status: res.status } })
     if (!res.ok) {
@@ -109,11 +109,13 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
 async function fetchTranscriptTail(
   sessionId: string,
   limit: number,
+  signal?: AbortSignal,
 ): Promise<{ entries: TranscriptEntry[]; totalCount: number }> {
   const done = perf.begin('transcript.tail')
   try {
     const res = await fetch(
       `/api/sessions/${encodeURIComponent(sessionId)}/transcript?tail=${limit}`,
+      { signal },
     )
     await perf.recordFetch('transcript.tail', res)
     if (!res.ok) { done(); return { entries: [], totalCount: 0 } }
@@ -244,6 +246,8 @@ export function useTranscriptStream(
     currentSessionRef.current = sessionId
     sc.focus(sessionId)
     let cancelled = false
+    const abortCtrl = new AbortController()
+    const signal = abortCtrl.signal
 
     const dataCache = getGlobalDataCache()
     const cached = dataCache.get(sessionId)
@@ -263,7 +267,7 @@ export function useTranscriptStream(
       console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.length}`)
       const lastId = cached[cached.length - 1]!.id
       sc.focus(sessionId, lastId)
-      fetchPendingQuestions(sessionId).then((qs) => {
+      fetchPendingQuestions(sessionId, signal).then((qs) => {
         if (cancelled) return
         setPendingQuestions(qs)
       })
@@ -286,7 +290,7 @@ export function useTranscriptStream(
       if (isFirstLoad) setLoading(true)
       if (isFirstLoad) {
         // Phase 1: tail fetch for instant display.
-        fetchTranscriptTail(sessionId, TAIL_LIMIT).then(({ entries: tail, totalCount }) => {
+        fetchTranscriptTail(sessionId, TAIL_LIMIT, signal).then(({ entries: tail, totalCount }) => {
           if (cancelled) return
           setEntries(tail)
           setLoading(false)
@@ -301,7 +305,7 @@ export function useTranscriptStream(
           // full transcript as the base and appends any WS-delivered
           // entries that arrived after the full fetch was initiated.
           if (totalCount > tail.length) {
-            fetchTranscriptSeed(sessionId).then((full) => {
+            fetchTranscriptSeed(sessionId, signal).then((full) => {
               if (cancelled) return
               setEntries((prev) => {
                 const merged = mergeFullWithPrev(full, prev)
@@ -320,7 +324,7 @@ export function useTranscriptStream(
         // by id — seed entries with matching ids replace in place, new
         // seed entries are appended, and WS-delivered entries that
         // aren't in the seed are retained.
-        fetchTranscriptSeed(sessionId).then((seed) => {
+        fetchTranscriptSeed(sessionId, signal).then((seed) => {
           if (cancelled) return
           setEntries((prev) => {
             let merged = prev
@@ -340,12 +344,12 @@ export function useTranscriptStream(
           console.log(`[transcript] SEED http-merge session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
         })
       }
-      fetchPendingQuestions(sessionId).then((qs) => {
+      fetchPendingQuestions(sessionId, signal).then((qs) => {
         if (cancelled) return
         setPendingQuestions(qs)
       })
     }
-    return () => { cancelled = true }
+    return () => { cancelled = true; abortCtrl.abort() }
   }, [sessionId, sc, refreshCount])
 
   // WS entry subscription (focused session only).
