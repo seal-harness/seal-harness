@@ -4,6 +4,7 @@ module Seal.Core.PagingSpec (spec) where
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck
+import Data.List (isInfixOf)
 
 import Seal.Core.Paging
 import Seal.TestHelpers.Arbitrary ()
@@ -107,6 +108,86 @@ spec = describe "Seal.Core.Paging" $ do
     prop "SECURITY: any offset/limit (incl. negative/huge) -> bounded, offset in [0,total]" $
       \params offset mLimit (xs :: [Int]) ->
         let p = paginate params offset (mLimit :: Maybe Int) xs
+        in length (pgItems p) <= ppCeiling params
+           .&&. pgOffset p >= 0
+           .&&. pgOffset p <= pgTotal p
+
+  -- ---------------------------------------------------------------------
+  -- paginateDesc — back-to-front pagination
+  -- ---------------------------------------------------------------------
+  describe "paginateDesc" $ do
+
+    it "offset=0 returns the last window" $
+      let p = paginateDesc defaultPageParams 0 (Just 20) [1..100 :: Int]
+      in do
+        pgItems p   `shouldBe` [81..100]
+        pgOffset p  `shouldBe` 80
+        pgTotal p   `shouldBe` 100
+        pgHasMore p `shouldBe` True
+
+    it "offset=20 returns the window before the last" $
+      let p = paginateDesc defaultPageParams 20 (Just 20) [1..100 :: Int]
+      in do
+        pgItems p   `shouldBe` [61..80]
+        pgOffset p  `shouldBe` 60
+        pgHasMore p `shouldBe` True
+
+    it "offset at the boundary returns the first window" $
+      let p = paginateDesc defaultPageParams 80 (Just 20) [1..100 :: Int]
+      in do
+        pgItems p   `shouldBe` [1..20]
+        pgOffset p  `shouldBe` 0
+        pgHasMore p `shouldBe` False
+
+    it "offset past total yields empty window and pgHasMore False" $
+      let p = paginateDesc defaultPageParams 100 (Just 20) [1..100 :: Int]
+      in do
+        pgItems p   `shouldBe` []
+        pgHasMore p `shouldBe` False
+
+    it "limit larger than total returns all items from the start" $
+      let p = paginateDesc defaultPageParams 0 (Just 50) [1..5 :: Int]
+      in do
+        pgItems p   `shouldBe` [1..5]
+        pgOffset p  `shouldBe` 0
+        pgHasMore p `shouldBe` False
+
+    it "window is smaller when few items remain before offset point" $
+      let p = paginateDesc defaultPageParams 10 (Just 50) [1..55 :: Int]
+      in do
+        -- Skip 10 from end (messages 46-55), take up to 50 before that.
+        -- Only 45 messages remain (1-45).
+        pgItems p   `shouldBe` [1..45]
+        pgOffset p  `shouldBe` 0
+        pgHasMore p `shouldBe` False
+
+    it "items are in original (chronological) order within the window" $
+      let p = paginateDesc defaultPageParams 0 (Just 3) [1..10 :: Int]
+      in pgItems p `shouldBe` [8, 9, 10]
+
+    it "negative offset is clamped to 0 (last window)" $
+      let p = paginateDesc defaultPageParams (-5) (Just 3) [1..10 :: Int]
+      in do
+        pgItems p  `shouldBe` [8, 9, 10]
+        pgOffset p `shouldBe` 7
+
+    it "limit above ceiling is clamped to ceiling" $
+      let p = paginateDesc defaultPageParams 0 (Just 5000) [1..10000 :: Int]
+      in length (pgItems p) `shouldBe` 2000
+
+    prop "pgOffset + length pgItems <= pgTotal" $ \params offset mLimit (xs :: [Int]) ->
+      let p = paginateDesc params offset mLimit xs
+      in pgOffset p + length (pgItems p) <= pgTotal p
+
+    prop "pgItems is a contiguous slice of the input in original order" $ \params offset mLimit (xs :: [Int]) ->
+      let p = paginateDesc params offset mLimit xs
+      in pgItems p `shouldSatisfy` \win ->
+           null win
+             || win `isInfixOf` xs
+
+    prop "SECURITY: window size never exceeds ceiling, offset in [0,total]" $
+      \params offset mLimit (xs :: [Int]) ->
+        let p = paginateDesc params offset (mLimit :: Maybe Int) xs
         in length (pgItems p) <= ppCeiling params
            .&&. pgOffset p >= 0
            .&&. pgOffset p <= pgTotal p
