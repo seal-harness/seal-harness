@@ -30,12 +30,14 @@ module Seal.Channels.Chat.Loop
   , handleWatchToggle
   , handleWatchActivity
   , lookupWatch
+  , toggleWatch
   , newPersistingWatchState
   , seedWatchState
   , snapshotWatch
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (when, unless, void)
 import Data.Foldable (for_)
@@ -100,6 +102,14 @@ type PendingAsks = TVar (Map SessionId [PendingAsk])
 data WatchState = WatchState
   { wsVar  :: TVar (Map ConversationKey Bool)
   , wsSave :: Maybe (IO ())
+  -- ^ The save action (snapshots the TVar and writes to disk). Called
+  -- inside the 'wsLock' critical section so the snapshot is consistent
+  -- with the mutation.
+  , wsLock :: MVar ()
+  -- ^ Serializes the mutation+persist sequence so a stale snapshot from
+  -- one thread cannot overwrite a newer on-disk write from another.
+  -- Without this lock, concurrent toggles from Signal + Telegram (which
+  -- share one 'WatchState') can lose state after a restart.
   }
 
 -- | Create a new empty watch-state map (watch mode off for all
@@ -107,7 +117,8 @@ data WatchState = WatchState
 newWatchState :: IO WatchState
 newWatchState = do
   tv <- newTVarIO Map.empty
-  pure (WatchState tv Nothing)
+  lock <- newMVar ()
+  pure (WatchState tv Nothing lock)
 
 -- | Create a persisting watch-state store. The supplied save function is
 -- called after every mutation (snapshotting the full current map, so the
@@ -116,7 +127,8 @@ newWatchState = do
 newPersistingWatchState :: (Map ConversationKey Bool -> IO ()) -> IO WatchState
 newPersistingWatchState saveFn = do
   tv <- newTVarIO Map.empty
-  let ws = WatchState tv (Just (saveAction ws))
+  lock <- newMVar ()
+  let ws = WatchState tv (Just (saveAction ws)) lock
       saveAction s = saveFn =<< snapshotWatch s
   pure ws
 
@@ -138,13 +150,17 @@ lookupWatch ws key = fromMaybe False . Map.lookup key <$> readTVarIO (wsVar ws)
 -- | Toggle watch mode for a conversation. Returns the new state.
 toggleWatch :: WatchState -> ConversationKey -> IO Bool
 toggleWatch ws key = do
-  newVal <- atomically $ do
-    m <- readTVar (wsVar ws)
-    let v = not (fromMaybe False (Map.lookup key m))
-    writeTVar (wsVar ws) (Map.insert key v m)
-    pure v
-  persistWatch ws
-  pure newVal
+  -- Hold the lock through mutation+persist so no concurrent thread can
+  -- mutate the TVar between our snapshot and our save (which would let a
+  -- stale snapshot overwrite a newer on-disk write).
+  withMVar (wsLock ws) $ \_ -> do
+    newVal <- atomically $ do
+      m <- readTVar (wsVar ws)
+      let v = not (fromMaybe False (Map.lookup key m))
+      writeTVar (wsVar ws) (Map.insert key v m)
+      pure v
+    persistWatch ws
+    pure newVal
 
 -- | Run the persist action (if any) after a successful mutation. A save
 -- failure is logged to stderr and swallowed — the in-memory store stays
@@ -453,8 +469,11 @@ handleWatchToggle chan watchState key body =
       ccSend chan (watchConfirm newVal)
   where
     setWatch v = do
-      atomically (modifyTVar' (wsVar watchState) (Map.insert key v))
-      persistWatch watchState
+      -- Hold the lock through mutation+persist (same reason as
+      -- 'toggleWatch').
+      withMVar (wsLock watchState) $ \_ -> do
+        atomically (modifyTVar' (wsVar watchState) (Map.insert key v))
+        persistWatch watchState
       ccSend chan (watchConfirm v)
 
 -- | The confirmation message for a watch-mode change.

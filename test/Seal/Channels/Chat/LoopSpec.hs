@@ -5,6 +5,8 @@
 -- breaks on tool calls, late-update handling after finalize, state reset).
 module Seal.Channels.Chat.LoopSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent.STM (newTVarIO, readTVarIO, TVar)
 import Data.IORef
 import Data.Aeson ((.=))
@@ -577,6 +579,38 @@ spec = do
       watchOn2 <- lookupWatch watchState key2
       watchOn1 `shouldBe` True
       watchOn2 `shouldBe` False
+
+    it "persist calls are serialized — no stale-snapshot overwrite race" $ do
+      -- A save function that tracks concurrent executions. Without a
+      -- mutation+persist lock, two concurrent toggleWatch calls can have
+      -- overlapping save invocations, and a stale snapshot (taken before
+      -- the other thread's mutation) can overwrite the newer on-disk
+      -- state — the "watch flag spontaneously changes from on to off"
+      -- bug. With the lock, saves are serialized and each save reflects
+      -- the latest in-memory state.
+      activeSaves   <- newIORef (0 :: Int)
+      maxConcurrent <- newIORef (0 :: Int)
+      savedMaps     <- newIORef ([] :: [Map ConversationKey Bool])
+      let saveFn m = do
+            cur <- atomicModifyIORef' activeSaves (\n -> (n + 1, n + 1))
+            atomicModifyIORef' maxConcurrent (\m' -> (max m' cur, ()))
+            threadDelay 10000  -- 10 ms — widen the race window
+            modifyIORef' savedMaps (m :)
+            atomicModifyIORef' activeSaves (\n -> (n - 1, ()))
+      watchState <- newPersistingWatchState saveFn
+      let key1 = ConversationKey "signal" "conv1"
+          key2 = ConversationKey "signal" "conv2"
+      withAsync (toggleWatch watchState key1) $ \a1 ->
+        withAsync (toggleWatch watchState key2) $ \a2 -> do
+          _ <- wait a1
+          _ <- wait a2
+          pure ()
+      maxC <- readIORef maxConcurrent
+      maxC `shouldBe` 1  -- saves never overlap
+      saves <- readIORef savedMaps
+      case saves of
+        (m:_) -> Map.size m `shouldBe` 2
+        []    -> expectationFailure "expected at least one save"
 
     it "non-focused session thinking then idle sends a notification when watch is on" $ do
       chan <- mkMockChan
