@@ -490,9 +490,9 @@ describe('Sidebar — tab status indicator', () => {
       makeSession({ id: 'read', description: 'Read tab' }),
     ]
     const sessionActivity = {
-      thinking: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null },
-      unread: { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-02T00:00:00.000Z', seenAt: '2024-06-01T00:00:00.000Z' },
-      read: { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z' },
+      thinking: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null },
+      unread: { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-02T00:00:00.000Z', seenAt: '2024-06-01T00:00:00.000Z', toolCall: null },
+      read: { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z', toolCall: null },
     }
     render(
       <Sidebar
@@ -542,10 +542,10 @@ describe('Sidebar — tab status indicator', () => {
       makeSession({ id: 'read',         description: 'Read tab',     lastUserMessageAt: '2024-06-02T00:00:00.000Z' }),
     ]
     const sessionActivity = {
-      thinking:    { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null },
-      'unread-old': { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-02T00:00:00.000Z', seenAt: '2024-06-01T00:00:00.000Z' },
-      'unread-new': { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-04T00:00:00.000Z', seenAt: '2024-06-03T00:00:00.000Z' },
-      read:        { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z' },
+      thinking:    { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null },
+      'unread-old': { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-02T00:00:00.000Z', seenAt: '2024-06-01T00:00:00.000Z', toolCall: null },
+      'unread-new': { harness: 'idle' as const, unread: 1, lastEntryAt: '2024-06-04T00:00:00.000Z', seenAt: '2024-06-03T00:00:00.000Z', toolCall: null },
+      read:        { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z', toolCall: null },
     }
     render(
       <Sidebar
@@ -915,7 +915,7 @@ describe('Sidebar — tab age pill', () => {
         unread: 0,
         // 5 minutes ago — should win over the days-old lastActive.
         lastEntryAt: new Date(Date.now() - 5 * 60000).toISOString(),
-        seenAt: null,
+        seenAt: null, toolCall: null,
       },
     }
     render(

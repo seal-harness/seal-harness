@@ -184,7 +184,7 @@ describe('applyActivity', () => {
   })
 
   it('is a no-op when harness-status carries the same value', () => {
-    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null } }
+    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null } }
     const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
     expect(result).toBe(before)
   })
@@ -194,7 +194,7 @@ describe('applyActivity', () => {
     // frames only go to the focused session's WS subscriber, so without
     // this signal the tab would stay Idle Read forever. The thinking→idle
     // transition is the evidence a new assistant reply landed.
-    const before = { s1: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null } }
+    const before = { s1: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null } }
     const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
     expect(result['s1']!.harness).toBe('idle')
     expect(result['s1']!.unread).toBe(1)
@@ -204,14 +204,14 @@ describe('applyActivity', () => {
   it('on thinking → idle, preserves an existing lastEntryAt only if newer (does not regress)', () => {
     // The transition stamps now; an older lastEntryAt must not survive.
     const oldTs = '2020-01-01T00:00:00.000Z'
-    const before = { s1: { harness: 'thinking' as const, unread: 2, lastEntryAt: oldTs, seenAt: null } }
+    const before = { s1: { harness: 'thinking' as const, unread: 2, lastEntryAt: oldTs, seenAt: null, toolCall: null } }
     const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
     expect(result['s1']!.unread).toBe(3)
     expect(result['s1']!.lastEntryAt).not.toBe(oldTs)
   })
 
   it('on idle → thinking, does NOT bump unread (turn start is not a new reply)', () => {
-    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null } }
+    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null } }
     const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'thinking' })
     expect(result['s1']!.harness).toBe('thinking')
     expect(result['s1']!.unread).toBe(0)
@@ -228,7 +228,7 @@ describe('applyActivity', () => {
   })
 
   it('sets seenAt on reply-delivered (advances forward only)', () => {
-    const before = { s1: { harness: null as never, unread: 2, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z' } }
+    const before = { s1: { harness: null as never, unread: 2, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z', toolCall: null } }
     const r1 = applyActivity(before, 's1', { kind: 'reply-delivered', timestamp: '2025-01-01T00:00:00.000Z' })
     expect(r1['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
     // An older delivered timestamp does NOT regress seenAt.
@@ -238,22 +238,45 @@ describe('applyActivity', () => {
     const r3 = applyActivity(r1, 's1', { kind: 'reply-delivered', timestamp: 'not-a-date' })
     expect(r3['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
   })
+
+  it('sets toolCall on tool-call activity', () => {
+    const result = applyActivity({}, 's1', { kind: 'tool-call', tool: 'SHELL_EXEC', input: '{"command":"make lint"}' })
+    expect(result['s1']!.toolCall).toEqual({ tool: 'SHELL_EXEC', input: '{"command":"make lint"}' })
+  })
+
+  it('clears toolCall on thinking → idle (the turn finished)', () => {
+    const before = { s1: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: { tool: 'SHELL_EXEC', input: '{"command":"make lint"}' } } }
+    const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
+    expect(result['s1']!.toolCall).toBeNull()
+  })
+
+  it('clears toolCall on idle → thinking (new turn, stale tool from prior turn)', () => {
+    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: { tool: 'FILE_READ', input: '{"path":"foo.hs"}' } } }
+    const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'thinking' })
+    expect(result['s1']!.toolCall).toBeNull()
+  })
+
+  it('updates toolCall when a second tool call starts (replaces the prior)', () => {
+    const before = { s1: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null, toolCall: { tool: 'FILE_READ', input: '{"path":"a.hs"}' } } }
+    const result = applyActivity(before, 's1', { kind: 'tool-call', tool: 'SHELL_EXEC', input: '{"command":"make test"}' })
+    expect(result['s1']!.toolCall).toEqual({ tool: 'SHELL_EXEC', input: '{"command":"make test"}' })
+  })
 })
 
 describe('clearUnread', () => {
   it('zeros the unread counter for a session', () => {
-    const before = { s1: { harness: null, unread: 5, lastEntryAt: 't', seenAt: null } }
+    const before = { s1: { harness: null, unread: 5, lastEntryAt: 't', seenAt: null, toolCall: null } }
     const result = clearUnread(before, 's1')
     expect(result['s1']!.unread).toBe(0)
   })
 
   it('is a no-op when unread is already 0 and seenAt is already at-or-after the focus timestamp', () => {
-    const before = { s1: { harness: null, unread: 0, lastEntryAt: null, seenAt: '2099-01-01T00:00:00.000Z' } }
+    const before = { s1: { harness: null, unread: 0, lastEntryAt: null, seenAt: '2099-01-01T00:00:00.000Z', toolCall: null } }
     expect(clearUnread(before, 's1', '2099-01-01T00:00:00.000Z')).toBe(before)
   })
 
   it('marks the session seen at the focus timestamp (advances seenAt forward only)', () => {
-    const before = { s1: { harness: null, unread: 0, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z' } }
+    const before = { s1: { harness: null, unread: 0, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z', toolCall: null } }
     const result = clearUnread(before, 's1', '2025-01-01T00:00:00.000Z')
     expect(result['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
     // An older focus timestamp does NOT regress seenAt.
@@ -331,5 +354,15 @@ describe('useSessionActivityStream', () => {
     await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
     expect(result.current.sessions['s1']!.harness).toBe('idle')
     expect(result.current.sessions['s1']!.unread).toBe(0)
+  })
+
+  it('tracks tool-call activity and clears it on idle', async () => {
+    const c = fakeClient()
+    const { result } = renderHook(({ sid }: { sid: string | null }) => useSessionActivityStream(sid, c), { initialProps: { sid: 's1' } })
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'thinking' }) })
+    await act(async () => { c.pushActivity('s1', { kind: 'tool-call', tool: 'SHELL_EXEC', input: '{"command":"make lint"}' }) })
+    expect(result.current.sessions['s1']!.toolCall).toEqual({ tool: 'SHELL_EXEC', input: '{"command":"make lint"}' })
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
+    expect(result.current.sessions['s1']!.toolCall).toBeNull()
   })
 })

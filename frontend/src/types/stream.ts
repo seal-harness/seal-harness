@@ -49,6 +49,7 @@ export type ActivityEvent =
   | { kind: 'harness-status'; status: HarnessActivity }
   | { kind: 'session-created'; session: StreamSessionMeta }
   | { kind: 'reply-delivered'; timestamp: string }
+  | { kind: 'tool-call'; tool: string; input: string }
 
 export interface ActivityEnvelope {
   type: 'activity'
@@ -214,6 +215,12 @@ export interface SessionActivityState {
    *  distinguish Idle Unread (LLM idle, last assistant entry newer than
    *  seenAt) from Idle Read. null until the first seen signal arrives. */
   seenAt: string | null
+  /** The tool currently being executed (from the `tool-call` activity
+   *  event), or null when no tool is running. The frontend renders this
+   *  alongside the thinking indicator so the user can see what the agent
+   *  is doing during long-running tool calls (e.g. SHELL_EXEC running
+   *  `make lint` inside `nix develop`). */
+  toolCall: { tool: string; input: string } | null
 }
 
 export interface UseTranscriptStream {

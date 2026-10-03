@@ -34,7 +34,7 @@ function makeTab(overrides: Partial<TabInfo> = {}): TabInfo {
 }
 
 function activity(overrides: Partial<SessionActivityState> = {}): SessionActivityState {
-  return { harness: null, unread: 0, lastEntryAt: null, seenAt: null, ...overrides }
+  return { harness: null, unread: 0, lastEntryAt: null, seenAt: null, toolCall: null, ...overrides }
 }
 
 // ── deriveTabStatusKind ────────────────────────────────────────────────
