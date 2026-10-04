@@ -20,7 +20,7 @@ import Data.Text (Text)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (sessionIdText)
-import Seal.Gateway.Transcript (firstUserMessageSnippet, lastUserMessageAt)
+import Seal.Gateway.Transcript (firstUserMessageSnippetFast, lastUserMessageAtFast)
 import Seal.Handles.Tab (TabKind (..), tabIndexToInt)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..))
@@ -100,6 +100,6 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
 -- description and the sidebar can sort tabs by last-user-message time.
 sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
 sessionInfoJsonWithSnippet paths m = do
-  mSnippet <- firstUserMessageSnippet paths (smId m)
-  mLastUserMessageAt <- lastUserMessageAt paths (smId m)
+  mSnippet <- firstUserMessageSnippetFast paths (smId m)
+  mLastUserMessageAt <- lastUserMessageAtFast paths (smId m)
   pure (sessionInfoJson mSnippet mLastUserMessageAt m)
