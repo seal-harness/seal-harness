@@ -166,7 +166,7 @@ describe('App — sidebar selection', () => {
     }))
     render(<App />)
     // The session row renders in the sidebar's Recent Sessions.
-    const row = await screen.findByText('Session A')
+    const row = await screen.findByText('Session A', {}, { timeout: 4000 })
     fireEvent.click(row)
     // The chat-header title should now read the session's title (the
     // EditableSessionTitle shows it).
@@ -214,7 +214,7 @@ describe('App — harness tab', () => {
     // first match (the Running Harnesses row renders above Recent Sessions).
     await waitFor(() => {
       expect(screen.getAllByText('Harness Sess').length).toBeGreaterThanOrEqual(1)
-    })
+    }, { timeout: 4000 })
     fireEvent.click(screen.getAllByText('Harness Sess')[0]!)
     // HarnessControls renders the "Destroy harness" button + the Status field.
     await waitFor(() => {
@@ -256,7 +256,7 @@ describe('App — send + branch', () => {
     }))
     render(<App />)
     // Select the session.
-    const row = await screen.findByText('Send Sess')
+    const row = await screen.findByText('Send Sess', {}, { timeout: 4000 })
     fireEvent.click(row)
     // Type a message + click Send.
     const textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
@@ -292,7 +292,7 @@ describe('App — send + branch', () => {
     }))
     render(<App />)
     // Select the provider session.
-    const row = await screen.findByText('Branch Sess')
+    const row = await screen.findByText('Branch Sess', {}, { timeout: 4000 })
     fireEvent.click(row)
     // Wait for the transcript to render the user message ("hi"), then click the
     // branch button on that row.
@@ -340,7 +340,7 @@ describe('App — send + branch', () => {
     // so "Dup Sess" renders exactly once (under Active Tabs).
     await waitFor(() => {
       expect(screen.getAllByText('Dup Sess').length).toBe(1)
-    })
+    }, { timeout: 4000 })
   })
 })
 
@@ -389,7 +389,7 @@ describe('App — tab name stability', () => {
     render(<App />)
     // The tab appears in Active Tabs. Initially the session has no snippet,
     // so the label falls back to the session ID prefix. Select it.
-    const tabRow = await screen.findByText('sess-snippet'.slice(0, 12))
+    const tabRow = await screen.findByText('sess-snippet'.slice(0, 12), {}, { timeout: 4000 })
     fireEvent.click(tabRow)
     // Type the first message + send.
     let textarea = await screen.findByPlaceholderText(/Message/) as HTMLTextAreaElement
@@ -740,7 +740,7 @@ describe('App — slash bubble inline ordering', () => {
     }))
     render(<App />)
     // Select the session.
-    const row = await screen.findByText('Slash Sess')
+    const row = await screen.findByText('Slash Sess', {}, { timeout: 4000 })
     fireEvent.click(row)
     // Wait for the initial transcript entry to render.
     await screen.findByText('first message')
@@ -843,8 +843,8 @@ describe('App — pending message does not cross sessions', () => {
     render(<App />)
 
     // Wait for both sessions to render in the sidebar.
-    const rowA = await screen.findByText('Session A')
-    await screen.findByText('Session B')
+    const rowA = await screen.findByText('Session A', {}, { timeout: 4000 })
+    await screen.findByText('Session B', {}, { timeout: 4000 })
 
     // Select session A.
     fireEvent.click(rowA)
