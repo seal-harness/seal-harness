@@ -31,7 +31,6 @@ export const POLL_INTERVAL = 3000
  *  round trips. The REST fallback (older servers without WS) is only
  *  briefly delayed. */
 export const WS_GRACE_MS = 2000
-
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
  *  already in their final shape; the rest map to camelCase TabInfo keys.
