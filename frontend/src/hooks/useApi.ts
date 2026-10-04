@@ -26,9 +26,11 @@ export const POLL_INTERVAL = 3000
 /** Grace period (ms) before the first REST `/api/lists` poll on initial
  *  mount. Gives the WebSocket time to connect and deliver a `lists` frame;
  *  if WS arrives during this window the REST poll never fires — zero
- *  unnecessary XHRs. Short enough that the REST fallback (older servers
- *  without WS) is only briefly delayed. */
-export const WS_GRACE_MS = 500
+ *  unnecessary XHRs. Set to 2 seconds to accommodate VPN/mesh networks
+ *  (Nebula, Tailscale, etc.) where the WS handshake involves multiple
+ *  round trips. The REST fallback (older servers without WS) is only
+ *  briefly delayed. */
+export const WS_GRACE_MS = 2000
 
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
