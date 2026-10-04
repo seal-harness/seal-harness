@@ -28,6 +28,8 @@ import qualified System.IO as IO
 import System.Timeout (timeout)
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Agent.ContextTruncation
+  ( estimateTokenCount, truncateMessages, defaultTruncationConfig )
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
@@ -40,6 +42,7 @@ import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
+import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
   ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
@@ -221,11 +224,29 @@ runTurn env userText = do
     go n lenContinue msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
+      -- Context window management: if the model has a known context window,
+      -- estimate the token count of system + tools + messages and truncate
+      -- the messages (sent to the provider) when they exceed the budget.
+      -- The on-disk transcript still records the full conversation (msgs);
+      -- only crMessages is truncated — a transient per-request optimization
+      -- (design D7). Unknown models (context window = 0) skip truncation.
+      let tools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
+          ModelId modelText = aeModel env
+          contextWindow = modelContextWindow modelText
+          totalEstimate = estimateTokenCount (aeSystem env) msgs tools
+          needsTruncation = contextWindow > 0
+            && totalEstimate > contextWindow - defaultMaxTokens
+          sendMsgs = if needsTruncation
+                       then truncateMessages defaultTruncationConfig
+                              (contextWindow - defaultMaxTokens
+                                 - estimateTokenCount (aeSystem env) [] tools)
+                              msgs
+                       else msgs
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
-                  , crMessages = msgs
-                  , crTools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
+                  , crMessages = sendMsgs
+                  , crTools = tools
                   , crToolChoice = ToolAuto
                   , crMaxTokens = defaultMaxTokens
                   }
