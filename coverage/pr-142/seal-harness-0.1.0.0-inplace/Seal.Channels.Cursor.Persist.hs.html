@@ -1,0 +1,118 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Cursor-map persistence — the 'CursorStore''s @ConversationKey → TabRef@
+<span class="lineno">    3 </span>-- map survives a @seal serve@ (or standalone @seal telegram@ / @seal
+<span class="lineno">    4 </span>-- signal@) restart. Written atomically (0600) to @\&lt;state\&gt;\/cursors.json@
+<span class="lineno">    5 </span>-- on every cursor mutation via 'Seal.Util.AtomicJson.saveJsonAtomic';
+<span class="lineno">    6 </span>-- loaded at boot by 'loadCursorMap' so a conversation re-resolves to its
+<span class="lineno">    7 </span>-- prior session (carrying the user's @\/model use@ choice) instead of a
+<span class="lineno">    8 </span>-- fresh default session.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- The map is encoded as a JSON array of @{&quot;key&quot;: [...], &quot;ref&quot;: {...}}@
+<span class="lineno">   11 </span>-- pairs (JSON object keys must be strings, and 'ConversationKey' is a
+<span class="lineno">   12 </span>-- '(Text, Text)' tuple, so it cannot key a JSON object directly). Every
+<span class="lineno">   13 </span>-- 'TabRef' id is re-validated on load ('mkSessionId' / 'parseHarnessId')
+<span class="lineno">   14 </span>-- and entries whose id fails to re-parse are dropped (defense-in-depth
+<span class="lineno">   15 </span>-- against a tampered file), mirroring 'Seal.Tabs.Persist.filterValidTabs'.
+<span class="lineno">   16 </span>module Seal.Channels.Cursor.Persist
+<span class="lineno">   17 </span>  ( saveCursorMap
+<span class="lineno">   18 </span>  , loadCursorMap
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Data.Aeson qualified as A
+<span class="lineno">   22 </span>import Data.Map.Strict (Map)
+<span class="lineno">   23 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>import System.Directory (doesFileExist)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Katip (Severity (..))
+<span class="lineno">   28 </span>import Seal.Core.Types (mkSessionId, sessionIdText)
+<span class="lineno">   29 </span>import Seal.Harness.Id (parseHarnessId, harnessIdToText)
+<span class="lineno">   30 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   31 </span>import Seal.Tabs.Types (TabRef (..))
+<span class="lineno">   32 </span>import Seal.Util.AtomicJson (saveJsonAtomic)
+<span class="lineno">   33 </span>import Seal.Util.StrictIO (decodeFileStrict)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | The on-disk wire type: a list of key/ref pairs. The map is converted
+<span class="lineno">   36 </span>-- to/from this list on save/load. 'ConversationKey' is a '(Text, Text)'
+<span class="lineno">   37 </span>-- tuple; aeson encodes a tuple as a JSON array, so 'cwKey' serializes as
+<span class="lineno">   38 </span>-- @[&quot;telegram&quot;,&quot;12345&quot;]@. 'TabRef' already has 'ToJSON'/''FromJSON'
+<span class="lineno">   39 </span>-- instances (used by @tabs.json@); reused here.
+<span class="lineno">   40 </span>data CursorWire = CursorWire
+<span class="lineno">   41 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cwKey</span></span></span> :: (Text, Text)
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cwRef</span></span></span> :: TabRef
+<span class="lineno">   43 </span>  }
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- Aeson derives the tuple and TabRef codecs via their existing instances.
+<span class="lineno">   46 </span>-- We hand-write the 'CursorWire' codec (not derive) to control field
+<span class="lineno">   47 </span>-- names and keep the on-disk shape explicit.
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">A.ToJSON CursorWire</span></span></span></span></span></span></span></span> where
+<span class="lineno">   50 </span>  <span class="decl"><span class="istickedoff">toJSON cw = A.object</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;key&quot; A..= cwKey cw</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ref&quot; A..= cwRef cw</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">A.FromJSON CursorWire</span></span></span></span> where
+<span class="lineno">   56 </span>  <span class="decl"><span class="istickedoff">parseJSON = A.withObject <span class="nottickedoff">&quot;CursorWire&quot;</span> $ \o -&gt; CursorWire</span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o A..: &quot;key&quot;</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o A..: &quot;ref&quot;</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Save a cursor map to @path@ atomically (0600, MVar-serialized via
+<span class="lineno">   61 </span>-- 'saveJsonAtomic'). Never throws; a write failure is the caller's
+<span class="lineno">   62 </span>-- responsibility to 'catch' (the persisting cursor store does so and logs
+<span class="lineno">   63 </span>-- a warning, matching the tab-list pattern).
+<span class="lineno">   64 </span>saveCursorMap :: FilePath -&gt; Map (Text, Text) TabRef -&gt; IO ()
+<span class="lineno">   65 </span><span class="decl"><span class="istickedoff">saveCursorMap path m =</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">saveJsonAtomic path (A.encode (map (uncurry CursorWire) (Map.toList m)))</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Load the cursor map from @path@. Missing file -&gt; 'Nothing' (fresh
+<span class="lineno">   69 </span>-- empty store). Corrupt JSON -&gt; 'Nothing' + a stderr warning (ids + error
+<span class="lineno">   70 </span>-- type only — no conversation content). Every 'TabRef' id is re-validated;
+<span class="lineno">   71 </span>-- entries with an unparseable id are dropped (defense-in-depth against a
+<span class="lineno">   72 </span>-- tampered @cursors.json@).
+<span class="lineno">   73 </span>loadCursorMap :: FilePath -&gt; IO (Maybe (Map (Text, Text) TabRef))
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">loadCursorMap path = do</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   79 </span><span class="spaces">      </span><span class="istickedoff">mWires &lt;- decodeFileStrict path :: IO (Maybe [CursorWire])</span>
+<span class="lineno">   80 </span><span class="spaces">      </span><span class="istickedoff">case mWires of</span>
+<span class="lineno">   81 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   82 </span><span class="spaces">          </span><span class="istickedoff">globalLogIO <span class="nottickedoff">WarningS</span> <span class="nottickedoff">&quot;could not parse cursors.json; using empty cursor store&quot;</span></span>
+<span class="lineno">   83 </span><span class="spaces">          </span><span class="istickedoff">pure Nothing</span>
+<span class="lineno">   84 </span><span class="spaces">        </span><span class="istickedoff">Just ws -&gt; pure (Just (filterValid (Map.fromList [ (cwKey w, cwRef w) | w &lt;- ws ])))</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | Drop entries whose 'TabRef' id fails to re-parse. The on-disk ids were
+<span class="lineno">   87 </span>-- validated when written, so a parse failure here means the file was
+<span class="lineno">   88 </span>-- tampered or written by a future/incompatible version — skip rather than
+<span class="lineno">   89 </span>-- error so a corrupt file self-heals on the next save. Mirrors
+<span class="lineno">   90 </span>-- 'Seal.Tabs.Persist.filterValidTabs'.
+<span class="lineno">   91 </span>filterValid :: Map (Text, Text) TabRef -&gt; Map (Text, Text) TabRef
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">filterValid = Map.filter validRef</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">validRef (BoundSession sid) = case mkSessionId (sessionIdText sid) of Right _ -&gt; True; Left _ -&gt; False</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">validRef (BoundHarness hid) = <span class="nottickedoff">case parseHarnessId (harnessIdToText hid) of Right _ -&gt; True; Left _ -&gt; False</span></span></span>
+
+</pre>
+</body>
+</html>

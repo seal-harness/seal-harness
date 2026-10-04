@@ -1,0 +1,672 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE LambdaCase #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | WEB_SEARCH (Untrusted): multi-provider web search. Dispatches to one of
+<span class="lineno">    4 </span>-- five backends (Parallel, SearXNG, Exa, Firecrawl, Custom) selected via
+<span class="lineno">    5 </span>-- 'wscProvider'. Parallel is the zero-config default (free MCP endpoint, no
+<span class="lineno">    6 </span>-- API key). API keys are vault references resolved at runtime via
+<span class="lineno">    7 </span>-- 'vaultGetByName' — they are injected into HTTP requests but NEVER appear in
+<span class="lineno">    8 </span>-- 'orRecorded' (the transcript records only query, result count, and provider
+<span class="lineno">    9 </span>-- name). Domain allow-list is operator-configured.
+<span class="lineno">   10 </span>module Seal.Web.Search
+<span class="lineno">   11 </span>  ( webSearchOp
+<span class="lineno">   12 </span>  , WebSearchConfig (..)
+<span class="lineno">   13 </span>  , SearchProvider (..)
+<span class="lineno">   14 </span>  , SearchResult (..)
+<span class="lineno">   15 </span>  , parseProvider
+<span class="lineno">   16 </span>  , providerName
+<span class="lineno">   17 </span>  , encodeResults
+<span class="lineno">   18 </span>  , dispatchSearch
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Control.Exception (try)
+<span class="lineno">   22 </span>import Seal.Tools.Exec.UIO (uioLiftIO)
+<span class="lineno">   23 </span>import Data.Aeson (Value, object, withObject, (.:), (.:?), (.!=), (.=))
+<span class="lineno">   24 </span>import Data.Aeson qualified as A
+<span class="lineno">   25 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   26 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   27 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   28 </span>import Data.Function (on)
+<span class="lineno">   29 </span>import Data.List (sortBy)
+<span class="lineno">   30 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   34 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   35 </span>import Data.Vector qualified as V
+<span class="lineno">   36 </span>import Network.HTTP.Client
+<span class="lineno">   37 </span>  ( HttpException, Manager, RequestBody (..), httpLbs, method, parseRequest
+<span class="lineno">   38 </span>  , requestBody, requestHeaders, responseBody, responseStatus )
+<span class="lineno">   39 </span>import Network.HTTP.Types (methodPost, statusCode, urlEncode)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   42 </span>import Seal.ISA.Opcode
+<span class="lineno">   43 </span>import Seal.ISA.Ops.Secret (vaultGetByName)
+<span class="lineno">   44 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   45 </span>import Seal.Vault.Commands (VaultRuntime)
+<span class="lineno">   46 </span>import Seal.Web.SearXngSetup (ensureSearXng)
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | Which search backend to use. 'ProviderParallel' is the zero-config
+<span class="lineno">   49 </span>-- default (free MCP endpoint, no API key needed).
+<span class="lineno">   50 </span>data SearchProvider
+<span class="lineno">   51 </span>  = ProviderParallel    -- ^ Parallel Search (free MCP or REST with key)
+<span class="lineno">   52 </span>  | ProviderSearXNG     -- ^ Self-hosted SearXNG instance
+<span class="lineno">   53 </span>  | ProviderExa         -- ^ Exa search API (requires key)
+<span class="lineno">   54 </span>  | ProviderFirecrawl   -- ^ Firecrawl search API (requires key)
+<span class="lineno">   55 </span>  | ProviderCustom      -- ^ User-configured custom endpoint (legacy behavior)
+<span class="lineno">   56 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Parse a provider name from config text. Unknown values default to
+<span class="lineno">   59 </span>-- 'ProviderParallel' (the zero-config default).
+<span class="lineno">   60 </span>parseProvider :: Text -&gt; SearchProvider
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">parseProvider t = case T.toLower t of</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">&quot;searxng&quot;   -&gt; ProviderSearXNG</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">&quot;exa&quot;       -&gt; ProviderExa</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">&quot;firecrawl&quot; -&gt; ProviderFirecrawl</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">&quot;custom&quot;    -&gt; ProviderCustom</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">_           -&gt; ProviderParallel</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Render a provider to its canonical string name (for 'orRecorded').
+<span class="lineno">   69 </span>providerName :: SearchProvider -&gt; Text
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">providerName ProviderParallel  = &quot;parallel&quot;</span>
+<span class="lineno">   71 </span><span class="spaces"></span><span class="istickedoff">providerName ProviderSearXNG   = &quot;searxng&quot;</span>
+<span class="lineno">   72 </span><span class="spaces"></span><span class="istickedoff">providerName ProviderExa       = &quot;exa&quot;</span>
+<span class="lineno">   73 </span><span class="spaces"></span><span class="istickedoff">providerName ProviderFirecrawl = &quot;firecrawl&quot;</span>
+<span class="lineno">   74 </span><span class="spaces"></span><span class="istickedoff">providerName ProviderCustom    = &quot;custom&quot;</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | A single normalized search result. All providers decode their
+<span class="lineno">   77 </span>-- provider-specific JSON into this shape before re-encoding for the model.
+<span class="lineno">   78 </span>data SearchResult = SearchResult
+<span class="lineno">   79 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srTitle</span></span></span>       :: Text
+<span class="lineno">   80 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srUrl</span></span></span>         :: Text
+<span class="lineno">   81 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srDescription</span></span></span> :: Text
+<span class="lineno">   82 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srPosition</span></span></span>    :: Int
+<span class="lineno">   83 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Encode search results as JSON for the model ('orParts'). The shape is
+<span class="lineno">   86 </span>-- @{&quot;results&quot;: [{&quot;title&quot;,&quot;url&quot;,&quot;description&quot;,&quot;position&quot;}, ...]}@.
+<span class="lineno">   87 </span>encodeResults :: [SearchResult] -&gt; Text
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">encodeResults results = TE.decodeUtf8 (BL.toStrict (A.encode body))</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">body = A.object [&quot;results&quot; .= map toValue results]</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">toValue (SearchResult title url desc pos) = A.object</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;title&quot;       .= title</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">, &quot;url&quot;         .= url</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">, &quot;description&quot; .= desc</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">, &quot;position&quot;    .= pos</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | The configuration for WEB_SEARCH.
+<span class="lineno">   99 </span>data WebSearchConfig = WebSearchConfig
+<span class="lineno">  100 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">wscManager</span></span></span>     :: Maybe Manager     -- ^ HTTP manager (Nothing = fail-closed)
+<span class="lineno">  101 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wscProvider</span></span></span>    :: SearchProvider    -- ^ which backend to use
+<span class="lineno">  102 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscEndpoint</span></span></span>    :: Text             -- ^ endpoint URL (empty = use provider default)
+<span class="lineno">  103 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscAllowList</span></span></span>   :: [Text]           -- ^ allowed domains (empty = all allowed)
+<span class="lineno">  104 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscAuthKey</span></span></span>     :: Maybe Text       -- ^ vault key reference for API key
+<span class="lineno">  105 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscMaxResults</span></span></span>  :: Int              -- ^ max results to return (0 = provider default)
+<span class="lineno">  106 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscVault</span></span></span>       :: Maybe VaultRuntime  -- ^ vault for resolving API keys
+<span class="lineno">  107 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wscSearXngUrl</span></span></span>  :: Maybe Text       -- ^ SearXNG instance URL (Nothing = localhost:8888)
+<span class="lineno">  108 </span>  }
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | WEB_SEARCH opcode. Input: @{ query: Text, limit?: Int }@. Dispatches to
+<span class="lineno">  111 </span>-- the configured provider ('wscProvider'). 'orRecorded' carries only the
+<span class="lineno">  112 </span>-- query, result count, and provider name — never API keys or response bodies.
+<span class="lineno">  113 </span>webSearchOp :: WebSearchConfig -&gt; Opcode
+<span class="lineno">  114 </span><span class="decl"><span class="istickedoff">webSearchOp cfg = UntrustedOpcode</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;WEB_SEARCH&quot;</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Search the web using the configured provider (parallel, searxng, exa, firecrawl, or custom). Returns ranked results with title, URL, and description.&quot;</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = webSearchSchema</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">case queryField v of</span>
+<span class="lineno">  121 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; Left &quot;WEB_SEARCH requires {query:string}&quot;</span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="istickedoff">Just q</span>
+<span class="lineno">  123 </span><span class="spaces">          </span><span class="istickedoff">| T.null q -&gt; Left &quot;WEB_SEARCH: query is empty&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; case limitField v of</span>
+<span class="lineno">  125 </span><span class="spaces">              </span><span class="istickedoff">Just n | n &lt; 1 -&gt; Left &quot;WEB_SEARCH: limit must be &gt;= 1&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">              </span><span class="istickedoff">_ -&gt; Right ()</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">let q = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (queryField v)</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">userLimit = limitField v</span></span>
+<span class="lineno">  130 </span><span class="spaces">          </span><span class="istickedoff">cfg' = cfg { wscMaxResults = <span class="nottickedoff">fromMaybe (wscMaxResults cfg) userLimit</span> }</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="istickedoff">case wscManager cfg' of</span>
+<span class="lineno">  132 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">[TrpText &quot;WEB_SEARCH: no HTTP manager configured&quot;]</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="istickedoff">True (recorded cfg' q 0))</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="istickedoff">Just mgr -&gt; <span class="nottickedoff">uioLiftIO (dispatchSearch mgr cfg' q)</span></span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | Build the secret-free 'orRecorded' metadata value for a search call.
+<span class="lineno">  139 </span>recorded :: WebSearchConfig -&gt; Text -&gt; Int -&gt; Value
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">recorded cfg q n = object</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;query&quot;        .= q</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">, &quot;result_count&quot; .= n</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">, &quot;provider&quot;     .= providerName (wscProvider cfg)</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | A standalone 'recorded' that takes the provider name directly (used by
+<span class="lineno">  147 </span>-- stub/error paths that don't have a full config in scope).
+<span class="lineno">  148 </span>recorded' :: Text -&gt; Text -&gt; Int -&gt; Value
+<span class="lineno">  149 </span><span class="decl"><span class="nottickedoff">recorded' q provider n = object</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="nottickedoff">[ &quot;query&quot;        .= q</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="nottickedoff">, &quot;result_count&quot; .= n</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="nottickedoff">, &quot;provider&quot;     .= provider</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | Construct an error 'OpResult' with recorded metadata.
+<span class="lineno">  156 </span>mkError :: Text -&gt; Text -&gt; Text -&gt; OpResult
+<span class="lineno">  157 </span><span class="decl"><span class="nottickedoff">mkError q provider msg = OpResult</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">[TrpText msg]</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">True (recorded' q provider 0)</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>-- | Decode a response body to 'Text' (lenient — never throws on bad UTF-8).
+<span class="lineno">  162 </span>bodyText :: BL.ByteString -&gt; Text
+<span class="lineno">  163 </span><span class="decl"><span class="nottickedoff">bodyText = TE.decodeUtf8With TEE.lenientDecode . BL.toStrict</span></span>
+<span class="lineno">  164 </span>
+<span class="lineno">  165 </span>-- | Dispatch to the appropriate provider search function.
+<span class="lineno">  166 </span>dispatchSearch :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  167 </span><span class="decl"><span class="nottickedoff">dispatchSearch mgr cfg q = case wscProvider cfg of</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">ProviderParallel  -&gt; searchParallel mgr cfg q</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="nottickedoff">ProviderSearXNG   -&gt; searchSearXNG mgr cfg q</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="nottickedoff">ProviderExa       -&gt; searchExa mgr cfg q</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="nottickedoff">ProviderFirecrawl -&gt; searchFirecrawl mgr cfg q</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="nottickedoff">ProviderCustom    -&gt; searchCustom mgr cfg q</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | Resolve an API key from the vault if configured. Returns 'Nothing' if
+<span class="lineno">  175 </span>-- no vault key is configured or the vault is unavailable. The resolved key
+<span class="lineno">  176 </span>-- never appears in 'orRecorded' — it is injected only into the HTTP request.
+<span class="lineno">  177 </span>resolveApiKey :: WebSearchConfig -&gt; IO (Maybe Text)
+<span class="lineno">  178 </span><span class="decl"><span class="nottickedoff">resolveApiKey cfg = case (wscVault cfg, wscAuthKey cfg) of</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="nottickedoff">(Just rt, Just keyName) -&gt; do</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="nottickedoff">eVal &lt;- vaultGetByName rt keyName</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="nottickedoff">pure (either (const Nothing) Just eVal)</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="nottickedoff">_ -&gt; pure Nothing</span></span>
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  185 </span>-- Provider 1: Parallel (zero-config MCP + REST with key)
+<span class="lineno">  186 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  187 </span>
+<span class="lineno">  188 </span>searchParallel :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  189 </span><span class="decl"><span class="nottickedoff">searchParallel mgr cfg q = do</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">mKey &lt;- resolveApiKey cfg</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">case mKey of</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="nottickedoff">Just key -&gt; searchParallelRest mgr cfg q key</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="nottickedoff">Nothing  -&gt; searchParallelMcp mgr cfg q</span></span>
+<span class="lineno">  194 </span>
+<span class="lineno">  195 </span>-- | Mode A — MCP endpoint (zero-config, no API key). Uses JSON-RPC over HTTP
+<span class="lineno">  196 </span>-- (Streamable HTTP transport). The response may be @application/json@
+<span class="lineno">  197 </span>-- (plain JSON-RPC) or @text/event-stream@ (SSE).
+<span class="lineno">  198 </span>searchParallelMcp :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  199 </span><span class="decl"><span class="nottickedoff">searchParallelMcp mgr _cfg q = do</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try (parseRequest &quot;https://search.parallel.ai/mcp&quot;)</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="nottickedoff">pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: failed to parse Parallel MCP URL&quot;)</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="nottickedoff">let body = A.encode $ A.object</span>
+<span class="lineno">  206 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;jsonrpc&quot; .= (&quot;2.0&quot; :: Text)</span>
+<span class="lineno">  207 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;method&quot;  .= (&quot;tools/call&quot; :: Text)</span>
+<span class="lineno">  208 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;params&quot;  .= A.object</span>
+<span class="lineno">  209 </span><span class="spaces">                </span><span class="nottickedoff">[ &quot;name&quot;      .= (&quot;web_search&quot; :: Text)</span>
+<span class="lineno">  210 </span><span class="spaces">                </span><span class="nottickedoff">, &quot;arguments&quot; .= A.object</span>
+<span class="lineno">  211 </span><span class="spaces">                    </span><span class="nottickedoff">[ &quot;objective&quot;      .= q</span>
+<span class="lineno">  212 </span><span class="spaces">                    </span><span class="nottickedoff">, &quot;search_queries&quot; .= [q]</span>
+<span class="lineno">  213 </span><span class="spaces">                    </span><span class="nottickedoff">]</span>
+<span class="lineno">  214 </span><span class="spaces">                </span><span class="nottickedoff">]</span>
+<span class="lineno">  215 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;id&quot;      .= (1 :: Int)</span>
+<span class="lineno">  216 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  217 </span><span class="spaces">          </span><span class="nottickedoff">req = initReq</span>
+<span class="lineno">  218 </span><span class="spaces">            </span><span class="nottickedoff">{ method = methodPost</span>
+<span class="lineno">  219 </span><span class="spaces">            </span><span class="nottickedoff">, requestBody = RequestBodyLBS body</span>
+<span class="lineno">  220 </span><span class="spaces">            </span><span class="nottickedoff">, requestHeaders =</span>
+<span class="lineno">  221 </span><span class="spaces">                </span><span class="nottickedoff">[ (&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  222 </span><span class="spaces">                </span><span class="nottickedoff">, (&quot;accept&quot;, &quot;application/json, text/event-stream&quot;)</span>
+<span class="lineno">  223 </span><span class="spaces">                </span><span class="nottickedoff">]</span>
+<span class="lineno">  224 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="nottickedoff">pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel MCP request failed&quot;)</span>
+<span class="lineno">  229 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  231 </span><span class="spaces">              </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  233 </span><span class="spaces">            </span><span class="nottickedoff">then parseParallelMcpResponse q respBody</span>
+<span class="lineno">  234 </span><span class="spaces">            </span><span class="nottickedoff">else pure (mkError q &quot;parallel&quot; $</span>
+<span class="lineno">  235 </span><span class="spaces">              </span><span class="nottickedoff">&quot;WEB_SEARCH: Parallel MCP HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot;</span>
+<span class="lineno">  236 </span><span class="spaces">              </span><span class="nottickedoff">&lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  237 </span>
+<span class="lineno">  238 </span>-- | Extract text content from the MCP @result.content@ array. Each item has
+<span class="lineno">  239 </span>-- @{type: &quot;text&quot;, text: &quot;...&quot;}@; we concatenate all text items.
+<span class="lineno">  240 </span>extractMcpContentText :: Value -&gt; Text
+<span class="lineno">  241 </span><span class="decl"><span class="nottickedoff">extractMcpContentText val = fromMaybe &quot;&quot; $</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="nottickedoff">parseMaybe (withObject &quot;result&quot; (.: &quot;content&quot;)) val &gt;&gt;= \case</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="nottickedoff">A.Array arr -&gt; Just $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  244 </span><span class="spaces">      </span><span class="nottickedoff">[ fromMaybe &quot;&quot; (parseMaybe (withObject &quot;item&quot; (.: &quot;text&quot;)) item)</span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="nottickedoff">| item &lt;- V.toList arr</span>
+<span class="lineno">  246 </span><span class="spaces">      </span><span class="nottickedoff">, hasTextType item</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="nottickedoff">]</span>
+<span class="lineno">  248 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  250 </span><span class="spaces">    </span><span class="nottickedoff">hasTextType v =</span>
+<span class="lineno">  251 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;item&quot; (.: &quot;type&quot;)) v == Just (&quot;text&quot; :: Text)</span></span>
+<span class="lineno">  252 </span>
+<span class="lineno">  253 </span>-- | Parse the text content from Parallel MCP into a 'SearchResult' list.
+<span class="lineno">  254 </span>-- The text may be JSON with a @results@ array, or a bare JSON array, or
+<span class="lineno">  255 </span>-- plain text (in which case we return no structured results).
+<span class="lineno">  256 </span>parseParallelResults :: Text -&gt; [SearchResult]
+<span class="lineno">  257 </span><span class="decl"><span class="nottickedoff">parseParallelResults txt =</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode (BL.fromStrict (TE.encodeUtf8 txt)) :: Maybe Value of</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object o) -&gt;</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="nottickedoff">case parseMaybe (withObject &quot;r&quot; (.: &quot;results&quot;)) (A.Object o) of</span>
+<span class="lineno">  261 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.Array arr) -&gt; zipWith fromParallelJson [1..] (V.toList arr)</span>
+<span class="lineno">  262 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; []</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Array arr) -&gt; zipWith fromParallelJson [1..] (V.toList arr)</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; []</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="nottickedoff">fromParallelJson :: Int -&gt; Value -&gt; SearchResult</span>
+<span class="lineno">  267 </span><span class="spaces">    </span><span class="nottickedoff">fromParallelJson pos v = fromMaybe (SearchResult &quot;&quot; &quot;&quot; &quot;&quot; pos) $</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;result&quot; $ \obj -&gt; do</span>
+<span class="lineno">  269 </span><span class="spaces">        </span><span class="nottickedoff">url      &lt;- obj .: &quot;url&quot;</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="nottickedoff">title    &lt;- obj .: &quot;title&quot;</span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="nottickedoff">excerpts &lt;- obj .:? &quot;excerpts&quot; .!= []</span>
+<span class="lineno">  272 </span><span class="spaces">        </span><span class="nottickedoff">let desc = T.intercalate &quot; &quot; (map asText excerpts)</span>
+<span class="lineno">  273 </span><span class="spaces">        </span><span class="nottickedoff">pure (SearchResult title url desc pos)) v</span>
+<span class="lineno">  274 </span><span class="spaces"></span><span class="nottickedoff"></span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="nottickedoff">asText :: Value -&gt; Text</span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="nottickedoff">asText (A.String s) = s</span>
+<span class="lineno">  277 </span><span class="spaces">    </span><span class="nottickedoff">asText _ = &quot;&quot;</span></span>
+<span class="lineno">  278 </span>
+<span class="lineno">  279 </span>parseParallelMcpResponse :: Text -&gt; BL.ByteString -&gt; IO OpResult
+<span class="lineno">  280 </span><span class="decl"><span class="nottickedoff">parseParallelMcpResponse q respBody =</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode respBody :: Maybe Value of</span>
+<span class="lineno">  282 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel MCP returned non-JSON&quot;)</span>
+<span class="lineno">  283 </span><span class="spaces">    </span><span class="nottickedoff">Just val -&gt; case parseMaybe (withObject &quot;rpc&quot; (.: &quot;result&quot;)) val of</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel MCP missing result field&quot;)</span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="nottickedoff">Just resultVal -&gt; do</span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="nottickedoff">let contentText = extractMcpContentText resultVal</span>
+<span class="lineno">  287 </span><span class="spaces">            </span><span class="nottickedoff">results = parseParallelResults contentText</span>
+<span class="lineno">  288 </span><span class="spaces">        </span><span class="nottickedoff">pure (OpResult</span>
+<span class="lineno">  289 </span><span class="spaces">          </span><span class="nottickedoff">[TrpText (encodeResults results)]</span>
+<span class="lineno">  290 </span><span class="spaces">          </span><span class="nottickedoff">False (recorded' q &quot;parallel&quot; (length results)))</span></span>
+<span class="lineno">  291 </span>
+<span class="lineno">  292 </span>-- | Mode B — REST API (with API key for higher limits).
+<span class="lineno">  293 </span>searchParallelRest :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; Text -&gt; IO OpResult
+<span class="lineno">  294 </span><span class="decl"><span class="nottickedoff">searchParallelRest mgr cfg q apiKey = do</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="nottickedoff">let endpoint = if T.null (wscEndpoint cfg)</span>
+<span class="lineno">  296 </span><span class="spaces">                   </span><span class="nottickedoff">then &quot;https://api.parallel.ai/v1/search&quot;</span>
+<span class="lineno">  297 </span><span class="spaces">                   </span><span class="nottickedoff">else wscEndpoint cfg</span>
+<span class="lineno">  298 </span><span class="spaces">      </span><span class="nottickedoff">maxR = min (wscMaxResults cfg) 20</span>
+<span class="lineno">  299 </span><span class="spaces">      </span><span class="nottickedoff">body = A.encode $ A.object</span>
+<span class="lineno">  300 </span><span class="spaces">        </span><span class="nottickedoff">[ &quot;objective&quot;      .= q</span>
+<span class="lineno">  301 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;search_queries&quot; .= [q]</span>
+<span class="lineno">  302 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;mode&quot;           .= (&quot;fast&quot; :: Text)</span>
+<span class="lineno">  303 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;max_results&quot;    .= maxR</span>
+<span class="lineno">  304 </span><span class="spaces">        </span><span class="nottickedoff">]</span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack endpoint))</span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  307 </span><span class="spaces">    </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  308 </span><span class="spaces">      </span><span class="nottickedoff">pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: invalid Parallel REST endpoint URL&quot;)</span>
+<span class="lineno">  309 </span><span class="spaces">    </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="nottickedoff">let req = initReq</span>
+<span class="lineno">  311 </span><span class="spaces">            </span><span class="nottickedoff">{ method = methodPost</span>
+<span class="lineno">  312 </span><span class="spaces">            </span><span class="nottickedoff">, requestBody = RequestBodyLBS body</span>
+<span class="lineno">  313 </span><span class="spaces">            </span><span class="nottickedoff">, requestHeaders =</span>
+<span class="lineno">  314 </span><span class="spaces">                </span><span class="nottickedoff">[ (&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  315 </span><span class="spaces">                </span><span class="nottickedoff">, (&quot;x-api-key&quot;, TE.encodeUtf8 apiKey)</span>
+<span class="lineno">  316 </span><span class="spaces">                </span><span class="nottickedoff">]</span>
+<span class="lineno">  317 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  320 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  321 </span><span class="spaces">          </span><span class="nottickedoff">pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel REST request failed&quot;)</span>
+<span class="lineno">  322 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  323 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  324 </span><span class="spaces">              </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  325 </span><span class="spaces">          </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  326 </span><span class="spaces">            </span><span class="nottickedoff">then parseParallelRestResponse q respBody</span>
+<span class="lineno">  327 </span><span class="spaces">            </span><span class="nottickedoff">else pure (mkError q &quot;parallel&quot; $</span>
+<span class="lineno">  328 </span><span class="spaces">              </span><span class="nottickedoff">&quot;WEB_SEARCH: Parallel REST HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot;</span>
+<span class="lineno">  329 </span><span class="spaces">              </span><span class="nottickedoff">&lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  330 </span>
+<span class="lineno">  331 </span>parseParallelRestResponse :: Text -&gt; BL.ByteString -&gt; IO OpResult
+<span class="lineno">  332 </span><span class="decl"><span class="nottickedoff">parseParallelRestResponse q respBody =</span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode respBody :: Maybe Value of</span>
+<span class="lineno">  334 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel REST returned non-JSON&quot;)</span>
+<span class="lineno">  335 </span><span class="spaces">    </span><span class="nottickedoff">Just val -&gt; case parseMaybe (withObject &quot;r&quot; (.: &quot;results&quot;)) val of</span>
+<span class="lineno">  336 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Array arr) -&gt; do</span>
+<span class="lineno">  337 </span><span class="spaces">        </span><span class="nottickedoff">let results = zipWith fromParallelJson [1..] (V.toList arr)</span>
+<span class="lineno">  338 </span><span class="spaces">        </span><span class="nottickedoff">pure (OpResult [TrpText (encodeResults results)] False (recorded' q &quot;parallel&quot; (length results)))</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; pure (mkError q &quot;parallel&quot; &quot;WEB_SEARCH: Parallel REST missing results array&quot;)</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="nottickedoff">fromParallelJson pos v = fromMaybe (SearchResult &quot;&quot; &quot;&quot; &quot;&quot; pos) $</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;result&quot; $ \obj -&gt; do</span>
+<span class="lineno">  343 </span><span class="spaces">        </span><span class="nottickedoff">url      &lt;- obj .: &quot;url&quot;</span>
+<span class="lineno">  344 </span><span class="spaces">        </span><span class="nottickedoff">title    &lt;- obj .: &quot;title&quot;</span>
+<span class="lineno">  345 </span><span class="spaces">        </span><span class="nottickedoff">excerpts &lt;- obj .:? &quot;excerpts&quot; .!= []</span>
+<span class="lineno">  346 </span><span class="spaces">        </span><span class="nottickedoff">let desc = T.intercalate &quot; &quot; (map asText excerpts)</span>
+<span class="lineno">  347 </span><span class="spaces">        </span><span class="nottickedoff">pure (SearchResult title url desc pos)) v</span>
+<span class="lineno">  348 </span><span class="spaces"></span><span class="nottickedoff"></span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="nottickedoff">asText (A.String s) = s</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="nottickedoff">asText _ = &quot;&quot;</span></span>
+<span class="lineno">  351 </span>
+<span class="lineno">  352 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  353 </span>-- Provider 2: SearXNG (self-hosted, free)
+<span class="lineno">  354 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  355 </span>
+<span class="lineno">  356 </span>-- | URL-encode a 'Text' for use in a query string.
+<span class="lineno">  357 </span>urlEncodeText :: Text -&gt; Text
+<span class="lineno">  358 </span><span class="decl"><span class="nottickedoff">urlEncodeText = TE.decodeUtf8 . urlEncode False . TE.encodeUtf8</span></span>
+<span class="lineno">  359 </span>
+<span class="lineno">  360 </span>searchSearXNG :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  361 </span><span class="decl"><span class="nottickedoff">searchSearXNG mgr cfg q = do</span>
+<span class="lineno">  362 </span><span class="spaces">  </span><span class="nottickedoff">let baseUrl = fromMaybe &quot;http://localhost:8888&quot; (wscSearXngUrl cfg)</span>
+<span class="lineno">  363 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- searXngSearchOnce mgr cfg q baseUrl</span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  365 </span><span class="spaces">    </span><span class="nottickedoff">Right opRes -&gt; pure opRes</span>
+<span class="lineno">  366 </span><span class="spaces">    </span><span class="nottickedoff">Left errMsg -&gt; do</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="nottickedoff">installed &lt;- ensureSearXng mgr baseUrl</span>
+<span class="lineno">  368 </span><span class="spaces">      </span><span class="nottickedoff">if installed</span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="nottickedoff">then do</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="nottickedoff">result2 &lt;- searXngSearchOnce mgr cfg q baseUrl</span>
+<span class="lineno">  371 </span><span class="spaces">          </span><span class="nottickedoff">case result2 of</span>
+<span class="lineno">  372 </span><span class="spaces">            </span><span class="nottickedoff">Right opRes    -&gt; pure opRes</span>
+<span class="lineno">  373 </span><span class="spaces">            </span><span class="nottickedoff">Left errMsg2   -&gt; pure (mkError q &quot;searxng&quot; errMsg2)</span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="nottickedoff">else pure (mkError q &quot;searxng&quot; $</span>
+<span class="lineno">  375 </span><span class="spaces">          </span><span class="nottickedoff">errMsg &lt;&gt; &quot; Auto-install attempted but failed. Ensure Docker is running or start SearXNG manually.&quot;)</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>searXngSearchOnce :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; Text -&gt; IO (Either Text OpResult)
+<span class="lineno">  378 </span><span class="decl"><span class="nottickedoff">searXngSearchOnce mgr cfg q baseUrl = do</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="nottickedoff">let endpoint = baseUrl &lt;&gt; &quot;/search&quot;</span>
+<span class="lineno">  380 </span><span class="spaces">      </span><span class="nottickedoff">maxR = wscMaxResults cfg</span>
+<span class="lineno">  381 </span><span class="spaces">      </span><span class="nottickedoff">fullUrl = endpoint &lt;&gt; &quot;?&quot; &lt;&gt; &quot;q=&quot; &lt;&gt; urlEncodeText q &lt;&gt; &quot;&amp;format=json&amp;pageno=1&quot;</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack fullUrl))</span>
+<span class="lineno">  383 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="nottickedoff">pure (Left &quot;WEB_SEARCH: invalid SearXNG URL&quot;)</span>
+<span class="lineno">  386 </span><span class="spaces">    </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  387 </span><span class="spaces">      </span><span class="nottickedoff">let req = initReq { requestHeaders = [(&quot;accept&quot;, &quot;application/json&quot;)] }</span>
+<span class="lineno">  388 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  389 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  390 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  391 </span><span class="spaces">          </span><span class="nottickedoff">pure (Left &quot;WEB_SEARCH: SearXNG request failed (is the instance running?)&quot;)</span>
+<span class="lineno">  392 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  393 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  394 </span><span class="spaces">              </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  395 </span><span class="spaces">          </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  396 </span><span class="spaces">            </span><span class="nottickedoff">then Right &lt;$&gt; parseSearXngResponse q maxR respBody</span>
+<span class="lineno">  397 </span><span class="spaces">            </span><span class="nottickedoff">else pure (Left $ &quot;WEB_SEARCH: SearXNG HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  398 </span>
+<span class="lineno">  399 </span>parseSearXngResponse :: Text -&gt; Int -&gt; BL.ByteString -&gt; IO OpResult
+<span class="lineno">  400 </span><span class="decl"><span class="nottickedoff">parseSearXngResponse q maxR respBody =</span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode respBody :: Maybe Value of</span>
+<span class="lineno">  402 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;searxng&quot; &quot;WEB_SEARCH: SearXNG returned non-JSON (is JSON format enabled in settings.yml?)&quot;)</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="nottickedoff">Just val -&gt; case parseMaybe (withObject &quot;r&quot; (.: &quot;results&quot;)) val of</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Array arr) -&gt; do</span>
+<span class="lineno">  405 </span><span class="spaces">        </span><span class="nottickedoff">let rawResults = V.toList arr</span>
+<span class="lineno">  406 </span><span class="spaces">            </span><span class="nottickedoff">scored = [(scoreOf r, r) | r &lt;- rawResults]</span>
+<span class="lineno">  407 </span><span class="spaces">            </span><span class="nottickedoff">sorted = map snd (sortBy (flip compare `on` fst) scored)</span>
+<span class="lineno">  408 </span><span class="spaces">            </span><span class="nottickedoff">taken = take maxR sorted</span>
+<span class="lineno">  409 </span><span class="spaces">            </span><span class="nottickedoff">results = zipWith fromSearXngJson [1..] taken</span>
+<span class="lineno">  410 </span><span class="spaces">        </span><span class="nottickedoff">pure (OpResult [TrpText (encodeResults results)] False (recorded' q &quot;searxng&quot; (length results)))</span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; pure (mkError q &quot;searxng&quot; &quot;WEB_SEARCH: SearXNG missing results array&quot;)</span>
+<span class="lineno">  412 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  413 </span><span class="spaces">    </span><span class="nottickedoff">scoreOf :: Value -&gt; Double</span>
+<span class="lineno">  414 </span><span class="spaces">    </span><span class="nottickedoff">scoreOf v = fromMaybe 0 $</span>
+<span class="lineno">  415 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;r&quot; (.: &quot;score&quot;)) v &gt;&gt;= \case</span>
+<span class="lineno">  416 </span><span class="spaces">        </span><span class="nottickedoff">A.Number n -&gt; Just (realToFrac n)</span>
+<span class="lineno">  417 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  418 </span><span class="spaces"></span><span class="nottickedoff"></span>
+<span class="lineno">  419 </span><span class="spaces">    </span><span class="nottickedoff">fromSearXngJson :: Int -&gt; Value -&gt; SearchResult</span>
+<span class="lineno">  420 </span><span class="spaces">    </span><span class="nottickedoff">fromSearXngJson pos v = fromMaybe (SearchResult &quot;&quot; &quot;&quot; &quot;&quot; pos) $</span>
+<span class="lineno">  421 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;r&quot; $ \obj -&gt; do</span>
+<span class="lineno">  422 </span><span class="spaces">        </span><span class="nottickedoff">url     &lt;- obj .:  &quot;url&quot;</span>
+<span class="lineno">  423 </span><span class="spaces">        </span><span class="nottickedoff">title   &lt;- obj .:  &quot;title&quot;</span>
+<span class="lineno">  424 </span><span class="spaces">        </span><span class="nottickedoff">content &lt;- obj .:? &quot;content&quot; .!= &quot;&quot;</span>
+<span class="lineno">  425 </span><span class="spaces">        </span><span class="nottickedoff">pure (SearchResult title url content pos)) v</span></span>
+<span class="lineno">  426 </span>
+<span class="lineno">  427 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  428 </span>-- Provider 3: Exa (API key required)
+<span class="lineno">  429 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  430 </span>
+<span class="lineno">  431 </span>searchExa :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  432 </span><span class="decl"><span class="nottickedoff">searchExa mgr cfg q = do</span>
+<span class="lineno">  433 </span><span class="spaces">  </span><span class="nottickedoff">mKey &lt;- resolveApiKey cfg</span>
+<span class="lineno">  434 </span><span class="spaces">  </span><span class="nottickedoff">case mKey of</span>
+<span class="lineno">  435 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;exa&quot;</span>
+<span class="lineno">  436 </span><span class="spaces">      </span><span class="nottickedoff">&quot;WEB_SEARCH: Exa requires an API key. Set vault key 'exa_api_key' and configure [web] search_auth_key.&quot;)</span>
+<span class="lineno">  437 </span><span class="spaces">    </span><span class="nottickedoff">Just apiKey -&gt; do</span>
+<span class="lineno">  438 </span><span class="spaces">      </span><span class="nottickedoff">let endpoint = if T.null (wscEndpoint cfg)</span>
+<span class="lineno">  439 </span><span class="spaces">                       </span><span class="nottickedoff">then &quot;https://api.exa.ai/search&quot;</span>
+<span class="lineno">  440 </span><span class="spaces">                       </span><span class="nottickedoff">else wscEndpoint cfg</span>
+<span class="lineno">  441 </span><span class="spaces">          </span><span class="nottickedoff">maxR = wscMaxResults cfg</span>
+<span class="lineno">  442 </span><span class="spaces">          </span><span class="nottickedoff">body = A.encode $ A.object</span>
+<span class="lineno">  443 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;query&quot;       .= q</span>
+<span class="lineno">  444 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;numResults&quot;  .= maxR</span>
+<span class="lineno">  445 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;contents&quot;    .= A.object [&quot;highlights&quot; .= True]</span>
+<span class="lineno">  446 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  447 </span><span class="spaces">      </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack endpoint))</span>
+<span class="lineno">  448 </span><span class="spaces">      </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  449 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  450 </span><span class="spaces">          </span><span class="nottickedoff">pure (mkError q &quot;exa&quot; &quot;WEB_SEARCH: invalid Exa endpoint URL&quot;)</span>
+<span class="lineno">  451 </span><span class="spaces">        </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  452 </span><span class="spaces">          </span><span class="nottickedoff">let req = initReq</span>
+<span class="lineno">  453 </span><span class="spaces">                </span><span class="nottickedoff">{ method = methodPost</span>
+<span class="lineno">  454 </span><span class="spaces">                </span><span class="nottickedoff">, requestBody = RequestBodyLBS body</span>
+<span class="lineno">  455 </span><span class="spaces">                </span><span class="nottickedoff">, requestHeaders =</span>
+<span class="lineno">  456 </span><span class="spaces">                    </span><span class="nottickedoff">[ (&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  457 </span><span class="spaces">                    </span><span class="nottickedoff">, (&quot;x-api-key&quot;, TE.encodeUtf8 apiKey)</span>
+<span class="lineno">  458 </span><span class="spaces">                    </span><span class="nottickedoff">]</span>
+<span class="lineno">  459 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  460 </span><span class="spaces">          </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  461 </span><span class="spaces">          </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  462 </span><span class="spaces">            </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  463 </span><span class="spaces">              </span><span class="nottickedoff">pure (mkError q &quot;exa&quot; &quot;WEB_SEARCH: Exa request failed&quot;)</span>
+<span class="lineno">  464 </span><span class="spaces">            </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  465 </span><span class="spaces">              </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  466 </span><span class="spaces">                  </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  467 </span><span class="spaces">              </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  468 </span><span class="spaces">                </span><span class="nottickedoff">then parseExaResponse q respBody</span>
+<span class="lineno">  469 </span><span class="spaces">                </span><span class="nottickedoff">else pure (mkError q &quot;exa&quot; $</span>
+<span class="lineno">  470 </span><span class="spaces">                  </span><span class="nottickedoff">&quot;WEB_SEARCH: Exa HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot;</span>
+<span class="lineno">  471 </span><span class="spaces">                  </span><span class="nottickedoff">&lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  472 </span>
+<span class="lineno">  473 </span>parseExaResponse :: Text -&gt; BL.ByteString -&gt; IO OpResult
+<span class="lineno">  474 </span><span class="decl"><span class="nottickedoff">parseExaResponse q respBody =</span>
+<span class="lineno">  475 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode respBody :: Maybe Value of</span>
+<span class="lineno">  476 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;exa&quot; &quot;WEB_SEARCH: Exa returned non-JSON&quot;)</span>
+<span class="lineno">  477 </span><span class="spaces">    </span><span class="nottickedoff">Just val -&gt; case parseMaybe (withObject &quot;r&quot; (.: &quot;results&quot;)) val of</span>
+<span class="lineno">  478 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Array arr) -&gt; do</span>
+<span class="lineno">  479 </span><span class="spaces">        </span><span class="nottickedoff">let results = zipWith fromExaJson [1..] (V.toList arr)</span>
+<span class="lineno">  480 </span><span class="spaces">        </span><span class="nottickedoff">pure (OpResult [TrpText (encodeResults results)] False (recorded' q &quot;exa&quot; (length results)))</span>
+<span class="lineno">  481 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; pure (mkError q &quot;exa&quot; &quot;WEB_SEARCH: Exa missing results array&quot;)</span>
+<span class="lineno">  482 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  483 </span><span class="spaces">    </span><span class="nottickedoff">fromExaJson pos v = fromMaybe (SearchResult &quot;&quot; &quot;&quot; &quot;&quot; pos) $</span>
+<span class="lineno">  484 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;r&quot; $ \obj -&gt; do</span>
+<span class="lineno">  485 </span><span class="spaces">        </span><span class="nottickedoff">url        &lt;- obj .:  &quot;url&quot;</span>
+<span class="lineno">  486 </span><span class="spaces">        </span><span class="nottickedoff">title      &lt;- obj .:  &quot;title&quot;</span>
+<span class="lineno">  487 </span><span class="spaces">        </span><span class="nottickedoff">highlights &lt;- obj .:? &quot;highlights&quot; .!= []</span>
+<span class="lineno">  488 </span><span class="spaces">        </span><span class="nottickedoff">let desc = T.intercalate &quot; &quot; (map asText highlights)</span>
+<span class="lineno">  489 </span><span class="spaces">        </span><span class="nottickedoff">pure (SearchResult title url desc pos)) v</span>
+<span class="lineno">  490 </span><span class="spaces"></span><span class="nottickedoff"></span>
+<span class="lineno">  491 </span><span class="spaces">    </span><span class="nottickedoff">asText (A.String s) = s</span>
+<span class="lineno">  492 </span><span class="spaces">    </span><span class="nottickedoff">asText _ = &quot;&quot;</span></span>
+<span class="lineno">  493 </span>
+<span class="lineno">  494 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  495 </span>-- Provider 4: Firecrawl (API key required)
+<span class="lineno">  496 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  497 </span>
+<span class="lineno">  498 </span>searchFirecrawl :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  499 </span><span class="decl"><span class="nottickedoff">searchFirecrawl mgr cfg q = do</span>
+<span class="lineno">  500 </span><span class="spaces">  </span><span class="nottickedoff">mKey &lt;- resolveApiKey cfg</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="nottickedoff">case mKey of</span>
+<span class="lineno">  502 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;firecrawl&quot;</span>
+<span class="lineno">  503 </span><span class="spaces">      </span><span class="nottickedoff">&quot;WEB_SEARCH: Firecrawl requires an API key. Set vault key 'firecrawl_api_key' and configure [web] search_auth_key.&quot;)</span>
+<span class="lineno">  504 </span><span class="spaces">    </span><span class="nottickedoff">Just apiKey -&gt; do</span>
+<span class="lineno">  505 </span><span class="spaces">      </span><span class="nottickedoff">let endpoint = if T.null (wscEndpoint cfg)</span>
+<span class="lineno">  506 </span><span class="spaces">                       </span><span class="nottickedoff">then &quot;https://api.firecrawl.dev/v2/search&quot;</span>
+<span class="lineno">  507 </span><span class="spaces">                       </span><span class="nottickedoff">else wscEndpoint cfg</span>
+<span class="lineno">  508 </span><span class="spaces">          </span><span class="nottickedoff">maxR = wscMaxResults cfg</span>
+<span class="lineno">  509 </span><span class="spaces">          </span><span class="nottickedoff">body = A.encode $ A.object</span>
+<span class="lineno">  510 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;query&quot; .= q</span>
+<span class="lineno">  511 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;limit&quot; .= maxR</span>
+<span class="lineno">  512 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  513 </span><span class="spaces">      </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack endpoint))</span>
+<span class="lineno">  514 </span><span class="spaces">      </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  515 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  516 </span><span class="spaces">          </span><span class="nottickedoff">pure (mkError q &quot;firecrawl&quot; &quot;WEB_SEARCH: invalid Firecrawl endpoint URL&quot;)</span>
+<span class="lineno">  517 </span><span class="spaces">        </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  518 </span><span class="spaces">          </span><span class="nottickedoff">let req = initReq</span>
+<span class="lineno">  519 </span><span class="spaces">                </span><span class="nottickedoff">{ method = methodPost</span>
+<span class="lineno">  520 </span><span class="spaces">                </span><span class="nottickedoff">, requestBody = RequestBodyLBS body</span>
+<span class="lineno">  521 </span><span class="spaces">                </span><span class="nottickedoff">, requestHeaders =</span>
+<span class="lineno">  522 </span><span class="spaces">                    </span><span class="nottickedoff">[ (&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  523 </span><span class="spaces">                    </span><span class="nottickedoff">, (&quot;authorization&quot;, &quot;Bearer &quot; &lt;&gt; TE.encodeUtf8 apiKey)</span>
+<span class="lineno">  524 </span><span class="spaces">                    </span><span class="nottickedoff">]</span>
+<span class="lineno">  525 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  526 </span><span class="spaces">          </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  527 </span><span class="spaces">          </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  528 </span><span class="spaces">            </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  529 </span><span class="spaces">              </span><span class="nottickedoff">pure (mkError q &quot;firecrawl&quot; &quot;WEB_SEARCH: Firecrawl request failed&quot;)</span>
+<span class="lineno">  530 </span><span class="spaces">            </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  531 </span><span class="spaces">              </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  532 </span><span class="spaces">                  </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  533 </span><span class="spaces">              </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  534 </span><span class="spaces">                </span><span class="nottickedoff">then parseFirecrawlResponse q respBody</span>
+<span class="lineno">  535 </span><span class="spaces">                </span><span class="nottickedoff">else pure (mkError q &quot;firecrawl&quot; $</span>
+<span class="lineno">  536 </span><span class="spaces">                  </span><span class="nottickedoff">&quot;WEB_SEARCH: Firecrawl HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot;</span>
+<span class="lineno">  537 </span><span class="spaces">                  </span><span class="nottickedoff">&lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  538 </span>
+<span class="lineno">  539 </span>parseFirecrawlResponse :: Text -&gt; BL.ByteString -&gt; IO OpResult
+<span class="lineno">  540 </span><span class="decl"><span class="nottickedoff">parseFirecrawlResponse q respBody =</span>
+<span class="lineno">  541 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode respBody :: Maybe Value of</span>
+<span class="lineno">  542 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure (mkError q &quot;firecrawl&quot; &quot;WEB_SEARCH: Firecrawl returned non-JSON&quot;)</span>
+<span class="lineno">  543 </span><span class="spaces">    </span><span class="nottickedoff">Just val -&gt; do</span>
+<span class="lineno">  544 </span><span class="spaces">      </span><span class="nottickedoff">let results = extractFirecrawlResults val</span>
+<span class="lineno">  545 </span><span class="spaces">      </span><span class="nottickedoff">if null results</span>
+<span class="lineno">  546 </span><span class="spaces">        </span><span class="nottickedoff">then pure (mkError q &quot;firecrawl&quot; &quot;WEB_SEARCH: Firecrawl returned no results&quot;)</span>
+<span class="lineno">  547 </span><span class="spaces">        </span><span class="nottickedoff">else pure (OpResult [TrpText (encodeResults results)] False (recorded' q &quot;firecrawl&quot; (length results)))</span></span>
+<span class="lineno">  548 </span>
+<span class="lineno">  549 </span>-- | Extract results from a Firecrawl response, trying multiple shapes:
+<span class="lineno">  550 </span>-- v2: @data.web[]@ → @data.results[]@ → @web[]@ → @results[]@ → @data@ (flat list, v1).
+<span class="lineno">  551 </span>extractFirecrawlResults :: Value -&gt; [SearchResult]
+<span class="lineno">  552 </span><span class="decl"><span class="nottickedoff">extractFirecrawlResults val =</span>
+<span class="lineno">  553 </span><span class="spaces">  </span><span class="nottickedoff">case tryPath [fromText &quot;data&quot;, fromText &quot;web&quot;] val of</span>
+<span class="lineno">  554 </span><span class="spaces">    </span><span class="nottickedoff">Just rs -&gt; rs</span>
+<span class="lineno">  555 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; case tryPath [fromText &quot;data&quot;, fromText &quot;results&quot;] val of</span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="nottickedoff">Just rs -&gt; rs</span>
+<span class="lineno">  557 </span><span class="spaces">      </span><span class="nottickedoff">Nothing -&gt; case tryPath [fromText &quot;web&quot;] val of</span>
+<span class="lineno">  558 </span><span class="spaces">        </span><span class="nottickedoff">Just rs -&gt; rs</span>
+<span class="lineno">  559 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; case tryPath [fromText &quot;results&quot;] val of</span>
+<span class="lineno">  560 </span><span class="spaces">          </span><span class="nottickedoff">Just rs -&gt; rs</span>
+<span class="lineno">  561 </span><span class="spaces">          </span><span class="nottickedoff">Nothing -&gt; case parseMaybe (withObject &quot;r&quot; (.: &quot;data&quot;)) val of</span>
+<span class="lineno">  562 </span><span class="spaces">            </span><span class="nottickedoff">Just (A.Array arr) -&gt; zipWith fromFirecrawlJson [1..] (V.toList arr)</span>
+<span class="lineno">  563 </span><span class="spaces">            </span><span class="nottickedoff">_ -&gt; []</span>
+<span class="lineno">  564 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="nottickedoff">tryPath :: [A.Key] -&gt; Value -&gt; Maybe [SearchResult]</span>
+<span class="lineno">  566 </span><span class="spaces">    </span><span class="nottickedoff">tryPath keys v = do</span>
+<span class="lineno">  567 </span><span class="spaces">      </span><span class="nottickedoff">let go []     val' = Just val'</span>
+<span class="lineno">  568 </span><span class="spaces">          </span><span class="nottickedoff">go (k:ks) val' = parseMaybe (withObject &quot;o&quot; (.: k)) val' &gt;&gt;= go ks</span>
+<span class="lineno">  569 </span><span class="spaces">      </span><span class="nottickedoff">resultVal &lt;- go keys v</span>
+<span class="lineno">  570 </span><span class="spaces">      </span><span class="nottickedoff">case resultVal of</span>
+<span class="lineno">  571 </span><span class="spaces">        </span><span class="nottickedoff">A.Array arr -&gt; Just (zipWith fromFirecrawlJson [1..] (V.toList arr))</span>
+<span class="lineno">  572 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  573 </span><span class="spaces"></span><span class="nottickedoff"></span>
+<span class="lineno">  574 </span><span class="spaces">    </span><span class="nottickedoff">fromFirecrawlJson :: Int -&gt; Value -&gt; SearchResult</span>
+<span class="lineno">  575 </span><span class="spaces">    </span><span class="nottickedoff">fromFirecrawlJson pos v = fromMaybe (SearchResult &quot;&quot; &quot;&quot; &quot;&quot; pos) $</span>
+<span class="lineno">  576 </span><span class="spaces">      </span><span class="nottickedoff">parseMaybe (withObject &quot;r&quot; $ \obj -&gt; do</span>
+<span class="lineno">  577 </span><span class="spaces">        </span><span class="nottickedoff">url   &lt;- obj .:  &quot;url&quot;</span>
+<span class="lineno">  578 </span><span class="spaces">        </span><span class="nottickedoff">title &lt;- obj .:  &quot;title&quot;</span>
+<span class="lineno">  579 </span><span class="spaces">        </span><span class="nottickedoff">desc  &lt;- obj .:? &quot;description&quot; .!= &quot;&quot;</span>
+<span class="lineno">  580 </span><span class="spaces">        </span><span class="nottickedoff">pos'  &lt;- obj .:? &quot;position&quot; .!= pos</span>
+<span class="lineno">  581 </span><span class="spaces">        </span><span class="nottickedoff">pure (SearchResult title url desc pos')) v</span></span>
+<span class="lineno">  582 </span>
+<span class="lineno">  583 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  584 </span>-- Provider 5: Custom (legacy single-endpoint compatibility)
+<span class="lineno">  585 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  586 </span>
+<span class="lineno">  587 </span>searchCustom :: Manager -&gt; WebSearchConfig -&gt; Text -&gt; IO OpResult
+<span class="lineno">  588 </span><span class="decl"><span class="nottickedoff">searchCustom mgr cfg q</span>
+<span class="lineno">  589 </span><span class="spaces">  </span><span class="nottickedoff">| T.null (wscEndpoint cfg) = pure (mkError q &quot;custom&quot;</span>
+<span class="lineno">  590 </span><span class="spaces">      </span><span class="nottickedoff">&quot;WEB_SEARCH: no search endpoint configured and no provider selected. Set [web] search_provider or search_endpoint.&quot;)</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise = do</span>
+<span class="lineno">  592 </span><span class="spaces">      </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack (wscEndpoint cfg)))</span>
+<span class="lineno">  593 </span><span class="spaces">      </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  594 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  595 </span><span class="spaces">          </span><span class="nottickedoff">pure (mkError q &quot;custom&quot; (&quot;WEB_SEARCH: invalid endpoint URL: &quot; &lt;&gt; wscEndpoint cfg))</span>
+<span class="lineno">  596 </span><span class="spaces">        </span><span class="nottickedoff">Right initReq -&gt; do</span>
+<span class="lineno">  597 </span><span class="spaces">          </span><span class="nottickedoff">let body = A.encode (A.object [&quot;query&quot; .= q])</span>
+<span class="lineno">  598 </span><span class="spaces">              </span><span class="nottickedoff">req = initReq</span>
+<span class="lineno">  599 </span><span class="spaces">                </span><span class="nottickedoff">{ method = methodPost</span>
+<span class="lineno">  600 </span><span class="spaces">                </span><span class="nottickedoff">, requestBody = RequestBodyLBS body</span>
+<span class="lineno">  601 </span><span class="spaces">                </span><span class="nottickedoff">, requestHeaders = [(&quot;content-type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  602 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  603 </span><span class="spaces">          </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  604 </span><span class="spaces">          </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  605 </span><span class="spaces">            </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  606 </span><span class="spaces">              </span><span class="nottickedoff">pure (mkError q &quot;custom&quot; &quot;WEB_SEARCH: HTTP request failed (connection or transport error)&quot;)</span>
+<span class="lineno">  607 </span><span class="spaces">            </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  608 </span><span class="spaces">              </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  609 </span><span class="spaces">                  </span><span class="nottickedoff">respBody = responseBody resp</span>
+<span class="lineno">  610 </span><span class="spaces">                  </span><span class="nottickedoff">resultCount = countResults respBody</span>
+<span class="lineno">  611 </span><span class="spaces">              </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  612 </span><span class="spaces">                </span><span class="nottickedoff">then pure (OpResult [TrpText (bodyText respBody)] False (recorded' q &quot;custom&quot; resultCount))</span>
+<span class="lineno">  613 </span><span class="spaces">                </span><span class="nottickedoff">else pure (mkError q &quot;custom&quot; $</span>
+<span class="lineno">  614 </span><span class="spaces">                  </span><span class="nottickedoff">&quot;WEB_SEARCH: HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; bodyText respBody)</span></span>
+<span class="lineno">  615 </span>
+<span class="lineno">  616 </span>-- | Best-effort count of search results from the response JSON. Tries to
+<span class="lineno">  617 </span>-- parse the body as a JSON array and returns its length; falls back to 0
+<span class="lineno">  618 </span>-- when the body is not a JSON array (the count is metadata only and not
+<span class="lineno">  619 </span>-- security-critical).
+<span class="lineno">  620 </span>countResults :: BL.ByteString -&gt; Int
+<span class="lineno">  621 </span><span class="decl"><span class="nottickedoff">countResults bs =</span>
+<span class="lineno">  622 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode bs :: Maybe Value of</span>
+<span class="lineno">  623 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Array arr) -&gt; length arr</span>
+<span class="lineno">  624 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object _)  -&gt; 1  -- single result object</span>
+<span class="lineno">  625 </span><span class="spaces">    </span><span class="nottickedoff">_                  -&gt; 0</span></span>
+<span class="lineno">  626 </span>
+<span class="lineno">  627 </span>webSearchSchema :: Value
+<span class="lineno">  628 </span><span class="decl"><span class="istickedoff">webSearchSchema =</span>
+<span class="lineno">  629 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  630 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  631 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  632 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;query&quot; .= object</span>
+<span class="lineno">  633 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  634 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The search query.&quot; :: Text)</span>
+<span class="lineno">  635 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  636 </span><span class="spaces">        </span><span class="istickedoff">, &quot;limit&quot; .= object</span>
+<span class="lineno">  637 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  638 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Maximum number of results to return (default: 10).&quot; :: Text)</span>
+<span class="lineno">  639 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  640 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  641 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;query&quot;] :: [Text])</span>
+<span class="lineno">  642 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  643 </span>
+<span class="lineno">  644 </span>queryField :: Value -&gt; Maybe Text
+<span class="lineno">  645 </span><span class="decl"><span class="istickedoff">queryField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;query&quot;))</span></span>
+<span class="lineno">  646 </span>
+<span class="lineno">  647 </span>-- | Optional per-call limit override (overrides 'wscMaxResults').
+<span class="lineno">  648 </span>limitField :: Value -&gt; Maybe Int
+<span class="lineno">  649 </span><span class="decl"><span class="istickedoff">limitField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;limit&quot;))</span></span>
+
+</pre>
+</body>
+</html>

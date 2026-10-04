@@ -1,0 +1,47 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TemplateHaskell #-}
+<span class="lineno">    3 </span>-- | GitHub's published SSH host keys, pinned at compile time via
+<span class="lineno">    4 </span>-- 'file-embed' (tamper-resistant — the bytes are baked into the binary;
+<span class="lineno">    5 </span>-- a runtime attacker cannot swap them without rebuilding). Public data:
+<span class="lineno">    6 </span>-- &lt;https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints&gt;
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- Used as the @UserKnownHostsFile@ content for the no-disk clone seam (W2):
+<span class="lineno">    9 </span>-- @StrictHostKeyChecking=yes@ (NOT @accept-new@ / @/dev/null@ — §5.3: MITM
+<span class="lineno">   10 </span>-- defense) reads these pinned keys, so a GitHub clone verifies the server
+<span class="lineno">   11 </span>-- against a known-good host key without ever touching @~/.ssh/known_hosts@
+<span class="lineno">   12 </span>-- and without prompting. The file is written per-op to
+<span class="lineno">   13 </span>-- @&lt;workdir&gt;/.seal-known-hosts@ (public data, 0644, cleaned up after the op).
+<span class="lineno">   14 </span>module Seal.SourceControl.GithubKeys
+<span class="lineno">   15 </span>  ( pinnedGithubKnownHosts
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.ByteString (ByteString)
+<span class="lineno">   19 </span>import Data.FileEmbed (embedFile)
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>-- | The pinned GitHub host keys (RSA, ECDSA, Ed25519) in OpenSSH
+<span class="lineno">   22 </span>-- @known_hosts@ format. Embedded at compile time.
+<span class="lineno">   23 </span>pinnedGithubKnownHosts :: ByteString
+<span class="lineno">   24 </span><span class="decl"><span class="istickedoff">pinnedGithubKnownHosts = $(embedFile &quot;src/Seal/SourceControl/data/github-known-hosts&quot;)</span></span>
+
+</pre>
+</body>
+</html>

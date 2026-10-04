@@ -1,0 +1,211 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The WebSocket stream protocol types — the wire shapes for the WS event
+<span class="lineno">    3 </span>-- union and the client-to-server focus op. These are the types both the
+<span class="lineno">    4 </span>-- server (WS server in 'Seal.Gateway.Stream') and channel clients (WS
+<span class="lineno">    5 </span>-- client in 'Seal.Channels.WsClient') import.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- 'BrokerEvent' is the in-process event the broker fans out. The WS server
+<span class="lineno">    8 </span>-- encodes it to wire JSON; the WS client decodes from wire JSON. Only the
+<span class="lineno">    9 </span>-- 'BrokerEvent' data type and 'FocusOp' live here — the 'Subscriber' and
+<span class="lineno">   10 </span>-- 'StreamBroker' runtime types stay in the server (they carry STM state).
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- Canonical home; 'Seal.Gateway.Stream' and 'Seal.Gateway.StreamBroker' in
+<span class="lineno">   13 </span>-- the server re-export 'FocusOp' and 'BrokerEvent' from here.
+<span class="lineno">   14 </span>module Seal.Gateway.Types.Stream
+<span class="lineno">   15 </span>  ( BrokerEvent (..)
+<span class="lineno">   16 </span>  , FocusOp (..)
+<span class="lineno">   17 </span>  , ServerEvent (..)
+<span class="lineno">   18 </span>  , decodeServerEvent
+<span class="lineno">   19 </span>  , StreamErrorCode (..)
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Data.Aeson (Value, (.:), (.:?))
+<span class="lineno">   23 </span>import Data.Aeson qualified as A
+<span class="lineno">   24 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   25 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   26 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   27 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   28 </span>import Data.Text (Text)
+<span class="lineno">   29 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Seal.Gateway.Types.Core (SessionId, mkSessionId)
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | One event the broker fans out to subscribers. The 'Value' payloads are
+<span class="lineno">   34 </span>-- the pre-encoded JSON the WS peer receives — the server's 'sendEvent'
+<span class="lineno">   35 </span>-- wraps them in the wire envelope.
+<span class="lineno">   36 </span>data BrokerEvent
+<span class="lineno">   37 </span>  = BeEntryRecorded SessionId Value   -- ^ a transcript entry (the JSON the WS peer receives)
+<span class="lineno">   38 </span>  | BeEntryUpdate SessionId Value      -- ^ a streaming entry whose text is still growing (the WS peer renders as an @entry-update@ event, replacing the in-place entry by id)
+<span class="lineno">   39 </span>  | BeHarnessStatus Value             -- ^ a harness liveness change
+<span class="lineno">   40 </span>  | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
+<span class="lineno">   41 </span>  | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
+<span class="lineno">   42 </span>  | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
+<span class="lineno">   43 </span>  | BeActivity SessionId Value          -- ^ a per-session activity signal (harness-status / reply-delivered) the WS peer renders as an @activity@ envelope
+<span class="lineno">   44 </span>  | BeAgentDefsChanged                 -- ^ agent defs were created/updated/deleted; clients should re-fetch
+<span class="lineno">   45 </span>  | BeSkillsChanged                    -- ^ skills were created/updated/deleted; clients should re-fetch
+<span class="lineno">   46 </span>  | BeReposChanged                     -- ^ the source-control repo registry was mutated; clients should re-fetch /api/repos
+<span class="lineno">   47 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | The focus op the client sends to change its focused session. Accepts
+<span class="lineno">   50 </span>-- both the frontend's shape (@{&quot;op&quot;:&quot;focus&quot;,&quot;sessionId&quot;:&quot;...&quot;}@) and the
+<span class="lineno">   51 </span>-- legacy shape (@{&quot;session&quot;:&quot;...&quot;}@) for robustness. The optional @since@
+<span class="lineno">   52 </span>-- field requests replay of entries after the given entry id.
+<span class="lineno">   53 </span>data FocusOp = FocusOp
+<span class="lineno">   54 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">foSession</span></span></span> :: Text
+<span class="lineno">   55 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">foSince</span></span></span>   :: Maybe Text
+<span class="lineno">   56 </span>  }
+<span class="lineno">   57 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.FromJSON FocusOp</span></span></span></span> where
+<span class="lineno">   60 </span>  <span class="decl"><span class="istickedoff">parseJSON = A.withObject <span class="nottickedoff">&quot;focus&quot;</span> $ \o -&gt;</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">FocusOp</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; (o .: &quot;sessionId&quot; &lt;|&gt; o .: &quot;session&quot;)</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; (o .:? &quot;since&quot;)</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.ToJSON FocusOp</span></span></span></span></span></span></span></span> where
+<span class="lineno">   66 </span>  <span class="decl"><span class="istickedoff">toJSON (FocusOp sess mSince) = A.object</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">( [ &quot;op&quot; A..= (&quot;focus&quot; :: Text)</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">, &quot;sessionId&quot; A..= sess</span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; maybe [] (\s -&gt; [&quot;since&quot; A..= s]) mSince</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | Decode a WS wire frame (raw JSON bytes) into a 'ServerEvent'. Returns
+<span class="lineno">   74 </span>-- 'Nothing' for unparseable frames. Used by the chat-channel WS client's
+<span class="lineno">   75 </span>-- background reader. Pure.
+<span class="lineno">   76 </span>decodeServerEvent :: BL.ByteString -&gt; Maybe ServerEvent
+<span class="lineno">   77 </span><span class="decl"><span class="istickedoff">decodeServerEvent bs = A.decode bs &gt;&gt;= parseServerEvent</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | The WS wire event union — the discriminated union the WS peer
+<span class="lineno">   80 </span>-- receives. Tagged by the @type@ field. This is the Haskell mirror of the
+<span class="lineno">   81 </span>-- frontend's @ServerEvent@ TypeScript type
+<span class="lineno">   82 </span>-- (@frontend/src/types/stream.ts@). The server encodes 'BrokerEvent's into
+<span class="lineno">   83 </span>-- these wire shapes; the channel WS client decodes them.
+<span class="lineno">   84 </span>--
+<span class="lineno">   85 </span>-- Currently only the 'FocusOp' and 'BrokerEvent' types are wired. The full
+<span class="lineno">   86 </span>-- 'ServerEvent' union will be fleshed out as the chat-channel WS client
+<span class="lineno">   87 </span>-- is implemented (Step 2). For now, this is the type declaration that
+<span class="lineno">   88 </span>-- establishes the contract.
+<span class="lineno">   89 </span>data ServerEvent
+<span class="lineno">   90 </span>  = SeHello Text Text          -- ^ @hello@: protocolVersion + serverStartedAt
+<span class="lineno">   91 </span>  | SeEntry SessionId Value    -- ^ @entry@: a complete transcript entry
+<span class="lineno">   92 </span>  | SeEntryUpdate SessionId Value  -- ^ @entry-update@: a streaming entry update
+<span class="lineno">   93 </span>  | SeActivity SessionId Value     -- ^ @activity@: a per-session activity signal
+<span class="lineno">   94 </span>  | SeReplayEnd SessionId (Maybe Text)  -- ^ @replay-end@: replay finished, last replayed entry id
+<span class="lineno">   95 </span>  | SeLists Value              -- ^ @lists@: a tab/session snapshot
+<span class="lineno">   96 </span>  | SeAsk SessionId Value      -- ^ @ask@: a pending human question
+<span class="lineno">   97 </span>  | SeAskResolved SessionId Value  -- ^ @ask_resolved@: a question was answered/cancelled
+<span class="lineno">   98 </span>  | SeAgentDefsChanged         -- ^ @agent-defs-changed@
+<span class="lineno">   99 </span>  | SeSkillsChanged            -- ^ @skills-changed@
+<span class="lineno">  100 </span>  | SeReposChanged             -- ^ @repos-changed@
+<span class="lineno">  101 </span>  | SeError StreamErrorCode Text  -- ^ @error@: an error code + message
+<span class="lineno">  102 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | The error codes the WS server can send in an @error@ event. Mirrors
+<span class="lineno">  105 </span>-- the frontend's @StreamErrorCode@ type.
+<span class="lineno">  106 </span>data StreamErrorCode
+<span class="lineno">  107 </span>  = SecInvalidOp
+<span class="lineno">  108 </span>  | SecInvalidFrame
+<span class="lineno">  109 </span>  | SecSessionNotFound
+<span class="lineno">  110 </span>  | SecFrameTooLarge
+<span class="lineno">  111 </span>  | SecReplayFailed
+<span class="lineno">  112 </span>  | SecReplayAborted
+<span class="lineno">  113 </span>  | SecInternal
+<span class="lineno">  114 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.ToJSON StreamErrorCode</span></span></span></span></span></span></span></span> where
+<span class="lineno">  117 </span>  <span class="decl"><span class="nottickedoff">toJSON = \case</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="nottickedoff">SecInvalidOp      -&gt; A.String &quot;invalid-op&quot;</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="nottickedoff">SecInvalidFrame   -&gt; A.String &quot;invalid-frame&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="nottickedoff">SecSessionNotFound -&gt; A.String &quot;session-not-found&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="nottickedoff">SecFrameTooLarge  -&gt; A.String &quot;frame-too-large&quot;</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="nottickedoff">SecReplayFailed   -&gt; A.String &quot;replay-failed&quot;</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="nottickedoff">SecReplayAborted  -&gt; A.String &quot;replay-aborted&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="nottickedoff">SecInternal       -&gt; A.String &quot;internal&quot;</span></span>
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.FromJSON StreamErrorCode</span></span></span></span> where
+<span class="lineno">  127 </span>  <span class="decl"><span class="istickedoff">parseJSON = A.withText <span class="nottickedoff">&quot;StreamErrorCode&quot;</span> $ \case</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">&quot;invalid-op&quot;        -&gt; pure SecInvalidOp</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">&quot;invalid-frame&quot;     -&gt; <span class="nottickedoff">pure SecInvalidFrame</span></span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">&quot;session-not-found&quot; -&gt; <span class="nottickedoff">pure SecSessionNotFound</span></span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">&quot;frame-too-large&quot;   -&gt; <span class="nottickedoff">pure SecFrameTooLarge</span></span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">&quot;replay-failed&quot;     -&gt; <span class="nottickedoff">pure SecReplayFailed</span></span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">&quot;replay-aborted&quot;    -&gt; <span class="nottickedoff">pure SecReplayAborted</span></span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">&quot;internal&quot;          -&gt; <span class="nottickedoff">pure SecInternal</span></span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">other               -&gt; <span class="nottickedoff">fail (&quot;unknown stream error code: &quot; &lt;&gt; show other)</span></span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | Parse a raw JSON 'Value' into a 'ServerEvent' by dispatching on the
+<span class="lineno">  138 </span>-- @type@ field. Returns 'Nothing' for unknown types or missing fields.
+<span class="lineno">  139 </span>-- Pure. Used by 'decodeServerEvent'.
+<span class="lineno">  140 </span>parseServerEvent :: Value -&gt; Maybe ServerEvent
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">parseServerEvent (A.Object o) =</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;type&quot;) o of</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="istickedoff">Just (A.String t) -&gt; case t of</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">&quot;hello&quot; -&gt; SeHello</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;protocolVersion&quot;) o)</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;serverStartedAt&quot;) o)</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">&quot;entry&quot; -&gt; SeEntry</span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(fromMaybe A.Null (KeyMap.lookup (Key.fromText &quot;entry&quot;) o))</span></span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">&quot;entry-update&quot; -&gt; SeEntryUpdate</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(fromMaybe A.Null (KeyMap.lookup (Key.fromText &quot;entry&quot;) o))</span></span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">&quot;activity&quot; -&gt; SeActivity</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(fromMaybe A.Null (KeyMap.lookup (Key.fromText &quot;activity&quot;) o))</span></span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">&quot;replay-end&quot; -&gt; SeReplayEnd</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;lastEntryId&quot;) o)</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">&quot;lists&quot; -&gt; Just (SeLists <span class="nottickedoff">(A.Object o)</span>)</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">&quot;ask&quot; -&gt; SeAsk</span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  162 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(fromMaybe A.Null (KeyMap.lookup (Key.fromText &quot;ask&quot;) o))</span></span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">&quot;ask_resolved&quot; -&gt; SeAskResolved</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asSessionId =&lt;&lt; KeyMap.lookup (Key.fromText &quot;sessionId&quot;) o)</span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(fromMaybe A.Null (KeyMap.lookup (Key.fromText &quot;ask&quot;) o))</span></span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">&quot;agent-defs-changed&quot; -&gt; Just SeAgentDefsChanged</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">&quot;skills-changed&quot; -&gt; Just SeSkillsChanged</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">&quot;repos-changed&quot; -&gt; Just SeReposChanged</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">&quot;error&quot; -&gt; SeError</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asErrCode =&lt;&lt; KeyMap.lookup (Key.fromText &quot;code&quot;) o)</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure (fromMaybe <span class="nottickedoff">&quot;&quot;</span> (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;message&quot;) o))</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  174 </span><span class="spaces"></span><span class="istickedoff">parseServerEvent _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>asText :: Value -&gt; Maybe Text
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">asText (A.String t) = Just t</span>
+<span class="lineno">  178 </span><span class="spaces"></span><span class="istickedoff">asText _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>asSessionId :: Value -&gt; Maybe SessionId
+<span class="lineno">  181 </span><span class="decl"><span class="istickedoff">asSessionId (A.String t) =</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">case mkSessionId t of Right s -&gt; Just s; Left _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  183 </span><span class="spaces"></span><span class="istickedoff">asSessionId _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>asErrCode :: Value -&gt; Maybe StreamErrorCode
+<span class="lineno">  186 </span><span class="decl"><span class="istickedoff">asErrCode v = case A.fromJSON v of</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">A.Success c -&gt; Just c</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">A.Error _   -&gt; <span class="nottickedoff">Nothing</span></span></span>
+
+</pre>
+</body>
+</html>

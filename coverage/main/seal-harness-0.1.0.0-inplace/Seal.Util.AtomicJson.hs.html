@@ -1,0 +1,77 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Shared atomic JSON persistence for small state files
+<span class="lineno">    3 </span>-- (@\&lt;state\&gt;\/tabs.json@, @\&lt;state\&gt;\/cursors.json@).
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The pattern — write @path.tmp@, chmod 0600, rename over the target, all
+<span class="lineno">    6 </span>-- serialized by a module-level MVar so concurrent writes to the same file
+<span class="lineno">    7 </span>-- cannot interleave — was duplicated across 'Seal.Tabs.Persist.saveTabList'
+<span class="lineno">    8 </span>-- and is now needed by 'Seal.Channels.Cursor.Persist.saveCursorMap'. This
+<span class="lineno">    9 </span>-- helper centralizes it so the two do not drift.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Note: 'Seal.Session.Store.saveSessionMeta' uses a different temp-file
+<span class="lineno">   12 </span>-- strategy ('openBinaryTempFile' for a unique name per call) because it
+<span class="lineno">   13 </span>-- guards against concurrent saves of the /same/ session file from multiple
+<span class="lineno">   14 </span>-- threads without a shared lock; it is intentionally NOT consolidated here
+<span class="lineno">   15 </span>-- (see the design doc's §6). This helper is for files where a single
+<span class="lineno">   16 </span>-- module-level MVar is an acceptable serialization point.
+<span class="lineno">   17 </span>module Seal.Util.AtomicJson
+<span class="lineno">   18 </span>  ( saveJsonAtomic
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar)
+<span class="lineno">   22 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   23 </span>import System.Directory (createDirectoryIfMissing, renameFile)
+<span class="lineno">   24 </span>import System.FilePath (takeDirectory)
+<span class="lineno">   25 </span>import System.IO.Unsafe (unsafePerformIO)
+<span class="lineno">   26 </span>import System.Posix.Files (setFileMode, unionFileModes, ownerReadMode, ownerWriteMode)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | Module-level write lock — serializes concurrent 'saveJsonAtomic' calls
+<span class="lineno">   29 </span>-- so two mutations cannot interleave file writes (a bare forkIO TVar
+<span class="lineno">   30 </span>-- listener would race; the explicit MVar guarantees atomicity). One lock
+<span class="lineno">   31 </span>-- per process, shared across all callers. The critical sections are short
+<span class="lineno">   32 </span>-- (a single file write + rename) so this is not a contention concern in
+<span class="lineno">   33 </span>-- practice — these files mutate at human, not machine, rate.
+<span class="lineno">   34 </span>writeLock :: MVar ()
+<span class="lineno">   35 </span><span class="decl"><span class="istickedoff">writeLock = unsafePerformIO (newMVar <span class="nottickedoff">()</span>)</span></span>
+<span class="lineno">   36 </span>{-# NOINLINE writeLock #-}
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | Atomically write a lazy 'BL.ByteString' (typically @Aeson.encode@ output)
+<span class="lineno">   39 </span>-- to @path@: create the parent dir, write @path.tmp@, chmod 0600, rename
+<span class="lineno">   40 </span>-- over the target. Serialized via 'writeLock' so concurrent calls from
+<span class="lineno">   41 </span>-- multiple threads (channel loop + gateway API + slash command) don't
+<span class="lineno">   42 </span>-- collide on the shared @.tmp@ path. Never throws (the caller is expected
+<span class="lineno">   43 </span>-- to 'catch' log a warning on failure, matching the
+<span class="lineno">   44 </span>-- 'Seal.Tabs.Persist' / 'Seal.Channels.Cursor.Persist' pattern — the
+<span class="lineno">   45 </span>-- in-memory handle stays authoritative within the session and the next
+<span class="lineno">   46 </span>-- successful mutation retries by writing the full current state, so a
+<span class="lineno">   47 </span>-- missed save self-heals).
+<span class="lineno">   48 </span>saveJsonAtomic :: FilePath -&gt; BL.ByteString -&gt; IO ()
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">saveJsonAtomic path bs = modifyMVar_ writeLock $ \_ -&gt; do</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">let tmp = path &lt;&gt; &quot;.tmp&quot;</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">BL.writeFile tmp bs</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp (unionFileModes ownerReadMode ownerWriteMode)  -- 0600</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span></span>
+
+</pre>
+</body>
+</html>

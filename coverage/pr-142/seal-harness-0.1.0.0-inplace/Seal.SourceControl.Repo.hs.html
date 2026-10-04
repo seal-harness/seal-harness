@@ -1,0 +1,534 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE PatternSynonyms #-}
+<span class="lineno">    3 </span>{-# LANGUAGE ScopedTypeVariables #-}
+<span class="lineno">    4 </span>{-# OPTIONS_GHC -Wno-partial-fields #-}
+<span class="lineno">    5 </span>-- | Source-control repository registry — the typed model + bidirectional
+<span class="lineno">    6 </span>-- TOML codec + URL helpers for the seal-harness repo-clone seam (design
+<span class="lineno">    7 </span>-- §4.1, §4.2).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- Security invariants (enforced by construction):
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- * 'RepoId' is never used to construct a 'FilePath' — it is only a 'Map' key.
+<span class="lineno">   12 </span>--   The charset predicate ('isValidRepoId') forbids @\/@, @\\@, @.@ and
+<span class="lineno">   13 </span>--   whitespace, neutralizing path-traversal by construction.
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- * 'cUsername' is a public handle (a GitHub bot account name), NOT a secret.
+<span class="lineno">   16 </span>--   It is stored in plaintext TOML and returned in API responses intentionally.
+<span class="lineno">   17 </span>--   Secret /values/ live in the vault and are retrieved by 'cVaultKey' (a key
+<span class="lineno">   18 </span>--   name) at clone time; this module never touches secret bytes.
+<span class="lineno">   19 </span>module Seal.SourceControl.Repo
+<span class="lineno">   20 </span>  ( VcsKind (..)
+<span class="lineno">   21 </span>  , RepoCredential (..)
+<span class="lineno">   22 </span>  , SourceRepo (..)
+<span class="lineno">   23 </span>  , RepoRegistry (..)
+<span class="lineno">   24 </span>  , RepoId (..)
+<span class="lineno">   25 </span>  , mkRepoId
+<span class="lineno">   26 </span>  , repoIdText
+<span class="lineno">   27 </span>  , isValidRepoId
+<span class="lineno">   28 </span>  , repoCodec
+<span class="lineno">   29 </span>  , repoRegistryCodec
+<span class="lineno">   30 </span>  , normalizeReposTable
+<span class="lineno">   31 </span>  , normalizeRepoUrl
+<span class="lineno">   32 </span>  , lookupRepoByUrl
+<span class="lineno">   33 </span>  , parseRepoHost
+<span class="lineno">   34 </span>  , hostAllowed
+<span class="lineno">   35 </span>  , urlShapeValid
+<span class="lineno">   36 </span>  , githubHosts
+<span class="lineno">   37 </span>  , repoCredentialKindText
+<span class="lineno">   38 </span>  , parseCredentialKind
+<span class="lineno">   39 </span>  , vcsKindText
+<span class="lineno">   40 </span>  , parseVcsKind
+<span class="lineno">   41 </span>  ) where
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>import Control.Applicative ((&lt;|&gt;), empty)
+<span class="lineno">   44 </span>import Control.Monad (void)
+<span class="lineno">   45 </span>import Control.Monad.State (modify)
+<span class="lineno">   46 </span>import Data.Aeson
+<span class="lineno">   47 </span>  ( FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?) )
+<span class="lineno">   48 </span>import Data.Aeson qualified as Aeson ((.=))
+<span class="lineno">   49 </span>import Data.Aeson.Types (Parser)
+<span class="lineno">   50 </span>import Data.Bifunctor (first)
+<span class="lineno">   51 </span>import Data.HashMap.Strict qualified as HashMap
+<span class="lineno">   52 </span>import Data.Map.Strict (Map)
+<span class="lineno">   53 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   54 </span>import Data.Maybe (fromMaybe, listToMaybe)
+<span class="lineno">   55 </span>import Data.Text (Text)
+<span class="lineno">   56 </span>import Data.Text qualified as T
+<span class="lineno">   57 </span>import Validation (Validation (..))
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>import Toml ((.=))
+<span class="lineno">   60 </span>import Toml qualified
+<span class="lineno">   61 </span>import Toml.Codec.BiMap (BiMap (..), TomlBiMap, TomlBiMapError (..))
+<span class="lineno">   62 </span>import Toml.Codec.Error (TomlDecodeError (..))
+<span class="lineno">   63 </span>import Toml.Codec.Types (Codec (..), TomlCodec, TomlState, eitherToTomlState)
+<span class="lineno">   64 </span>import Toml.Parser (parseKey, unTomlParseError)
+<span class="lineno">   65 </span>import Toml.Type.Key (Key, pattern (:||))
+<span class="lineno">   66 </span>import Toml.Type.Printer (prettyKey)
+<span class="lineno">   67 </span>import Toml.Type.TOML (TOML (..), insertKeyAnyVal)
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>----------------------------------------------------------------------------
+<span class="lineno">   70 </span>-- Types
+<span class="lineno">   71 </span>----------------------------------------------------------------------------
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | The VCS kind of a 'SourceRepo'. @git@ is a plain Git server; @github@ is
+<span class="lineno">   74 </span>-- GitHub (or a GitHub-protocol-compatible host). Used to pick the clone
+<span class="lineno">   75 </span>-- strategy in W3's @planClone@.
+<span class="lineno">   76 </span>data VcsKind = VcsGit | VcsGitHub
+<span class="lineno">   77 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | The credential bound to a 'SourceRepo'. Carries only vault key /names/ and
+<span class="lineno">   80 </span>-- (for 'CredMachineUser') a public username — never secret bytes.
+<span class="lineno">   81 </span>data RepoCredential
+<span class="lineno">   82 </span>  = CredPat         { <span class="istickedoff"><span class="decl"><span class="istickedoff">cVaultKey</span></span></span> :: Text }
+<span class="lineno">   83 </span>    -- ^ A personal access token (or fine-grained PAT); vault key → token bytes.
+<span class="lineno">   84 </span>  | CredDeployKey   { cVaultKey :: Text }
+<span class="lineno">   85 </span>    -- ^ An SSH deploy key; vault key → private key bytes.
+<span class="lineno">   86 </span>  | CredMachineUser { cVaultKey :: Text, <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cUsername</span></span></span> :: Text }
+<span class="lineno">   87 </span>    -- ^ A machine-user HTTPS clone: vault key → token, plus a public bot handle.
+<span class="lineno">   88 </span>    -- @cUsername@ is a public handle (a GitHub bot account name), NOT a secret.
+<span class="lineno">   89 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>data SourceRepo = SourceRepo
+<span class="lineno">   92 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">srId</span></span></span>               :: RepoId
+<span class="lineno">   93 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srUrl</span></span></span>              :: Text
+<span class="lineno">   94 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srVcsKind</span></span></span>          :: VcsKind
+<span class="lineno">   95 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srCredential</span></span></span>       :: RepoCredential
+<span class="lineno">   96 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srDeployKeyPublic</span></span></span>  :: Maybe Text
+<span class="lineno">   97 </span>    -- ^ The deploy-key public key (present iff 'srCredential' is
+<span class="lineno">   98 </span>    -- 'CredDeployKey' and the key was generated). Public data — safe to
+<span class="lineno">   99 </span>    -- return in API responses + render in the UI.
+<span class="lineno">  100 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srKeyfilePath</span></span></span>      :: Maybe Text
+<span class="lineno">  101 </span>    -- ^ The path to the encrypted keyfile on the harness disk
+<span class="lineno">  102 </span>    -- (@repoKeysDir &lt;/&gt; repo-id&gt;@). The file is CIPHERTEXT (encrypted by
+<span class="lineno">  103 </span>    -- @ssh-keygen@ with a passphrase from the vault); it stays on the
+<span class="lineno">  104 </span>    -- harness disk and never leaves it. 'Nothing' for non-deploy-key
+<span class="lineno">  105 </span>    -- repos. Stored as 'Text' for TOML/JSON codec simplicity; converted to
+<span class="lineno">  106 </span>    -- 'FilePath' at the call site via 'T.unpack'.
+<span class="lineno">  107 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | The source-control repo registry: a keyed-by-id map of 'SourceRepo's.
+<span class="lineno">  110 </span>-- Defined here (in the pure type module) so 'lookupRepoByUrl' can consume it
+<span class="lineno">  111 </span>-- without importing the IO-laden &quot;Seal.SourceControl.Registry&quot; (which would
+<span class="lineno">  112 </span>-- create a cycle). &quot;Seal.SourceControl.Registry&quot; re-exports it.
+<span class="lineno">  113 </span>newtype RepoRegistry = RepoRegistry { <span class="istickedoff"><span class="decl"><span class="istickedoff">rrRepos</span></span></span> :: Map RepoId SourceRepo }
+<span class="lineno">  114 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Opaque repo key. Smart-constructed via 'mkRepoId'; the charset predicate
+<span class="lineno">  117 </span>-- guards every Map position. 'RepoId' is never used to construct a 'FilePath'
+<span class="lineno">  118 </span>-- — it is only a 'Map' key.
+<span class="lineno">  119 </span>newtype RepoId = RepoId Text
+<span class="lineno">  120 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- | @[A-Za-z0-9_-]+@, non-empty, no leading @\.@. Mirrors
+<span class="lineno">  123 </span>-- 'Seal.Skills.Types.isValidSkillId'.
+<span class="lineno">  124 </span>isValidRepoId :: Text -&gt; Bool
+<span class="lineno">  125 </span><span class="decl"><span class="istickedoff">isValidRepoId t =</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head t /= '.'</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all (`elem` chars) t</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">chars = ['A' .. 'Z'] &lt;&gt; ['a' .. 'z'] &lt;&gt; ['0' .. '9'] &lt;&gt; &quot;_-&quot;</span></span>
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>mkRepoId :: Text -&gt; Either Text RepoId
+<span class="lineno">  133 </span><span class="decl"><span class="istickedoff">mkRepoId t</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">| isValidRepoId t = Right (RepoId t)</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = Left (&quot;invalid repo id: &quot; &lt;&gt; T.pack (show t))</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>repoIdText :: RepoId -&gt; Text
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">repoIdText (RepoId t) = t</span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>----------------------------------------------------------------------------
+<span class="lineno">  141 </span>-- Enum text helpers
+<span class="lineno">  142 </span>----------------------------------------------------------------------------
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>vcsKindText :: VcsKind -&gt; Text
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">vcsKindText VcsGit    = &quot;git&quot;</span>
+<span class="lineno">  146 </span><span class="spaces"></span><span class="istickedoff">vcsKindText VcsGitHub = &quot;github&quot;</span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>parseVcsKind :: Text -&gt; Either Text VcsKind
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">parseVcsKind &quot;git&quot;    = Right VcsGit</span>
+<span class="lineno">  150 </span><span class="spaces"></span><span class="istickedoff">parseVcsKind &quot;github&quot; = Right VcsGitHub</span>
+<span class="lineno">  151 </span><span class="spaces"></span><span class="istickedoff">parseVcsKind other    = Left <span class="nottickedoff">(&quot;unknown vcs_kind: &quot; &lt;&gt; other)</span></span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>repoCredentialKindText :: RepoCredential -&gt; Text
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">repoCredentialKindText CredPat{}         = &quot;pat&quot;</span>
+<span class="lineno">  155 </span><span class="spaces"></span><span class="istickedoff">repoCredentialKindText CredDeployKey{}   = &quot;deploy_key&quot;</span>
+<span class="lineno">  156 </span><span class="spaces"></span><span class="istickedoff">repoCredentialKindText CredMachineUser{} = &quot;machine_user&quot;</span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | Build a 'RepoCredential' from a wire kind + a vault key name + an optional
+<span class="lineno">  159 </span>-- username. Validates that @machine_user@ carries a non-empty username and
+<span class="lineno">  160 </span>-- that the vault key is non-empty. Used by the REST API (W4) and slash UI (W5).
+<span class="lineno">  161 </span>--
+<span class="lineno">  162 </span>-- @account_key@ is a /reserved/ credential kind (a future constructor may add
+<span class="lineno">  163 </span>-- it; until then it fails-closed so a repo registered with @account_key@
+<span class="lineno">  164 </span>-- cannot decode — the registry MUST NOT silently accept an unknown kind).
+<span class="lineno">  165 </span>parseCredentialKind :: Text -&gt; Text -&gt; Maybe Text -&gt; Either Text RepoCredential
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">parseCredentialKind kind vaultKey mUsername</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">| T.null vaultKey = Left <span class="nottickedoff">&quot;credential vault_key must be non-empty&quot;</span></span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">| kind == &quot;pat&quot;          = Right (CredPat vaultKey)</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">| kind == &quot;deploy_key&quot;   = Right (CredDeployKey vaultKey)</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">| kind == &quot;machine_user&quot; =</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">case mUsername of</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">Just u | <span class="tickonlytrue">not (T.null u)</span> -&gt; Right (CredMachineUser vaultKey u)</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">_                       -&gt; Left &quot;machine_user requires a non-empty username&quot;</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">| kind == &quot;account_key&quot; = Left <span class="nottickedoff">&quot;account_key credential kind is reserved (not yet supported)&quot;</span></span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Left <span class="nottickedoff">(&quot;unknown credential_kind: &quot; &lt;&gt; kind)</span></span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>----------------------------------------------------------------------------
+<span class="lineno">  178 </span>-- Codec
+<span class="lineno">  179 </span>----------------------------------------------------------------------------
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | Bidirectional tomland codec for ONE @[repos.\&lt;id\&gt;]@ table. The @id@
+<span class="lineno">  182 </span>-- comes from the enclosing 'Toml.tableMap' key (via 'repoRegistryCodec') and
+<span class="lineno">  183 </span>-- is injected as the fixed 'RepoId'. Fail-closed on unknown @vcs_kind@ /
+<span class="lineno">  184 </span>-- @credential_kind@, missing @vault_key@, and @machine_user@ without
+<span class="lineno">  185 </span>-- @username@ (each is a decode 'Failure'). Extra/unknown fields are ignored
+<span class="lineno">  186 </span>-- (tolmland default).
+<span class="lineno">  187 </span>repoCodec :: RepoId -&gt; TomlCodec SourceRepo
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">repoCodec srId = SourceRepo srId</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.text &quot;url&quot;                                       .= srUrl</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; validatedTextCodec &quot;vcs_kind&quot; parseVcsKind vcsKindText .= srVcsKind</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; credentialCodec                                       .= srCredential</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;deploy_key_public&quot;)       .= srDeployKeyPublic</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;keyfile_path&quot;)            .= srKeyfilePath</span></span>
+<span class="lineno">  194 </span>
+<span class="lineno">  195 </span>-- | Bidirectional tomland codec for the whole @[repos]@ table — a keyed-by-id
+<span class="lineno">  196 </span>-- map. Runs 'mkRepoId' on each decoded key (fail-closed: a bad key id → decode
+<span class="lineno">  197 </span>-- 'Failure'). Returns an empty 'Map' when the @[repos]@ table is absent.
+<span class="lineno">  198 </span>repoRegistryCodec :: TomlCodec (Map RepoId SourceRepo)
+<span class="lineno">  199 </span><span class="decl"><span class="istickedoff">repoRegistryCodec = Toml.tableMap keyRepoBiMap repoCodecByKey &quot;repos&quot;</span></span>
+<span class="lineno">  200 </span>
+<span class="lineno">  201 </span>-- | Adapter the 'Toml.tableMap' value-codec slot requires (a @Key -&gt; TomlCodec@
+<span class="lineno">  202 </span>-- function). Converts the raw TOML 'Key' to a 'RepoId' (fail-closed via
+<span class="lineno">  203 </span>-- 'mkRepoId') and nests 'repoCodec' under a sub-table named by the key —
+<span class="lineno">  204 </span>-- mirroring @Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec)
+<span class="lineno">  205 </span>-- &quot;providers&quot;@ in &quot;Seal.Config.File&quot;. The 'keyRepoBiMap' already validates
+<span class="lineno">  206 </span>-- the key, so the 'Left' branch is unreachable in practice but kept for
+<span class="lineno">  207 </span>-- totality.
+<span class="lineno">  208 </span>repoCodecByKey :: Key -&gt; TomlCodec SourceRepo
+<span class="lineno">  209 </span><span class="decl"><span class="istickedoff">repoCodecByKey rawKey =</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">case mkRepoId (prettyKey rawKey) of</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">Left _    -&gt; <span class="nottickedoff">empty</span></span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">Right rid -&gt; Toml.table (repoCodec rid) rawKey</span></span>
+<span class="lineno">  213 </span>
+<span class="lineno">  214 </span>-- | Bidirectional 'TomlBiMap' between TOML 'Key's and 'RepoId's. @forward@
+<span class="lineno">  215 </span>-- (Key → RepoId) runs 'mkRepoId' on the rendered key text; a bad id is a
+<span class="lineno">  216 </span>-- 'Failure' (fail-closed). @backward@ (RepoId → Key) re-parses the id text
+<span class="lineno">  217 </span>-- (which is guaranteed valid by 'mkRepoId').
+<span class="lineno">  218 </span>keyRepoBiMap :: TomlBiMap Key RepoId
+<span class="lineno">  219 </span><span class="decl"><span class="istickedoff">keyRepoBiMap = BiMap</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">{ forward  = first <span class="nottickedoff">(ArbitraryError . (&quot;invalid repo id key: &quot; &lt;&gt;) . T.pack . show)</span></span>
+<span class="lineno">  221 </span><span class="spaces">                </span><span class="istickedoff">. mkRepoId . prettyKey</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, backward = first <span class="nottickedoff">(ArbitraryError . unTomlParseError)</span> . parseKey . repoIdText</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  224 </span>
+<span class="lineno">  225 </span>----------------------------------------------------------------------------
+<span class="lineno">  226 </span>-- A codec for a validated text field (fail-closed on bad enum values)
+<span class="lineno">  227 </span>----------------------------------------------------------------------------
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Codec for a required text field that is parsed/validated into a typed
+<span class="lineno">  230 </span>-- value. On decode: looks up the key, decodes it as 'Text', runs the parser;
+<span class="lineno">  231 </span>-- on @Left@ returns a 'Failure' (fail-closed). On encode: renders the value
+<span class="lineno">  232 </span>-- back to 'Text' and writes it. A missing key is a 'KeyNotFound' 'Failure'.
+<span class="lineno">  233 </span>validatedTextCodec :: forall a. Key -&gt; (Text -&gt; Either Text a) -&gt; (a -&gt; Text) -&gt; TomlCodec a
+<span class="lineno">  234 </span><span class="decl"><span class="istickedoff">validatedTextCodec key parse render = Codec input output</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="istickedoff">input :: TOML -&gt; Validation [TomlDecodeError] a</span>
+<span class="lineno">  237 </span><span class="spaces">    </span><span class="istickedoff">input toml = case HashMap.lookup key (tomlPairs toml) of</span>
+<span class="lineno">  238 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Failure [KeyNotFound key]</span></span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">Just v  -&gt; case backward Toml._Text v of</span>
+<span class="lineno">  240 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Failure [BiMapError key err]</span></span>
+<span class="lineno">  241 </span><span class="spaces">        </span><span class="istickedoff">Right txt -&gt; case parse txt of</span>
+<span class="lineno">  242 </span><span class="spaces">          </span><span class="istickedoff">Left msg -&gt; Failure <span class="nottickedoff">[BiMapError key (ArbitraryError msg)]</span></span>
+<span class="lineno">  243 </span><span class="spaces">          </span><span class="istickedoff">Right a  -&gt; Success a</span>
+<span class="lineno">  244 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="istickedoff">output :: a -&gt; TomlState a</span>
+<span class="lineno">  246 </span><span class="spaces">    </span><span class="istickedoff">output a = do</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">anyVal &lt;- eitherToTomlState (forward Toml._Text (render a))</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">a</span> &lt;$ modify (insertKeyAnyVal key anyVal)</span></span>
+<span class="lineno">  249 </span>
+<span class="lineno">  250 </span>----------------------------------------------------------------------------
+<span class="lineno">  251 </span>-- Credential codec (fail-closed on unknown kind / missing username)
+<span class="lineno">  252 </span>----------------------------------------------------------------------------
+<span class="lineno">  253 </span>
+<span class="lineno">  254 </span>-- | Codec for the @credential_kind@ + @vault_key@ + optional @username@
+<span class="lineno">  255 </span>-- fields, decoded into a 'RepoCredential'. Fail-closed on unknown
+<span class="lineno">  256 </span>-- @credential_kind@, missing @vault_key@, and @machine_user@ without
+<span class="lineno">  257 </span>-- @username@.
+<span class="lineno">  258 </span>credentialCodec :: TomlCodec RepoCredential
+<span class="lineno">  259 </span><span class="decl"><span class="istickedoff">credentialCodec = Codec input output</span>
+<span class="lineno">  260 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  261 </span><span class="spaces">    </span><span class="istickedoff">input :: TOML -&gt; Validation [TomlDecodeError] RepoCredential</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">input toml =</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">let vKind  = fieldText          &quot;credential_kind&quot; toml</span>
+<span class="lineno">  264 </span><span class="spaces">          </span><span class="istickedoff">vVault = fieldText          &quot;vault_key&quot;        toml</span>
+<span class="lineno">  265 </span><span class="spaces">          </span><span class="istickedoff">vUser  = fieldOptionalText  &quot;username&quot;         toml</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">in case (vKind, vVault, vUser) of</span>
+<span class="lineno">  267 </span><span class="spaces">           </span><span class="istickedoff">(Success kind, Success vault, Success mUser) -&gt;</span>
+<span class="lineno">  268 </span><span class="spaces">             </span><span class="istickedoff">either (\msg -&gt; Failure <span class="nottickedoff">[BiMapError &quot;credential_kind&quot; (ArbitraryError msg)]</span>)</span>
+<span class="lineno">  269 </span><span class="spaces">                    </span><span class="istickedoff">Success</span>
+<span class="lineno">  270 </span><span class="spaces">                    </span><span class="istickedoff">(parseCredentialKind kind vault mUser)</span>
+<span class="lineno">  271 </span><span class="spaces">           </span><span class="istickedoff">(e1, e2, e3) -&gt; Failure <span class="nottickedoff">(concatErrors e1 &lt;&gt; concatErrors e2 &lt;&gt; concatErrors e3)</span></span>
+<span class="lineno">  272 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">output :: RepoCredential -&gt; TomlState RepoCredential</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">output cred = do</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">writeText &quot;credential_kind&quot; (repoCredentialKindText cred)</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">writeText &quot;vault_key&quot;        (cVaultKey cred)</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">case cred of</span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="istickedoff">CredMachineUser _ u -&gt; writeText &quot;username&quot; u</span>
+<span class="lineno">  279 </span><span class="spaces">        </span><span class="istickedoff">_                   -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  280 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">cred</span></span></span>
+<span class="lineno">  281 </span>
+<span class="lineno">  282 </span>-- | Collect the error list from a 'Validation' branch (used to merge
+<span class="lineno">  283 </span>-- fail-closed field errors in 'credentialCodec').
+<span class="lineno">  284 </span>concatErrors :: Validation [e] a -&gt; [e]
+<span class="lineno">  285 </span><span class="decl"><span class="nottickedoff">concatErrors (Failure es) = es</span>
+<span class="lineno">  286 </span><span class="spaces"></span><span class="nottickedoff">concatErrors (Success _)  = []</span></span>
+<span class="lineno">  287 </span>
+<span class="lineno">  288 </span>-- | Read a required text field from a 'TOML' (fail-closed on missing/typed
+<span class="lineno">  289 </span>-- mismatch). Used inside the custom 'credentialCodec' read.
+<span class="lineno">  290 </span>fieldText :: Key -&gt; TOML -&gt; Validation [TomlDecodeError] Text
+<span class="lineno">  291 </span><span class="decl"><span class="istickedoff">fieldText key toml = case HashMap.lookup key (tomlPairs toml) of</span>
+<span class="lineno">  292 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; Failure <span class="nottickedoff">[KeyNotFound key]</span></span>
+<span class="lineno">  293 </span><span class="spaces">  </span><span class="istickedoff">Just v  -&gt; case backward Toml._Text v of</span>
+<span class="lineno">  294 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Failure [BiMapError key err]</span></span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">Right t  -&gt; Success t</span></span>
+<span class="lineno">  296 </span>
+<span class="lineno">  297 </span>-- | Read an optional text field from a 'TOML' (missing → 'Nothing').
+<span class="lineno">  298 </span>fieldOptionalText :: Key -&gt; TOML -&gt; Validation [TomlDecodeError] (Maybe Text)
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">fieldOptionalText key toml = case HashMap.lookup key (tomlPairs toml) of</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; Success Nothing</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">Just v  -&gt; case backward Toml._Text v of</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Failure [BiMapError key err]</span></span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">Right t  -&gt; Success (Just t)</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- | Write a text key/value into the encoded TOML state.
+<span class="lineno">  306 </span>writeText :: Key -&gt; Text -&gt; TomlState ()
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">writeText key txt = do</span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">anyVal &lt;- eitherToTomlState (forward Toml._Text txt)</span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">void (modify (insertKeyAnyVal key anyVal))</span></span>
+<span class="lineno">  310 </span>
+<span class="lineno">  311 </span>----------------------------------------------------------------------------
+<span class="lineno">  312 </span>-- @repos@ table normalization
+<span class="lineno">  313 </span>----------------------------------------------------------------------------
+<span class="lineno">  314 </span>
+<span class="lineno">  315 </span>-- | tomland's 'Toml.tableMap' \/ 'Toml.table' combinators look up the @repos@
+<span class="lineno">  316 </span>-- node by requiring it to carry an explicit value in the parsed AST. A TOML
+<span class="lineno">  317 </span>-- file that declares only @[repos.\&lt;id\&gt;]@ sub-tables (the idiomatic style,
+<span class="lineno">  318 </span>-- and the one every hand-written @repos.toml@ uses) never writes a bare
+<span class="lineno">  319 </span>-- @[repos]@ header, so that node is /implicit/ in tomland's prefix tree and
+<span class="lineno">  320 </span>-- the lookup silently returns an empty map instead of the sub-tables'
+<span class="lineno">  321 </span>-- contents.
+<span class="lineno">  322 </span>--
+<span class="lineno">  323 </span>-- This walks the parsed AST once before decoding and makes that node explicit
+<span class="lineno">  324 </span>-- — without disturbing anything else — so both styles decode correctly.
+<span class="lineno">  325 </span>-- Round-tripped files (written by the encoder) already have an explicit node
+<span class="lineno">  326 </span>-- and pass through unchanged. Direct sibling of 'normalizeProvidersTable'.
+<span class="lineno">  327 </span>normalizeReposTable :: TOML -&gt; TOML
+<span class="lineno">  328 </span><span class="decl"><span class="istickedoff">normalizeReposTable t =</span>
+<span class="lineno">  329 </span><span class="spaces">  </span><span class="istickedoff">t { tomlTables = HashMap.adjust explicitNode &quot;repos&quot; (tomlTables t) }</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  331 </span><span class="spaces">    </span><span class="istickedoff">explicitNode :: Toml.PrefixTree TOML -&gt; Toml.PrefixTree TOML</span>
+<span class="lineno">  332 </span><span class="spaces">    </span><span class="istickedoff">explicitNode tree = case tree of</span>
+<span class="lineno">  333 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch pref Nothing children -&gt;</span>
+<span class="lineno">  334 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Toml.Leaf pref (mempty { tomlTables = children })</span></span>
+<span class="lineno">  335 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch _ (Just _) _ -&gt; <span class="nottickedoff">tree</span></span>
+<span class="lineno">  336 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf (_ :|| [])  _  -&gt; tree</span>
+<span class="lineno">  337 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf (_ :|| (p : ps)) v -&gt;</span>
+<span class="lineno">  338 </span><span class="spaces">        </span><span class="istickedoff">Toml.Leaf (&quot;repos&quot; :|| []) (mempty { tomlTables = Toml.single (p :|| ps) v })</span></span>
+<span class="lineno">  339 </span>
+<span class="lineno">  340 </span>----------------------------------------------------------------------------
+<span class="lineno">  341 </span>-- URL helpers (pure — used by planClone in W3 + REST/slash validation in W4/W5)
+<span class="lineno">  342 </span>----------------------------------------------------------------------------
+<span class="lineno">  343 </span>
+<span class="lineno">  344 </span>-- | The GitHub-first host allow-list. This pass restricts clones to
+<span class="lineno">  345 </span>-- @github.com@; a per-credential @cHost@ may widen this in a follow-up.
+<span class="lineno">  346 </span>-- @localhost@ / @127.0.0.1@ are included for integration testing (a local
+<span class="lineno">  347 </span>-- bare git repo + SSH-to-localhost exercises the full deploy-key flow
+<span class="lineno">  348 </span>-- without GitHub). TODO: make this configurable via SecurityConfig.
+<span class="lineno">  349 </span>githubHosts :: [Text]
+<span class="lineno">  350 </span><span class="decl"><span class="istickedoff">githubHosts = [&quot;github.com&quot;, &quot;localhost&quot;, &quot;127.0.0.1&quot;]</span></span>
+<span class="lineno">  351 </span>
+<span class="lineno">  352 </span>-- | Is the parsed host in 'githubHosts'?
+<span class="lineno">  353 </span>hostAllowed :: Text -&gt; Bool
+<span class="lineno">  354 </span><span class="decl"><span class="istickedoff">hostAllowed h = h `elem` githubHosts</span></span>
+<span class="lineno">  355 </span>
+<span class="lineno">  356 </span>-- | Parse the host from an SSH (@git@github.com:owner\/repo.git@) or HTTPS
+<span class="lineno">  357 </span>-- (@https://github.com/owner/repo.git@) URL. Returns @Left@ with a clear
+<span class="lineno">  358 </span>-- error on malformed URLs. Returns 'Either' 'Text' (NOT @Either CloneError@)
+<span class="lineno">  359 </span>-- so this module does not depend on W3's 'CloneError'; W3's @planClone@ lifts
+<span class="lineno">  360 </span>-- the error.
+<span class="lineno">  361 </span>parseRepoHost :: Text -&gt; Either Text Text
+<span class="lineno">  362 </span><span class="decl"><span class="istickedoff">parseRepoHost url</span>
+<span class="lineno">  363 </span><span class="spaces">  </span><span class="istickedoff">| T.null url = Left <span class="nottickedoff">&quot;empty repo URL&quot;</span></span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="istickedoff">| Just afterAt &lt;- stripUserAt url = parseSsh afterAt</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">| &quot;https://&quot; `T.isPrefixOf` url = parseHttps</span>
+<span class="lineno">  366 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">&quot;http://&quot; `T.isPrefixOf` url</span> = <span class="nottickedoff">parseHttps</span></span>
+<span class="lineno">  367 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Left <span class="nottickedoff">&quot;URL is neither SSH (user@&lt;host&gt;:...) nor HTTPS (https://&lt;host&gt;/...)&quot;</span></span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  369 </span><span class="spaces">    </span><span class="istickedoff">-- Strip the leading user@ from an SCP-form URL (git@github.com:...,</span>
+<span class="lineno">  370 </span><span class="spaces">    </span><span class="istickedoff">-- zoe@localhost:..., etc). Returns 'Nothing' when the URL is not</span>
+<span class="lineno">  371 </span><span class="spaces">    </span><span class="istickedoff">-- SCP-form (no colon, or no @ before the colon).</span>
+<span class="lineno">  372 </span><span class="spaces">    </span><span class="istickedoff">stripUserAt :: Text -&gt; Maybe Text</span>
+<span class="lineno">  373 </span><span class="spaces">    </span><span class="istickedoff">stripUserAt u =</span>
+<span class="lineno">  374 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;:&quot; u of</span>
+<span class="lineno">  375 </span><span class="spaces">        </span><span class="istickedoff">(_, &quot;&quot;) -&gt; Nothing  -- no colon → not SCP-form</span>
+<span class="lineno">  376 </span><span class="spaces">        </span><span class="istickedoff">(beforeColon, _) -&gt;</span>
+<span class="lineno">  377 </span><span class="spaces">          </span><span class="istickedoff">case T.breakOn &quot;@&quot; beforeColon of</span>
+<span class="lineno">  378 </span><span class="spaces">            </span><span class="istickedoff">(_, rest) | not (T.null rest) -&gt; Just (T.drop 1 rest &lt;&gt; T.drop (T.length beforeColon) u)</span>
+<span class="lineno">  379 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  380 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">parseSsh :: Text -&gt; Either Text Text</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="istickedoff">parseSsh afterUser =</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;:&quot; afterUser of</span>
+<span class="lineno">  384 </span><span class="spaces">        </span><span class="istickedoff">(host, rest)</span>
+<span class="lineno">  385 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rest</span> -&gt; <span class="nottickedoff">Left &quot;missing ':' in scp-form URL&quot;</span></span>
+<span class="lineno">  386 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null host</span> -&gt; <span class="nottickedoff">Left &quot;empty host in scp-form URL&quot;</span></span>
+<span class="lineno">  387 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   -&gt; Right host</span>
+<span class="lineno">  388 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  389 </span><span class="spaces">    </span><span class="istickedoff">parseHttps :: Either Text Text</span>
+<span class="lineno">  390 </span><span class="spaces">    </span><span class="istickedoff">parseHttps =</span>
+<span class="lineno">  391 </span><span class="spaces">      </span><span class="istickedoff">let rest = fromMaybe <span class="nottickedoff">url</span> (T.stripPrefix &quot;https://&quot; url &lt;|&gt; <span class="nottickedoff">T.stripPrefix &quot;http://&quot; url</span>)</span>
+<span class="lineno">  392 </span><span class="spaces">          </span><span class="istickedoff">host = T.takeWhile (\c -&gt; c /= '/' &amp;&amp; c /= '?' &amp;&amp; c /= '#') rest</span>
+<span class="lineno">  393 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null host</span></span>
+<span class="lineno">  394 </span><span class="spaces">           </span><span class="istickedoff">then <span class="nottickedoff">Left &quot;empty host in HTTPS URL&quot;</span></span>
+<span class="lineno">  395 </span><span class="spaces">           </span><span class="istickedoff">else Right host</span></span>
+<span class="lineno">  396 </span>
+<span class="lineno">  397 </span>-- | True iff the URL is non-empty AND matches one of the two supported shapes
+<span class="lineno">  398 </span>-- (SSH @git\@\&lt;host\&gt;:...@ or HTTPS @https://\&lt;host\&gt;/...@).
+<span class="lineno">  399 </span>urlShapeValid :: Text -&gt; Bool
+<span class="lineno">  400 </span><span class="decl"><span class="istickedoff">urlShapeValid url = not (T.null url) &amp;&amp; (isSsh url || isHttps url)</span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  402 </span><span class="spaces">    </span><span class="istickedoff">isSsh u   = hasUserAt u &amp;&amp; T.isInfixOf &quot;:&quot; u</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="istickedoff">isHttps u = &quot;https://&quot; `T.isPrefixOf` u || &quot;http://&quot; `T.isPrefixOf` u</span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">hasUserAt u = case T.breakOn &quot;:&quot; u of</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="istickedoff">(beforeColon, rest) -&gt; not (T.null rest) &amp;&amp; T.isInfixOf &quot;@&quot; beforeColon</span></span>
+<span class="lineno">  406 </span>
+<span class="lineno">  407 </span>----------------------------------------------------------------------------
+<span class="lineno">  408 </span>-- URL normalization + registry lookup (W1 — shared with ISA.Ops.Repo)
+<span class="lineno">  409 </span>----------------------------------------------------------------------------
+<span class="lineno">  410 </span>
+<span class="lineno">  411 </span>-- | Normalize a repo URL to a canonical form for cross-scheme comparison.
+<span class="lineno">  412 </span>-- The same repo reached via different schemes (e.g.
+<span class="lineno">  413 </span>-- @git\@github.com:foo/bar.git@ vs @https://github.com/foo/bar.git@) should
+<span class="lineno">  414 </span>-- compare equal so 'lookupRepoByUrl' matches across forms. Normalization:
+<span class="lineno">  415 </span>--
+<span class="lineno">  416 </span>--   * strip a scheme (@https://@, @http://@, @git://@, @ssh://@, @file://@);
+<span class="lineno">  417 </span>--   * strip a leading @user\@@ (SCP-style);
+<span class="lineno">  418 </span>--   * replace the SCP-style @:@ separator with @/@;
+<span class="lineno">  419 </span>--   * strip a trailing @.git@;
+<span class="lineno">  420 </span>--   * strip trailing slashes;
+<span class="lineno">  421 </span>--   * lowercase (GitHub URLs are case-insensitive in host/path).
+<span class="lineno">  422 </span>--
+<span class="lineno">  423 </span>-- Returns the empty string only if the input is empty after trimming.
+<span class="lineno">  424 </span>-- Idempotent: @normalizeRepoUrl (normalizeRepoUrl u) == normalizeRepoUrl u@.
+<span class="lineno">  425 </span>normalizeRepoUrl :: Text -&gt; Text
+<span class="lineno">  426 </span><span class="decl"><span class="istickedoff">normalizeRepoUrl raw =</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">let t1 = T.strip raw</span>
+<span class="lineno">  428 </span><span class="spaces">      </span><span class="istickedoff">-- Strip a scheme.</span>
+<span class="lineno">  429 </span><span class="spaces">      </span><span class="istickedoff">t2 = foldr (\s acc -&gt; fromMaybe acc (T.stripPrefix s acc))</span>
+<span class="lineno">  430 </span><span class="spaces">                 </span><span class="istickedoff">t1 [ &quot;https://&quot;, &quot;http://&quot;, &quot;git://&quot;, &quot;ssh://&quot;, &quot;file://&quot; ]</span>
+<span class="lineno">  431 </span><span class="spaces">      </span><span class="istickedoff">-- Strip a leading user@ (SCP-style: git@host:path).</span>
+<span class="lineno">  432 </span><span class="spaces">      </span><span class="istickedoff">t3 = case T.breakOn &quot;@&quot; t2 of</span>
+<span class="lineno">  433 </span><span class="spaces">             </span><span class="istickedoff">(_, rest) | not (T.null rest) -&gt; T.drop 1 rest</span>
+<span class="lineno">  434 </span><span class="spaces">             </span><span class="istickedoff">_ -&gt; t2</span>
+<span class="lineno">  435 </span><span class="spaces">      </span><span class="istickedoff">-- Replace the SCP ':' separator with '/'. Only the FIRST ':'</span>
+<span class="lineno">  436 </span><span class="spaces">      </span><span class="istickedoff">-- (after the host) is the separator; later ':' would be port-like,</span>
+<span class="lineno">  437 </span><span class="spaces">      </span><span class="istickedoff">-- but a bare SCP url has exactly one ':'. If there's no '/', the</span>
+<span class="lineno">  438 </span><span class="spaces">      </span><span class="istickedoff">-- first ':' is host/path; if there's a '/' before the ':', it's</span>
+<span class="lineno">  439 </span><span class="spaces">      </span><span class="istickedoff">-- not SCP-style (e.g. ssh://host:port/path already had scheme</span>
+<span class="lineno">  440 </span><span class="spaces">      </span><span class="istickedoff">-- stripped, so unlikely) — leave it.</span>
+<span class="lineno">  441 </span><span class="spaces">      </span><span class="istickedoff">t4 = case T.breakOn &quot;:&quot; t3 of</span>
+<span class="lineno">  442 </span><span class="spaces">             </span><span class="istickedoff">(host, rest) | not (T.null rest), <span class="tickonlytrue">not (T.any (== '/') host)</span> -&gt;</span>
+<span class="lineno">  443 </span><span class="spaces">               </span><span class="istickedoff">host &lt;&gt; &quot;/&quot; &lt;&gt; T.drop 1 rest</span>
+<span class="lineno">  444 </span><span class="spaces">             </span><span class="istickedoff">_ -&gt; t3</span>
+<span class="lineno">  445 </span><span class="spaces">      </span><span class="istickedoff">-- Strip trailing slashes, then a trailing .git, then any slash</span>
+<span class="lineno">  446 </span><span class="spaces">      </span><span class="istickedoff">-- that the .git-strip might have exposed (e.g. &quot;.../repo.git/&quot;</span>
+<span class="lineno">  447 </span><span class="spaces">      </span><span class="istickedoff">-- → &quot;.../repo.git&quot; → &quot;.../repo&quot;). Apply twice in case of a</span>
+<span class="lineno">  448 </span><span class="spaces">      </span><span class="istickedoff">-- &quot;.../repo.git/.&quot;-like edge; the composition is idempotent.</span>
+<span class="lineno">  449 </span><span class="spaces">      </span><span class="istickedoff">stripTail t = T.dropWhileEnd (== '/') (fromMaybe t (T.stripSuffix &quot;.git&quot; (T.dropWhileEnd (== '/') t)))</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">t5 = stripTail t4</span>
+<span class="lineno">  451 </span><span class="spaces">  </span><span class="istickedoff">in T.toLower t5</span></span>
+<span class="lineno">  452 </span>
+<span class="lineno">  453 </span>-- | Look up a 'SourceRepo' in a 'RepoRegistry' by URL, matching across
+<span class="lineno">  454 </span>-- scheme forms (SSH @git\@host:o/r.git@ ↔ HTTPS @https://host/o/r.git@ ↔
+<span class="lineno">  455 </span>-- @https://host/o/r@). Both the query URL and each 'srUrl' are normalized
+<span class="lineno">  456 </span>-- via 'normalizeRepoUrl' before comparison. Pure.
+<span class="lineno">  457 </span>lookupRepoByUrl :: Text -&gt; RepoRegistry -&gt; Maybe SourceRepo
+<span class="lineno">  458 </span><span class="decl"><span class="istickedoff">lookupRepoByUrl query (RepoRegistry repos) =</span>
+<span class="lineno">  459 </span><span class="spaces">  </span><span class="istickedoff">let q = normalizeRepoUrl query</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">in listToMaybe</span>
+<span class="lineno">  461 </span><span class="spaces">       </span><span class="istickedoff">[ r | r &lt;- Map.elems repos, normalizeRepoUrl (srUrl r) == q ]</span></span>
+<span class="lineno">  462 </span>
+<span class="lineno">  463 </span>----------------------------------------------------------------------------
+<span class="lineno">  464 </span>-- JSON descriptor (for the REST API in W4)
+<span class="lineno">  465 </span>----------------------------------------------------------------------------
+<span class="lineno">  466 </span>
+<span class="lineno">  467 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON SourceRepo</span></span></span></span></span></span></span></span> where
+<span class="lineno">  468 </span>  <span class="decl"><span class="istickedoff">toJSON r = object</span>
+<span class="lineno">  469 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;id&quot;                Aeson..= repoIdText (srId r)</span>
+<span class="lineno">  470 </span><span class="spaces">    </span><span class="istickedoff">, &quot;url&quot;               Aeson..= srUrl r</span>
+<span class="lineno">  471 </span><span class="spaces">    </span><span class="istickedoff">, &quot;vcs_kind&quot;          Aeson..= vcsKindText (srVcsKind r)</span>
+<span class="lineno">  472 </span><span class="spaces">    </span><span class="istickedoff">, &quot;credential&quot;        Aeson..= credentialToObject (srCredential r)</span>
+<span class="lineno">  473 </span><span class="spaces">    </span><span class="istickedoff">, &quot;deploy_key_public&quot; Aeson..= srDeployKeyPublic r</span>
+<span class="lineno">  474 </span><span class="spaces">    </span><span class="istickedoff">, &quot;keyfile_path&quot;      Aeson..= srKeyfilePath r</span>
+<span class="lineno">  475 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  476 </span>
+<span class="lineno">  477 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON SourceRepo</span></span></span></span> where
+<span class="lineno">  478 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;SourceRepo&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  479 </span><span class="spaces">    </span><span class="istickedoff">rid    &lt;- o .:  &quot;id&quot;</span>
+<span class="lineno">  480 </span><span class="spaces">    </span><span class="istickedoff">url    &lt;- o .:  &quot;url&quot;</span>
+<span class="lineno">  481 </span><span class="spaces">    </span><span class="istickedoff">kind   &lt;- o .:  &quot;vcs_kind&quot;</span>
+<span class="lineno">  482 </span><span class="spaces">    </span><span class="istickedoff">cred   &lt;- o .:  &quot;credential&quot;</span>
+<span class="lineno">  483 </span><span class="spaces">    </span><span class="istickedoff">mPub   &lt;- o .:? &quot;deploy_key_public&quot;</span>
+<span class="lineno">  484 </span><span class="spaces">    </span><span class="istickedoff">mPath  &lt;- o .:? &quot;keyfile_path&quot;</span>
+<span class="lineno">  485 </span><span class="spaces">    </span><span class="istickedoff">i  &lt;- either <span class="nottickedoff">(fail . T.unpack)</span> pure (mkRepoId rid)</span>
+<span class="lineno">  486 </span><span class="spaces">    </span><span class="istickedoff">vk &lt;- either <span class="nottickedoff">(fail . T.unpack)</span> pure (parseVcsKind kind)</span>
+<span class="lineno">  487 </span><span class="spaces">    </span><span class="istickedoff">cred' &lt;- parseCredentialFromObject cred</span>
+<span class="lineno">  488 </span><span class="spaces">    </span><span class="istickedoff">pure SourceRepo</span>
+<span class="lineno">  489 </span><span class="spaces">      </span><span class="istickedoff">{ srId = i</span>
+<span class="lineno">  490 </span><span class="spaces">      </span><span class="istickedoff">, srUrl = url</span>
+<span class="lineno">  491 </span><span class="spaces">      </span><span class="istickedoff">, srVcsKind = vk</span>
+<span class="lineno">  492 </span><span class="spaces">      </span><span class="istickedoff">, srCredential = cred'</span>
+<span class="lineno">  493 </span><span class="spaces">      </span><span class="istickedoff">, srDeployKeyPublic = mPub</span>
+<span class="lineno">  494 </span><span class="spaces">      </span><span class="istickedoff">, srKeyfilePath = mPath</span>
+<span class="lineno">  495 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  496 </span>
+<span class="lineno">  497 </span>credentialToObject :: RepoCredential -&gt; Value
+<span class="lineno">  498 </span><span class="decl"><span class="istickedoff">credentialToObject c = object $ case c of</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">CredPat k -&gt;</span>
+<span class="lineno">  500 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;kind&quot; Aeson..= (&quot;pat&quot; :: Text), &quot;vault_key&quot; Aeson..= k ]</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="istickedoff">CredDeployKey k -&gt;</span>
+<span class="lineno">  502 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;kind&quot; Aeson..= (&quot;deploy_key&quot; :: Text), &quot;vault_key&quot; Aeson..= k ]</span>
+<span class="lineno">  503 </span><span class="spaces">  </span><span class="istickedoff">CredMachineUser k u -&gt;</span>
+<span class="lineno">  504 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;kind&quot; Aeson..= (&quot;machine_user&quot; :: Text), &quot;vault_key&quot; Aeson..= k, &quot;username&quot; Aeson..= u ]</span></span>
+<span class="lineno">  505 </span>
+<span class="lineno">  506 </span>parseCredentialFromObject :: Value -&gt; Parser RepoCredential
+<span class="lineno">  507 </span><span class="decl"><span class="istickedoff">parseCredentialFromObject = withObject <span class="nottickedoff">&quot;RepoCredential&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  508 </span><span class="spaces">  </span><span class="istickedoff">kind  &lt;- o .:  &quot;kind&quot;</span>
+<span class="lineno">  509 </span><span class="spaces">  </span><span class="istickedoff">vault &lt;- o .:  &quot;vault_key&quot;</span>
+<span class="lineno">  510 </span><span class="spaces">  </span><span class="istickedoff">mUser &lt;- o .:? &quot;username&quot;</span>
+<span class="lineno">  511 </span><span class="spaces">  </span><span class="istickedoff">either (fail . <span class="nottickedoff">T.unpack</span>) pure (parseCredentialKind kind vault mUser)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,241 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE DerivingStrategies #-}
+<span class="lineno">    4 </span>-- | Persistent UI state for the web gateway: the last-chosen &quot;new tab&quot; form
+<span class="lineno">    5 </span>-- options and the user's accumulated custom-model id history. Persisted as a
+<span class="lineno">    6 </span>-- single JSON file under @\&lt;state\&gt;\/ui_state.json@ so it survives server
+<span class="lineno">    7 </span>-- restarts.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The store is a small, atomic-write JSON file (not TOML) because the shape
+<span class="lineno">   10 </span>-- is frontend-owned and may evolve quickly, and it carries no secrets —
+<span class="lineno">   11 </span>-- it's plain model ids + a kind tag.
+<span class="lineno">   12 </span>module Seal.Web.UiState
+<span class="lineno">   13 </span>  ( UiState (..)
+<span class="lineno">   14 </span>  , LastOptions (..)
+<span class="lineno">   15 </span>  , UiStateHandle
+<span class="lineno">   16 </span>  , newUiStateHandle
+<span class="lineno">   17 </span>  , getUiState
+<span class="lineno">   18 </span>  , setLastOptions
+<span class="lineno">   19 </span>  , addCustomModel
+<span class="lineno">   20 </span>  , addRepoHistory
+<span class="lineno">   21 </span>  ) where
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+<span class="lineno">   24 </span>import Data.Aeson
+<span class="lineno">   25 </span>  ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=) )
+<span class="lineno">   26 </span>import Data.Aeson qualified as A
+<span class="lineno">   27 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   28 </span>import Data.Text (Text)
+<span class="lineno">   29 </span>import Data.Text qualified as T
+<span class="lineno">   30 </span>import GHC.Generics (Generic)
+<span class="lineno">   31 </span>import System.Directory
+<span class="lineno">   32 </span>  ( createDirectoryIfMissing, doesFileExist, renameFile )
+<span class="lineno">   33 </span>import System.FilePath ((&lt;/&gt;), takeDirectory)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Katip (Severity (..))
+<span class="lineno">   36 </span>import Seal.Config.Paths (SealPaths (..))
+<span class="lineno">   37 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | The persisted UI state. Both fields are optional so a missing/empty
+<span class="lineno">   40 </span>-- file decodes to the empty state (the frontend treats that as &quot;use the
+<span class="lineno">   41 </span>-- defaults&quot;).
+<span class="lineno">   42 </span>data UiState = UiState
+<span class="lineno">   43 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">usLastOptions</span></span></span>  :: Maybe LastOptions
+<span class="lineno">   44 </span>    -- ^ The last-chosen &quot;new tab&quot; form selection.
+<span class="lineno">   45 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">usCustomModels</span></span></span> :: [Text]
+<span class="lineno">   46 </span>    -- ^ Custom model ids the user has typed before, most-recent first,
+<span class="lineno">   47 </span>    -- deduped. Kept small (capped at 'maxCustomModels') by 'addCustomModel'.
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">usRepoHistory</span></span></span> :: [Text]
+<span class="lineno">   49 </span>    -- ^ Repository URLs the user has &quot;set up&quot; before, most-recent first,
+<span class="lineno">   50 </span>    -- deduped. The &quot;set up repo&quot; combo box offers these as suggestions.
+<span class="lineno">   51 </span>    -- Kept small (capped at 'maxRepoHistory') by 'addRepoHistory'.
+<span class="lineno">   52 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | The last-chosen &quot;new tab&quot; form selection. Mirrors the frontend's
+<span class="lineno">   55 </span>-- @useNewTabSpec@ shape; only the user-selectable fields are persisted (the
+<span class="lineno">   56 </span>-- transiently-computed model list + validation state are NOT).
+<span class="lineno">   57 </span>data LastOptions = LastOptions
+<span class="lineno">   58 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">loKind</span></span></span>          :: Text
+<span class="lineno">   59 </span>    -- ^ @\&quot;provider\&quot;@ | @\&quot;harness\&quot;@ | @\&quot;attach\&quot;@
+<span class="lineno">   60 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loProvider</span></span></span>      :: Text
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loModel</span></span></span>         :: Text
+<span class="lineno">   62 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loUseCustomModel</span></span></span> :: Bool
+<span class="lineno">   63 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loFlavour</span></span></span>       :: Text
+<span class="lineno">   64 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loCustomBinary</span></span></span>  :: Text
+<span class="lineno">   65 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loAttachSession</span></span></span> :: Text
+<span class="lineno">   66 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loAttachWindow</span></span></span>  :: Text
+<span class="lineno">   67 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loAttachManual</span></span></span>  :: Bool
+<span class="lineno">   68 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">loRepo</span></span></span>          :: Text
+<span class="lineno">   69 </span>    -- ^ The last-entered repo URL for the &quot;set up repo&quot; combo box (empty
+<span class="lineno">   70 </span>    -- string = no repo). Persisted so the combo box reopens with the last
+<span class="lineno">   71 </span>    -- URL, and recorded into 'usRepoHistory' on submit.
+<span class="lineno">   72 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON UiState</span></span></span></span></span></span></span></span> where
+<span class="lineno">   75 </span>  <span class="decl"><span class="istickedoff">toJSON s = object</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;last_options&quot;  .= usLastOptions s</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">, &quot;custom_models&quot; .= usCustomModels s</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">, &quot;repo_history&quot;  .= usRepoHistory s</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON UiState</span></span></span></span> where
+<span class="lineno">   82 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;UiState&quot;</span> $ \o -&gt; UiState</span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o .:? &quot;last_options&quot;</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;custom_models&quot; .!= <span class="nottickedoff">[]</span></span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;repo_history&quot; .!= <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON LastOptions</span></span></span></span></span></span></span></span> where
+<span class="lineno">   88 </span>  <span class="decl"><span class="istickedoff">toJSON o = object</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;kind&quot;           .= loKind o</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">, &quot;provider&quot;       .= loProvider o</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">, &quot;model&quot;          .= loModel o</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">, &quot;useCustomModel&quot; .= loUseCustomModel o</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">, &quot;flavour&quot;        .= loFlavour o</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">, &quot;customBinary&quot;   .= loCustomBinary o</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">, &quot;attachSession&quot;  .= loAttachSession o</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">, &quot;attachWindow&quot;   .= loAttachWindow o</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">, &quot;attachManual&quot;   .= loAttachManual o</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">, &quot;repo&quot;           .= loRepo o</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON LastOptions</span></span></span></span> where
+<span class="lineno">  102 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;LastOptions&quot;</span> $ \o -&gt; LastOptions</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o .:  &quot;kind&quot;</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;provider&quot;       .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;model&quot;          .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;useCustomModel&quot; .!= <span class="nottickedoff">False</span></span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;flavour&quot;        .!= <span class="nottickedoff">&quot;claude-code&quot;</span></span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;customBinary&quot;   .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;attachSession&quot;  .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;attachWindow&quot;   .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;attachManual&quot;   .!= <span class="nottickedoff">False</span></span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;repo&quot;           .!= &quot;&quot;</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | The maximum number of custom model ids retained. Keeps the combobox
+<span class="lineno">  115 </span>-- list bounded — the user is unlikely to type more than 32 unique ids over
+<span class="lineno">  116 </span>-- time, and the list is for fast recall, not an audit log.
+<span class="lineno">  117 </span>maxCustomModels :: Int
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">maxCustomModels = 32</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | The maximum number of repo URLs retained in the history. Same
+<span class="lineno">  121 </span>-- rationale as 'maxCustomModels'.
+<span class="lineno">  122 </span>maxRepoHistory :: Int
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">maxRepoHistory = 32</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | A handle holding the in-memory copy + the on-disk path. The MVar
+<span class="lineno">  126 </span>-- serializes writes so concurrent PUTs don't interleave file writes.
+<span class="lineno">  127 </span>data UiStateHandle = UiStateHandle
+<span class="lineno">  128 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uhPath</span></span></span>  :: FilePath
+<span class="lineno">  129 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uhState</span></span></span> :: MVar UiState
+<span class="lineno">  130 </span>  }
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>-- | Create a 'UiStateHandle' by loading the file at
+<span class="lineno">  133 </span>-- @\&lt;state\&gt;\/ui_state.json@. Missing/unparseable file → empty state (a
+<span class="lineno">  134 </span>-- warning is emitted to stderr on a parse error so the operator knows).
+<span class="lineno">  135 </span>newUiStateHandle :: SealPaths -&gt; IO UiStateHandle
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">newUiStateHandle paths = do</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">let path = spState paths &lt;/&gt; &quot;ui_state.json&quot;</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">mState &lt;- loadUiState path</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">ref &lt;- newMVar mState</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">pure UiStateHandle { uhPath = path, uhState = ref }</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | Read the current 'UiState'. Cheap — reads the in-memory copy.
+<span class="lineno">  143 </span>getUiState :: UiStateHandle -&gt; IO UiState
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">getUiState h = readMVar (uhState h)</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Replace the last-chosen form selection. Persists atomically; never
+<span class="lineno">  147 </span>-- throws (a write failure logs to stderr and keeps the in-memory copy so
+<span class="lineno">  148 </span>-- the UI still works within the session).
+<span class="lineno">  149 </span>setLastOptions :: UiStateHandle -&gt; LastOptions -&gt; IO ()
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">setLastOptions h opts =</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">modifyMVar_ (uhState h) $ \s -&gt; do</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">let next = s { usLastOptions = Just opts }</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">persistUiState (uhPath h) next</span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">pure <span class="nottickedoff">next</span></span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- | Add a custom model id to the history. Dedupes, trims, caps at
+<span class="lineno">  157 </span>-- 'maxCustomModels' (most-recent first), and persists atomically. A blank
+<span class="lineno">  158 </span>-- id is a no-op. Never throws.
+<span class="lineno">  159 </span>addCustomModel :: UiStateHandle -&gt; Text -&gt; IO ()
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">addCustomModel h raw =</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">modifyMVar_ (uhState h) $ \s -&gt; do</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">let trimmed = T.strip raw</span>
+<span class="lineno">  163 </span><span class="spaces">        </span><span class="istickedoff">next = if <span class="tickonlyfalse">T.null trimmed</span></span>
+<span class="lineno">  164 </span><span class="spaces">                 </span><span class="istickedoff">then <span class="nottickedoff">s</span></span>
+<span class="lineno">  165 </span><span class="spaces">                 </span><span class="istickedoff">else s { usCustomModels = dedupe trimmed (usCustomModels s) }</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">persistUiState (uhPath h) next</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">pure next</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">-- Move @x@ to the front, drop any earlier occurrence, cap the tail.</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">dedupe x xs = take maxCustomModels (x : filter (/= x) xs)</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | Add a repo URL to the history. Dedupes, trims, caps at
+<span class="lineno">  173 </span>-- 'maxRepoHistory' (most-recent first), and persists atomically. A blank
+<span class="lineno">  174 </span>-- URL is a no-op. Never throws.
+<span class="lineno">  175 </span>addRepoHistory :: UiStateHandle -&gt; Text -&gt; IO ()
+<span class="lineno">  176 </span><span class="decl"><span class="istickedoff">addRepoHistory h raw =</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">modifyMVar_ (uhState h) $ \s -&gt; do</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">let trimmed = T.strip raw</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff">next = if <span class="tickonlyfalse">T.null trimmed</span></span>
+<span class="lineno">  180 </span><span class="spaces">                 </span><span class="istickedoff">then <span class="nottickedoff">s</span></span>
+<span class="lineno">  181 </span><span class="spaces">                 </span><span class="istickedoff">else s { usRepoHistory = dedupe trimmed (usRepoHistory s) }</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff">persistUiState (uhPath h) next</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">pure next</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">dedupe x xs = take maxRepoHistory (x : filter (/= x) xs)</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>-- ── Internal: load/persist ─────────────────────────────────────────────
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>-- | The empty state: no last options, no custom models, no repo history.
+<span class="lineno">  190 </span>emptyUiState :: UiState
+<span class="lineno">  191 </span><span class="decl"><span class="istickedoff">emptyUiState = UiState { usLastOptions = Nothing, usCustomModels = [], usRepoHistory = [] }</span></span>
+<span class="lineno">  192 </span>
+<span class="lineno">  193 </span>-- | Load the state file. Missing file → empty state. Unparseable → empty
+<span class="lineno">  194 </span>-- state + a stderr warning (the file is replaced on the next successful
+<span class="lineno">  195 </span>-- write, so corruption self-heals).
+<span class="lineno">  196 </span>loadUiState :: FilePath -&gt; IO UiState
+<span class="lineno">  197 </span><span class="decl"><span class="istickedoff">loadUiState path = do</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">then pure emptyUiState</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">bs &lt;- BL.readFile path</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">case A.decode bs :: Maybe UiState of</span>
+<span class="lineno">  204 </span><span class="spaces">        </span><span class="istickedoff">Just s  -&gt; pure s</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  206 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">globalLogIO WarningS &quot;could not parse ui_state.json; using empty UI state&quot;</span></span>
+<span class="lineno">  207 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure emptyUiState</span></span></span>
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | Persist the state atomically: write @.tmp@, rename over the target.
+<span class="lineno">  210 </span>-- Creates the parent dir (it exists under @\&lt;state\&gt;@, but the call is
+<span class="lineno">  211 </span>-- idempotent). On any IO error, logs to stderr and continues (the
+<span class="lineno">  212 </span>-- in-memory copy stays; the UI still works within the session).
+<span class="lineno">  213 </span>persistUiState :: FilePath -&gt; UiState -&gt; IO ()
+<span class="lineno">  214 </span><span class="decl"><span class="istickedoff">persistUiState path s = do</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">let tmp = path &lt;&gt; &quot;.tmp&quot;</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">BL.writeFile tmp (A.encode s)</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span></span>
+
+</pre>
+</body>
+</html>

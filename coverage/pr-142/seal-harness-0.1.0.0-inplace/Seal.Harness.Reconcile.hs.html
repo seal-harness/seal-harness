@@ -1,0 +1,127 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The background reconcile loop: a server sweep ('readMarkers' + a screen
+<span class="lineno">    3 </span>-- capture) per session, classified by a per-flavour observer into
+<span class="lineno">    4 </span>-- 'Liveness', merged into the registry via 'mergeReconcile', then the
+<span class="lineno">    5 </span>-- 'defaultOrphanGraceTicks' wall-clock-free grace policy auto-evicts an
+<span class="lineno">    6 </span>-- entry after N consecutive Orphaned ticks (never touches @session.json@).
+<span class="lineno">    7 </span>module Seal.Harness.Reconcile
+<span class="lineno">    8 </span>  ( reconcileTick
+<span class="lineno">    9 </span>  , tickOrphans
+<span class="lineno">   10 </span>  , defaultOrphanGraceTicks
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Control.Concurrent.STM (STM, atomically, readTVar, writeTVar)
+<span class="lineno">   14 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   15 </span>import Data.Set (Set)
+<span class="lineno">   16 </span>import Data.Set qualified as Set
+<span class="lineno">   17 </span>import Data.Text (Text)
+<span class="lineno">   18 </span>import Data.Text qualified as T
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Harness.Id (HarnessId, parseHarnessId)
+<span class="lineno">   21 </span>import Seal.Harness.Observer (observeClaudeCode)
+<span class="lineno">   22 </span>import Seal.Harness.Registry
+<span class="lineno">   23 </span>  ( HarnessEntry (..), HarnessRegistry (..), Liveness (..), ObservedHarness (..)
+<span class="lineno">   24 </span>  , mergeReconcile, snapshot )
+<span class="lineno">   25 </span>import Seal.Harness.Tmux (TmuxIdent, TmuxRunner, captureWindowNamed, readMarkers)
+<span class="lineno">   26 </span>import Seal.Session.Kind (HarnessFlavour (..))
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | The default wall-clock-free grace policy: auto-evict an entry after
+<span class="lineno">   29 </span>-- this many consecutive Orphaned ticks. Never touches @session.json@.
+<span class="lineno">   30 </span>defaultOrphanGraceTicks :: Int
+<span class="lineno">   31 </span><span class="decl"><span class="istickedoff">defaultOrphanGraceTicks = 3</span></span>
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | One reconcile tick: read markers for the session, classify via the
+<span class="lineno">   34 </span>-- observer, merge into the registry, then tick orphans and evict those
+<span class="lineno">   35 </span>-- over the grace limit. Returns the post-tick snapshot.
+<span class="lineno">   36 </span>--
+<span class="lineno">   37 </span>-- The observed list is built from the @seal_id@ marker (which carries the
+<span class="lineno">   38 </span>-- 'HarnessId') + the classified liveness. In 6a's single-harness-per-session
+<span class="lineno">   39 </span>-- model there's at most one observed harness per tick.
+<span class="lineno">   40 </span>reconcileTick
+<span class="lineno">   41 </span>  :: HarnessRegistry -&gt; TmuxRunner -&gt; TmuxIdent -&gt; HarnessFlavour
+<span class="lineno">   42 </span>  -&gt; Int  -- ^ grace ticks (defaultOrphanGraceTicks)
+<span class="lineno">   43 </span>  -&gt; IO [HarnessEntry]
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">reconcileTick reg runner session flavour graceTicks = do</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">markersR &lt;- readMarkers runner <span class="nottickedoff">session</span></span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">captureR &lt;- captureWindowNamed runner <span class="nottickedoff">session</span></span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">observed &lt;- case (markersR, captureR) of</span>
+<span class="lineno">   48 </span><span class="spaces">    </span><span class="istickedoff">(Right markers, Right screenLines) -&gt;</span>
+<span class="lineno">   49 </span><span class="spaces">      </span><span class="istickedoff">let screen = T.intercalate &quot;\n&quot; screenLines</span>
+<span class="lineno">   50 </span><span class="spaces">      </span><span class="istickedoff">in pure (buildObserved flavour screen markers)</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure []</span></span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- atomically (mergeReconcile reg observed)</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">let observedIds = Set.fromList (map ohId observed)</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">_evicted &lt;- atomically (tickOrphans reg observedIds <span class="nottickedoff">graceTicks</span>)</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">snapshot reg</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | Build the observed-harness list from the marker map + the classified
+<span class="lineno">   58 </span>-- liveness. The @seal_id@ marker carries the 'HarnessId'; the coord is the
+<span class="lineno">   59 </span>-- session ident. Pure.
+<span class="lineno">   60 </span>buildObserved :: HarnessFlavour -&gt; Text -&gt; Map.Map Text Text -&gt; [ObservedHarness]
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">buildObserved flavour screen markers =</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup &quot;seal_id&quot; markers of</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">[]</span>  -- no seal_id =&gt; nothing to observe (the observer's</span>
+<span class="lineno">   64 </span><span class="spaces">                   </span><span class="istickedoff">-- LvOrphaned/LvExited classification is for entries that</span>
+<span class="lineno">   65 </span><span class="spaces">                   </span><span class="istickedoff">-- ARE in the registry but lost their marker; that's</span>
+<span class="lineno">   66 </span><span class="spaces">                   </span><span class="istickedoff">-- handled by the unobserved-tick path)</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">Just sealIdText -&gt; case parseHarnessId sealIdText of</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">Right hid -&gt;</span>
+<span class="lineno">   69 </span><span class="spaces">        </span><span class="istickedoff">let liveness = classify flavour screen markers</span>
+<span class="lineno">   70 </span><span class="spaces">        </span><span class="istickedoff">in [ ObservedHarness</span>
+<span class="lineno">   71 </span><span class="spaces">               </span><span class="istickedoff">{ ohId = hid</span>
+<span class="lineno">   72 </span><span class="spaces">               </span><span class="istickedoff">, ohLiveness = liveness</span>
+<span class="lineno">   73 </span><span class="spaces">               </span><span class="istickedoff">, ohTmuxCoord = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">   74 </span><span class="spaces">               </span><span class="istickedoff">, ohFlavour = <span class="nottickedoff">Just (flavourText flavour)</span></span>
+<span class="lineno">   75 </span><span class="spaces">               </span><span class="istickedoff">} ]</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | Increment orphan-ticks for entries NOT in the observed set, evict those
+<span class="lineno">   79 </span>-- over the limit. STM. Returns the evicted entries.
+<span class="lineno">   80 </span>tickOrphans :: HarnessRegistry -&gt; Set HarnessId -&gt; Int -&gt; STM [HarnessEntry]
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">tickOrphans (HarnessRegistry tv) observedIds graceTicks = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">m &lt;- readTVar tv</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">let (m', evicted) = foldr step (m, []) (Map.toList m)</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">writeTVar tv m'</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">pure evicted</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">step (hid, entry) (m', ev)</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">| hid `Set.member` observedIds = (m', ev)  -- observed; untouched here</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">let ticks = heOrphanTicks entry + 1</span>
+<span class="lineno">   91 </span><span class="spaces">              </span><span class="istickedoff">entry' = entry { heLiveness = LvOrphaned, heOrphanTicks = ticks }</span>
+<span class="lineno">   92 </span><span class="spaces">          </span><span class="istickedoff">in if ticks &gt; graceTicks</span>
+<span class="lineno">   93 </span><span class="spaces">               </span><span class="istickedoff">then (Map.delete hid m', entry' : ev)  -- evict</span>
+<span class="lineno">   94 </span><span class="spaces">               </span><span class="istickedoff">else (Map.insert hid entry' m', ev)</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>classify :: HarnessFlavour -&gt; Text -&gt; Map.Map Text Text -&gt; Liveness
+<span class="lineno">   97 </span><span class="decl"><span class="istickedoff">classify HfClaudeCode screen markers = observeClaudeCode screen markers</span>
+<span class="lineno">   98 </span><span class="spaces"></span><span class="istickedoff">classify _ _ _ = <span class="nottickedoff">LvIdle</span></span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>flavourText :: HarnessFlavour -&gt; Text
+<span class="lineno">  101 </span><span class="decl"><span class="nottickedoff">flavourText HfClaudeCode = &quot;claude-code&quot;</span>
+<span class="lineno">  102 </span><span class="spaces"></span><span class="nottickedoff">flavourText HfCodex      = &quot;codex&quot;</span>
+<span class="lineno">  103 </span><span class="spaces"></span><span class="nottickedoff">flavourText HfGeneric    = &quot;generic&quot;</span>
+<span class="lineno">  104 </span><span class="spaces"></span><span class="nottickedoff">flavourText (HCustom t)  = t</span></span>
+
+</pre>
+</body>
+</html>

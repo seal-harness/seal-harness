@@ -1,0 +1,206 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DataKinds #-}
+<span class="lineno">    2 </span>{-# LANGUAGE GADTs #-}
+<span class="lineno">    3 </span>{-# LANGUAGE KindSignatures #-}
+<span class="lineno">    4 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    5 </span>{-# LANGUAGE RankNTypes #-}
+<span class="lineno">    6 </span>-- | Generate an OpenAPI 3.1 specification from the 'SealRoute' declarative
+<span class="lineno">    7 </span>-- route spec (design §2.2 + Phase 4 — the §1a UC3 follow-up).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- This module is pure: no 'IO', no 'ApiDeps'. It builds a
+<span class="lineno">   10 </span>-- 'Data.OpenApi.OpenApi' document by feeding an OpenAPI-flavored 'Meta' table
+<span class="lineno">   11 </span>-- (parallel to the runtime 'Seal.Gateway.Route.routeMeta') to
+<span class="lineno">   12 </span>-- 'Trasa.OpenApi.toOpenApi'. Every path is prefixed with @\/api@ (matching the
+<span class="lineno">   13 </span>-- gateway's @(&quot;api&quot; : _) -&gt; apiApp@ dispatch in 'Seal.Gateway.Server').
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- The handlers build JSON 'Value's directly (the 'Resp'/'Req' types are
+<span class="lineno">   16 </span>-- opaque markers), so request and response bodies are typed as free-form JSON
+<span class="lineno">   17 </span>-- objects for v1. The spec documents routes, methods, capture names, and media
+<span class="lineno">   18 </span>-- types honestly without overpromising a typed body shape the handlers don't
+<span class="lineno">   19 </span>-- yet enforce. High-value bodies can later get dedicated 'ToSchema' instances.
+<span class="lineno">   20 </span>module Seal.Gateway.OpenApi
+<span class="lineno">   21 </span>  ( sealOpenApi
+<span class="lineno">   22 </span>  , encodeOpenApi
+<span class="lineno">   23 </span>  , openApiMeta
+<span class="lineno">   24 </span>  ) where
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Data.Aeson qualified as A
+<span class="lineno">   27 </span>import Data.ByteString.Lazy (ByteString)
+<span class="lineno">   28 </span>import Data.OpenApi (OpenApi (..), Info (..), ToSchema)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Trasa.Core
+<span class="lineno">   31 </span>  ( Meta (..), Many, Path, Query, Rec
+<span class="lineno">   32 </span>  , RequestBody, ResponseBody
+<span class="lineno">   33 </span>  , match, end, capture, qend, bodyless, body, one, (./), resp )
+<span class="lineno">   34 </span>import Trasa.OpenApi
+<span class="lineno">   35 </span>import qualified Trasa.Method as M
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Seal.Gateway.Route
+<span class="lineno">   38 </span>  ( SealRoute (..), allRoutes
+<span class="lineno">   39 </span>  , SessionIdOrErr (..), AgentDefIdOrErr (..), SkillIdOrErr (..)
+<span class="lineno">   40 </span>  , RepoIdOrErr (..), TabIndexOrErr (..), AskIdOrErr (..)
+<span class="lineno">   41 </span>  , sessionIdCapture, agentDefIdCapture, skillIdCapture
+<span class="lineno">   42 </span>  , repoIdCapture, tabIndexCapture, askIdCapture, textCapture
+<span class="lineno">   43 </span>  , freeFormBodyCodec
+<span class="lineno">   44 </span>  )
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | The complete Seal Harness OpenAPI 3.1 document, generated from
+<span class="lineno">   47 </span>-- 'allRoutes' + 'openApiMeta'. The 'Data.OpenApi.Info' is stamped with the
+<span class="lineno">   48 </span>-- project title + version (the 'mempty' default has empty strings).
+<span class="lineno">   49 </span>sealOpenApi :: OpenApi
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">sealOpenApi = baseDoc</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">{ _openApiInfo = (_openApiInfo baseDoc)</span>
+<span class="lineno">   52 </span><span class="spaces">      </span><span class="istickedoff">{ _infoTitle = &quot;Seal Harness Gateway API&quot;</span>
+<span class="lineno">   53 </span><span class="spaces">      </span><span class="istickedoff">, _infoVersion = &quot;0.1.0.0&quot;</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="istickedoff">} }</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">baseDoc = Trasa.OpenApi.toOpenApi openApiMeta allRoutes</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | The OpenAPI document encoded as compact JSON. This is what
+<span class="lineno">   59 </span>-- @seal gen-openapi@ writes to stdout and what @GET \/api\/openapi.json@ serves.
+<span class="lineno">   60 </span>encodeOpenApi :: ByteString
+<span class="lineno">   61 </span><span class="decl"><span class="nottickedoff">encodeOpenApi = A.encode sealOpenApi</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | The OpenAPI-flavored 'Meta' table — one arm per 'SealRoute' constructor.
+<span class="lineno">   64 </span>-- Mirrors 'Seal.Gateway.Route.routeMeta' but:
+<span class="lineno">   65 </span>--
+<span class="lineno">   66 </span>--   * every path is prefixed with @match &quot;api&quot;@ (the gateway strips @\/api@
+<span class="lineno">   67 </span>--     before dispatching to the manual router; the OpenAPI spec documents the
+<span class="lineno">   68 </span>--     full path the client sees);
+<span class="lineno">   69 </span>--   * captures use 'OpenApiCaptureCodec' (the existing 'CaptureCodec's wrapped
+<span class="lineno">   70 </span>--     with the 'ToParamSchema' string schema);
+<span class="lineno">   71 </span>--   * request/response bodies use 'Trasa.OpenApi.Codec.openApiJsonBody' (the
+<span class="lineno">   72 </span>--     opaque 'Resp'/'Req'/'AnswerReq' types carry free-form JSON 'ToSchema'
+<span class="lineno">   73 </span>--     instances defined in 'Seal.Gateway.Route'; 'Text' uses its native
+<span class="lineno">   74 </span>--     schema).
+<span class="lineno">   75 </span>openApiMeta :: SealRoute caps qrys req resp
+<span class="lineno">   76 </span>            -&gt; Meta OpenApiCaptureCodec OpenApiCaptureCodec
+<span class="lineno">   77 </span>                     (Many OpenApiBodyCodec) (Many OpenApiBodyCodec)
+<span class="lineno">   78 </span>                     caps qrys req resp
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">openApiMeta = \case</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">RouteHealth -&gt; api (match &quot;health&quot; ./ end) qend bodyless (resp (one openApiJsonBody)) M.get</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsList -&gt; api (match &quot;tabs&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsNew -&gt; api (match &quot;tabs&quot; ./ match &quot;new&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsClose -&gt; api (match &quot;tabs&quot; ./ capture oaTabIndex ./ match &quot;close&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsDismiss -&gt; api (match &quot;tabs&quot; ./ capture oaTabIndex ./ match &quot;dismiss&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsAcknowledge -&gt; api (match &quot;tabs&quot; ./ capture oaTabIndex ./ match &quot;acknowledge&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsRelease -&gt; api (match &quot;tabs&quot; ./ capture oaTabIndex ./ match &quot;release&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">RouteTabsDestroy -&gt; api (match &quot;tabs&quot; ./ capture oaTabIndex ./ match &quot;destroy&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">RouteLists -&gt; api (match &quot;lists&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionsList -&gt; api (match &quot;sessions&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionsArchived -&gt; api (match &quot;sessions&quot; ./ match &quot;archived&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionTranscript -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;transcript&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionSend -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;send&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionStop -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;stop&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionSetupRepo -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;setup-repo&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionAgents -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;agents&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionDescription -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;description&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionArchived -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;archived&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionPrompt -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;prompt&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionAgent -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;agent&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionQuestions -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;questions&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionAnswer -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;questions&quot; ./ capture oaAskId ./ match &quot;answer&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionAskCancel -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;questions&quot; ./ capture oaAskId ./ match &quot;cancel&quot; ./ end) qend bodyless (resp (one ffBody)) M.post</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionNew -&gt; api (match &quot;sessions&quot; ./ match &quot;new&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">RouteSessionNewFrom -&gt; api (match &quot;sessions&quot; ./ capture oaSessionId ./ match &quot;new&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">RouteHarnesses -&gt; api (match &quot;harnesses&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">RouteHarnessDiscover -&gt; api (match &quot;harnesses&quot; ./ match &quot;discover&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentsList -&gt; api (match &quot;agents&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentDefaultGet -&gt; api (match &quot;agents&quot; ./ match &quot;default&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentDefaultPut -&gt; api (match &quot;agents&quot; ./ match &quot;default&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentGet -&gt; api (match &quot;agents&quot; ./ capture oaAgentDefId ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentCreate -&gt; api (match &quot;agents&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentUpdate -&gt; api (match &quot;agents&quot; ./ capture oaAgentDefId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">RouteAgentDelete -&gt; api (match &quot;agents&quot; ./ capture oaAgentDefId ./ end) qend bodyless (resp (one ffBody)) M.delete</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">RouteSkillsList -&gt; api (match &quot;skills&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">RouteSkillGet -&gt; api (match &quot;skills&quot; ./ capture oaSkillId ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">RouteSkillCreate -&gt; api (match &quot;skills&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">RouteSkillUpdate -&gt; api (match &quot;skills&quot; ./ capture oaSkillId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">RouteSkillDelete -&gt; api (match &quot;skills&quot; ./ capture oaSkillId ./ end) qend bodyless (resp (one ffBody)) M.delete</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">RouteReposList -&gt; api (match &quot;repos&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoCreate -&gt; api (match &quot;repos&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoGet -&gt; api (match &quot;repos&quot; ./ capture oaRepoId ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoUpdate -&gt; api (match &quot;repos&quot; ./ capture oaRepoId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoDelete -&gt; api (match &quot;repos&quot; ./ capture oaRepoId ./ end) qend bodyless (resp (one ffBody)) M.delete</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoDeployKey -&gt; api (match &quot;repos&quot; ./ capture oaRepoId ./ match &quot;deploy-key&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">RouteRepoDeployKeyGenerate -&gt; api (match &quot;repos&quot; ./ capture oaRepoId ./ match &quot;deploy-key&quot; ./ match &quot;generate&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">RouteProvidersList -&gt; api (match &quot;providers&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">RouteProviderModels -&gt; api (match &quot;providers&quot; ./ capture oaText ./ match &quot;models&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">RouteProviderModelContext -&gt; api (match &quot;providers&quot; ./ capture oaText ./ match &quot;models&quot; ./ capture oaText ./ match &quot;context&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">RouteUiStateGet -&gt; api (match &quot;ui&quot; ./ match &quot;state&quot; ./ end) qend bodyless (resp (one ffBody)) M.get</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">RouteUiStatePut -&gt; api (match &quot;ui&quot; ./ match &quot;state&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">RouteUiCustomModels -&gt; api (match &quot;ui&quot; ./ match &quot;custom-models&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">RouteUiRepos -&gt; api (match &quot;ui&quot; ./ match &quot;repos&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">RouteAdopt -&gt; api (match &quot;adopt&quot; ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Prefix a path with @match &quot;api&quot;@ so the rendered OpenAPI paths include the
+<span class="lineno">  136 </span>-- @\/api@ prefix the client sees (the gateway strips it before dispatching to
+<span class="lineno">  137 </span>-- the manual router).
+<span class="lineno">  138 </span>api
+<span class="lineno">  139 </span>  :: Path OpenApiCaptureCodec caps
+<span class="lineno">  140 </span>  -&gt; Rec (Query OpenApiCaptureCodec) qrys
+<span class="lineno">  141 </span>  -&gt; RequestBody (Many OpenApiBodyCodec) req
+<span class="lineno">  142 </span>  -&gt; ResponseBody (Many OpenApiBodyCodec) resp
+<span class="lineno">  143 </span>  -&gt; M.Method
+<span class="lineno">  144 </span>  -&gt; Meta OpenApiCaptureCodec OpenApiCaptureCodec
+<span class="lineno">  145 </span>           (Many OpenApiBodyCodec) (Many OpenApiBodyCodec)
+<span class="lineno">  146 </span>           caps qrys req resp
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">api p = Meta (match &quot;api&quot; ./ p)</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  150 </span>-- OpenAPI-flavored capture codecs
+<span class="lineno">  151 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | Each capture codec wraps the existing 'CaptureCodec' from
+<span class="lineno">  154 </span>-- 'Seal.Gateway.Route' with the 'ToParamSchema' string schema via
+<span class="lineno">  155 </span>-- 'openApiCaptureCodec'.
+<span class="lineno">  156 </span>oaSessionId :: OpenApiCaptureCodec SessionIdOrErr
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">oaSessionId = openApiCaptureCodec sessionIdCapture</span></span>
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>oaAgentDefId :: OpenApiCaptureCodec AgentDefIdOrErr
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">oaAgentDefId = openApiCaptureCodec agentDefIdCapture</span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>oaSkillId :: OpenApiCaptureCodec SkillIdOrErr
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">oaSkillId = openApiCaptureCodec skillIdCapture</span></span>
+<span class="lineno">  164 </span>
+<span class="lineno">  165 </span>oaRepoId :: OpenApiCaptureCodec RepoIdOrErr
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">oaRepoId = openApiCaptureCodec repoIdCapture</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>oaTabIndex :: OpenApiCaptureCodec TabIndexOrErr
+<span class="lineno">  169 </span><span class="decl"><span class="istickedoff">oaTabIndex = openApiCaptureCodec tabIndexCapture</span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>oaAskId :: OpenApiCaptureCodec AskIdOrErr
+<span class="lineno">  172 </span><span class="decl"><span class="istickedoff">oaAskId = openApiCaptureCodec askIdCapture</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>oaText :: OpenApiCaptureCodec Text
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">oaText = openApiCaptureCodec textCapture</span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- | The free-form JSON body codec for the opaque marker types ('Resp', 'Req',
+<span class="lineno">  178 </span>-- 'AnswerReq'). Wraps 'Seal.Gateway.Route.freeFormBodyCodec' (a dummy
+<span class="lineno">  179 </span>-- 'BodyCodec' whose encode/decode are never called) with the 'ToSchema'
+<span class="lineno">  180 </span>-- free-form object schema via 'openApiBodyCodec'. Each route arm specializes
+<span class="lineno">  181 </span>-- the polymorphic type to its own response/request type.
+<span class="lineno">  182 </span>ffBody :: ToSchema a =&gt; OpenApiBodyCodec a
+<span class="lineno">  183 </span><span class="decl"><span class="istickedoff">ffBody = openApiBodyCodec freeFormBodyCodec</span></span>
+
+</pre>
+</body>
+</html>

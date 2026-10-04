@@ -1,0 +1,119 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @/bg@ command: run a prompt in a fresh session using the default
+<span class="lineno">    3 </span>-- model + agent, and send the LLM response back on the channel the command
+<span class="lineno">    4 </span>-- was invoked from.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- This module is deliberately thin: the @/bg@ 'CommandAction' just delegates
+<span class="lineno">    7 </span>-- to a channel-supplied 'BgRunner'. Each channel implements its own
+<span class="lineno">    8 </span>-- 'BgRunner' (in 'Seal.Channels.Loop' for inbox-driven channels,
+<span class="lineno">    9 </span>-- 'Seal.Channel.Cli' for the TUI) so that:
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>--   * the turn is forked (the receive loop keeps running so confirmation
+<span class="lineno">   12 </span>--     answers can be delivered asynchronously);
+<span class="lineno">   13 </span>--   * the confirmation prompt (@ccPrompt@) routes through the channel's
+<span class="lineno">   14 </span>--     own approval UX — the same seam a normal turn uses — so the reply
+<span class="lineno">   15 </span>--     and any @Allow SHELL_EXEC ...? [y/N]@ prompts land on the
+<span class="lineno">   16 </span>--     originating channel;
+<span class="lineno">   17 </span>--   * no tab or cursor state is mutated (the fresh @/bg@ session runs
+<span class="lineno">   18 </span>--     headless relative to the tab list).
+<span class="lineno">   19 </span>--
+<span class="lineno">   20 </span>-- The fresh session is persisted to disk (like @/tab new@) so the run
+<span class="lineno">   21 </span>-- appears in @/session list@ and is resumable.
+<span class="lineno">   22 </span>module Seal.Command.Background
+<span class="lineno">   23 </span>  ( BgRunner(..)
+<span class="lineno">   24 </span>  , backgroundCommandSpec
+<span class="lineno">   25 </span>  , runBackground
+<span class="lineno">   26 </span>  ) where
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Data.Text (Text)
+<span class="lineno">   29 </span>import Data.Text qualified as T
+<span class="lineno">   30 </span>import Options.Applicative
+<span class="lineno">   31 </span>  ( Parser, ParserInfo, (&lt;**&gt;), header, help, helper, info, many, metavar
+<span class="lineno">   32 </span>  , progDesc, strArgument )
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   35 </span>import Seal.Command.Spec
+<span class="lineno">   36 </span>  ( Availability (..), CommandAction (..), CommandGroup (..)
+<span class="lineno">   37 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | A channel-supplied runner for a @/bg@ prompt. The channel builds this
+<span class="lineno">   40 </span>-- closure (minting the fresh session, forking the turn, wiring @ccPrompt@
+<span class="lineno">   41 </span>-- to its own approval UX, and delivering the reply to the invoking
+<span class="lineno">   42 </span>-- 'ChannelCaps'); the @/bg@ action just invokes it. Keeping this as a
+<span class="lineno">   43 </span>-- parameter decouples the command from the channel-specific turn +
+<span class="lineno">   44 </span>-- confirmation machinery so each channel can tailor the approval UX (e.g.
+<span class="lineno">   45 </span>-- Telegram's inline buttons, the CLI's @&gt;@ prompt).
+<span class="lineno">   46 </span>--
+<span class="lineno">   47 </span>-- The confirmation ask is keyed to the /originating conversation's/ active
+<span class="lineno">   48 </span>-- session id (NOT the fresh bg session's) so the channel loop's per-session
+<span class="lineno">   49 </span>-- 'deliverNextAnswer' short-circuit consumes the next inbound message as
+<span class="lineno">   50 </span>-- the answer — producing a modal &quot;answer the pending question before
+<span class="lineno">   51 </span>-- resuming normal turns&quot; state scoped to that conversation. The runner
+<span class="lineno">   52 </span>-- resolves that sid itself (the @/bg@ 'CommandAction' only receives
+<span class="lineno">   53 </span>-- 'ChannelCaps', not conversation context, so the sid cannot be passed in
+<span class="lineno">   54 </span>-- at action-invocation time); channels typically capture a mutable
+<span class="lineno">   55 </span>-- &quot;current conversation sid&quot; cell that the loop updates each turn.
+<span class="lineno">   56 </span>newtype BgRunner = BgRunner { <span class="istickedoff"><span class="decl"><span class="istickedoff">runBg</span></span></span> :: Text -&gt; IO () }
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | The @/bg@ command spec. The action closes over the channel's
+<span class="lineno">   59 </span>-- 'BgRunner'; optparse supplies the prompt as one or more positional
+<span class="lineno">   60 </span>-- words (joined with spaces).
+<span class="lineno">   61 </span>backgroundCommandSpec :: BgRunner -&gt; CommandSpec
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">backgroundCommandSpec runner = CommandSpec</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = CommandName &quot;bg&quot;</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = []</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = GroupGeneral</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = &quot;Run a prompt in a fresh session and reply with the result&quot;</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = bgParserInfo runner</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">AlwaysAvailable</span></span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>bgParserInfo :: BgRunner -&gt; ParserInfo CommandAction
+<span class="lineno">   72 </span><span class="decl"><span class="istickedoff">bgParserInfo runner =</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">info (bgParser runner &lt;**&gt; helper)</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Run a prompt in a fresh session and reply with the result&quot;</span></span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header <span class="nottickedoff">&quot;bg — run a prompt in a fresh background session&quot;</span></span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | One or more positional arguments joined with spaces to form the prompt.
+<span class="lineno">   79 </span>-- The tokenizer already joins quoted spans into a single token, so
+<span class="lineno">   80 </span>-- @/bg &quot;tell me a joke&quot;@ yields one token; @/bg tell me a joke@ yields
+<span class="lineno">   81 </span>-- several tokens that we re-join. A blank prompt (no tokens) is rejected at
+<span class="lineno">   82 </span>-- run time with a usage line.
+<span class="lineno">   83 </span>bgParser :: BgRunner -&gt; Parser CommandAction
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">bgParser runner =</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">runBackground runner . T.intercalate &quot; &quot; &lt;$&gt; many wordArg</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">wordArg = strArgument (metavar <span class="nottickedoff">&quot;PROMPT...&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;The prompt to run&quot;</span>)</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | The @/bg@ action: reject a blank prompt, otherwise delegate to the
+<span class="lineno">   90 </span>-- channel's 'BgRunner'. The runner owns session creation, forking,
+<span class="lineno">   91 </span>-- confirmation routing, and reply delivery.
+<span class="lineno">   92 </span>runBackground :: BgRunner -&gt; Text -&gt; CommandAction
+<span class="lineno">   93 </span><span class="decl"><span class="istickedoff">runBackground runner prompt = CommandAction $ \caps -&gt;</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">if T.null (T.strip prompt)</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">then ccSend caps &quot;usage: /bg &lt;prompt&gt;&quot;</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">else runBg runner prompt</span></span>
+
+</pre>
+</body>
+</html>

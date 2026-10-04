@@ -1,0 +1,97 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The @conversation.jsonl@ model: one raw 'Message' per line, in order — the
+<span class="lineno">    2 </span>-- pure content list of the session. Reading is @mapMaybe decode . lines@ →
+<span class="lineno">    3 </span>-- @[Message]@, fed straight to the provider with zero transformation. Appending
+<span class="lineno">    4 </span>-- a turn appends only the *new* message lines, so the file grows by deltas
+<span class="lineno">    5 </span>-- rather than re-serializing the whole prior conversation each turn (the old
+<span class="lineno">    6 </span>-- @transcript.jsonl@ format's O(N²) growth). No timestamps or ids live here —
+<span class="lineno">    7 </span>-- those are derived from @entries.jsonl@ ('Seal.Transcript.Entries').
+<span class="lineno">    8 </span>module Seal.Transcript.Conv
+<span class="lineno">    9 </span>  ( ConvLine (..)
+<span class="lineno">   10 </span>  , encodeConvLine
+<span class="lineno">   11 </span>  , readConversation
+<span class="lineno">   12 </span>  , appendMessages
+<span class="lineno">   13 </span>  , diffNew
+<span class="lineno">   14 </span>  ) where
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Data.Aeson (decode, encode)
+<span class="lineno">   17 </span>import Data.ByteString (ByteString)
+<span class="lineno">   18 </span>import Data.ByteString qualified as BS
+<span class="lineno">   19 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   20 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Seal.Providers.Class (Message (..))
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>-- | A single line of @conversation.jsonl@: a raw 'Message' (role + content
+<span class="lineno">   25 </span>-- blocks). The on-disk form is the canonical aeson encoding of 'Message' with
+<span class="lineno">   26 </span>-- no trailing newline; the writer appends the newline.
+<span class="lineno">   27 </span>newtype ConvLine = ConvLine { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">clMessage</span></span></span> :: Message }
+<span class="lineno">   28 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | Canonical strict encoding of one line, no trailing newline.
+<span class="lineno">   31 </span>encodeConvLine :: ConvLine -&gt; ByteString
+<span class="lineno">   32 </span><span class="decl"><span class="istickedoff">encodeConvLine (ConvLine m) = BL.toStrict (encode m)</span></span>
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | Read @conversation.jsonl@ into the message list. Malformed lines are
+<span class="lineno">   35 </span>-- skipped (a torn tail leaves at most one bad line, already tolerated here).
+<span class="lineno">   36 </span>readConversation :: ByteString -&gt; [Message]
+<span class="lineno">   37 </span><span class="decl"><span class="istickedoff">readConversation bs = mapMaybe decodeLine (splitLines bs)</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   39 </span><span class="spaces">    </span><span class="istickedoff">decodeLine l = decode (BL.fromStrict l)</span></span>
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | Split the file body into its non-empty component lines. A trailing newline
+<span class="lineno">   42 </span>-- produces a final empty chunk that we drop; interior empty lines (which a
+<span class="lineno">   43 </span>-- well-formed conversation file never has) are also dropped.
+<span class="lineno">   44 </span>splitLines :: ByteString -&gt; [ByteString]
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">splitLines = filter (not . BS.null) . BS.split 0x0a</span></span>
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>-- | The minimal append: the messages from @incoming@ that are not already
+<span class="lineno">   48 </span>-- present in @written@, taken as a suffix of the written list. The writer
+<span class="lineno">   49 </span>-- calls this to find what to append, then writes one line per result.
+<span class="lineno">   50 </span>--
+<span class="lineno">   51 </span>-- Invariant (caller responsibility): @incoming@ is the full message list for
+<span class="lineno">   52 </span>-- the turn (prior messages + new ones); @written@ is the conversation as it
+<span class="lineno">   53 </span>-- exists on disk. The new messages are the suffix of @incoming@ beyond the
+<span class="lineno">   54 </span>-- length of @written@, after verifying @written@ is a prefix of @incoming@.
+<span class="lineno">   55 </span>-- If @written@ is not a prefix of @incoming@ (a divergence — should not happen
+<span class="lineno">   56 </span>-- under the single-writer daemon), the whole @incoming@ is returned (a safe,
+<span class="lineno">   57 </span>-- if redundant, fallback).
+<span class="lineno">   58 </span>diffNew :: [Message] -&gt; [Message] -&gt; [Message]
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">diffNew incoming written = fromMaybe incoming (stripPrefixMessages written incoming)</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | Append @newLines@ to @written@, returning the combined list. Kept as a
+<span class="lineno">   62 </span>-- separate function so the writer's &quot;diff then append&quot; flow is one named step.
+<span class="lineno">   63 </span>appendMessages :: [Message] -&gt; [Message] -&gt; [Message]
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">appendMessages written newLines = written &lt;&gt; newLines</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | Like 'Data.List.stripPrefix' but compares 'Message's for equality. Returns
+<span class="lineno">   67 </span>-- @Just remainder@ when @written@ is a leading prefix of @incoming@ (so the
+<span class="lineno">   68 </span>-- remainder is the new suffix to append), or 'Nothing' on divergence.
+<span class="lineno">   69 </span>stripPrefixMessages :: [Message] -&gt; [Message] -&gt; Maybe [Message]
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">stripPrefixMessages [] incoming              = Just incoming</span>
+<span class="lineno">   71 </span><span class="spaces"></span><span class="istickedoff">stripPrefixMessages _   []                   = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">   72 </span><span class="spaces"></span><span class="istickedoff">stripPrefixMessages (w:ws) (i:is)</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">| w == i    = stripPrefixMessages ws is</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Nothing</span></span>
+
+</pre>
+</body>
+</html>
