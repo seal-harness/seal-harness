@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import App from '../App'
+import { WS_GRACE_MS } from '../hooks/useApi'
 import type { SessionInfo, TranscriptEntry } from '../types'
 
 // Mock the WS singleton so the stream-driven hooks (useListsStream,
@@ -470,6 +471,8 @@ describe('App — tab close preserves the focused session', () => {
     }))
     render(<App />)
     // Wait for both tabs to render, then select Tab B (index 1).
+    // Advance past the REST grace period so the first /api/lists poll fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
     const tabBRow = await screen.findByText('Tab B')
     fireEvent.click(tabBRow)
     await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
@@ -530,6 +533,8 @@ describe('App — tab close preserves the focused session', () => {
     }))
     render(<App />)
     // Select Tab B (the lower tab). It appears in Active Tabs.
+    // Advance past the REST grace period so the first /api/lists poll fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
     const tabBRow = await screen.findByText('Tab B')
     fireEvent.click(tabBRow)
     await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
@@ -586,6 +591,8 @@ describe('App — tab close preserves the focused session', () => {
     }))
     render(<App />)
     // Select Tab B (index 1) and let its transcript seed land.
+    // Advance past the REST grace period so the first /api/lists poll fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
     const tabBRow = await screen.findByText('Tab B')
     fireEvent.click(tabBRow)
     await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
@@ -657,6 +664,8 @@ describe('App — tab close preserves the focused session', () => {
     }))
     render(<App />)
     // Select tab 1 (Tab B).
+    // Advance past the REST grace period so the first /api/lists poll fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
     const tabBRow = await screen.findByText('Tab B')
     fireEvent.click(tabBRow)
     await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })

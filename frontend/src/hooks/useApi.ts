@@ -23,6 +23,13 @@ import { streamClient } from '../lib/streamClient'
 
 export const POLL_INTERVAL = 3000
 
+/** Grace period (ms) before the first REST `/api/lists` poll on initial
+ *  mount. Gives the WebSocket time to connect and deliver a `lists` frame;
+ *  if WS arrives during this window the REST poll never fires — zero
+ *  unnecessary XHRs. Short enough that the REST fallback (older servers
+ *  without WS) is only briefly delayed. */
+export const WS_GRACE_MS = 500
+
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
  *  already in their final shape; the rest map to camelCase TabInfo keys.
@@ -240,11 +247,30 @@ export function useListsPoll(disabled = false): ListsPollResult {
     }
   }, [])
 
+  // Track whether the hook has ever been disabled (WS was live). On the
+  // very first enable (initial mount with disabled=false) we delay the
+  // first poll by WS_GRACE_MS to give the WebSocket a chance to connect.
+  // If `disabled` flips to true during the grace period, the cleanup
+  // clears the timeout and no REST request fires at all. On a subsequent
+  // re-enable (WS dropped), we poll immediately — no grace period needed
+  // because WS was already established and the REST fallback is urgent.
+  const everDisabledRef = useRef(false)
+
   useEffect(() => {
-    if (disabled) return
-    poll()
-    const id = setInterval(poll, POLL_INTERVAL)
-    return () => clearInterval(id)
+    if (disabled) {
+      everDisabledRef.current = true
+      return
+    }
+    const delay = everDisabledRef.current ? 0 : WS_GRACE_MS
+    let intervalId: ReturnType<typeof setInterval> | undefined
+    const timer = setTimeout(() => {
+      poll()
+      intervalId = setInterval(poll, POLL_INTERVAL)
+    }, delay)
+    return () => {
+      clearTimeout(timer)
+      if (intervalId !== undefined) clearInterval(intervalId)
+    }
   }, [poll, disabled])
 
   return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }

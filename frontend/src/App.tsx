@@ -173,6 +173,8 @@ export default function App() {
   //      the WS frame and ALL REST polling hooks are disabled (zero XHRs).
   //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
   //      polls every 3s when WS is not live AND /api/lists is not in error.
+  //      The first poll is delayed by WS_GRACE_MS (500 ms) on initial mount
+  //      so the REST endpoint is not hit while WS is still connecting.
   //      when WS is not live AND /api/lists is not in error.
   //   3. Else (older server without /api/lists) the legacy three-poll
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the

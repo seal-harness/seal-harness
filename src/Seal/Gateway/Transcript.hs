@@ -17,6 +17,8 @@ module Seal.Gateway.Transcript
   , setEncodeMs
   , firstUserMessageSnippet
   , lastUserMessageAt
+  , firstUserMessageSnippetFast
+  , lastUserMessageAtFast
   , showIso
   , reconEntryToFrontend
   ) where
@@ -42,7 +44,7 @@ import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Transcript.Entries (EntryRecord (..))
+import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict)
@@ -754,3 +756,101 @@ lastUserMessageAt paths sid = do
                   | d == "request" && not (isBlank (A.String t)) -> Just t
                 _ -> go rest
             _ -> go rest
+
+
+-- ── Fast variants for buildListsSnapshot ───────────────────────────────
+--
+-- These functions avoid the full transcript read + parse + reconstruction
+-- that 'firstUserMessageSnippet' and 'lastUserMessageAt' perform. They are
+-- used by 'buildListsSnapshot' which calls them for EVERY session (704+
+-- sessions × 2.7MB avg transcript = ~2GB of I/O on every call with the
+-- slow versions).
+
+-- | Fast variant of 'firstUserMessageSnippet': reads the conversation file
+-- lazily and stops after the first user message, instead of reading and
+-- parsing the entire file. For 'conversation.jsonl' (the common case), each
+-- line is a JSON 'Message'; we decode lines one at a time and return the
+-- first @User@ message's text (truncated to 80 chars). For legacy
+-- 'transcript.jsonl', each line is a 'TranscriptEntry'; we extract request
+-- messages and return the first user text. Returns 'Nothing' when no
+-- transcript file exists or no user message is found.
+firstUserMessageSnippetFast :: SealPaths -> SessionId -> IO (Maybe Text)
+firstUserMessageSnippetFast paths sid = do
+  let legacyPath = sessionTranscriptPath paths sid
+      convPath   = sessionConversationPath paths sid
+  convExists <- doesFileExist convPath
+  if convExists
+    then do
+      raw <- readFileTextStrict convPath
+      pure (snippetFromMessages (takeFirstUserMessage (parseMessagesLazy raw)))
+    else do
+      legacyExists <- doesFileExist legacyPath
+      if legacyExists
+        then do
+          raw <- readFileTextStrict legacyPath
+          pure (snippetFromMessages (legacyFirstUserMessages (parseEntriesLazy raw)))
+        else pure Nothing
+
+-- | Fast variant of 'lastUserMessageAt': reads only 'entries.jsonl' (avg
+-- ~128KB, vs 2.7MB for conversation.jsonl) and finds the last
+-- 'EKRequest' entry's timestamp. Returns 'Nothing' when 'entries.jsonl'
+-- doesn't exist (the frontend falls back to @smLastActive@ for sorting).
+-- This avoids the full 'readTranscriptEntries' call which reads BOTH
+-- files, parses everything, and reconstructs entries.
+lastUserMessageAtFast :: SealPaths -> SessionId -> IO (Maybe Text)
+lastUserMessageAtFast paths sid = do
+  let entriesPath = sessionEntriesPath paths sid
+  entriesExist <- doesFileExist entriesPath
+  if not entriesExist
+    then pure Nothing
+    else do
+      raw <- readFileTextStrict entriesPath
+      pure (lastRequestTs (parseEntryRecordsLazy raw))
+
+-- ── internals ──────────────────────────────────────────────────────────
+
+-- | Lazily parse non-empty lines as 'Message' values.
+parseMessagesLazy :: Text -> [Message]
+parseMessagesLazy raw =
+  mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+           (filter (not . T.null) (T.lines raw))
+
+-- | Lazily parse non-empty lines as 'TranscriptEntry' values (legacy
+-- 'transcript.jsonl' format).
+parseEntriesLazy :: Text -> [TranscriptEntry]
+parseEntriesLazy raw =
+  mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+           (filter (not . T.null) (T.lines raw))
+
+-- | Take only the first user message from a list, avoiding traversal of
+-- the entire list.
+takeFirstUserMessage :: [Message] -> [Message]
+takeFirstUserMessage [] = []
+takeFirstUserMessage (m : ms)
+  | msgRole m == User = [m]
+  | otherwise         = takeFirstUserMessage ms
+
+-- | Extract user messages from legacy transcript entries (only from
+-- 'Request'-direction entries). Stops after the first match.
+legacyFirstUserMessages :: [TranscriptEntry] -> [Message]
+legacyFirstUserMessages [] = []
+legacyFirstUserMessages (te : tes)
+  | teDirection te /= Request = legacyFirstUserMessages tes
+  | otherwise = case legacyRequestMessages [te] of
+      (m : _) | msgRole m == User -> [m]
+      _ -> legacyFirstUserMessages tes
+
+-- | Lazily parse non-empty lines as 'EntryRecord' values.
+parseEntryRecordsLazy :: Text -> [EntryRecord]
+parseEntryRecordsLazy raw =
+  mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+           (filter (not . T.null) (T.lines raw))
+
+-- | Find the timestamp of the last 'EKRequest' entry, formatted as ISO.
+lastRequestTs :: [EntryRecord] -> Maybe Text
+lastRequestTs = go Nothing
+  where
+    go acc [] = fmap (T.pack . showIso) acc
+    go acc (e : es) = case erKind e of
+      EKRequest -> go (Just (erTimestamp e)) es
+      _         -> go acc es
