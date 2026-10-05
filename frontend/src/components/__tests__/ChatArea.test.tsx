@@ -721,6 +721,42 @@ describe('transcriptToMessages', () => {
   })
 })
 
+  it('renders an ASK_HUMAN harness entry as a visible question message', () => {
+    // The backend records a harness entry for ASK_HUMAN with op.name,
+    // input.question, and input.options in the payload. Without a handler,
+    // processEntry produces zero messages — the question is invisible in
+    // the transcript. This test verifies the question text and options
+    // are rendered as a text message.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'askhuman-1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'ASK_HUMAN' },
+          input: {
+            question: 'How would you like to proceed?',
+            options: [
+              { label: 'Option A', description: 'First choice' },
+              { label: 'Option B', description: 'Second choice' },
+            ],
+          },
+          result: null,
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    const textBlock = msgs[0]!.blocks.find((b) => b.text !== undefined)
+    expect(textBlock).toBeTruthy()
+    expect(textBlock!.text).toContain('How would you like to proceed?')
+    expect(textBlock!.text).toContain('1) Option A — First choice')
+    expect(textBlock!.text).toContain('2) Option B — Second choice')
+    expect(msgs[0]!.agentName).toBe('Assistant')
+  })
+
 // ── ChatArea rendering ──────────────────────────────────────────────────────
 
 describe('ChatArea', () => {

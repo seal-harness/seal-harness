@@ -217,6 +217,90 @@ describe('useTranscriptStream', () => {
     expect(result.current.entries[0]!.id).toBe('f1')
     vi.unstubAllGlobals()
   })
+
+  it('re-fetches pending questions on WS reconnect (reconnecting → live)', async () => {
+    // Regression: when the WebSocket disconnects and reconnects while an
+    // ASK_HUMAN is pending, the `ask` WS event is lost (the server has no
+    // replay mechanism for ask events, only for transcript entries). The
+    // hook must re-fetch pending questions via HTTP on reconnect to
+    // recover questions that arrived during the WS gap.
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    let questionsFetchCount = 0
+    let returnQuestion = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/questions')) {
+        questionsFetchCount++
+        if (returnQuestion) {
+          return new Response(JSON.stringify([
+            { id: 'q1', question: 'Proceed?', createdAt: '2026-01-01T00:00:00Z',
+              options: [{ label: 'Yes' }] },
+          ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+
+    // Wait for initial session-load fetch.
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.pendingQuestions).toEqual([])
+    const initialCount = questionsFetchCount
+    expect(initialCount).toBeGreaterThanOrEqual(1)
+
+    // Now make the questions endpoint return a pending question (simulating
+    // an ASK_HUMAN that arrived during the WS disconnect).
+    returnQuestion = true
+
+    // Simulate WS disconnect + reconnect.
+    act(() => { c.setStatus('reconnecting') })
+    await act(async () => {
+      c.setStatus('live')
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    // The hook should have re-fetched pending questions and discovered
+    // the question that arrived during the WS gap.
+    expect(questionsFetchCount).toBeGreaterThan(initialCount)
+    expect(result.current.pendingQuestions).toHaveLength(1)
+    expect(result.current.pendingQuestions[0]!.id).toBe('q1')
+
+    vi.unstubAllGlobals()
+  })
+
+  it('does NOT re-fetch pending questions on initial connection (live → replaying → live)', async () => {
+    // The session-load effect already fetches on initial load. The
+    // status-change effect should only fire on reconnects (reconnecting →
+    // live), not on the initial connection or replay transitions.
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    let questionsFetchCount = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/questions')) {
+        questionsFetchCount++
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    const afterInitial = questionsFetchCount
+
+    // Simulate replay transition: live → replaying → live (no reconnect).
+    act(() => { c.setStatus('replaying') })
+    await act(async () => {
+      c.setStatus('live')
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    // Should NOT have re-fetched (no reconnect occurred).
+    expect(questionsFetchCount).toBe(afterInitial)
+
+    vi.unstubAllGlobals()
+  })
 })
 
 // ── useSessionActivityStream ────────────────────────────────────────────
