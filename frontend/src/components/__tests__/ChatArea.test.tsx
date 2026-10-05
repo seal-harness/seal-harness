@@ -2100,8 +2100,12 @@ describe('Scroll-to-bottom behavior', () => {
   it('switching sessions scrolls to bottom of the new session', () => {
     // When the user switches from session s1 to session s2, the transcript
     // must scroll to the bottom of s2's messages. The session-switch scroll
-    // now uses scrollTo on the scroller directly (in a useLayoutEffect for
-    // pre-paint positioning). We verify by spying on both scrollTo and
+    // uses scrollTo on the scroller directly (in a useLayoutEffect for
+    // pre-paint positioning). The scroll is deferred to the render AFTER
+    // the session change — on the session-change render itself, the
+    // messages prop is stale (still from the previous session), because
+    // useTranscriptStream's effect runs after ChatArea's useLayoutEffect.
+    // We simulate this two-phase behavior with two rerenders. We spy on scrollTo and
     // scrollIntoView — the session-switch fires scrollTo, and the
     // sticky-bottom effect also fires scrollIntoView (wasAtBottom is true
     // after the switch).
@@ -2127,7 +2131,24 @@ describe('Scroll-to-bottom behavior', () => {
       scrollIntoViewSpy.mockClear()
       scrollToSpy.mockClear()
 
-      // Switch to session s2 with different messages.
+      // Phase 1: session changes to s2, but messages are still from s1.
+      // (In the real app, useTranscriptStream's effect hasn't run yet.)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsA}
+          />,
+        )
+      })
+      // scrollTo must NOT have fired — messages are stale.
+      expect(scrollToSpy).not.toHaveBeenCalled()
+
+      // Phase 2: messages arrive for s2 (useTranscriptStream's effect
+      // completes, triggering a re-render with s2's messages).
+      // Clear calls from phase 1.
+      scrollToSpy.mockClear()
       act(() => {
         rerender(
           <ChatArea
@@ -2138,7 +2159,7 @@ describe('Scroll-to-bottom behavior', () => {
         )
       })
 
-      // The session-switch scroll should have fired via scrollTo.
+      // The deferred scroll-to-bottom should now have fired via scrollTo.
       expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView

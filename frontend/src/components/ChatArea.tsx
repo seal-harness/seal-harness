@@ -2568,6 +2568,16 @@ export function ChatArea({
     if (sessionChanged) {
       wasAtBottom.current = true
       pendingScrollToBottom.current = true
+      // Return early — do NOT scroll on this render. The messages prop
+      // is stale: it still reflects the previous session's data because
+      // useTranscriptStream's session-load effect (which fetches the new
+      // session's entries) runs AFTER this useLayoutEffect. Scrolling now
+      // would scroll to the bottom of the WRONG session's content and
+      // clear pendingScrollToBottom, so when the new session's messages
+      // arrive on the next render, no scroll happens. The next render
+      // (triggered by setEntries in useTranscriptStream) will have the
+      // correct messages and will handle the scroll.
+      return
     }
 
     // Scroll to the bottom when a session switch is pending and real
