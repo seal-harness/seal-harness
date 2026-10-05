@@ -21,6 +21,7 @@ module Seal.Gateway.Transcript
   , lastUserMessageAtFast
   , showIso
   , reconEntryToFrontend
+  , trailingConvEntries
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
@@ -192,7 +193,14 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
             tPr3 <- getCurrentTime
             tRc0 <- getCurrentTime
             let reconstructed = reconstruct msgs evs
-                frontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
+                reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
+                -- If entries.jsonl doesn't cover all conversation messages
+                -- (e.g. due to truncation or a crash during recording),
+                -- synthesize frontend entries for the remaining messages so
+                -- they're visible in the web UI instead of silently dropped.
+                maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
+                trailing = trailingConvEntries model fallbackTs maxConvLen msgVals
+                frontend = reconFrontend <> trailing
             tRc1 <- getCurrentTime
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
@@ -346,6 +354,31 @@ teLineToFrontend rawLine =
     , "internal"  .= mInternal
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
+
+-- | Synthesize frontend TranscriptEntry JSON values for conversation
+-- messages that are NOT covered by any 'EntryRecord' (i.e. messages beyond
+-- the maximum @convLen@ across all entries). This handles incomplete
+-- @entries.jsonl@ files (e.g. due to truncation or a crash during
+-- recording) — without this, any conversation messages beyond the last
+-- entry's @convLen@ are silently dropped by 'reconstruct', making them
+-- invisible in the web UI. Each trailing message is converted via
+-- 'convLineToFrontend' (the same function used when @entries.jsonl@ does
+-- not exist at all), so User messages become @request@ entries and
+-- Assistant messages become @response@ entries with the same shape the
+-- frontend's @transcriptToMessages@ expects.
+trailingConvEntries
+  :: Text     -- ^ model label (for the @model@ field in the frontend entry)
+  -> String   -- ^ fallback timestamp (conversation.jsonl carries no timestamps)
+  -> Int      -- ^ maxConvLen — the highest @convLen@ across all entry records
+  -> [A.Value] -- ^ all conversation.jsonl lines (parsed as Aeson values)
+  -> [A.Value] -- ^ frontend TranscriptEntry JSON for the trailing messages
+trailingConvEntries model fallbackTs maxConvLen msgVals =
+  let convCount = length msgVals
+  in if convCount > maxConvLen
+       then zipWith (convLineToFrontend model [] fallbackTs)
+                    [maxConvLen ..]
+                    (drop maxConvLen msgVals)
+       else []
 
 -- | Synthesize a frontend TranscriptEntry from a conversation.jsonl line
 -- (@role@/@content@). User → request; Assistant → response. The
