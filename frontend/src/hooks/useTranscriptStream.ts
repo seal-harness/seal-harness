@@ -318,5 +318,10 @@ export function useTranscriptStream(
     return unsub
   }, [sc])
 
-  return { entries, status, lastError, pendingQuestions, loading, refresh }
+  // WU-3 stubs — WU-4 will replace with real chunk-loading state.
+  return {
+    entries, status, lastError, pendingQuestions, loading, refresh,
+    hasMore: false, totalCount: 0, loadingMore: false,
+    loadOlder: () => {},
+  }
 }

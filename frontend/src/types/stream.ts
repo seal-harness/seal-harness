@@ -137,6 +137,27 @@ export interface ReposChangedEvent {
   type: 'repos-changed'
 }
 
+/** A chunk of transcript entries delivered in response to a `request-entries`
+ *  op. `totalCount` is optional — it is omitted in the error path so the
+ *  client can preserve the last known value. */
+export interface EntriesChunkPayload {
+  entries: TranscriptEntry[]
+  hasMore: boolean
+  totalCount?: number
+  requestBefore: string | null
+}
+
+/** `entries-chunk` server event — carries a chunk of older transcript entries
+ *  in response to a client `request-entries` op. */
+export interface EntriesChunkEvent {
+  type: 'entries-chunk'
+  sessionId: string
+  entries: TranscriptEntry[]
+  hasMore: boolean
+  totalCount: number
+  requestBefore: string | null
+}
+
 export type ServerEvent =
   | HelloEvent
   | EntryEvent
@@ -151,12 +172,14 @@ export type ServerEvent =
   | AgentDefsChangedEvent
   | SkillsChangedEvent
   | ReposChangedEvent
+  | EntriesChunkEvent
 
 // ── Client → Server ────────────────────────────────────────────────────
 
 export type ClientOp =
   | { op: 'focus'; sessionId: string | null }
   | { op: 'focus'; sessionId: string; since: string }
+  | { op: 'request-entries'; sessionId: string; before: string | null; limit: number }
 
 // ── Stream client + hook contracts ──────────────────────────────────────
 
@@ -200,6 +223,10 @@ export interface StreamClient {
   onReposChanged(cb: () => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
+  /** Request a chunk of transcript entries from the server. */
+  requestEntries(sessionId: string, before: string | null, limit: number): void
+  /** Subscribe to entries-chunk events. */
+  onEntriesChunk(cb: (sessionId: string, chunk: EntriesChunkPayload) => void): () => void
 }
 
 export interface SessionActivityState {
@@ -239,6 +266,14 @@ export interface UseTranscriptStream {
    *  the WS stream usually delivers new entries live, but the re-seed
    *  acts as a consistency check. */
   refresh: () => void
+  /** Older entries exist on disk; initialized false. */
+  hasMore: boolean
+  /** Total entries; initialized 0. */
+  totalCount: number
+  /** Fetching older entries; initialized false. */
+  loadingMore: boolean
+  /** Trigger to load the next chunk of older entries. */
+  loadOlder: () => void
 }
 
 export interface UseSessionActivityStream {

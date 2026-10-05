@@ -39,6 +39,9 @@ function fakeClient(): StreamClient & {
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
+    // WU-3 stubs — WU-4 will replace with real implementations.
+    requestEntries: () => {},
+    onEntriesChunk: () => () => {},
     // test drivers:
     pushLists: (s) => { for (const cb of listsCbs) cb(s) },
     pushEntry: (e) => { for (const cb of entryCbs) cb(e) },

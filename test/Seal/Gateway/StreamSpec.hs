@@ -132,3 +132,111 @@ spec = describe "Seal.Gateway.Stream" $ do
   it "extractId returns empty string for missing id field" $ do
     let entry = A.object [Key.fromText "type" .= ("entry" :: T.Text)]
     extractId entry `shouldBe` ""
+
+  -- ── entriesBeforeId ────────────────────────────────────────────────
+  describe "entriesBeforeId" $ do
+    let mkEntries :: [Int] -> [A.Value]
+        mkEntries = map (\i -> A.object [Key.fromText "id" .= T.pack (show i)])
+
+    it "returns entries before the cursor id (exclusive)" $ do
+      entriesBeforeId "3" (mkEntries [0..5]) `shouldBe` Just (mkEntries [0..2])
+
+    it "returns Nothing when the cursor id is not found" $ do
+      entriesBeforeId "99" (mkEntries [0..2]) `shouldBe` Nothing
+
+    it "returns Nothing for an empty list" $ do
+      entriesBeforeId "1" [] `shouldBe` (Nothing :: Maybe [A.Value])
+
+    it "returns Just [] when the cursor is at the head" $ do
+      entriesBeforeId "0" (mkEntries [0..2]) `shouldBe` Just []
+
+    it "returns all-but-last when the cursor is at the tail" $ do
+      entriesBeforeId "2" (mkEntries [0..2]) `shouldBe` Just (mkEntries [0..1])
+
+  -- ── clampLimit ────────────────────────────────────────────────────
+  describe "clampLimit" $ do
+    it "defaults to 50 when Nothing" $
+      clampLimit Nothing `shouldBe` 50
+    it "passes through a value in range" $
+      clampLimit (Just 10) `shouldBe` 10
+    it "clamps 0 to the minimum (1)" $
+      clampLimit (Just 0) `shouldBe` 1
+    it "clamps negative values to the minimum (1)" $
+      clampLimit (Just (-5)) `shouldBe` 1
+    it "passes through the max (200)" $
+      clampLimit (Just 200) `shouldBe` 200
+    it "clamps values above 200 to the max" $
+      clampLimit (Just 500) `shouldBe` 200
+
+  -- ── ClientMessage FromJSON ────────────────────────────────────────
+  describe "ClientMessage FromJSON" $ do
+    it "parses a focus op with sessionId" $ do
+      let msg = A.encode (object
+            [ "op" .= ("focus" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (CmFocus (FocusOp "s1" Nothing))
+
+    it "parses a focus op with since field" $ do
+      let msg = A.encode (object
+            [ "op" .= ("focus" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            , "since" .= ("e5" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (CmFocus (FocusOp "s1" (Just "e5")))
+
+    it "parses a request-entries op with only sessionId" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (CmRequestEntries (RequestEntriesOp "s1" Nothing Nothing))
+
+    it "parses a request-entries op with before + limit" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            , "before" .= ("e3" :: T.Text)
+            , "limit" .= (50 :: Int)
+            ])
+      A.decode msg `shouldBe` Just (CmRequestEntries (RequestEntriesOp "s1" (Just "e3") (Just 50)))
+
+    it "falls back to CmFocus when op is absent (legacy shape)" $ do
+      let msg = A.encode (object
+            [ "session" .= ("s1" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (CmFocus (FocusOp "s1" Nothing))
+
+  -- ── RequestEntriesOp FromJSON ─────────────────────────────────────
+  describe "RequestEntriesOp FromJSON" $ do
+    it "parses with before + limit" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            , "before" .= ("e3" :: T.Text)
+            , "limit" .= (50 :: Int)
+            ])
+      A.decode msg `shouldBe` Just (RequestEntriesOp "s1" (Just "e3") (Just 50))
+
+    it "parses with only before" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            , "before" .= ("e3" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (RequestEntriesOp "s1" (Just "e3") Nothing)
+
+    it "parses with only limit" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            , "limit" .= (50 :: Int)
+            ])
+      A.decode msg `shouldBe` Just (RequestEntriesOp "s1" Nothing (Just 50))
+
+    it "parses with neither before nor limit" $ do
+      let msg = A.encode (object
+            [ "op" .= ("request-entries" :: T.Text)
+            , "sessionId" .= ("s1" :: T.Text)
+            ])
+      A.decode msg `shouldBe` Just (RequestEntriesOp "s1" Nothing Nothing)

@@ -23,6 +23,7 @@ import type {
   ActivityEvent,
   AskPayload,
   ClientOp,
+  EntriesChunkPayload,
   ListsSnapshot,
   ServerEvent,
   StreamClient,
@@ -64,6 +65,7 @@ class StreamClientImpl implements StreamClient {
   private agentDefsChangedListeners = new Set<() => void>()
   private skillsChangedListeners = new Set<() => void>()
   private reposChangedListeners = new Set<() => void>()
+  private entriesChunkListeners = new Set<(sessionId: string, chunk: EntriesChunkPayload) => void>()
 
   constructor(urlOrPromise: string | Promise<string>) {
     if (typeof urlOrPromise === 'string') {
@@ -163,6 +165,23 @@ class StreamClientImpl implements StreamClient {
     this.reposChangedListeners.add(cb)
     return () => {
       this.reposChangedListeners.delete(cb)
+    }
+  }
+
+  requestEntries(sessionId: string, before: string | null, limit: number): void {
+    if (this.ws === null || this.ws.readyState !== WebSocket.OPEN) return
+    const op: ClientOp = { op: 'request-entries', sessionId, before, limit }
+    try {
+      this.ws.send(JSON.stringify(op))
+    } catch (e) {
+      this._lastError = e instanceof Error ? e.message : 'send failed'
+    }
+  }
+
+  onEntriesChunk(cb: (sessionId: string, chunk: EntriesChunkPayload) => void): () => void {
+    this.entriesChunkListeners.add(cb)
+    return () => {
+      this.entriesChunkListeners.delete(cb)
     }
   }
 
@@ -324,6 +343,16 @@ class StreamClientImpl implements StreamClient {
       case 'repos-changed':
         for (const cb of this.reposChangedListeners) cb()
         break
+      case 'entries-chunk': {
+        const chunk: EntriesChunkPayload = {
+          entries: event.entries,
+          hasMore: event.hasMore,
+          totalCount: event.totalCount,
+          requestBefore: event.requestBefore,
+        }
+        for (const cb of this.entriesChunkListeners) cb(event.sessionId, chunk)
+        break
+      }
       case 'replay-end':
         if (
           this.focusState.kind === 'focused' &&

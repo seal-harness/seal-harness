@@ -17,8 +17,13 @@ module Seal.Gateway.Stream
   ( runStreamServer
   , StreamGuard (..)
   , FocusOp (..)
+  , RequestEntriesOp (..)
+  , ClientMessage (..)
   , filterAfterId
   , extractId
+  , entriesBeforeId
+  , clampLimit
+  , sendErrorFrame
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -50,7 +55,7 @@ import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
 
-import Seal.Gateway.Types.Stream (FocusOp (..))
+import Seal.Gateway.Types.Stream (FocusOp (..), RequestEntriesOp (..), ClientMessage (..))
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
@@ -243,6 +248,30 @@ extractId v = case v of
     Just (A.String t) -> t
     _                 -> ""
   _ -> ""
+
+-- | Return entries before the entry with id @before@ (exclusive).
+-- Returns 'Nothing' when the id is not found (distinct from
+-- 'filterAfterId' which falls back to all entries on a miss).
+entriesBeforeId :: Text -> [A.Value] -> Maybe [A.Value]
+entriesBeforeId beforeId = go
+  where
+    go [] = Nothing
+    go (v : vs) =
+      if extractId v == beforeId
+        then Just []
+        else case go vs of
+          Just rest -> Just (v : rest)
+          Nothing   -> Nothing
+
+-- | Clamp the limit to [1, 200], defaulting to 50.
+clampLimit :: Maybe Int -> Int
+clampLimit = min 200 . max 1 . fromMaybe 50
+
+-- | Send an error frame to the WS peer. Extracted from the inline
+-- pattern in 'readerLoop' for reuse.
+sendErrorFrame :: Connection -> Text -> IO ()
+sendErrorFrame conn msg = sendTextData conn (A.encode (object
+  [ "type" .= ("error" :: Text), "message" .= msg ]))
 
 -- | Look up a header value from the pending request headers (case-insensitive).
 lookupHeader :: Text -> WS.RequestHead -> Maybe String
