@@ -247,6 +247,7 @@ library
         Seal.Agent.Runtime.Registry
         Seal.Agent.Runtime.Delegation
         Seal.Agent.Runtime.Delegation.Worker
+        Seal.Agent.Runtime.RunRecord
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
@@ -452,6 +453,7 @@ test-suite tests
         Seal.Agent.Runtime.RegistrySpec
         Seal.Agent.Runtime.Delegation.WorkerSpec
         Seal.Agent.Runtime.Delegation.ConcurrentSpec
+        Seal.Agent.Runtime.RunRecordSpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
