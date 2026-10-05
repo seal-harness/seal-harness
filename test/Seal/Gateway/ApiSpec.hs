@@ -25,7 +25,7 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (Header, methodDelete, methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
-  , setRequestBodyChunks )
+  , queryString, setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, removeDirectoryRecursive)
 import System.FilePath ((</>))
@@ -154,6 +154,15 @@ testRequest :: BC.ByteString -> [T.Text] -> Request
 testRequest mth path = defaultRequest
   { requestMethod = mth
   , pathInfo = path
+  }
+
+-- | Build a test GET request with query-string parameters.
+-- Each pair is (key, value); the value is URL-decoded by Wai.
+testRequestWithQuery :: [T.Text] -> [(BC.ByteString, Maybe BC.ByteString)] -> Request
+testRequestWithQuery path qs = defaultRequest
+  { requestMethod = methodGet
+  , pathInfo = path
+  , queryString = qs
   }
 
 -- | Build a POST request with a JSON body. The body is delivered as one
@@ -1060,6 +1069,107 @@ spec = describe "Seal.Gateway.API" $ do
       tsOf firstEntry `shouldBe` Just (A.String "2026-01-01T00:00:00.000Z")
       tsOf (arr !! 1) `shouldBe` Just (A.String "2026-01-01T00:00:00.000Z")
 
+  -- ------------------------------------------------------------------
+  -- GET /api/sessions/<sid>/transcript?limit=N — query-param limit tests
+  -- ------------------------------------------------------------------
+
+  it "GET /api/sessions/<sid>/transcript?limit=2 returns only the 2 most recent entries" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120001-100"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+          convPath = sdir </> "conversation.jsonl"
+      createDirectoryIfMissing True sdir
+      let mkEntry n = A.object
+            [ "kind" A..= ("user" :: T.Text)
+            , "text" A..= T.pack ("msg-" <> show (n :: Int))
+            ]
+          bs = mconcat [A.encode (mkEntry n) <> "\n" | n <- [1..5]]
+      BL.writeFile convPath bs
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequestWithQuery ["api", "sessions", sidTxt, "transcript"]
+          [("limit", Just "2")])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 2
+
+  it "GET /api/sessions/<sid>/transcript?limit=0 returns empty array" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120002-200"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+          convPath = sdir </> "conversation.jsonl"
+      createDirectoryIfMissing True sdir
+      let mkEntry = A.object
+            [ "kind" A..= ("user" :: T.Text)
+            , "text" A..= ("only" :: T.Text)
+            ]
+      BL.writeFile convPath (A.encode mkEntry <> "\n")
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequestWithQuery ["api", "sessions", sidTxt, "transcript"]
+          [("limit", Just "0")])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      arr `shouldBe` []
+
+  it "GET /api/sessions/<sid>/transcript?limit=999 returns all entries when limit > count" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120003-300"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+          convPath = sdir </> "conversation.jsonl"
+      createDirectoryIfMissing True sdir
+      let mkEntry n = A.object
+            [ "kind" A..= ("user" :: T.Text)
+            , "text" A..= T.pack ("msg-" <> show (n :: Int))
+            ]
+          bs = mconcat [A.encode (mkEntry n) <> "\n" | n <- [1..3]]
+      BL.writeFile convPath bs
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequestWithQuery ["api", "sessions", sidTxt, "transcript"]
+          [("limit", Just "999")])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 3
+
+  it "GET /api/sessions/<sid>/transcript without limit returns all entries" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120004-400"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+          convPath = sdir </> "conversation.jsonl"
+      createDirectoryIfMissing True sdir
+      let mkEntry n = A.object
+            [ "kind" A..= ("user" :: T.Text)
+            , "text" A..= T.pack ("msg-" <> show (n :: Int))
+            ]
+          bs = mconcat [A.encode (mkEntry n) <> "\n" | n <- [1..4]]
+      BL.writeFile convPath bs
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 4
   it "POST /api/sessions/<sid>/send returns 200 with {kind:assistant}" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "sess1", "send"]
