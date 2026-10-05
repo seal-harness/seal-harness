@@ -393,6 +393,32 @@ try {
 
 ---
 
+### 6. Diagnose Before Implementing (Complex Tasks)
+
+For complex tasks — multi-file changes, non-obvious behavior, performance
+issues, or anything where the root cause is unclear — add debug/logging
+statements or diagnostic tests first to confirm your understanding of the
+actual problem before writing the implementation. Do not implement based on
+assumptions.
+
+```text
+1. INSTRUMENT: Add debug output, logging, or a diagnostic test that reveals
+   the actual behavior at runtime.
+2. OBSERVE: Run the instrumented code and confirm what is actually happening
+   — not what you assumed is happening.
+3. IMPLEMENT: Write the fix based on confirmed understanding.
+4. CLEAN UP: Remove temporary debug statements, keeping only
+   production-appropriate logging.
+```
+
+This is especially important when:
+- A bug's root cause is not immediately obvious from reading the code
+- Behavior depends on runtime state, concurrency, or external systems
+- The fix could have side effects that need to be verified
+- Multiple plausible explanations exist for the observed behavior
+
+---
+
 ## File Organization
 
 Follow `docs/SERVICE_CREATION_GUIDE.md`:
