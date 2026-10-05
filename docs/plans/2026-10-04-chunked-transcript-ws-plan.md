@@ -52,9 +52,14 @@
 - `frontend/src/hooks/useTranscriptStream.ts` — replace HTTP seed with WS chunk requests, `hasMore`/`totalCount`/`loadingMore`/`loadOlder` state, `CachedTranscript` type, `prependChunkEntries` function, WS status reset, response matching by sessionId + requestBefore, empty-chunk guard, initial-chunk reconnect, `refresh()` merge semantics
 - `frontend/src/hooks/__tests__/useStreams.test.ts` — tests (note: actual test file is `useStreams.test.ts`, not `useTranscriptStream.test.ts`)
 
+**Perf instrumentation (design §6.2 acceptance criteria 1-3):**
+- Repurpose the existing `perf.begin('transcript.seed')` timer: wrap the initial `requestEntries(sessionId, null, CHUNK_SIZE)` call and complete it in the `onEntriesChunk` handler when `requestBefore === null`. This measures time-to-first-entry.
+- Add `perf.begin('transcript.loadOlder')` around the load-older `requestEntries` call; complete it in the `onEntriesChunk` handler when `requestBefore !== null`.
+- Record `entries-chunk` byte size: in the `onEntriesChunk` handler, call `perf.record('entries-chunk', { meta: { bytes: JSON.stringify(chunk).length, count: chunk.entries.length } })`.
+
 **TDD:**
 - RED: Test initial load (latest chunk via WS), load older (prepend via `prependChunkEntries`), session switch (old response ignored), cache hit (shows cached + metadata), live entry during partial load, `loadingMore` reset on WS disconnect, empty-chunk guard, initial-chunk reconnect, `prependChunkEntries` dedup (older entry already in array → dropped), `prependChunkEntries` preserves ascending order, `refresh()` merges latest chunk with existing older entries
-- GREEN: Implement hook changes + `prependChunkEntries`
+- GREEN: Implement hook changes + `prependChunkEntries` + perf timers (`perf.begin('transcript.seed')` around initial chunk request, `perf.begin('transcript.loadOlder')` around load-older request, `perf.record('entries-chunk', { meta: { bytes } })` in the `onEntriesChunk` handler)
 - REFACTOR: Extract `prependChunkEntries` as exported pure function for testability
 
 **Dependencies:** WU-3 (needs `StreamClient.requestEntries`, `onEntriesChunk`, new types)
@@ -83,6 +88,7 @@
 - Run `cd frontend && npx vitest run && npx tsc --noEmit` (frontend tests + type check)
 - Run `cd frontend && npm run build` (production build)
 - Verify no full-transcript HTTP fetch on tab switch (test assertion or manual check)
+- Verify perf metrics meet design §6.2 acceptance criteria: initial chunk payload < 60 KB (`entries-chunk` byte size), time-to-first-entry < 50 ms (`transcript.seed` timer), load-older round-trip < 100 ms (`transcript.loadOlder` timer). Check via PerfOverlay or perf log output.
 
 **Dependencies:** WU-1, WU-2, WU-3, WU-4, WU-5 (all must be complete)
 **Verification:** `make check` green, frontend build green
