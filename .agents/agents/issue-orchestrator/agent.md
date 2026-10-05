@@ -299,6 +299,9 @@ Run: git diff main..HEAD -- ${fileScope.join(' ')}
    - New patterns discovered during implementation
    - Updated SERVICE-INVENTORY.md entries
    Pass this context document to every subsequent coder subagent alongside the work unit spec.
+7. **Diagnose before implementing**: For complex work units where the root cause
+   or correct behavior is non-obvious, instruct the coder to add debug/logging
+   or diagnostic tests first and confirm understanding before implementing.
 
 ### Phase 3.5: Final Comprehensive Review
 

@@ -71,6 +71,11 @@ orchestration pipeline is followed regardless of which skill initiated the work.
 - **Context recovery**: Approved plans, project context, and execution
   state persist to disk. If context is lost mid-execution, reload from
   the persisted plan and execution-state files.
+- **Diagnose before implementing**: For complex tasks (multi-file, non-obvious
+  behavior, performance issues, anything where the root cause is unclear), add
+  debug/logging statements or diagnostic tests first to confirm your
+  understanding of the actual problem before writing the implementation. Do not
+  implement based on assumptions — instrument, observe, then fix.
 
 # Seal Harness — Agent Guide
 
