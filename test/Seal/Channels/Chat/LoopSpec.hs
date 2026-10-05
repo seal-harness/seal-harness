@@ -32,7 +32,7 @@ import Seal.Channels.Chat.Types
   , defaultGatewayConfig
   )
 import Seal.Channels.Chat.WsClient (WsClient (..))
-import Seal.Gateway.Types.Core (SessionId, mkSessionId)
+import Seal.Gateway.Types.Core (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 
 -- | A mock 'ChatChannel' that records every send, sendWithId, and edit.
@@ -291,6 +291,25 @@ spec = do
     it "returns empty for missing question" $ do
       let val = A.object ["id" .= ("q1" :: Text)]
       extractAskQuestion val `shouldBe` ""
+
+
+  describe "extractThinkingSessionIds" $ do
+    it "extracts valid session IDs from the thinkingSessionIds array" $ do
+      let val = A.object
+            [ "type" .= ("lists" :: Text)
+            , "thinkingSessionIds" .= ["abc-123" :: Text, "def-456" :: Text]
+            ]
+      extractThinkingSessionIds val `shouldBe` [mkSid "abc-123", mkSid "def-456"]
+
+    it "returns empty list when thinkingSessionIds is missing" $ do
+      let val = A.object ["type" .= ("lists" :: Text)]
+      extractThinkingSessionIds val `shouldBe` []
+
+    it "filters out invalid session IDs" $ do
+      let val = A.object
+            [ "thinkingSessionIds" .= ["valid-id" :: Text, ".invalid" :: Text]
+            ]
+      extractThinkingSessionIds val `shouldBe` [mkSid "valid-id"]
 
   describe "extractToolName" $ do
     it "extracts the tool field from a tool-call activity" $ do
@@ -723,3 +742,67 @@ spec = do
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
 
+    it "SeLists seeds thinking tabs from snapshot — idle after lists notifies" $ do
+      -- The core fix: when a SeLists event arrives (e.g. on WS connect),
+      -- the thinkingSessionIds from the snapshot seed the ThinkingTabs
+      -- set. This means tabs that were already thinking BEFORE the WS
+      -- connection was established will still trigger a notification when
+      -- they finish (idle event arrives, wasThinking is true).
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+          listsVal = A.object
+            [ "type" .= ("lists" :: T.Text)
+            , "thinkingSessionIds" .= [sessionIdText otherSid]
+            ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      -- Simulate the SeLists event arriving on WS connect (no prior
+      -- thinking event was received — the turn started before WS connect).
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeLists listsVal)
+      -- Now the idle event arrives — should notify because the thinking
+      -- set was seeded from the lists snapshot.
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "finished thinking")
+
+    it "SeLists without thinkingSessionIds does not seed thinking tabs" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+          listsVal = A.object
+            [ "type" .= ("lists" :: T.Text)
+            , "thinkingSessionIds" .= ([] :: [T.Text])
+            ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeLists listsVal)
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
