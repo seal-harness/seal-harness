@@ -560,7 +560,8 @@ concurrentSubagentSpec = describe "concurrent subagent (batch AGENT_START, real 
       length startResults `shouldBe` 1
       let startText = textOf (firstResult startResults)
       -- 3 result lines (one per child), all "running" (async return)
-      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls == 3)
+      -- The result also includes a one-line anti-polling guidance note.
+      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls >= 3)
       startText `shouldSatisfy` ("running" `T.isInfixOf`)
       -- No errors
       isErrorOf (firstResult startResults) `shouldBe` False
@@ -620,7 +621,8 @@ concurrentSubagentSpec = describe "concurrent subagent (batch AGENT_START, real 
       length startResults `shouldBe` 1
       let startText = textOf (firstResult startResults)
       -- 3 result lines, all "running" (async return)
-      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls == 3)
+      -- The result also includes a one-line anti-polling guidance note.
+      T.lines (T.strip startText) `shouldSatisfy` (\ls -> length ls >= 3)
       startText `shouldSatisfy` ("running" `T.isInfixOf`)
       isErrorOf (firstResult startResults) `shouldBe` False
       -- The AGENT_START result should appear quickly (the async return
