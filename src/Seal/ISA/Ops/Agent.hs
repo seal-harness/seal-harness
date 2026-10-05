@@ -41,7 +41,10 @@ module Seal.ISA.Ops.Agent
   , AgentWorkerBuilder
   , AgentStartWiring (..)
   , AgentStartGate (..)
+  , SpawnMode (..)
+  , parseSpawnMode
   , gateOpen
+  , encodeForegroundResults
   ) where
 
 import Control.Monad (join)
@@ -73,6 +76,7 @@ import Seal.Agent.Runtime.Delegation
   , DelegateInput (..)
   , SpawnInfo (..)
   , SpawnPauseFlag
+  , runDelegate
   , ParentActivity
   , SubagentId (..)
   , resolveDelegationConfig
@@ -550,6 +554,20 @@ data AgentStartGate = AgentStartGate
 gateOpen :: AgentStartGate
 gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
 
+-- | The spawn mode parsed from the @mode@ field of @AGENT_MANAGE start@.
+-- @foreground@ blocks and returns results in-band; @background@ (the
+-- default) forks children and delivers completion via push notification.
+data SpawnMode = SpawnModeForeground | SpawnModeBackground
+  deriving stock (Eq, Show)
+
+-- | Parse the @mode@ field from the input value. Defaults to
+-- 'SpawnModeBackground' when absent or unrecognized.
+parseSpawnMode :: Value -> SpawnMode
+parseSpawnMode v =
+  case textFieldMaybe "mode" v of
+    Just "foreground" -> SpawnModeForeground
+    _                 -> SpawnModeBackground
+
 -- | Parse the model's input into a 'DelegateInput'. Single mode requires
 -- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
 parseInput :: Value -> IO (Either Text DelegateInput)
@@ -695,6 +713,48 @@ handleStart wiring v = do
   case input of
     Left err -> pure (OpResult [TrpText err] True (object []))
     Right di -> do
+      let mode = parseSpawnMode v
+      case mode of
+        SpawnModeForeground -> handleStartForeground wiring v di
+        SpawnModeBackground -> handleStartBackground wiring v di
+
+-- | Handle the start action in foreground (blocking) mode. Calls
+-- 'runDelegate' (synchronous) and returns the ChildResult(s) directly as
+-- the tool result text. No sidecar append — the result is in-band.
+handleStartForeground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
+handleStartForeground wiring _v di = do
+  cfg <- liftIO (aswConfig wiring)
+  let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
+      runtime = aswRuntime wiring
+      resolver task = do
+        mResolve <- resolveTask (aswDefBackend wiring)
+                                runtime
+                                (aswParentDepth wiring)
+                                orchEnabled
+                                (aswWorker wiring)
+                                task
+        case mResolve of
+          Left err -> pure (Left err)
+          Right (def, worker) -> do
+            childSid <- aswMintSession wiring
+            pure (Right (def, worker, childSid))
+  eResults <- liftIO (runDelegate
+                        cfg
+                        (aswPauseFlag wiring)
+                        (aswParentActivity wiring)
+                        (aswParentDepth wiring)
+                        di
+                        resolver)
+  case eResults of
+    Left err -> pure (OpResult [TrpText err] True (object []))
+    Right results ->
+      pure (OpResult [TrpText (encodeForegroundResults results)] False
+             (object ["results" .= fmap toJSONChildResult results]))
+
+-- | Handle the start action in background (async) mode. Forks children,
+-- returns immediately with per-child SpawnInfo. Existing behavior.
+handleStartBackground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
+handleStartBackground wiring _v di = do
       cfg <- liftIO (aswConfig wiring)
       let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           runtime = aswRuntime wiring
@@ -799,7 +859,7 @@ agentManageOp :: AgentStartWiring -> Opcode
 agentManageOp wiring = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — returns immediately with per-child subagent_id + child_session), status (check one agent — includes summary + child_session + exit_reason after completion; wait at least 60 seconds between status checks on the same subagent to avoid cluttering the transcript), stop (kill agent), interrupt (cooperative stop)."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents), status (check one agent — includes summary + child_session + exit_reason after completion), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately with subagent_id + child_session and delivers completion via push notification."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -807,6 +867,11 @@ agentManageOp wiring = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
               , "description" .= ("Operation to perform." :: Text)
+              ]
+          , fromText "mode" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["foreground", "background"] :: [Text])
+              , "description" .= ("Spawn mode for start: \"foreground\" blocks until children complete and returns results in-band; \"background\" (default) returns immediately and delivers completion via push notification." :: Text)
               ]
           , fromText "id" .= object
               [ "type" .= ("string" :: Text)
@@ -1052,6 +1117,41 @@ toJSONSpawnInfo si = object
   [ "subagent_id"   .= subagentIdText (siSubagentId si)
   , "child_session" .= sessionIdText (siChildSession si)
   , "status"        .= ("running" :: Text)
+  ]
+
+-- | Render the foreground ChildResult list as a text block for the model.
+-- One block per child with status, exit reason, child session, and summary.
+encodeForegroundResults :: [ChildResult] -> Text
+encodeForegroundResults [] = "(no children spawned)"
+encodeForegroundResults results = T.intercalate "\n\n" (map renderOne results)
+  where
+    renderOne r =
+      let sid = subagentIdText (crSubagentId r)
+          status = T.pack (show (crStatus r))
+          exitReason = T.pack (show (crExitReason r))
+          mSummary = crSummary r
+          mChildSession = sessionIdText <$> crChildSession r
+          header = "[subagent " <> sid <> " completed] status=" <> status
+                     <> " exit=" <> exitReason
+          sessionLine = case mChildSession of
+            Just cs -> " child_session=" <> cs
+            Nothing -> ""
+          summaryLine = case mSummary of
+            Just s  -> "\n" <> s
+            Nothing -> case crError r of
+              Just e  -> "\nerror: " <> e
+              Nothing -> ""
+      in header <> sessionLine <> summaryLine
+
+-- | Encode a 'ChildResult' as JSON for the 'orRecorded' payload.
+toJSONChildResult :: ChildResult -> Value
+toJSONChildResult r = object
+  [ "subagent_id"   .= subagentIdText (crSubagentId r)
+  , "status"        .= T.pack (show (crStatus r))
+  , "exit_reason"   .= T.pack (show (crExitReason r))
+  , "summary"       .= crSummary r
+  , "child_session" .= fmap sessionIdText (crChildSession r)
+  , "duration_seconds" .= crDurationSeconds r
   ]
 
 -- | Build the user-role harness message appended to the parent's

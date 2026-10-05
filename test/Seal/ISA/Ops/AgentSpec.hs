@@ -21,6 +21,7 @@ import Seal.Agent.Runtime.Delegation
   ( ChildExitReason (..), ChildResult (..), ChildStatus (..)
   , ChildWorkerOutcome (..)
   , DelegateInput (..)
+  , runDelegate
   , SpawnInfo (..)
   , defaultDelegationConfig, dcChildTimeoutSeconds
   , newSpawnPauseFlag, setSpawnPaused
@@ -69,6 +70,12 @@ recordingWorker :: IORef Int -> Del.AgentWorkerBuilder
 recordingWorker ref _ _ _ _ = do
   modifyIORef' ref (+1)
   pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
+-- | A worker that returns a fixed summary string and completes. Used by
+-- foreground mode tests where we want a specific summary text.
+recordingWorker' :: Text -> Del.AgentWorkerBuilder
+recordingWorker' summary _ _ _ _ =
+  pure (ChildWorkerOutcome (Just summary) CerCompleted 0 0 (Just (mkSystemSessionId "child")))
 
 -- | A worker that tracks the maximum number of concurrent executions.
 -- Each child increments a counter on entry, sleeps briefly so overlaps are
@@ -796,6 +803,99 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           aiStatus inst `shouldBe` Stopped
           aiResult inst `shouldBe` Just result
         Nothing -> expectationFailure "instance not found in registry"
+
+  describe "runDelegate (foreground/sync core)" $ do
+    it "returns ChildResult with completed status for a successful worker" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker' "foreground done"
+                                        , mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+        Right [result] -> do
+          crStatus result `shouldBe` CsCompleted
+          crSummary result `shouldBe` Just "foreground done"
+          crExitReason result `shouldBe` CerCompleted
+        Right _ -> expectationFailure "expected exactly one result"
+
+    it "returns ChildResult with error status for a crashing worker" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          crashingWorker :: Del.AgentWorkerBuilder
+          crashingWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
+          resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right [result] -> crStatus result `shouldBe` CsError
+        _ -> expectationFailure "expected Right with one error result"
+
+    it "batch foreground mode returns results for all children" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
+          tasks = [mkTask i | i <- [1..3 :: Int]]
+          input = DiBatch tasks
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker' "done"
+                                        , mkSystemSessionId "child"))
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right results -> length results `shouldBe` 3
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+
+    it "resolve error returns CsError" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          resolver _task = pure (Left "agent def not found: nope")
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right [result] -> do
+          crStatus result `shouldBe` CsError
+          crError result `shouldBe` Just "agent def not found: nope"
+        _ -> expectationFailure "expected Right with one error result"
+
+  describe "parseSpawnMode" $ do
+    it "defaults to background when mode field is absent" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text)])
+        `shouldBe` SpawnModeBackground
+    it "parses foreground mode" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("foreground" :: Text)])
+        `shouldBe` SpawnModeForeground
+    it "parses background mode explicitly" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("background" :: Text)])
+        `shouldBe` SpawnModeBackground
+    it "defaults to background for unrecognized mode" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("bogus" :: Text)])
+        `shouldBe` SpawnModeBackground
+
+  describe "encodeForegroundResults" $ do
+    it "renders a completed result with status and summary" $ do
+      let result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsCompleted
+            , crSummary = Just "task completed successfully"
+            , crExitReason = CerCompleted
+            , crDurationSeconds = 1.5
+            , crSubagentId = Del.SubagentId "sa-a1-00000001"
+            , crTokensInput = 100
+            , crTokensOutput = 50
+            , crToolTrace = []
+            , crError = Nothing
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just (mkSystemSessionId "child")
+            }
+          text = encodeForegroundResults [result]
+      T.isInfixOf "sa-a1-00000001" text `shouldBe` True
+      T.isInfixOf "CsCompleted" text `shouldBe` True
+      T.isInfixOf "task completed successfully" text `shouldBe` True
+    it "renders empty list as no children" $ do
+      encodeForegroundResults [] `shouldBe` "(no children spawned)"
 
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do
