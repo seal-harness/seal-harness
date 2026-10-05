@@ -799,7 +799,7 @@ agentManageOp :: AgentStartWiring -> Opcode
 agentManageOp wiring = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — returns immediately with per-child subagent_id + child_session, results arrive via AGENT_STATUS), status (check one agent — includes summary + child_session + exit_reason after completion), stop (kill agent), interrupt (cooperative stop)."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — returns immediately with per-child subagent_id + child_session), status (check one agent — includes summary + child_session + exit_reason after completion; wait at least 60 seconds between status checks on the same subagent to avoid cluttering the transcript), stop (kill agent), interrupt (cooperative stop)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -874,7 +874,7 @@ agentStartOp :: AgentStartWiring -> Opcode
 agentStartOp wiring = TrustedOpcode
   { toName = OpName "AGENT_START"
   , toTrust = Trusted
-  , toDesc = "Spawn one or more child agents asynchronously. Returns immediately with per-child subagent_id + child_session (status=running). Results arrive via AGENT_STATUS or the parent transcript. Single mode: {id, goal, context?, role?, isolate_workdir?}. Batch mode: {tasks: [{id, goal, context?, role?, isolate_workdir?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
+  , toDesc = "Spawn one or more child agents asynchronously. Returns immediately with per-child subagent_id + child_session (status=running). Wait at least 60 seconds between AGENT_STATUS or AGENT_MANAGE status checks on the same subagent to avoid cluttering the transcript. Single mode: {id, goal, context?, role?, isolate_workdir?}. Batch mode: {tasks: [{id, goal, context?, role?, isolate_workdir?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -912,7 +912,7 @@ agentStatusOp :: AgentRuntime -> Opcode
 agentStatusOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STATUS"
   , toTrust = Trusted
-  , toDesc = "Read one running agent's status by subagent_id. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
+  , toDesc = "Read one running agent's status by subagent_id. Wait at least 60 seconds between checks on the same subagent to avoid cluttering the transcript. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
   , toInSchema = singleStringSchema "subagent_id" "The subagent id (from AGENT_START's result)."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") (const (Right ())) . subagentIdField
@@ -1039,6 +1039,8 @@ renderTools (AllowOnly xs) = T.intercalate ", " [ t | OpName t <- Set.toList xs 
 encodeSpawnInfos :: [SpawnInfo] -> Text
 encodeSpawnInfos [] = "(no children spawned)"
 encodeSpawnInfos infos = T.intercalate "\n" (map renderOne infos)
+  <>
+  "\n\nWait at least 60 seconds between AGENT_STATUS or AGENT_MANAGE status checks on the same subagent to avoid cluttering the transcript."
   where
     renderOne si =
       subagentIdText (siSubagentId si) <> " | " <>
