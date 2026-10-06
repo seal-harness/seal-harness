@@ -38,15 +38,6 @@ Agent frameworks are racing to hide what they do. Background steps you can't ins
 
 Security isn't a layer bolted on top. It's the foundation.
 
-**Encrypted secrets vault.** API keys, bearer tokens, and encryption keys
-don't live in plaintext config files or environment variables. They live in
-an [age](https://age-encryption.org)-encrypted vault with public-key
-cryptography and hardware token support (YubiKey, NitroKey). Three unlock
-modes: explicit unlock at startup, automatic unlock on first access, or
-decrypt-from-disk on every operation. Atomic writes — no partial states.
-Rekey support re-encrypts the entire vault with a new key, verified
-byte-for-byte before the old vault is replaced.
-
 **Two trust levels, enforced by the system.** Every opcode is classified:
 
 - **Untrusted** — interacts with the outside world (shell, files, web,
@@ -55,6 +46,15 @@ byte-for-byte before the old vault is replaced.
 - **Trusted** — harness-internal (sessions, scheduling, human
   interaction, state management). In-process, logged in the session
   transcript.
+
+**Encrypted secrets vault.** API keys, bearer tokens, and encryption keys
+don't live in plaintext config files or environment variables. They live in
+an [age](https://age-encryption.org)-encrypted vault with public-key
+cryptography and hardware token support (YubiKey, NitroKey). Three unlock
+modes: explicit unlock at startup, automatic unlock on first access, or
+decrypt-from-disk on every operation. Atomic writes — no partial states.
+Rekey support re-encrypts the entire vault with a new key, verified
+byte-for-byte before the old vault is replaced.
 
 Seal Harness allows you to guarantee complete machine separation between
 the untrusted and trusted environments. Untrusted operations can run on a
@@ -70,7 +70,7 @@ teammate glance at the state? Watch two agents at once? You're back to
 tabbing.
 
 Seal Harness treats every agent session as a first-class, persistent object
-— a **tab** — that multiple channels subscribe to simultaneously.
+— a **tab** — that multiple channels can subscribe to simultaneously.
 
 - **Session transcript is the source of truth.** Web frontend renders the
   transcript directly with full fidelity — every message, tool call, skill
