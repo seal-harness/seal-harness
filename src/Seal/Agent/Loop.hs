@@ -714,13 +714,13 @@ stripToolCallXml t0 =
       t5 = T.replace oFcClose "" t4
       t6 = T.replace oToolOpen "" t5
       t7 = T.replace oToolClose "" t6
-      -- 3. Remove orphan param tags (leaked args wrap key/value in
-      --    \<arg_key\>/\<arg_value\> tags; when the surrounding
-      --    \<invoke\> block was already removed these are strays).
-      t8 = T.replace paramKeyOpen "" t7
-      t9 = T.replace paramKeyClose "" t8
-      t10 = T.replace paramValOpen "" t9
-      t11 = T.replace paramValClose "" t10
+      -- 3. Remove orphan param key+value spans (leaked args wrap key/value
+      --    in arg_key/arg_value tags; when the surrounding <invoke> block
+      --    was already removed these are strays). We must remove the ENTIRE
+      --    key+value span (not just the tags), otherwise the bare key/value
+      --    text is left concatenated — producing garbled output like
+      --    "binarygitargs[...]cwdseal-harness".
+      t11 = dropOrphanParamSpans t7
       -- 5. Remove a trailing unterminated opener (its closer was never
       --    emitted, e.g. a truncation cut mid-block): if an opener
       --    appears in the last maxPartialTagScan chars and no closer
@@ -733,10 +733,6 @@ stripToolCallXml t0 =
     oFcClose     = "</function_calls>"
     oToolOpen    = "<tool_call>"
     oToolClose   = "</tool_call>"
-    paramKeyOpen  = "<arg_key>"
-    paramKeyClose = "</arg_key>"
-    paramValOpen  = "<arg_value>"
-    paramValClose = "</arg_value>"
 
 -- | Remove a complete @\<tool_call>...\<tool_call>\/tool_call\>@ span. The opener
 -- carries no attributes, so this is a plain two-marker scan (unlike
@@ -756,6 +752,64 @@ dropToolCallBlock = go
                  (_, afterCloseRest)
                    | T.null afterCloseRest -> acc  -- no close: leave
                  (_, afterClose)           -> go (before <> T.drop (T.length close) afterClose)
+
+-- | Remove orphan param key+value spans (ARGE...ARGEARGE...ARGE).
+-- When the model emits arg_key/arg_value tags WITHOUT a surrounding
+-- <invoke> block, the 'dropBlocks' pass doesn't fire (no <invoke> to
+-- match). The old code just stripped the tags themselves, leaving the
+-- bare key/value text concatenated — producing garbled output like
+-- "binarygitargs[...]cwdseal-harness". This function removes the
+-- ENTIRE key+value span: from the arg_key opener through the
+-- arg_value closer, including the tags and the content between them.
+--
+-- The scan is non-greedy: each ARGE...ARGE is the key, and the
+-- immediately following ARGE...ARGE is its value. The pair is removed
+-- as a unit. This handles both well-formed pairs and the common case
+-- where the model emits several key/value pairs in sequence.
+dropOrphanParamSpans :: Text -> Text
+dropOrphanParamSpans = go
+  where
+    pkOpen  = "<arg_key>"
+    pkClose = "</arg_key>"
+    pvOpen  = "<arg_value>"
+    pvClose = "</arg_value>"
+    go acc
+      | T.null acc = acc
+      | otherwise =
+          case T.breakOn pkOpen acc of
+            (before, rest)
+              | T.null rest -> acc  -- no more param tags
+              | otherwise ->
+                  let afterPkOpen = T.drop (T.length pkOpen) rest
+                  in case T.breakOn pkClose afterPkOpen of
+                       (_, afterPkCloseRest)
+                         | T.null afterPkCloseRest ->
+                             -- No key close tag — just strip the open tag
+                             -- and continue (defensive: shouldn't happen
+                             -- with well-formed input, but don't loop).
+                             go (before <> T.drop (T.length pkOpen) rest)
+                         | otherwise ->
+                             let afterPkClose = T.drop (T.length pkClose) afterPkCloseRest
+                             in case T.breakOn pvOpen afterPkClose of
+                                  (_, rest2)
+                                    | T.null rest2 ->
+                                        -- No value open tag — strip up to
+                                        -- here and continue.
+                                        go before
+                                    | otherwise ->
+                                        let afterPvOpen = T.drop (T.length pvOpen) rest2
+                                        in case T.breakOn pvClose afterPvOpen of
+                                             (_, afterPvCloseRest)
+                                               | T.null afterPvCloseRest ->
+                                                   -- No value close — strip
+                                                   -- everything from the key
+                                                   -- open onward.
+                                                   go before
+                                               | otherwise ->
+                                                   -- Complete key+value pair
+                                                   -- found: drop it all and
+                                                   -- continue scanning.
+                                                   go before
 
 -- | Remove every complete @open ... close@ span (non-greedy: up to the
 -- FIRST closing tag), including the tags themselves. Unterminated blocks
