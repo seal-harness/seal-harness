@@ -898,6 +898,84 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
     it "renders empty list as no children" $ do
       encodeForegroundResults [] `shouldBe` "(no children spawned)"
 
+  describe "adAllowSpawn enforcement (authorizeStart gate)" $ do
+    let mkGate role orchEnabled allow = AgentStartGate
+          { gEffectiveRole = role
+          , gOrchEnabled = orchEnabled
+          , gAllowSpawn = allow
+          }
+        mkWiring gate = AgentStartWiring
+          { aswDefBackend = error "unused by authorize"
+          , aswRuntime = error "unused by authorize"
+          , aswConfig = error "unused by authorize"
+          , aswPauseFlag = error "unused by authorize"
+          , aswParentActivity = Nothing
+          , aswMintSession = error "unused by authorize"
+          , aswParentDepth = 0
+          , aswWorker = error "unused by authorize"
+          , aswGate = gate
+          , aswPaths = samplePaths
+          , aswParentSession = sampleSession
+          }
+        validInput = object ["id" .= ("a1" :: Text), "goal" .= ("g" :: Text)]
+        auth gate = authorizeStart (mkWiring gate) validInput
+
+    it "Nothing + orchestrator role + switch on ⇒ allowed" $
+      auth (mkGate (Just "orchestrator") True Nothing) `shouldBe` Right ()
+    it "Nothing + leaf role ⇒ leafMsg" $
+      auth (mkGate (Just "leaf") True Nothing) `shouldBe` Left leafMsg
+    it "Nothing + orchestrator role + switch off ⇒ killSwitchMsg" $
+      auth (mkGate (Just "orchestrator") False Nothing) `shouldBe` Left killSwitchMsg
+    it "Just False blocks an orchestrator even with switch on ⇒ allowSpawnBlockedMsg" $
+      auth (mkGate (Just "orchestrator") True (Just False)) `shouldBe` Left allowSpawnBlockedMsg
+    it "Just True allows a leaf role (escape hatch) ⇒ allowed" $
+      auth (mkGate (Just "leaf") True (Just True)) `shouldBe` Right ()
+    it "Just False takes precedence over switch-off (most-specific message)" $
+      auth (mkGate (Just "orchestrator") False (Just False)) `shouldBe` Left allowSpawnBlockedMsg
+    it "Just True takes precedence over switch-off (override wins) ⇒ allowed" $
+      auth (mkGate (Just "orchestrator") False (Just True)) `shouldBe` Right ()
+    it "Just True takes precedence over leaf role ⇒ allowed" $
+      auth (mkGate (Just "leaf") False (Just True)) `shouldBe` Right ()
+
+  describe "encodeSpawnInfos — anti-polling text" $ do
+    it "includes the anti-polling instruction for background spawns" $ do
+      let si = Del.SpawnInfo
+            { Del.siSubagentId = Del.SubagentId "sa-a1-00000001"
+            , Del.siChildSession = mkSystemSessionId "child"
+            , Del.siTaskIndex = 0
+            }
+          text = encodeSpawnInfos [si]
+      ("do NOT call AGENT_MANAGE status" `T.isInfixOf` text) `shouldBe` True
+      ("NO_REPLY" `T.isInfixOf` text) `shouldBe` True
+      ("ALL expected completions" `T.isInfixOf` text) `shouldBe` True
+    it "renders the empty list without the anti-polling block" $ do
+      encodeSpawnInfos [] `shouldBe` "(no children spawned)"
+
+  describe "completionMessage — anti-polling text" $ do
+    let mkResult = ChildResult
+          { crTaskIndex = 0
+          , crStatus = CsCompleted
+          , crSummary = Just "done"
+          , crExitReason = CerCompleted
+          , crDurationSeconds = 1.0
+          , crSubagentId = Del.SubagentId "sa-a1-00000001"
+          , crTokensInput = 0
+          , crTokensOutput = 0
+          , crToolTrace = []
+          , crError = Nothing
+          , crFilesRead = []
+          , crFilesWritten = []
+          , crChildSession = Just (mkSystemSessionId "child")
+          }
+    it "includes the NO_REPLY instruction for late completions" $ do
+      let text = completionMessage mkResult
+      ("NO_REPLY" `T.isInfixOf` text) `shouldBe` True
+      ("final answer" `T.isInfixOf` text) `shouldBe` True
+    it "includes the subagent id and status" $ do
+      let text = completionMessage mkResult
+      ("sa-a1-00000001" `T.isInfixOf` text) `shouldBe` True
+      ("CsCompleted" `T.isInfixOf` text) `shouldBe` True
+
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do
       backend <- noneBackend

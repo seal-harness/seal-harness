@@ -368,6 +368,21 @@ parseTime :: Maybe Text -> UTCTime
 parseTime Nothing    = epochZero
 parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
 
+-- | Parse a boolean from a frontmatter value. Recognizes @true@/@false@
+-- (case-insensitive) and @yes@/@no@; anything else (including absent) is
+-- 'Nothing'.
+parseBoolField :: Maybe Text -> Maybe Bool
+parseBoolField Nothing  = Nothing
+parseBoolField (Just raw) =
+  case T.toLower (T.strip raw) of
+    "true"  -> Just True
+    "yes"   -> Just True
+    "1"     -> Just True
+    "false" -> Just False
+    "no"    -> Just False
+    "0"     -> Just False
+    _       -> Nothing
+
 -- | The epoch fallback for missing/unparseable timestamps.
 epochZero :: UTCTime
 epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)

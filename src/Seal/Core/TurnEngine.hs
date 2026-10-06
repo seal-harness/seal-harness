@@ -52,7 +52,7 @@ import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
 import Seal.Agent.Loop (runTurn, defaultMaxTokens)
-import Seal.Agent.PromptParts (injectAvailableAgents, injectStaticGuidance, leafAgentNote)
+import Seal.Agent.PromptParts (injectAvailableAgents, injectStaticGuidance, leafAgentNote, childAutoAnnounceNote)
 import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
@@ -1223,6 +1223,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
           , aswGate = AgentStartGate
                 { gEffectiveRole = mRole
                 , gOrchEnabled = orchEnabled
+                , gAllowSpawn = adAllowSpawn def
                 }
           , aswPaths = tdPaths td
           , aswParentSession = childSid
@@ -1284,13 +1285,16 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
       credentialTool = either (const True) resolvedCredentialToolGuidance eCfg
       injectAgents = either (const True) resolvedAvailableAgents eCfg
       -- W3 (§3.4): the effective role (def-authoritative, ctRole
-      -- narrowed) + the kill switch decide the CHILD's catalog plane —
-      -- the same predicate the registry's gate used (both planes gated
-      -- together, computed once in the adapter and threaded here). An
-      -- orchestrator child (+ switch on) gets the catalog; a leaf child
-      -- (or switch-off) gets the one-line leaf note.
+      -- narrowed) + the kill switch + the per-def @adAllowSpawn@
+      -- override decide the CHILD's catalog plane — the same predicate
+      -- the registry's gate used (both planes gated together, computed
+      -- once in the adapter and threaded here). An orchestrator child
+      -- (+ switch on) gets the catalog; a leaf child (or switch-off)
+      -- gets the one-line leaf note. @adAllowSpawn = Just True@ widens
+      -- a leaf (escape hatch); @Just False@ narrows an orchestrator.
       effRole = Worker.effectiveRole (adRole agentDef) (ctRole task)
-      canSpawn = effRole == Just "orchestrator" && orchEnabled
+      roleCanSpawn = effRole == Just "orchestrator" && orchEnabled
+      canSpawn = fromMaybe roleCanSpawn (adAllowSpawn agentDef)
       withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool basePrompt
   withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
   withSkills <- if injectCatalog
@@ -1301,7 +1305,11 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
     else if canSpawn
       then do
         agentDefs <- Def.adbList unionDefBackend
-        pure (injectAvailableAgents agentDefs withSkills)
+        -- A spawning child gets the catalog PLUS the auto-announce note
+        -- (it must not busy-poll for its own status — the harness pushes
+        -- its results upward automatically).
+        pure (fmap (\p -> p <> "\n\n" <> childAutoAnnounceNote)
+                   (injectAvailableAgents agentDefs withSkills))
       else pure (Just (maybe leafAgentNote (\p -> p <> "\n\n" <> leafAgentNote) withSkills))
 
 -- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.

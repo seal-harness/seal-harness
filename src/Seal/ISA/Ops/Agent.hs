@@ -44,7 +44,13 @@ module Seal.ISA.Ops.Agent
   , SpawnMode (..)
   , parseSpawnMode
   , gateOpen
+  , authorizeStart
   , encodeForegroundResults
+  , encodeSpawnInfos
+  , completionMessage
+  , killSwitchMsg
+  , leafMsg
+  , allowSpawnBlockedMsg
   ) where
 
 import Control.Monad (join)
@@ -65,7 +71,7 @@ import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
   , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
   )
-import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
+import Seal.Agent.Runtime.Delegation.Worker ()
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , AgentCompletionCallback
@@ -544,17 +550,21 @@ data AgentStartWiring = AgentStartWiring
 -- | The role/switch condition the nested AGENT_START enforces before it
 -- will spawn. Leaf children (and orchestrator children while the kill
 -- switch is off) get a present-but-rejecting op whose authorize returns
--- the dedicated error.
+-- the dedicated error. The per-def @adAllowSpawn@ override is captured in
+-- 'gAllowSpawn': @Just False@ blocks spawning regardless of role; @Just
+-- True@ allows spawning even for a leaf role (escape hatch); @Nothing@
+-- defers to the role-based default.
 data AgentStartGate = AgentStartGate
   { gEffectiveRole :: Maybe Text
   , gOrchEnabled   :: Bool
+  , gAllowSpawn    :: Maybe Bool
   }
 
 -- | The open gate for top-level (operator-authorized) turns: spawning is
 -- governed only by the depth cap, spawn-pause, and per-spawn resolver
 -- checks.
 gateOpen :: AgentStartGate
-gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
+gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True, gAllowSpawn = Nothing }
 
 -- | The spawn mode parsed from the @mode@ field of @AGENT_MANAGE start@.
 -- @foreground@ blocks and returns results in-band; @background@ (the
@@ -602,8 +612,10 @@ parseTask v =
                  | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir"))))
 
 -- | Resolve a task to its def + worker. Returns Left if the def id is
--- invalid, the def doesn't exist, or the effective-role / kill-switch gate
--- rejects the spawn. The session id is NOT minted here — 'spawnOne' in
+-- invalid or the def doesn't exist. The role/kill-switch gate is enforced
+-- at authorize time ('authorizeStart') and in 'buildChildRegistryAdapter'
+-- (which consults the def's @adAllowSpawn@ when building the child's
+-- nested gate). The session id is NOT minted here — 'spawnOne' in
 -- 'runDelegateAsync' mints the session before calling the resolver,
 -- eliminating the double-mint that doubled the collision surface.
 resolveTask
@@ -614,18 +626,14 @@ resolveTask
   -> AgentWorkerBuilder
   -> ChildTask
   -> IO (Either Text (AgentDef, AgentWorkerBuilder))
-resolveTask defBackend _runtime _parentDepth orchEnabled worker task = do
+resolveTask defBackend _runtime _parentDepth _orchEnabled worker task = do
   case mkAgentDefId (ctDefId task) of
     Left err -> pure (Left err)
     Right aid -> do
       mDef <- adbRead defBackend aid
       case mDef of
         Nothing  -> pure (Left ("agent def not found: " <> ctDefId task))
-        Just def -> do
-          let role = effectiveRole (adRole def) (ctRole task)
-          if role == Just "orchestrator" && not orchEnabled
-            then pure (Left killSwitchMsg)
-            else pure (Right (def, worker))
+        Just def -> pure (Right (def, worker))
 
 -- | The dedicated kill-switch error. Distinct from the depth/leaf/pause
 -- messages so the parent transcript distinguishes all spawn-failure causes.
@@ -636,6 +644,14 @@ killSwitchMsg = "Delegation spawning is disabled: delegation.orchestrator_enable
 -- for both the model and the operator.
 leafMsg :: Text
 leafMsg = "AGENT_START is not available to this agent: its definition is a leaf (role: leaf). Ask the operator to grant the orchestrator role if delegation is required."
+
+-- | The dedicated @adAllowSpawn = Just False@ error: the def explicitly
+-- forbids spawning, overriding the role-based default.
+allowSpawnBlockedMsg :: Text
+allowSpawnBlockedMsg =
+  "AGENT_START is not available to this agent: its definition has \
+  \allow_spawn = false. Re-trying will not succeed until the operator \
+  \sets allow_spawn = true on this agent definition."
 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
 -- ran synchronously to completion). Records the instance with status
@@ -665,7 +681,10 @@ parseAgentAction v =
 
 -- | Authorize gate for the `start` action (shared with the legacy
 -- AGENT_START shim). Checks both the input shape (goal or tasks present)
--- and the role/kill-switch gate from the wiring.
+-- and the role/kill-switch/@adAllowSpawn@ gate from the wiring. The
+-- @gAllowSpawn@ override takes precedence: @Just False@ always blocks,
+-- @Just True@ always allows (even a leaf), @Nothing@ defers to the
+-- role-based default.
 authorizeStart :: AgentStartWiring -> Value -> Either Text ()
 authorizeStart wiring v =
   let shapeGate =
@@ -674,10 +693,13 @@ authorizeStart wiring v =
         in if hasGoal || hasTasks
              then Right ()
              else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
-      roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
-        (Just "orchestrator", True) -> Right ()
-        (Just "orchestrator", False) -> Left killSwitchMsg
-        (_, _) -> Left leafMsg
+      roleGate = case gAllowSpawn (aswGate wiring) of
+        Just False -> Left allowSpawnBlockedMsg
+        Just True  -> Right ()
+        Nothing -> case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
+          (Just "orchestrator", True)  -> Right ()
+          (Just "orchestrator", False) -> Left killSwitchMsg
+          (_, _)                       -> Left leafMsg
   in shapeGate *> roleGate
 
 -- | Authorize gate for AGENT_MANAGE — dispatches per-action validation.

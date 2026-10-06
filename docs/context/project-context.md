@@ -21,10 +21,14 @@
 ## Completed Work Units
 | WU | Title | Key Files | Services Created |
 |----|-------|-----------|-----------------|
-| (none yet) | | | |
+| WU-1 | SubagentRunRecord — durable tracking foundation | src/Seal/Agent/Runtime/RunRecord.hs | RunRecordRegistry (STM-backed) |
+| WU-2 | Foreground (blocking) mode for AGENT_MANAGE start | src/Seal/ISA/Ops/Agent.hs | SpawnMode, handleStartForeground |
+| WU-3 | Anti-polling instructions + Phase 2/3 migration + adAllowSpawn | src/Seal/ISA/Ops/Agent.hs, src/Seal/Agent/PromptParts.hs, src/Seal/Core/TurnEngine.hs, src/Seal/Agent/Def/Types.hs, src/Seal/Agent/Def/Workdir.hs | childAutoAnnounceNote, gAllowSpawn gate, allowSpawnBlockedMsg |
 
 ## Established Patterns
 - STM-backed registries: `newtype Registry = Registry (TVar (Map Key Value))`
 - Sidecar completion: forked child threads append to JSONL, turn engine reads at turn start
 - Agent runtime: `AgentRuntime (TVar (Map SubagentId AgentInstance))`
 - Delegation: `runDelegate` (sync) / `runDelegateAsync` (async with forked threads)
+- Spawn gate: `AgentStartGate { gEffectiveRole, gOrchEnabled, gAllowSpawn }` — `gAllowSpawn` (per-def `adAllowSpawn`) overrides role-based default; `authorizeStart` consults it
+- Anti-polling: spawn response + completion message carry NO_REPLY instructions; child prompt gets `childAutoAnnounceNote` when it can spawn
