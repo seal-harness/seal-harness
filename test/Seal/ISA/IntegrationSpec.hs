@@ -762,6 +762,7 @@ spec = describe "Seal.ISA.Integration" $ do
             , aswGate = gateOpen
             , aswPaths = testPaths
             , aswParentSession = sid
+            , aswRunRecords = Nothing
             }
           op = agentStartOp wiring
           reg = Registry.mkRegistry [op]

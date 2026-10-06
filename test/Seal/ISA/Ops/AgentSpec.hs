@@ -346,6 +346,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -382,6 +383,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -414,6 +416,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("nope" :: Text), "goal" .= ("x" :: Text)]))
@@ -446,6 +449,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend (object ["id" .= ("a1" :: Text)]))
       orIsError r `shouldBe` True
@@ -469,6 +473,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("task one" :: Text)]
@@ -497,6 +502,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("t1" :: Text)]
@@ -534,6 +540,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
@@ -561,6 +568,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True]))
@@ -590,6 +598,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
@@ -619,6 +628,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True] ]]))
@@ -916,6 +926,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           , aswGate = gate
           , aswPaths = samplePaths
           , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
           }
         validInput = object ["id" .= ("a1" :: Text), "goal" .= ("g" :: Text)]
         auth gate = authorizeStart (mkWiring gate) validInput

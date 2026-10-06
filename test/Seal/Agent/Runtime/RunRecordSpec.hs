@@ -242,6 +242,49 @@ spec = describe "Seal.Agent.Runtime.RunRecord" $ do
       nPending <- countPendingDescendants reg sampleParentSid
       nPending `shouldBe` 1
 
+  describe "descendant settle (WU-5)" $ do
+    it "shouldDeferDelivery returns True when the child has pending descendants" $ do
+      reg <- newRunRecordRegistry
+      -- parent → child → grandchild (pending)
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let grandchildSid = mkSystemSessionId "grandchild"
+      _grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
+      -- The child has 1 pending descendant → defer
+      n <- countPendingDescendants reg sampleChildSid
+      n `shouldBe` 1
+      shouldDeferDelivery reg sampleChildSid `shouldReturn` True
+
+    it "shouldDeferDelivery returns False when the child has no pending descendants" $ do
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      -- No descendants → don't defer
+      shouldDeferDelivery reg sampleChildSid `shouldReturn` False
+
+    it "shouldDeferDelivery returns False after all descendants complete" $ do
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let grandchildSid = mkSystemSessionId "grandchild"
+      grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
+      now <- getCurrentTime
+      -- Initially defer (1 pending descendant)
+      shouldDeferDelivery reg sampleChildSid `shouldReturn` True
+      -- Complete the grandchild
+      _ <- completeRun reg (rrrRunId grandchild) (rrrGenerationToken grandchild) (mkSampleResult sampleSubagentId2) now
+      -- Now no pending descendants → don't defer
+      shouldDeferDelivery reg sampleChildSid `shouldReturn` False
+
+    it "descendantSettled returns True when a session has no pending descendants" $ do
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      descendantSettled reg sampleChildSid `shouldReturn` True
+
+    it "descendantSettled returns False when a session has pending descendants" $ do
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let grandchildSid = mkSystemSessionId "grandchild"
+      _grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
+      descendantSettled reg sampleChildSid `shouldReturn` False
+
   describe "persistence" $ do
     it "saveRunRecordToDisk writes a JSON file that loadRunRecord can read" $ do
       reg <- newRunRecordRegistry

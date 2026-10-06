@@ -94,6 +94,8 @@ import Seal.Agent.Runtime.Registry
   , agentInstanceBySubagentId
   , interruptAgent, listAgents
   , registerCompletedAgentResult, registerRunningAgent, stopAgent )
+import Seal.Agent.Runtime.RunRecord qualified as RunRecord
+  ( RunRecordRegistry, shouldDeferDelivery )
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Handles.Transcript (appendCompletionToSidecar)
@@ -545,6 +547,12 @@ data AgentStartWiring = AgentStartWiring
   , aswParentSession :: SessionId
     -- ^ The parent's session id (so the completion callback knows which
     -- @conversation.jsonl@ to append to).
+  , aswRunRecords   :: Maybe RunRecord.RunRecordRegistry
+    -- ^ The durable run-record registry (WU-5). When 'Just', the
+    -- completion callback checks 'shouldDeferDelivery' before appending to
+    -- the sidecar — a child with pending descendants has its delivery
+    -- deferred until the descendants settle. 'Nothing' in test wirings
+    -- without the registry (delivery is never deferred).
   }
 
 -- | The role/switch condition the nested AGENT_START enforces before it
@@ -787,14 +795,28 @@ handleStartBackground wiring _v di = do
           callback :: AgentCompletionCallback
           callback result = do
             registerCompletedAgentResult runtime (crSubagentId result) result
-            -- Append the completion message to a sidecar file. The turn
-            -- engine reads this file at the start of the parent's next turn
-            -- and injects the messages into the conversation. This avoids
-            -- interfering with the single-writer daemon's in-memory diff
-            -- state (tfsWritten) during the ongoing turn — writing directly
-            -- to conversation.jsonl while the daemon is active causes the
-            -- daemon's diff to desynchronize, corrupting the transcript.
-            appendCompletionToSidecar paths parentSid (completionMessage result)
+            -- WU-5: descendant settle — if the child has pending
+            -- descendants, defer the completion delivery. The child's
+            -- results would be partial; wait for its descendants to
+            -- settle so the child can synthesize a final summary. When
+            -- the registry is unavailable (tests) or the child has no
+            -- pending descendants, deliver immediately.
+            let mRunRecords = aswRunRecords wiring
+                mChildSession = crChildSession result
+            defer <- case (mRunRecords, mChildSession) of
+              (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
+              _ -> pure False
+            if defer
+              then pure ()  -- delivery deferred until descendants settle
+              else
+                -- Append the completion message to a sidecar file. The turn
+                -- engine reads this file at the start of the parent's next turn
+                -- and injects the messages into the conversation. This avoids
+                -- interfering with the single-writer daemon's in-memory diff
+                -- state (tfsWritten) during the ongoing turn — writing directly
+                -- to conversation.jsonl while the daemon is active causes the
+                -- daemon's diff to desynchronize, corrupting the transcript.
+                appendCompletionToSidecar paths parentSid (completionMessage result)
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =
             registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)

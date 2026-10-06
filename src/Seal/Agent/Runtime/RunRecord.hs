@@ -30,6 +30,8 @@ module Seal.Agent.Runtime.RunRecord
   , listRunsForParent
   , findLatestRunForChild
   , countPendingDescendants
+  , descendantSettled
+  , shouldDeferDelivery
   , cancelRunsForParent
     -- * Lifecycle hooks
   , registerEndedHook
@@ -422,6 +424,23 @@ countPendingDescendants reg parentSid = do
   pure (length (filter (\r -> rrrParentSessionKey r == parentSid
                           && isNothing (rrrEndedAt r))
                        (Map.elems records)))
+
+-- | Check whether a session has any pending (non-terminal) descendants.
+-- Returns 'True' when there are pending runs whose parent is this session.
+descendantSettled :: RunRecordRegistry -> SessionId -> IO Bool
+descendantSettled reg sid = do
+  n <- countPendingDescendants reg sid
+  pure (n == 0)
+
+-- | Check whether a child's completion delivery should be deferred until
+-- its descendants settle. Returns 'True' when the child session still has
+-- pending descendants (the child's results would be partial). Once all
+-- descendants reach a terminal state, this returns 'False' and the child's
+-- completion can be delivered upward.
+shouldDeferDelivery :: RunRecordRegistry -> SessionId -> IO Bool
+shouldDeferDelivery reg childSid = do
+  settled <- descendantSettled reg childSid
+  pure (not settled)
 
 -- | Cancel all pending runs for a parent session, recursively walking the
 -- parent→child linkage so grandchildren (and deeper descendants) are also

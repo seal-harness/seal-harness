@@ -1030,6 +1030,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswGate = gateOpen
     , aswPaths = tdPaths td
     , aswParentSession = parentSid
+    , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
@@ -1227,6 +1228,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
                 }
           , aswPaths = tdPaths td
           , aswParentSession = childSid
+          , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
           }
       nestedWorker = case tdMkWorker td of
         Just stub

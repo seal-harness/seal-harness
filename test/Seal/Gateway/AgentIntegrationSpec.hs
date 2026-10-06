@@ -1058,6 +1058,7 @@ gateTestWiring gate = do
         , spCache = "/tmp/seal-test/cache"
         }
     , aswParentSession = mkSystemSessionId "gate-parent"
+            , aswRunRecords = Nothing
     }
 
 -- | AGENT_DEF_WRITE args with a role.
