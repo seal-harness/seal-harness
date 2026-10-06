@@ -259,7 +259,6 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing
-    , adAllowSpawn = Nothing
             , adCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
             , adUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
             , adSession = sampleSession

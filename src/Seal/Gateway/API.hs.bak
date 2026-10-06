@@ -1223,7 +1223,6 @@ stampAgentDef _deps aid v mExisting = do
     , adGroup     = group_
     , adRole      = role_
     , adDescription = description_
-    , adAllowSpawn = Nothing
     , adCreatedAt = createdAt
     , adUpdatedAt = now
     , adSession   = session

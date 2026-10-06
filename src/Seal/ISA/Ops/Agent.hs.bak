@@ -214,7 +214,6 @@ handleDefWrite backend session v = do
                   , adGroup = groupField v (Just existing)
                   , adRole = roleField v
                   , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
-, adAllowSpawn = Nothing
                   , adUpdatedAt = now
                   }
               , False
@@ -230,7 +229,6 @@ handleDefWrite backend session v = do
                   , adGroup = groupField v Nothing
                   , adRole = roleField v
                   , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
-, adAllowSpawn = Nothing
                   , adCreatedAt = now
                   , adUpdatedAt = now
                   , adSession = session

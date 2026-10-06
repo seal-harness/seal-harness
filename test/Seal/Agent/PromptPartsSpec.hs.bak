@@ -101,7 +101,6 @@ catalogDef defId mGroup mRole mDesc = case mkAgentDefId defId of
     , adGroup = mGroup
     , adRole = mRole
     , adDescription = mDesc
-    , adAllowSpawn = Nothing
     , adCreatedAt = sampleCatalogTime
     , adUpdatedAt = sampleCatalogTime
     , adSession = mkSystemSessionId "catalog"
