@@ -285,6 +285,51 @@ spec = describe "Seal.Agent.Runtime.RunRecord" $ do
       _grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
       descendantSettled reg sampleChildSid `shouldReturn` False
 
+  describe "announce retry (WU-6)" $ do
+    it "recordAnnounceAttempt increments the retry count and records the timestamp" $ do
+      reg <- newRunRecordRegistry
+      rec <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let runId = rrrRunId rec
+      now1 <- getCurrentTime
+      _ <- recordAnnounceAttempt reg runId now1
+      mRec1 <- findLatestRunForChild reg sampleChildSid
+      case mRec1 of
+        Just r1 -> do
+          rrrAnnounceRetryCount r1 `shouldBe` 1
+          rrrLastAnnounceRetryAt r1 `shouldBe` Just now1
+        Nothing -> expectationFailure "record not found"
+      now2 <- getCurrentTime
+      _ <- recordAnnounceAttempt reg runId now2
+      mRec2 <- findLatestRunForChild reg sampleChildSid
+      case mRec2 of
+        Just r2 -> rrrAnnounceRetryCount r2 `shouldBe` 2
+        Nothing -> expectationFailure "record not found"
+
+    it "recordAnnounceAttempt is a no-op on a missing run id" $ do
+      reg <- newRunRecordRegistry
+      now <- getCurrentTime
+      mR <- recordAnnounceAttempt reg "nonexistent-run" now
+      mR `shouldBe` Nothing
+
+    it "computeAnnounceBackoff returns the base delay at attempt 0" $
+      computeAnnounceBackoff 0 `shouldBe` 1.0
+
+    it "computeAnnounceBackoff grows exponentially with the attempt count" $ do
+      computeAnnounceBackoff 1 `shouldBe` 2.0
+      computeAnnounceBackoff 2 `shouldBe` 4.0
+      computeAnnounceBackoff 3 `shouldBe` 8.0
+
+    it "maxAnnounceRetries is 3" $
+      maxAnnounceRetries `shouldBe` 3
+
+    it "announceRetriesExhausted returns True when retry count >= max" $ do
+      announceRetriesExhausted 3 `shouldBe` True
+      announceRetriesExhausted 4 `shouldBe` True
+
+    it "announceRetriesExhausted returns False when retry count < max" $ do
+      announceRetriesExhausted 0 `shouldBe` False
+      announceRetriesExhausted 2 `shouldBe` False
+
   describe "persistence" $ do
     it "saveRunRecordToDisk writes a JSON file that loadRunRecord can read" $ do
       reg <- newRunRecordRegistry

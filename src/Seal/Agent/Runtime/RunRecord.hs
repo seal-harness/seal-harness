@@ -32,6 +32,10 @@ module Seal.Agent.Runtime.RunRecord
   , countPendingDescendants
   , descendantSettled
   , shouldDeferDelivery
+  , maxAnnounceRetries
+  , computeAnnounceBackoff
+  , announceRetriesExhausted
+  , recordAnnounceAttempt
   , cancelRunsForParent
     -- * Lifecycle hooks
   , registerEndedHook
@@ -441,6 +445,56 @@ shouldDeferDelivery :: RunRecordRegistry -> SessionId -> IO Bool
 shouldDeferDelivery reg childSid = do
   settled <- descendantSettled reg childSid
   pure (not settled)
+
+----------------------------------------------------------------------------
+-- Announce retry / backoff (WU-6)
+----------------------------------------------------------------------------
+
+-- | The maximum number of announce retry attempts before the completion
+-- is stored for delivery on parent reactivation.
+maxAnnounceRetries :: Int
+maxAnnounceRetries = 3
+
+-- | The base backoff delay (seconds) for the first retry. Subsequent
+-- retries double the delay (exponential backoff: 1s, 2s, 4s).
+announceBackoffBase :: Double
+announceBackoffBase = 1.0
+
+-- | Compute the exponential backoff delay (seconds) for a given attempt
+-- number. Attempt 0 = base, attempt 1 = base * 2, attempt 2 = base * 4,
+-- etc. Capped to avoid overflow on very large attempt counts.
+computeAnnounceBackoff :: Int -> Double
+computeAnnounceBackoff attempt =
+  announceBackoffBase * (2 ^ safeAttempt)
+  where
+    safeAttempt = min attempt 30  -- cap to prevent overflow
+
+-- | Check whether the announce retries are exhausted (the retry count has
+-- reached or exceeded 'maxAnnounceRetries').
+announceRetriesExhausted :: Int -> Bool
+announceRetriesExhausted n = n >= maxAnnounceRetries
+
+-- | Record an announce attempt: increment the retry counter and record
+-- the timestamp. Returns the updated record, or 'Nothing' if the run id
+-- is not found. This is used by the delivery retry loop to track how many
+-- attempts have been made and when the last one occurred.
+recordAnnounceAttempt
+  :: RunRecordRegistry
+  -> RunId
+  -> UTCTime
+  -> IO (Maybe SubagentRunRecord)
+recordAnnounceAttempt reg runId now = do
+  atomically $ do
+    records <- readTVar (rrrRegistry reg)
+    case Map.lookup runId records of
+      Nothing -> pure Nothing
+      Just rec -> do
+        let rec' = rec
+              { rrrAnnounceRetryCount = rrrAnnounceRetryCount rec + 1
+              , rrrLastAnnounceRetryAt = Just now
+              }
+        writeTVar (rrrRegistry reg) (Map.insert runId rec' records)
+        pure (Just rec')
 
 -- | Cancel all pending runs for a parent session, recursively walking the
 -- parent→child linkage so grandchildren (and deeper descendants) are also
