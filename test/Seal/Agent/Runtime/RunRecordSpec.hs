@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.Runtime.RunRecordSpec (spec) where
 
+import Control.Concurrent (forkIO, threadDelay)
 import Data.IORef
 import Data.Maybe (isJust, fromJust)
 import Data.Time.Clock (getCurrentTime)
@@ -329,6 +330,59 @@ spec = describe "Seal.Agent.Runtime.RunRecord" $ do
     it "announceRetriesExhausted returns False when retry count < max" $ do
       announceRetriesExhausted 0 `shouldBe` False
       announceRetriesExhausted 2 `shouldBe` False
+
+  describe "completion signal (WU-7 dual-path)" $ do
+    it "awaitCompletion returns the record after completeRun fills the signal" $ do
+      reg <- newRunRecordRegistry
+      rec <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let runId = rrrRunId rec
+      -- Register a completion signal for this run
+      mSignal <- registerCompletionSignal reg runId
+      mSignal `shouldSatisfy` isJust
+      case mSignal of
+        Nothing -> expectationFailure "signal not registered"
+        Just signal -> do
+          -- Complete the run in a forked thread (simulates async completion)
+          now <- getCurrentTime
+          _ <- forkIO $ do
+            threadDelay 100000  -- 100ms
+            _ <- completeRun reg runId (rrrGenerationToken rec) (mkSampleResult sampleSubagentId) now
+            pure ()
+          -- awaitCompletion blocks until the signal is filled
+          result <- awaitCompletion signal 1000000  -- 1s timeout
+          case result of
+            Just completedRec -> rrrRunId completedRec `shouldBe` runId
+            Nothing -> expectationFailure "awaitCompletion timed out"
+
+    it "awaitCompletion returns Nothing on timeout" $ do
+      reg <- newRunRecordRegistry
+      rec <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let runId = rrrRunId rec
+      mSignal <- registerCompletionSignal reg runId
+      mSignal `shouldSatisfy` isJust
+      case mSignal of
+        Nothing -> expectationFailure "signal not registered"
+        Just signal -> do
+          -- Don't complete the run — awaitCompletion should time out
+          result <- awaitCompletion signal 50000  -- 50ms timeout
+          result `shouldBe` Nothing
+
+    it "registerEndedHook fires on completion (Path B — event listener)" $ do
+      reg <- newRunRecordRegistry
+      hookFired <- newIORef (0 :: Int)
+      registerEndedHook reg (\_ -> modifyIORef' hookFired (+1))
+      rec <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      now <- getCurrentTime
+      _ <- completeRun reg (rrrRunId rec) (rrrGenerationToken rec) (mkSampleResult sampleSubagentId) now
+      readIORef hookFired `shouldReturn` 1
+
+    it "stale generation token is rejected by completeRun" $ do
+      reg <- newRunRecordRegistry
+      rec <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      now <- getCurrentTime
+      let staleToken = Just (GenerationToken 0)  -- wrong token
+      mCompleted <- completeRun reg (rrrRunId rec) staleToken (mkSampleResult sampleSubagentId) now
+      mCompleted `shouldBe` Nothing  -- rejected: stale token
 
   describe "persistence" $ do
     it "saveRunRecordToDisk writes a JSON file that loadRunRecord can read" $ do

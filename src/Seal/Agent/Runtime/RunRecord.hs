@@ -36,6 +36,10 @@ module Seal.Agent.Runtime.RunRecord
   , computeAnnounceBackoff
   , announceRetriesExhausted
   , recordAnnounceAttempt
+    -- * Completion signal (WU-7 dual-path)
+  , CompletionSignal
+  , registerCompletionSignal
+  , awaitCompletion
   , cancelRunsForParent
     -- * Lifecycle hooks
   , registerEndedHook
@@ -296,9 +300,13 @@ instance FromJSON SubagentRunRecord where
 
 -- | The STM-backed registry of run records, keyed by 'RunId'. Thread-safe.
 -- Lifecycle hooks are stored in an 'IORef' list (appended on registration).
+-- Completion signals (WU-7 Path A) are per-run @TMVar@s stored in a
+-- separate @TVar@ map; 'awaitCompletion' blocks on the @TMVar@ while
+-- 'completeRun' and 'cancelRunsForParent' fill it.
 data RunRecordRegistry = RunRecordRegistry
-  { rrrRegistry :: !(TVar (Map RunId SubagentRunRecord))
-  , rrrHooks    :: !(IORef [SubagentRunRecord -> IO ()])
+  { rrrRegistry  :: !(TVar (Map RunId SubagentRunRecord))
+  , rrrHooks     :: !(IORef [SubagentRunRecord -> IO ()])
+  , rrrSignals   :: !(TVar (Map RunId (TMVar SubagentRunRecord)))
   }
 
 -- | Build an empty registry.
@@ -306,7 +314,8 @@ newRunRecordRegistry :: IO RunRecordRegistry
 newRunRecordRegistry = do
   tv <- newTVarIO Map.empty
   hooksRef <- newIORef []
-  pure (RunRecordRegistry tv hooksRef)
+  signalsTv <- newTVarIO Map.empty
+  pure (RunRecordRegistry tv hooksRef signalsTv)
 
 ----------------------------------------------------------------------------
 -- Operations
@@ -393,6 +402,7 @@ completeRun reg runId mToken result now = do
                   , rrrEndedHookEmittedAt = Just now
                   }
             writeTVar (rrrRegistry reg) (Map.insert runId rec' records)
+            fillCompletionSignal reg rec'  -- WU-7 Path A
             pure (Just rec')
   -- Emit lifecycle hooks OUTSIDE the STM transaction (callbacks are IO).
   forM_ mRec $ \rec -> do
@@ -496,6 +506,73 @@ recordAnnounceAttempt reg runId now = do
         writeTVar (rrrRegistry reg) (Map.insert runId rec' records)
         pure (Just rec')
 
+----------------------------------------------------------------------------
+-- Completion signal (WU-7 dual-path detection)
+----------------------------------------------------------------------------
+
+-- | A completion signal (WU-7 Path A): a @TMVar@ that is filled exactly
+-- once when a run reaches a terminal state. A watcher thread can block on
+-- 'awaitCompletion' to detect completion without polling.
+newtype CompletionSignal = CompletionSignal (TMVar SubagentRunRecord)
+
+instance Show CompletionSignal where
+  show _ = "CompletionSignal"
+
+-- | Register a completion signal for a run. Returns 'Just' the signal if
+-- the run exists, or 'Nothing' if the run id is not found. The signal is
+-- filled by 'completeRun' or 'cancelRunsForParent' when the run reaches a
+-- terminal state. Registering twice for the same run returns the same
+-- 'TMVar' (idempotent).
+registerCompletionSignal
+  :: RunRecordRegistry
+  -> RunId
+  -> IO (Maybe CompletionSignal)
+registerCompletionSignal reg runId = do
+  atomically $ do
+    records <- readTVar (rrrRegistry reg)
+    if Map.member runId records
+      then do
+        signals <- readTVar (rrrSignals reg)
+        case Map.lookup runId signals of
+          Just tmv -> pure (Just (CompletionSignal tmv))
+          Nothing -> do
+            tmv <- newEmptyTMVar
+            writeTVar (rrrSignals reg) (Map.insert runId tmv signals)
+            pure (Just (CompletionSignal tmv))
+      else pure Nothing
+
+-- | Block until the completion signal is filled, or the timeout (micro-
+-- seconds) elapses. Returns 'Just' the terminal record on completion, or
+-- 'Nothing' on timeout. Uses 'registerDelay' + 'readTMVar' racing for a
+-- pure STM timeout (no forked threads needed).
+awaitCompletion :: CompletionSignal -> Int -> IO (Maybe SubagentRunRecord)
+awaitCompletion (CompletionSignal tmv) timeoutMicros = do
+  timer <- registerDelay timeoutMicros
+  atomically $ do
+    mRec <- tryReadTMVar tmv
+    case mRec of
+      Just rec -> pure (Just rec)
+      Nothing -> do
+        expired <- readTVar timer
+        if expired
+          then pure Nothing
+          else retry
+
+-- | Fill the completion signal for a run (called by 'completeRun' and
+-- 'cancelRunsForParent'). If no signal is registered, this is a no-op.
+-- If the signal is already filled, this is a no-op (idempotent — the
+-- first completion wins).
+fillCompletionSignal :: RunRecordRegistry -> SubagentRunRecord -> STM ()
+fillCompletionSignal reg rec = do
+  signals <- readTVar (rrrSignals reg)
+  case Map.lookup (rrrRunId rec) signals of
+    Nothing -> pure ()  -- no signal registered
+    Just tmv -> do
+      mExisting <- tryReadTMVar tmv
+      case mExisting of
+        Just _  -> pure ()  -- already filled — first wins
+        Nothing -> putTMVar tmv rec
+
 -- | Cancel all pending runs for a parent session, recursively walking the
 -- parent→child linkage so grandchildren (and deeper descendants) are also
 -- cancelled. Marks each cancelled run as killed and sets the suppress
@@ -546,6 +623,8 @@ cancelRunsForParent reg parentSid now reason = do
                       pending
         newMap = foldr (\r m -> Map.insert (rrrRunId r) r m) records updated
     writeTVar (rrrRegistry reg) newMap
+    -- Fill completion signals for all cancelled runs (WU-7 Path A)
+    forM_ updated (fillCompletionSignal reg)
     pure updated
   -- Emit hooks for cancelled runs
   hooks <- readIORef (rrrHooks reg)
