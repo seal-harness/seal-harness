@@ -1826,3 +1826,90 @@ spec = describe "Seal.Agent.Loop" $ do
       case reqs of
         (firstReq : _) -> length (crMessages firstReq) `shouldBe` 101
         [] -> expectationFailure "provider was not called"
+
+  -- ── Fallback XML tool call parser ────────────────────────────────
+  describe "parseXmlToolCalls (fallback for GLM XML tool calls)" $ do
+    it "extracts a tool call from a proper invoke block with name attribute" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          blocks = rsContent resp
+          -- Should contain a CbToolUse block with name=FILE_READ
+          toolUses = [b | b <- blocks, case b of CbToolUse{} -> True; _ -> False]
+      length toolUses `shouldBe` 1
+      case toolUses of
+        (CbToolUse _ (OpName n) _) : _ -> n `shouldBe` "FILE_READ"
+        _ -> expectationFailure "expected a CbToolUse block"
+
+    it "extracts path argument from invoke block params" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+      case [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False] of
+        (CbToolUse _ _ args) : _ -> do
+         case args of
+           A.Object o ->
+             case KeyMap.lookup (Key.fromText "path") o of
+               Just (A.String p) -> p `shouldBe` "some_file.hs"
+               other -> expectationFailure ("expected path=some_file.hs, got " <> show other)
+           _ -> expectationFailure "expected Object args"
+        _ -> expectationFailure "expected a CbToolUse block"
+
+    it "returns empty text after extracting a tool call from invoke block" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          texts = [t | CbText t <- rsContent resp]
+      -- The invoke block is fully stripped; text should be empty
+      texts `shouldBe` [""]
+
+    it "preserves prose before and after an invoke block" $ do
+      let xml = T.pack ("Reading file now. " ++ "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62" ++ " Done.")
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          texts = [t | CbText t <- rsContent resp]
+          tools = [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False]
+      length tools `shouldBe` 1
+      case texts of
+        [t] -> do
+          T.isPrefixOf "Reading file now." t `shouldBe` True
+          T.isSuffixOf "Done." t `shouldBe` True
+        _ -> expectationFailure ("expected one CbText block, got " <> show (length texts))
+
+
+    it "tag character codes produce correct strings" $ do
+      -- Verify that toEnum-based construction matches hex-escape strings
+      let akOpenCode = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+          akOpenLit = T.pack "\60arg_key\62"
+      akOpenCode `shouldBe` akOpenLit
+      let akCloseCode = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+          akCloseLit = T.pack "\60/arg_key\62"
+      akCloseCode `shouldBe` akCloseLit
+      let avOpenCode = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+          avOpenLit = T.pack "\60arg_value\62"
+      avOpenCode `shouldBe` avOpenLit
+      let avCloseCode = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+          avCloseLit = T.pack "\60/arg_value\62"
+      avCloseCode `shouldBe` avCloseLit
+
+    it "findAllInvokeCalls directly extracts tool call from invoke block" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          calls = findAllInvokeCalls 0 xml
+      length calls `shouldBe` 1
+      case calls of
+        (CbToolUse _ (OpName n) args) : _ -> do
+          n `shouldBe` "FILE_READ"
+          case args of
+            A.Object o -> case KeyMap.lookup (Key.fromText "path") o of
+              Just (A.String p) -> p `shouldBe` "some_file.hs"
+              _ -> expectationFailure "path not found in args"
+            _ -> expectationFailure "args is not an Object"
+        _ -> expectationFailure "no calls found"
+
+    it "does NOT extract from invoke blocks without name attribute" $ do
+      -- <invoke "FILE_READ"> without name= should be stripped, not parsed
+      let xml = T.pack "\60invoke \"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62a.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          tools = [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False]
+      tools `shouldBe` []
