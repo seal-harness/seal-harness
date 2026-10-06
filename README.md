@@ -72,18 +72,13 @@ tabbing.
 Seal Harness treats every agent session as a first-class, persistent object
 — a **tab** — that multiple channels subscribe to simultaneously.
 
-- **The web frontend is the source of truth.** It renders the transcript
-  directly with full fidelity — every message, tool call, skill load, and
-  permission prompt, with channel attribution, timestamps, raw JSON
+- **Session transcript is the source of truth.** Web frontend renders the
+  transcript directly with full fidelity — every message, tool call, skill
+  load, and permission prompt, with channel attribution, timestamps, raw JSON
   inspection, and branching from any point. This is where you do deep work.
-- **Append-only channels (Telegram, Signal) subscribe to the tab.** Each
-  channel is a live view: it sees new messages and replies as they happen.
-  One handle per channel kind, deduped so re-subscribing replaces the old
-  handle, not the other channels.
-- **Every user message is mirrored across channels.** A message from
-  Telegram appears in Signal as `[telegram] what is your name?`; a
-  message from the web appears in Telegram as `[web] fix the failing
-  test`.
+- **Manage multiple in-flight tasks.** Easily juggle multiple tasks even with
+  append-only chat interfaces. Get notified when tasks are waiting on you, and
+  direct them from your phone wherever you are.
 
 Start a conversation on Telegram from your phone, continue it from the
 web UI at your desk, watch it unfold on Signal — all three stay in sync
@@ -103,25 +98,22 @@ full fidelity: channel attribution, timestamps, raw JSON inspection,
 collapsible structured views. Nothing is summarized behind the scenes. Branch
 from any point and you branch from the real record.
 
-**Cross-channel mirroring.** Every user message is mirrored across all
-subscribed channels with a `[channel]` prefix. Assistant replies fan out to
-every channel. You always know who said what, from where.
+**Agents can't tamper with the logs.** Prevent agents from tampering with your
+audit trail and rest easy knowing that you have full visibily into the workings
+of your agent organization.
 
 ## The SealOp ISA
 
 Every other agent framework has ad-hoc tool calls: `shell`, `read_file`,
 `web_search`, whatever the developer thought of that week. No unifying
-design. No privilege model. No atomicity guarantees.
+design. No privilege model.
 
 Seal Harness defines a formal Instruction Set Architecture — a closed set
 of opcodes where every instruction has:
 
 - **Defined input/output JSON schema** — not "whatever JSON the LLM generates"
 - **Trust classification** — Untrusted or Trusted
-- **Atomicity guarantee** — what state is left if the opcode fails mid-execution
 - **Transcript entry format** — how the execution is recorded in the audit log
-- **Authorization gate** — a pure `Value -> Either Text ()` check that must
-  pass before execution
 
 ### The Wired Opcode Catalog
 
@@ -144,14 +136,6 @@ tool catalog, superseded by the consolidated `*_MANAGE` opcodes.
 | **Files** | `FILE_READ`, `FILE_WRITE`, `FILE_PATCH`, `SEARCH_FILES` | Untrusted |
 | **Web** | `WEB_FETCH`, `WEB_SEARCH` | Untrusted |
 | **Introspection** | `OPCODE_DESCRIBE`, `OPCODE_LIST` | Trusted |
-
-Vault management (lock, unlock, rekey) is handled by the `seal vault` CLI —
-admin operations that can require a physical hardware token, not something
-the agent does autonomously. `SECRET_MANAGE` covers vault CRUD (get, put,
-delete, list) with values never logged — only key names and operation
-metadata are recorded. If the vault is locked when the agent calls
-`SECRET_MANAGE`, it gets a "vault locked" error and can ask the human to
-unlock it via `ASK_HUMAN`.
 
 ## Quick Start
 
