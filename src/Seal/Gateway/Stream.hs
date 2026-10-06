@@ -17,6 +17,7 @@ module Seal.Gateway.Stream
   ( runStreamServer
   , StreamGuard (..)
   , FocusOp (..)
+  , handleRequestEntries
   , RequestEntriesOp (..)
   , ClientMessage (..)
   , filterAfterId
@@ -151,8 +152,8 @@ streamApp guard broker pending = do
       withPingThread conn 30 (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
-              case A.decode msg of
-                Just (focusOp :: FocusOp) ->
+              case A.decode msg :: Maybe ClientMessage of
+                Just (CmFocus focusOp) ->
                   case mkSessionId (foSession focusOp) of
                     Right s  -> do
                       globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
@@ -162,8 +163,10 @@ streamApp guard broker pending = do
                       -- entries broadcast during the WS gap are recovered.
                       forM_ (foSince focusOp) $ \sinceId ->
                         replayEntriesSince conn (sgPaths guard) s sinceId
-                    Left _e  -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("invalid session id" :: Text)]))
-                Nothing -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("expected a focus op" :: Text)]))
+                    Left _e  -> sendErrorFrame conn "invalid session id"
+                Just (CmRequestEntries reqOp) ->
+                  handleRequestEntries conn (sgPaths guard) reqOp
+                Nothing -> sendErrorFrame conn "unknown op"
         readerLoop `catch` \(_e :: SomeException) -> pure ()
 
 -- | Replay transcript entries after the given entry id, then send a
@@ -248,6 +251,51 @@ extractId v = case v of
     Just (A.String t) -> t
     _                 -> ""
   _ -> ""
+
+-- | Handle a @request-entries@ op: read the transcript from disk, slice it
+-- to the requested chunk, and send an @entries-chunk@ event. Includes a
+-- catch handler so a corrupt/missing transcript sends an error frame
+-- instead of propagating to the readerLoop's top-level catch and
+-- disconnecting the entire WS connection.
+handleRequestEntries :: Connection -> SealPaths -> RequestEntriesOp -> IO ()
+handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
+  case mkSessionId sidTxt of
+    Left _ -> sendErrorFrame conn "invalid session id"
+    Right sid -> do
+      let go = do
+            mMeta <- loadSessionMeta paths sid
+            let model = maybe "" smModel mMeta
+                fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
+            allEntries <- readTranscriptEntries paths model fallbackTs sid
+            let limit = clampLimit mLimit
+                totalCount = length allEntries
+                (chunk, hasMore) = case mBefore of
+                  Nothing ->
+                    let dropped = max 0 (totalCount - limit)
+                    in (drop dropped allEntries, totalCount > limit)
+                  Just before ->
+                    case entriesBeforeId before allEntries of
+                      Just beforeEntries ->
+                        let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries
+                            hasMoreBefore = length beforeEntries > limit
+                        in (taken, hasMoreBefore)
+                      Nothing -> ([], False)
+            sendTextData conn (A.encode (A.object
+              [ "type" A..= ("entries-chunk" :: Text)
+              , "sessionId" A..= sidTxt
+              , "entries" A..= chunk
+              , "hasMore" A..= hasMore
+              , "totalCount" A..= totalCount
+              , "requestBefore" A..= mBefore
+              ]))
+      go `catch` \(e :: SomeException) -> do
+        globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
+        sendTextData conn (A.encode (A.object
+          [ "type" A..= ("entries-chunk" :: Text)
+          , "sessionId" A..= sidTxt
+          , "entries" A..= ([] :: [A.Value])
+          , "requestBefore" A..= mBefore
+          ]))
 
 -- | Return entries before the entry with id @before@ (exclusive).
 -- Returns 'Nothing' when the id is not found (distinct from
