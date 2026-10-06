@@ -35,7 +35,7 @@ import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsD
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex )
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
@@ -173,6 +173,7 @@ mkSendDepsWith paths resolveStub = do
   ensureConfigRepo configRoot
   let repo = openConfigRepo configRoot
   backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+  wakeMutex <- newSessionWakeMutex
   reg   <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
   askReply <- newAskReplyStore 0
@@ -223,6 +224,8 @@ mkSendDepsWith paths resolveStub = do
         , sdMkWorker    = Nothing
         , sdResolveProviderOverride = Nothing
         , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
         }
   pure sendDeps
 

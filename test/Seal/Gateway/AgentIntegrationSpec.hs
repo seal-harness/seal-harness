@@ -1059,6 +1059,7 @@ gateTestWiring gate = do
         }
     , aswParentSession = mkSystemSessionId "gate-parent"
             , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
     }
 
 -- | AGENT_DEF_WRITE args with a role.

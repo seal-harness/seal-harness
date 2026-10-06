@@ -414,6 +414,12 @@ data TurnDeps = TurnDeps
     -- orchestrator child can run a REAL scripted turn while its
     -- grandchildren get the stub. The harness's default (2) means
     -- depth-1 spawns are real, depth-2+ are stubbed.
+  , tdOnIdleCompletion :: Maybe (SessionId -> IO ())
+    -- ^ Wake-up hook: when a background sub-agent completes and the parent
+    -- session is idle (no turn in flight), this action triggers a synthetic
+    -- turn so the sidecar completions are read and processed. 'Nothing' in
+    -- tests / channels that don't support idle wake-up. The action must be
+    -- safe to call from a forked thread (the child's worker thread).
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -1031,6 +1037,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswPaths = tdPaths td
     , aswParentSession = parentSid
     , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
+    , aswOnIdleCompletion = ($ parentSid) <$> tdOnIdleCompletion td
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
@@ -1229,6 +1236,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
           , aswPaths = tdPaths td
           , aswParentSession = childSid
           , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
+          , aswOnIdleCompletion = ($ childSid) <$> tdOnIdleCompletion td
           }
       nestedWorker = case tdMkWorker td of
         Just stub

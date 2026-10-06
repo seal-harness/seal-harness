@@ -53,7 +53,7 @@ module Seal.ISA.Ops.Agent
   , allowSpawnBlockedMsg
   ) where
 
-import Control.Monad (join)
+import Control.Monad (join, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
@@ -553,6 +553,12 @@ data AgentStartWiring = AgentStartWiring
     -- the sidecar — a child with pending descendants has its delivery
     -- deferred until the descendants settle. 'Nothing' in test wirings
     -- without the registry (delivery is never deferred).
+  , aswOnIdleCompletion :: Maybe (IO ())
+    -- ^ Wake-up hook: when a background sub-agent completes and the parent
+    -- session is idle (no turn in flight), this action triggers a synthetic
+    -- turn so the sidecar completions are read and processed. 'Nothing' in
+    -- test wirings. The action is closed over the parent session id at
+    -- wiring time.
   }
 
 -- | The role/switch condition the nested AGENT_START enforces before it
@@ -808,7 +814,7 @@ handleStartBackground wiring _v di = do
               _ -> pure False
             if defer
               then pure ()  -- delivery deferred until descendants settle
-              else
+              else do
                 -- Append the completion message to a sidecar file. The turn
                 -- engine reads this file at the start of the parent's next turn
                 -- and injects the messages into the conversation. This avoids
@@ -817,6 +823,13 @@ handleStartBackground wiring _v di = do
                 -- to conversation.jsonl while the daemon is active causes the
                 -- daemon's diff to desynchronize, corrupting the transcript.
                 appendCompletionToSidecar paths parentSid (completionMessage result)
+                -- Wake-up hook: if the parent session is idle (no turn in
+                -- flight), trigger a synthetic turn so the sidecar
+                -- completions are read and processed. Without this, the
+                -- completions sit in the sidecar until the user sends
+                -- another message — the session appears dead even though
+                -- sub-agents have finished.
+                forM_ (aswOnIdleCompletion wiring) id
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =
             registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)

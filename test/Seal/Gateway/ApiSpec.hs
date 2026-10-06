@@ -45,7 +45,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps)
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -3951,6 +3951,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = error "sdWakeMutex: unused on the 404 path"
+        , sdEnableIdleWake = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3996,6 +3998,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4055,6 +4058,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4138,6 +4143,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4200,6 +4206,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
             , sdResolveProviderOverride = Nothing
             , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             , sdAgentReg    = fakeAgentRegH
             }
           deps = ApiDeps
@@ -4265,6 +4273,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4322,6 +4331,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4385,6 +4396,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4446,6 +4458,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
