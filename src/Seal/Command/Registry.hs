@@ -31,6 +31,7 @@ import Seal.Session.Store (SessionRuntime)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tabs (TabsHandle)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+import Seal.Agent.Runtime.RunRecord (RunRecordRegistry)
 import Seal.Vault.Commands (VaultRuntime, vaultCommandSpec)
 
 -- | The shared dependencies for the core slash-command specs. Built once
@@ -64,6 +65,9 @@ data CoreCommandDeps = CoreCommandDeps
   , ccdAbortReg    :: SessionAbortRegistry
     -- ^ For @\/stop@ (the single-session variant; the web rebuilds
     -- per-request).
+  , ccdRunRecords  :: RunRecordRegistry
+    -- ^ For @\/stop@ cascade cancellation (WU-4): cancels pending child
+    -- runs when a session is stopped.
   , ccdStopWriter  :: StopTranscriptWriter
     -- ^ Writes the stop message to the session's transcript + broadcasts
     -- it so the stop appears cross-channel. Built at the wiring site from
@@ -108,7 +112,7 @@ coreCommandSpecs d =
   , modelCommandSpec (ccdProvider d) (ccdSession d) (ccdModelWriter d)
   , agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)
   , tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)
-  , stopCommandSpec (ccdAbortReg d) (ccdSession d) (ccdStopWriter d)
+  , stopCommandSpec (ccdAbortReg d) (ccdRunRecords d) (ccdSession d) (ccdStopWriter d)
   , terseGrammarSpec
   ]
   <> [ repoCommandSpec (ccdRepoReg d) seam | Just seam <- [ccdRepoSeam d] ]

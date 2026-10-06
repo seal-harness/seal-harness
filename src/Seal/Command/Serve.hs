@@ -250,6 +250,7 @@ runServeMain autonomy logger = do
         , ccdTabs        = tabsH
         , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , ccdAbortReg    = cdAbortReg chanDeps
+        , ccdRunRecords  = bRunRecords backends
         , ccdStopWriter  = mkStopTranscriptWriter paths (Just broker)
         , ccdModelWriter = mkModelTranscriptWriter paths (Just broker)
         , ccdRepoReg     = repoRegH

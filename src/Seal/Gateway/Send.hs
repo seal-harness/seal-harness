@@ -475,7 +475,7 @@ runSlash deps meta fullLine = do
   let perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
         (skillCommandSpec sessionSkills perRequestCallDispatcher)
         (callCommandSpec perRequestCallDispatcher)
-        (stopCommandSpecForSession (sdAbortReg deps) sid
+        (stopCommandSpecForSession (sdAbortReg deps) (bRunRecords (sdBackends deps)) sid
            (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))
         (modelCommandSpecForSession (sdProvider deps) (sdPaths deps) (pure sid)
            (mkModelTranscriptWriter (sdPaths deps) (sdBroker deps)))

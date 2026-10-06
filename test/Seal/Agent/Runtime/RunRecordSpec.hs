@@ -204,6 +204,44 @@ spec = describe "Seal.Agent.Runtime.RunRecord" $ do
       cancelled <- cancelRunsForParent reg sampleParentSid now "killed"
       length cancelled `shouldBe` 1  -- only r2 was pending
 
+    it "cascade is recursive — grandchildren are also cancelled" $ do
+      reg <- newRunRecordRegistry
+      -- parent → child → grandchild linkage
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let grandchildSid = mkSystemSessionId "grandchild"
+      _grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
+      now <- getCurrentTime
+      cancelled <- cancelRunsForParent reg sampleParentSid now "killed"
+      length cancelled `shouldBe` 2
+      -- Both the child and the grandchild are killed
+      all (\r -> rrrOutcome r == OutcomeKilled) cancelled `shouldBe` True
+      -- The grandchild's run record is found via its parent (child) session
+      mGrand <- findLatestRunForChild reg grandchildSid
+      case mGrand of
+        Just g -> rrrOutcome g `shouldBe` OutcomeKilled
+        Nothing -> expectationFailure "grandchild record not found"
+
+    it "suppression reason is recorded on all cancelled runs" $ do
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      let grandchildSid = mkSystemSessionId "grandchild"
+      _grandchild <- createRun reg sampleSubagentId2 grandchildSid sampleChildSid 1 SpawnBackground
+      now <- getCurrentTime
+      cancelled <- cancelRunsForParent reg sampleParentSid now "killed"
+      all (\r -> rrrSuppressAnnounceReason r == Just "killed") cancelled `shouldBe` True
+
+    it "normal turn end does NOT cancel children (only explicit cancel does)" $ do
+      -- This is a contract test: cancelRunsForParent is the ONLY function
+      -- that marks runs as killed, and it must be called explicitly by the
+      -- session-termination hook — never by the per-turn bracket. Here we
+      -- verify that simply listing pending descendants after a "turn end"
+      -- (simulated by doing nothing) leaves them all pending.
+      reg <- newRunRecordRegistry
+      _child <- createRun reg sampleSubagentId sampleChildSid sampleParentSid 0 SpawnBackground
+      -- Simulate a turn end: no cancel call. Children must remain pending.
+      nPending <- countPendingDescendants reg sampleParentSid
+      nPending `shouldBe` 1
+
   describe "persistence" $ do
     it "saveRunRecordToDisk writes a JSON file that loadRunRecord can read" $ do
       reg <- newRunRecordRegistry

@@ -423,9 +423,13 @@ countPendingDescendants reg parentSid = do
                           && isNothing (rrrEndedAt r))
                        (Map.elems records)))
 
--- | Cancel all pending runs for a parent session. Marks them as killed and
--- sets the suppress reason. Returns the cancelled records. Already-
--- completed runs are not affected.
+-- | Cancel all pending runs for a parent session, recursively walking the
+-- parent→child linkage so grandchildren (and deeper descendants) are also
+-- cancelled. Marks each cancelled run as killed and sets the suppress
+-- reason. Returns all cancelled records (the full subtree). Already-
+-- completed runs are not affected and are not traversed through — only
+-- pending runs whose child session may itself be a parent of further
+-- pending runs are followed.
 cancelRunsForParent
   :: RunRecordRegistry
   -> SessionId
@@ -436,9 +440,30 @@ cancelRunsForParent
 cancelRunsForParent reg parentSid now reason = do
   cancelled <- atomically $ do
     records <- readTVar (rrrRegistry reg)
-    let pending = filter (\r -> rrrParentSessionKey r == parentSid
-                                && isNothing (rrrEndedAt r))
-                         (Map.elems records)
+    -- BFS/DFS over the parent→child linkage. Start with runs whose parent
+    -- is the cancelled session; for each cancelled child, follow its child
+    -- session key to find runs where THAT session is the parent.
+    let allRecs = Map.elems records
+        -- Index pending runs by their parent session key for O(1) lookup.
+        pendingByParent :: Map.Map SessionId [SubagentRunRecord]
+        pendingByParent = Map.fromListWith (++)
+          [ (rrrParentSessionKey r, [r])
+          | r <- allRecs, isNothing (rrrEndedAt r)
+          ]
+        -- Collect the full subtree of pending runs reachable from parentSid.
+        collect :: [SessionId] -> [SubagentRunRecord] -> [SubagentRunRecord]
+        collect [] acc = acc
+        collect (sid : rest) acc =
+          case Map.lookup sid pendingByParent of
+            Nothing -> collect rest acc
+            Just children ->
+              let newAcc = acc ++ children
+                  -- Each cancelled child's session becomes a new parent to
+                  -- explore (its child_session_key is where grandchildren
+                  -- attach as parent_session_key).
+                  newFront = map rrrChildSessionKey children ++ rest
+              in collect newFront newAcc
+        pending = collect [parentSid] []
         updated = map (\r -> r { rrrEndedAt = Just now
                                , rrrOutcome = OutcomeKilled
                                , rrrEndedReason = Just EndKilled
