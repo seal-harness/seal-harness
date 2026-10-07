@@ -28,11 +28,20 @@ import * as perf from '../lib/perf'
 
 const MAX_CACHED_TRANSCRIPTS = 8
 
+const CHUNK_SIZE = 50
+
+/** Cached transcript data including chunk-loading metadata. */
+interface CachedTranscript {
+  entries: TranscriptEntry[]
+  hasMore: boolean
+  totalCount: number
+}
+
 /** LRU cache of per-session transcript data. */
 class TranscriptDataCache {
-  private map: Map<string, TranscriptEntry[]> = new Map()
+  private map: Map<string, CachedTranscript> = new Map()
 
-  get(sessionId: string): TranscriptEntry[] | undefined {
+  get(sessionId: string): CachedTranscript | undefined {
     const data = this.map.get(sessionId)
     if (data) {
       // Move to end (most recently used).
@@ -42,19 +51,24 @@ class TranscriptDataCache {
     return data
   }
 
-  set(sessionId: string, entries: TranscriptEntry[]): void {
-    this.map.set(sessionId, entries)
+  set(sessionId: string, data: CachedTranscript): void {
+    this.map.set(sessionId, data)
     if (this.map.size > MAX_CACHED_TRANSCRIPTS) {
       const oldest = this.map.keys().next().value
       if (oldest) this.map.delete(oldest)
     }
   }
 
-  /** Update cached data for a session — append new entries or replace
-   *  existing ones. Called on every WS entry event so the cache stays
-   *  fresh even when the user is viewing a different session. */
+  /** Update cached entries for a session (preserving metadata).
+   *  Called on every WS entry event so the cache stays fresh. */
   update(sessionId: string, entries: TranscriptEntry[]): void {
-    this.set(sessionId, entries)
+    const existing = this.map.get(sessionId)
+    const prevLen = existing?.entries.length ?? 0
+    this.set(sessionId, {
+      entries,
+      hasMore: existing?.hasMore ?? false,
+      totalCount: entries.length > prevLen ? (existing?.totalCount ?? entries.length) + 1 : (existing?.totalCount ?? entries.length),
+    })
   }
 }
 
@@ -71,7 +85,7 @@ export function _resetDataCacheForTests(): void {
   globalDataCache = null
 }
 
-async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]> {
+async function fetchTranscriptSeed(sessionId: string): Promise<{ entries: TranscriptEntry[]; hasMore: boolean; totalCount: number }> {
   const done = perf.begin('transcript.seed')
   const ttfbDone = perf.begin('transcript.seed.ttfb')
   const textDone = perf.begin('transcript.seed.readBody')
@@ -82,17 +96,19 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
     ttfbDone({ meta: { sessionId, status: res.status } })
     if (!res.ok) {
       done(); textDone(); parseDone()
-      return []
+      return { entries: [], hasMore: false, totalCount: 0 }
     }
     const text = await res.text()
     textDone({ meta: { sessionId, bytes: text.length } })
     const data = JSON.parse(text) as TranscriptEntry[]
     parseDone({ count: data.length, meta: { sessionId, bytes: text.length } })
     done({ count: data.length, meta: { sessionId, bytes: text.length } })
-    return data
+    const hasMore = res.headers.get('X-Has-More') === 'true'
+    const totalCount = parseInt(res.headers.get('X-Total-Count') ?? '0', 10) || data.length
+    return { entries: data, hasMore, totalCount }
   } catch {
     done(); ttfbDone(); textDone(); parseDone()
-    return []
+    return { entries: [], hasMore: false, totalCount: 0 }
   }
 }
 
@@ -156,6 +172,20 @@ export function reconcileEntries(
   return next
 }
 
+/** Prepend older chunk entries to the existing array, dedup by id.
+ *  Older entries that already exist (e.g. delivered via live tail
+ *  during the chunk request) are NOT re-added — the existing entry
+ *  wins. Ascending order preserved: chunk is ascending, goes before
+ *  existing. */
+export function prependChunkEntries(
+  existing: TranscriptEntry[],
+  older: TranscriptEntry[],
+): TranscriptEntry[] {
+  const existingIds = new Set(existing.map(e => e.id))
+  const deduped = older.filter(e => !existingIds.has(e.id))
+  return [...deduped, ...existing]
+}
+
 export function useTranscriptStream(
   sessionId: string | null,
   client?: StreamClient,
@@ -167,6 +197,9 @@ export function useTranscriptStream(
   const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([])
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
+  const [totalCount, setTotalCount] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
   const loadedSessionRef = useRef<string | null>(null)
   const currentSessionRef = useRef<string | null>(null)
 
@@ -189,6 +222,7 @@ export function useTranscriptStream(
       // controls are shown), so stale entries are harmless.
       setPendingQuestions([])
       setLoading(false)
+      setHasMore(false); setTotalCount(0); setLoadingMore(false)
       loadedSessionRef.current = null
       return
     }
@@ -200,7 +234,7 @@ export function useTranscriptStream(
     const cached = dataCache.get(sessionId)
     const isFirstLoad = loadedSessionRef.current !== sessionId
 
-    if (cached !== undefined && cached.length > 0 && isFirstLoad) {
+    if (cached !== undefined && cached.entries.length > 0 && isFirstLoad) {
       // Cache hit on session switch — instantly show cached data, no
       // loading spinner. Focus with `since` = last cached entry id so
       // the WS replay delivers only new entries. No background re-seed —
@@ -208,11 +242,13 @@ export function useTranscriptStream(
       // that arrived since the last visit. A background re-seed would
       // race with WS-delivered entries and cause flickering (the re-seed
       // overwrites newer WS entries with stale HTTP data).
-      setEntries(cached)
+      setEntries(cached.entries)
+      setHasMore(cached.hasMore)
+      setTotalCount(cached.totalCount)
       setLoading(false)
       loadedSessionRef.current = sessionId
-      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.length}`)
-      const lastId = cached[cached.length - 1]!.id
+      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.entries.length}`)
+      const lastId = cached.entries[cached.entries.length - 1]!.id
       sc.focus(sessionId, lastId)
       fetchPendingQuestions(sessionId).then((qs) => {
         if (cancelled) return
@@ -220,42 +256,27 @@ export function useTranscriptStream(
       })
     } else {
       // First load (cache miss) or refresh — HTTP GET seed.
-      // On first load, the seed replaces the (empty) entries array.
-      // On refresh (after send), the seed is MERGED with the current
-      // entries via reconcileEntries — this preserves WS-delivered
-      // entries that arrived between the HTTP request and response.
-      // Replacing the array (setEntries(seed)) would lose those entries
-      // and cause the entire transcript to be rebuilt, producing the
-      // flickering pattern where messages disappear and reappear.
-      if (isFirstLoad) setLoading(true)
+      if (isFirstLoad) {
+        setLoading(true)
+        setHasMore(false); setTotalCount(0); setLoadingMore(false)
+      }
       fetchTranscriptSeed(sessionId).then((seed) => {
         if (cancelled) return
         if (isFirstLoad) {
-          setEntries(seed)
+          setEntries(seed.entries)
+          setHasMore(seed.hasMore)
+          setTotalCount(seed.totalCount)
           dataCache.set(sessionId, seed)
         } else {
-          // Refresh: merge seed with existing entries to preserve
-          // WS-delivered entries. reconcileEntries handles dedup by
-          // id — seed entries with matching ids replace in place,
-          // new seed entries are appended, and WS-delivered entries
-          // that aren't in the seed are retained.
           setEntries((prev) => {
             let merged = prev
-            for (const e of seed) {
-              merged = reconcileEntries(merged, e)
-            }
+            for (const e of seed.entries) merged = reconcileEntries(merged, e)
             return merged
           })
         }
         setLoading(false)
-        console.log(`[transcript] SEED ${isFirstLoad ? 'http-fetch' : 'http-merge'} session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
         loadedSessionRef.current = sessionId
-        // Use the data cache's last id for focus — it includes
-        // WS-delivered entries that may have arrived after the seed.
-        const cachedNow = dataCache.get(sessionId)
-        const lastId = cachedNow && cachedNow.length > 0
-          ? cachedNow[cachedNow.length - 1]!.id
-          : seed.length > 0 ? seed[seed.length - 1]!.id : undefined
+        const lastId = seed.entries.length > 0 ? seed.entries[seed.entries.length - 1]!.id : undefined
         if (lastId !== undefined) sc.focus(sessionId, lastId)
         else sc.focus(sessionId)
       })
@@ -281,6 +302,67 @@ export function useTranscriptStream(
     })
     return unsub
   }, [sessionId, sc])
+
+  // WS entries-chunk subscription (for chunked loading).
+  useEffect(() => {
+    if (sessionId === null) return
+    const unsub = sc.onEntriesChunk((chunkSid, chunk) => {
+      // Only handle chunks for the currently-focused session.
+      if (chunkSid !== currentSessionRef.current) return
+      if (chunk.requestBefore === null) {
+        // Initial chunk (latest entries).
+        setEntries(chunk.entries)
+        setHasMore(chunk.hasMore)
+        setTotalCount(chunk.totalCount ?? chunk.entries.length)
+        setLoading(false)
+        setLoadingMore(false)
+        loadedSessionRef.current = chunkSid
+        getGlobalDataCache().set(chunkSid, {
+          entries: chunk.entries,
+          hasMore: chunk.hasMore,
+          totalCount: chunk.totalCount ?? chunk.entries.length,
+        })
+        // Focus for live tail + replay.
+        const lastId = chunk.entries.length > 0
+          ? chunk.entries[chunk.entries.length - 1]!.id : undefined
+        if (lastId !== undefined) sc.focus(chunkSid, lastId)
+        else sc.focus(chunkSid)
+      } else {
+        // Load-older chunk (prepend).
+        setEntries((prev) => prependChunkEntries(prev, chunk.entries))
+        setHasMore(chunk.hasMore)
+        setLoadingMore(false)
+        // Update cache with merged entries.
+        const sid = currentSessionRef.current
+        if (sid !== null) {
+          const cached = getGlobalDataCache().get(sid)
+          if (cached) {
+            const merged = prependChunkEntries(cached.entries, chunk.entries)
+            getGlobalDataCache().set(sid, {
+              entries: merged,
+              hasMore: chunk.hasMore,
+              totalCount: chunk.totalCount ?? cached.totalCount,
+            })
+          }
+        }
+        // Empty chunk with hasMore=true (shouldn't happen, but defensive).
+        if (chunk.entries.length === 0 && chunk.hasMore) {
+          setHasMore(false)
+        }
+      }
+    })
+    return unsub
+  }, [sessionId, sc])
+
+  // loadOlder: request the next chunk of older entries.
+  const loadOlder = useCallback(() => {
+    const sid = currentSessionRef.current
+    if (sid === null || loadingMore || !hasMore) return
+    const firstId = entries.length > 0 ? entries[0]!.id : null
+    if (firstId === null) return
+    setLoadingMore(true)
+    sc.requestEntries(sid, firstId, CHUNK_SIZE)
+  }, [loadingMore, hasMore, entries, sc])
 
   // WS ask subscription (focused session only).
   useEffect(() => {
@@ -314,14 +396,21 @@ export function useTranscriptStream(
     const unsub = sc.onStatusChange((s) => {
       setStatus(s)
       setLastError(sc.lastError())
+      // Reset loadingMore on disconnect (in-flight chunk request is lost).
+      if (s === 'reconnecting' || s === 'closed') {
+        setLoadingMore(false)
+      }
+      // On reconnect, re-request the initial chunk if still loading.
+      if ((s === 'live' || s === 'replaying') && loading && entries.length === 0) {
+        const sid = currentSessionRef.current
+        if (sid !== null) sc.requestEntries(sid, null, CHUNK_SIZE)
+      }
     })
     return unsub
-  }, [sc])
+  }, [sc, loading, entries.length])
 
-  // WU-3 stubs — WU-4 will replace with real chunk-loading state.
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
-    hasMore: false, totalCount: 0, loadingMore: false,
-    loadOlder: () => {},
+    hasMore, totalCount, loadingMore, loadOlder,
   }
 }
