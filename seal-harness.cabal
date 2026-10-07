@@ -213,7 +213,6 @@ library
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
         Seal.Web.UrlSafety
-        Seal.Web.Browser
         Seal.Web.UiState
         Seal.Media.Image
         Seal.Media.Tts
@@ -538,7 +537,6 @@ test-suite tests
          Seal.Tools.Exec.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
-        Seal.Web.BrowserSpec
         Seal.Media.ImageSpec
         Seal.Media.TtsSpec
         Seal.Security.Vault.AgeSpec

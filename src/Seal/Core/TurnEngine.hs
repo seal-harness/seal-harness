@@ -105,6 +105,7 @@ import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
+import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -296,6 +297,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
+     , browserManageOp securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
       , harnessListOp harnessReg

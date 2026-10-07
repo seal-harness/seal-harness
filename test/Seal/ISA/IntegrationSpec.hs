@@ -96,8 +96,6 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Web.Browser (browserClickOp, browserOpenOp, browserReadOp,
-                         noBrowserDriver)
 import Seal.Web.Fetch (WebFetchConfig (..), webFetchOp)
 import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (ProviderParallel))
 
@@ -1040,73 +1038,6 @@ spec = describe "Seal.ISA.Integration" $ do
       r <- runTestApp (dispatchOne reg (OpName "WEB_FETCH")
                         (object ["url" .= ("" :: Text)]))
       r `shouldBe` Left (Denied "WEB_FETCH: url is empty")
-
-  -- ----------------------------------------------------------------------
-  -- BROWSER_OPEN / CLICK / READ
-  -- ----------------------------------------------------------------------
-  describe "BROWSER_OPEN" $ do
-    it "\"Open https://example.com in a browser.\" -> BROWSER_OPEN -> fail-closed (no driver)" $ do
-      let op = browserOpenOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_OPEN")
-                        (object ["url" .= ("https://example.com" :: Text)]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` True
-          case orParts res of
-            [TrpText t] -> "no browser driver" `T.isInfixOf` t `shouldBe` True
-            _          -> expectationFailure "expected text part"
-          orRecorded res `shouldBe` object ["url" .= ("https://example.com" :: Text)]
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
-
-    it "\"Open a blank page.\" -> BROWSER_OPEN with empty url -> Denied" $ do
-      let op = browserOpenOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_OPEN")
-                        (object ["url" .= ("" :: Text)]))
-      r `shouldBe` Left (Denied "BROWSER_OPEN: url is empty")
-
-  describe "BROWSER_CLICK" $ do
-    it "\"Click the 'submit' button.\" -> BROWSER_CLICK -> fail-closed (no driver)" $ do
-      let op = browserClickOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_CLICK")
-                        (object ["selector" .= ("#submit" :: Text)]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` True
-          orRecorded res `shouldBe` object ["selector" .= ("#submit" :: Text)]
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
-
-    it "\"Click ''.\" -> BROWSER_CLICK with empty selector -> Denied" $ do
-      let op = browserClickOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_CLICK")
-                        (object ["selector" .= ("" :: Text)]))
-      r `shouldBe` Left (Denied "BROWSER_CLICK: selector is empty")
-
-  describe "BROWSER_READ" $ do
-    it "\"Read the page text.\" -> BROWSER_READ -> fail-closed (no driver); selector optional" $ do
-      let op = browserReadOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_READ") (object []))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` True
-          case orParts res of
-            [TrpText t] -> "no browser driver" `T.isInfixOf` t `shouldBe` True
-            _          -> expectationFailure "expected text part"
-          orRecorded res `shouldBe` object ["selector" .= ("" :: Text)]
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
-
-    it "\"Read the text of the '#main' element.\" -> BROWSER_READ with selector -> recorded" $ do
-      let op = browserReadOp noBrowserDriver
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "BROWSER_READ")
-                        (object ["selector" .= ("#main" :: Text)]))
-      case r of
-        Right res -> orRecorded res `shouldBe` object ["selector" .= ("#main" :: Text)]
-        Left e   -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------
   -- IMAGE_GENERATE / DESCRIBE

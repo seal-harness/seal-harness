@@ -52,7 +52,6 @@ import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
 import qualified Seal.Web.UrlSafetySpec
 import qualified Seal.Config.WorkdirSpec
-import qualified Seal.Web.BrowserSpec
 import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
@@ -234,7 +233,6 @@ specs = do
   Seal.Web.FetchSpec.spec
   Seal.Web.UrlSafetySpec.spec
   Seal.Config.WorkdirSpec.spec
-  Seal.Web.BrowserSpec.spec
   Seal.Media.ImageSpec.spec
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec

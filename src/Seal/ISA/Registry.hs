@@ -4,7 +4,7 @@
 -- (not alphabetical) so the wiring layer controls which tools the model sees
 -- first — many LLMs bias toward the first tool whose description matches,
 -- so the order is a lever for steering tool selection (e.g. WEB_FETCH before
--- BROWSER_OPEN for simple page fetches).
+-- BROWSER_MANAGE for simple page fetches).
 module Seal.ISA.Registry
   ( Registry
   , mkRegistry
