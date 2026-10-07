@@ -7,10 +7,13 @@ import Data.Text qualified as T
 import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
-import Seal.ISA.Opcode (uoAuthorize)
+import Seal.ISA.Opcode (uoAuthorize, uoRun, orIsError)
 import Seal.ISA.Ops.Browser (browserManageOp, BrowserAction (..), buildBrowserArgs)
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Args (textBinArg)
+import Seal.Tools.Exec.UIO (runUIOWithEnv, mkTestUIOEnv)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 
 testPolicy :: SecurityPolicy
 testPolicy = SecurityPolicy (AllowOnly Set.empty) Full
@@ -109,3 +112,20 @@ spec = describe "BROWSER_MANAGE opcode" $ do
       case result of
         Right (_, args) -> map textBinArg args `shouldContain` ["--max-output", "5000"]
         Left e -> expectationFailure (T.unpack e)
+
+  describe "run (stub UIO — no agent-browser installed)" $ do
+    it "returns error for open action when binary not found" $ do
+      let op = browserManageOp testPolicy
+          input = object ["action" .= ("open" :: String), "url" .= ("https://example.com" :: String)]
+      result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
+      orIsError result `shouldBe` True
+    it "returns error for snapshot action when binary not found" $ do
+      let op = browserManageOp testPolicy
+          input = object ["action" .= ("snapshot" :: String)]
+      result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
+      orIsError result `shouldBe` True
+    it "returns error for close action when binary not found" $ do
+      let op = browserManageOp testPolicy
+          input = object ["action" .= ("close" :: String)]
+      result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
+      orIsError result `shouldBe` True
