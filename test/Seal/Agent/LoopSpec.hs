@@ -163,6 +163,15 @@ spec = describe "Seal.Agent.Loop" $ do
           result = stripToolCallXml input
       result `shouldBe` ""
 
+    it "strips orphan closing tags when opening arg_key is missing (session 20261007 crash)" $ do
+      -- The model emitted a tool call as XML but the opening arg_key tag
+      -- was missing (or stripped by a prior step). The text is:
+      --   limit</arg_key><arg_value>15</arg_value>
+      -- Without the fix, this passes through as garbled text.
+      let input = "limit</arg_key><arg_value>15</arg_value>"
+          result = stripToolCallXml input
+      result `shouldBe` ""
+
     it "leaves normal prose untouched" $
       stripToolCallXml "hello world" `shouldBe` "hello world"
 

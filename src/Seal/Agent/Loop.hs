@@ -767,18 +767,21 @@ dropToolCallBlock = go
 -- as a unit. This handles both well-formed pairs and the common case
 -- where the model emits several key/value pairs in sequence.
 dropOrphanParamSpans :: Text -> Text
-dropOrphanParamSpans = go
+dropOrphanParamSpans t0 =
+  let t1 = dropCompleteSpans t0
+      t2 = dropOrphanClosers t1
+  in t2
   where
     pkOpen  = "<arg_key>"
     pkClose = "</arg_key>"
     pvOpen  = "<arg_value>"
     pvClose = "</arg_value>"
-    go acc
+    dropCompleteSpans acc
       | T.null acc = acc
       | otherwise =
           case T.breakOn pkOpen acc of
             (before, rest)
-              | T.null rest -> acc  -- no more param tags
+              | T.null rest -> acc
               | otherwise ->
                   let afterPkOpen = T.drop (T.length pkOpen) rest
                   in case T.breakOn pkClose afterPkOpen of
@@ -787,7 +790,7 @@ dropOrphanParamSpans = go
                              -- No key close tag — just strip the open tag
                              -- and continue (defensive: shouldn't happen
                              -- with well-formed input, but don't loop).
-                             go (before <> T.drop (T.length pkOpen) rest)
+                             dropCompleteSpans (before <> T.drop (T.length pkOpen) rest)
                          | otherwise ->
                              let afterPkClose = T.drop (T.length pkClose) afterPkCloseRest
                              in case T.breakOn pvOpen afterPkClose of
@@ -795,7 +798,7 @@ dropOrphanParamSpans = go
                                     | T.null rest2 ->
                                         -- No value open tag — strip up to
                                         -- here and continue.
-                                        go before
+                                        dropCompleteSpans before
                                     | otherwise ->
                                         let afterPvOpen = T.drop (T.length pvOpen) rest2
                                         in case T.breakOn pvClose afterPvOpen of
@@ -804,12 +807,35 @@ dropOrphanParamSpans = go
                                                    -- No value close — strip
                                                    -- everything from the key
                                                    -- open onward.
-                                                   go before
+                                                   dropCompleteSpans before
                                                | otherwise ->
                                                    -- Complete key+value pair
                                                    -- found: drop it all and
                                                    -- continue scanning.
-                                                   go before
+                                                   dropCompleteSpans before
+
+    -- Pass 2: remove orphan closing tags + their content. When the model
+    -- omits the opening arg_key tag but emits closing arg_key + arg_value
+    -- pair, strip from any pkClose through the following pvClose.
+    dropOrphanClosers acc
+      | T.null acc = acc
+      | otherwise =
+          case T.breakOn pkClose acc of
+            (_before, rest)
+              | T.null rest -> acc
+              | otherwise ->
+                  -- Found a closing arg_key without a preceding opening.
+                  -- Strip EVERYTHING from the start through the next
+                  -- closing arg_value (the text before the closing
+                  -- arg_key is the key value that lost its opening tag;
+                  -- it's part of the malformed tool call, not prose).
+                  let afterPkClose = T.drop (T.length pkClose) rest
+                  in case T.breakOn pvClose afterPkClose of
+                       (_, afterPvCloseRest)
+                         | T.null afterPvCloseRest ->
+                             dropOrphanClosers afterPkClose
+                         | otherwise ->
+                             dropOrphanClosers (T.drop (T.length pvClose) afterPvCloseRest)
 
 -- | Remove every complete @open ... close@ span (non-greedy: up to the
 -- FIRST closing tag), including the tags themselves. Unterminated blocks
