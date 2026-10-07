@@ -309,8 +309,8 @@ export function useTranscriptStream(
     const unsub = sc.onEntriesChunk((chunkSid, chunk) => {
       // Only handle chunks for the currently-focused session.
       if (chunkSid !== currentSessionRef.current) return
-      if (chunk.requestBefore === null || chunk.requestBefore === '__beginning__') {
-        // Initial chunk (latest entries) or jump-to-beginning chunk (oldest entries).
+      if (chunk.requestBefore === null) {
+        // Initial chunk (latest entries).
         setEntries(chunk.entries)
         setHasMore(chunk.hasMore)
         setTotalCount(chunk.totalCount ?? chunk.entries.length)
@@ -327,6 +327,24 @@ export function useTranscriptStream(
           ? chunk.entries[chunk.entries.length - 1]!.id : undefined
         if (lastId !== undefined) sc.focus(chunkSid, lastId)
         else sc.focus(chunkSid)
+      } else if (chunk.requestBefore === '__beginning__') {
+        // Jump-to-beginning chunk (oldest entries).
+        // hasMore=false because we're at the beginning — no older entries to load.
+        // Don't call focus with since — that would replay all entries after the
+        // chunk, flooding the frontend with hundreds of WS entry events.
+        setEntries(chunk.entries)
+        setHasMore(false)
+        setTotalCount(chunk.totalCount ?? chunk.entries.length)
+        setLoading(false)
+        setLoadingMore(false)
+        loadedSessionRef.current = chunkSid
+        getGlobalDataCache().set(chunkSid, {
+          entries: chunk.entries,
+          hasMore: false,
+          totalCount: chunk.totalCount ?? chunk.entries.length,
+        })
+        // Focus without since — just subscribe to live tail, no replay.
+        sc.focus(chunkSid)
       } else {
         // Load-older chunk (prepend).
         setEntries((prev) => prependChunkEntries(prev, chunk.entries))
@@ -370,8 +388,10 @@ export function useTranscriptStream(
   const loadFromBeginning = useCallback(() => {
     const sid = currentSessionRef.current
     if (sid === null) return
-    setLoading(true)
-    setHasMore(false); setTotalCount(0); setLoadingMore(false)
+    // Don't set loading=true — keep the current transcript visible
+    // while the WS request is in flight. The entries will be replaced
+    // atomically when the response arrives.
+    setLoadingMore(true)
     sc.requestEntries(sid, '__beginning__', CHUNK_SIZE)
   }, [sc])
 
