@@ -299,6 +299,7 @@ encodeAgentDef d = encodeDoc fm body
       ] ++ maybe [] (\g -> [("group", g)]) (adGroup d)
         ++ maybe [] (\r -> [("role", r)]) (adRole d)
         ++ maybe [] (\desc -> [("description", desc)]) (adDescription d)
+        ++ maybe [] (\b -> [("allow_spawn", if b then "true" else "false")]) (adAllowSpawn d)
 
 -- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkAgentDefId'. Every renderable field passes
@@ -320,6 +321,7 @@ decodeAgentDef content =
         , adGroup = fmLookup "group" fm
         , adRole = fmLookup "role" fm
         , adDescription = fmLookup "description" fm
+        , adAllowSpawn = parseBoolField (fmLookup "allow_spawn" fm)
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
         , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
@@ -365,6 +367,21 @@ isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
 parseTime :: Maybe Text -> UTCTime
 parseTime Nothing    = epochZero
 parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
+
+-- | Parse a boolean from a frontmatter value. Recognizes @true@/@false@
+-- (case-insensitive) and @yes@/@no@; anything else (including absent) is
+-- 'Nothing'.
+parseBoolField :: Maybe Text -> Maybe Bool
+parseBoolField Nothing  = Nothing
+parseBoolField (Just raw) =
+  case T.toLower (T.strip raw) of
+    "true"  -> Just True
+    "yes"   -> Just True
+    "1"     -> Just True
+    "false" -> Just False
+    "no"    -> Just False
+    "0"     -> Just False
+    _       -> Nothing
 
 -- | The epoch fallback for missing/unparseable timestamps.
 epochZero :: UTCTime
@@ -445,6 +462,7 @@ loadDirAgentDef fs aid = do
         , adGroup = Nothing
         , adRole = Nothing
         , adDescription = Nothing
+    , adAllowSpawn = Nothing
         , adCreatedAt = mtime
         , adUpdatedAt = mtime
         , adSession = mkSystemSessionId "manual"
@@ -498,6 +516,7 @@ decodeProjectAgentsMd content =
           , adGroup = Nothing
           , adRole = Nothing
           , adDescription = Nothing
+    , adAllowSpawn = Nothing
           , adCreatedAt = epochZero
           , adUpdatedAt = epochZero
           , adSession = mkSystemSessionId "manual"
@@ -528,6 +547,7 @@ decodeProtocolAgentMd subDirName content =
                  , adGroup = Nothing
                  , adRole = fmLookup "role" fm
                  , adDescription = fmLookup "description" fm
+    , adAllowSpawn = Nothing
                  , adCreatedAt = epochZero
                  , adUpdatedAt = epochZero
                  , adSession = mkSystemSessionId "manual"

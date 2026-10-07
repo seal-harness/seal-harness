@@ -19,6 +19,8 @@ import Seal.Agent.Runtime.Delegation
   , SpawnPauseFlag, newSpawnPauseFlag
   , ParentActivity, newParentActivity )
 import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
+import Seal.Agent.Runtime.RunRecord qualified as RunRecord
+  ( RunRecordRegistry, newRunRecordRegistry )
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Memory.Embedding qualified as Emb
@@ -47,6 +49,11 @@ data Backends = Backends
   , bSkills    :: Skill.SkillBackend
   , bAgentDefs :: Def.AgentDefBackend
   , bRuntime   :: AgentRuntime
+  , bRunRecords :: RunRecord.RunRecordRegistry
+    -- ^ Durable per-run tracking registry (WU-1). Records every spawned
+    -- child's lifecycle (create → complete/cancel), supports parent→child
+    -- linkage queries for cascade cancellation (WU-4) and descendant-settle
+    -- (WU-5), and persists to disk for restart recovery.
   , bDelegationConfig :: IO DelegationConfig
     -- ^ Reload the [delegation] config per AGENT_START call (so config
     -- changes take effect without a restart). The IO action reads
@@ -74,6 +81,7 @@ newBackends paths repo embedding = do
       agentsDir    = spConfig paths </> "agents"
       memoryDir    = spHome paths </> "memory"
   rt          <- newAgentRuntime
+  runRecords  <- RunRecord.newRunRecordRegistry
   pauseFlag   <- newSpawnPauseFlag
   parentAct   <- newParentActivity
   memStore    <- Mem.fileMemoryStore memoryDir
@@ -87,6 +95,7 @@ newBackends paths repo embedding = do
     , bSkills = skills
     , bAgentDefs = agentDefs
     , bRuntime = rt
+    , bRunRecords = runRecords
     , bDelegationConfig = pure defaultDelegationConfig
     , bSpawnPauseFlag = pauseFlag
     , bParentActivity = parentAct

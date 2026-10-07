@@ -148,6 +148,38 @@ runTestApp act = do
 
 spec :: Spec
 spec = describe "Seal.Agent.Loop" $ do
+  describe "stripToolCallXml" $ do
+    it "removes a complete <invoke> block" $ do
+      let input = "before<invoke name=\"FILE_READ\"></invoke>after"
+          result = stripToolCallXml input
+      result `shouldBe` "beforeafter"
+
+    it "strips orphan param tags WITHOUT leaving the bare key/value text" $ do
+      -- The garbled-text bug: when the model emits arg_key/arg_value tags
+      -- without a surrounding <invoke> block, stripping just the tags
+      -- leaves the bare key/value text concatenated (garbled output).
+      -- The fix must strip the entire key+value span.
+      let input = "<arg_key>binary</arg_key><arg_value>git</arg_value><arg_key>args</arg_key><arg_value>[\"fetch\"]</arg_value><arg_key>cwd</arg_key><arg_value>seal-harness</arg_value>"
+          result = stripToolCallXml input
+      result `shouldBe` ""
+
+    it "strips orphan closing tags when opening arg_key is missing (session 20261007 crash)" $ do
+      -- The model emitted a tool call as XML but the opening arg_key tag
+      -- was missing (or stripped by a prior step). The text is:
+      --   limit</arg_key><arg_value>15</arg_value>
+      -- Without the fix, this passes through as garbled text.
+      let input = "limit</arg_key><arg_value>15</arg_value>"
+          result = stripToolCallXml input
+      result `shouldBe` ""
+
+    it "leaves normal prose untouched" $
+      stripToolCallXml "hello world" `shouldBe` "hello world"
+
+    it "strips a trailing partial invoke opener (truncation cut)" $ do
+      let input = "some text<invoke na"
+          result = stripToolCallXml input
+      result `shouldBe` "some text"
+
   it "dispatches a tool call then emits the final text" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])

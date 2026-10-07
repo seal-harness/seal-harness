@@ -137,6 +137,7 @@ import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.Agent.Runtime.Delegation.WorkerSpec
 import qualified Seal.Agent.Runtime.Delegation.ConcurrentSpec
+import qualified Seal.Agent.Runtime.RunRecordSpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
@@ -322,6 +323,7 @@ specs = do
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.Agent.Runtime.Delegation.WorkerSpec.spec
   Seal.Agent.Runtime.Delegation.ConcurrentSpec.spec
+  Seal.Agent.Runtime.RunRecordSpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
