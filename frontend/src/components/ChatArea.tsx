@@ -2304,12 +2304,17 @@ export function ChatArea({
   onAnswerQuestionText,
   isSessionThinking,
   onCancelQuestion,
+  hasMore, loadingMore, totalCount, loadOlder,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
   onSetDescription?: (id: string, description: string) => void
   messages: Message[]
   loading?: boolean
+  hasMore?: boolean
+  loadingMore?: boolean
+  totalCount?: number
+  loadOlder?: () => void
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2514,12 +2519,17 @@ export function ChatArea({
     if (!el) return
     const onScroll = () => {
       wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      // Load older entries when scrolled to top
+      if (el.scrollTop < 60 && hasMore && !loadingMore && loadOlder) {
+        loadOlder()
+        wasAtBottom.current = false
+      }
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
 
-  }, [hasFragment])
+  }, [hasFragment, hasMore, loadingMore, loadOlder])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2736,6 +2746,23 @@ export function ChatArea({
       {/* Messages or composer panel */}
       <div ref={scrollerRef} className="flex-1 overflow-y-auto chat-scroll px-5 py-6">
         <div className="flex flex-col gap-5">
+          {/* Load older entries UI */}
+          {hasMore && !loadingMore && loadOlder && (
+            <button
+              onClick={loadOlder}
+              className="self-center text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 py-1 px-3 rounded border border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 transition-colors"
+            >
+              Load older messages
+            </button>
+          )}
+          {loadingMore && (
+            <div className="self-center text-xs text-slate-400 py-1">Loading older messages…</div>
+          )}
+          {totalCount !== undefined && totalCount > 0 && !loading && (
+            <div className="self-center text-xs text-slate-400 dark:text-slate-500 py-0.5">
+              Showing {messages.length} of {totalCount}
+            </div>
+          )}
           {composerControls ? (
             <>
               {prefixMessages && prefixMessages.length > 0 && (
