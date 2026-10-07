@@ -8,7 +8,9 @@ import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.ISA.Opcode (uoAuthorize, uoRun, orIsError)
-import Seal.ISA.Ops.Browser (browserManageOp, BrowserAction (..), buildBrowserArgs)
+import Seal.ISA.Ops.Browser
+  ( browserManageOp, BrowserAction (..), NetworkFilters (..), HarAction (..)
+  , buildBrowserArgs )
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Args (textBinArg)
@@ -20,6 +22,9 @@ testPolicy = SecurityPolicy (AllowOnly Set.empty) Full
 
 denyPolicy :: SecurityPolicy
 denyPolicy = SecurityPolicy (AllowOnly Set.empty) Deny
+
+noFilters :: NetworkFilters
+noFilters = NetworkFilters Nothing Nothing Nothing Nothing False
 
 spec :: Spec
 spec = describe "BROWSER_MANAGE opcode" $ do
@@ -74,6 +79,72 @@ spec = describe "BROWSER_MANAGE opcode" $ do
       uoAuthorize op (object ["action" .= ("snapshot" :: String)])
         `shouldBe` Right ()
 
+  describe "authorize gate — network actions" $ do
+    it "accepts network-requests with no filters" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-requests" :: String)])
+        `shouldBe` Right ()
+    it "accepts network-requests with filter" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-requests" :: String), "filter" .= ("api" :: String)])
+        `shouldBe` Right ()
+    it "accepts network-requests with type and method" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object
+        [ "action" .= ("network-requests" :: String)
+        , "type" .= ("xhr,fetch" :: String)
+        , "method" .= ("POST" :: String)
+        ])
+        `shouldBe` Right ()
+    it "accepts network-requests with clear" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-requests" :: String), "clear" .= True])
+        `shouldBe` Right ()
+    it "rejects network-requests when autonomy is Deny" $ do
+      let op = browserManageOp denyPolicy
+      uoAuthorize op (object ["action" .= ("network-requests" :: String)])
+        `shouldBe` Left "BROWSER_MANAGE denied by autonomy policy"
+    it "accepts network-request with requestId" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-request" :: String), "requestId" .= ("req-42" :: String)])
+        `shouldBe` Right ()
+    it "rejects network-request without requestId" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-request" :: String)])
+        `shouldBe` Left "BROWSER_MANAGE: network-request requires {requestId:string}"
+    it "rejects network-request with empty requestId" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-request" :: String), "requestId" .= ("" :: String)])
+        `shouldBe` Left "BROWSER_MANAGE: requestId is empty"
+    it "accepts network-har with harAction start" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-har" :: String), "harAction" .= ("start" :: String)])
+        `shouldBe` Right ()
+    it "accepts network-har with harAction stop and path" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object
+        [ "action" .= ("network-har" :: String)
+        , "harAction" .= ("stop" :: String)
+        , "path" .= ("./trace.har" :: String)
+        ])
+        `shouldBe` Right ()
+    it "accepts network-har start with content" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object
+        [ "action" .= ("network-har" :: String)
+        , "harAction" .= ("start" :: String)
+        , "content" .= ("all" :: String)
+        ])
+        `shouldBe` Right ()
+    it "rejects network-har without harAction" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-har" :: String)])
+        `shouldBe` Left "BROWSER_MANAGE: network-har requires {harAction:string}"
+    it "rejects network-har with invalid harAction" $ do
+      let op = browserManageOp testPolicy
+      uoAuthorize op (object ["action" .= ("network-har" :: String), "harAction" .= ("frobnicate" :: String)])
+        `shouldBe` Left "BROWSER_MANAGE: network-har requires harAction \"start\" or \"stop\", got \"frobnicate\""
+
   describe "buildBrowserArgs" $ do
     it "builds open args with url" $ do
       let result = buildBrowserArgs (BaOpen "https://example.com") Nothing 15000
@@ -113,6 +184,75 @@ spec = describe "BROWSER_MANAGE opcode" $ do
         Right (_, args) -> map textBinArg args `shouldContain` ["--max-output", "5000"]
         Left e -> expectationFailure (T.unpack e)
 
+  describe "buildBrowserArgs — network actions" $ do
+    it "builds network-requests with no filters" $ do
+      let result = buildBrowserArgs (BaNetworkRequests noFilters) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["network", "requests"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-requests with --filter" $ do
+      let f = noFilters { nfFilter = Just "api" }
+          result = buildBrowserArgs (BaNetworkRequests f) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--filter", "api"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-requests with --type" $ do
+      let f = noFilters { nfType = Just "xhr,fetch" }
+          result = buildBrowserArgs (BaNetworkRequests f) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--type", "xhr,fetch"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-requests with --method" $ do
+      let f = noFilters { nfMethod = Just "POST" }
+          result = buildBrowserArgs (BaNetworkRequests f) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--method", "POST"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-requests with --status" $ do
+      let f = noFilters { nfStatus = Just "2xx" }
+          result = buildBrowserArgs (BaNetworkRequests f) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--status", "2xx"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-requests with --clear" $ do
+      let f = noFilters { nfClear = True }
+          result = buildBrowserArgs (BaNetworkRequests f) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--clear"]
+        Left e -> expectationFailure (T.unpack e)
+    it "omits --clear when not set" $ do
+      let result = buildBrowserArgs (BaNetworkRequests noFilters) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldNotContain` ["--clear"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-request with requestId" $ do
+      let result = buildBrowserArgs (BaNetworkRequest "req-42") Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["network", "request", "req-42"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-har start with no content" $ do
+      let result = buildBrowserArgs (BaNetworkHar (HarStart Nothing)) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["network", "har", "start"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-har start with --content all" $ do
+      let result = buildBrowserArgs (BaNetworkHar (HarStart (Just "all"))) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["--content", "all"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-har stop with path" $ do
+      let result = buildBrowserArgs (BaNetworkHar (HarStop (Just "./trace.har"))) Nothing 15000
+      case result of
+        Right (_, args) -> map textBinArg args `shouldContain` ["network", "har", "stop", "./trace.har"]
+        Left e -> expectationFailure (T.unpack e)
+    it "builds network-har stop without path" $ do
+      let result = buildBrowserArgs (BaNetworkHar (HarStop Nothing)) Nothing 15000
+      case result of
+        Right (_, args) -> do
+          map textBinArg args `shouldContain` ["network", "har", "stop"]
+          map textBinArg args `shouldNotContain` ["./trace.har"]
+        Left e -> expectationFailure (T.unpack e)
+
   describe "run (stub UIO — no agent-browser installed)" $ do
     it "returns error for open action when binary not found" $ do
       let op = browserManageOp testPolicy
@@ -127,5 +267,15 @@ spec = describe "BROWSER_MANAGE opcode" $ do
     it "returns error for close action when binary not found" $ do
       let op = browserManageOp testPolicy
           input = object ["action" .= ("close" :: String)]
+      result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
+      orIsError result `shouldBe` True
+    it "returns error for network-requests when binary not found" $ do
+      let op = browserManageOp testPolicy
+          input = object ["action" .= ("network-requests" :: String)]
+      result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
+      orIsError result `shouldBe` True
+    it "returns error for network-request when binary not found" $ do
+      let op = browserManageOp testPolicy
+          input = object ["action" .= ("network-request" :: String), "requestId" .= ("req-1" :: String)]
       result <- runUIOWithEnv (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (uoRun op input)
       orIsError result `shouldBe` True

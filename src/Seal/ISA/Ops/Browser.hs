@@ -13,6 +13,8 @@
 module Seal.ISA.Ops.Browser
   ( browserManageOp
   , BrowserAction (..)
+  , NetworkFilters (..)
+  , HarAction (..)
   , parseBrowserAction
   , buildBrowserArgs
   ) where
@@ -20,6 +22,7 @@ module Seal.ISA.Ops.Browser
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
+import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import Data.Text qualified as T
 
@@ -45,6 +48,24 @@ data BrowserAction
   | BaWait       Text           -- ^ selector or condition
   | BaClose
   | BaSession
+  | BaNetworkRequests NetworkFilters  -- ^ network requests with optional filters
+  | BaNetworkRequest  Text            -- ^ requestId for a single request detail
+  | BaNetworkHar       HarAction      -- ^ HAR recording start/stop
+  deriving stock (Eq, Show)
+
+-- | Optional filter flags for @network requests@.
+data NetworkFilters = NetworkFilters
+  { nfFilter :: Maybe Text   -- ^ @--filter <pattern>@: URL substring or pattern
+  , nfType   :: Maybe Text   -- ^ @--type <csv>@: resource type (script, image, xhr, fetch, ...)
+  , nfMethod :: Maybe Text   -- ^ @--method <method>@: HTTP method (GET, POST, ...)
+  , nfStatus :: Maybe Text   -- ^ @--status <status>@: exact status, family (2xx), or range
+  , nfClear  :: Bool          -- ^ @--clear@: clear the tracked request log
+  } deriving stock (Eq, Show)
+
+-- | Discriminates between HAR start and stop sub-actions.
+data HarAction
+  = HarStart (Maybe Text)  -- ^ start recording; optional @--content@ mode (text, all, none)
+  | HarStop  (Maybe Text)  -- ^ stop recording; optional output file path
   deriving stock (Eq, Show)
 
 -- | The default max-output ceiling (characters). Operator-configurable
@@ -56,7 +77,7 @@ defaultMaxOutput = 15000
 browserManageOp :: SecurityPolicy -> Opcode
 browserManageOp policy = UntrustedOpcode
   { uoName = OpName "BROWSER_MANAGE"
-  , uoDesc = "Browser automation via agent-browser CLI. Action: open (url), snapshot (interactive elements), click (ref/selector), fill (ref+text), type (ref+text), press (key), scroll (dir), read (url?), screenshot (path?), eval (js), wait (selector), close, session (list current)."
+  , uoDesc = "Browser automation via agent-browser CLI. Action: open (url), snapshot (interactive elements), click (ref/selector), fill (ref+text), type (ref+text), press (key), scroll (dir), read (url?), screenshot (path?), eval (js), wait (selector), close, session (list current), network-requests (filters?), network-request (requestId), network-har (harAction)."
   , uoInSchema = browserManageSchema
   , uoOutSchema = object []
   , uoAuthorize = \v ->
@@ -89,20 +110,23 @@ parseBrowserAction v =
   case actionField v of
     Nothing -> Left "BROWSER_MANAGE requires {action:string}"
     Just a
-      | a == "open"       -> BaOpen <$> requireField a v "url"
-      | a == "snapshot"   -> Right BaSnapshot
-      | a == "click"      -> BaClick <$> refOrSelector a v
-      | a == "fill"       -> BaFill <$> refOrSelector a v <*> requireField a v "text"
-      | a == "type"       -> BaType <$> refOrSelector a v <*> requireField a v "text"
-      | a == "press"      -> BaPress <$> requireField a v "key"
-      | a == "scroll"     -> BaScroll <$> requireField a v "dir"
-      | a == "read"       -> Right (BaRead (optionalField v "url"))
-      | a == "screenshot" -> Right (BaScreenshot (optionalField v "path"))
-      | a == "eval"       -> BaEval <$> requireField a v "js"
-      | a == "wait"       -> BaWait <$> requireField a v "selector"
-      | a == "close"      -> Right BaClose
-      | a == "session"    -> Right BaSession
-      | otherwise         -> Left ("BROWSER_MANAGE: unknown action \"" <> a <> "\"")
+      | a == "open"             -> BaOpen <$> requireField a v "url"
+      | a == "snapshot"         -> Right BaSnapshot
+      | a == "click"            -> BaClick <$> refOrSelector a v
+      | a == "fill"             -> BaFill <$> refOrSelector a v <*> requireField a v "text"
+      | a == "type"             -> BaType <$> refOrSelector a v <*> requireField a v "text"
+      | a == "press"            -> BaPress <$> requireField a v "key"
+      | a == "scroll"           -> BaScroll <$> requireField a v "dir"
+      | a == "read"             -> Right (BaRead (optionalField v "url"))
+      | a == "screenshot"       -> Right (BaScreenshot (optionalField v "path"))
+      | a == "eval"             -> BaEval <$> requireField a v "js"
+      | a == "wait"             -> BaWait <$> requireField a v "selector"
+      | a == "close"            -> Right BaClose
+      | a == "session"          -> Right BaSession
+      | a == "network-requests" -> Right (BaNetworkRequests (parseNetworkFilters v))
+      | a == "network-request"  -> BaNetworkRequest <$> requireField a v "requestId"
+      | a == "network-har"      -> BaNetworkHar <$> parseHarAction v
+      | otherwise               -> Left ("BROWSER_MANAGE: unknown action \"" <> a <> "\"")
 
 -- | Build the agent-browser argv from the parsed action.
 -- Returns (binary name, argv args) or an error if a BinArg fails validation.
@@ -143,6 +167,11 @@ buildBrowserArgs action mSession maxOut = do
       BaWait sel         -> ["wait", sel]
       BaClose            -> ["close"]
       BaSession          -> ["session", "list"]
+      BaNetworkRequests f -> ["network", "requests"] ++ filterArgTexts f
+      BaNetworkRequest rid -> ["network", "request", rid]
+      BaNetworkHar hAction -> case hAction of
+        HarStart mContent -> ["network", "har", "start"] ++ contentArgTexts mContent
+        HarStop  mPath    -> ["network", "har", "stop"]  ++ maybeToList mPath
 
 -- | The input schema — a flat object with an action enum and action-specific
 -- fields. All fields are optional except @action@; the authorize gate
@@ -183,7 +212,7 @@ browserManageSchema =
             ]
         , fromText "path" .= object
             [ "type" .= ("string" :: Text)
-            , "description" .= ("File path for screenshot output (screenshot)." :: Text)
+            , "description" .= ("File path for screenshot or HAR output (screenshot, network-har stop)." :: Text)
             ]
         , fromText "js" .= object
             [ "type" .= ("string" :: Text)
@@ -193,6 +222,40 @@ browserManageSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("agent-browser session name for isolation. Optional; defaults to the agent-browser default session." :: Text)
             ]
+        , fromText "requestId" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Request ID from network-requests output (network-request)." :: Text)
+            ]
+        , fromText "harAction" .= object
+            [ "type" .= ("string" :: Text)
+            , "enum" .= (["start", "stop"] :: [Text])
+            , "description" .= ("HAR sub-action: start or stop recording (network-har)." :: Text)
+            ]
+        , fromText "content" .= object
+            [ "type" .= ("string" :: Text)
+            , "enum" .= (["text", "all", "none"] :: [Text])
+            , "description" .= ("HAR body capture mode: text (default), all (base64), none (network-har start)." :: Text)
+            ]
+        , fromText "filter" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Filter requests by URL substring or pattern (network-requests)." :: Text)
+            ]
+        , fromText "type" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Filter by resource type, comma-separated: script, image, font, xhr, fetch (network-requests)." :: Text)
+            ]
+        , fromText "method" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Filter by HTTP method, e.g. GET, POST (network-requests)." :: Text)
+            ]
+        , fromText "status" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Filter by status: exact (200), family (2xx), or range (200-299) (network-requests)." :: Text)
+            ]
+        , fromText "clear" .= object
+            [ "type" .= ("boolean" :: Text)
+            , "description" .= ("Clear the tracked request log (network-requests)." :: Text)
+            ]
         ]
     , "required" .= (["action"] :: [Text])
     ]
@@ -200,7 +263,44 @@ browserManageSchema =
     actionEnum =
       [ "open", "snapshot", "click", "fill", "type", "press"
       , "scroll", "read", "screenshot", "eval", "wait", "close", "session"
+      , "network-requests", "network-request", "network-har"
       ]
+
+-- ── Network parsing helpers ──────────────────────────────────────────────
+
+-- | Parse the optional filter fields for @network-requests@.
+parseNetworkFilters :: Value -> NetworkFilters
+parseNetworkFilters v = NetworkFilters
+  { nfFilter = optionalField v "filter"
+  , nfType   = optionalField v "type"
+  , nfMethod = optionalField v "method"
+  , nfStatus = optionalField v "status"
+  , nfClear  = boolField v "clear"
+  }
+
+-- | Parse the @harAction@ discriminator and its sub-fields for @network-har@.
+parseHarAction :: Value -> Either Text HarAction
+parseHarAction v =
+  case optionalField v "harAction" of
+    Nothing -> Left "BROWSER_MANAGE: network-har requires {harAction:string}"
+    Just ha
+      | ha == "start" -> Right (HarStart (optionalField v "content"))
+      | ha == "stop"  -> Right (HarStop (optionalField v "path"))
+      | otherwise     -> Left ("BROWSER_MANAGE: network-har requires harAction \"start\" or \"stop\", got \"" <> ha <> "\"")
+
+-- | Build the @--flag value@ argv tokens from 'NetworkFilters'.
+filterArgTexts :: NetworkFilters -> [Text]
+filterArgTexts f = concat
+  [ maybe [] (\x -> ["--filter", x]) (nfFilter f)
+  , maybe [] (\x -> ["--type", x])   (nfType f)
+  , maybe [] (\x -> ["--method", x]) (nfMethod f)
+  , maybe [] (\x -> ["--status", x]) (nfStatus f)
+  , ["--clear" | nfClear f]
+  ]
+
+-- | Build the @--content@ argv token from an optional content mode.
+contentArgTexts :: Maybe Text -> [Text]
+contentArgTexts = maybe [] (\c -> ["--content", c])
 
 -- ── Field accessors ──────────────────────────────────────────────────────
 
@@ -225,6 +325,13 @@ optionalField v field =
   case parseMaybe (withObject "in" (.:? fromText field)) v :: Maybe (Maybe Text) of
     Just (Just s) | not (T.null s) -> Just s
     _                              -> Nothing
+
+-- | Read a boolean field from the input JSON (defaults to False).
+boolField :: Value -> Text -> Bool
+boolField v field =
+  case parseMaybe (withObject "in" (.:? fromText field)) v :: Maybe (Maybe Bool) of
+    Just (Just b) -> b
+    _             -> False
 
 -- | Get the ref or selector for click/fill/type actions.
 refOrSelector :: Text -> Value -> Either Text Text
