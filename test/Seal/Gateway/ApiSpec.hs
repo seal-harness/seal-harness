@@ -45,7 +45,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps)
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -1634,8 +1634,8 @@ spec = describe "Seal.Gateway.API" $ do
           let now = UTCTime (fromGregorian 2026 7 1) 0
           let zoeId  = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
               devId  = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "dev"
-              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
-              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
           adbUpdate adb mkZoe
           adbUpdate adb mkDev
           let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
@@ -1711,7 +1711,7 @@ spec = describe "Seal.Gateway.API" $ do
       let now = UTCTime (fromGregorian 2026 7 1) 0
           adb = bAgentDefs backends
           zoeId = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
-          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
       adbUpdate adb zoe
       let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
           sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
@@ -1851,7 +1851,7 @@ spec = describe "Seal.Gateway.API" $ do
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "full" of Right x -> x; Left _ -> error "aid"
         d = AgentDef aid "Full Name" "anthropic" (ModelId "claude-sonnet-4") (Just "be terse")
-            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb d
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1945,7 +1945,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         aid = case mkAgentDefId "eddy" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2004,7 +2004,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         oldId = case mkAgentDefId "alpha" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2062,7 +2062,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "keep" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2101,7 +2101,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "delme" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2969,6 +2969,186 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
         _ -> expectationFailure "expected a 500 error JSON object"
 
+  -- ── Vault secrets CRUD ───────────────────────────────────────────────
+  -- The /api/secrets surface: GET (list key names), POST (put, 201),
+  -- GET/:name (read value), PUT/:name (update, 200), DELETE/:name (204).
+  -- Values are returned on GET/:name only; list returns key names only.
+  -- A locked/unconfigured vault surfaces as 500.
+  describe "/api/secrets" $ do
+    let mkSecretsApp :: VaultRuntime -> IO ApiDeps
+        mkSecretsApp vr = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          skills <- Skill.noneBackend
+          activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
+          repoRegH <- mkRepoRegistryHandle "/tmp/nonexistent-seal-test/repos.toml"
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+          pure ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = repoRegH
+            , adAgentRegistry    = fakeAgentRegH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+            , adVault            = vr
+            , adPaths            = fakePaths
+            , adWsPort           = 8081
+            , adAbortReg         = testAbortReg
+            , adSecurityConfig   = defaultSecurityConfig
+            , adMkSessionExec    = Nothing
+            }
+
+    it "GET /api/secrets returns 200 + key names (no values)" $ do
+      vr <- makeFakeVaultRuntime [("API_KEY", "secret123"), ("DB_PASS", "hunter2")]
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [T.Text] of
+        Just ks -> ks `shouldMatchList` ["API_KEY", "DB_PASS"]
+        Nothing -> expectationFailure "expected a JSON array of strings"
+
+    it "GET /api/secrets returns 200 + [] when the vault is empty" $ do
+      vr <- makeFakeVaultRuntime []
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [T.Text] of
+        Just ks -> ks `shouldBe` []
+        Nothing -> expectationFailure "expected a JSON array"
+
+    it "GET /api/secrets returns 500 when the vault is locked" $ do
+      vr <- makeLockedVaultRuntime
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      status `shouldBe` 500
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+        _ -> expectationFailure "expected a 500 error JSON object"
+
+    it "POST /api/secrets stores a secret (201) and it appears in the list" $ do
+      vr <- makeFakeVaultRuntime []
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testPost ["api", "secrets"]
+        (A.encode (A.object [ "name" .= ("NEW_KEY" :: T.Text), "value" .= ("new_val" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "name" o `shouldBe` Just (A.String "NEW_KEY")
+        _ -> expectationFailure "expected JSON object with name"
+      -- Value should NOT be in the response.
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "value" o `shouldBe` Nothing
+        _ -> pure ()
+      -- List should now include it.
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldBe` ["NEW_KEY"]
+        Nothing -> expectationFailure "expected a JSON array"
+
+    it "POST /api/secrets is upsert (same name overwrites)" $ do
+      vr <- makeFakeVaultRuntime [("KEY", "old")]
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testPost ["api", "secrets"]
+        (A.encode (A.object [ "name" .= ("KEY" :: T.Text), "value" .= ("new" :: T.Text) ]))
+      (status, _) <- runAppBody app req
+      status `shouldBe` 201
+      -- The value is write-only (no GET endpoint); verify the key still
+      -- exists in the list (the upsert did not delete it).
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldMatchList` ["KEY"]
+        Nothing -> expectationFailure "expected a JSON array"
+
+    it "POST /api/secrets with missing name returns 400" $ do
+      vr <- makeFakeVaultRuntime []
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testPost ["api", "secrets"]
+        (A.encode (A.object [ "value" .= ("v" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 400
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+        _ -> expectationFailure "expected 400 error"
+
+    it "POST /api/secrets with missing value returns 400" $ do
+      vr <- makeFakeVaultRuntime []
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testPost ["api", "secrets"]
+        (A.encode (A.object [ "name" .= ("K" :: T.Text) ]))
+      (status, _) <- runAppBody app req
+      status `shouldBe` 400
+
+    it "PUT /api/secrets/:name updates an existing secret (200)" $ do
+      vr <- makeFakeVaultRuntime [("K", "old")]
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testWithBody methodPut ["api", "secrets", "K"]
+        (A.encode (A.object [ "value" .= ("updated" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "name" o `shouldBe` Just (A.String "K")
+        _ -> expectationFailure "expected JSON object with name"
+      -- The value is write-only (no GET endpoint); verify the key still
+      -- exists in the list after the upsert.
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldMatchList` ["K"]
+        Nothing -> expectationFailure "expected a JSON array"
+
+    it "PUT /api/secrets/:name with missing value returns 400" $ do
+      vr <- makeFakeVaultRuntime [("K", "old")]
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      req <- testWithBody methodPut ["api", "secrets", "K"] (A.encode (A.object []))
+      (status, _) <- runAppBody app req
+      status `shouldBe` 400
+
+    it "DELETE /api/secrets/:name removes a secret (204)" $ do
+      vr <- makeFakeVaultRuntime [("DOOMED", "val")]
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, _) <- runAppBody app (testRequest methodDelete ["api", "secrets", "DOOMED"])
+      status `shouldBe` 204
+      -- List should no longer include it.
+      (_, listBody) <- runAppBody app (testRequest methodGet ["api", "secrets"])
+      case A.decode listBody :: Maybe [T.Text] of
+        Just ks -> ks `shouldBe` []
+        Nothing -> expectationFailure "expected a JSON array"
+
+    it "DELETE /api/secrets/:name is idempotent (204 for absent key)" $ do
+      vr <- makeFakeVaultRuntime []
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, _) <- runAppBody app (testRequest methodDelete ["api", "secrets", "GHOST"])
+      status `shouldBe` 204
+
+    it "DELETE /api/secrets/:name returns 500 when the vault is locked" $ do
+      vr <- makeLockedVaultRuntime
+      deps <- mkSecretsApp vr
+      let app = apiApp deps
+      (status, _) <- runAppBody app (testRequest methodDelete ["api", "secrets", "K"])
+      status `shouldBe` 500
+
+  -- ── PAT token ingestion (WU-A) ────────────────────────────────────────
   -- ── PAT token ingestion (WU-A) ────────────────────────────────────────
   -- The `token` field: a top-level, write-only request field. When present
   -- and the credential is PAT/MachineUser, the server `vhPut`s it into the
@@ -3545,6 +3725,7 @@ spec = describe "Seal.Gateway.API" $ do
               , adModel = ModelId "", adSystem = Just "user prompt"
               , adTools = AllowAll, adGroup = Nothing
               , adRole = Nothing, adDescription = Nothing
+    , adAllowSpawn = Nothing
               , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
               , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
               , adSession = mkSystemSessionId "manual" })
@@ -3678,6 +3859,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adModel = ModelId "", adSystem = Just "user prompt"
           , adTools = AllowAll, adGroup = Nothing
           , adRole = Nothing, adDescription = Nothing
+    , adAllowSpawn = Nothing
           , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
           , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
           , adSession = mkSystemSessionId "manual" })
@@ -3769,6 +3951,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = error "sdWakeMutex: unused on the 404 path"
+        , sdEnableIdleWake = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3814,6 +3998,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -3873,6 +4058,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3956,6 +4143,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4018,6 +4206,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
             , sdResolveProviderOverride = Nothing
             , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             , sdAgentReg    = fakeAgentRegH
             }
           deps = ApiDeps
@@ -4083,6 +4273,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4140,6 +4331,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4203,6 +4396,7 @@ spec = describe "Seal.Gateway.API" $ do
       ensureConfigRepo configRoot
       let repo = openConfigRepo configRoot
       backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+      wakeMutex <- newSessionWakeMutex
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
@@ -4264,6 +4458,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
 , sdResolveProviderOverride = Nothing
 , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

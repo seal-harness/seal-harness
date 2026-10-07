@@ -1,7 +1,9 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.LoopSpec (spec) where
 
 import Control.Monad.IO.Class (liftIO)
+import Data.Time (getCurrentTime)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Map qualified as Map
@@ -24,7 +26,9 @@ import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.Handles.Transcript (fakeTwoFileTranscript, withTwoFileTranscript)
+import Seal.Handles.Transcript
+  ( fakeTwoFileTranscript, withTwoFileTranscript, TwoFileWrite (..)
+  , tfwRecordAndAck )
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -123,6 +127,19 @@ instance Provider CountingTruncProvider where
     modifyIORef' ref (+ 1)
     pure (Right (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)))
 
+-- | A provider that captures each CompletionRequest it receives (for
+-- inspecting crMessages after the turn) and returns a scripted response.
+newtype CapturingProvider = CapturingProvider (IORef [CompletionRequest], IORef [CompletionResponse])
+
+instance Provider CapturingProvider where
+  listModels _ = pure (Right [])
+  complete (CapturingProvider (reqRef, scriptRef)) req = do
+    modifyIORef' reqRef (++ [req])
+    rs <- readIORef scriptRef
+    case rs of
+      (x:xs) -> writeIORef scriptRef xs >> pure (Right x)
+      [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+
 runTestApp :: App a -> IO a
 runTestApp act = do
   logger <- testSealLogger
@@ -131,6 +148,38 @@ runTestApp act = do
 
 spec :: Spec
 spec = describe "Seal.Agent.Loop" $ do
+  describe "stripToolCallXml" $ do
+    it "removes a complete <invoke> block" $ do
+      let input = "before<invoke name=\"FILE_READ\"></invoke>after"
+          result = stripToolCallXml input
+      result `shouldBe` "beforeafter"
+
+    it "strips orphan param tags WITHOUT leaving the bare key/value text" $ do
+      -- The garbled-text bug: when the model emits arg_key/arg_value tags
+      -- without a surrounding <invoke> block, stripping just the tags
+      -- leaves the bare key/value text concatenated (garbled output).
+      -- The fix must strip the entire key+value span.
+      let input = "<arg_key>binary</arg_key><arg_value>git</arg_value><arg_key>args</arg_key><arg_value>[\"fetch\"]</arg_value><arg_key>cwd</arg_key><arg_value>seal-harness</arg_value>"
+          result = stripToolCallXml input
+      result `shouldBe` ""
+
+    it "strips orphan closing tags when opening arg_key is missing (session 20261007 crash)" $ do
+      -- The model emitted a tool call as XML but the opening arg_key tag
+      -- was missing (or stripped by a prior step). The text is:
+      --   limit</arg_key><arg_value>15</arg_value>
+      -- Without the fix, this passes through as garbled text.
+      let input = "limit</arg_key><arg_value>15</arg_value>"
+          result = stripToolCallXml input
+      result `shouldBe` ""
+
+    it "leaves normal prose untouched" $
+      stripToolCallXml "hello world" `shouldBe` "hello world"
+
+    it "strips a trailing partial invoke opener (truncation cut)" $ do
+      let input = "some text<invoke na"
+          result = stripToolCallXml input
+      result `shouldBe` "some text"
+
   it "dispatches a tool call then emits the final text" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
@@ -1636,3 +1685,144 @@ spec = describe "Seal.Agent.Loop" $ do
     sentMsgs `shouldSatisfy` any ("(stopped)" `T.isInfixOf`)
     -- The "all done" follow-up must NOT be sent.
     sentMsgs `shouldSatisfy` not . any ("all done" `T.isInfixOf`)
+
+  -- W3: Context window management integration tests
+  describe "context window management" $ do
+    it "truncates messages for a known model when over context window" $ do
+      approvals <- newApprovalCache
+      reqRef <- newIORef ([] :: [CompletionRequest])
+      let script = [CompletionResponse [CbText "done"] StopEnd (Usage 0 0)]
+          scriptRef = unsafePerformIO (newIORef script)
+          -- Create a large user message (~5000 chars → ~1250 tokens)
+          bigMsg = textMsg User (T.replicate 5000 "x")
+          -- Prior conversation: 1000 big messages = ~1.25M tokens
+          -- (exceeds glm-5's 1M context window)
+          priorMsgs = replicate 1000 bigMsg
+          caps = def
+      (h, _) <- fakeTwoFileTranscript
+      -- Write prior messages to the transcript so runTurn reads them
+      liftIO $ do
+        now <- getCurrentTime
+        let entry = EntryRecord
+              { erId = ""
+              , erTimestamp = now
+              , erKind = EKRequest
+              , erConvLen = length priorMsgs
+              , erEnvelope = Nothing
+              , erUsage = Nothing
+              , erStop = Nothing
+              , erDurationMs = Nothing
+              , erHarness = Nothing
+              , erCorrelation = Nothing
+              , erMeta = Map.empty
+              }
+        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+            { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+            , aeProviderLabel = "ollama"
+            , aeModel = ModelId "glm-5.2:cloud"
+            , aeSystem = Nothing
+            , aeRegistry = mkRegistry []
+            , aeTranscript = h
+            , aeBackend = localBackend
+            , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , aeCaps = caps
+            , aeSession = either (error "sid") id (mkSessionId "s1")
+            , aeMaxTurns = 8
+            , aeChannel = "test"
+            , aeMessageSource = Nothing
+            , aeAutonomy = Full
+            , aeApprovals = approvals
+            , aeDebugRequestsPath = Nothing
+            , aeOnEntry = pure ()
+            , aeOnUserMessage = Nothing
+            , aeOnStop = Nothing
+            , aeStopFanoutDone = stopFanoutDoneRef
+            , aeOnToolCall = \_ _ -> pure ()
+            , aeOnTextDelta = Nothing
+            , aeOnDemandSchemas = False
+            , aeLogPath = Nothing
+            , aeAbortFlag = testAbortFlag
+            , aeToolTimeout = defaultToolTimeoutConfig
+            }
+      runTestApp (runTurn env "hello")
+      -- The provider should have received truncated messages (fewer than
+      -- the full 1000 prior + 1 new = 1001 messages)
+      reqs <- readIORef reqRef
+      reqs `shouldNotSatisfy` null
+      case reqs of
+        (firstReq : _) -> do
+          let sentMsgCount = length (crMessages firstReq)
+          sentMsgCount `shouldSatisfy` (< 1001)
+          -- The truncation notice should be present (truncation occurred)
+          let noticePresent = any
+                (any (\case
+                      CbText t -> "truncated" `T.isInfixOf` t
+                      _ -> False)
+                  . msgContent)
+                (crMessages firstReq)
+          noticePresent `shouldBe` True
+        [] -> expectationFailure "provider was not called"
+
+    it "does not truncate for an unknown model (context window = 0)" $ do
+      approvals <- newApprovalCache
+      reqRef <- newIORef ([] :: [CompletionRequest])
+      let script = [CompletionResponse [CbText "done"] StopEnd (Usage 0 0)]
+          scriptRef = unsafePerformIO (newIORef script)
+          bigMsg = textMsg User (T.replicate 5000 "x")
+          priorMsgs = replicate 100 bigMsg
+          caps = def
+      (h, _) <- fakeTwoFileTranscript
+      liftIO $ do
+        now <- getCurrentTime
+        let entry = EntryRecord
+              { erId = ""
+              , erTimestamp = now
+              , erKind = EKRequest
+              , erConvLen = length priorMsgs
+              , erEnvelope = Nothing
+              , erUsage = Nothing
+              , erStop = Nothing
+              , erDurationMs = Nothing
+              , erHarness = Nothing
+              , erCorrelation = Nothing
+              , erMeta = Map.empty
+              }
+        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+            { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+            , aeProviderLabel = "ollama"
+            , aeModel = ModelId "some-unknown-model"
+            , aeSystem = Nothing
+            , aeRegistry = mkRegistry []
+            , aeTranscript = h
+            , aeBackend = localBackend
+            , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , aeCaps = caps
+            , aeSession = either (error "sid") id (mkSessionId "s1")
+            , aeMaxTurns = 8
+            , aeChannel = "test"
+            , aeMessageSource = Nothing
+            , aeAutonomy = Full
+            , aeApprovals = approvals
+            , aeDebugRequestsPath = Nothing
+            , aeOnEntry = pure ()
+            , aeOnUserMessage = Nothing
+            , aeOnStop = Nothing
+            , aeStopFanoutDone = stopFanoutDoneRef
+            , aeOnToolCall = \_ _ -> pure ()
+            , aeOnTextDelta = Nothing
+            , aeOnDemandSchemas = False
+            , aeLogPath = Nothing
+            , aeAbortFlag = testAbortFlag
+            , aeToolTimeout = defaultToolTimeoutConfig
+            }
+      runTestApp (runTurn env "hello")
+      -- The provider should receive all messages (no truncation)
+      reqs <- readIORef reqRef
+      reqs `shouldNotSatisfy` null
+      case reqs of
+        (firstReq : _) -> length (crMessages firstReq) `shouldBe` 101
+        [] -> expectationFailure "provider was not called"

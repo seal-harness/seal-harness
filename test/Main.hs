@@ -90,10 +90,12 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
+import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
+import qualified Seal.Channels.Chat.WatchPersistSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
@@ -134,6 +136,7 @@ import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.Agent.Runtime.Delegation.WorkerSpec
 import qualified Seal.Agent.Runtime.Delegation.ConcurrentSpec
+import qualified Seal.Agent.Runtime.RunRecordSpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
@@ -156,8 +159,10 @@ import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
 import qualified Seal.Providers.OllamaSpec
+import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
+import qualified Seal.Agent.ContextTruncationSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
@@ -271,10 +276,12 @@ specs = do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.Chat.TypesSpec.spec
+  Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
+  Seal.Channels.Chat.WatchPersistSpec.spec
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
@@ -315,6 +322,7 @@ specs = do
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.Agent.Runtime.Delegation.WorkerSpec.spec
   Seal.Agent.Runtime.Delegation.ConcurrentSpec.spec
+  Seal.Agent.Runtime.RunRecordSpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
@@ -336,9 +344,11 @@ specs = do
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
+  Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
+  Seal.Agent.ContextTruncationSpec.spec
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.IntegrationSpec.spec
   Seal.ISA.Ops.HumanSpec.spec

@@ -287,6 +287,19 @@ model NewModel {
 - Use mock factories from `src/test-utils/factories/`
 - Mock external APIs completely
 
+## Diagnosis Strategy (Complex Tasks Only)
+
+For complex tasks where the root cause or correct behavior is non-obvious,
+the plan must include a diagnosis step before implementation:
+
+1. **What to instrument**: debug statements, logging, or diagnostic tests
+2. **What to observe**: the specific behavior to confirm before implementing
+3. **How to verify understanding**: the expected observation that confirms
+   the diagnosis
+
+Do not proceed to implementation until the diagnosis is confirmed by
+actual observation, not assumption.
+
 ## Risks and Mitigations
 
 | Risk   | Likelihood   | Impact       | Mitigation   |

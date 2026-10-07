@@ -241,7 +241,8 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let op = sessionGetOp paths
         r <- runTestApp (opRun op localBackend
           (object
-            [ "session_id" .= sessionIdText (smId meta)
+            [ "order" .= ("front-to-back" :: Text)
+            , "session_id" .= sessionIdText (smId meta)
             , "offset" .= (4 :: Int)
             , "limit" .= (2 :: Int)
             ]))
@@ -251,6 +252,91 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             T.isInfixOf "msg4" t `shouldBe` True
             T.isInfixOf "msg5" t `shouldBe` True
             T.isInfixOf "msg0" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "defaults to back-to-front (last messages first)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "msg0"
+          , assistantMsg "msg1"
+          , userMsg "msg2"
+          , assistantMsg "msg3"
+          , userMsg "msg4"
+          , assistantMsg "msg5"
+          ]
+        let op = sessionGetOp paths
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Default order is back-to-front, so we get the last 2 messages.
+            T.isInfixOf "msg4" t `shouldBe` True
+            T.isInfixOf "msg5" t `shouldBe` True
+            T.isInfixOf "msg0" t `shouldBe` False
+            T.isInfixOf "msg1" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "back-to-front paginates from the end with offset" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "msg0"
+          , assistantMsg "msg1"
+          , userMsg "msg2"
+          , assistantMsg "msg3"
+          , userMsg "msg4"
+          , assistantMsg "msg5"
+          ]
+        let op = sessionGetOp paths
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "order" .= ("back-to-front" :: Text)
+            , "offset" .= (2 :: Int)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- offset=2 from end skips msg4/msg5, returns msg2/msg3.
+            T.isInfixOf "msg2" t `shouldBe` True
+            T.isInfixOf "msg3" t `shouldBe` True
+            T.isInfixOf "msg4" t `shouldBe` False
+            T.isInfixOf "msg5" t `shouldBe` False
+            T.isInfixOf "msg0" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "back-to-front renders messages in chronological order within window" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "alpha"
+          , assistantMsg "beta"
+          , userMsg "gamma"
+          ]
+        let op = sessionGetOp paths
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "order" .= ("back-to-front" :: Text)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Window is messages 2-3 (beta, gamma), in that order.
+            let betaPos = T.length (fst (T.breakOn "beta" t))
+                gammaPos = T.length (fst (T.breakOn "gamma" t))
+            -- beta should appear before gamma in the rendered text.
+            betaPos `shouldSatisfy` (< gammaPos)
           _ -> expectationFailure "expected a single text part"
 
     it "returns metadata header for the session" $ do
@@ -377,6 +463,34 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             [TrpText t] -> do
               T.isInfixOf "Hello world" t `shouldBe` True
               T.isInfixOf "Hi there" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+
+      it "respects order=back-to-front" $ do
+        withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+          let paths = mkPaths tmp
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          seedConversation paths (smId meta)
+            [ userMsg "msg0"
+            , assistantMsg "msg1"
+            , userMsg "msg2"
+            , assistantMsg "msg3"
+            , userMsg "msg4"
+            , assistantMsg "msg5"
+            ]
+          let op = sessionManageOp paths inMemorySessionSearchBackend
+          r <- runTestApp (opRun op localBackend
+            (object
+              [ "action" .= ("get" :: Text)
+              , "session_id" .= sessionIdText (smId meta)
+              , "order" .= ("back-to-front" :: Text)
+              , "limit" .= (2 :: Int)
+              ]))
+          orIsError r `shouldBe` False
+          case orParts r of
+            [TrpText t] -> do
+              T.isInfixOf "msg4" t `shouldBe` True
+              T.isInfixOf "msg5" t `shouldBe` True
+              T.isInfixOf "msg0" t `shouldBe` False
             _ -> expectationFailure "expected a single text part"
 
       it "errors on missing session_id" $ do

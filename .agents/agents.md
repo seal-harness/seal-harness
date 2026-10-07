@@ -2,6 +2,81 @@
 kind: agents
 ---
 
+# Orchestration Workflow
+
+This project uses a multi-agent orchestration framework. It provides
+specialized agents, a 4-phase orchestrated execution loop, and quality
+gates that enforce TDD, coverage thresholds, and spec-driven development.
+
+## Starting Work
+
+The default entry point is the **`start-task`** skill. Load it via
+`SKILL_MANAGE` (`action: load`, `id: start-task`) before starting
+any new task. It primes context, guides complexity assessment, and routes
+to the right level of process.
+
+For complex features (multi-file, spec-driven), the full pipeline is:
+
+Research → Plan → Design Review Gate → Work Unit Decomposition →
+Orchestrated Execution (4-phase loop per unit) → Final Review → PR
+
+Load the **`orchestrated-execution`** skill (`orchestrated-execution`)
+for the full 4-phase loop: IMPLEMENT → VALIDATE → ADVERSARIAL REVIEW → COMMIT.
+
+## Available Skills
+
+| Skill | Purpose |
+|---|---|
+| `start-task` | Begin tracked work — complexity assessment, routing |
+| `prime` | Load relevant knowledge before starting |
+| `orchestrated-execution` | 4-phase execution loop per work unit |
+| `review-design` / `design-review-gate` | Parallel 5-agent design review |
+| `plan-review-gate` | Adversarial plan review (3 reviewers must PASS) |
+| `pr-shepherd` | Monitor a PR through to merge |
+| `self-reflect` | Extract learnings after a PR merge |
+| `handling-pr-comments` | Handle PR review comments |
+| `create-issue` | Create a well-structured GitHub Issue |
+| `setup` | Interactive guided setup — detects project, configures orchestration |
+
+## Quality Gates
+
+- **Design Review Gate**: Parallel 5-agent review after design is drafted.
+  Load `design-review-gate`.
+- **Plan Review Gate**: Adversarial review after any implementation plan is
+  drafted. Spawns 3 independent reviewers (Feasibility, Completeness, Scope
+  & Alignment) — ALL must PASS before the plan is presented to the user.
+  Load `plan-review-gate`.
+- **Coverage Gate**: Reads `.coverage-thresholds.json` and runs the
+  enforcement command — BLOCKING gate before PR creation.
+
+## Workflow Enforcement (MANDATORY)
+
+These rules override any conflicting instructions. They ensure the full
+orchestration pipeline is followed regardless of which skill initiated the work.
+
+- **After brainstorming**: STOP — do NOT proceed to planning or
+  implementation. RUN the Design Review Gate. WAIT for all 5 reviewers to
+  approve. ONLY THEN proceed.
+- **After any plan is created**: STOP — do NOT present the plan to the user
+  or begin implementation. RUN the Plan Review Gate. WAIT for all 3
+  reviewers to PASS. ONLY THEN present the plan for approval.
+- **Execution method choice**: When a plan is ready, always ask the user
+  which execution approach they want (orchestrated execution vs.
+  subagent-driven vs. parallel session). Do NOT auto-select.
+- **Before finishing a branch**: RUN `self-reflect` to capture
+  learnings, commit knowledge base updates, THEN proceed to PR creation.
+- **Subagent discipline**: NEVER use `--no-verify` on commits. NEVER
+  force-push. ALWAYS follow TDD. NEVER self-certify — the orchestrator
+  validates independently. STAY within declared file scope.
+- **Context recovery**: Approved plans, project context, and execution
+  state persist to disk. If context is lost mid-execution, reload from
+  the persisted plan and execution-state files.
+- **Diagnose before implementing**: For complex tasks (multi-file, non-obvious
+  behavior, performance issues, anything where the root cause is unclear), add
+  debug/logging statements or diagnostic tests first to confirm your
+  understanding of the actual problem before writing the implementation. Do not
+  implement based on assumptions — instrument, observe, then fix.
+
 # Seal Harness — Agent Guide
 
 > Security-first Haskell runtime for AI agents, built on the **SealOp ISA**:

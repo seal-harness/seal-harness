@@ -147,6 +147,7 @@ library
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
+        Seal.Channels.Chat.WatchPersist
         Seal.Channels.Cursor
         Seal.Channels.Cursor.Persist
         Seal.Channels.Loop
@@ -237,6 +238,7 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.ContextTruncation
         Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
@@ -244,6 +246,7 @@ library
         Seal.Agent.Runtime.Registry
         Seal.Agent.Runtime.Delegation
         Seal.Agent.Runtime.Delegation.Worker
+        Seal.Agent.Runtime.RunRecord
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
@@ -450,6 +453,7 @@ test-suite tests
         Seal.Agent.Runtime.RegistrySpec
         Seal.Agent.Runtime.Delegation.WorkerSpec
         Seal.Agent.Runtime.Delegation.ConcurrentSpec
+        Seal.Agent.Runtime.RunRecordSpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
@@ -471,7 +475,9 @@ test-suite tests
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
         Seal.Channels.Chat.WsClientSpec
+        Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
         Seal.Command.HelpSpec
@@ -557,10 +563,12 @@ test-suite tests
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
+        Seal.Providers.ContextWindowSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
+        Seal.Agent.ContextTruncationSpec
         Seal.ISA.DispatchSpec
         Seal.ISA.IntegrationSpec
         Seal.ISA.Ops.HumanSpec

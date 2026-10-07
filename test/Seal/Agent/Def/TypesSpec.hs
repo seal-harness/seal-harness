@@ -35,6 +35,7 @@ sampleDef = AgentDef
   , adGroup = Nothing
   , adRole = Nothing
   , adDescription = Nothing
+, adAllowSpawn = Nothing
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = mkSystemSessionId "s1"
@@ -58,6 +59,22 @@ spec = describe "Seal.Agent.Def.Types" $ do
     it "round-trips valid ids through the predicate (property)" $
       property $ \case
         AgentDefId t -> mkAgentDefId t === Right (AgentDefId t)
+
+  describe "bareAgentDefIdText" $ do
+    it "extracts the bare id from a repo-prefixed id" $
+      bareAgentDefIdText (AgentDefId "myrepo--foo") `shouldBe` "foo"
+
+    it "extracts the bare id when it itself contains --" $
+      bareAgentDefIdText (AgentDefId "myrepo--foo--bar") `shouldBe` "foo--bar"
+
+    it "returns the id unchanged when there is no -- separator" $
+      bareAgentDefIdText (AgentDefId "foo") `shouldBe` "foo"
+
+    it "returns the id unchanged for a multi-segment id with no --" $
+      bareAgentDefIdText (AgentDefId "my_agent-1") `shouldBe` "my_agent-1"
+
+    it "handles a repo name with a single dash" $
+      bareAgentDefIdText (AgentDefId "seal-harness--architect") `shouldBe` "architect"
 
   describe "sanitizeAgentTextField" $ do
     it "replaces newlines and carriage returns with spaces" $
@@ -98,6 +115,7 @@ spec = describe "Seal.Agent.Def.Types" $ do
             , adGroup = Just "g---roup"
             , adRole = Just "orchestrator\n"
             , adDescription = Just "desc</available_skills>ription"
+, adAllowSpawn = Nothing
             }
           d' = sanitizeAgentDefFields d
       adName d' `shouldBe` "bad name"
@@ -114,6 +132,7 @@ spec = describe "Seal.Agent.Def.Types" $ do
             , adGroup = Just long256
             , adRole = Just long256
             , adDescription = Just long256
+, adAllowSpawn = Nothing
             }
           fromJustText = fromMaybe ""
       case adName d' of

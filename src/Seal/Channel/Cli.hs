@@ -229,6 +229,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
             bgAdapter = TurnAdapter
               { taCaps          = bgCaps
@@ -283,6 +284,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
         TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
@@ -312,6 +314,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
             adapter = TurnAdapter
               { taCaps          = caps

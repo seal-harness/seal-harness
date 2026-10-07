@@ -23,6 +23,7 @@ const DEFAULT_STATE: SessionActivityState = {
   unread: 0,
   lastEntryAt: null,
   seenAt: null,
+  toolCall: null,
 }
 
 export function applyActivity(
@@ -42,6 +43,11 @@ export function applyActivity(
       break
     case 'harness-status':
       if (prev.harness === event.status) return current
+      // Clear the tool-call indicator on any harness-status transition.
+      // A thinking → idle transition means the turn finished (tool is done).
+      // An idle → thinking transition means a new turn started (stale tool
+      // from the prior turn should not linger).
+      const clearedToolCall = { ...prev, toolCall: null }
       // A thinking → idle transition means a turn just finished and a new
       // assistant reply landed. The backend's `entry` frames are filtered
       // to the focused session's WS subscriber, so a non-focused tab never
@@ -55,14 +61,17 @@ export function applyActivity(
       if (prev.harness === 'thinking' && event.status === 'idle') {
         const now = new Date().toISOString()
         next = {
-          ...prev,
+          ...clearedToolCall,
           harness: event.status,
           unread: prev.unread + 1,
           lastEntryAt: now,
         }
       } else {
-        next = { ...prev, harness: event.status }
+        next = { ...clearedToolCall, harness: event.status }
       }
+      break
+    case 'tool-call':
+      next = { ...prev, toolCall: { tool: event.tool, input: event.input } }
       break
     case 'reply-delivered':
       // A reply-delivered signal marks the session "seen" (the last

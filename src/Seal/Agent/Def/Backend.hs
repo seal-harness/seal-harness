@@ -43,6 +43,8 @@
 module Seal.Agent.Def.Backend
   ( -- * Backend record (re-exported from Seal.Agent.Def.Workdir)
     AgentDefBackend (..)
+  , ResolveResult (..)
+  , resolveAgentDefEntry
   , noneBackend
   , unionAgentDefBackend
     -- * User store (local-FS, §3.9)
