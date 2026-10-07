@@ -91,7 +91,7 @@ async function fetchTranscriptSeed(sessionId: string): Promise<{ entries: Transc
   const textDone = perf.begin('transcript.seed.readBody')
   const parseDone = perf.begin('transcript.seed.jsonParse')
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript?limit=${CHUNK_SIZE}`)
     await perf.recordFetch('transcript.seed', res)
     ttfbDone({ meta: { sessionId, status: res.status } })
     if (!res.ok) {
