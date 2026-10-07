@@ -99,6 +99,11 @@ data AgentDef = AgentDef
     -- @\<available_agents\>@ catalog and AGENT_DEF_LIST output.
     -- Sanitized (single line, no control chars, no catalog-fence tokens,
     -- capped) — the same injection defense as every other def field.
+  , adAllowSpawn :: Maybe Bool
+    -- ^ Per-agent-definition spawn permission. @Nothing@ = role-based
+    -- default (orchestrator can spawn, leaf cannot). @Just False@ = never
+    -- allow spawn, even if role is orchestrator. @Just True@ = allow
+    -- spawn even if role is leaf (escape hatch for special defs).
   , adCreatedAt :: UTCTime
   , adUpdatedAt :: UTCTime
   , adSession   :: SessionId
@@ -184,6 +189,7 @@ instance ToJSON AgentDef where
     , "group"      .= adGroup d
     , "role"       .= adRole d
     , "description" .= adDescription d
+    , "allow_spawn" .= adAllowSpawn d
     , "created_at" .= adCreatedAt d
     , "updated_at" .= adUpdatedAt d
     , "session"    .= adSession d
@@ -200,6 +206,7 @@ instance FromJSON AgentDef where
     <*> o .:? "group"
     <*> o .:? "role"
     <*> o .:? "description"
+    <*> o .:? "allow_spawn"
     <*> o .:  "created_at"
     <*> o .:  "updated_at"
     <*> o .:  "session"

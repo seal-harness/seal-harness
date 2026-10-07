@@ -184,6 +184,7 @@ runTui autonomy logger = do
         , ccdTabs        = tabsH
         , ccdTabCloseNotifier = noTabCloseNotifier
         , ccdAbortReg    = abortReg
+        , ccdRunRecords  = bRunRecords backends
         , ccdStopWriter  = mkStopTranscriptWriter paths Nothing
         , ccdModelWriter = mkModelTranscriptWriter paths Nothing
         , ccdRepoReg     = repoReg

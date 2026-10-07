@@ -574,6 +574,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
             }
       backend <- staticAgentDefBackend [d]
@@ -587,6 +588,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
             }
       backend <- staticAgentDefBackend [d]
@@ -600,6 +602,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
             }
       backend <- staticAgentDefBackend [d]
@@ -613,6 +616,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
             }
       backend <- staticAgentDefBackend [mkD "repo1--foo", mkD "repo2--foo"]
@@ -636,6 +640,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "user version"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "s1"
             }
       adbUpdate userBackend userDef
@@ -654,6 +659,7 @@ spec = do
             , adModel = ModelId "llama3", adSystem = Just "user version"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
             , adUpdatedAt = aTime, adSession = mkSystemSessionId "s1"
             }
       adbUpdate userBackend userDef

@@ -90,7 +90,7 @@ import Seal.Config.Security
   , saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
-import Seal.Gateway.Send (SendDeps (..))
+import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -397,6 +397,7 @@ buildTestEnv tmp mode mRepo opts = do
       pure ()
   let configRepo = openConfigRepo configRoot
   backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) configRepo nullEmbeddingBackend
+  wakeMutex <- newSessionWakeMutex
   tabsH <- newTabsHandle
   reg <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
@@ -507,6 +508,8 @@ buildTestEnv tmp mode mRepo opts = do
         , sdRemoteRunner = mRunner
         , sdMkWorker = atoChildWorker opts
         , sdMkWorkerStubDepth = atoStubWorkerFromDepth opts
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = False
         , sdResolveProviderOverride =
             if atoChildProvider opts
               then Just (\_ -> pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2")))

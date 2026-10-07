@@ -21,6 +21,7 @@ import Seal.Agent.Runtime.Delegation
   ( ChildExitReason (..), ChildResult (..), ChildStatus (..)
   , ChildWorkerOutcome (..)
   , DelegateInput (..)
+  , runDelegate
   , SpawnInfo (..)
   , defaultDelegationConfig, dcChildTimeoutSeconds
   , newSpawnPauseFlag, setSpawnPaused
@@ -69,6 +70,12 @@ recordingWorker :: IORef Int -> Del.AgentWorkerBuilder
 recordingWorker ref _ _ _ _ = do
   modifyIORef' ref (+1)
   pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
+-- | A worker that returns a fixed summary string and completes. Used by
+-- foreground mode tests where we want a specific summary text.
+recordingWorker' :: Text -> Del.AgentWorkerBuilder
+recordingWorker' summary _ _ _ _ =
+  pure (ChildWorkerOutcome (Just summary) CerCompleted 0 0 (Just (mkSystemSessionId "child")))
 
 -- | A worker that tracks the maximum number of concurrent executions.
 -- Each child increments a counter on entry, sleeps briefly so overlaps are
@@ -252,6 +259,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , adModel = ModelId "llama3", adSystem = Just "be nice"
             , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
             , adDescription = Nothing
+    , adAllowSpawn = Nothing
             , adCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
             , adUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
             , adSession = sampleSession
@@ -338,6 +346,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -374,6 +384,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -406,6 +418,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("nope" :: Text), "goal" .= ("x" :: Text)]))
@@ -438,6 +452,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend (object ["id" .= ("a1" :: Text)]))
       orIsError r `shouldBe` True
@@ -461,6 +477,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("task one" :: Text)]
@@ -489,6 +507,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("t1" :: Text)]
@@ -526,6 +546,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
@@ -553,6 +575,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True]))
@@ -582,6 +606,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
@@ -611,6 +637,8 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text), "isolate_workdir" .= True] ]]))
@@ -796,6 +824,179 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           aiStatus inst `shouldBe` Stopped
           aiResult inst `shouldBe` Just result
         Nothing -> expectationFailure "instance not found in registry"
+
+  describe "runDelegate (foreground/sync core)" $ do
+    it "returns ChildResult with completed status for a successful worker" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker' "foreground done"
+                                        , mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+        Right [result] -> do
+          crStatus result `shouldBe` CsCompleted
+          crSummary result `shouldBe` Just "foreground done"
+          crExitReason result `shouldBe` CerCompleted
+        Right _ -> expectationFailure "expected exactly one result"
+
+    it "returns ChildResult with error status for a crashing worker" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          crashingWorker :: Del.AgentWorkerBuilder
+          crashingWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
+          resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right [result] -> crStatus result `shouldBe` CsError
+        _ -> expectationFailure "expected Right with one error result"
+
+    it "batch foreground mode returns results for all children" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
+          tasks = [mkTask i | i <- [1..3 :: Int]]
+          input = DiBatch tasks
+          resolver _task = pure (Right ( undefined
+                                        , recordingWorker' "done"
+                                        , mkSystemSessionId "child"))
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right results -> length results `shouldBe` 3
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+
+    it "resolve error returns CsError" $ do
+      pauseFlag <- newSpawnPauseFlag
+      let cfg = defaultDelegationConfig
+          resolver _task = pure (Left "agent def not found: nope")
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
+      eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      case eResult of
+        Right [result] -> do
+          crStatus result `shouldBe` CsError
+          crError result `shouldBe` Just "agent def not found: nope"
+        _ -> expectationFailure "expected Right with one error result"
+
+  describe "parseSpawnMode" $ do
+    it "defaults to background when mode field is absent" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text)])
+        `shouldBe` SpawnModeBackground
+    it "parses foreground mode" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("foreground" :: Text)])
+        `shouldBe` SpawnModeForeground
+    it "parses background mode explicitly" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("background" :: Text)])
+        `shouldBe` SpawnModeBackground
+    it "defaults to background for unrecognized mode" $ do
+      parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("bogus" :: Text)])
+        `shouldBe` SpawnModeBackground
+
+  describe "encodeForegroundResults" $ do
+    it "renders a completed result with status and summary" $ do
+      let result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsCompleted
+            , crSummary = Just "task completed successfully"
+            , crExitReason = CerCompleted
+            , crDurationSeconds = 1.5
+            , crSubagentId = Del.SubagentId "sa-a1-00000001"
+            , crTokensInput = 100
+            , crTokensOutput = 50
+            , crToolTrace = []
+            , crError = Nothing
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just (mkSystemSessionId "child")
+            }
+          text = encodeForegroundResults [result]
+      T.isInfixOf "sa-a1-00000001" text `shouldBe` True
+      T.isInfixOf "CsCompleted" text `shouldBe` True
+      T.isInfixOf "task completed successfully" text `shouldBe` True
+    it "renders empty list as no children" $ do
+      encodeForegroundResults [] `shouldBe` "(no children spawned)"
+
+  describe "adAllowSpawn enforcement (authorizeStart gate)" $ do
+    let mkGate role orchEnabled allow = AgentStartGate
+          { gEffectiveRole = role
+          , gOrchEnabled = orchEnabled
+          , gAllowSpawn = allow
+          }
+        mkWiring gate = AgentStartWiring
+          { aswDefBackend = error "unused by authorize"
+          , aswRuntime = error "unused by authorize"
+          , aswConfig = error "unused by authorize"
+          , aswPauseFlag = error "unused by authorize"
+          , aswParentActivity = Nothing
+          , aswMintSession = error "unused by authorize"
+          , aswParentDepth = 0
+          , aswWorker = error "unused by authorize"
+          , aswGate = gate
+          , aswPaths = samplePaths
+          , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
+          }
+        validInput = object ["id" .= ("a1" :: Text), "goal" .= ("g" :: Text)]
+        auth gate = authorizeStart (mkWiring gate) validInput
+
+    it "Nothing + orchestrator role + switch on ⇒ allowed" $
+      auth (mkGate (Just "orchestrator") True Nothing) `shouldBe` Right ()
+    it "Nothing + leaf role ⇒ leafMsg" $
+      auth (mkGate (Just "leaf") True Nothing) `shouldBe` Left leafMsg
+    it "Nothing + orchestrator role + switch off ⇒ killSwitchMsg" $
+      auth (mkGate (Just "orchestrator") False Nothing) `shouldBe` Left killSwitchMsg
+    it "Just False blocks an orchestrator even with switch on ⇒ allowSpawnBlockedMsg" $
+      auth (mkGate (Just "orchestrator") True (Just False)) `shouldBe` Left allowSpawnBlockedMsg
+    it "Just True allows a leaf role (escape hatch) ⇒ allowed" $
+      auth (mkGate (Just "leaf") True (Just True)) `shouldBe` Right ()
+    it "Just False takes precedence over switch-off (most-specific message)" $
+      auth (mkGate (Just "orchestrator") False (Just False)) `shouldBe` Left allowSpawnBlockedMsg
+    it "Just True takes precedence over switch-off (override wins) ⇒ allowed" $
+      auth (mkGate (Just "orchestrator") False (Just True)) `shouldBe` Right ()
+    it "Just True takes precedence over leaf role ⇒ allowed" $
+      auth (mkGate (Just "leaf") False (Just True)) `shouldBe` Right ()
+
+  describe "encodeSpawnInfos — anti-polling text" $ do
+    it "includes the anti-polling instruction for background spawns" $ do
+      let si = Del.SpawnInfo
+            { Del.siSubagentId = Del.SubagentId "sa-a1-00000001"
+            , Del.siChildSession = mkSystemSessionId "child"
+            , Del.siTaskIndex = 0
+            }
+          text = encodeSpawnInfos [si]
+      ("do NOT call AGENT_MANAGE status" `T.isInfixOf` text) `shouldBe` True
+      ("NO_REPLY" `T.isInfixOf` text) `shouldBe` True
+      ("ALL expected completions" `T.isInfixOf` text) `shouldBe` True
+    it "renders the empty list without the anti-polling block" $ do
+      encodeSpawnInfos [] `shouldBe` "(no children spawned)"
+
+  describe "completionMessage — anti-polling text" $ do
+    let mkResult = ChildResult
+          { crTaskIndex = 0
+          , crStatus = CsCompleted
+          , crSummary = Just "done"
+          , crExitReason = CerCompleted
+          , crDurationSeconds = 1.0
+          , crSubagentId = Del.SubagentId "sa-a1-00000001"
+          , crTokensInput = 0
+          , crTokensOutput = 0
+          , crToolTrace = []
+          , crError = Nothing
+          , crFilesRead = []
+          , crFilesWritten = []
+          , crChildSession = Just (mkSystemSessionId "child")
+          }
+    it "includes the NO_REPLY instruction for late completions" $ do
+      let text = completionMessage mkResult
+      ("NO_REPLY" `T.isInfixOf` text) `shouldBe` True
+      ("final answer" `T.isInfixOf` text) `shouldBe` True
+    it "includes the subagent id and status" $ do
+      let text = completionMessage mkResult
+      ("sa-a1-00000001" `T.isInfixOf` text) `shouldBe` True
+      ("CsCompleted" `T.isInfixOf` text) `shouldBe` True
 
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do
