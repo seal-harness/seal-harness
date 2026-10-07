@@ -274,6 +274,9 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
                     let dropped = max 0 (totalCount - limit)
                     in (drop dropped allEntries, totalCount > limit)
                   Just before ->
+                   if before == "__beginning__"
+                     then (take limit allEntries, totalCount > limit)
+                     else
                     case entriesBeforeId before allEntries of
                       Just beforeEntries ->
                         let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries

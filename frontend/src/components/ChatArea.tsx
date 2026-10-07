@@ -2304,7 +2304,7 @@ export function ChatArea({
   onAnswerQuestionText,
   isSessionThinking,
   onCancelQuestion,
-  hasMore, loadingMore, totalCount, loadOlder,
+  hasMore, loadingMore, totalCount, loadOlder, loadFromBeginning,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2315,6 +2315,7 @@ export function ChatArea({
   loadingMore?: boolean
   totalCount?: number
   loadOlder?: () => void
+  loadFromBeginning?: () => void
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2709,7 +2710,13 @@ export function ChatArea({
               className="header-scroll-btn"
               title="Scroll to top of transcript"
               aria-label="Scroll to top"
-              onClick={() => scrollerRef.current?.scrollTo({ top: 0 })}
+              onClick={() => {
+                if (hasMore && loadFromBeginning) {
+                  loadFromBeginning()
+                } else {
+                  scrollerRef.current?.scrollTo({ top: 0 })
+                }
+              }}
             >
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
                 stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"

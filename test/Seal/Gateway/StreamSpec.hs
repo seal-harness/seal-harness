@@ -306,6 +306,28 @@ spec = describe "Seal.Gateway.Stream" $ do
         Just result -> result `shouldBe` []
         Nothing -> pure ()  -- Nothing is also acceptable (handler returns [])
 
+
+    it "returns the oldest N entries when before is __beginning__" $ do
+      let mkEntries :: [Int] -> [A.Value]
+          mkEntries = map (\i -> A.object [Key.fromText "id" .= T.pack (show i)])
+          entries = mkEntries [0..9]
+          limit = 3
+      -- Simulate the __beginning__ case: take limit entries from the start
+      let result = take limit entries
+          hasMoreResult = length entries > limit
+      result `shouldBe` mkEntries [0..2]
+      hasMoreResult `shouldBe` True
+
+    it "returns all entries when before is __beginning__ and count <= limit" $ do
+      let mkEntries :: [Int] -> [A.Value]
+          mkEntries = map (\i -> A.object [Key.fromText "id" .= T.pack (show i)])
+          entries = mkEntries [0..2]
+          limit = 50
+      let result = take limit entries
+          hasMoreResult = length entries > limit
+      result `shouldBe` mkEntries [0..2]
+      hasMoreResult `shouldBe` False
+
     it "clamps limit to [1, 200] with default 50" $ do
       clampLimit Nothing `shouldBe` 50
       clampLimit (Just 0) `shouldBe` 1

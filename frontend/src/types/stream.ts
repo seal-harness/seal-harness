@@ -274,6 +274,7 @@ export interface UseTranscriptStream {
   loadingMore: boolean
   /** Trigger to load the next chunk of older entries. */
   loadOlder: () => void
+  loadFromBeginning: () => void
 }
 
 export interface UseSessionActivityStream {

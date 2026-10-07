@@ -309,8 +309,8 @@ export function useTranscriptStream(
     const unsub = sc.onEntriesChunk((chunkSid, chunk) => {
       // Only handle chunks for the currently-focused session.
       if (chunkSid !== currentSessionRef.current) return
-      if (chunk.requestBefore === null) {
-        // Initial chunk (latest entries).
+      if (chunk.requestBefore === null || chunk.requestBefore === '__beginning__') {
+        // Initial chunk (latest entries) or jump-to-beginning chunk (oldest entries).
         setEntries(chunk.entries)
         setHasMore(chunk.hasMore)
         setTotalCount(chunk.totalCount ?? chunk.entries.length)
@@ -364,6 +364,17 @@ export function useTranscriptStream(
     sc.requestEntries(sid, firstId, CHUNK_SIZE)
   }, [loadingMore, hasMore, entries, sc])
 
+  // loadFromBeginning: jump to the oldest entries (for "scroll to top" button).
+  // Sends a WS requestEntries with before="__beginning__" which the backend
+  // handles by returning the oldest N entries in one shot.
+  const loadFromBeginning = useCallback(() => {
+    const sid = currentSessionRef.current
+    if (sid === null) return
+    setLoading(true)
+    setHasMore(false); setTotalCount(0); setLoadingMore(false)
+    sc.requestEntries(sid, '__beginning__', CHUNK_SIZE)
+  }, [sc])
+
   // WS ask subscription (focused session only).
   useEffect(() => {
     if (sessionId === null) return
@@ -411,6 +422,6 @@ export function useTranscriptStream(
 
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
-    hasMore, totalCount, loadingMore, loadOlder,
+    hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning,
   }
 }
