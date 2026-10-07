@@ -166,6 +166,7 @@ import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
+import qualified Seal.ISA.Ops.BrowserSpec
 import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
 import qualified Seal.ISA.Ops.BinGhSpec
@@ -347,6 +348,7 @@ specs = do
   Seal.ISA.Ops.ShellSpec.spec
   Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
+  Seal.ISA.Ops.BrowserSpec.spec
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.BinGhSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
