@@ -55,3 +55,58 @@ spec = describe "Seal.Transcript.ConvIndex" $ do
               eResult `shouldSatisfy` isRight
               eLines <- readConvLines convPath idxPath 0 (length msgs)
               pure (eLines `shouldBe` Right msgs)
+
+  describe "edge cases" $ do
+    it "empty conversation file: convLineCount=0, readConvLines=[]" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+        BS.writeFile convPath ""
+        eResult <- buildIndex convPath idxPath
+        eResult `shouldSatisfy` isRight
+        lc <- convLineCount idxPath
+        lc `shouldBe` 0
+        eLines <- readConvLines convPath idxPath 0 0
+        eLines `shouldBe` Right []
+
+    it "single line: readConvLines 0 1 returns the one message" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+        writeConvFile convPath [textMsg "hello"]
+        _ <- buildIndex convPath idxPath
+        eLines <- readConvLines convPath idxPath 0 1
+        eLines `shouldBe` Right [textMsg "hello"]
+
+    it "lines with embedded \\n in JSON strings (escaped, not real newlines)" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            -- The text "line1\nline2" is JSON-encoded as "line1\\nline2"
+            -- (no actual 0x0a byte in the file)
+            msgs = [textMsg "line1\nline2", textMsg "ok"]
+        writeConvFile convPath msgs
+        _ <- buildIndex convPath idxPath
+        lc <- convLineCount idxPath
+        lc `shouldBe` 2
+        eLines <- readConvLines convPath idxPath 0 2
+        eLines `shouldBe` Right msgs
+
+    it "readConvLines with start == end returns []" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+        writeConvFile convPath [textMsg "a", textMsg "b", textMsg "c"]
+        _ <- buildIndex convPath idxPath
+        eLines <- readConvLines convPath idxPath 1 1
+        eLines `shouldBe` Right []
+
+    it "readConvLines with end > lineCount clamps to available lines" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            msgs = [textMsg "a", textMsg "b", textMsg "c"]
+        writeConvFile convPath msgs
+        _ <- buildIndex convPath idxPath
+        eLines <- readConvLines convPath idxPath 0 999999
+        eLines `shouldBe` Right msgs
