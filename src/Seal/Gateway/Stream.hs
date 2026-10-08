@@ -51,7 +51,7 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
-import Seal.Gateway.Transcript (readTranscriptEntriesTimed, showIso)
+import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -272,22 +272,25 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
             let model = maybe "" smModel mMeta
                 fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
                 limit = clampLimit mLimit
-            -- For the initial chunk (mBefore == Nothing), use the
-            -- paginated read to avoid loading all entries into memory.
-            -- For before/id pagination, read with a generous limit
-            -- (the entries file is small; the conversation read is
-            -- what's expensive, and the limit caps that).
-            (allEntries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
+            -- Use the paginated read to avoid loading all entries into
+            -- memory. For the initial chunk (mBefore == Nothing), read
+            -- only the last `limit` entries. For before/id pagination,
+            -- read a wider window. For __beginning__, we need the FIRST
+            -- entries — read without limit (the conv-only path is rare
+            -- and typically small; the entries path uses the page).
+            (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
               (case mBefore of
-                Nothing -> Just limit
-                Just _  -> Just (limit * 3))
-            let totalCount = case mBefore of
-                  Nothing -> length allEntries  -- already limited; use ttEntryCount for real total
-                  Just _  -> length allEntries
+                Nothing          -> Just limit
+                Just "__beginning__" -> Nothing  -- need first entries, not last
+                Just _           -> Just (limit * 3))
+            -- totalCount comes from the timings (full entry count before
+            -- limiting), NOT from length allEntries (which is the limited count).
+            let totalCount = ttEntryCount tt
                 (chunk, hasMore) = case mBefore of
                   Nothing ->
-                    let dropped = max 0 (totalCount - min limit totalCount)
-                    in (drop dropped allEntries, totalCount > limit)
+                    -- allEntries already contains only the last `limit`
+                    -- entries; the chunk is all of them, hasMore = totalCount > limit
+                    (allEntries, totalCount > limit)
                   Just before ->
                    if before == "__beginning__"
                      then (take limit allEntries, totalCount > limit)
