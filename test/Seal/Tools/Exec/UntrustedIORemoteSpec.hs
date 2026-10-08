@@ -25,7 +25,7 @@
 module Seal.Tools.Exec.UntrustedIORemoteSpec (spec) where
 
 import Data.IORef
-import Data.List (isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Either (fromRight)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -216,7 +216,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
           uio    = mkRemoteUntrustedIO sshCfg runner
       cmd <- either (const (error "fixture")) pure
                (mkShellCommand "gh repo clone 'x' 'y'")
-      _ <- uioShellExecEnv uio [("GH_TOKEN", "tok")] cmd Nothing
+      _ <- uioShellExecEnv uio [("GIT_TERMINAL_PROMPT", "0")] cmd Nothing
       recorded <- readIORef calls
       case recorded of
         [(argv, _)] ->
@@ -229,7 +229,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
               -- The credential env rides AFTER 'cd <ws> &&', adjacent to
               -- the command it scopes.
               composed `shouldBe`
-                "cd '/srv/agent-workspace' && env GH_TOKEN='tok' "
+                "cd '/srv/agent-workspace' && env GIT_TERMINAL_PROMPT='0' "
                 <> "gh repo clone 'x' 'y'"
             [] -> expectationFailure "empty argv"
         _ -> expectationFailure "expected exactly one call"
@@ -253,7 +253,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
             [] -> expectationFailure "empty argv"
         _ -> expectationFailure "expected exactly one call"
 
-    it "uioBinExecEnv scopes the env to the binary: 'cd <ws> && env K=V bin args'" $ do
+    it "uioBinExecEnv with GH_TOKEN: token is on stdin, NOT in the command string" $ do
       calls <- newIORef []
       let runner = mkFakeRemoteRunnerRecording calls okRight
           uio    = mkRemoteUntrustedIO sshCfg runner
@@ -262,16 +262,119 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       _ <- uioBinExecEnv uio [("GH_TOKEN", "tok")] bin bargs Nothing
       recorded <- readIORef calls
       case recorded of
-        [(argv, _)] ->
-          case reverse argv of
-            (composed : _) -> do
-              "env " `isPrefixOf` composed `shouldBe` False
-              -- Each argv token is single-quoted (the arm's existing
-              -- quoting discipline); the env prefix scopes to the binary.
-              composed `shouldBe`
-                "cd '/srv/agent-workspace' && env GH_TOKEN='tok' "
-                <> "'gh' 'pr' 'create'"
-            [] -> expectationFailure "empty argv"
+        [(argv, mStdin)] -> do
+          -- The token must NOT appear in the argv.
+          argv `shouldNotSatisfy` any ("GH_TOKEN=" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("env GH_TOKEN" `isInfixOf`)
+          -- The token MUST be on stdin.
+          mStdin `shouldBe` Just "tok\n"
+          argv `shouldSatisfy` any ("read -r GH_TOKEN" `isInfixOf`)
+          argv `shouldSatisfy` any ("exec " `isInfixOf`)
+          argv `shouldSatisfy` any ("gh" `isInfixOf`)
+        _ -> expectationFailure "expected exactly one call"
+
+  -- -----------------------------------------------------------------------
+  -- Stdin-based env injection for secret-bearing env vars (PAT tokens).
+  --
+  -- When the env extras contain a secret-bearing key (GH_TOKEN,
+  -- GITHUB_TOKEN, http.extraHeader, GIT_CONFIG_PARAMETERS), the remote
+  -- arm pipes the values over SSH stdin instead of embedding them in
+  -- the command string. This prevents the token from appearing in:
+  --   * the local ssh process's argv (/proc/<pid>/cmdline)
+  --   * the remote shell's command line (/proc on the untrusted machine)
+  --   * shell history (if any)
+  --
+  -- The remote command uses `sh -c 'read -r K1; read -r K2; ...; export
+  -- K1 K2 ...; exec <cmd>'` and the stdin payload is newline-separated
+  -- raw values (no shell quoting — read -r handles arbitrary bytes
+  -- except NUL/newline, which tokens never contain).
+  --
+  -- Non-secret extras (GIT_TERMINAL_PROMPT=0) ride alongside secrets
+  -- via stdin too (all extras go via stdin when any are secret). When
+  -- NO secrets are present, the existing `env K=V` prefix is used
+  -- (unchanged behavior for non-secret cases).
+  -- -----------------------------------------------------------------------
+  describe "uioShellExecEnv + uioBinExecEnv (stdin-based secret injection)" $ do
+
+    it "uioShellExecEnv with GH_TOKEN: token is on stdin, NOT in the command string" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure
+               (mkShellCommand "gh repo clone 'x' 'y'")
+      _ <- uioShellExecEnv uio [("GH_TOKEN", "ghp_secret123")] cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, mStdin)] -> do
+          argv `shouldNotSatisfy` any ("ghp_secret123" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("GH_TOKEN=" `isInfixOf`)
+          mStdin `shouldBe` Just "ghp_secret123\n"
+          argv `shouldSatisfy` any ("read -r GH_TOKEN" `isInfixOf`)
+          argv `shouldSatisfy` any ("exec " `isInfixOf`)
+        _ -> expectationFailure "expected exactly one call"
+
+    it "uioShellExecEnv with GH_TOKEN + GIT_TERMINAL_PROMPT: both on stdin, neither in argv" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "gh pr create")
+      _ <- uioShellExecEnv uio [("GH_TOKEN", "ghp_abc"), ("GIT_TERMINAL_PROMPT", "0")] cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, mStdin)] -> do
+          argv `shouldNotSatisfy` any ("ghp_abc" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("GH_TOKEN=" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("env GH_TOKEN" `isInfixOf`)
+          mStdin `shouldBe` Just "ghp_abc\n0\n"
+        _ -> expectationFailure "expected exactly one call"
+
+    it "uioBinExecEnv with GH_TOKEN: token is on stdin, NOT in the command string" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+          bin    = fromRight (error "fixture") (mkBinName "gh")
+          bargs  = map (fromRight (error "fixture") . mkBinArg) ["pr", "create"]
+      _ <- uioBinExecEnv uio [("GH_TOKEN", "ghp_xyz789")] bin bargs Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, mStdin)] -> do
+          argv `shouldNotSatisfy` any ("ghp_xyz789" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("GH_TOKEN=" `isInfixOf`)
+          mStdin `shouldBe` Just "ghp_xyz789\n"
+          argv `shouldSatisfy` any ("read -r GH_TOKEN" `isInfixOf`)
+          argv `shouldSatisfy` any ("exec " `isInfixOf`)
+          argv `shouldSatisfy` any ("gh" `isInfixOf`)
+        _ -> expectationFailure "expected exactly one call"
+
+    it "uioShellExecEnv with GIT_CONFIG_PARAMETERS (git PAT): header on stdin, NOT in argv" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "git fetch")
+      _ <- uioShellExecEnv uio
+             [("GIT_CONFIG_PARAMETERS", "'http.extraheader=Authorization: Basic dXNlcjp0b2tlbg=='")
+             ,("GIT_TERMINAL_PROMPT", "0")]
+             cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, mStdin)] -> do
+          argv `shouldNotSatisfy` any ("Authorization: Basic" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("dXNlcjp0b2tlbg==" `isInfixOf`)
+          argv `shouldNotSatisfy` any ("GIT_CONFIG_PARAMETERS=" `isInfixOf`)
+          mStdin `shouldBe` Just "'http.extraheader=Authorization: Basic dXNlcjp0b2tlbg=='\n0\n"
+        _ -> expectationFailure "expected exactly one call"
+
+    it "non-secret extras still use the env prefix (no stdin)" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "git status")
+      _ <- uioShellExecEnv uio [("GIT_TERMINAL_PROMPT", "0")] cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, mStdin)] -> do
+          mStdin `shouldBe` Nothing
+          argv `shouldSatisfy` any ("env GIT_TERMINAL_PROMPT='0'" `isInfixOf`)
         _ -> expectationFailure "expected exactly one call"
 
   describe "host-key mismatch (hard failure, never bypassed)" $ do
@@ -391,7 +494,7 @@ checkAdjacentPair argv key value =
   argv `shouldSatisfy` \argvList ->
     let joined    = key <> "=" <> value
         adjacent  = [key, value]
-        isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
-        tails []                   = [[]]
-        tails list@(_:rest)        = list : tails rest
-    in joined `elem` argvList || adjacent `isInfixOf` argvList
+        isInfixOf' needle haystack = any (isPrefixOf needle) (tails' haystack)
+        tails' []                   = [[]]
+        tails' list@(_:rest)        = list : tails' rest
+    in joined `elem` argvList || adjacent `isInfixOf'` argvList

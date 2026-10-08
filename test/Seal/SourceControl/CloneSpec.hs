@@ -559,7 +559,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
   --------------------------------------------------------------------------
 
   describe "PAT env (W2)" $ do
-    it "http.extraHeader in ceGitConfigArgs; token NOT in ceUrl or ceEnvExtras" $
+    it "GIT_CONFIG_PARAMETERS in ceEnvExtras; token NOT in ceUrl or ceGitConfigArgs" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
         let keyfilesDir = homeDir </> ".seal/state/repos/keys"
             stateDir = homeDir </> ".seal/state/repos"
@@ -585,13 +585,16 @@ spec = describe "Seal.SourceControl.Clone" $ do
           -- The URL is token-free HTTPS
           ceUrl env `shouldBe` "https://github.com/o/r.git"
           token `BS.isInfixOf` TE.encodeUtf8 (ceUrl env) `shouldBe` False
-          -- ceGitConfigArgs contains the http.extraHeader
-          ceGitConfigArgs env `shouldSatisfy` (not . null)
-          let configStr = T.intercalate " " (ceGitConfigArgs env)
-          "http.extraHeader=Authorization: Basic" `T.isInfixOf` configStr `shouldBe` True
-          -- The token is NOT in the git config args (it's base64-encoded)
-          token `BS.isInfixOf` TE.encodeUtf8 configStr `shouldBe` False
-          -- The token is NOT in any env value
+          -- ceGitConfigArgs is empty (PAT auth is via GIT_CONFIG_PARAMETERS env)
+          ceGitConfigArgs env `shouldBe` []
+          -- GIT_CONFIG_PARAMETERS is in ceEnvExtras with the http.extraHeader
+          case lookup "GIT_CONFIG_PARAMETERS" (ceEnvExtras env) of
+            Nothing -> expectationFailure "GIT_CONFIG_PARAMETERS not in ceEnvExtras"
+            Just gcp -> do
+              "http.extraHeader=Authorization: Basic" `T.isInfixOf` T.pack gcp `shouldBe` True
+              -- The raw token is NOT in GIT_CONFIG_PARAMETERS (it's base64-encoded)
+              token `BS.isInfixOf` TE.encodeUtf8 (T.pack gcp) `shouldBe` False
+          -- The raw token is NOT in any env value (base64 only)
           let envValues = map (TE.encodeUtf8 . T.pack . snd) (ceEnvExtras env)
           any (token `BS.isInfixOf`) envValues `shouldBe` False
           -- Walk the disk: no token on disk
@@ -599,7 +602,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
           any (\(_, c) -> token `BS.isInfixOf` c) files `shouldBe` False
           -- ceRawToken carries the raw token bytes (the gh injection
           -- payload), and the raw token bytes do NOT leak into ceUrl,
-          -- ceEnvExtras, or the non-header parts of ceGitConfigArgs.
+          -- ceEnvExtras, or ceGitConfigArgs.
           ceRawToken env `shouldBe` Just token
 
     it "MachineUser: username in Basic auth header; token NOT in env" $
@@ -627,9 +630,13 @@ spec = describe "Seal.SourceControl.Clone" $ do
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
           ceUrl env `shouldBe` "https://github.com/o/r.git"
-          let configStr = T.intercalate " " (ceGitConfigArgs env)
-          "http.extraHeader=Authorization: Basic" `T.isInfixOf` configStr `shouldBe` True
-          -- The token is NOT in any env value or URL
+          ceGitConfigArgs env `shouldBe` []
+          case lookup "GIT_CONFIG_PARAMETERS" (ceEnvExtras env) of
+            Nothing -> expectationFailure "GIT_CONFIG_PARAMETERS not in ceEnvExtras"
+            Just gcp ->
+              "http.extraHeader=Authorization: Basic" `T.isInfixOf` T.pack gcp `shouldBe` True
+          -- The token is NOT in any env value (except GIT_CONFIG_PARAMETERS,
+          -- which is base64) or URL
           token `BS.isInfixOf` TE.encodeUtf8 (ceUrl env) `shouldBe` False
           let envValues = map (TE.encodeUtf8 . T.pack . snd) (ceEnvExtras env)
           any (token `BS.isInfixOf`) envValues `shouldBe` False

@@ -235,7 +235,7 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
   --------------------------------------------------------------------
 
   describe "PAT repo — local mode" $ do
-    it "injects GIT_TERMINAL_PROMPT + http.extraHeader via uioBinExecEnv" $ do
+    it "injects GIT_TERMINAL_PROMPT + GIT_CONFIG_PARAMETERS via uioBinExecEnv" $ do
       deps <- mkPatDeps [patRepo] False
       seen <- newIORef []
       let uio = fakeUio seen "git@github.com:owner/test-repo.git\n" "done\n"
@@ -244,19 +244,17 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
       orParts result `shouldBe` [TrpText "done\n"]
       (_, second) <- getTwoExecs seen 2
       reBinary second `shouldBe` "git"
-      -- The http.extraHeader config args are prepended to the git argv
-      -- so git push/fetch/pull authenticate via the PAT.
-      reArgs second `shouldBe`
-        [ "-c"
-        , "http.extraHeader=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX0ZBS0VfVE9LRU5fMTIzNDU="
-        , "fetch"
-        ]
+      -- PAT auth is via GIT_CONFIG_PARAMETERS in env (NOT argv — avoids
+      -- token exposure in /proc/<pid>/cmdline). The git argv is just
+      -- the user's args, no -c http.extraHeader prepended.
+      reArgs second `shouldBe` ["fetch"]
       reUsedEnv second `shouldBe` True
       reUsedGitEnv second `shouldBe` False
       reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_TERMINAL_PROMPT")
+      reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_CONFIG_PARAMETERS")
 
   describe "PAT repo — remote mode" $ do
-    it "injects GIT_TERMINAL_PROMPT + http.extraHeader via uioBinExecEnv" $ do
+    it "injects GIT_TERMINAL_PROMPT + GIT_CONFIG_PARAMETERS via uioBinExecEnv" $ do
       deps <- mkPatDeps [patRepo] True
       seen <- newIORef []
       let uio = fakeUio seen "git@github.com:owner/test-repo.git\n" "done\n"
@@ -265,14 +263,11 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
       orParts result `shouldBe` [TrpText "done\n"]
       (_, second) <- getTwoExecs seen 2
       reBinary second `shouldBe` "git"
-      reArgs second `shouldBe`
-        [ "-c"
-        , "http.extraHeader=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX0ZBS0VfVE9LRU5fMTIzNDU="
-        , "fetch"
-        ]
+      reArgs second `shouldBe` ["fetch"]
       reUsedEnv second `shouldBe` True
       reUsedGitEnv second `shouldBe` False
       reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_TERMINAL_PROMPT")
+      reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_CONFIG_PARAMETERS")
 
   --------------------------------------------------------------------
   -- Unregistered repo (fall-through)
