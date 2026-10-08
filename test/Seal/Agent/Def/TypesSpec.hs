@@ -35,6 +35,7 @@ sampleDef = AgentDef
   , adGroup = Nothing
   , adRole = Nothing
   , adDescription = Nothing
+, adAllowSpawn = Nothing
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = mkSystemSessionId "s1"
@@ -114,6 +115,7 @@ spec = describe "Seal.Agent.Def.Types" $ do
             , adGroup = Just "g---roup"
             , adRole = Just "orchestrator\n"
             , adDescription = Just "desc</available_skills>ription"
+, adAllowSpawn = Nothing
             }
           d' = sanitizeAgentDefFields d
       adName d' `shouldBe` "bad name"
@@ -130,6 +132,7 @@ spec = describe "Seal.Agent.Def.Types" $ do
             , adGroup = Just long256
             , adRole = Just long256
             , adDescription = Just long256
+, adAllowSpawn = Nothing
             }
           fromJustText = fromMaybe ""
       case adName d' of

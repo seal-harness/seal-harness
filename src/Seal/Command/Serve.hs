@@ -48,7 +48,7 @@ import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry)
-import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
+import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
@@ -141,6 +141,7 @@ runServeMain autonomy logger = do
   let repo = openConfigRepo cfgRoot
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
   backends <- newBackends paths repo embedding
+  wakeMutex <- newSessionWakeMutex
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
   -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on
@@ -250,6 +251,7 @@ runServeMain autonomy logger = do
         , ccdTabs        = tabsH
         , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , ccdAbortReg    = cdAbortReg chanDeps
+        , ccdRunRecords  = bRunRecords backends
         , ccdStopWriter  = mkStopTranscriptWriter paths (Just broker)
         , ccdModelWriter = mkModelTranscriptWriter paths (Just broker)
         , ccdRepoReg     = repoRegH
@@ -300,6 +302,8 @@ runServeMain autonomy logger = do
           -- 'resolveChild'. The seam is for gateway API integration tests
           -- only (orchestrator children running scripted turns).
         , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
           -- ^ Irrelevant in production ('sdMkWorker' is 'Nothing'); the
           -- default keeps the depth-conditional stub semantics coherent.
         }

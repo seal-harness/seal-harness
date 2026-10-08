@@ -42,6 +42,7 @@ import Seal.Command.Spec
 import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
+import Seal.Agent.Runtime.RunRecord (RunRecordRegistry, cancelRunsForParent)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..), withTwoFileTranscript)
 import Seal.Providers.Class (Message (..), Role (..), ContentBlock (..))
@@ -95,39 +96,42 @@ mkStopTranscriptWriter paths mBroker =
 -- Telegram). Closes over the 'SessionAbortRegistry' + 'SessionRuntime' +
 -- 'StopTranscriptWriter'; the action reads @srActive@ at dispatch time
 -- to resolve the target session. The command takes no arguments.
-stopCommandSpec :: SessionAbortRegistry -> SessionRuntime -> StopTranscriptWriter -> CommandSpec
-stopCommandSpec abortReg sr = stopCommandSpecWith abortReg (smId <$> readIORef (srActive sr))
+stopCommandSpec :: SessionAbortRegistry -> RunRecordRegistry -> SessionRuntime -> StopTranscriptWriter -> CommandSpec
+stopCommandSpec abortReg runRecords sr = stopCommandSpecWith abortReg runRecords (smId <$> readIORef (srActive sr))
 
 -- | The @\/stop@ command spec for the multi-session web gateway. Closes
 -- over the 'SessionAbortRegistry' + an explicit 'SessionId' (the
 -- request's sid from the URL, threaded in via the per-request registry
 -- rebuild in 'Seal.Gateway.Send.runSlash') + 'StopTranscriptWriter'.
-stopCommandSpecForSession :: SessionAbortRegistry -> SessionId -> StopTranscriptWriter -> CommandSpec
-stopCommandSpecForSession abortReg sid = stopCommandSpecWith abortReg (pure sid)
+stopCommandSpecForSession :: SessionAbortRegistry -> RunRecordRegistry -> SessionId -> StopTranscriptWriter -> CommandSpec
+stopCommandSpecForSession abortReg runRecords sid = stopCommandSpecWith abortReg runRecords (pure sid)
 
 -- | The core spec builder, parameterized by the session-id resolution
 -- action + the transcript writer. Both public constructors delegate here.
-stopCommandSpecWith :: SessionAbortRegistry -> IO SessionId -> StopTranscriptWriter -> CommandSpec
-stopCommandSpecWith abortReg resolveSid writer = CommandSpec
+stopCommandSpecWith :: SessionAbortRegistry -> RunRecordRegistry -> IO SessionId -> StopTranscriptWriter -> CommandSpec
+stopCommandSpecWith abortReg runRecords resolveSid writer = CommandSpec
   { csName         = CommandName "stop"
   , csAliases      = []
   , csGroup        = GroupSession
   , csSynopsis     = "Abort the active session's in-flight tool call"
-  , csParserInfo   = stopParserInfo abortReg resolveSid writer
+  , csParserInfo   = stopParserInfo abortReg runRecords resolveSid writer
   , csAvailability = InteractiveOnly
   }
 
-stopParserInfo :: SessionAbortRegistry -> IO SessionId -> StopTranscriptWriter -> ParserInfo CommandAction
-stopParserInfo abortReg resolveSid writer =
-  info (pure (stopAction abortReg resolveSid writer) <**> helper)
+stopParserInfo :: SessionAbortRegistry -> RunRecordRegistry -> IO SessionId -> StopTranscriptWriter -> ParserInfo CommandAction
+stopParserInfo abortReg runRecords resolveSid writer =
+  info (pure (stopAction abortReg runRecords resolveSid writer) <**> helper)
     (  progDesc "Abort the active session's in-flight tool call"
     <> header   "stop — abort the active session's in-flight tool call"
     )
 
-stopAction :: SessionAbortRegistry -> IO SessionId -> StopTranscriptWriter -> CommandAction
-stopAction abortReg resolveSid (StopTranscriptWriter mWriter) = commandAction $ \caps -> do
+stopAction :: SessionAbortRegistry -> RunRecordRegistry -> IO SessionId -> StopTranscriptWriter -> CommandAction
+stopAction abortReg runRecords resolveSid (StopTranscriptWriter mWriter) = commandAction $ \caps -> do
   sid <- resolveSid
   setSessionAbort abortReg sid
+  -- Cascade cancellation (WU-4): cancel all pending child runs recursively.
+  now <- getCurrentTime
+  _ <- cancelRunsForParent runRecords sid now "killed"
   let stopMsg = "(stopped)"
   case mWriter of
     Just writer -> writer sid stopMsg

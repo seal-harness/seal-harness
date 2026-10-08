@@ -1012,7 +1012,7 @@ w2GateSpec :: Spec
 w2GateSpec = describe "W2 gate (present-but-rejecting op)" $ do
   describe "#W2.4 Leaf cannot spawn — the gate rejects with the dedicated leaf message" $
     it "authorize on a leaf-gated wiring fails with the leaf message" $ do
-      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "leaf", gOrchEnabled = True })
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "leaf", gOrchEnabled = True, gAllowSpawn = Nothing })
       case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
         Left why -> do
           why `shouldSatisfy` ("its definition is a leaf" `T.isInfixOf`)
@@ -1021,7 +1021,7 @@ w2GateSpec = describe "W2 gate (present-but-rejecting op)" $ do
 
   describe "#W2.5 Kill switch — the gate rejects with the dedicated kill-switch message" $ do
     it "orchestrator-gated wiring + switch off fails with the retry-hint message" $ do
-      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = False })
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = False, gAllowSpawn = Nothing })
       case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
         Left why -> do
           why `shouldSatisfy` ("delegation.orchestrator_enabled = false" `T.isInfixOf`)
@@ -1058,6 +1058,8 @@ gateTestWiring gate = do
         , spCache = "/tmp/seal-test/cache"
         }
     , aswParentSession = mkSystemSessionId "gate-parent"
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
     }
 
 -- | AGENT_DEF_WRITE args with a role.

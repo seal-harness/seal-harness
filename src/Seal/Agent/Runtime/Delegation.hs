@@ -158,7 +158,7 @@ defaultChildTimeoutSeconds :: Double
 defaultChildTimeoutSeconds = 600
 
 defaultMaxSpawnDepth :: Int
-defaultMaxSpawnDepth = 1
+defaultMaxSpawnDepth = 3
 
 minSpawnDepth :: Int
 minSpawnDepth = 1

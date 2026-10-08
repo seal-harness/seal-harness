@@ -17,7 +17,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.ByteString.Lazy qualified as BL
 import Control.Exception (SomeException, try)
-import Control.Monad (void, replicateM, when)
+import Control.Monad (void, replicateM, when, forM_)
 import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
@@ -75,6 +75,8 @@ import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, pendingForSession, PendingQuestionInfo (..) )
+import Seal.Core.Backends (Backends (bRunRecords))
+import Seal.Agent.Runtime.RunRecord (cancelRunsForParent)
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
   , handleAskCancel, handleSend
@@ -220,21 +222,28 @@ apiApp deps req respond =
     -- (design Blocker Resolution #2 — ApiDeps has no AgentEnv at this call
     -- site). Trust boundary: loopback-only, matching /api/repos.
     (m', ["api", "sessions", sid, "stop"]) | m' == methodPost -> do
-      case mkSessionId sid of
-        Left e   -> respond (errJson status400 ("invalid session id: " <> e))
-        Right sId -> do
-          setSessionAbort (adAbortReg deps) sId
-          -- pending: whether a turn is currently in flight. Determined via a
-          -- non-blocking tryReadMVar on the session's lock (from sdLocks if
-          -- adSend is wired; else assume not-in-flight). True = no turn in
-          -- flight (the abort will be a no-op, cleared at next runTurn entry).
-          pending <- case adSend deps of
-            Just sendDeps -> sessionTurnInFlight (sdLocks sendDeps) sId
-            Nothing       -> pure True
-          respond (jsonOk (object
-            [ "aborted" .= True
-            , "pending" .= pending
-            ]))
+       case mkSessionId sid of
+         Left e   -> respond (errJson status400 ("invalid session id: " <> e))
+         Right sId -> do
+           setSessionAbort (adAbortReg deps) sId
+           -- Cascade cancellation (WU-4): when a session is stopped, cancel
+           -- all pending child runs recursively. The RunRecordRegistry is
+           -- accessed via the wired SendDeps (Nothing in tests without the
+           -- full runtime — no children to cancel in that case).
+           now <- getCurrentTime
+           forM_ (adSend deps) $ \sendDeps ->
+             cancelRunsForParent (bRunRecords (sdBackends sendDeps)) sId now "killed"
+           -- pending: whether a turn is currently in flight. Determined via a
+           -- non-blocking tryReadMVar on the session's lock (from sdLocks if
+           -- adSend is wired; else assume not-in-flight). True = no turn in
+           -- flight (the abort will be a no-op, cleared at next runTurn entry).
+           pending <- case adSend deps of
+             Just sendDeps -> sessionTurnInFlight (sdLocks sendDeps) sId
+             Nothing       -> pure True
+           respond (jsonOk (object
+             [ "aborted" .= True
+             , "pending" .= pending
+             ]))
     -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
     -- workdir before the first turn (the web "set up repo" combo box calls
     -- this). Shares the clone logic with the SETUP_REPO opcode via
@@ -1223,6 +1232,7 @@ stampAgentDef _deps aid v mExisting = do
     , adGroup     = group_
     , adRole      = role_
     , adDescription = description_
+    , adAllowSpawn = Nothing
     , adCreatedAt = createdAt
     , adUpdatedAt = now
     , adSession   = session

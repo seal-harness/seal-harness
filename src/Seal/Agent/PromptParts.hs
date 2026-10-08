@@ -20,6 +20,7 @@ module Seal.Agent.PromptParts
   , availableAgentsBlock
   , injectAvailableAgents
   , leafAgentNote
+  , childAutoAnnounceNote
   ) where
 
 import Data.List (groupBy, sortOn)
@@ -122,6 +123,16 @@ availableAgentsBudget = 4096
 -- agents it cannot delegate to would waste turns).
 leafAgentNote :: Text
 leafAgentNote = "You are a leaf agent; delegation is not available."
+
+-- | The note injected into a SPAWNING child's prompt telling it that its
+-- results will be auto-announced to its parent and that it should not
+-- busy-poll for its own status. Push-based completion delivery means the
+-- child never needs to check its own status — the harness handles
+-- upward notification automatically.
+childAutoAnnounceNote :: Text
+childAutoAnnounceNote =
+  "Your results will be auto-announced to your parent. Do not busy-poll \
+  \for your own status."
 
 -- | The untruncated @\<available_agents\>@ catalog block: one bullet per
 -- def (@- \<full-id\> [\<role\>]: \<description|name-fallback\>@), grouped
