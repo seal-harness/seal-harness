@@ -182,6 +182,7 @@ import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
 import qualified Seal.Tools.TimeoutSpec
 import qualified Seal.Tools.Exec.AbortSpec
+import qualified Seal.Tools.Exec.HostKeyAdoptionSpec
 import qualified Seal.Tools.Exec.TimeoutSpec
 
 main :: IO ()
@@ -368,4 +369,5 @@ specs = do
   Seal.Logging.ExceptionsSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
+  Seal.Tools.Exec.HostKeyAdoptionSpec.spec
   Seal.Tools.Exec.TimeoutSpec.spec

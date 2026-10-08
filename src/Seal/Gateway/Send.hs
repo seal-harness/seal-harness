@@ -95,6 +95,7 @@ import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
   , SessionLocks, sessionTurnInFlight )
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
@@ -193,6 +194,10 @@ data SendDeps = SendDeps
     -- API integration tests inject a recording fake so the composed ssh
     -- argv — the fully-rendered remote command — is observable without a
     -- live SSH host.
+  , sdHostKeyAdoption :: Maybe HostKeyAdoption
+    -- ^ Optional TOFU host-key adoption capability (mirrors
+    -- 'TurnDeps.tdHostKeyAdoption'). 'Nothing' in tests / when no
+    -- human-interaction surface is wired.
   , sdMkWorker :: Maybe AgentWorkerBuilder
     -- ^ Test seam (mirrors 'sdRemoteRunner' / 'TurnDeps.tdMkWorker'): when
     -- 'Just', replaces 'buildWorker' as the 'AGENT_START' worker-builder.
@@ -264,6 +269,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdBaseBackends = sdBackends deps
   , tdExecCache    = sdExecCache deps
   , tdRemoteRunner = sdRemoteRunner deps
+  , tdHostKeyAdoption = sdHostKeyAdoption deps
   , tdMkWorker    = sdMkWorker deps
   , tdResolveProviderOverride = sdResolveProviderOverride deps
   , tdMkWorkerStubDepth = sdMkWorkerStubDepth deps

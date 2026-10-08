@@ -293,6 +293,12 @@ runServeMain autonomy logger = do
         , sdRemoteRunner = Nothing
           -- ^ ONE shared instance: turns (web + channels), /call dispatches,
           -- and GET /api/sessions/:id/agents all hit the same cache.
+        , sdHostKeyAdoption = Nothing
+          -- ^ TOFU host-key adoption for the web channel. Not wired here
+          -- (the web's ASK_HUMAN is session-scoped, but host-key adoption
+          -- happens at session-exec build time, before a session turn
+          -- starts). The CLI wires it via @ccPrompt@; the web falls back
+          -- to the descriptive error message with manual instructions.
         , sdMkWorker    = Nothing
           -- ^ Production: always use the real 'buildWorker' →
           -- 'mkDelegateWorker' path. The 'sdMkWorker' seam is for gateway

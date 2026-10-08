@@ -506,6 +506,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdIsRemote = mode == UemRemote
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
+        , sdHostKeyAdoption = Nothing
         , sdMkWorker = atoChildWorker opts
         , sdMkWorkerStubDepth = atoStubWorkerFromDepth opts
         , sdWakeMutex = wakeMutex

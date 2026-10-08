@@ -918,11 +918,11 @@ handleSessionAgents deps sid = do
         Nothing -> case adSend deps of
           Just sendDeps -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps)
             pure (e, Just (sdExecCache sendDeps))
           Nothing -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing
             pure (e, Nothing)
       let wfs = seWorkdirFs exec
           metaEnv = metaCacheEnvForApi deps

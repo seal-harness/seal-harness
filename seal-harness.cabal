@@ -199,7 +199,8 @@ library
          Seal.Text.LineFile
           Seal.Tools.Args
           Seal.Tools.Exec.Abort
-          Seal.Tools.Exec.Remote
+           Seal.Tools.Exec.HostKeyAdoption
+           Seal.Tools.Exec.Remote
           Seal.Tools.Exec.Timeout
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
@@ -539,8 +540,9 @@ test-suite tests
          Seal.ISA.Ops.UIOUnrestrictedFailSpec
          Seal.ISA.Ops.UIOConstructionFailSpec
          Seal.Tools.TimeoutSpec
-         Seal.Tools.Exec.AbortSpec
-         Seal.Tools.Exec.TimeoutSpec
+          Seal.Tools.Exec.AbortSpec
+          Seal.Tools.Exec.HostKeyAdoptionSpec
+          Seal.Tools.Exec.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Media.ImageSpec

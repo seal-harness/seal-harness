@@ -221,6 +221,7 @@ mkSendDepsWith paths resolveStub = do
         , sdIsRemote    = False
         , sdExecCache   = execCache
         , sdRemoteRunner = Nothing
+        , sdHostKeyAdoption = Nothing
         , sdMkWorker    = Nothing
         , sdResolveProviderOverride = Nothing
         , sdMkWorkerStubDepth = 2
