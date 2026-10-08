@@ -173,7 +173,7 @@ spec = describe "Seal.Session.Workdir" $ do
             secCfg = defaultSecurityConfig
         createDirectoryIfMissing True (spCache paths)
         exec <- mkSessionExec paths secCfg sid stubCloneDeps
-                   (mkFakeRemoteRunner (Right ""))
+                   (mkFakeRemoteRunner (Right "")) Nothing
         -- The workspace root is the local per-session workdir.
         let expectedWd = tmp </> "cache" </> "workdirs" </> "exec-local-001"
         unWorkspaceRoot (seWorkspaceRoot exec) `shouldBe` expectedWd
@@ -197,7 +197,7 @@ spec = describe "Seal.Session.Workdir" $ do
       let runner  = mkFakeRemoteRunnerRecording callsRef (Right "")
           sid     = mkSystemSessionId "exec-remote-001"
           secCfg  = remoteSecurityConfig
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner
+      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
       -- The workspace root is the remote per-session workdir path.
       let expectedRemoteWd =
             "/srv/agent-workspace/workdirs/exec-remote-001"
@@ -228,7 +228,7 @@ spec = describe "Seal.Session.Workdir" $ do
           -- ensureRemoteSessionWorkdir (the runner is never touched).
           secCfg = defaultSecurityConfig
                      { scUntrustedExec = Just (UntrustedExecFileConfig "remote" Nothing) }
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner
+      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
       -- The runner was NOT invoked (the misconfigured branch returns
       -- both stubs before reaching ensureRemoteSessionWorkdir).
       readIORef callsRef `shouldReturn` []
@@ -243,7 +243,7 @@ spec = describe "Seal.Session.Workdir" $ do
       let runner = mkFakeRemoteRunnerRecording callsRef (Left ExecRemoteUnreachable)
           sid    = mkSystemSessionId "exec-remote-unreachable-001"
           secCfg = remoteSecurityConfig
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner
+      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
       -- The mkdir over SSH failed, so both handles are stubs.
       let rp = either (error "fixture") id (mkRemotePath "anyfile.txt")
       wfsReadFile (seWorkdirFs exec) rp `shouldReturn` Left WfsStub
@@ -257,7 +257,7 @@ spec = describe "Seal.Session.Workdir" $ do
         createDirectoryIfMissing True (spCache paths)
         setFileMode (spCache paths) 0o444  -- read-only: mkdir inside fails
         exec <- mkSessionExec paths secCfg sid stubCloneDeps
-                   (mkFakeRemoteRunner (Right ""))
+                   (mkFakeRemoteRunner (Right "")) Nothing
         setFileMode (spCache paths) 0o755  -- restore for cleanup
         -- Both handles are stubs.
         let rp = either (error "fixture") id (mkRemotePath "anyfile.txt")
@@ -272,7 +272,7 @@ spec = describe "Seal.Session.Workdir" $ do
         createDirectoryIfMissing True (spCache paths)
         uio1 <- mkSessionUntrustedIO paths secCfg sid
         exec <- mkSessionExec paths secCfg sid stubCloneDeps
-                   (mkFakeRemoteRunner (Right ""))
+                   (mkFakeRemoteRunner (Right "")) Nothing
         let uio2 = uieUntrustedIO (seUIOEnv exec)
         -- Both are local UntrustedIO handles (NOT the stub): they can
         -- read a marker file. The stub would fail-closed.

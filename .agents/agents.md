@@ -97,7 +97,12 @@ orchestration pipeline is followed regardless of which skill initiated the work.
 3. **Security-first.** Never commit or log secrets, keys, tokens, or vault
    contents. Secret and proof types stay opaque with unexported constructors
    (`SafePath`, `AuthorizedCommand`). Found a vulnerability? Disclose
-   privately — never a public issue.
+   privately — never a public issue. **No opcode may ever read or write
+   files under `~/.seal/`** — that directory holds security-critical,
+   agent-immutable state (`security.toml`, `exec-known-hosts`, `keys/`,
+   `config/vault/`, `ssh-mux/`). An agent that could modify these could
+   bypass the trust boundary. Only human-driven admin commands may touch
+   `~/.seal/`; never wire an opcode or agent-driven code path to do so.
 4. **TDD.** Failing test first, then minimal implementation, then commit.
    Security-critical pure functions get QuickCheck properties.
 5. **No git force pushes. Ever.**

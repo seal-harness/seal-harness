@@ -70,6 +70,23 @@ This is security infrastructure. That raises the bar:
   through its validating smart constructor (`SafePath`, `AuthorizedCommand`, …).
 - Found a vulnerability? **Do not open a public issue.** Disclose privately —
   see `SECURITY.md` (in progress); until it lands, email the maintainers.
+- **No opcode may ever read or write files under `~/.seal/`.** The
+  `~/.seal/` directory tree holds security-critical, agent-immutable state:
+  `security.toml` (the boot-only config — SSH coordinates, vault settings),
+  `exec-known-hosts` (the pinned SSH host-key file), `keys/` (vault identity
+  files), `config/vault/` (the encrypted vault), and `ssh-mux/` (the SSH
+  connection-multiplexing sockets). An agent that could modify any of these
+  could weaken or bypass the trust boundary (e.g. swapping a host key to
+  MITM the remote execution plane, or editing `security.toml` to disable
+  remote-only enforcement). The `FILE_WRITE` / `FILE_PATCH` opcodes confine
+  writes to the session workdir via `SafePath`; `SafePath` rejects any path
+  outside the workspace root. The `CONFIG_UPDATE` opcode operates on
+  `RuntimeConfig` (in `config.toml`), not `SecurityConfig` — the type split
+  makes modifying `security.toml` a compile error. **Never add an opcode,
+  capability, or code path that writes to `~/.seal/` outside the harness's
+  own boot-time admin commands** (`/vault setup`, the `security.toml`
+  migration). If a feature needs to modify a file under `~/.seal/`, it must
+  be a human-driven admin command, never an agent-driven opcode.
 
 ### 3. Style: follow the `haskell-coder` conventions
 

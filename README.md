@@ -87,6 +87,19 @@ because they're views into the same transcript. The state of every agent
 subscribed channel. No conversation is lost when a tmux session dies —
 the transcript is on disk.
 
+### Built-in Git Repo and Credential Management
+
+Working across repos in different organizations is usually a juggling act —
+SSH keys or Personal Access Tokens scattered around, tokens in env vars, one
+credential often granting access to far more than it should. Seal Harness
+handles this for you, allowing you to use the Principle of Least Privilege to
+only give agents the access they need for the task at hand.
+
+Point a session at a repo URL and Seal clones it into the workspace for
+you — no manual `git clone`, no hoping the agent runs the right command.
+You tell Seal about a repo, supply the appropriate credential, and then you
+never have to think about it again.
+
 ### See Everything Your Agents Do
 
 When an agent acts, you see everything. No hidden layers, no off-the-record

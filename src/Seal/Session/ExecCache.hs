@@ -54,6 +54,7 @@ import Seal.Session.Workdir
 import Seal.Skills.Backend (listWorkdirSkillsSnap)
 import Seal.Skills.Types (Skill)
 import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs, snapTopDirs, wfsSnapshot)
 
@@ -102,14 +103,14 @@ execFingerprint = T.pack . show . untrustedExecConfigFromSecurity
 -- 'invalidateExec'. Fail-closed builds are never stored.
 cachedSessionExec
   :: SessionExecCache -> SealPaths -> SecurityConfig -> SessionId
-  -> CloneDeps -> RemoteRunner -> IO SessionExec
-cachedSessionExec cache paths secCfg sid cloneDeps runner = do
+  -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption -> IO SessionExec
+cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption = do
   execs <- readIORef (sceExecs cache)
   let fp = execFingerprint secCfg
   case Map.lookup sid execs of
     Just ce | ceFingerprint ce == fp -> pure (ceExec ce)
     _ -> do
-      exec <- mkSessionExec paths secCfg sid cloneDeps runner
+      exec <- mkSessionExec paths secCfg sid cloneDeps runner mAdoption
       if isFailClosedSessionExec exec
         then pure exec   -- never cache failures: a later retry must succeed
         else do

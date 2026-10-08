@@ -52,7 +52,6 @@ import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
 import qualified Seal.Web.UrlSafetySpec
 import qualified Seal.Config.WorkdirSpec
-import qualified Seal.Web.BrowserSpec
 import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
@@ -172,6 +171,7 @@ import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
+import qualified Seal.ISA.Ops.BrowserSpec
 import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
 import qualified Seal.ISA.Ops.BinGhSpec
@@ -183,6 +183,7 @@ import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
 import qualified Seal.Tools.TimeoutSpec
 import qualified Seal.Tools.Exec.AbortSpec
+import qualified Seal.Tools.Exec.HostKeyAdoptionSpec
 import qualified Seal.Tools.Exec.TimeoutSpec
 
 main :: IO ()
@@ -239,7 +240,6 @@ specs = do
   Seal.Web.FetchSpec.spec
   Seal.Web.UrlSafetySpec.spec
   Seal.Config.WorkdirSpec.spec
-  Seal.Web.BrowserSpec.spec
   Seal.Media.ImageSpec.spec
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
@@ -359,6 +359,7 @@ specs = do
   Seal.ISA.Ops.ShellSpec.spec
   Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
+  Seal.ISA.Ops.BrowserSpec.spec
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.BinGhSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
@@ -370,4 +371,5 @@ specs = do
   Seal.Logging.ExceptionsSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
+  Seal.Tools.Exec.HostKeyAdoptionSpec.spec
   Seal.Tools.Exec.TimeoutSpec.spec
