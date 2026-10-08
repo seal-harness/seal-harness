@@ -51,7 +51,7 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Gateway.Transcript (readTranscriptEntriesTimed, showIso)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -190,7 +190,12 @@ replayEntriesSince conn paths sid sinceId = do
         mMeta <- loadSessionMeta paths sid
         let model = maybe "" smModel mMeta
             fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-        entries <- readTranscriptEntries paths model fallbackTs sid
+        -- Read only the last 200 entries (limit) to avoid flooding the
+        -- frontend with thousands of WS entry events on large sessions.
+        -- The frontend dedupes by id, and the HTTP seed already provided
+        -- the initial page. The replay only needs to catch up entries
+        -- that arrived since the last visit.
+        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (Just 200)
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
           sendTextData conn (A.encode (object
@@ -266,12 +271,22 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
             mMeta <- loadSessionMeta paths sid
             let model = maybe "" smModel mMeta
                 fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-            allEntries <- readTranscriptEntries paths model fallbackTs sid
-            let limit = clampLimit mLimit
-                totalCount = length allEntries
+                limit = clampLimit mLimit
+            -- For the initial chunk (mBefore == Nothing), use the
+            -- paginated read to avoid loading all entries into memory.
+            -- For before/id pagination, read with a generous limit
+            -- (the entries file is small; the conversation read is
+            -- what's expensive, and the limit caps that).
+            (allEntries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
+              (case mBefore of
+                Nothing -> Just limit
+                Just _  -> Just (limit * 3))
+            let totalCount = case mBefore of
+                  Nothing -> length allEntries  -- already limited; use ttEntryCount for real total
+                  Just _  -> length allEntries
                 (chunk, hasMore) = case mBefore of
                   Nothing ->
-                    let dropped = max 0 (totalCount - limit)
+                    let dropped = max 0 (totalCount - min limit totalCount)
                     in (drop dropped allEntries, totalCount > limit)
                   Just before ->
                    if before == "__beginning__"

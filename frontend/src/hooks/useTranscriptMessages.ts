@@ -542,8 +542,6 @@ function getGlobalRendererCache(): RendererCache {
   return globalRendererCache
 }
 
-const prevMsgCountRef: { value: number } = { value: 0 }
-
 /** React hook: incrementally convert transcript entries to messages.
  *  Uses a multi-session renderer cache (Map<sessionId, TranscriptRenderer>)
  *  that persists across session switches. When the user switches back to a
@@ -572,14 +570,6 @@ export function useTranscriptMessages(
     }
     const msgs = renderer.update(entries, sessionId!)
     lastMsgsRef.current = msgs
-    // Log message array changes for debugging. The message array should
-    // only grow (append-only) or stay the same length (in-place updates).
-    // A decrease in length indicates an entry was removed, which would
-    // cause messages to disappear from the DOM. Search `[transcript] MSGS`.
-    if (msgs.length !== prevMsgCountRef.value) {
-      console.log(`[transcript] MSGS ${prevMsgCountRef.value} -> ${msgs.length} entries=${entries.length} first=${msgs.length > 0 ? msgs[0]!.id : 'none'} last=${msgs.length > 0 ? msgs[msgs.length - 1]!.id : 'none'}`)
-      prevMsgCountRef.value = msgs.length
-    }
     return msgs
   }, [entries, renderer, sessionId])
 }

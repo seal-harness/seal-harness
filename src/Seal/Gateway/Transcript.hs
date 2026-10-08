@@ -200,7 +200,8 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             tRc0 <- getCurrentTime
             reconstructed <- case mLim of
               Just n | n > 0 && n < length evs ->
-                reconstructStreamingPage convPath idxPath evs (length evs - n) n
+                let start = length evs - n
+                in reconstructStreamingPage convPath idxPath evs start n
               _ -> reconstructStreaming convPath idxPath evs
             let reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
             -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
