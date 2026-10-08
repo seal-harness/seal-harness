@@ -267,7 +267,7 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
                       <> shellQ repoName <> " -- --depth 1"
           cloneRes <- UIORec.uioShellExecEnv uio envExtras (shellCmd ghCmd) mCwdPath
           case cloneRes of
-            Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+            Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
             Right _out -> verifyClone uio repoName _out mCwdPath
         Nothing -> do
           let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
@@ -275,7 +275,7 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
                          <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
           cloneRes <- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
           case cloneRes of
-            Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+            Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
             Right _out -> verifyClone uio repoName _out mCwdPath
 
 -- | Clone a bare URL (no credential — public repo, backward-compat).
@@ -284,7 +284,7 @@ cloneBareUrl uio cleanUrl repoName mCwdPath = do
   let cloneCmd = "git clone --depth 1 -- " <> shellQ cleanUrl <> " " <> shellQ repoName
   cloneRes <- UIORec.uioShellExec uio (shellCmd cloneCmd) mCwdPath
   case cloneRes of
-    Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+    Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
     Right _out -> verifyClone uio repoName _out mCwdPath
 
 -- | Verify a clone actually landed by checking for @<repoName>/.git@.
@@ -304,8 +304,8 @@ verifyClone uio repoName cloneOut mCwdPath = do
           _ <- tryCodegraphInit uio repoName mCwdPath
           pure (CloneCloned repoName)
       | otherwise -> pure (CloneFailed
-                            ("clone did not land — git output: "
-                             <> T.strip (T.filter (/= '\n') cloneOut)))
+                            ("clone did not land — git output:\n"
+                             <> T.strip cloneOut))
 
 -- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
 -- 'cloneRepoIO' with the audit 'orRecorded' payload).
@@ -324,7 +324,8 @@ runSetupRepo deps url recorded = do
       OpResult [TrpText ("A different repo already occupies " <> repoName <> " (existing: " <> existing <> ").")]
                True (recordWith recorded repoName "conflict")
     CloneFailed err ->
-      OpResult [TrpText ("SETUP_REPO: " <> err)] True (recordWith recorded "" "failed")
+      OpResult [TrpText ("SETUP_REPO failed — could not clone " <> T.strip url <> ":\n" <> err)]
+               True (recordWith recorded "" "failed")
 
 -- | Construct a 'ShellCommand', total on our internally-built command
 -- strings (they contain no NULs). 'mkShellCommand' only fails on NUL, so

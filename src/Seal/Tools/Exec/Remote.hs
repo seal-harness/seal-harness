@@ -64,6 +64,10 @@ import System.Process
 import Seal.Tools.Args (ShellCommand, textShellCommand)
 import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
 import Seal.Tools.Exec.Types
+import Seal.Logging.Global (globalLogIO)
+
+import Katip qualified as K (ls)
+import Katip (Severity (..))
 
 -- | Build the fixed argv for an SSH exec. The argv is:
 --
@@ -248,19 +252,47 @@ mkRealRemoteRunner = RemoteRunner
                 ec  <- waitForProcess ph
                 pure (ec, out, err))
       case res of
-        Left _ioErr -> pure (Left ExecRemoteUnreachable)  -- launch fail = unreachable
+        Left _ioErr -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)  -- launch fail = unreachable
         Right (ExitSuccess, out, _) -> pure (Right out)
         Right (ExitFailure 255, _, err)
           | "REMOTE HOST IDENTIFICATION HAS CHANGED" `T.isInfixOf` err
-            -> pure (Left ExecHostKeyMismatch)
+            -> do logRemoteResult (Left ExecHostKeyMismatch)
+                  pure (Left ExecHostKeyMismatch)
           | "has changed and you have requested strict checking" `T.isInfixOf` err
-            -> pure (Left ExecHostKeyMismatch)
+            -> do logRemoteResult (Left ExecHostKeyMismatch)
+                  pure (Left ExecHostKeyMismatch)
           | "Host key verification failed" `T.isInfixOf` err
-            -> pure (Left ExecHostKeyUnknown)
+            -> do logRemoteResult (Left ExecHostKeyUnknown)
+                  pure (Left ExecHostKeyUnknown)
           | otherwise
-          -> pure (Left ExecRemoteUnreachable)
-        Right (ExitFailure 127, _, _)  -> pure (Left ExecRemoteUnreachable)  -- ssh not on PATH
-        Right (ExitFailure _n, _, _err) -> pure (Left ExecRemoteUnreachable)
+            -> do logRemoteResult (Left ExecRemoteUnreachable)
+                  pure (Left ExecRemoteUnreachable)  -- 255 + not host-key = transport/auth failure
+        Right (ExitFailure 127, _, _) -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)  -- ssh not on PATH
+        Right (ExitFailure n, out, err) -> do
+          let formatted = formatExitResult n out err
+          logRemoteResult (Right formatted)
+          pure (Right formatted)  -- remote command's own exit code, propagated by ssh
+
+-- | Emit a katip log line for the result of a remote SSH exec. Transport
+-- failures (launch fail, exit 255, exit 127) log at 'WarningS' so
+-- operators see SSH connectivity issues in the server console. A
+-- non-zero remote-command exit logs at 'DebugS' (the command ran but
+-- failed — the formatted output with the exit code is logged for
+-- diagnosis). Success (exit 0) is NOT logged (the common case; logging
+-- every successful exec would be noise).
+logRemoteResult :: Either ExecError Text -> IO ()
+logRemoteResult result =
+  case result of
+    Left err ->
+      globalLogIO WarningS (K.ls ("[remote ssh] transport failure: " <> T.pack (show err)))
+    Right formatted
+      | "[exit code: " `T.isInfixOf` formatted ->
+          globalLogIO DebugS (K.ls ("[remote ssh] remote command failed: " <> T.strip formatted))
+      | otherwise -> pure ()  -- success (exit 0) — no log
 
 -- | Run a shell command via the remote SSH executor. The command is a
 -- validated 'ShellCommand' (NUL rejected). Returns the stdout or a

@@ -1,16 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tools.Exec.RemoteSpec (spec) where
 
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isSuffixOf)
 import Data.Text (Text)
+import Data.Text qualified as T
 import System.Directory (getHomeDirectory)
 import System.FilePath ((</>))
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
 import Seal.Tools.Exec.Types
-import Seal.Tools.Exec.Remote (sshExecArgv, sshExecArgvForwarding)
+import Seal.Tools.Exec.Remote
+  ( RemoteRunner (..), mkRealRemoteRunner, sshExecArgv, sshExecArgvForwarding )
 import Seal.TestHelpers.Arbitrary ()  -- Arbitrary Text
+
+import Katip (Severity (..), Scribe (..), permitItem, jsonFormat, Verbosity (V2))
 
 spec :: Spec
 spec = describe "Seal.Tools.Exec.Remote" $ do
@@ -117,14 +124,101 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
       r2 `shouldBe` Left ExecHostKeyMismatch
 
   -- -----------------------------------------------------------------------
+  -- Exit-code classification (transport failure vs remote-command failure)
+  --
+  -- SSH itself exits 255 on connect/auth/transport failures. The remote
+  -- command's own exit code is propagated verbatim by ssh. So:
+  --   * exit 255 (not host-key) → ExecRemoteUnreachable (transport failure)
+  --   * exit 127                → ExecRemoteUnreachable (ssh not on PATH)
+  --   * exit 0                  → Right stdout (success)
+  --   * any other exit N        → Right (formatExitResult N out err)
+  --     (the remote command ran and failed — NOT unreachable. Matches the
+  --     local arm's behavior: a non-zero exit is a normal command failure,
+  --     surfaced as Right with stdout+stderr+exit-code annotation.)
+  --
+  -- Tests exercise 'mkRealRemoteRunner' by spawning a local @sh -c@ script
+  -- that produces the exact exit code + output we want. The real runner
+  -- spawns whatever argv it's given (normally an ssh argv, but @sh -c@
+  -- works identally for testing the exit-code classification).
+  -- -----------------------------------------------------------------------
+  describe "exit-code classification (transport vs remote-command failure)" $ do
+
+    it "exit 1 (remote command failed) → Right with formatted output (NOT ExecRemoteUnreachable)" $ do
+      res <- runRealSh 1 "some output" "some error"
+      case res of
+        Right out -> do
+          out `shouldSatisfy` ("some output" `T.isInfixOf`)
+          out `shouldSatisfy` ("some error" `T.isInfixOf`)
+          out `shouldSatisfy` ("[exit code: 1]" `T.isInfixOf`)
+        Left e -> expectationFailure ("expected Right, got Left " <> show e
+                                       <> " — a non-255/non-127 exit is a remote-command failure, not unreachable")
+
+    it "exit 128 (git clone failed) → Right with formatted output (NOT ExecRemoteUnreachable)" $ do
+      res <- runRealSh 128 "" "fatal: repository not found"
+      case res of
+        Right out -> out `shouldSatisfy` ("repository not found" `T.isInfixOf`)
+        Left e -> expectationFailure ("expected Right, got Left " <> show e)
+
+    it "exit 255 (transport failure, not host-key) → Left ExecRemoteUnreachable" $ do
+      res <- runRealSh 255 "" "ssh: connect to host: Connection refused"
+      res `shouldBe` Left ExecRemoteUnreachable
+
+    it "exit 255 with 'Host key verification failed' → Left ExecHostKeyUnknown" $ do
+      res <- runRealSh 255 "" "Host key verification failed"
+      res `shouldBe` Left ExecHostKeyUnknown
+
+    it "exit 255 with 'REMOTE HOST IDENTIFICATION HAS CHANGED' → Left ExecHostKeyMismatch" $ do
+      res <- runRealSh 255 "" "REMOTE HOST IDENTIFICATION HAS CHANGED"
+      res `shouldBe` Left ExecHostKeyMismatch
+
+    it "exit 127 (ssh not on PATH) → Left ExecRemoteUnreachable" $ do
+      res <- runRealSh 127 "" "command not found"
+      res `shouldBe` Left ExecRemoteUnreachable
+
+    it "exit 0 → Right stdout (success)" $ do
+      res <- runRealSh 0 "hello world" ""
+      res `shouldBe` Right "hello world"
+
+  -- -----------------------------------------------------------------------
+  -- Logging: transport failures + non-zero exits emit katip log lines
+  -- so operators can diagnose SSH issues from the server console.
+  -- -----------------------------------------------------------------------
+  describe "result logging (katip)" $ do
+
+    it "logs a warning on transport failure (exit 255, not host-key)" $ do
+      (_, lines_) <- withCaptureGlobalLogger' (runRealSh 255 "" "Connection refused")
+      let allText = T.unlines lines_
+      allText `shouldSatisfy` ("ExecRemoteUnreachable" `T.isInfixOf`)
+
+    it "logs a debug line on non-zero remote-command exit (exit 1)" $ do
+      (_, lines_) <- withCaptureGlobalLogger' (runRealSh 1 "output" "error text")
+      let allText = T.unlines lines_
+      allText `shouldSatisfy` ("[exit code: 1]" `T.isInfixOf`)
+
+    it "does NOT log on success (exit 0)" $ do
+      (_, lines_) <- withCaptureGlobalLogger' (runRealSh 0 "ok" "")
+      lines_ `shouldBe` []
+
+  -- -----------------------------------------------------------------------
   -- SSH connection multiplexing (one handshake, many ops)
   --
   -- Two DISJOINT master pools keyed by ControlPath suffix:
   --   m-%C — plain ops (never -A);  a-%C — agent-forwarding ops only.
   -- The split preserves the §5.6 opt-in invariant: agent forwarding over a
-  -- muxed connection requires the MASTER to have been started with -A, so
-  -- plain ops must never be able to ride an agent-forwarding master (and
-  -- vice versa a git -A op must not silently upgrade the plain pool).
+  -- multiplexed connection requires the MASTER to have been started with
+  -- -A, so a plain op can never ride an agent-forwarding master (and a
+  -- forwarding op never upgrades the shared plain pool). The first op to
+  -- each pool pays the TCP + key-exchange + auth handshake; every
+  -- subsequent op for ~10 minutes ('ControlPersist') rides the persistent
+  -- master socket — turning N serialized round trips from N handshakes
+  -- into 1 + N fast channel opens.
+  --
+  -- Security posture is unchanged: the master itself was established under
+  -- the same pinning options (same argv shape ⇒ same config),
+  -- @BatchMode=yes@ still forbids interactive prompts, and a stale socket
+  -- (master killed) is detected by @ControlMaster=auto@, which falls back
+  -- to a fresh direct connection. The socket directory is private (mode
+  -- 0700) under @~/.seal/@.
   -- -----------------------------------------------------------------------
   describe "SSH connection multiplexing" $ do
 
@@ -189,3 +283,37 @@ sshCfg = SshConfig
   , scKnownHosts = "/home/agent/.ssh/known_hosts"
   , scWorkspace  = either (error "fixture") id (mkRemotePath "/srv/agent-workspace")
   }
+
+-- | Run a script via the real 'mkRealRemoteRunner' that produces a given
+-- exit code, stdout, and stderr. The runner spawns whatever argv it's
+-- given; we pass @sh -c@ (not an ssh argv) so the test exercises the
+-- exit-code classification logic without needing a real SSH server.
+runRealSh :: Int -> Text -> Text -> IO (Either ExecError Text)
+runRealSh exitN out err =
+  let script = "printf '%s' " <> shellQuoteStr (T.unpack out)
+               <> "; printf '%s' " <> shellQuoteStr (T.unpack err)
+               <> " >&2; exit " <> show exitN
+  in runRemote mkRealRemoteRunner ["sh", "-c", script]
+
+-- | Single-quote a String for embedding in a shell script.
+shellQuoteStr :: String -> String
+shellQuoteStr s = "'" <> concatMap (\c -> if c == '\'' then "'\\''" else [c]) s <> "'"
+
+-- | A capture-logger wrapper (mirrors LogRedactionSpec).
+withCaptureGlobalLogger' :: IO a -> IO (a, [Text])
+withCaptureGlobalLogger' action = do
+  ref <- newIORef []
+  let scribe = Scribe
+        { liPush = \item -> do
+            let rendered = jsonFormat False V2 item
+            modifyIORef' ref (T.pack (show rendered) :)
+        , scribePermitItem = permitItem DebugS
+        , scribeFinalizer = pure ()
+        }
+  logger <- newSealLoggerWithScribe scribe DebugS
+  setGlobalLogger logger
+  result <- action
+  closeSealLogger logger
+  lines_ <- readIORef ref
+  unsetGlobalLogger
+  pure (result, reverse lines_)

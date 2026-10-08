@@ -84,6 +84,7 @@ import Seal.Tools.Exec.Remote
   )
 import Seal.Tools.Exec.Types
   ( ExecError (..), RemotePath, SshConfig (..), getRemotePath
+  , formatExitResult
   )
 
 import Katip (Severity (..))
@@ -225,8 +226,23 @@ renderUntrustedErr :: UntrustedErr -> Text
 renderUntrustedErr = \case
   UePath pe   -> "path error: " <> T.pack (show pe)
   UeBounded n -> "content exceeds operator ceiling (" <> T.pack (show n) <> " bytes)"
-  UeExec ee   -> "exec error: " <> T.pack (show ee)
+  UeExec ee   -> renderExecError ee
   UeIo msg    -> "io error: " <> msg
+
+-- | Render an 'ExecError' as a human-readable 'Text'. The structured
+-- 'ExecError' ADT's 'Show' instance gives compact names like
+-- @"ExecRemoteUnreachable"@; this function expands them to full sentences
+-- so the model + user sees the /meaning/, not the constructor name.
+renderExecError :: ExecError -> Text
+renderExecError = \case
+  ExecNotAllowed -> "operation not allowed by the operator policy"
+  ExecLocalNotPermittedForUntrusted -> "local execution not permitted for untrusted opcodes in this configuration"
+  ExecRemoteRequired -> "remote execution is required but no remote SSH backend is configured"
+  ExecRemoteUnreachable -> "SSH connection to the remote execution host failed (unreachable or authentication failed)"
+  ExecHostKeyMismatch -> "REMOTE HOST KEY MISMATCH — the remote host's key has changed. This is a hard security failure; never bypassed."
+  ExecHostKeyUnknown -> "the remote host's key is not in known_hosts. Add it manually or use host-key adoption."
+  ExecNotImplemented -> "the execution backend is not available (not implemented)"
+  ExecNotImplementedReason reason -> "the execution backend is not available: " <> reason
 
 -- ---------------------------------------------------------------------------
 -- The local arm
@@ -484,14 +500,6 @@ runLocalFixedArgvEnv treat127AsMissing argv mCwd extras = do
 mergeEnv :: [(String, String)] -> [(String, String)] -> [(String, String)]
 mergeEnv inherited overrides =
   Map.toList (Map.union (Map.fromList overrides) (Map.fromList inherited))
-
--- | Format a non-zero exit result for the tool-call consumer. Combines
--- stdout and stderr (if non-empty) and annotates the exit code.
-formatExitResult :: Int -> Text -> Text -> Text
-formatExitResult n out err =
-  let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
-      body  = if null parts then "" else T.intercalate "\n" parts
-  in body <> "\n[exit code: " <> T.pack (show n) <> "]"
 
 -- | Env keys whose values are redacted in debug logs. These carry raw
 -- secrets injected by credential-injection paths (gh: 'GH_TOKEN';
