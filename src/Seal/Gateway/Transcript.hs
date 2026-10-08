@@ -47,7 +47,7 @@ import Seal.Config.Paths
 import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.ConvIndex
-  (convLineCount, ensureIndex, readConvLinesRaw)
+  (convLineCount, ensureIndex, readConvLines, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
@@ -847,11 +847,16 @@ firstUserMessageSnippetFast :: SealPaths -> SessionId -> IO (Maybe Text)
 firstUserMessageSnippetFast paths sid = do
   let legacyPath = sessionTranscriptPath paths sid
       convPath   = sessionConversationPath paths sid
+      idxPath    = sessionConversationIndexPath paths sid
   convExists <- doesFileExist convPath
   if convExists
     then do
-      raw <- readFileTextStrict convPath
-      pure (snippetFromMessages (takeFirstUserMessage (parseMessagesLazy raw)))
+      -- Use the index to read only the first 50 lines (avoid reading the
+      -- full conversation.jsonl into memory for large sessions).
+      _ <- ensureIndex convPath idxPath
+      eMsgs <- readConvLines convPath idxPath 0 50
+      let msgs = case eMsgs of Right ms -> ms; Left _ -> []
+      pure (snippetFromMessages (takeFirstUserMessage msgs))
     else do
       legacyExists <- doesFileExist legacyPath
       if legacyExists
@@ -877,12 +882,6 @@ lastUserMessageAtFast paths sid = do
       pure (lastRequestTs (parseEntryRecordsLazy raw))
 
 -- ── internals ──────────────────────────────────────────────────────────
-
--- | Lazily parse non-empty lines as 'Message' values.
-parseMessagesLazy :: Text -> [Message]
-parseMessagesLazy raw =
-  mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
-           (filter (not . T.null) (T.lines raw))
 
 -- | Lazily parse non-empty lines as 'TranscriptEntry' values (legacy
 -- 'transcript.jsonl' format).

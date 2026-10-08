@@ -31,17 +31,14 @@ module Seal.Core.TurnEngine
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Data.Aeson (Value)
-import Data.Aeson qualified as A
 import Data.Aeson.Types qualified as AT
-import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -69,6 +66,7 @@ import Seal.Config.File
   , WebConfig (..) )
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
+   sessionConversationIndexPath,
    sessionDir,
    sessionLogPath, sessionRequestsPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
@@ -120,6 +118,7 @@ import Seal.Providers.Class
   (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
+import Seal.Transcript.ConvIndex (convLineCount, ensureIndex, readConvLines)
 import Seal.Session.ExecCache
   ( SessionExecCache, cachedSessionExec, cachedWorkdirScan
   , invalidateWorkdirScan
@@ -157,7 +156,7 @@ import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
+import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
@@ -820,13 +819,24 @@ broadcastNewEntries mBroker paths sid model createdAt =
 fanoutLastReply :: ReplyRegistry -> Maybe StreamBroker -> SealPaths -> SessionId -> IO ()
 fanoutLastReply replies mBroker paths sid = do
   let convPath = sessionConversationPath paths sid
+      idxPath  = sessionConversationIndexPath paths sid
   exists <- doesFileExist convPath
   if not exists
     then pure ()
     else do
-      raw <- readFileTextStrict convPath
-      let lines' = filter (not . T.null) (T.lines raw)
-          msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
+      -- Read the last few conversation lines via the index (avoid reading
+      -- the full conversation.jsonl into memory). Scan backward for the
+      -- last Assistant message.
+      _ <- ensureIndex convPath idxPath
+      totalLines <- convLineCount idxPath
+      -- Read the last min(totalLines, 50) lines — enough to find the last
+      -- assistant reply in a typical turn (user msg + assistant reply).
+      let readStart = max 0 (totalLines - 50)
+          readCount = totalLines - readStart
+      eMsgs <- if readCount > 0
+        then readConvLines convPath idxPath readStart totalLines
+        else pure (Right [])
+      let msgs = case eMsgs of Right ms -> ms; Left _ -> []
       for_ (lastAssistantText msgs) $ \reply -> do
         replyFanout replies sid reply
         count <- replySubscriberCount replies sid
