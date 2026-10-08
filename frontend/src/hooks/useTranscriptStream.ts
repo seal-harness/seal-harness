@@ -247,7 +247,7 @@ export function useTranscriptStream(
       setTotalCount(cached.totalCount)
       setLoading(false)
       loadedSessionRef.current = sessionId
-      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.entries.length}`)
+      console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.entries.length} totalCount=${cached.totalCount} hasMore=${cached.hasMore} firstId=${cached.entries[0]?.id} lastId=${cached.entries[cached.entries.length-1]?.id}`)
       const lastId = cached.entries[cached.entries.length - 1]!.id
       sc.focus(sessionId, lastId)
       fetchPendingQuestions(sessionId).then((qs) => {
@@ -267,6 +267,7 @@ export function useTranscriptStream(
           setHasMore(seed.hasMore)
           setTotalCount(seed.totalCount)
           dataCache.set(sessionId, seed)
+          console.log(`[transcript] SEED http-fetch session=${sessionId} count=${seed.entries.length} totalCount=${seed.totalCount} hasMore=${seed.hasMore} firstId=${seed.entries[0]?.id} lastId=${seed.entries[seed.entries.length-1]?.id}`)
         } else {
           setEntries((prev) => {
             let merged = prev
@@ -297,6 +298,9 @@ export function useTranscriptStream(
         // Update the data cache so it stays fresh for this session.
         const sid = currentSessionRef.current
         if (sid !== null) getGlobalDataCache().update(sid, next)
+        if (next.length !== prev.length) {
+          console.log(`[transcript] WS-ENTRY session=${sid} entryId=${e.id} prevCount=${prev.length} nextCount=${next.length} lastId=${next[next.length-1]?.id}`)
+        }
         return next
       })
     })
@@ -311,6 +315,7 @@ export function useTranscriptStream(
       if (chunkSid !== currentSessionRef.current) return
       if (chunk.requestBefore === null) {
         // Initial chunk (latest entries).
+        console.log(`[transcript] CHUNK latest session=${chunkSid} count=${chunk.entries.length} totalCount=${chunk.totalCount} hasMore=${chunk.hasMore} firstId=${chunk.entries[0]?.id} lastId=${chunk.entries[chunk.entries.length-1]?.id}`)
         setEntries(chunk.entries)
         setHasMore(chunk.hasMore)
         setTotalCount(chunk.totalCount ?? chunk.entries.length)
@@ -329,6 +334,7 @@ export function useTranscriptStream(
         else sc.focus(chunkSid)
       } else if (chunk.requestBefore === '__beginning__') {
         // Jump-to-beginning chunk (oldest entries).
+        console.log(`[transcript] CHUNK beginning session=${chunkSid} count=${chunk.entries.length} totalCount=${chunk.totalCount} hasMore=${chunk.hasMore} firstId=${chunk.entries[0]?.id} lastId=${chunk.entries[chunk.entries.length-1]?.id}`)
         // hasMore=false because we're at the beginning — no older entries to load.
         // Don't call focus with since — that would replay all entries after the
         // chunk, flooding the frontend with hundreds of WS entry events.
@@ -347,7 +353,12 @@ export function useTranscriptStream(
         sc.focus(chunkSid)
       } else {
         // Load-older chunk (prepend).
-        setEntries((prev) => prependChunkEntries(prev, chunk.entries))
+        console.log(`[transcript] CHUNK older session=${chunkSid} count=${chunk.entries.length} totalCount=${chunk.totalCount} hasMore=${chunk.hasMore} firstId=${chunk.entries[0]?.id} lastId=${chunk.entries[chunk.entries.length-1]?.id}`)
+        setEntries((prev) => {
+          const merged = prependChunkEntries(prev, chunk.entries)
+          console.log(`[transcript] PREPEND session=${chunkSid} prevCount=${prev.length} chunkCount=${chunk.entries.length} mergedCount=${merged.length} firstId=${merged[0]?.id} lastId=${merged[merged.length-1]?.id}`)
+          return merged
+        })
         setHasMore(chunk.hasMore)
         setLoadingMore(false)
         // Update cache with merged entries.
@@ -378,6 +389,7 @@ export function useTranscriptStream(
     if (sid === null || loadingMore || !hasMore) return
     const firstId = entries.length > 0 ? entries[0]!.id : null
     if (firstId === null) return
+    console.log(`[transcript] REQ older session=${sid} before=${firstId} limit=${CHUNK_SIZE} currentCount=${entries.length}`)
     setLoadingMore(true)
     sc.requestEntries(sid, firstId, CHUNK_SIZE)
   }, [loadingMore, hasMore, entries, sc])
@@ -388,12 +400,23 @@ export function useTranscriptStream(
   const loadFromBeginning = useCallback(() => {
     const sid = currentSessionRef.current
     if (sid === null) return
-    // Don't set loading=true — keep the current transcript visible
-    // while the WS request is in flight. The entries will be replaced
-    // atomically when the response arrives.
+    console.log(`[transcript] REQ beginning session=${sid} limit=${CHUNK_SIZE} currentCount=${entries.length}`)
     setLoadingMore(true)
     sc.requestEntries(sid, '__beginning__', CHUNK_SIZE)
-  }, [sc])
+  }, [sc, entries.length])
+
+  // loadLatest: jump to the newest entries (for "scroll to bottom" button).
+  // Sends a WS requestEntries with before=null which the backend handles by
+  // returning the latest N entries. This replaces the current entries
+  // entirely — the user lands at the true end of the transcript, not just
+  // the bottom of whatever slice is currently loaded.
+  const loadLatest = useCallback(() => {
+    const sid = currentSessionRef.current
+    if (sid === null) return
+    console.log(`[transcript] REQ latest session=${sid} limit=${CHUNK_SIZE} currentCount=${entries.length}`)
+    setLoadingMore(true)
+    sc.requestEntries(sid, null, CHUNK_SIZE)
+  }, [sc, entries.length])
 
   // WS ask subscription (focused session only).
   useEffect(() => {
@@ -442,6 +465,6 @@ export function useTranscriptStream(
 
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
-    hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning,
+    hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning, loadLatest,
   }
 }

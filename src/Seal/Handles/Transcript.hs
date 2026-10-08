@@ -289,7 +289,20 @@ withIndexedTranscript dir action = do
       writeOne st (IndexedTranscriptWrite msgs entry) = do
         secretOps <- readIORef (itsSecretOpsRef st)
         let redactedMsgs = redactMessages secretOps msgs msgs
-            new = diffMessages redactedMsgs (itsWritten st)
+            writtenLen = length (itsWritten st)
+            -- Positional suffix extraction: the entry's erConvLen tells us
+            -- the total conversation length after this write (for
+            -- request/response) or the number of new lines (for harness).
+            -- For request/response: new = take (erConvLen - writtenLen)
+            --   (drop writtenLen redactedMsgs)
+            -- For harness: erConvLen is a delta, so new = take erConvLen
+            --   (drop writtenLen redactedMsgs)
+            -- For compaction: erConvLen is the new cursor (total), same as
+            --   request/response.
+            newLen = case erKind entry of
+              EKHarness -> erConvLen entry
+              _ -> max 0 (erConvLen entry - writtenLen)
+            new = take newLen (drop writtenLen redactedMsgs)
         -- 1. Append new conversation lines + index entries, fsync both.
         convOffset <- fromIntegral <$> fdSeek (itsConvFd st) SeekFromEnd 0
         newOffset <- foldM (\off m -> do
@@ -464,7 +477,11 @@ fakeIndexedTranscript = do
         secretOps <- readIORef secretOpsRef
         written <- readMVar convRef
         let redactedMsgs = redactMessages secretOps (itwMessages w) (itwMessages w)
-            newRedacted = diffMessages redactedMsgs written
+            writtenLen = length written
+            newLen = case erKind (itwEntry w) of
+              EKHarness -> erConvLen (itwEntry w)
+              _ -> max 0 (erConvLen (itwEntry w) - writtenLen)
+            newRedacted = take newLen (drop writtenLen redactedMsgs)
         mapM_ pushConv newRedacted
         pushEntry (itwEntry w)
   pure
@@ -481,17 +498,6 @@ fakeIndexedTranscript = do
          es <- readMVar entriesRef
          pure (cs, es)
     )
-
--- | The new-message suffix beyond the written conversation prefix. Mirrors
--- 'Seal.Transcript.Conv.diffNew' (kept local so this module is self-contained).
-diffMessages :: [Message] -> [Message] -> [Message]
-diffMessages incoming written = fromMaybe incoming (stripPrefixMsg written incoming)
-  where
-    stripPrefixMsg [] is             = Just is
-    stripPrefixMsg _  []             = Nothing
-    stripPrefixMsg (w:ws) (i:is)
-      | w == i    = stripPrefixMsg ws is
-      | otherwise = Nothing
 
 -- | Redact tool-result parts that may carry secret values. Only results from
 -- secret-producing opcodes (those whose name is in the provided set) are

@@ -213,7 +213,7 @@ recordSkillLoadResult h (OpName nm) input result mChannel
             { erId = ""
             , erTimestamp = now
             , erKind = EKHarness
-            , erConvLen = 0
+            , erConvLen = length convMsgs
             , erEnvelope = Nothing
             , erUsage = Nothing
             , erStop = Nothing
@@ -260,7 +260,7 @@ recordSetupRepoResult h (OpName nm) input result mChannel = do
         { erId = ""
         , erTimestamp = now
         , erKind = EKHarness
-        , erConvLen = 0
+        , erConvLen = length convMsgs
         , erEnvelope = Nothing
         , erUsage = Nothing
         , erStop = Nothing
@@ -272,7 +272,7 @@ recordSetupRepoResult h (OpName nm) input result mChannel = do
              , ("input", input)
              , ("result", orRecorded result)
             ] <> channelMeta)
-        }
+            }
       bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
       convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
   itwRecordAndAck h (IndexedTranscriptWrite convMsgs entry)

@@ -275,6 +275,10 @@ export interface UseTranscriptStream {
   /** Trigger to load the next chunk of older entries. */
   loadOlder: () => void
   loadFromBeginning: () => void
+  /** Jump to the newest entries (scroll-to-bottom button). Re-requests the
+   *  latest N entries from the backend, replacing whatever is currently
+   *  loaded. */
+  loadLatest: () => void
 }
 
 export interface UseSessionActivityStream {

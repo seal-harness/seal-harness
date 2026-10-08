@@ -34,6 +34,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Debug.Trace (trace)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -195,41 +196,65 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             -- Ensure the conversation index exists and is current
             let idxPath = sessionConversationIndexPath paths sid
             _ <- ensureIndex convPath idxPath
+            -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
+            totalLines <- convLineCount idxPath
+            let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
+                trailingCount = totalLines - maxConvLen
+            -- Split the limit between reconstructed entries and trailing
+            -- conv entries. Trailing entries are the most recent activity
+            -- (they have no entry records), so they get priority: allocate
+            -- up to half the limit to trailing, the rest to reconstruction.
+            -- Without this, a limit fully consumed by reconstructed entries
+            -- starves the trailing range — the user sees old entries instead
+            -- of the end of the session.
+            let (reconLimit, trailingLimit) = case mLim of
+                  Just n | n > 0 ->
+                    let trailingBudget = min n (min trailingCount (n `div` 2))
+                        reconBudget = n - trailingBudget
+                    in (Just reconBudget, trailingBudget)
+                  _ -> (Nothing, trailingCount)
             -- Stream-reconstruct: use paginated variant when a limit is
             -- specified (only process the last N entries' conversation lines)
             tRc0 <- getCurrentTime
-            (reconstructed, reconStartIdx) <- case mLim of
+            (reconstructed, reconStartIdx) <- case reconLimit of
               Just n | n > 0 && n < length evs ->
                 let start = length evs - n
                 in (, start) <$> reconstructStreamingPage convPath idxPath evs start n
               _ -> (, 0) <$> reconstructStreaming convPath idxPath evs
             let reconFrontend = zipWithMaybe reconEntryToFrontend [reconStartIdx..] reconstructed
-            -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
-            totalLines <- convLineCount idxPath
-            let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
-                trailingCount = totalLines - maxConvLen
-            -- Apply limit to trailing entries: read only the last N
-            let (trailingStart, trailingLimit) = case mLim of
-                  Just n | n > 0 ->
-                    let remaining = n - length reconFrontend
-                    in if remaining > 0
-                       then (max 0 (trailingCount - remaining), remaining)
-                       else (0, 0)
-                  _ -> (0, trailingCount)
+            -- Read the last trailingLimit trailing conv lines
+            let trailingStart = max 0 (trailingCount - trailingLimit)
             trailing <- if trailingCount > 0 && trailingLimit > 0
               then do
                 let readStart = maxConvLen + trailingStart
                     readEnd = maxConvLen + min trailingCount (trailingStart + trailingLimit)
+                putStrLn $ "[transcript] trailing-read readStart=" <> show readStart <> " readEnd=" <> show readEnd <> " (convLines " <> show readStart <> ".." <> show (readEnd - 1) <> ")"
                 eTrailingVals <- readConvLinesRaw convPath idxPath readStart readEnd
-                let trailingVals = case eTrailingVals of Right vs -> vs; Left _ -> []
+                let trailingVals = case eTrailingVals of
+                      Right vs -> vs
+                      Left err -> trace ("[transcript] trailing-read ERROR: " <> T.unpack err) []
+                putStrLn $ "[transcript] trailing-read got " <> show (length trailingVals) <> " values"
                 pure (trailingConvEntries model fallbackTs (maxConvLen + trailingStart) trailingVals)
-              else pure []
+              else do
+                putStrLn $ "[transcript] trailing-read SKIPPED trailingCount=" <> show trailingCount <> " trailingLimit=" <> show trailingLimit
+                pure []
             let frontend = reconFrontend <> trailing
             tRc1 <- getCurrentTime
             tEnd <- getCurrentTime
+            putStrLn $ "[transcript] conv+entries sid=" <> show sid
+                     <> " evs=" <> show (length evs)
+                     <> " totalLines=" <> show totalLines
+                     <> " maxConvLen=" <> show maxConvLen
+                     <> " trailingCount=" <> show trailingCount
+                     <> " mLim=" <> show mLim
+                     <> " reconLimit=" <> show reconLimit
+                     <> " trailingLimit=" <> show trailingLimit
+                     <> " reconFrontend=" <> show (length reconFrontend)
+                     <> " trailing=" <> show (length trailing)
+                     <> " frontend=" <> show (length frontend)
             let tt = TranscriptTimings
                   { ttSource        = TSConvEntries
-                  , ttEntryCount    = length evs
+                  , ttEntryCount    = length evs + trailingCount
                   , ttFileReadMs    = ms tFr2 tFr3
                   , ttParseMs       = ms tPr2 tPr3
                   , ttReconstructMs = ms tRc0 tRc1

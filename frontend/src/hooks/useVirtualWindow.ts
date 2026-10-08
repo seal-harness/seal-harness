@@ -83,6 +83,7 @@ export function useVirtualWindow(
     setVisibleRange([start, messageCount])
     setAvgRowHeight(ESTIMATED_ROW_HEIGHT)
     wasAtBottom.current = true
+    console.log(`[vwindow] RESET resetKey=${resetKey} messageCount=${messageCount} range=[${start}, ${messageCount}]`)
   }, [resetKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Measure rendered content height after the visible range changes and
@@ -198,8 +199,11 @@ export function useVirtualWindow(
       setVisibleRange((prev) => {
         const size = Math.max(prev[1] - prev[0], MIN_RENDERED)
         const start = Math.max(0, messageCount - size)
+        console.log(`[vwindow] STICKY-BOTTOM msgCount=${messageCount} prev=[${prev[0]}, ${prev[1]}] new=[${start}, ${messageCount}]`)
         return [start, messageCount]
       })
+    } else {
+      console.log(`[vwindow] NEW-MSGS-NOT-BOTTOM msgCount=${messageCount} wasAtBottom=false`)
     }
     // If not at bottom, the existing range is still valid — the new
     // messages are below the viewport and will be rendered when the

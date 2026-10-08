@@ -353,6 +353,7 @@ class TranscriptRenderer {
     // that clone the same repo share the same first entry id (e.g.,
     // '1-setuprepo'), so comparing firstEntryId fails to detect the change.
     if (this.lastSessionId !== null && sessionId !== this.lastSessionId) {
+      console.log(`[renderer] session change ${this.lastSessionId} → ${sessionId}, clearing cache`)
       this.reset()
     }
     this.lastSessionId = sessionId
@@ -458,6 +459,7 @@ class TranscriptRenderer {
       const cached = this.cache.get(e.id)
       if (cached) messages.push(...cached.messages)
     }
+    console.log(`[renderer] update session=${sessionId} entries=${entries.length} msgs=${messages.length} firstEntryId=${entries[0]?.id} lastEntryId=${entries[entries.length-1]?.id} cacheSize=${this.cache.size}`)
     return messages
   }
 

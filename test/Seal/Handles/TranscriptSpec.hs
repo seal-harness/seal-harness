@@ -36,14 +36,14 @@ mkEntry = do
     }
 
 -- | A minimal entry record for the indexed transcript writer tests.
-mkEntryRecord :: IO EntryRecord
-mkEntryRecord = do
+mkEntryRecord :: Int -> IO EntryRecord
+mkEntryRecord convLen = do
   now <- getCurrentTime
   pure EntryRecord
     { erId = "r1"
     , erTimestamp = now
     , erKind = EKRequest
-    , erConvLen = 1
+    , erConvLen = convLen
     , erEnvelope = Just emptyEnvelopeDelta
     , erUsage = Nothing
     , erStop = Nothing
@@ -101,7 +101,7 @@ spec = describe "Seal.Handles.Transcript" $ do
   describe "indexed transcript format" $ do
     it "writes conversation.jsonl and entries.jsonl with one line each per write" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e <- mkEntryRecord
+        e <- mkEntryRecord 1
         let conv = [Message User [CbText "hello"]]
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite conv e)
@@ -112,8 +112,8 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "grows conversation.jsonl by deltas across turns" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e1 <- mkEntryRecord
-        e2 <- mkEntryRecord
+        e1 <- mkEntryRecord 1
+        e2 <- mkEntryRecord 2
         let turn1 = [Message User [CbText "a"]]
             turn2 = turn1 <> [Message Assistant [CbText "b"]]
         withIndexedTranscript dir $ \h -> do
@@ -125,7 +125,7 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "redacts CbToolResult parts from secret-producing opcodes so secret values never reach disk" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e <- mkEntryRecord
+        e <- mkEntryRecord 2
         let secret = TrpText "super-secret-api-key"
             toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [secret] False]
@@ -138,7 +138,7 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "does NOT redact CbToolResult parts from non-secret opcodes (e.g. SHELL_EXEC)" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e <- mkEntryRecord
+        e <- mkEntryRecord 2
         let output = TrpText "total used free\n4096 2048 2048"
             toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SHELL_EXEC") (object ["command" .= ("free -h" :: String)])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [output] False]
@@ -152,7 +152,7 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "readConversation / readEntries round-trip the written data" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e <- mkEntryRecord
+        e <- mkEntryRecord 2
         let conv = [Message User [CbText "hi"], Message Assistant [CbText "bye"]]
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite conv e)
@@ -171,7 +171,7 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "fakeIndexedTranscript records writes in memory" $ do
       (h, readState) <- fakeIndexedTranscript
-      e <- mkEntryRecord
+      e <- mkEntryRecord 1
       let conv = [Message User [CbText "hi"]]
       itwRecordAndAck h (IndexedTranscriptWrite conv e)
       (msgs, _entries) <- readState
@@ -180,7 +180,7 @@ spec = describe "Seal.Handles.Transcript" $ do
 
     it "itwIsAlive returns True for a healthy daemon" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        e <- mkEntryRecord
+        e <- mkEntryRecord 1
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e)
           alive <- itwIsAlive h
@@ -215,7 +215,7 @@ spec = describe "Seal.Handles.Transcript" $ do
         -- exercised by the integration test (a closed fd causes fsync to
         -- fail, the handler fires, aliveRef flips, and the next
         -- itwRecordAndAck raises TranscriptError instead of hanging).
-        e <- mkEntryRecord
+        e <- mkEntryRecord 1
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
           alive <- itwIsAlive h
@@ -266,8 +266,8 @@ spec = describe "Seal.Handles.Transcript" $ do
         --
         -- The fix: redact the full incoming list BEFORE diffing, so the
         -- comparison is redacted-vs-redacted.
-        e1 <- mkEntryRecord
-        e2 <- mkEntryRecord
+        e1 <- mkEntryRecord 2
+        e2 <- mkEntryRecord 3
         let secret = TrpText "super-secret-api-key"
             toolUse = Message Assistant
               [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
@@ -293,3 +293,47 @@ spec = describe "Seal.Handles.Transcript" $ do
         BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
         BS8.unpack convContents `shouldContain` "<redacted:secret>"
         BS8.unpack convContents `shouldContain` "ok"
+
+    it "does not duplicate the conversation when itsWritten diverges from incoming" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        -- Regression: diffMessages used a prefix-match with a fallback that
+        -- re-appended the FULL incoming list when the prefix didn't match.
+        -- This happened when itsWritten (the in-memory copy of what's on
+        -- disk) diverged from the incoming messages — e.g. after a daemon
+        -- restart where existingConv was read from a file that already had
+        -- duplicates, or when the in-memory list and the on-disk file
+        -- disagree due to redaction or other transformations.
+        --
+        -- The fix: use erConvLen (the entry's logical conversation length)
+        -- to compute the suffix positionally — drop (length itsWritten)
+        -- from the incoming list, take (erConvLen - length itsWritten).
+        -- This is deterministic and never re-appends the full conversation.
+        now1 <- getCurrentTime
+        let e1 = mkEntryRecordAt now1 EKRequest 2 Nothing
+            conv1 = [Message User [CbText "a"], Message Assistant [CbText "b"]]
+        now2 <- getCurrentTime
+        let e2 = mkEntryRecordAt now2 EKRequest 4 Nothing
+            -- conv2 has the same logical content as conv1 plus 2 new messages,
+            -- but the MIDDLE message has been modified (simulating divergence
+            -- — e.g. redaction changed the on-disk version). The prefix match
+            -- would fail at position 1, causing the fallback to re-append all
+            -- 4 messages. The positional fix takes only the last 2.
+            conv2 = [ Message User [CbText "a"]
+                    , Message Assistant [CbText "CHANGED"]
+                    , Message User [CbText "c"]
+                    , Message Assistant [CbText "d"]
+                    ]
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        -- Without the fix: conv1 writes 2 lines, conv2's diff fails (b ≠
+        -- CHANGED) and the fallback re-appends all 4 → 6 total. With the
+        -- positional fix: conv2 appends only the 2 new messages (c, d)
+        -- → 4 total. The divergent "CHANGED" message at position 1 is
+        -- NOT re-written (it's in the already-written range).
+        length (BS8.lines convContents) `shouldBe` 4
+        BS8.unpack convContents `shouldContain` "\"a\""
+        BS8.unpack convContents `shouldContain` "\"b\""
+        BS8.unpack convContents `shouldContain` "\"c\""
+        BS8.unpack convContents `shouldContain` "\"d\""

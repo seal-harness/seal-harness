@@ -2304,7 +2304,7 @@ export function ChatArea({
   onAnswerQuestionText,
   isSessionThinking,
   onCancelQuestion,
-  hasMore, loadingMore, totalCount, loadOlder, loadFromBeginning,
+  hasMore, loadingMore, totalCount, loadOlder, loadFromBeginning, loadLatest,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2316,6 +2316,7 @@ export function ChatArea({
   totalCount?: number
   loadOlder?: () => void
   loadFromBeginning?: () => void
+  loadLatest?: () => void
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2711,6 +2712,7 @@ export function ChatArea({
               title="Scroll to top of transcript"
               aria-label="Scroll to top"
               onClick={() => {
+                console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
                 if (hasMore && loadFromBeginning) {
                   loadFromBeginning()
                 } else {
@@ -2729,8 +2731,13 @@ export function ChatArea({
               title="Scroll to bottom of transcript"
               aria-label="Scroll to bottom"
               onClick={() => {
-                const el = scrollerRef.current
-                if (el) el.scrollTo({ top: el.scrollHeight })
+                console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
+                if (loadLatest) {
+                  loadLatest()
+                } else {
+                  const el = scrollerRef.current
+                  if (el) el.scrollTo({ top: el.scrollHeight })
+                }
                 wasAtBottom.current = true
               }}
             >

@@ -714,7 +714,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           { erId = harnessIdToText hid
           , erTimestamp = now
           , erKind = EKHarness
-          , erConvLen = length fullMsgs
+          , erConvLen = length completions
           , erEnvelope = Nothing
           , erUsage = Nothing
           , erStop = Nothing
