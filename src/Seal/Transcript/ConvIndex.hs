@@ -14,6 +14,9 @@
 module Seal.Transcript.ConvIndex
   ( readConvLines
   , readConvLinesRaw
+  , readConvLinesWith
+  , withConvIndex
+  , ConvIndexHandles(..)
   , convLineCount
   , buildIndex
   , ensureIndex
@@ -121,6 +124,45 @@ readConvLinesRaw convPath idxPath start end
                         let lns = filter (not . BS.null) (BS.split 0x0a raw)
                             vals = mapMaybe (A.decode . BL.fromStrict) lns
                         pure (Right vals)
+
+-- | A pair of open handles for reading conversation + index files.
+-- Used by 'withConvIndex' to avoid per-entry open/close overhead.
+data ConvIndexHandles = ConvIndexHandles
+  { cihConv :: Handle
+  , cihIdx  :: Handle
+  }
+
+-- | Open both conversation.jsonl and conversation.idx for reading, run the
+-- action with the handles, then close both. Use 'readConvLinesWith' inside
+-- the bracket to read lines without per-call open/close.
+withConvIndex :: FilePath -> FilePath -> (ConvIndexHandles -> IO a) -> IO a
+withConvIndex convPath idxPath action =
+  withBinaryFile convPath ReadMode $ \convH ->
+    withBinaryFile idxPath ReadMode $ \idxH ->
+      action (ConvIndexHandles convH idxH)
+
+-- | Read lines [start, end) using pre-opened handles (no per-call open/close).
+-- Returns 'Left' on out-of-bounds offsets. Clamps @end@ to available lines.
+readConvLinesWith :: ConvIndexHandles -> Int -> Int -> Int -> IO (Either Text [Message])
+readConvLinesWith hs lineCount start end
+  | start >= end = pure (Right [])
+  | lineCount <= 0 || start >= lineCount = pure (Right [])
+  | otherwise = do
+      let end' = min end lineCount
+      offStart <- readWord64At (cihIdx hs) start
+      offEnd   <- readWord64At (cihIdx hs) end'
+      convSize <- hFileSize (cihConv hs)
+      if offStart > offEnd || offEnd > fromIntegral (convSize :: Integer)
+        then pure (Left "index offset out of bounds")
+        else do
+          let len = fromIntegral (offEnd - offStart) :: Int
+          hSeek (cihConv hs) AbsoluteSeek (fromIntegral offStart)
+          allocaBytes len $ \ptr -> do
+            _ <- hGetBuf (cihConv hs) ptr len
+            bs <- BS.packCStringLen (castPtr ptr, len)
+            let lns = filter (not . BS.null) (BS.split 0x0a bs)
+                msgs = mapMaybe (A.decode . BL.fromStrict) lns
+            pure (Right msgs)
 
 -- | Read the byte offsets for lines [start, end) from the index.
 -- Returns (offset[start], offset[end]) — the byte range to read from

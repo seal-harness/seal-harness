@@ -35,7 +35,9 @@ import Data.Text (Text)
 
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (Message (..), ToolChoice (..), ToolDefinition (..))
-import Seal.Transcript.ConvIndex (readConvLines)
+import Seal.Transcript.ConvIndex
+  ( ConvIndexHandles, readConvLinesWith, withConvIndex
+  , convLineCount )
 import Seal.Transcript.Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 
@@ -234,16 +236,18 @@ reconstructStreaming
   -> FilePath       -- ^ conversation.idx path
   -> [EntryRecord]  -- ^ all entries (small file, read fully)
   -> IO [TranscriptEntry]
-reconstructStreaming convPath idxPath = go 0 Nothing
+reconstructStreaming convPath idxPath entries = do
+  lc <- convLineCount idxPath
+  withConvIndex convPath idxPath $ \hs -> go hs lc 0 Nothing entries
   where
-    go :: Int -> Maybe Envelope -> [EntryRecord] -> IO [TranscriptEntry]
-    go _ _       [] = pure []
-    go start mEnv (e : es) =
+    go :: ConvIndexHandles -> Int -> Int -> Maybe Envelope -> [EntryRecord] -> IO [TranscriptEntry]
+    go _ _ _ _       [] = pure []
+    go hs lc start mEnv (e : es) =
       case erKind e of
         EKRequest -> do
           let env = effectiveAtE e mEnv
               end = erConvLen e
-          eMsgs <- readMsgs start end
+          eMsgs <- readMsgsH hs lc start end
           let sys = if envSystem env /= (envSystem =<< mEnv)
                       then envSystem env
                       else Nothing
@@ -252,34 +256,34 @@ reconstructStreaming convPath idxPath = go 0 Nothing
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
               entry = toEntry e Request payload
-          rest <- go end (Just env) es
+          rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
-          eMsgs <- readMsgs start end
+          eMsgs <- readMsgsH hs lc start end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
               entry = toEntry e Response payload
-          rest <- go end mEnv es
+          rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
-          eMsgs <- readMsgs start (erConvLen e)
+          eMsgs <- readMsgsH hs lc start (erConvLen e)
           let payload = harnessPayload (msgsFromEither eMsgs) e
               entry = toEntry e Request payload
-          rest <- go start mEnv es
+          rest <- go hs lc start mEnv es
           pure (entry : rest)
         EKCompaction -> do
           let entry = toEntry e Request Null
-          rest <- go (erConvLen e) mEnv es
+          rest <- go hs lc (erConvLen e) mEnv es
           pure (entry : rest)
 
-    readMsgs :: Int -> Int -> IO (Either a [Message])
-    readMsgs s e
+    readMsgsH :: ConvIndexHandles -> Int -> Int -> Int -> IO (Either a [Message])
+    readMsgsH hs lc s e
       | s >= e = pure (Right [])
       | otherwise = do
-          result <- readConvLines convPath idxPath s e
+          result <- readConvLinesWith hs lc s e
           pure (case result of
                    Right ms -> Right ms
-                   Left _   -> Right [])  -- swallow errors, return empty
+                   Left _   -> Right [])
 
     msgsFromEither :: Either a [Message] -> [Message]
     msgsFromEither (Right ms) = ms
