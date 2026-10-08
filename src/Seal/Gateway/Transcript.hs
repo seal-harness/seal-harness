@@ -206,11 +206,22 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
             totalLines <- convLineCount idxPath
             let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
-            trailing <- if totalLines > maxConvLen
+                trailingCount = totalLines - maxConvLen
+            -- Apply limit to trailing entries: read only the last N
+            let (trailingStart, trailingLimit) = case mLim of
+                  Just n | n > 0 ->
+                    let remaining = n - length reconFrontend
+                    in if remaining > 0
+                       then (max 0 (trailingCount - remaining), remaining)
+                       else (0, 0)
+                  _ -> (0, trailingCount)
+            trailing <- if trailingCount > 0 && trailingLimit > 0
               then do
-                eTrailingVals <- readConvLinesRaw convPath idxPath maxConvLen totalLines
+                let readStart = maxConvLen + trailingStart
+                    readEnd = maxConvLen + min trailingCount (trailingStart + trailingLimit)
+                eTrailingVals <- readConvLinesRaw convPath idxPath readStart readEnd
                 let trailingVals = case eTrailingVals of Right vs -> vs; Left _ -> []
-                pure (trailingConvEntries model fallbackTs maxConvLen trailingVals)
+                pure (trailingConvEntries model fallbackTs (maxConvLen + trailingStart) trailingVals)
               else pure []
             let frontend = reconFrontend <> trailing
             tRc1 <- getCurrentTime
