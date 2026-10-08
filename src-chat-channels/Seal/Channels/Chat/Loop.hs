@@ -19,6 +19,7 @@ module Seal.Channels.Chat.Loop
   , extractAskQuestion
   , extractAskId
   , extractAskOptions
+  , extractThinkingSessionIds
   , lastAssistantText
   , formatQuestionWithOptions
   , parseCallbackData
@@ -433,7 +434,7 @@ handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkin
     -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key pendingAsks sid val
-    SeLists val -> handleLists cfg chan key tabTracker val
+    SeLists val -> handleLists cfg chan key tabTracker watchState thinkingTabs val
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
 
 -- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
@@ -994,13 +995,24 @@ handleCallback cfg chan sessions pendingAsks key _src cbData = do
 -- | Handle a @lists@ WS event: compare the new tab list with the last known
 -- one for this conversation. If the focused session's tab was removed (closed),
 -- send the "tab closed" notification and clear the tracking state so the next
--- message creates a fresh tab.
+-- message creates a fresh tab. Also seeds the 'ThinkingTabs' set from the
+-- snapshot's @thinkingSessionIds@ so tabs already thinking before the WS
+-- connection was established still trigger a finished notification.
 handleLists
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
-  -> Value -> IO ()
-handleLists cfg chan key tabTracker _val = do
+  -> WatchState -> ThinkingTabs -> Value -> IO ()
+handleLists cfg chan key tabTracker watchState thinkingTabs val = do
+  -- Seed the thinking-tabs set from the snapshot's thinkingSessionIds.
+  -- This is the core fix for the "missed thinking event" problem: when a
+  -- WS connection is established (or a lists snapshot is broadcast on tab
+  -- changes), sessions that were already thinking before the connection
+  -- existed are included in the snapshot. Without this seeding, the
+  -- ThinkingTabs set starts empty and the thinking→idle transition is
+  -- never detected for those sessions (the idle event arrives but
+  -- wasThinking is false → no notification).
+  seedThinkingTabsFromLists watchState thinkingTabs key val
   -- Fetch the current tabs from the gateway to get an accurate list.
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
@@ -1026,6 +1038,38 @@ handleLists cfg chan key tabTracker _val = do
               atomically (modifyTVar' tabTracker (Map.delete key))
   where
     mkSessionId' t = case mkSessionId t of Right s -> Just s; Left _ -> Nothing
+
+-- | Seed the 'ThinkingTabs' set for a conversation from the
+-- @thinkingSessionIds@ field in a @lists@ WS event payload. This ensures
+-- sessions that were already thinking before the WS connection was
+-- established are tracked, so their eventual @idle@ transition triggers a
+-- watch notification. Replaces the per-conversation thinking set (rather
+-- than unioning) so sessions that finished between snapshots are not kept
+-- stale — the next @thinking@ activity event will re-add them if needed.
+-- No-op when watch mode is off (the thinking set is only consulted by
+-- 'handleWatchActivity', which itself checks watch mode, but seeding
+-- when off would waste memory for no benefit).
+seedThinkingTabsFromLists :: WatchState -> ThinkingTabs -> ConversationKey -> Value -> IO ()
+seedThinkingTabsFromLists watchState thinkingTabs key val = do
+  watchOn <- lookupWatch watchState key
+  when watchOn $ do
+    let sids = extractThinkingSessionIds val
+    unless (null sids) $ do
+      dbg ("[watch] seeding thinking tabs from lists snapshot: key=" <> ckConv key
+        <> " count=" <> T.pack (show (length sids)))
+      atomically (modifyTVar' thinkingTabs (Map.insert key (Set.fromList sids)))
+
+-- | Extract the @thinkingSessionIds@ array from a @lists@ WS event
+-- payload. Returns the list of valid 'SessionId's. Pure.
+extractThinkingSessionIds :: Value -> [SessionId]
+extractThinkingSessionIds val =
+  case val of
+    A.Object o -> case KeyMap.lookup (Key.fromText "thinkingSessionIds") o of
+      Just (A.Array arr) -> mapMaybe (\case
+        A.String t -> either (const Nothing) Just (mkSessionId t)
+        _           -> Nothing) (foldr (:) [] arr)
+      _ -> []
+    _ -> []
 
 -- | Parse callback_data of the form @"<8hex>:<index>"@. Returns 'Nothing'
 -- for malformed data. Pure.
