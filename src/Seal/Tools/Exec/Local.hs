@@ -155,18 +155,6 @@ runFixedArgv treat127AsMissing argv mCwd = do
       | treat127AsMissing            -> pure (Left ExecNotImplemented)  -- binary not on PATH
     Right (ExitFailure n, out, err)  -> pure (Right (formatExitResult n out err))
 
--- | Format a non-zero exit result for the tool-call consumer. Combines stdout
--- and stderr (if non-empty) and annotates the exit code so the frontend can
--- surface it. The result is returned via 'Right' (not an 'ExecError') so the
--- dispatcher records @is_error = False@ — the command ran successfully, it just
--- returned a non-zero exit code. The frontend treats the exit code annotation
--- as the success/failure signal.
-formatExitResult :: Int -> Text -> Text -> Text
-formatExitResult n out err =
-  let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
-      body  = if null parts then "" else T.intercalate "\n" parts
-  in body <> "\n[exit code: " <> T.pack (show n) <> "]"
-
 -- | Spawn a process in its own process group (@create_group = True@) and run
 -- an action with the process handle + stdin/stdout/stderr handles. On cleanup
 -- (normal exit OR async-exception cancellation), kill the whole process

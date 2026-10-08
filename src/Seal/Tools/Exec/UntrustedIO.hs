@@ -84,6 +84,7 @@ import Seal.Tools.Exec.Remote
   )
 import Seal.Tools.Exec.Types
   ( ExecError (..), RemotePath, SshConfig (..), getRemotePath
+  , formatExitResult
   )
 
 import Katip (Severity (..))
@@ -225,8 +226,23 @@ renderUntrustedErr :: UntrustedErr -> Text
 renderUntrustedErr = \case
   UePath pe   -> "path error: " <> T.pack (show pe)
   UeBounded n -> "content exceeds operator ceiling (" <> T.pack (show n) <> " bytes)"
-  UeExec ee   -> "exec error: " <> T.pack (show ee)
+  UeExec ee   -> renderExecError ee
   UeIo msg    -> "io error: " <> msg
+
+-- | Render an 'ExecError' as a human-readable 'Text'. The structured
+-- 'ExecError' ADT's 'Show' instance gives compact names like
+-- @"ExecRemoteUnreachable"@; this function expands them to full sentences
+-- so the model + user sees the /meaning/, not the constructor name.
+renderExecError :: ExecError -> Text
+renderExecError = \case
+  ExecNotAllowed -> "operation not allowed by the operator policy"
+  ExecLocalNotPermittedForUntrusted -> "local execution not permitted for untrusted opcodes in this configuration"
+  ExecRemoteRequired -> "remote execution is required but no remote SSH backend is configured"
+  ExecRemoteUnreachable -> "SSH connection to the remote execution host failed (unreachable or authentication failed)"
+  ExecHostKeyMismatch -> "REMOTE HOST KEY MISMATCH — the remote host's key has changed. This is a hard security failure; never bypassed."
+  ExecHostKeyUnknown -> "the remote host's key is not in known_hosts. Add it manually or use host-key adoption."
+  ExecNotImplemented -> "the execution backend is not available (not implemented)"
+  ExecNotImplementedReason reason -> "the execution backend is not available: " <> reason
 
 -- ---------------------------------------------------------------------------
 -- The local arm
@@ -485,28 +501,35 @@ mergeEnv :: [(String, String)] -> [(String, String)] -> [(String, String)]
 mergeEnv inherited overrides =
   Map.toList (Map.union (Map.fromList overrides) (Map.fromList inherited))
 
--- | Format a non-zero exit result for the tool-call consumer. Combines
--- stdout and stderr (if non-empty) and annotates the exit code.
-formatExitResult :: Int -> Text -> Text -> Text
-formatExitResult n out err =
-  let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
-      body  = if null parts then "" else T.intercalate "\n" parts
-  in body <> "\n[exit code: " <> T.pack (show n) <> "]"
-
--- | Env keys whose values are redacted in debug logs. These carry raw
--- secrets injected by credential-injection paths (gh: 'GH_TOKEN';
--- 'GITHUB_TOKEN' is the older env var that some CI runners set, shadowed
--- by 'GH_TOKEN' at precedence; the git PAT path's 'http.extraHeader' is
--- an argv element, not env, but is listed here for defense-in-depth so a
--- value that accidentally reaches the env extras surface is still
--- redacted). Add to this set as new credential-injection paths introduce
--- new secret env keys.
+-- | Env keys whose values are redacted in debug logs AND injected via
+-- SSH stdin (not the command string) on the remote arm. These carry raw
+-- secrets injected by credential-injection paths:
+--
+--   * @GH_TOKEN@ / @GITHUB_TOKEN@ — the raw PAT token (gh path)
+--   * @GIT_CONFIG_PARAMETERS@ — carries @http.extraHeader@ with the
+--     base64-encoded @user:token@ (git PAT path, replaces the
+--     @-c http.extraHeader=…@ argv element)
+--   * @http.extraHeader@ — listed for defense-in-depth (the git PAT
+--     path's header is an argv element in the old path, not env; but if
+--     it accidentally reaches env extras, it's still redacted)
+--
+-- Add to this set as new credential-injection paths introduce new
+-- secret env keys.
 secretEnvKeys :: Set String
 secretEnvKeys = Set.fromList
   [ "GH_TOKEN"
   , "GITHUB_TOKEN"
+  , "GIT_CONFIG_PARAMETERS"
   , "http.extraHeader"
   ]
+
+-- | True if the env extras contain any key in 'secretEnvKeys'. When True,
+-- the remote arm pipes ALL extras over SSH stdin (not just the secret
+-- ones) to avoid mixing stdin-injected and command-string-injected vars
+-- in the same exec. When False, the existing @env K=V@ prefix is used
+-- (non-secret extras are visible in the command string for debugging).
+hasSecretExtras :: [(String, String)] -> Bool
+hasSecretExtras = any (\(k, _) -> k `Set.member` secretEnvKeys)
 
 -- | Replace the values of keys in 'secretEnvKeys' with @"<redacted>"@,
 -- preserving the key (so the reader sees that an env override was
@@ -679,17 +702,22 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
             Right sp -> runRemoteShellText runner sshCfg (buildRgCmd pat (Just sp))
     , uioShellExecEnv = \extras cmd mCwd ->
        let prefixCd p = "cd " <> shellQuote p <> " && "
+           cmdText = T.pack (T.unpack (textShellCommand cmd))
        in case mCwd of
-         Nothing -> runRemoteShellTextEnv runner sshCfg
-                      (T.pack (prefixCd wsRootPath)) extras
-                      (T.pack (T.unpack (textShellCommand cmd)))
+         Nothing ->
+           if hasSecretExtras extras
+             then runRemoteShellStdinEnv runner sshCfg
+                    (T.pack (prefixCd wsRootPath)) extras cmdText
+             else runRemoteShellTextEnv runner sshCfg
+                    (T.pack (prefixCd wsRootPath)) extras cmdText
          Just rp ->
            case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of
              Left pe  -> pure (Left (UePath pe))
              Right sp ->
-               runRemoteShellTextEnv runner sshCfg
-                 (T.pack ("cd " <> shellQuote (getSafePath sp) <> " && ")) extras
-                 (T.pack (T.unpack (textShellCommand cmd)))
+               let cdPart = T.pack ("cd " <> shellQuote (getSafePath sp) <> " && ")
+               in if hasSecretExtras extras
+                    then runRemoteShellStdinEnv runner sshCfg cdPart extras cmdText
+                    else runRemoteShellTextEnv runner sshCfg cdPart extras cmdText
     , uioShellExecGitEnv = \extras _mKnownHosts cmd mCwd ->
         -- Remote deploy-key path (simple approach): ssh -A forwards the
         -- SEAL agent to the remote machine. The remote git clone uses the
@@ -725,7 +753,9 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
             Right cwdPath ->
               let cdPart = T.pack ("cd " <> shellQuote cwdPath <> " && ")
                   cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
-              in runRemoteShellTextEnv runner sshCfg cdPart extras cmd
+              in if hasSecretExtras extras
+                   then runRemoteShellStdinEnv runner sshCfg cdPart extras cmd
+                   else runRemoteShellTextEnv runner sshCfg cdPart extras cmd
     , uioBinExecGitEnv = \extras _mKnownHosts bin bargs mCwd ->
         -- Remote deploy-key path: mirrors uioShellExecGitEnv. Strip
         -- SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix (the
@@ -922,6 +952,57 @@ runRemoteShellTextEnv runner cfg cdPart extras cmd =
          let argv = sshExecArgv cfg (textShellCommand logCmd)
          logExecDebug "[remote ssh]" argv Nothing extras
          res <- runRemoteShell runner cfg full
+         pure (either (Left . UeExec) Right res)
+
+-- | Run a remote command with secret-bearing env vars piped over SSH
+-- stdin (NOT embedded in the command string). Used by
+-- 'uioShellExecEnv'/'uioBinExecEnv' when the extras contain any key in
+-- 'secretEnvKeys' (GH_TOKEN, GIT_CONFIG_PARAMETERS, etc.).
+--
+-- The remote command is wrapped in a POSIX @sh -c@ that reads one
+-- newline-separated value per @read -r KEY@, exports them, then @exec@s
+-- the target command. The stdin payload is the raw values joined by
+-- newlines (no shell quoting — @read -r@ handles arbitrary bytes except
+-- NUL/newline, which tokens never contain).
+--
+-- Security: the secret values travel over the SSH channel's stdin pipe
+-- (encrypted in transit, kernel-owned memory on both ends). They never
+-- appear in the command string, so they are NOT visible in:
+--   * the local @ssh@ process's argv (@\/proc\/<pid>\/cmdline@)
+--   * the remote shell's command line (@\/proc@ on the untrusted machine)
+--   * shell history (SSH commands are non-interactive)
+--
+-- The @cd@ prefix runs BEFORE the @sh -c@ wrapper (it's in the outer
+-- command string, not inside the @sh -c@), so the cwd is set by the
+-- remote shell before the inner @sh -c@ execs the target command. The
+-- @exec@ replaces the inner shell, so the target command inherits the
+-- cwd + the exported env vars.
+--
+-- The 'logExecDebug' call receives the command WITHOUT the secret
+-- values (they're on stdin, not in the command string) and the extras
+-- with redacted values (so the log shows which keys were set, not their
+-- values). The stdin payload itself is NEVER logged.
+runRemoteShellStdinEnv
+  :: RemoteRunner -> SshConfig -> Text -> [(String, String)] -> Text
+  -> IO (Either UntrustedErr Text)
+runRemoteShellStdinEnv runner cfg cdPart extras cmd =
+  let keys = map fst extras
+      readCmds = T.intercalate "; " (map (\k -> T.pack ("read -r " <> k)) keys)
+      exportList = T.unwords (map T.pack keys)
+      -- Escape single quotes in cmd so it can be embedded inside the
+      -- outer sh -c '...' wrapper (each ' becomes '\'' — the standard
+      -- POSIX single-quote escape idiom).
+      escapedCmd = T.replace "'" "'\\''" cmd
+      innerCmd = "sh -c '" <> readCmds <> "; export " <> exportList
+                 <> "; exec " <> escapedCmd <> "'"
+      fullCmdText = cdPart <> innerCmd
+      stdinPayload = BS.intercalate (BS.singleton 10) (map (TE.encodeUtf8 . T.pack . snd) extras) <> BS.singleton 10
+  in case shellCmd fullCmdText of
+       Left e     -> pure (Left e)
+       Right full -> do
+         let argv = sshExecArgv cfg (textShellCommand full)
+         logExecDebug "[remote ssh -stdin]" argv Nothing extras
+         res <- runRemoteStdin runner argv stdinPayload
          pure (either (Left . UeExec) Right res)
 
 -- ---------------------------------------------------------------------------
