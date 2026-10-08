@@ -13,6 +13,7 @@
 -- shorter than conversation) appends only the missing tail.
 module Seal.Transcript.ConvIndex
   ( readConvLines
+  , readConvLinesRaw
   , convLineCount
   , buildIndex
   , ensureIndex
@@ -88,6 +89,38 @@ readConvLines convPath idxPath start end
                         let lns = filter (not . BS.null) (BS.split 0x0a raw)
                             msgs = mapMaybe (A.decode . BL.fromStrict) lns
                         pure (Right msgs)
+
+-- | Read lines [start, end) as raw Aeson Values (without decoding to Message).
+-- Used by the conv-only transcript path where lines may not be valid Message
+-- JSON (e.g. test fixtures). Decoding to Message is the caller's responsibility.
+readConvLinesRaw :: FilePath -> FilePath -> Int -> Int -> IO (Either Text [A.Value])
+readConvLinesRaw convPath idxPath start end
+  | start >= end = pure (Right [])
+  | otherwise = do
+      convExists <- doesFileExist convPath
+      idxExists  <- doesFileExist idxPath
+      if not convExists
+        then pure (Left "conversation.jsonl not found")
+        else if not idxExists
+          then pure (Left "conversation.idx not found")
+          else do
+            lc <- convLineCount idxPath
+            if lc <= 0 || start >= lc
+              then pure (Right [])
+              else do
+                let end' = min end lc
+                eOffsets <- readOffsets idxPath start end'
+                case eOffsets of
+                  Left e -> pure (Left e)
+                  Right (offStart, offEnd) -> do
+                    convSize <- withBinaryFile convPath ReadMode hFileSize
+                    if offStart > offEnd || offEnd > fromIntegral (convSize :: Integer)
+                      then pure (Left "index offset out of bounds")
+                      else do
+                        raw <- readByteRange convPath (fromIntegral offStart) (fromIntegral offEnd)
+                        let lns = filter (not . BS.null) (BS.split 0x0a raw)
+                            vals = mapMaybe (A.decode . BL.fromStrict) lns
+                        pure (Right vals)
 
 -- | Read the byte offsets for lines [start, end) from the index.
 -- Returns (offset[start], offset[end]) — the byte range to read from
@@ -225,8 +258,8 @@ validateIndex :: FilePath -> FilePath -> IO (Either ConvIndexError IndexStatus)
 validateIndex convPath idxPath = do
   idxSize <- withBinaryFile idxPath ReadMode hFileSize
   let entryCount = fromIntegral idxSize `div` word64Size
-  if entryCount <= 1
-    then pure (Left IndexCorrupt)  -- need at least 2 entries (offset[0]=0, offset[1])
+  if entryCount == 0
+    then pure (Left IndexCorrupt)  -- empty index file (0 bytes)
     else do
       offsets <- readAllOffsets idxPath
       case offsets of

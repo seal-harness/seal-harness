@@ -25,6 +25,7 @@
 -- boundary marker with 'Request' direction).
 module Seal.Transcript.Reconstruct
   ( reconstruct
+  , reconstructStreaming
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
@@ -34,6 +35,7 @@ import Data.Text (Text)
 
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (Message (..), ToolChoice (..), ToolDefinition (..))
+import Seal.Transcript.ConvIndex (readConvLines)
 import Seal.Transcript.Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 
@@ -72,7 +74,7 @@ reconstruct conv = go 0 Nothing
     go start mEnv (e : es) =
       case erKind e of
         EKRequest ->
-          let env = effectiveAt e mEnv
+          let env = effectiveAtE e mEnv
               end = erConvLen e
               -- Delta-only: the NEW messages added since the prior turn
               -- (conv[start:end]), NOT the cumulative prefix.
@@ -114,20 +116,21 @@ reconstruct conv = go 0 Nothing
           let entry = toEntry e Request Null
           in entry : go (erConvLen e) mEnv es
 
-    -- The effective envelope at a request entry. The first request has no
-    -- prior envelope, so its delta is folded against a default baseline; in
-    -- practice the writer always emits a full envelope on the first request,
-    -- so the delta carries every field. We fall back to a sensible default
-    -- only if the delta is absent (a malformed entry).
-    effectiveAt :: EntryRecord -> Maybe Envelope -> Envelope
-    effectiveAt e mEnv =
-      let baseline = fromMaybe defaultEnv mEnv
-      in case erEnvelope e of
-           Nothing -> baseline
-           Just d  -> applyDelta baseline d
+-- | The effective envelope at a request entry. The first request has no
+-- prior envelope, so its delta is folded against a default baseline; in
+-- practice the writer always emits a full envelope on the first request,
+-- so the delta carries every field. We fall back to a sensible default
+-- only if the delta is absent (a malformed entry).
+effectiveAtE :: EntryRecord -> Maybe Envelope -> Envelope
+effectiveAtE e mEnv =
+  let baseline = fromMaybe defaultEnv mEnv
+  in case erEnvelope e of
+       Nothing -> baseline
+       Just d  -> applyDelta baseline d
 
-    defaultEnv :: Envelope
-    defaultEnv = Envelope (ModelId "") Nothing [] ToolAuto 0
+-- | A neutral baseline envelope used when no prior envelope exists.
+defaultEnv :: Envelope
+defaultEnv = Envelope (ModelId "") Nothing [] ToolAuto 0
 
 -- | Build the old 'Request' payload: a 'CompletionRequest'-shaped JSON object
 -- carrying the model, system, tools, toolChoice, maxTokens, and the message
@@ -217,3 +220,67 @@ toEntry e dir payload = TranscriptEntry
   , teCorrelation = erCorrelation e
   , teMeta = erMeta e
   }
+
+-- | Streaming variant of 'reconstruct': reads conversation lines on demand
+-- via the index instead of requiring the full @[Message]@ list in memory.
+-- The fold state (start, mEnv) is identical to the pure 'reconstruct' go
+-- function. For each 'EntryRecord', reads only the conversation lines
+-- @[start, end)@ via 'readConvLines'.
+--
+-- On a 'readConvLines' error (Left), returns an empty list for that entry
+-- (matching the skip-malformed-line behavior of the pure path).
+reconstructStreaming
+  :: FilePath       -- ^ conversation.jsonl path
+  -> FilePath       -- ^ conversation.idx path
+  -> [EntryRecord]  -- ^ all entries (small file, read fully)
+  -> IO [TranscriptEntry]
+reconstructStreaming convPath idxPath = go 0 Nothing
+  where
+    go :: Int -> Maybe Envelope -> [EntryRecord] -> IO [TranscriptEntry]
+    go _ _       [] = pure []
+    go start mEnv (e : es) =
+      case erKind e of
+        EKRequest -> do
+          let env = effectiveAtE e mEnv
+              end = erConvLen e
+          eMsgs <- readMsgs start end
+          let sys = if envSystem env /= (envSystem =<< mEnv)
+                      then envSystem env
+                      else Nothing
+              tools = if envTools env /= maybe [] envTools mEnv
+                        then Just (envTools env)
+                        else Nothing
+              payload = requestPayload env sys tools (msgsFromEither eMsgs)
+              entry = toEntry e Request payload
+          rest <- go end (Just env) es
+          pure (entry : rest)
+        EKResponse -> do
+          let end = erConvLen e
+          eMsgs <- readMsgs start end
+          let payload = responsePayload mEnv (msgsFromEither eMsgs) e
+              entry = toEntry e Response payload
+          rest <- go end mEnv es
+          pure (entry : rest)
+        EKHarness -> do
+          eMsgs <- readMsgs start (erConvLen e)
+          let payload = harnessPayload (msgsFromEither eMsgs) e
+              entry = toEntry e Request payload
+          rest <- go start mEnv es
+          pure (entry : rest)
+        EKCompaction -> do
+          let entry = toEntry e Request Null
+          rest <- go (erConvLen e) mEnv es
+          pure (entry : rest)
+
+    readMsgs :: Int -> Int -> IO (Either a [Message])
+    readMsgs s e
+      | s >= e = pure (Right [])
+      | otherwise = do
+          result <- readConvLines convPath idxPath s e
+          pure (case result of
+                   Right ms -> Right ms
+                   Left _   -> Right [])  -- swallow errors, return empty
+
+    msgsFromEither :: Either a [Message] -> [Message]
+    msgsFromEither (Right ms) = ms
+    msgsFromEither (Left _)   = []

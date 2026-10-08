@@ -42,7 +42,7 @@ import Control.Concurrent.STM
   , orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry, takeTMVar
   , tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
 import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
-import Control.Monad (void)
+import Control.Monad (void, foldM, when)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
@@ -59,9 +59,10 @@ import System.Directory (doesFileExist, renameFile, removeFile)
 import System.FilePath ((</>))
 import System.Posix.IO
   ( OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags
-  , fdWriteBuf, openFd )
+  , fdWriteBuf, fdSeek, openFd )
 import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
+import System.IO (SeekMode(..))
 
 import Katip (Severity (..), ls)
 import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir)
@@ -70,6 +71,7 @@ import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), ToolChoice (..) )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
+import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
   , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
@@ -239,6 +241,9 @@ defaultAckTimeoutUs = 30_000_000
 data IndexedTranscriptState = IndexedTranscriptState
   { itsConvFd :: Fd
   , itsEntriesFd :: Fd
+  , itsConvIdxFd :: Fd
+  -- ^ The fd for @conversation.idx@ (O_APPEND). Appended after each
+  -- conversation line is written + fsync'd.
   , itsWritten :: [Message]
   -- ^ The conversation as it exists on disk, in order. Grown by each write
   -- so the next diff can be computed in-memory.
@@ -275,6 +280,7 @@ withIndexedTranscript dir action = do
   aliveRef <- newTVarIO True
   let convPath     = dir </> "conversation.jsonl"
       entriesPath  = dir </> "entries.jsonl"
+      idxPath      = dir </> "conversation.idx"
       flags = defaultFileFlags
         { append = True
         , creat = Just (0o600 :: FileMode)
@@ -282,18 +288,20 @@ withIndexedTranscript dir action = do
       ack = maybe (pure ()) (\tv -> atomically (putTMVar tv ()))
       writeOne st (IndexedTranscriptWrite msgs entry) = do
         secretOps <- readIORef (itsSecretOpsRef st)
-        -- Redact the FULL incoming list BEFORE diffing so the comparison
-        -- is redacted-vs-redacted. The agent loop passes the in-memory list
-        -- (with unredacted tool results) on every write; itsWritten holds
-        -- the redacted version from the previous write. Without pre-diff
-        -- redaction, stripPrefix fails on the unredacted-vs-redacted
-        -- mismatch and the fallback re-appends the entire conversation
-        -- (O(N²) duplication — session 20260912-183908-767).
         let redactedMsgs = redactMessages secretOps msgs msgs
             new = diffMessages redactedMsgs (itsWritten st)
-        -- 1. Append new conversation lines, fsync.
-        mapM_ (\m -> writeFd (itsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) new
+        -- 1. Append new conversation lines + index entries, fsync both.
+        convOffset <- fromIntegral <$> fdSeek (itsConvFd st) SeekFromEnd 0
+        newOffset <- foldM (\off m -> do
+            let bs = encodeConvLine (ConvLine m) <> "\n"
+            writeFd (itsConvFd st) bs
+            let off' = off + fromIntegral (BS.length bs)
+            writeIdxEntry (itsConvIdxFd st) off'
+            pure off'
+          ) convOffset new
+        _ <- newOffset `seq` pure ()
         fileSynchronise (itsConvFd st)
+        fileSynchronise (itsConvIdxFd st)
         -- 2. Compute a minimal envelope delta for EKRequest entries. The
         -- caller passes a FULL delta (every field set to 'Just'); the writer
         -- compares it against the prior effective envelope and emits only
@@ -337,11 +345,12 @@ withIndexedTranscript dir action = do
             st' <- drain st
             atomically (putTMVar done ())
             pure st'
-      shutdown convFd entriesFd done = do
+      shutdown convFd entriesFd idxFd done = do
         atomically (writeTQueue q (ITShutdown done))
         atomically (takeTMVar done)
         closeFd convFd
         closeFd entriesFd
+        closeFd idxFd
   -- Read existing conversation (if any) so the diff starts from the right
   -- baseline. A torn legacy file or a fresh session yields [].
   existingConv <- do
@@ -349,16 +358,31 @@ withIndexedTranscript dir action = do
     if exists
       then readConversation <$> BS.readFile convPath
       else pure []
+  -- Build the index if missing (one-time migration for pre-existing sessions).
+  -- For fresh sessions, write the initial [0] offset so the index is valid
+  -- (not empty) before the daemon's first write.
+  convExists <- doesFileExist convPath
+  idxExists  <- doesFileExist idxPath
+  if convExists && not idxExists
+    then void (buildIndex convPath idxPath)
+    else when (not convExists && not idxExists) $ do
+      -- Create the index with the initial [0] offset
+      let idxFlags = defaultFileFlags { append = False, creat = Just (0o600 :: FileMode) }
+      idxFd0 <- openFd idxPath WriteOnly idxFlags
+      writeIdxEntry idxFd0 0
+      fileSynchronise idxFd0
+      closeFd idxFd0
   bracket
     (do convFd     <- openFd convPath    WriteOnly flags
         entriesFd  <- openFd entriesPath WriteOnly flags
-        pure (convFd, entriesFd))
-    (\(convFd, entriesFd) -> do
+        idxFd      <- openFd idxPath     WriteOnly flags
+        pure (convFd, entriesFd, idxFd))
+    (\(convFd, entriesFd, idxFd) -> do
         done <- newEmptyTMVarIO
-        shutdown convFd entriesFd done)
-    $ \(convFd, entriesFd) -> do
+        shutdown convFd entriesFd idxFd done)
+    $ \(convFd, entriesFd, idxFd) -> do
         secretOpsRef <- newIORef Set.empty
-        let st0 = IndexedTranscriptState convFd entriesFd existingConv secretOpsRef Nothing
+        let st0 = IndexedTranscriptState convFd entriesFd idxFd existingConv secretOpsRef Nothing
             -- The daemon with an exception handler: if writeOne throws, mark
             -- the daemon dead, fail every queued ACK (so callers blocked on
             -- takeTMVar unblock immediately), and log to stderr. The daemon

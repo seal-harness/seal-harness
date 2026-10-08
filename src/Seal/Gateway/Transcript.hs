@@ -42,11 +42,14 @@ import Data.Vector qualified as V
 import System.Directory (doesFileExist)
 
 import Seal.Config.Paths
-  (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
+  (SealPaths, sessionConversationPath, sessionConversationIndexPath
+  , sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Transcript.ConvIndex
+  (convLineCount, ensureIndex, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
-import Seal.Transcript.Reconstruct (reconstruct)
+import Seal.Transcript.Reconstruct (reconstructStreaming)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict)
 
@@ -172,18 +175,11 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
       pure (frontend, tt)
     else if convExists
       then do
-        tFr0 <- getCurrentTime
-        raw <- readFileTextStrict convPath
-        tFr1 <- getCurrentTime
-        tPr0 <- getCurrentTime
-        let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
-                               (filter (not . T.null) (T.lines raw)) :: [A.Value]
-            msgs    = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
-                               (filter (not . T.null) (T.lines raw)) :: [Message]
-        tPr1 <- getCurrentTime
         entriesExist <- doesFileExist (sessionEntriesPath paths sid)
         if entriesExist
           then do
+            -- Indexed path: read entries.jsonl fully (small file), then
+            -- read conversation lines on demand via the index.
             tFr2 <- getCurrentTime
             eraw <- readFileTextStrict (sessionEntriesPath paths sid)
             tFr3 <- getCurrentTime
@@ -191,39 +187,55 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
             let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines eraw)) :: [EntryRecord]
             tPr3 <- getCurrentTime
+            -- Ensure the conversation index exists and is current
+            let idxPath = sessionConversationIndexPath paths sid
+            _ <- ensureIndex convPath idxPath
+            -- Stream-reconstruct: read conversation lines per entry via index
             tRc0 <- getCurrentTime
-            let reconstructed = reconstruct msgs evs
-                reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
-                -- If entries.jsonl doesn't cover all conversation messages
-                -- (e.g. due to truncation or a crash during recording),
-                -- synthesize frontend entries for the remaining messages so
-                -- they're visible in the web UI instead of silently dropped.
-                maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
-                trailing = trailingConvEntries model fallbackTs maxConvLen msgVals
-                frontend = reconFrontend <> trailing
+            reconstructed <- reconstructStreaming convPath idxPath evs
+            let reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
+            -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
+            totalLines <- convLineCount idxPath
+            let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
+            trailing <- if totalLines > maxConvLen
+              then do
+                eTrailingVals <- readConvLinesRaw convPath idxPath maxConvLen totalLines
+                let trailingVals = case eTrailingVals of Right vs -> vs; Left _ -> []
+                pure (trailingConvEntries model fallbackTs maxConvLen trailingVals)
+              else pure []
+            let frontend = reconFrontend <> trailing
             tRc1 <- getCurrentTime
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
                   { ttSource        = TSConvEntries
                   , ttEntryCount    = length frontend
-                  , ttFileReadMs    = ms tFr0 tFr1 + ms tFr2 tFr3
-                  , ttParseMs       = ms tPr0 tPr1 + ms tPr2 tPr3
+                  , ttFileReadMs    = ms tFr2 tFr3
+                  , ttParseMs       = ms tPr2 tPr3
                   , ttReconstructMs = ms tRc0 tRc1
-                  , ttRewriteMs     = 0  -- reconstruction includes rewrite
+                  , ttRewriteMs     = 0
                   , ttEncodeMs      = 0
                   , ttTotalMs       = ms tStart tEnd
                   }
             pure (frontend, tt)
           else do
+            -- Conv-only path: no entries.jsonl. Use the index to read
+            -- conversation lines in batches instead of the full file.
+            let idxPath = sessionConversationIndexPath paths sid
+            _ <- ensureIndex convPath idxPath
+            totalLines <- convLineCount idxPath
             tRw0 <- getCurrentTime
-            let frontend = zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals
+            eMsgs <- readConvLinesRaw convPath idxPath 0 totalLines
+            let msgVals = case eMsgs of
+                  Right vs -> vs
+                  Left _ -> []
+                frontend = zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals
             tRw1 <- getCurrentTime
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
                   { ttSource        = TSConvOnly
                   , ttEntryCount    = length frontend
-                  , ttFileReadMs    = ms tFr0 tFr1
-                  , ttParseMs       = ms tPr0 tPr1
+                  , ttFileReadMs    = 0
+                  , ttParseMs       = 0
                   , ttReconstructMs = 0
                   , ttRewriteMs     = ms tRw0 tRw1
                   , ttEncodeMs      = 0
