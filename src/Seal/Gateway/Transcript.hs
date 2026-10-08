@@ -39,7 +39,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
-import System.Directory (doesFileExist, getFileSize)
+import System.Directory (doesFileExist)
 
 import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)

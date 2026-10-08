@@ -16,6 +16,7 @@ module Seal.Config.Paths
   , sessionArchivedMarkerPath
   , sessionTranscriptPath
   , sessionConversationPath
+  , sessionConversationIndexPath
   , sessionEntriesPath
   , sessionRequestsPath
   , sessionLogPath
@@ -179,6 +180,14 @@ sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl
 -- | The session's entry log (new indexed transcript format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | The session's conversation index file: @\<sessionDir\>\/conversation.idx@.
+-- A binary file of contiguous little-endian 'Word64' values storing the byte
+-- offset of the start of each line in @conversation.jsonl@. N lines → N+1
+-- offsets (offset[0]=0, offset[N]=fileSize). Used by
+-- 'Seal.Transcript.ConvIndex' for random-access reads.
+sessionConversationIndexPath :: SealPaths -> SessionId -> FilePath
+sessionConversationIndexPath paths sid = sessionDir paths sid </> "conversation.idx"
 
 -- | The session's debug requests file: @\<sessionDir\>\/requests.jsonl@. Each
 -- line is the complete 'CompletionRequest' JSON exactly as sent to the LLM,
