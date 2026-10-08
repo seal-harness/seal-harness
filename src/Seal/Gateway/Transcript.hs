@@ -198,12 +198,12 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             -- Stream-reconstruct: use paginated variant when a limit is
             -- specified (only process the last N entries' conversation lines)
             tRc0 <- getCurrentTime
-            reconstructed <- case mLim of
+            (reconstructed, reconStartIdx) <- case mLim of
               Just n | n > 0 && n < length evs ->
                 let start = length evs - n
-                in reconstructStreamingPage convPath idxPath evs start n
-              _ -> reconstructStreaming convPath idxPath evs
-            let reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
+                in (, start) <$> reconstructStreamingPage convPath idxPath evs start n
+              _ -> (, 0) <$> reconstructStreaming convPath idxPath evs
+            let reconFrontend = zipWithMaybe reconEntryToFrontend [reconStartIdx..] reconstructed
             -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
             totalLines <- convLineCount idxPath
             let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
