@@ -50,8 +50,8 @@ describe('tabLineConfig constants', () => {
     expect(ALL_TAB_LINE_FIELDS).toContain('agent')
   })
 
-  it('DEFAULT_TAB_LINE_FIELDS is provider → model → repo (preserves prior behavior)', () => {
-    expect(DEFAULT_TAB_LINE_FIELDS).toEqual(['provider', 'model', 'repo'])
+  it('DEFAULT_TAB_LINE_FIELDS is repo → channel', () => {
+    expect(DEFAULT_TAB_LINE_FIELDS).toEqual(['repo', 'channel'])
   })
 })
 

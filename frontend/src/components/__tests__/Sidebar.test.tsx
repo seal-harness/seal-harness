@@ -479,6 +479,9 @@ describe('Sidebar', () => {
 
 describe('Sidebar — tab status indicator', () => {
   it('renders the 3-state status label derived from the activity stream', () => {
+    // Pin the second-line config so the status-indicator assertions are
+    // independent of the default field selection.
+    localStorage.setItem('seal.tabLineFields', '["provider","model"]')
     const tabs = [
       makeTab({ index: 0, kind: 'session:anthropic', session_id: 'thinking' }),
       makeTab({ index: 1, kind: 'session:anthropic', session_id: 'unread' }),
@@ -528,6 +531,9 @@ describe('Sidebar — tab status indicator', () => {
   })
 
   it('sorts Active Tabs: Idle Unread → Idle Read → Thinking (newest user msg first within bucket)', () => {
+    // Pin the second-line config so the sort assertions are independent of
+    // the default field selection.
+    localStorage.setItem('seal.tabLineFields', '["provider","model"]')
     // Indices deliberately out of expected order to prove sorting.
     const tabs = [
       makeTab({ index: 3, kind: 'session:anthropic', session_id: 'thinking', label: 'Thinking tab' }),
@@ -609,13 +615,14 @@ describe('Sidebar — tab status indicator', () => {
 // ── Tab second-line info density ───────────────────────────────────────
 
 describe('Sidebar — tab second-line info (repo · provider · model · agent)', () => {
-  it('shows provider badge + model · repo-name — agent suppressed when repo is present', () => {
+  it('shows repo name · channel by default — agent and model suppressed', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
       model: 'claude-sonnet-4-20250514',
       runtime: 'session:anthropic',
       repoUrl: 'https://github.com/seal-harness/seal-harness.git',
+      channel: 'web',
       agent: 'zoe',
     })]
     render(
@@ -636,17 +643,16 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // The second line shows: "A" badge + "sonnet-4" + "·" + "seal-harness"
-    // The agent ("zoe") is NOT shown — when a repo is present, the repo name
-    // takes precedence over the agent for the limited space.
+    // Default config is repo · channel: the second line shows the repo name
+    // and the channel. The agent ("zoe") and model are NOT in the default.
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toContain('sonnet-4')
     expect(label.textContent).toContain('seal-harness')
+    expect(label.textContent).toContain('web')
     expect(label.textContent).not.toContain('zoe')
-    expect(screen.getByTestId('provider-badge-anthropic')).toBeTruthy()
+    expect(label.textContent).not.toContain('sonnet-4')
   })
 
-  it('shows provider badge + model only when no repo and no agent', () => {
+  it('renders an empty second line when no default-config fields have data', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -672,13 +678,12 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
       />,
     )
     const label = screen.getByTestId('tab-status-label-0')
-    // Default config (provider · model · repo) — no repo data, so just
-    // provider badge + model separated by "·".
-    expect(label.textContent).toBe('O·llama3.2')
-    expect(screen.getByTestId('provider-badge-ollama')).toBeTruthy()
+    // Default config is repo · channel — no repo and no channel data, so
+    // the second line is empty (renderConfigurableLine returns null).
+    expect(label.textContent).toBe('')
   })
 
-  it('shows provider badge + model + agent when no repo (agent fills the space)', () => {
+  it('does not show agent or model under the default config (no repo, no channel)', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -705,11 +710,11 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // Default config is provider · model · repo — agent is NOT shown
-    // unless the user adds it via the config bar. So: "A" badge + "·" +
-    // "sonnet-4" only.
+    // Default config is repo · channel — agent and model are not in the
+    // default, and there is no repo/channel data, so the second line is empty.
     const label = screen.getByTestId('tab-status-label-0')
-    expect(label.textContent).toBe('A·sonnet-4')
+    expect(label.textContent).not.toContain('sonnet-4')
+    expect(label.textContent).not.toContain('zoe')
   })
 
   it('derives repo name from agent prefix when repoUrl is null (legacy session fallback)', () => {
@@ -996,11 +1001,11 @@ describe('Sidebar — session second-line configurable fields', () => {
         onReleaseTab={() => {}}
       />,
     )
-    // Default config: provider · model · repo.
+    // Default config: repo · channel. No channel recorded → just repo name.
     const label = screen.getByTestId('session-status-label-s1')
-    expect(label.textContent).toContain('sonnet-4')
     expect(label.textContent).toContain('seal-harness')
-    expect(screen.getByTestId('provider-badge-anthropic')).toBeTruthy()
+    expect(label.textContent).not.toContain('sonnet-4')
+    expect(label.textContent).not.toContain('zoe')
   })
 
   it('Recent Sessions rows respect custom field config (channel shown)', () => {
@@ -1040,7 +1045,7 @@ describe('Sidebar — session second-line configurable fields', () => {
       id: 'old1',
       model: 'llama3.2',
       runtime: 'session:ollama',
-      repoUrl: null,
+      repoUrl: 'https://github.com/seal-harness/seal-harness.git',
       agent: 'zoe',
     })]
     render(
@@ -1062,10 +1067,11 @@ describe('Sidebar — session second-line configurable fields', () => {
     )
     // Expand the archived section.
     fireEvent.click(screen.getByTestId('collapse-icon'))
-    // Default config: provider · model · repo. No repo → just provider + model.
+    // Default config: repo · channel. No channel → just repo name.
     const label = screen.getByTestId('session-status-label-old1')
-    expect(label.textContent).toContain('llama3.2')
-    expect(screen.getByTestId('provider-badge-ollama')).toBeTruthy()
+    expect(label.textContent).toContain('seal-harness')
+    expect(label.textContent).not.toContain('llama3.2')
+    expect(label.textContent).not.toContain('zoe')
   })
 
   it('Archived rows respect custom field config (agent shown)', () => {
