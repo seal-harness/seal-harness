@@ -27,8 +27,8 @@ import Data.Default (def)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript
-  ( fakeTwoFileTranscript, withTwoFileTranscript, TwoFileWrite (..)
-  , tfwRecordAndAck )
+  ( fakeIndexedTranscript, withIndexedTranscript, IndexedTranscriptWrite (..)
+  , itwRecordAndAck )
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -199,7 +199,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -234,7 +234,7 @@ spec = describe "Seal.Agent.Loop" $ do
     -- Streaming: the final text "all done" is sent as a delta (no prefix).
     readIORef sent `shouldReturn` ["all done"]
 
-  it "writes the conversation + entries to the two-file transcript" $ do
+  it "writes the conversation + entries to the indexed transcript" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     let caps = def
@@ -242,7 +242,7 @@ spec = describe "Seal.Agent.Loop" $ do
         script =
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
-    (h, readState) <- fakeTwoFileTranscript
+    (h, readState) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -284,7 +284,7 @@ spec = describe "Seal.Agent.Loop" $ do
       _      -> expectationFailure "expected exactly one response entry"
 
   -- Regression: a second turn must load the prior conversation from disk so
-  -- the model sees the full history, and the two-file writer's diff-based
+  -- the model sees the full history, and the indexed transcript writer's diff-based
   -- appender never duplicates messages. Before the fix, runTurn started each
   -- turn with only the new user message, so (a) the model answered as if it
   -- was a fresh chat (ignoring all prior turns) and (b) the writer's diff
@@ -303,7 +303,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -350,7 +350,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- Debug-transcript: when aeDebugRequestsPath is set, each LLM request is
   -- written in full (including the complete message history) to requests.jsonl,
   -- one line per request. This lets us verify the model actually received the
-  -- full conversation history (the bug hypothesis: the two-file storage format's
+  -- full conversation history (the bug hypothesis: the indexed transcript storage format's
   -- reconstruction was only surfacing the latest message, not the history).
   it "writes the full CompletionRequest to requests.jsonl when aeDebugRequestsPath is set" $
     withSystemTempDirectory "seal-loop-debug" $ \dir -> do
@@ -362,7 +362,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -410,7 +410,7 @@ spec = describe "Seal.Agent.Loop" $ do
         (req1 : _) -> length (crMessages req1) `shouldBe` 1
         []         -> expectationFailure "expected at least one request line"
       -- Turn 2: the model sees the full history (prior 2 + new user message).
-      -- This is the key assertion — if the two-file format was not feeding
+      -- This is the key assertion — if the indexed transcript format was not feeding
       -- history, this would be 1 instead of 3.
       case drop 1 reqs of
         [req2] -> length (crMessages req2) `shouldBe` 3
@@ -419,7 +419,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- Verification: the reconstructed Request payloads (from conversation.jsonl
   -- + entries.jsonl) carry ONLY the new messages added at each turn (the
   -- delta), NOT the cumulative conversation history. This is the contract
-  -- of the two-file delta format: the on-disk conversation.jsonl already
+  -- of the indexed transcript delta format: the on-disk conversation.jsonl already
   -- stores each message exactly once, and re-embedding the full history into
   -- every request entry would be O(N²) in the conversation length. The
   -- separate debug requests.jsonl file (captured via the debug flag) still
@@ -437,7 +437,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -469,7 +469,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
-      -- Read back the two-file format + the debug requests file.
+      -- Read back the indexed transcript format + the debug requests file.
       convBs <- BS8.readFile (dir </> "conversation.jsonl")
       entriesBs <- BS8.readFile (dir </> "entries.jsonl")
       reqBs <- BS8.readFile reqPath
@@ -548,7 +548,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -594,7 +594,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -640,7 +640,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Full
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -696,7 +696,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
             ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let reg = mkRegistry [stubOp]
           env = AgentEnv
@@ -741,7 +741,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -785,7 +785,7 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -836,7 +836,7 @@ spec = describe "Seal.Agent.Loop" $ do
     sent <- newIORef ([] :: [Text])
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, readState) <- fakeTwoFileTranscript
+    (h, readState) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
@@ -890,7 +890,7 @@ spec = describe "Seal.Agent.Loop" $ do
     sent <- newIORef ([] :: [Text])
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     -- Fail the first 2 calls (transport-style error), then succeed.
     ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
     stopFanoutDoneRef <- newIORef False
@@ -937,7 +937,7 @@ spec = describe "Seal.Agent.Loop" $ do
     callCount <- newIORef (0 :: Int)
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     -- A provider that counts calls and always returns a 401 auth error.
     stopFanoutDoneRef <- newIORef False
     let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
@@ -984,7 +984,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1032,7 +1032,7 @@ spec = describe "Seal.Agent.Loop" $ do
                                    [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
                                    StopToolUse (Usage 0 0))
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1129,7 +1129,7 @@ spec = describe "Seal.Agent.Loop" $ do
           [ CompletionResponse [CbText "finished after human input"] StopEnd (Usage 0 0)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1182,7 +1182,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1232,7 +1232,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1278,7 +1278,7 @@ spec = describe "Seal.Agent.Loop" $ do
         -- up. 1 initial + 3 continuations = 4 scripted responses consumed.
         script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1325,7 +1325,7 @@ spec = describe "Seal.Agent.Loop" $ do
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         -- A provider that always truncates and counts calls.
         countingTrunc = SomeProvider (CountingTruncProvider calls)
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = countingTrunc
@@ -1382,7 +1382,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "all done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1473,7 +1473,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, readBack) <- fakeTwoFileTranscript
+    (h, readBack) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1521,7 +1521,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, readBack) <- fakeTwoFileTranscript
+    (h, readBack) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1573,7 +1573,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
             ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1643,7 +1643,7 @@ spec = describe "Seal.Agent.Loop" $ do
                         (\_ _ -> do
                            liftIO (setAbort abortFlag)
                            pure (OpResult [TrpText "stopped"] False Null))
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider countingScript
@@ -1699,7 +1699,7 @@ spec = describe "Seal.Agent.Loop" $ do
           -- (exceeds glm-5's 1M context window)
           priorMsgs = replicate 1000 bigMsg
           caps = def
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       -- Write prior messages to the transcript so runTurn reads them
       liftIO $ do
         now <- getCurrentTime
@@ -1716,7 +1716,7 @@ spec = describe "Seal.Agent.Loop" $ do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+        itwRecordAndAck h (IndexedTranscriptWrite priorMsgs entry)
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
             { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
@@ -1773,7 +1773,7 @@ spec = describe "Seal.Agent.Loop" $ do
           bigMsg = textMsg User (T.replicate 5000 "x")
           priorMsgs = replicate 100 bigMsg
           caps = def
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       liftIO $ do
         now <- getCurrentTime
         let entry = EntryRecord
@@ -1789,7 +1789,7 @@ spec = describe "Seal.Agent.Loop" $ do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+        itwRecordAndAck h (IndexedTranscriptWrite priorMsgs entry)
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
             { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))

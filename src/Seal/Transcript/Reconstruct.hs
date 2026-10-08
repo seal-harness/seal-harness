@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Pure reconstruction from the new two-file format
+-- | Pure reconstruction from the new indexed transcript format
 -- (@conversation.jsonl@ + @entries.jsonl@) back to the old
 -- 'TranscriptEntry' stream. The reconstructed entries are byte-identical to
 -- what the old @transcript.jsonl@ format would have stored, modulo the
@@ -51,7 +51,7 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 --
 -- Both 'EKRequest' and 'EKResponse' entries carry ONLY the NEW messages added
 -- since the prior turn (@conv[start:end]@), NOT the cumulative conversation
--- prefix. This is the whole point of the two-file delta format: the on-disk
+-- prefix. This is the whole point of the indexed transcript delta format: the on-disk
 -- @conversation.jsonl@ already stores each message exactly once, and
 -- re-embedding the full history into every request entry would be O(N²) in
 -- the conversation length (a 146-turn session would ship ~5,000 redundant

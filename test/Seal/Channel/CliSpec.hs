@@ -25,7 +25,7 @@ import Seal.Command.Spec (commandAction)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.Ingest (Disposition (..))
 import Seal.Security.Policy (AutonomyLevel (..))
 import qualified Seal.ISA.Registry as ISA
@@ -138,7 +138,7 @@ spec = do
     it "carries the session's model and id into the AgentEnv" $ do
       approvals <- newApprovalCache
       (_, caps) <- makeFakeCaps []
-      (th, _)   <- fakeTwoFileTranscript
+      (th, _)   <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")

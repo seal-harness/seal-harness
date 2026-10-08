@@ -161,7 +161,7 @@ data SendDeps = SendDeps
     -- via the WS broker.
   , sdLocks :: SessionLocks
     -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
-    -- lock before 'withTwoFileTranscript' so a web send and a channel
+    -- lock before 'withIndexedTranscript' so a web send and a channel
     -- message on the same tab serialize rather than race.
   , sdAbortReg :: SessionAbortRegistry
     -- ^ Per-session abort registry (design Blocker Resolution #2). The web

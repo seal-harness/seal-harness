@@ -39,7 +39,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, getFileSize)
 
 import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
@@ -248,7 +248,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
 
 -- | Extract a short snippet of the first user message in a session's
 -- transcript, for use as the default session title when the user has not
--- set an explicit description. Reads the two-file format
+-- set an explicit description. Reads the indexed transcript format
 -- (@conversation.jsonl@) first, falling back to the legacy
 -- @transcript.jsonl@. Returns 'Nothing' when the session has no transcript
 -- or no user message with text content. The snippet is truncated to 80

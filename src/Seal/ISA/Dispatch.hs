@@ -1,16 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The dispatcher. Runs the pure authorization gate, then — for Untrusted
--- opcodes — durably records the invocation (tfwRecordAndAck) BEFORE executing,
+-- opcodes — durably records the invocation (itwRecordAndAck) BEFORE executing,
 -- so no untrusted action runs until its audit entry is on disk. Trusted
 -- opcodes record concurrently with execution.
 --
--- Invariant: for an Untrusted opcode, tfwRecordAndAck completes before opRun
+-- Invariant: for an Untrusted opcode, itwRecordAndAck completes before opRun
 -- is called. This ordering is the whole point of the module.
 --
 -- There is no longer an Audited branch: the four evolutionary stores
 -- (memory, skills, agent-defs) are file-backed under @config\/@ and versioned
 -- by git; their opcodes are Trusted file writes that auto-commit. The session
--- transcript (two-file format) remains the per-session record of every opcode
+-- transcript (indexed transcript format) remains the per-session record of every opcode
 -- invocation, recorded here as an 'EKHarness' entry.
 --
 -- Opcode invocations are recorded as 'EKHarness' entries in @entries.jsonl@:
@@ -34,7 +34,7 @@ import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
-import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
@@ -55,7 +55,7 @@ data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
 -- Trusted/Audited opcodes ignore it (they have no 'UIOEnv' in scope —
 -- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> UIOEnv
+  :: Registry -> IndexedTranscriptHandle -> BackendExec -> UIOEnv
   -> ToolTimeoutConfig -> AbortFlag
   -> OpName -> Value
   -> App (Either DispatchError OpResult)
@@ -72,7 +72,7 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
               Microseconds perCallMicros = extractPerCallTimeout input toolTimeout
           case op of
             UntrustedOpcode {} -> do
-              liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
+              liftIO (itwRecordAndAck h (IndexedTranscriptWrite [] entry))   -- ACK-before-execute
               -- Wrap uoRun in the timeout/abort/retry race. The untrusted
               -- action runs via 'runUIOWithEnv' (the UIO→IO bridge carrying
               -- the 'UntrustedIO' capability handle + Git 'CloneDeps'
@@ -96,13 +96,13 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do
-                  liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
+                  liftIO (itwRecordAsync h (IndexedTranscriptWrite [] entry))
                   runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Audited -> do
                   -- No Audited log remains; treat as Trusted (record to the
                   -- session transcript, then run). The evolutionary-store
                   -- opcodes that used to be Audited are now Trusted file writes.
-                  liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
+                  liftIO (itwRecordAsync h (IndexedTranscriptWrite [] entry))
                   runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Untrusted ->
                   -- Unreachable: an UntrustedOpcode would have matched above.
@@ -117,7 +117,7 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
     -- and the 'AskReplyStore' has its own cancel mechanism. Non-blocking
     -- opcodes get the full timeout/abort/retry treatment.
     runTrustedOpcode
-      :: TwoFileHandle -> BackendExec -> ToolTimeoutConfig -> AbortFlag
+      :: IndexedTranscriptHandle -> BackendExec -> ToolTimeoutConfig -> AbortFlag
       -> Opcode -> OpName -> Value -> Int
       -> App (Either DispatchError OpResult)
     runTrustedOpcode h' backend' tt abort op' nm inp micros
@@ -179,7 +179,7 @@ mkInvocationEntry name input = do
 -- message carrying the rendered body text (harness output, not user input).
 -- The agent loop builds its
 -- next-turn context from @conversation.jsonl@ ('runTurn' at
--- 'Seal.Agent.Loop' reads @tfwReadConversation@); without this write,
+-- 'Seal.Agent.Loop' reads @itwReadConversation@); without this write,
 -- a user-invoked @/skill load@ would record the body only to
 -- @entries.jsonl@ (the audit sidecar) and the model would never see
 -- the skill on the next turn — the @/skill load@ "Command output" box
@@ -202,7 +202,7 @@ mkInvocationEntry name input = do
 -- then sends @#123@ as the user's message). When @message@ is absent or
 -- blank, no second message is written (the load behaves as before — skill
 -- body only).
-recordSkillLoadResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordSkillLoadResult :: IndexedTranscriptHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
 recordSkillLoadResult h (OpName nm) input result mChannel
   | isSkillLoadOp nm input && not (orIsError result) = do
       now <- getCurrentTime
@@ -229,7 +229,7 @@ recordSkillLoadResult h (OpName nm) input result mChannel
           bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
           convMsgs =
             [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
-      tfwRecordAndAck h (TwoFileWrite convMsgs entry)
+      itwRecordAndAck h (IndexedTranscriptWrite convMsgs entry)
   | otherwise = pure ()
 
 -- | Predicate: is this opcode invocation a skill-load? Matches the
@@ -250,7 +250,7 @@ isSkillLoadOp nm input =
 -- transcript — the error text tells them why the repo didn't appear).
 -- The conversation message carries the opcode's text result so the
 -- user sees the clone/no-op/conflict/failure message in the chat.
-recordSetupRepoResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordSetupRepoResult :: IndexedTranscriptHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
 recordSetupRepoResult h (OpName nm) input result mChannel = do
   now <- getCurrentTime
   let channelMeta = case mChannel of
@@ -275,14 +275,14 @@ recordSetupRepoResult h (OpName nm) input result mChannel = do
         }
       bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
       convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
-  tfwRecordAndAck h (TwoFileWrite convMsgs entry)
+  itwRecordAndAck h (IndexedTranscriptWrite convMsgs entry)
 
 -- | Record a 'ToolError' as an 'EKHarness' transcript entry carrying the
 -- error CLASS (secret-free — design Blocker Resolution #13: never the full
 -- 'ToolIOError' Text payload, which could contain paths/host info). The
 -- metadata includes the timeout value (seconds) and the error class string.
 -- Called by 'dispatch' when the timeout/abort/retry wrapper returns 'Left'.
-recordToolError :: TwoFileHandle -> OpName -> Value -> ToolError -> Int -> IO ()
+recordToolError :: IndexedTranscriptHandle -> OpName -> Value -> ToolError -> Int -> IO ()
 recordToolError h name input toolErr timeoutMicros = do
   now <- getCurrentTime
   let entry = EntryRecord
@@ -303,4 +303,4 @@ recordToolError h name input toolErr timeoutMicros = do
             , ("timeout_s", A.toJSON (timeoutMicros `div` 1_000_000))
             ]
         }
-  tfwRecordAndAck h (TwoFileWrite [] entry)
+  itwRecordAndAck h (IndexedTranscriptWrite [] entry)

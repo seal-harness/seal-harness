@@ -180,7 +180,7 @@ streamApp guard broker pending = do
 -- @live@, falling back to the HTTP seed for any missing entries).
 --
 -- Entry ids are either the on-disk @teId@ (a Text) or a synthetic index
--- (@\"0\"@, @\"1\"@, ...) when the two-file format has no per-entry id. We
+-- (@\"0\"@, @\"1\"@, ...) when the indexed transcript format has no per-entry id. We
 -- compare by the @id@ field in the frontend JSON shape, which is the same
 -- shape @readTranscriptEntries@ returns.
 replayEntriesSince
@@ -220,7 +220,7 @@ replayEntriesSince conn paths sid sinceId = do
       ]))
 
 -- | Filter the frontend-shaped transcript entries to those whose @id@
--- field is strictly after @sinceId@. Entry ids from the two-file format
+-- field is strictly after @sinceId@. Entry ids from the indexed transcript format
 -- are synthetic line indices (@\"0\"@, @\"1\"@, ...) which sort
 -- lexicographically the same as numerically for single-digit counts but
 -- diverge for multi-digit (e.g. @\"10\"@ < @\"2\"@ lexically). To be

@@ -230,7 +230,7 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
         -- prior turn (start=2, end=3): the user message "what is 2+2?".
         -- The cumulative conversation history (the prior user+assistant
         -- pair) is NOT re-embedded — that's the whole point of the
-        -- two-file delta format. Re-embedding the full prefix at every
+        -- indexed transcript delta format. Re-embedding the full prefix at every
         -- request would be O(N²) in the conversation length (a 146-turn
         -- session would ship ~5,000 redundant message copies, turning
         -- 280KB on disk into ~18MB on the wire). The envelope still

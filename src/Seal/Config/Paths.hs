@@ -172,11 +172,11 @@ sessionArchivedMarkerPath paths sid = sessionDir paths sid </> "archived"
 sessionTranscriptPath :: SealPaths -> SessionId -> FilePath
 sessionTranscriptPath paths sid = sessionDir paths sid </> "transcript.jsonl"
 
--- | The session's conversation file (new two-file format): @\<sessionDir\>\/conversation.jsonl@.
+-- | The session's conversation file (new indexed transcript format): @\<sessionDir\>\/conversation.jsonl@.
 sessionConversationPath :: SealPaths -> SessionId -> FilePath
 sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl"
 
--- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
+-- | The session's entry log (new indexed transcript format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
 
@@ -225,7 +225,7 @@ cursorMapPath paths = spState paths </> "cursors.json"
 -- state is lost on restart and every conversation resets to watch-off.
 watchMapPath :: SealPaths -> FilePath
 watchMapPath paths = spState paths </> "watch_state.json"
--- instance gets its own two-file transcript here so the parent's
+-- instance gets its own indexed transcript here so the parent's
 -- @conversation.jsonl@ \/ @entries.jsonl@ stay uncontaminated (the two-file
 -- format's @erConvLen@ and envelope-delta fold are per-session; mixing a
 -- sub-agent's entries into the parent's files would corrupt reconstruction).

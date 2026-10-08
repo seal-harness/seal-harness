@@ -738,7 +738,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      -- Two-file format: write conversation.jsonl only (no entries.jsonl
+      -- Indexed transcript format: write conversation.jsonl only (no entries.jsonl
       -- sidecar) so the source is TSConvOnly.
       let convLine :: Message -> BL.ByteString
           convLine m = A.encode m <> "\n"
@@ -764,7 +764,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       -- Write a conversation.jsonl using the same on-disk shape the
-      -- two-file transcript writer produces (GHC-Generics @tag@/@contents@).
+      -- indexed transcript writer produces (GHC-Generics @tag@/@contents@).
       let convLine :: Message -> BL.ByteString
           convLine m = A.encode m <> "\n"
           conv = [ Message User [CbText "hi there"]
@@ -946,7 +946,7 @@ spec = describe "Seal.Gateway.API" $ do
       tsOf firstEntry `shouldBe` Just (A.String "2026-07-01T12:00:00.100Z")
       tsOf (arr !! 1) `shouldBe` Just (A.String "2026-07-01T12:00:01.234Z")
 
-  it "GET /api/sessions/<sid>/transcript includes the system prompt in request payloads (two-file format)" $
+  it "GET /api/sessions/<sid>/transcript includes the system prompt in request payloads (indexed transcript format)" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
           sidTxt = "20260701-120000-042"
@@ -989,7 +989,7 @@ spec = describe "Seal.Gateway.API" $ do
             _          -> Nothing
       systemField `shouldBe` Just (A.String "You are a helpful assistant.")
 
-  it "GET /api/sessions/<sid>/transcript lowercases message roles for the frontend (two-file format)" $
+  it "GET /api/sessions/<sid>/transcript lowercases message roles for the frontend (indexed transcript format)" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
           sidTxt = "20260701-120000-042"

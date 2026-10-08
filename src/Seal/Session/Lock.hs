@@ -5,8 +5,8 @@
 --
 -- 1. **Write lock**: a per-session 'MVar' serializes turns on the same
 --    session. Both the channel 'plainTurn' and the web 'plainTurn' acquire
---    the session's lock before calling 'withTwoFileTranscript', preventing
---    concurrent writes from corrupting the two-file transcript format.
+--    the session's lock before calling 'withIndexedTranscript', preventing
+--    concurrent writes from corrupting the indexed transcript format.
 --    Different sessions run concurrently; only turns on the SAME session
 --    queue.
 --

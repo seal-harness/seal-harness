@@ -38,7 +38,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..), TrustLevel (
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
-import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
@@ -107,12 +107,12 @@ runTurn env userText = do
   -- flag set until the next turn begins).
   liftIO (clearAbort (aeAbortFlag env))
   -- Load the prior conversation from disk so the model sees the full history
-  -- (not just this turn's new message). The two-file writer's diff-based
+  -- (not just this turn's new message). The indexed transcript writer's diff-based
   -- appender requires the incoming message list to be a prefix-extension of
   -- the on-disk conversation; without the prior messages, the diff falls back
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
-  prior <- liftIO (tfwReadConversation (aeTranscript env))
+  prior <- liftIO (itwReadConversation (aeTranscript env))
   let userMsg = textMsg User userText
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
@@ -147,7 +147,7 @@ runTurn env userText = do
           }
     -- When a caller wants to react to the user message being durable
     -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows
-    -- the session name immediately), record it with tfwRecordAndAck
+    -- the session name immediately), record it with itwRecordAndAck
     -- (synchronously fsync'd) and run the hook. Otherwise keep the async
     -- write (no fsync latency at turn start). In the fsync path, also fire
     -- the per-entry broadcast hook (aeOnEntry) so the web frontend sees the
@@ -158,11 +158,11 @@ runTurn env userText = do
     -- not be on disk yet (the read would return stale data).
     case aeOnUserMessage env of
       Just after -> do
-        tfwRecordAndAck (aeTranscript env) (TwoFileWrite turn0 entry)
+        itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite turn0 entry)
         liftIO after
         liftIO (aeOnEntry env)
       Nothing ->
-        tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
+        itwRecordAsync (aeTranscript env) (IndexedTranscriptWrite turn0 entry)
   go (aeMaxTurns env) 0 turn0
   where
     -- | Fan out the final user-visible text to every chat channel subscribed
@@ -219,7 +219,7 @@ runTurn env userText = do
             , erCorrelation = Nothing
             , erMeta = Map.empty
             }
-      tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+      itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite conv entry)
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
       notifyStop stopMsg
@@ -322,7 +322,7 @@ runTurn env userText = do
                 , erCorrelation = Nothing
                 , erMeta = Map.empty
                 }
-          tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+          itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite conv entry)
           aeOnEntry env
           ccSend (aeCaps env) errMsg
           notifyStop errMsg
@@ -356,7 +356,7 @@ runTurn env userText = do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+        itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv entry)
         aeOnEntry env'
       let toolUses = [b | b@CbToolUse{} <- rsContent resp]
       if null toolUses
@@ -384,7 +384,7 @@ runTurn env userText = do
                       -- synthetic continuation prompt from the chat view.
                       , erMeta = Map.singleton "internal" (Bool True)
                       }
-                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv2 entry2)
                 aeOnEntry env'
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
@@ -454,7 +454,7 @@ runTurn env userText = do
                     , erCorrelation = Nothing
                     , erMeta = Map.empty
                     }
-              tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+              itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv entry)
               aeOnEntry env'
               ccSend (aeCaps env') stopMsg
               notifyStop stopMsg
@@ -477,7 +477,7 @@ runTurn env userText = do
                       , erCorrelation = Nothing
                       , erMeta = Map.empty
                       }
-                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv2 entry2)
                 aeOnEntry env'
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
@@ -607,7 +607,7 @@ runTurn env userText = do
                     , ("approval", object ["scope" .= scope])
                     ]
                 }
-          tfwRecordAndAck (aeTranscript env) (TwoFileWrite [] entry)
+          itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite [] entry)
           aeOnEntry env
     dispatchOne other = pure other  -- non-tool blocks never reach dispatchOne
 

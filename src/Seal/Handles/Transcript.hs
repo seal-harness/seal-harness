@@ -7,9 +7,9 @@
 -- format where each 'Request' entry re-serializes the whole prior
 -- conversation. Read-only for new sessions; old sessions are still readable.
 --
--- [New] @conversation.jsonl@ + @entries.jsonl@ — the change-log sidecar
--- format. @conversation.jsonl@ is one raw 'Message' per line (the pure content
--- list, grown by deltas). @entries.jsonl@ is one 'EntryRecord' per event
+-- [New] @conversation.jsonl@ + @entries.jsonl@ + @conversation.idx@ — the
+-- indexed transcript format. @conversation.jsonl@ is one raw 'Message' per
+-- line (the pure content list, grown by deltas). @entries.jsonl@ is one 'EntryRecord' per event
 -- (payload-free, with an envelope-delta recorded only when changed). The new
 -- format is what the writer produces for sessions that did not already have a
 -- @transcript.jsonl@.
@@ -24,10 +24,10 @@ module Seal.Handles.Transcript
   ( TranscriptHandle (..)
   , withTranscript
   , fakeTranscript
-  , withTwoFileTranscript
-  , fakeTwoFileTranscript
-  , TwoFileHandle (..)
-  , TwoFileWrite (..)
+  , withIndexedTranscript
+  , fakeIndexedTranscript
+  , IndexedTranscriptHandle (..)
+  , IndexedTranscriptWrite (..)
   , TranscriptError (..)
   , defaultAckTimeoutUs
   , appendConversationMessage
@@ -76,7 +76,7 @@ import Seal.Transcript.Entries
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
 
--- | Exception raised by 'tfwRecordAndAck' when the single-writer daemon has
+-- | Exception raised by 'itwRecordAndAck' when the single-writer daemon has
 -- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
 -- leaves the ACK 'TMVar' empty and the caller blocks forever — the
 -- root-cause of session @20260724-113851-844@ silently hanging mid-dispatch.
@@ -186,47 +186,47 @@ fakeTranscript = do
     )
 
 -- ---------------------------------------------------------------------------
--- Two-file format (conversation.jsonl + entries.jsonl)
+-- Indexed transcript format (conversation.jsonl + entries.jsonl)
 -- ---------------------------------------------------------------------------
 
--- | A structured write request for the two-file writer. The writer diffs
--- @tfwMessages@ against the conversation as it exists on disk and appends only
+-- | A structured write request for the indexed transcript writer. The writer diffs
+-- @itwMessages@ against the conversation as it exists on disk and appends only
 -- the new lines (with @CbToolResult@ parts redacted), then appends the entry
 -- record. Crash semantics: messages first, then the entry line, so a torn tail
 -- leaves at most orphan message lines / a malformed last line — both already
 -- tolerated by the skip-malformed decode path.
-data TwoFileWrite = TwoFileWrite
-  { tfwMessages :: [Message]
+data IndexedTranscriptWrite = IndexedTranscriptWrite
+  { itwMessages :: [Message]
   -- ^ The full message list in effect at this turn (the conversation prefix +
   -- any new messages). The writer diffs against the on-disk conversation and
   -- appends only the new lines.
-  , tfwEntry    :: EntryRecord
+  , itwEntry    :: EntryRecord
   -- ^ The event line to append to @entries.jsonl@.
   }
 
--- | Handle to the two-file writer. 'tfwRecordAndAck' blocks until both files
--- are fsync'd; 'tfwRecordAsync' is fire-and-forget.
-data TwoFileHandle = TwoFileHandle
-  { tfwRecordAndAck :: TwoFileWrite -> IO ()
-  , tfwRecordAsync  :: TwoFileWrite -> IO ()
-  , tfwReadConversation :: IO [Message]
+-- | Handle to the indexed transcript writer. 'itwRecordAndAck' blocks until both files
+-- are fsync'd; 'itwRecordAsync' is fire-and-forget.
+data IndexedTranscriptHandle = IndexedTranscriptHandle
+  { itwRecordAndAck :: IndexedTranscriptWrite -> IO ()
+  , itwRecordAsync  :: IndexedTranscriptWrite -> IO ()
+  , itwReadConversation :: IO [Message]
   -- ^ Read back the on-disk conversation (for tests / replay).
-  , tfwReadEntries     :: IO [EntryRecord]
+  , itwReadEntries     :: IO [EntryRecord]
   -- ^ Read back the on-disk entry log.
-  , tfwSetSecretOps    :: Set OpName -> IO ()
+  , itwSetSecretOps    :: Set OpName -> IO ()
   -- ^ Set the set of opcode names whose tool results should be redacted from
   -- the on-disk conversation file. Call this after building the ISA registry
   -- so the writer knows which 'CbToolResult's may carry secrets. Results from
   -- opcodes NOT in this set (e.g. SHELL_EXEC, FILE_READ) pass through verbatim.
-  , tfwCloseTranscript :: IO ()
-  , tfwIsAlive :: IO Bool
+  , itwCloseTranscript :: IO ()
+  , itwIsAlive :: IO Bool
   -- ^ Is the single-writer daemon still running? Returns 'False' after a
   -- write error killed it. Callers that depend on durability (the dispatch
   -- ACK-before-execute gate) should check this before trusting a prior write.
   }
 
 -- | Default ACK timeout (30 seconds). If the daemon does not acknowledge a
--- write within this window, 'tfwRecordAndAck' raises 'TranscriptError' instead
+-- write within this window, 'itwRecordAndAck' raises 'TranscriptError' instead
 -- of hanging forever. Tuned generously — normal writes complete in
 -- milliseconds; 30s is a fail-safe for a stuck/dead daemon, not a performance
 -- bound.
@@ -236,19 +236,19 @@ defaultAckTimeoutUs = 30_000_000
 -- | The daemon's accumulated state: the conversation lines written so far (so
 -- the diff can be computed without re-reading the file each turn) and the
 -- fsync'd fds.
-data TwoFileState = TwoFileState
-  { tfsConvFd :: Fd
-  , tfsEntriesFd :: Fd
-  , tfsWritten :: [Message]
+data IndexedTranscriptState = IndexedTranscriptState
+  { itsConvFd :: Fd
+  , itsEntriesFd :: Fd
+  , itsWritten :: [Message]
   -- ^ The conversation as it exists on disk, in order. Grown by each write
   -- so the next diff can be computed in-memory.
-  , tfsSecretOpsRef :: IORef (Set OpName)
+  , itsSecretOpsRef :: IORef (Set OpName)
   -- ^ The set of opcode names whose tool results may carry secrets and must
   -- be redacted from the on-disk conversation file. An IORef so the caller
   -- can set it after building the registry (the registry construction may
-  -- depend on values only available inside the 'withTwoFileTranscript'
+  -- depend on values only available inside the 'withIndexedTranscript'
   -- callback, e.g. session id or worker functions).
-  , tfsPriorEnv :: Maybe Envelope
+  , itsPriorEnv :: Maybe Envelope
   -- ^ The effective envelope at the most recent 'EKRequest' entry. Used by
   -- 'writeOne' to compute a minimal 'EnvelopeDelta' — only fields that
   -- differ from the prior envelope are emitted, so a stable system prompt
@@ -257,20 +257,20 @@ data TwoFileState = TwoFileState
   -- the first request entry lands.
   }
 
--- | A work item for the two-file daemon.
-data TwoFileItem
-  = TFWWrite TwoFileWrite (Maybe (TMVar ()))
-  | TFWShutdown (TMVar ())
+-- | A work item for the indexed transcript daemon.
+data IndexedTranscriptItem
+  = ITWrite IndexedTranscriptWrite (Maybe (TMVar ()))
+  | ITShutdown (TMVar ())
 
 -- | Open both files in O_APPEND mode, spawn the single-writer daemon, run
--- @action@, then close. Every 'tfwRecordAndAck' blocks until both files are
+-- @action@, then close. Every 'itwRecordAndAck' blocks until both files are
 -- fsync'd.
 --
 -- If the session directory already contains a legacy @transcript.jsonl@ and no
 -- @conversation.jsonl@, the legacy file is left untouched (the legacy read path
 -- handles it); the new writer simply creates the two new files alongside it.
-withTwoFileTranscript :: FilePath -> (TwoFileHandle -> IO a) -> IO a
-withTwoFileTranscript dir action = do
+withIndexedTranscript :: FilePath -> (IndexedTranscriptHandle -> IO a) -> IO a
+withIndexedTranscript dir action = do
   q <- newTQueueIO
   aliveRef <- newTVarIO True
   let convPath     = dir </> "conversation.jsonl"
@@ -280,20 +280,20 @@ withTwoFileTranscript dir action = do
         , creat = Just (0o600 :: FileMode)
         }
       ack = maybe (pure ()) (\tv -> atomically (putTMVar tv ()))
-      writeOne st (TwoFileWrite msgs entry) = do
-        secretOps <- readIORef (tfsSecretOpsRef st)
+      writeOne st (IndexedTranscriptWrite msgs entry) = do
+        secretOps <- readIORef (itsSecretOpsRef st)
         -- Redact the FULL incoming list BEFORE diffing so the comparison
         -- is redacted-vs-redacted. The agent loop passes the in-memory list
-        -- (with unredacted tool results) on every write; tfsWritten holds
+        -- (with unredacted tool results) on every write; itsWritten holds
         -- the redacted version from the previous write. Without pre-diff
         -- redaction, stripPrefix fails on the unredacted-vs-redacted
         -- mismatch and the fallback re-appends the entire conversation
         -- (O(N²) duplication — session 20260912-183908-767).
         let redactedMsgs = redactMessages secretOps msgs msgs
-            new = diffMessages redactedMsgs (tfsWritten st)
+            new = diffMessages redactedMsgs (itsWritten st)
         -- 1. Append new conversation lines, fsync.
-        mapM_ (\m -> writeFd (tfsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) new
-        fileSynchronise (tfsConvFd st)
+        mapM_ (\m -> writeFd (itsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) new
+        fileSynchronise (itsConvFd st)
         -- 2. Compute a minimal envelope delta for EKRequest entries. The
         -- caller passes a FULL delta (every field set to 'Just'); the writer
         -- compares it against the prior effective envelope and emits only
@@ -305,40 +305,40 @@ withTwoFileTranscript dir action = do
         let (entry', mNextEnv) = case erKind entry of
               EKRequest -> case erEnvelope entry of
                 Just delta ->
-                  let baseline = fromMaybe defaultEnv (tfsPriorEnv st)
+                  let baseline = fromMaybe defaultEnv (itsPriorEnv st)
                       nextEnv = applyDelta baseline delta
-                      minimal = minimalDelta (tfsPriorEnv st) nextEnv
+                      minimal = minimalDelta (itsPriorEnv st) nextEnv
                   in (entry { erEnvelope = minimal }, Just nextEnv)
-                Nothing -> (entry, tfsPriorEnv st)
-              _ -> (entry, tfsPriorEnv st)
+                Nothing -> (entry, itsPriorEnv st)
+              _ -> (entry, itsPriorEnv st)
         -- 3. Append the entry line, fsync.
-        writeFd (tfsEntriesFd st) (encodeEntryRecordRaw entry' <> "\n")
-        fileSynchronise (tfsEntriesFd st)
-        pure st { tfsWritten = tfsWritten st <> new, tfsPriorEnv = mNextEnv }
+        writeFd (itsEntriesFd st) (encodeEntryRecordRaw entry' <> "\n")
+        fileSynchronise (itsEntriesFd st)
+        pure st { itsWritten = itsWritten st <> new, itsPriorEnv = mNextEnv }
       drain st = do
         next <- atomically (tryReadTQueue q)
         case next of
           Nothing -> pure st
-          Just (TFWWrite w mack) -> do
+          Just (ITWrite w mack) -> do
             st' <- writeOne st w
             ack mack
             drain st'
-          Just (TFWShutdown done) -> do
+          Just (ITShutdown done) -> do
             atomically (putTMVar done ())
             drain st
       daemon st = do
         item <- atomically (readTQueue q)
         case item of
-          TFWWrite w mack -> do
+          ITWrite w mack -> do
             st' <- writeOne st w
             ack mack
             daemon st'
-          TFWShutdown done -> do
+          ITShutdown done -> do
             st' <- drain st
             atomically (putTMVar done ())
             pure st'
       shutdown convFd entriesFd done = do
-        atomically (writeTQueue q (TFWShutdown done))
+        atomically (writeTQueue q (ITShutdown done))
         atomically (takeTMVar done)
         closeFd convFd
         closeFd entriesFd
@@ -358,7 +358,7 @@ withTwoFileTranscript dir action = do
         shutdown convFd entriesFd done)
     $ \(convFd, entriesFd) -> do
         secretOpsRef <- newIORef Set.empty
-        let st0 = TwoFileState convFd entriesFd existingConv secretOpsRef Nothing
+        let st0 = IndexedTranscriptState convFd entriesFd existingConv secretOpsRef Nothing
             -- The daemon with an exception handler: if writeOne throws, mark
             -- the daemon dead, fail every queued ACK (so callers blocked on
             -- takeTMVar unblock immediately), and log to stderr. The daemon
@@ -376,13 +376,13 @@ withTwoFileTranscript dir action = do
                       item <- atomically (tryReadTQueue q)
                       case item of
                         Nothing -> pure ()
-                        Just (TFWWrite _ _mack) -> drainRemaining
-                        Just (TFWShutdown done) -> do
+                        Just (ITWrite _ _mack) -> drainRemaining
+                        Just (ITShutdown done) -> do
                           atomically (putTMVar done ())
                 drainRemaining
                 pure st
         void $ forkIO (void (safeDaemon st0))
-        let enqueue w = atomically (writeTQueue q (TFWWrite w Nothing))
+        let enqueue w = atomically (writeTQueue q (ITWrite w Nothing))
             ackWrite w = do
               alive <- readTVarIO aliveRef
               if not alive
@@ -390,7 +390,7 @@ withTwoFileTranscript dir action = do
                 else do
                   tv <- newEmptyTMVarIO
                   timeoutVar <- newEmptyTMVarIO
-                  atomically (writeTQueue q (TFWWrite w (Just tv)))
+                  atomically (writeTQueue q (ITWrite w (Just tv)))
                   void $ forkIO $ do
                     threadDelay defaultAckTimeoutUs
                     void $ atomically (tryPutTMVar timeoutVar ())
@@ -407,14 +407,14 @@ withTwoFileTranscript dir action = do
                       if stillAlive
                         then throwIO (TranscriptError "transcript write timed out (daemon stuck)")
                         else throwIO (TranscriptError "transcript writer daemon died during write")
-        action TwoFileHandle
-          { tfwRecordAndAck = ackWrite
-          , tfwRecordAsync  = enqueue
-          , tfwReadConversation = readConversation <$> BS.readFile convPath
-          , tfwReadEntries     = readEntries entriesPath
-          , tfwSetSecretOps    = writeIORef secretOpsRef
-          , tfwCloseTranscript = pure ()
-          , tfwIsAlive = readTVarIO aliveRef
+        action IndexedTranscriptHandle
+          { itwRecordAndAck = ackWrite
+          , itwRecordAsync  = enqueue
+          , itwReadConversation = readConversation <$> BS.readFile convPath
+          , itwReadEntries     = readEntries entriesPath
+          , itwSetSecretOps    = writeIORef secretOpsRef
+          , itwCloseTranscript = pure ()
+          , itwIsAlive = readTVarIO aliveRef
           }
 
 -- | Read back the entries file, skipping malformed lines.
@@ -428,9 +428,9 @@ readEntries path = do
       let lns = filter (not . BS.null) (BS.split 0x0a bs)
       pure (mapMaybe (decode . BL.fromStrict) lns)
 
--- | In-memory two-file handle for tests. No file IO, no daemon.
-fakeTwoFileTranscript :: IO (TwoFileHandle, IO ([Message], [EntryRecord]))
-fakeTwoFileTranscript = do
+-- | In-memory indexed transcript handle for tests. No file IO, no daemon.
+fakeIndexedTranscript :: IO (IndexedTranscriptHandle, IO ([Message], [EntryRecord]))
+fakeIndexedTranscript = do
   convRef    <- newMVar ([] :: [Message])
   entriesRef <- newMVar ([] :: [EntryRecord])
   secretOpsRef <- newIORef Set.empty
@@ -439,19 +439,19 @@ fakeTwoFileTranscript = do
       handle w = do
         secretOps <- readIORef secretOpsRef
         written <- readMVar convRef
-        let redactedMsgs = redactMessages secretOps (tfwMessages w) (tfwMessages w)
+        let redactedMsgs = redactMessages secretOps (itwMessages w) (itwMessages w)
             newRedacted = diffMessages redactedMsgs written
         mapM_ pushConv newRedacted
-        pushEntry (tfwEntry w)
+        pushEntry (itwEntry w)
   pure
-    ( TwoFileHandle
-        { tfwRecordAndAck = handle
-        , tfwRecordAsync  = handle
-        , tfwReadConversation = readMVar convRef
-        , tfwReadEntries     = readMVar entriesRef
-        , tfwSetSecretOps    = writeIORef secretOpsRef
-        , tfwCloseTranscript = pure ()
-        , tfwIsAlive = pure True
+    ( IndexedTranscriptHandle
+        { itwRecordAndAck = handle
+        , itwRecordAsync  = handle
+        , itwReadConversation = readMVar convRef
+        , itwReadEntries     = readMVar entriesRef
+        , itwSetSecretOps    = writeIORef secretOpsRef
+        , itwCloseTranscript = pure ()
+        , itwIsAlive = pure True
         }
     , do cs <- readMVar convRef
          es <- readMVar entriesRef
@@ -539,7 +539,7 @@ minimalDelta mPrior next = case mPrior of
 -- | Append a single 'Message' to a session's @conversation.jsonl@ file
 -- using direct @O_APPEND@ + @fsync@. This is used by the async delegation
 -- completion callback — which runs in a forked child thread that may
--- outlive the parent's 'withTwoFileTranscript' bracket (and its
+-- outlive the parent's 'withIndexedTranscript' bracket (and its
 -- single-writer daemon). POSIX @O_APPEND@ guarantees each @write()@
 -- atomically seeks to end-of-file, so concurrent writes (from the daemon
 -- during the parent's turn, or from another completion callback) do not

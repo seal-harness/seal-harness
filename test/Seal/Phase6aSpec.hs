@@ -12,7 +12,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Handles.Harness (HarnessError (..))
-import Seal.Handles.Transcript (TwoFileHandle, fakeTwoFileTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle, fakeIndexedTranscript)
 import Seal.Harness.Id
 import Seal.Harness.Reconcile
 import Seal.Harness.Registry
@@ -71,7 +71,7 @@ spec = describe "Seal.Phase6aSpec" $ do
         listOp  = harnessListOp reg
     logger <- testSealLogger
     appEnv <- mkEnv logger defaultConfig
-    (tHandle, _) <- fakeTwoFileTranscript
+    (tHandle, _) <- fakeIndexedTranscript
 
     -- 1. HARNESS_START
     r1 <- runApp appEnv (dispatchReg tHandle startOp)
@@ -137,10 +137,10 @@ spec = describe "Seal.Phase6aSpec" $ do
 -- ---------------------------------------------------------------------------
 
 -- | Dispatch one opcode via a one-op registry against a fake transcript.
-dispatchReg :: TwoFileHandle -> Opcode -> App (Either DispatchError OpResult)
+dispatchReg :: IndexedTranscriptHandle -> Opcode -> App (Either DispatchError OpResult)
 dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op) (object [])
 
-dispatchOp :: TwoFileHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
+dispatchOp :: IndexedTranscriptHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
 dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op)
 
 testEntry :: HarnessId -> HarnessEntry
