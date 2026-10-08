@@ -15,6 +15,7 @@ import Seal.Skills.Backend
   ( SkillBackend (..)
   , tripleUnionSkillBackend
   , workdirSkillBackend
+  , staticSkillBackend
   , workdirSkillConventions
   , decodeAgentSkill
   )
@@ -23,15 +24,17 @@ import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
-import Seal.Core.Types (mkSystemSessionId, mkSessionId, OpName (..))
+import Seal.Core.Types (mkSystemSessionId, mkSessionId, OpName (..), ModelId (..))
 import Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
   , workdirAgentDefBackend
+  , staticAgentDefBackend
   , unionAgentDefBackend
   , noneBackend
   , deriveAgentsMdId
   )
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText, isValidAgentDefId, mkAgentDefId)
+import Seal.Security.Policy (AllowList (..))
 import Seal.Config.Paths (SealPaths (..), sessionMetaPath)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -562,6 +565,144 @@ spec = do
       defs <- adbList unioned
       length defs `shouldBe` 1
       cleanup tmp
+
+  describe "Seal.Agent.Def.Backend.staticAgentDefBackend (bare-id resolution)" $ do
+    it "adbRead finds a proj-prefixed def by its bare id" $ do
+      let aid = case mkAgentDefId "myrepo--foo" of Right a -> a; Left _ -> error "bad id"
+          d = AgentDef
+            { adId = aid, adName = "myrepo/Foo", adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "be nice"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
+            }
+      backend <- staticAgentDefBackend [d]
+      m <- adbRead backend (case mkAgentDefId "foo" of Right a -> a; Left _ -> error "bad bare id")
+      m `shouldBe` Just d
+
+    it "adbRead finds a proj-prefixed def by its fully-qualified id" $ do
+      let aid = case mkAgentDefId "myrepo--foo" of Right a -> a; Left _ -> error "bad id"
+          d = AgentDef
+            { adId = aid, adName = "myrepo/Foo", adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "be nice"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
+            }
+      backend <- staticAgentDefBackend [d]
+      m <- adbRead backend aid
+      m `shouldBe` Just d
+
+    it "adbRead returns Nothing when no def matches the bare id" $ do
+      let aid = case mkAgentDefId "myrepo--foo" of Right a -> a; Left _ -> error "bad id"
+          d = AgentDef
+            { adId = aid, adName = "myrepo/Foo", adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "be nice"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
+            }
+      backend <- staticAgentDefBackend [d]
+      m <- adbRead backend (case mkAgentDefId "bar" of Right a -> a; Left _ -> error "bad bare id")
+      m `shouldBe` Nothing
+
+    it "adbRead returns Nothing when multiple defs share the same bare id (ambiguous)" $ do
+      let mkAid t = case mkAgentDefId t of Right a -> a; Left _ -> error "bad id"
+          mkD t = AgentDef
+            { adId = mkAid t, adName = t, adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "be nice"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "manual"
+            }
+      backend <- staticAgentDefBackend [mkD "repo1--foo", mkD "repo2--foo"]
+      m <- adbRead backend (case mkAgentDefId "foo" of Right a -> a; Left _ -> error "bad bare id")
+      m `shouldBe` Nothing
+
+  describe "Seal.Agent.Def.Backend.unionAgentDefBackend (bare-id resolution)" $ do
+    it "resolves a bare id to the workdir (proj) def first, then falls back to user" $ do
+      let tmp = "/tmp/seal-repo-discovery-bare-union-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "foo-agent")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "foo-agent" </> "SOUL.md")
+        "Workdir foo agent.\n"
+      workdirBackend <- workdirAgentDefBackend =<< mkFs tmp
+      userBackend <- noneBackend
+      -- Add a user def with the SAME bare id "foo-agent" but a different
+      -- fully-qualified id (no prefix) to confirm the workdir one wins.
+      let userFooAid = case mkAgentDefId "foo-agent" of Right a -> a; Left _ -> error "bad user id"
+          userDef = AgentDef
+            { adId = userFooAid, adName = "User Foo", adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "user version"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "s1"
+            }
+      adbUpdate userBackend userDef
+      let unioned = unionAgentDefBackend workdirBackend userBackend
+      m <- adbRead unioned (case mkAgentDefId "foo-agent" of Right a -> a; Left _ -> error "bad bare id")
+      case m of
+        Just d -> agentDefIdText (adId d) `shouldBe` "my-repo--foo-agent"
+        Nothing -> expectationFailure "expected workdir def, got Nothing"
+      cleanup tmp
+
+    it "falls back to the user store when no workdir def matches the bare id" $ do
+      userBackend <- noneBackend
+      let userFooAid = case mkAgentDefId "foo-agent" of Right a -> a; Left _ -> error "bad user id"
+          userDef = AgentDef
+            { adId = userFooAid, adName = "User Foo", adProvider = "ollama"
+            , adModel = ModelId "llama3", adSystem = Just "user version"
+            , adTools = AllowAll, adGroup = Nothing, adRole = Nothing
+            , adDescription = Nothing, adCreatedAt = aTime
+    , adAllowSpawn = Nothing
+            , adUpdatedAt = aTime, adSession = mkSystemSessionId "s1"
+            }
+      adbUpdate userBackend userDef
+      emptyWorkdir <- staticAgentDefBackend []
+      let unioned = unionAgentDefBackend emptyWorkdir userBackend
+      m <- adbRead unioned userFooAid
+      m `shouldBe` Just userDef
+
+  describe "Seal.Skills.Backend.tripleUnionSkillBackend (bare-id resolution)" $ do
+    it "sbRead finds a proj-prefixed skill by its bare id (proj first)" $ do
+      let projSkill = Skill
+            { skId = case mkSkillId "proj/myrepo/foo" of Right s -> s; Left _ -> error "bad proj id"
+            , skDescription = "proj version"
+            , skBody = "proj body"
+            , skGroup = Just "proj/myrepo"
+            , skCreatedAt = aTime, skUpdatedAt = aTime
+            , skSession = mkSystemSessionId "manual"
+            }
+      workdirBackend <- staticSkillBackend [projSkill]
+      userBackend <- SkillBackend.noneBackend
+      let unioned = tripleUnionSkillBackend workdirBackend userBackend
+      m <- sbRead unioned (case mkSkillId "foo" of Right s -> s; Left _ -> error "bad bare id")
+      case m of
+        Just s -> skillIdText (skId s) `shouldBe` "proj/myrepo/foo"
+        Nothing -> expectationFailure "expected proj skill, got Nothing"
+
+    it "sbRead falls back to user store when no proj skill matches the bare id" $ do
+      let userSkill = Skill
+            { skId = case mkSkillId "foo" of Right s -> s; Left _ -> error "bad user id"
+            , skDescription = "user version"
+            , skBody = "user body"
+            , skGroup = Nothing
+            , skCreatedAt = aTime, skUpdatedAt = aTime
+            , skSession = mkSystemSessionId "s1"
+            }
+      workdirBackend <- staticSkillBackend []
+      userBackend <- SkillBackend.noneBackend
+      sbCreate userBackend userSkill
+      let unioned = tripleUnionSkillBackend workdirBackend userBackend
+      m <- sbRead unioned (case mkSkillId "foo" of Right s -> s; Left _ -> error "bad bare id")
+      case m of
+        Just s -> skillIdText (skId s) `shouldBe` "foo"
+        Nothing -> expectationFailure "expected user skill, got Nothing"
 
   describe "Seal.Session.Store.autoBindRepoAgent" $ do
     -- Shared session-JSON scaffold: a session bound to the user's

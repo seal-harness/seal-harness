@@ -52,6 +52,7 @@ stubDef defId = AgentDef
   , adGroup       = Nothing
   , adRole        = Nothing
   , adDescription = Nothing
+    , adAllowSpawn = Nothing
   , adCreatedAt   = fixedTime
   , adUpdatedAt   = fixedTime
   , adSession     = mkSystemSessionId "test-session"

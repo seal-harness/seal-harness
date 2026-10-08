@@ -5,6 +5,10 @@ import Control.Exception (throwIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+import System.Process (readProcess)
 import Test.Hspec
 
 import Seal.Core.ChannelKind (ChannelKind (..))
@@ -42,6 +46,23 @@ withCaptureLogger action = do
   lines_ <- readIORef ref
   pure (result, lines_)
 
+-- | Run an action with a unique temp directory and a @seal.log@ path inside
+-- it. The directory is created fresh for each call and removed afterwards.
+-- The log file itself is NOT created here — 'withSealLogger' opens it in
+-- append mode.
+withTempLogPath :: (FilePath -> IO a) -> IO a
+withTempLogPath action =
+  withSystemTempDirectory "seal-logger-spec" $ \dir -> do
+    action (dir </> "seal.log")
+
+-- | Read a log file via @cat@ (subprocess). On macOS, GHC's 'openFile'
+-- acquires an advisory lock that persists briefly after 'hClose', so
+-- reading the file with 'readFile' immediately after 'closeScribes' can
+-- fail with @resource busy (file is locked)@. Spawning @cat@ bypasses
+-- GHC's locking entirely, reading the file content reliably.
+readLogFile :: FilePath -> IO String
+readLogFile path = readProcess "cat" [path] ""
+
 spec :: Spec
 spec = describe "Seal.Logging.Logger" $ do
   describe "logIO" $ do
@@ -73,6 +94,34 @@ spec = describe "Seal.Logging.Logger" $ do
       logger <- newSealLoggerWithScribe badScribe DebugS
       logIO logger InfoS "should not crash"
       closeSealLogger logger
+
+  describe "withSealLogger (file logging)" $ do
+    it "writes log lines to the file when a path is provided" $ do
+      withTempLogPath $ \logPath -> do
+        withSealLogger "Info" (Just logPath) $ \logger -> do
+          logIO logger InfoS "file logging test message"
+        -- After withSealLogger closes (flushing scribes), read the file.
+        -- readLogFile uses cat to bypass macOS GHC file-locking.
+        content <- readLogFile logPath
+        T.isInfixOf "file logging test message" (T.pack content) `shouldBe` True
+
+    it "writes to stderr only when no file path is provided" $ do
+      -- With Nothing, no file should be created. The key invariant is that
+      -- Nothing doesn't create a file at the given path.
+      withTempLogPath $ \logPath -> do
+        withSealLogger "Info" Nothing $ \logger -> do
+          logIO logger InfoS "stderr only message"
+        fileExists <- doesFileExist logPath
+        fileExists `shouldBe` False
+
+    it "does not emit ANSI color codes in the file (plain text)" $ do
+      withTempLogPath $ \logPath -> do
+        withSealLogger "Info" (Just logPath) $ \logger -> do
+          logIO logger InfoS "color test message"
+        content <- readLogFile logPath
+        -- ANSI escape sequences start with ESC (0x1b). The file scribe must
+        -- use ColorLog False, so no escape codes should appear.
+        T.isInfixOf "\ESC" (T.pack content) `shouldBe` False
 
   describe "withChannelContext" $ do
     it "merges context so logIO includes ChannelContext fields" $ do

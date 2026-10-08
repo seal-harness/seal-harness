@@ -188,6 +188,7 @@ sampleAgentDef = AgentDef
   , adGroup = Nothing
   , adRole = Nothing
   , adDescription = Nothing
+, adAllowSpawn = Nothing
   , adCreatedAt = read "1970-01-01 00:00:00 UTC"
   , adUpdatedAt = read "1970-01-01 00:00:00 UTC"
   , adSession = sampleSession

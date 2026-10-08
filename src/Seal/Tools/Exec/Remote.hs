@@ -251,8 +251,12 @@ mkRealRemoteRunner = RemoteRunner
         Left _ioErr -> pure (Left ExecRemoteUnreachable)  -- launch fail = unreachable
         Right (ExitSuccess, out, _) -> pure (Right out)
         Right (ExitFailure 255, _, err)
+          | "REMOTE HOST IDENTIFICATION HAS CHANGED" `T.isInfixOf` err
+            -> pure (Left ExecHostKeyMismatch)
+          | "has changed and you have requested strict checking" `T.isInfixOf` err
+            -> pure (Left ExecHostKeyMismatch)
           | "Host key verification failed" `T.isInfixOf` err
-          -> pure (Left ExecHostKeyMismatch)
+            -> pure (Left ExecHostKeyUnknown)
           | otherwise
           -> pure (Left ExecRemoteUnreachable)
         Right (ExitFailure 127, _, _)  -> pure (Left ExecRemoteUnreachable)  -- ssh not on PATH

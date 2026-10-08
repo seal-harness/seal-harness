@@ -28,6 +28,8 @@ import qualified System.IO as IO
 import System.Timeout (timeout)
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Agent.ContextTruncation
+  ( estimateTokenCount, truncateMessages, defaultTruncationConfig )
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
@@ -40,6 +42,7 @@ import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
+import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
   ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
@@ -221,11 +224,29 @@ runTurn env userText = do
     go n lenContinue msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
+      -- Context window management: if the model has a known context window,
+      -- estimate the token count of system + tools + messages and truncate
+      -- the messages (sent to the provider) when they exceed the budget.
+      -- The on-disk transcript still records the full conversation (msgs);
+      -- only crMessages is truncated — a transient per-request optimization
+      -- (design D7). Unknown models (context window = 0) skip truncation.
+      let tools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
+          ModelId modelText = aeModel env
+          contextWindow = modelContextWindow modelText
+          totalEstimate = estimateTokenCount (aeSystem env) msgs tools
+          needsTruncation = contextWindow > 0
+            && totalEstimate > contextWindow - defaultMaxTokens
+          sendMsgs = if needsTruncation
+                       then truncateMessages defaultTruncationConfig
+                              (contextWindow - defaultMaxTokens
+                                 - estimateTokenCount (aeSystem env) [] tools)
+                              msgs
+                       else msgs
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
-                  , crMessages = msgs
-                  , crTools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
+                  , crMessages = sendMsgs
+                  , crTools = tools
                   , crToolChoice = ToolAuto
                   , crMaxTokens = defaultMaxTokens
                   }
@@ -693,13 +714,13 @@ stripToolCallXml t0 =
       t5 = T.replace oFcClose "" t4
       t6 = T.replace oToolOpen "" t5
       t7 = T.replace oToolClose "" t6
-      -- 3. Remove orphan param tags (leaked args wrap key/value in
-      --    \<arg_key\>/\<arg_value\> tags; when the surrounding
-      --    \<invoke\> block was already removed these are strays).
-      t8 = T.replace paramKeyOpen "" t7
-      t9 = T.replace paramKeyClose "" t8
-      t10 = T.replace paramValOpen "" t9
-      t11 = T.replace paramValClose "" t10
+      -- 3. Remove orphan param key+value spans (leaked args wrap key/value
+      --    in arg_key/arg_value tags; when the surrounding <invoke> block
+      --    was already removed these are strays). We must remove the ENTIRE
+      --    key+value span (not just the tags), otherwise the bare key/value
+      --    text is left concatenated — producing garbled output like
+      --    "binarygitargs[...]cwdseal-harness".
+      t11 = dropOrphanParamSpans t7
       -- 5. Remove a trailing unterminated opener (its closer was never
       --    emitted, e.g. a truncation cut mid-block): if an opener
       --    appears in the last maxPartialTagScan chars and no closer
@@ -712,10 +733,6 @@ stripToolCallXml t0 =
     oFcClose     = "</function_calls>"
     oToolOpen    = "<tool_call>"
     oToolClose   = "</tool_call>"
-    paramKeyOpen  = "<arg_key>"
-    paramKeyClose = "</arg_key>"
-    paramValOpen  = "<arg_value>"
-    paramValClose = "</arg_value>"
 
 -- | Remove a complete @\<tool_call>...\<tool_call>\/tool_call\>@ span. The opener
 -- carries no attributes, so this is a plain two-marker scan (unlike
@@ -735,6 +752,90 @@ dropToolCallBlock = go
                  (_, afterCloseRest)
                    | T.null afterCloseRest -> acc  -- no close: leave
                  (_, afterClose)           -> go (before <> T.drop (T.length close) afterClose)
+
+-- | Remove orphan param key+value spans (ARGE...ARGEARGE...ARGE).
+-- When the model emits arg_key/arg_value tags WITHOUT a surrounding
+-- <invoke> block, the 'dropBlocks' pass doesn't fire (no <invoke> to
+-- match). The old code just stripped the tags themselves, leaving the
+-- bare key/value text concatenated — producing garbled output like
+-- "binarygitargs[...]cwdseal-harness". This function removes the
+-- ENTIRE key+value span: from the arg_key opener through the
+-- arg_value closer, including the tags and the content between them.
+--
+-- The scan is non-greedy: each ARGE...ARGE is the key, and the
+-- immediately following ARGE...ARGE is its value. The pair is removed
+-- as a unit. This handles both well-formed pairs and the common case
+-- where the model emits several key/value pairs in sequence.
+dropOrphanParamSpans :: Text -> Text
+dropOrphanParamSpans t0 =
+  let t1 = dropCompleteSpans t0
+      t2 = dropOrphanClosers t1
+  in t2
+  where
+    pkOpen  = "<arg_key>"
+    pkClose = "</arg_key>"
+    pvOpen  = "<arg_value>"
+    pvClose = "</arg_value>"
+    dropCompleteSpans acc
+      | T.null acc = acc
+      | otherwise =
+          case T.breakOn pkOpen acc of
+            (before, rest)
+              | T.null rest -> acc
+              | otherwise ->
+                  let afterPkOpen = T.drop (T.length pkOpen) rest
+                  in case T.breakOn pkClose afterPkOpen of
+                       (_, afterPkCloseRest)
+                         | T.null afterPkCloseRest ->
+                             -- No key close tag — just strip the open tag
+                             -- and continue (defensive: shouldn't happen
+                             -- with well-formed input, but don't loop).
+                             dropCompleteSpans (before <> T.drop (T.length pkOpen) rest)
+                         | otherwise ->
+                             let afterPkClose = T.drop (T.length pkClose) afterPkCloseRest
+                             in case T.breakOn pvOpen afterPkClose of
+                                  (_, rest2)
+                                    | T.null rest2 ->
+                                        -- No value open tag — strip up to
+                                        -- here and continue.
+                                        dropCompleteSpans before
+                                    | otherwise ->
+                                        let afterPvOpen = T.drop (T.length pvOpen) rest2
+                                        in case T.breakOn pvClose afterPvOpen of
+                                             (_, afterPvCloseRest)
+                                               | T.null afterPvCloseRest ->
+                                                   -- No value close — strip
+                                                   -- everything from the key
+                                                   -- open onward.
+                                                   dropCompleteSpans before
+                                               | otherwise ->
+                                                   -- Complete key+value pair
+                                                   -- found: drop it all and
+                                                   -- continue scanning.
+                                                   dropCompleteSpans before
+
+    -- Pass 2: remove orphan closing tags + their content. When the model
+    -- omits the opening arg_key tag but emits closing arg_key + arg_value
+    -- pair, strip from any pkClose through the following pvClose.
+    dropOrphanClosers acc
+      | T.null acc = acc
+      | otherwise =
+          case T.breakOn pkClose acc of
+            (_before, rest)
+              | T.null rest -> acc
+              | otherwise ->
+                  -- Found a closing arg_key without a preceding opening.
+                  -- Strip EVERYTHING from the start through the next
+                  -- closing arg_value (the text before the closing
+                  -- arg_key is the key value that lost its opening tag;
+                  -- it's part of the malformed tool call, not prose).
+                  let afterPkClose = T.drop (T.length pkClose) rest
+                  in case T.breakOn pvClose afterPkClose of
+                       (_, afterPvCloseRest)
+                         | T.null afterPvCloseRest ->
+                             dropOrphanClosers afterPkClose
+                         | otherwise ->
+                             dropOrphanClosers (T.drop (T.length pvClose) afterPvCloseRest)
 
 -- | Remove every complete @open ... close@ span (non-greedy: up to the
 -- FIRST closing tag), including the tags themselves. Unterminated blocks

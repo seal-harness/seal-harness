@@ -41,10 +41,19 @@ module Seal.ISA.Ops.Agent
   , AgentWorkerBuilder
   , AgentStartWiring (..)
   , AgentStartGate (..)
+  , SpawnMode (..)
+  , parseSpawnMode
   , gateOpen
+  , authorizeStart
+  , encodeForegroundResults
+  , encodeSpawnInfos
+  , completionMessage
+  , killSwitchMsg
+  , leafMsg
+  , allowSpawnBlockedMsg
   ) where
 
-import Control.Monad (join)
+import Control.Monad (join, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
@@ -57,12 +66,12 @@ import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 import Data.Vector qualified as V
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Backend (AgentDefBackend (..), ResolveResult (..), resolveAgentDefEntry)
 import Seal.Agent.Def.Types
-  ( AgentDef (..), mkAgentDefId, agentDefIdText
+  ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
   , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
   )
-import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
+import Seal.Agent.Runtime.Delegation.Worker ()
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , AgentCompletionCallback
@@ -73,6 +82,7 @@ import Seal.Agent.Runtime.Delegation
   , DelegateInput (..)
   , SpawnInfo (..)
   , SpawnPauseFlag
+  , runDelegate
   , ParentActivity
   , SubagentId (..)
   , resolveDelegationConfig
@@ -84,6 +94,8 @@ import Seal.Agent.Runtime.Registry
   , agentInstanceBySubagentId
   , interruptAgent, listAgents
   , registerCompletedAgentResult, registerRunningAgent, stopAgent )
+import Seal.Agent.Runtime.RunRecord qualified as RunRecord
+  ( RunRecordRegistry, shouldDeferDelivery )
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Handles.Transcript (appendCompletionToSidecar)
@@ -210,6 +222,7 @@ handleDefWrite backend session v = do
                   , adGroup = groupField v (Just existing)
                   , adRole = roleField v
                   , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
+, adAllowSpawn = Nothing
                   , adUpdatedAt = now
                   }
               , False
@@ -225,6 +238,7 @@ handleDefWrite backend session v = do
                   , adGroup = groupField v Nothing
                   , adRole = roleField v
                   , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
+, adAllowSpawn = Nothing
                   , adCreatedAt = now
                   , adUpdatedAt = now
                   , adSession = session
@@ -248,13 +262,24 @@ handleDefRead backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
     Just aid -> do
-      mDef <- liftIO (adbRead backend aid)
-      case mDef of
-        Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
-        Just d  -> do
+      rDef <- liftIO (resolveAgentDefEntry backend aid)
+      case rDef of
+        ResolveNotFound ->
+          pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousAgentDefMsg aid ids)] True (object ["id" .= agentDefIdText aid]))
+        ResolveFound d  -> do
           let rendered = renderDef d
               recorded = encodeDefRecorded d False []
           pure (OpResult [TrpText rendered] False recorded)
+
+-- | Format an ambiguity error for an agent def id, listing the
+-- fully-qualified ids that matched so the user can disambiguate.
+ambiguousAgentDefMsg :: AgentDefId -> [Text] -> Text
+ambiguousAgentDefMsg aid ids =
+  "ambiguous agent def id \"" <> agentDefIdText aid <> "\". Matching ids: "
+    <> T.intercalate ", " ids
+    <> ". Use the full id to disambiguate."
 
 -- | Handle the list action (shared with the legacy AGENT_DEF_LIST shim).
 handleDefList :: AgentDefBackend -> App OpResult
@@ -281,13 +306,16 @@ handleDefDelete backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
     Just aid -> do
-      mExisting <- liftIO (adbRead backend aid)
-      liftIO (adbDelete backend aid)
-      let msg = case mExisting of
-            Nothing -> "deleted (was not present)"
-            Just _  -> "deleted"
-          recorded = object ["id" .= agentDefIdText aid]
-      pure (OpResult [TrpText msg] False recorded)
+      rExisting <- liftIO (resolveAgentDefEntry backend aid)
+      case rExisting of
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousAgentDefMsg aid ids)] True (object ["id" .= agentDefIdText aid]))
+        ResolveNotFound -> do
+          liftIO (adbDelete backend aid)
+          pure (OpResult [TrpText "deleted (was not present)"] False (object ["id" .= agentDefIdText aid]))
+        ResolveFound _ -> do
+          liftIO (adbDelete backend aid)
+          pure (OpResult [TrpText "deleted"] False (object ["id" .= agentDefIdText aid]))
 
 -- ---------------------------------------------------------------------------
 -- knownOpNames — the universe of opcode names the harness exposes
@@ -310,7 +338,7 @@ knownOpNames = Set.fromList
   , "AGENT_MANAGE"
   , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
   , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
-  , "WEB_FETCH", "WEB_SEARCH"
+ , "WEB_FETCH", "WEB_SEARCH", "BROWSER_MANAGE"
   , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
   , "SESSION_NEW", "SESSION_LIST", "SESSION_SEARCH", "SESSION_GET"
   , "SESSION_MANAGE"
@@ -519,22 +547,52 @@ data AgentStartWiring = AgentStartWiring
   , aswParentSession :: SessionId
     -- ^ The parent's session id (so the completion callback knows which
     -- @conversation.jsonl@ to append to).
+  , aswRunRecords   :: Maybe RunRecord.RunRecordRegistry
+    -- ^ The durable run-record registry (WU-5). When 'Just', the
+    -- completion callback checks 'shouldDeferDelivery' before appending to
+    -- the sidecar — a child with pending descendants has its delivery
+    -- deferred until the descendants settle. 'Nothing' in test wirings
+    -- without the registry (delivery is never deferred).
+  , aswOnIdleCompletion :: Maybe (IO ())
+    -- ^ Wake-up hook: when a background sub-agent completes and the parent
+    -- session is idle (no turn in flight), this action triggers a synthetic
+    -- turn so the sidecar completions are read and processed. 'Nothing' in
+    -- test wirings. The action is closed over the parent session id at
+    -- wiring time.
   }
 
 -- | The role/switch condition the nested AGENT_START enforces before it
 -- will spawn. Leaf children (and orchestrator children while the kill
 -- switch is off) get a present-but-rejecting op whose authorize returns
--- the dedicated error.
+-- the dedicated error. The per-def @adAllowSpawn@ override is captured in
+-- 'gAllowSpawn': @Just False@ blocks spawning regardless of role; @Just
+-- True@ allows spawning even for a leaf role (escape hatch); @Nothing@
+-- defers to the role-based default.
 data AgentStartGate = AgentStartGate
   { gEffectiveRole :: Maybe Text
   , gOrchEnabled   :: Bool
+  , gAllowSpawn    :: Maybe Bool
   }
 
 -- | The open gate for top-level (operator-authorized) turns: spawning is
 -- governed only by the depth cap, spawn-pause, and per-spawn resolver
 -- checks.
 gateOpen :: AgentStartGate
-gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
+gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True, gAllowSpawn = Nothing }
+
+-- | The spawn mode parsed from the @mode@ field of @AGENT_MANAGE start@.
+-- @foreground@ blocks and returns results in-band; @background@ (the
+-- default) forks children and delivers completion via push notification.
+data SpawnMode = SpawnModeForeground | SpawnModeBackground
+  deriving stock (Eq, Show)
+
+-- | Parse the @mode@ field from the input value. Defaults to
+-- 'SpawnModeBackground' when absent or unrecognized.
+parseSpawnMode :: Value -> SpawnMode
+parseSpawnMode v =
+  case textFieldMaybe "mode" v of
+    Just "foreground" -> SpawnModeForeground
+    _                 -> SpawnModeBackground
 
 -- | Parse the model's input into a 'DelegateInput'. Single mode requires
 -- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
@@ -568,8 +626,10 @@ parseTask v =
                  | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir"))))
 
 -- | Resolve a task to its def + worker. Returns Left if the def id is
--- invalid, the def doesn't exist, or the effective-role / kill-switch gate
--- rejects the spawn. The session id is NOT minted here — 'spawnOne' in
+-- invalid or the def doesn't exist. The role/kill-switch gate is enforced
+-- at authorize time ('authorizeStart') and in 'buildChildRegistryAdapter'
+-- (which consults the def's @adAllowSpawn@ when building the child's
+-- nested gate). The session id is NOT minted here — 'spawnOne' in
 -- 'runDelegateAsync' mints the session before calling the resolver,
 -- eliminating the double-mint that doubled the collision surface.
 resolveTask
@@ -580,18 +640,14 @@ resolveTask
   -> AgentWorkerBuilder
   -> ChildTask
   -> IO (Either Text (AgentDef, AgentWorkerBuilder))
-resolveTask defBackend _runtime _parentDepth orchEnabled worker task = do
+resolveTask defBackend _runtime _parentDepth _orchEnabled worker task = do
   case mkAgentDefId (ctDefId task) of
     Left err -> pure (Left err)
     Right aid -> do
       mDef <- adbRead defBackend aid
       case mDef of
         Nothing  -> pure (Left ("agent def not found: " <> ctDefId task))
-        Just def -> do
-          let role = effectiveRole (adRole def) (ctRole task)
-          if role == Just "orchestrator" && not orchEnabled
-            then pure (Left killSwitchMsg)
-            else pure (Right (def, worker))
+        Just def -> pure (Right (def, worker))
 
 -- | The dedicated kill-switch error. Distinct from the depth/leaf/pause
 -- messages so the parent transcript distinguishes all spawn-failure causes.
@@ -602,6 +658,14 @@ killSwitchMsg = "Delegation spawning is disabled: delegation.orchestrator_enable
 -- for both the model and the operator.
 leafMsg :: Text
 leafMsg = "AGENT_START is not available to this agent: its definition is a leaf (role: leaf). Ask the operator to grant the orchestrator role if delegation is required."
+
+-- | The dedicated @adAllowSpawn = Just False@ error: the def explicitly
+-- forbids spawning, overriding the role-based default.
+allowSpawnBlockedMsg :: Text
+allowSpawnBlockedMsg =
+  "AGENT_START is not available to this agent: its definition has \
+  \allow_spawn = false. Re-trying will not succeed until the operator \
+  \sets allow_spawn = true on this agent definition."
 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
 -- ran synchronously to completion). Records the instance with status
@@ -631,7 +695,10 @@ parseAgentAction v =
 
 -- | Authorize gate for the `start` action (shared with the legacy
 -- AGENT_START shim). Checks both the input shape (goal or tasks present)
--- and the role/kill-switch gate from the wiring.
+-- and the role/kill-switch/@adAllowSpawn@ gate from the wiring. The
+-- @gAllowSpawn@ override takes precedence: @Just False@ always blocks,
+-- @Just True@ always allows (even a leaf), @Nothing@ defers to the
+-- role-based default.
 authorizeStart :: AgentStartWiring -> Value -> Either Text ()
 authorizeStart wiring v =
   let shapeGate =
@@ -640,10 +707,13 @@ authorizeStart wiring v =
         in if hasGoal || hasTasks
              then Right ()
              else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
-      roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
-        (Just "orchestrator", True) -> Right ()
-        (Just "orchestrator", False) -> Left killSwitchMsg
-        (_, _) -> Left leafMsg
+      roleGate = case gAllowSpawn (aswGate wiring) of
+        Just False -> Left allowSpawnBlockedMsg
+        Just True  -> Right ()
+        Nothing -> case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
+          (Just "orchestrator", True)  -> Right ()
+          (Just "orchestrator", False) -> Left killSwitchMsg
+          (_, _)                       -> Left leafMsg
   in shapeGate *> roleGate
 
 -- | Authorize gate for AGENT_MANAGE — dispatches per-action validation.
@@ -681,6 +751,48 @@ handleStart wiring v = do
   case input of
     Left err -> pure (OpResult [TrpText err] True (object []))
     Right di -> do
+      let mode = parseSpawnMode v
+      case mode of
+        SpawnModeForeground -> handleStartForeground wiring v di
+        SpawnModeBackground -> handleStartBackground wiring v di
+
+-- | Handle the start action in foreground (blocking) mode. Calls
+-- 'runDelegate' (synchronous) and returns the ChildResult(s) directly as
+-- the tool result text. No sidecar append — the result is in-band.
+handleStartForeground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
+handleStartForeground wiring _v di = do
+  cfg <- liftIO (aswConfig wiring)
+  let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
+      runtime = aswRuntime wiring
+      resolver task = do
+        mResolve <- resolveTask (aswDefBackend wiring)
+                                runtime
+                                (aswParentDepth wiring)
+                                orchEnabled
+                                (aswWorker wiring)
+                                task
+        case mResolve of
+          Left err -> pure (Left err)
+          Right (def, worker) -> do
+            childSid <- aswMintSession wiring
+            pure (Right (def, worker, childSid))
+  eResults <- liftIO (runDelegate
+                        cfg
+                        (aswPauseFlag wiring)
+                        (aswParentActivity wiring)
+                        (aswParentDepth wiring)
+                        di
+                        resolver)
+  case eResults of
+    Left err -> pure (OpResult [TrpText err] True (object []))
+    Right results ->
+      pure (OpResult [TrpText (encodeForegroundResults results)] False
+             (object ["results" .= fmap toJSONChildResult results]))
+
+-- | Handle the start action in background (async) mode. Forks children,
+-- returns immediately with per-child SpawnInfo. Existing behavior.
+handleStartBackground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
+handleStartBackground wiring _v di = do
       cfg <- liftIO (aswConfig wiring)
       let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           runtime = aswRuntime wiring
@@ -689,14 +801,35 @@ handleStart wiring v = do
           callback :: AgentCompletionCallback
           callback result = do
             registerCompletedAgentResult runtime (crSubagentId result) result
-            -- Append the completion message to a sidecar file. The turn
-            -- engine reads this file at the start of the parent's next turn
-            -- and injects the messages into the conversation. This avoids
-            -- interfering with the single-writer daemon's in-memory diff
-            -- state (tfsWritten) during the ongoing turn — writing directly
-            -- to conversation.jsonl while the daemon is active causes the
-            -- daemon's diff to desynchronize, corrupting the transcript.
-            appendCompletionToSidecar paths parentSid (completionMessage result)
+            -- WU-5: descendant settle — if the child has pending
+            -- descendants, defer the completion delivery. The child's
+            -- results would be partial; wait for its descendants to
+            -- settle so the child can synthesize a final summary. When
+            -- the registry is unavailable (tests) or the child has no
+            -- pending descendants, deliver immediately.
+            let mRunRecords = aswRunRecords wiring
+                mChildSession = crChildSession result
+            defer <- case (mRunRecords, mChildSession) of
+              (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
+              _ -> pure False
+            if defer
+              then pure ()  -- delivery deferred until descendants settle
+              else do
+                -- Append the completion message to a sidecar file. The turn
+                -- engine reads this file at the start of the parent's next turn
+                -- and injects the messages into the conversation. This avoids
+                -- interfering with the single-writer daemon's in-memory diff
+                -- state (tfsWritten) during the ongoing turn — writing directly
+                -- to conversation.jsonl while the daemon is active causes the
+                -- daemon's diff to desynchronize, corrupting the transcript.
+                appendCompletionToSidecar paths parentSid (completionMessage result)
+                -- Wake-up hook: if the parent session is idle (no turn in
+                -- flight), trigger a synthetic turn so the sidecar
+                -- completions are read and processed. Without this, the
+                -- completions sit in the sidecar until the user sends
+                -- another message — the session appears dead even though
+                -- sub-agents have finished.
+                forM_ (aswOnIdleCompletion wiring) id
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =
             registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)
@@ -785,7 +918,7 @@ agentManageOp :: AgentStartWiring -> Opcode
 agentManageOp wiring = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — returns immediately with per-child subagent_id + child_session, results arrive via AGENT_STATUS), status (check one agent — includes summary + child_session + exit_reason after completion), stop (kill agent), interrupt (cooperative stop)."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -793,6 +926,11 @@ agentManageOp wiring = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
               , "description" .= ("Operation to perform." :: Text)
+              ]
+          , fromText "mode" .= object
+              [ "type" .= ("string" :: Text)
+              , "enum" .= (["foreground", "background"] :: [Text])
+              , "description" .= ("Spawn mode for start: \"foreground\" blocks until children complete and returns results in-band; \"background\" (default) returns immediately and delivers completion via push notification." :: Text)
               ]
           , fromText "id" .= object
               [ "type" .= ("string" :: Text)
@@ -860,7 +998,7 @@ agentStartOp :: AgentStartWiring -> Opcode
 agentStartOp wiring = TrustedOpcode
   { toName = OpName "AGENT_START"
   , toTrust = Trusted
-  , toDesc = "Spawn one or more child agents asynchronously. Returns immediately with per-child subagent_id + child_session (status=running). Results arrive via AGENT_STATUS or the parent transcript. Single mode: {id, goal, context?, role?, isolate_workdir?}. Batch mode: {tasks: [{id, goal, context?, role?, isolate_workdir?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
+  , toDesc = "Spawn one or more child agents asynchronously. Returns immediately with per-child subagent_id + child_session (status=running). Completion is delivered automatically via push notification — do NOT poll AGENT_STATUS for completion. Single mode: {id, goal, context?, role?, isolate_workdir?}. Batch mode: {tasks: [{id, goal, context?, role?, isolate_workdir?}, ...]}. (Legacy — prefer AGENT_MANAGE with action=\"start\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -898,7 +1036,7 @@ agentStatusOp :: AgentRuntime -> Opcode
 agentStatusOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STATUS"
   , toTrust = Trusted
-  , toDesc = "Read one running agent's status by subagent_id. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
+  , toDesc = "Read one running agent's status by subagent_id. For debugging/observability only — NOT for completion checking. Completion is delivered automatically via push notification. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
   , toInSchema = singleStringSchema "subagent_id" "The subagent id (from AGENT_START's result)."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") (const (Right ())) . subagentIdField
@@ -1025,6 +1163,8 @@ renderTools (AllowOnly xs) = T.intercalate ", " [ t | OpName t <- Set.toList xs 
 encodeSpawnInfos :: [SpawnInfo] -> Text
 encodeSpawnInfos [] = "(no children spawned)"
 encodeSpawnInfos infos = T.intercalate "\n" (map renderOne infos)
+  <>
+  "\n\nSub-agents are running in the background. Completion will be delivered to you automatically as a message — do NOT call AGENT_MANAGE status, sleep, or any polling tool. Track the expected child IDs and wait for completion events to arrive. Only send your final answer after ALL expected completions have arrived. If a completion event arrives AFTER your final answer, reply with NO_REPLY."
   where
     renderOne si =
       subagentIdText (siSubagentId si) <> " | " <>
@@ -1036,6 +1176,41 @@ toJSONSpawnInfo si = object
   [ "subagent_id"   .= subagentIdText (siSubagentId si)
   , "child_session" .= sessionIdText (siChildSession si)
   , "status"        .= ("running" :: Text)
+  ]
+
+-- | Render the foreground ChildResult list as a text block for the model.
+-- One block per child with status, exit reason, child session, and summary.
+encodeForegroundResults :: [ChildResult] -> Text
+encodeForegroundResults [] = "(no children spawned)"
+encodeForegroundResults results = T.intercalate "\n\n" (map renderOne results)
+  where
+    renderOne r =
+      let sid = subagentIdText (crSubagentId r)
+          status = T.pack (show (crStatus r))
+          exitReason = T.pack (show (crExitReason r))
+          mSummary = crSummary r
+          mChildSession = sessionIdText <$> crChildSession r
+          header = "[subagent " <> sid <> " completed] status=" <> status
+                     <> " exit=" <> exitReason
+          sessionLine = case mChildSession of
+            Just cs -> " child_session=" <> cs
+            Nothing -> ""
+          summaryLine = case mSummary of
+            Just s  -> "\n" <> s
+            Nothing -> case crError r of
+              Just e  -> "\nerror: " <> e
+              Nothing -> ""
+      in header <> sessionLine <> summaryLine
+
+-- | Encode a 'ChildResult' as JSON for the 'orRecorded' payload.
+toJSONChildResult :: ChildResult -> Value
+toJSONChildResult r = object
+  [ "subagent_id"   .= subagentIdText (crSubagentId r)
+  , "status"        .= T.pack (show (crStatus r))
+  , "exit_reason"   .= T.pack (show (crExitReason r))
+  , "summary"       .= crSummary r
+  , "child_session" .= fmap sessionIdText (crChildSession r)
+  , "duration_seconds" .= crDurationSeconds r
   ]
 
 -- | Build the user-role harness message appended to the parent's
@@ -1061,3 +1236,4 @@ completionMessage r =
           Just e  -> "\nerror: " <> e
           Nothing -> ""
   in header <> sessionLine <> summaryLine
+     <> "\n\nIf you have already sent your final answer, reply with NO_REPLY."

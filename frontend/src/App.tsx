@@ -7,6 +7,7 @@ import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
+import { SecretsView } from './components/SecretsView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
@@ -37,7 +38,6 @@ import { useListsStream } from './hooks/useListsStream'
 import { useNewTabSpec } from './hooks/useNewTabSpec'
 import { useTranscriptStream } from './hooks/useTranscriptStream'
 import { useSessionActivityStream } from './hooks/useSessionActivityStream'
-import { streamClient } from './lib/streamClient'
 import type { Agent, AgentStatus, Message, SessionInfo, TabInfo } from './types'
 import { findSession, tabDisplayLabel } from './types'
 
@@ -63,6 +63,7 @@ function sectionFromPath(): TopSection {
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
+  if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
   return 'sessions'
 }
 
@@ -172,6 +173,8 @@ export default function App() {
   //      the WS frame and ALL REST polling hooks are disabled (zero XHRs).
   //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
   //      polls every 3s when WS is not live AND /api/lists is not in error.
+  //      The first poll is delayed by WS_GRACE_MS (500 ms) on initial mount
+  //      so the REST endpoint is not hit while WS is still connecting.
   //      when WS is not live AND /api/lists is not in error.
   //   3. Else (older server without /api/lists) the legacy three-poll
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
@@ -587,6 +590,30 @@ export default function App() {
     && (sessionActivity?.[currentSessionId]?.harness === 'thinking'
         || (sending && pendingQuestions.length === 0))
 
+  // The tool currently being executed (if any). Broadcast by the backend
+  // as a `tool-call` activity event before each tool dispatch. Shown in the
+  // thinking indicator so the user can see what the agent is doing during
+  // long-running tool calls (e.g. SHELL_EXEC running `make lint`).
+  const activeToolCall = currentSessionId !== null
+    ? sessionActivity?.[currentSessionId]?.toolCall ?? null
+    : null
+  // Short label for the thinking indicator: "SHELL_EXEC: make lint" (the
+  // most relevant arg extracted from the JSON input, not the raw JSON).
+  const toolCallLabel = activeToolCall
+    ? (() => {
+        let detail = activeToolCall.input
+        try {
+          const parsed = JSON.parse(activeToolCall.input) as Record<string, unknown>
+          for (const k of ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url']) {
+            const v = parsed[k]
+            if (typeof v === 'string' && v.length > 0) { detail = v; break }
+          }
+        } catch { /* not JSON — use raw input */ }
+        const trimmed = detail.length > 100 ? detail.slice(0, 100) + '…' : detail
+        return `${activeToolCall.tool}: ${trimmed}`
+      })()
+    : null
+
   // Model id to display on the thinking indicator. Prefer the explicit
   // pending-thinking model captured at send-time; fall back to the most
   // recent assistant message's agentName; finally "Assistant".
@@ -646,7 +673,7 @@ export default function App() {
           agentName: thinkingAgentName,
           agentStatus: 'thinking' as const,
           timestamp: now,
-          blocks: [],
+          blocks: toolCallLabel ? [{ text: toolCallLabel }] : [],
           isGenerating: true,
         },
       ]
@@ -659,13 +686,13 @@ export default function App() {
           agentName: thinkingAgentName,
           agentStatus: 'thinking' as const,
           timestamp: now,
-          blocks: [],
+          blocks: toolCallLabel ? [{ text: toolCallLabel }] : [],
           isGenerating: true,
         },
       ]
     }
     return merged
-  }, [transcriptMessages, pendingMessage, sessionIsThinking, thinkingAgentName, slashBubbles])
+  }, [transcriptMessages, pendingMessage, sessionIsThinking, thinkingAgentName, slashBubbles, toolCallLabel])
 
   // Clear the optimistic pending pair once the transcript gains new entries.
   useEffect(() => {
@@ -904,12 +931,6 @@ export default function App() {
 
   const tokensUsed = useMemo(() => computeTokensUsed(entries), [entries])
 
-  // Eagerly focus the WS before any send so the server's _conn_focus matches
-  // when the broker publishes the first entry. (No-op when WS is down.)
-  useEffect(() => {
-    if (currentSessionId) streamClient().focus(currentSessionId)
-  }, [currentSessionId])
-
   // ── Render ────────────────────────────────────────────────────────────
   // The top-level section switches the entire body. "Sessions" is the
   // existing sessions/tabs/chat UI; "Agents" + "Skills" are the CRUD views.
@@ -922,6 +943,8 @@ export default function App() {
         <SkillsView />
       ) : section === 'repos' ? (
         <ReposView />
+      ) : section === 'secrets' ? (
+        <SecretsView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar

@@ -1,10 +1,12 @@
 import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
-import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel, providerFromRuntime } from '../types'
+import { findSession, sessionDisplayTitle, shortenModel, tabDisplayLabel, providerFromRuntime } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
-import { ActiveTabs } from './ActiveTabs'
+import { type TabLineField, loadTabLineFields, saveTabLineFields } from '../lib/tabLineConfig'
+import { ActiveTabs, renderConfigurableLine, deriveRepoName, type TabLineData } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
+import { TabLineConfigBar } from './TabLineConfigBar'
 import { ActivityDot } from './StatusDot'
 
 /** A "Recent Sessions" section header — plain label, no action button.
@@ -67,6 +69,7 @@ function SessionRow({
   onArchive,
   onUnarchive,
   activity,
+  fields,
 }: {
   session: SessionInfo
   selected: boolean
@@ -74,6 +77,9 @@ function SessionRow({
   onArchive?: (id: string) => void
   onUnarchive?: (id: string) => void
   activity?: SessionActivityState
+  /** Ordered list of fields to render on the second line — same config as
+   *  Active Tabs / Running Harnesses tab rows. */
+  fields?: TabLineField[]
 }) {
   const isThinking = activity?.harness === 'thinking'
   const unread = activity?.unread ?? 0
@@ -117,15 +123,23 @@ function SessionRow({
         <span className="pill token-count">{age}</span>
       </div>
       {(() => {
-        const subtitle = sessionSubtitle(session)
-        if (!subtitle) return null
+        const data: TabLineData = {
+          provider: providerFromRuntime(session.runtime),
+          model: session.model ? shortenModel(session.model) : '',
+          repoName: deriveRepoName(session.repoUrl, session.agent),
+          repoUrl: session.repoUrl,
+          channel: session.channel,
+          agent: session.agent,
+        }
+        const line = renderConfigurableLine(fields ?? [], data)
+        if (!line) return null
         return (
           <div
-            className="text-xs ml-0 mt-0.5 truncate"
-            style={{ color: 'var(--text-faint)', lineHeight: 'var(--leading-tight)' }}
-            title={subtitle}
+            className="text-xs ml-0 mt-0.5 flex items-center gap-1"
+            style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
+            data-testid={`session-status-label-${session.id}`}
           >
-            {subtitle}
+            {line}
           </div>
         )
       })()}
@@ -138,11 +152,13 @@ function ArchivedSection({
   selectedId,
   onSelectSession,
   onUnarchive,
+  fields,
 }: {
   sessions: SessionInfo[]
   selectedId: string | null
   onSelectSession: (id: string) => void
   onUnarchive: (id: string) => void
+  fields: TabLineField[]
 }) {
   const [expanded, setExpanded] = useState(false)
 
@@ -182,6 +198,7 @@ function ArchivedSection({
               selected={selectedId === `session:${s.id}`}
               onSelect={() => onSelectSession(s.id)}
               onUnarchive={onUnarchive}
+              fields={fields}
             />
           ))}
         </div>
@@ -228,6 +245,16 @@ export function Sidebar({
 }) {
   // Harnesses (the harness-registry rows, kind "harness") get their own
   // "Running Harnesses" section; everything else stays under "Active Tabs".
+
+  // Configurable tab second-line fields — loaded once from localStorage on
+  // mount, updated via the TabLineConfigBar at the sidebar bottom, and
+  // persisted on every change so the selection survives reloads.
+  const [tabLineFields, setTabLineFields] = useState<TabLineField[]>(() => loadTabLineFields())
+  const handleTabLineFieldsChange = (fields: TabLineField[]) => {
+    setTabLineFields(fields)
+    saveTabLineFields(fields)
+  }
+
   const harnessTabs = tabs.filter((t) => t.kind === 'harness')
   const otherTabs = tabs.filter((t) => t.kind !== 'harness')
   // A tab's display label = its backing session's title (so it reads
@@ -267,6 +294,14 @@ export function Sidebar({
   const tabProvider = (tab: TabInfo): string => {
     const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
     return session ? providerFromRuntime(session.runtime) : ''
+  }
+
+  // The starting channel of the tab's session (e.g. "web", "signal", "cli"),
+  // or null when no channel was recorded. Centralized here so both
+  // ActiveTabs and RunningHarnesses share the same session-join.
+  const tabChannel = (tab: TabInfo): string | null => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.channel ?? null
   }
 
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
@@ -320,6 +355,8 @@ export function Sidebar({
           tabRepoUrl={tabRepoUrl}
           tabAgent={tabAgent}
           tabProvider={tabProvider}
+          tabChannel={tabChannel}
+          fields={tabLineFields}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -338,6 +375,8 @@ export function Sidebar({
           tabRepoUrl={tabRepoUrl}
           tabAgent={tabAgent}
           tabProvider={tabProvider}
+          tabChannel={tabChannel}
+          fields={tabLineFields}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}
@@ -353,6 +392,7 @@ export function Sidebar({
             onSelect={() => onSelectSession(s.id)}
             onArchive={onArchiveSession}
             activity={sessionActivity?.[s.id]}
+            fields={tabLineFields}
           />
         ))}
       </div>
@@ -361,6 +401,11 @@ export function Sidebar({
         selectedId={selectedId}
         onSelectSession={onSelectSession}
         onUnarchive={onUnarchiveSession}
+        fields={tabLineFields}
+      />
+      <TabLineConfigBar
+        fields={tabLineFields}
+        onFieldsChange={handleTabLineFieldsChange}
       />
     </div>
   )

@@ -29,9 +29,12 @@ import Seal.Gateway.Transcript
   , TranscriptTimings (..)
   , reconEntryToFrontend
   , renderServerTiming
+  , trailingConvEntries
   , setEncodeMs
   )
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+
+import Seal.Providers.Class (ContentBlock (..))
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 21) (secondsToDiffTime 0)
@@ -112,6 +115,20 @@ approvalPayload = object
   , "op"        .= object [ "name" .= String "SHELL_EXEC" ]
   , "approval"  .= object [ "scope" .= String "once" ]
   ]
+
+-- | Extract the @direction@ field from a frontend TranscriptEntry JSON value.
+getDir :: A.Value -> Maybe Value
+getDir (A.Object o) = KeyMap.lookup (Key.fromText "direction") o
+getDir _ = Nothing
+
+-- | Extract a field from the @payload@ object inside a frontend
+-- TranscriptEntry JSON value.
+getPayloadField :: String -> A.Value -> Maybe Value
+getPayloadField k (A.Object o) =
+  case KeyMap.lookup (Key.fromText "payload") o of
+    Just (A.Object po) -> KeyMap.lookup (Key.fromString k) po
+    _ -> Nothing
+getPayloadField _ _ = Nothing
 
 spec :: Spec
 spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
@@ -255,6 +272,59 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               _ -> expectationFailure "expected tool object"
           other -> expectationFailure ("expected tools array, got " ++ show other)
         Nothing -> expectationFailure "expected Just (request entry surfaces), got Nothing"
+
+  -- ── trailingConvEntries ─────────────────────────────────────────────
+
+  describe "Seal.Gateway.Transcript.trailingConvEntries" $ do
+    -- | Build a conversation.jsonl line as an Aeson Value (the shape
+    -- convLineToFrontend expects: {role, content: [ContentBlock]}).
+    let convLine roleText blocks =
+          A.object [ "role" A..= (roleText :: Text)
+                   , "content" A..= map blkToJson blocks
+                   ]
+        blkToJson (CbText t) = A.object ["tag" A..= ("CbText" :: Text), "contents" A..= t]
+        blkToJson (CbToolUse cid name inp) =
+          A.object [ "tag"      A..= ("CbToolUse" :: Text)
+                   , "id"       A..= cid
+                   , "name"     A..= name
+                   , "input"    A..= inp
+                   ]
+        blkToJson _ = A.object ["tag" A..= ("CbText" :: Text), "contents" A..= ("?" :: Text)]
+
+    it "returns empty when all conversation messages are covered by entries" $ do
+      let msgs = [ convLine "User" [CbText "hi"]
+                 , convLine "Assistant" [CbText "hello"]
+                 ]
+      trailingConvEntries "model-x" "2026-01-01T00:00:00.000Z" 2 msgs
+        `shouldBe` []
+
+    it "synthesizes frontend entries for trailing conversation messages" $ do
+      -- entries cover 2 messages (convLen=2), but conversation has 4.
+      -- The trailing 2 messages (indices 2,3) should become frontend entries.
+      let msgs = [ convLine "User"      [CbText "hi"]
+                 , convLine "Assistant" [CbText "hello"]
+                 , convLine "User"      [CbText "what is 2+2?"]
+                 , convLine "Assistant" [CbText "it's 4"]
+                 ]
+          result = trailingConvEntries "model-x" "2026-01-01T00:00:00.000Z" 2 msgs
+      length result `shouldBe` 2
+      -- First trailing entry (index 2) is a user message → request direction.
+      case result of
+        [e1, e2] -> do
+          getDir e1 `shouldBe` Just (String "request")
+          getDir e2 `shouldBe` Just (String "response")
+          -- The response entry should carry the assistant's content.
+          case getPayloadField "content" e2 of
+            Just (A.Array arr) -> length arr `shouldBe` 1
+            other -> expectationFailure ("expected content array, got " ++ show other)
+        other -> expectationFailure ("expected 2 entries, got " ++ show (length other))
+
+    it "handles maxConvLen=0 (entries cover nothing)" $ do
+      let msgs = [ convLine "User" [CbText "hi"]
+                 , convLine "Assistant" [CbText "hello"]
+                 ]
+          result = trailingConvEntries "model-x" "2026-01-01T00:00:00.000Z" 0 msgs
+      length result `shouldBe` 2
 
   -- ── renderServerTiming ───────────────────────────────────────────────
 

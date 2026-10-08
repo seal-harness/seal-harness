@@ -52,7 +52,7 @@ import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
 import Seal.Agent.Loop (runTurn, defaultMaxTokens)
-import Seal.Agent.PromptParts (injectAvailableAgents, injectStaticGuidance, leafAgentNote)
+import Seal.Agent.PromptParts (injectAvailableAgents, injectStaticGuidance, leafAgentNote, childAutoAnnounceNote)
 import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
@@ -105,6 +105,7 @@ import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
+import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -148,6 +149,7 @@ import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
+import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Tools.Exec.WorkdirFs
@@ -296,6 +298,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
+     , browserManageOp securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
       , harnessListOp harnessReg
@@ -389,6 +392,14 @@ data TurnDeps = TurnDeps
     -- remote command — is observable without a live SSH host. Never set in
     -- production; the field exists solely so gateway API integration tests
     -- can assert local/remote parity of the composed untrusted commands.
+  , tdHostKeyAdoption :: Maybe HostKeyAdoption
+    -- ^ Optional TOFU host-key adoption capability. When 'Just' and the
+    -- remote workdir bootstrap fails with 'ExecHostKeyUnknown', the harness
+    -- probes the host via @ssh-keyscan@, asks the human for confirmation,
+    -- and appends the key to the pinned @known_hosts@ file on approval.
+    -- 'Nothing' (tests / no human-interaction surface) fail-closes with a
+    -- descriptive error. Production wiring passes 'Just' when a channel
+    -- with a @ccPrompt@ is available.
   , tdMkWorker :: Maybe AgentWorkerBuilder
     -- ^ Test seam (mirrors 'tdRemoteRunner'): when 'Just', replaces
     -- 'buildWorker' as the 'AGENT_START' worker-builder used by
@@ -414,6 +425,12 @@ data TurnDeps = TurnDeps
     -- orchestrator child can run a REAL scripted turn while its
     -- grandchildren get the stub. The harness's default (2) means
     -- depth-1 spawns are real, depth-2+ are stubbed.
+  , tdOnIdleCompletion :: Maybe (SessionId -> IO ())
+    -- ^ Wake-up hook: when a background sub-agent completes and the parent
+    -- session is idle (no turn in flight), this action triggers a synthetic
+    -- turn so the sidecar completions are read and processed. 'Nothing' in
+    -- tests / channels that don't support idle wake-up. The action must be
+    -- safe to call from a forked thread (the child's worker thread).
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -596,9 +613,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
-  exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
-                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+  exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
       uioEnv = seUIOEnv exec
@@ -871,9 +888,9 @@ sessionSkillBackend td sid = do
   let paths = tdPaths td
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   cloneDeps <- mkCloneDepsTurn td
-  exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
-                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+  exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
   metaEnv <- metaCacheEnvFor td paths eSecCfg
@@ -908,9 +925,9 @@ callDispatcher td caps sid channelLabel callOpName val = do
     eSecCfg <- loadSecurityConfig (securityFilePath paths)
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
-    exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
-                   eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+    exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                   eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
@@ -983,7 +1000,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 catalogAgentDefs' <- Def.adbList (bAgentDefs freshBackends)
                 let injectAgents = either (const True) resolvedAvailableAgents eCfg
                 mSystem <- resolveSystemPrompt
-                  (bAgentDefs freshBackends) sessionSkills
+                  (bAgentDefs freshBackends) freshSessionSkills
                   autoloadId injectCatalog injectAgents catalogAgentDefs'
                   parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
@@ -1030,6 +1047,8 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswGate = gateOpen
     , aswPaths = tdPaths td
     , aswParentSession = parentSid
+    , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
+    , aswOnIdleCompletion = ($ parentSid) <$> tdOnIdleCompletion td
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
@@ -1091,9 +1110,9 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
         let execSid = case mAnchor of
               Just _  -> parentSid
               Nothing -> childSid
-        seUIOEnv <$> either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner)
-                            eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+        seUIOEnv <$> either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
+                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt)
+                            eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     , dwdParentWorkdir = Just (sessionWorkdir (tdPaths td) parentSid)
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
@@ -1142,9 +1161,9 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
-  childExec <- either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
-                      eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+  childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
+                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)
+                      eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
       (_, _, _, orchEnabled) =
@@ -1223,9 +1242,12 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
           , aswGate = AgentStartGate
                 { gEffectiveRole = mRole
                 , gOrchEnabled = orchEnabled
+                , gAllowSpawn = adAllowSpawn def
                 }
           , aswPaths = tdPaths td
           , aswParentSession = childSid
+          , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
+          , aswOnIdleCompletion = ($ childSid) <$> tdOnIdleCompletion td
           }
       nestedWorker = case tdMkWorker td of
         Just stub
@@ -1284,13 +1306,16 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
       credentialTool = either (const True) resolvedCredentialToolGuidance eCfg
       injectAgents = either (const True) resolvedAvailableAgents eCfg
       -- W3 (§3.4): the effective role (def-authoritative, ctRole
-      -- narrowed) + the kill switch decide the CHILD's catalog plane —
-      -- the same predicate the registry's gate used (both planes gated
-      -- together, computed once in the adapter and threaded here). An
-      -- orchestrator child (+ switch on) gets the catalog; a leaf child
-      -- (or switch-off) gets the one-line leaf note.
+      -- narrowed) + the kill switch + the per-def @adAllowSpawn@
+      -- override decide the CHILD's catalog plane — the same predicate
+      -- the registry's gate used (both planes gated together, computed
+      -- once in the adapter and threaded here). An orchestrator child
+      -- (+ switch on) gets the catalog; a leaf child (or switch-off)
+      -- gets the one-line leaf note. @adAllowSpawn = Just True@ widens
+      -- a leaf (escape hatch); @Just False@ narrows an orchestrator.
       effRole = Worker.effectiveRole (adRole agentDef) (ctRole task)
-      canSpawn = effRole == Just "orchestrator" && orchEnabled
+      roleCanSpawn = effRole == Just "orchestrator" && orchEnabled
+      canSpawn = fromMaybe roleCanSpawn (adAllowSpawn agentDef)
       withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool basePrompt
   withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
   withSkills <- if injectCatalog
@@ -1301,7 +1326,11 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
     else if canSpawn
       then do
         agentDefs <- Def.adbList unionDefBackend
-        pure (injectAvailableAgents agentDefs withSkills)
+        -- A spawning child gets the catalog PLUS the auto-announce note
+        -- (it must not busy-poll for its own status — the harness pushes
+        -- its results upward automatically).
+        pure (fmap (\p -> p <> "\n\n" <> childAutoAnnounceNote)
+                   (injectAvailableAgents agentDefs withSkills))
       else pure (Just (maybe leafAgentNote (\p -> p <> "\n\n" <> leafAgentNote) withSkills))
 
 -- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.

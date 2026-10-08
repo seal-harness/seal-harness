@@ -146,6 +146,8 @@ buildRegistry cfgRoot workerRan sid = do
         , aswGate = gateOpen
         , aswPaths = sealPaths
         , aswParentSession = sid
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
         }
   pure $ ISA.mkRegistry
     [ memoryWriteOp memBackend nullEmbeddingBackend
@@ -253,6 +255,8 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             , aswGate = gateOpen
             , aswPaths = sealPaths
             , aswParentSession = sid
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
             }
           reg = ISA.mkRegistry
             [ agentDefWriteOp defBackend sid

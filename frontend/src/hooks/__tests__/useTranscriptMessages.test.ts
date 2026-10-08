@@ -239,6 +239,40 @@ describe('useTranscriptMessages', () => {
     expect(result.current.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
+  it('preserves System Prompt block when entries are re-fetched with new references', () => {
+    // Simulates the real-world scenario: after sending a message, the
+    // frontend re-fetches the transcript seed via HTTP. The seed creates
+    // new entry objects (same content, different references). The
+    // TranscriptRenderer must preserve the System Prompt block — not
+    // lose it because seenSystem already contains the content from the
+    // first render.
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
+    const original: TranscriptEntry[] = [
+      makeEntry({
+        id: 'd1',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+      }),
+      makeEntry({
+        id: 'd2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+      }),
+    ]
+    const { result, rerender } = renderHook(
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
+      { initialProps: { entries: original } },
+    )
+    // System Prompt block is present on first render.
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+    // Re-fetch: same content but new object references (fresh parse).
+    const refetched = original.map((e) => ({ ...e, payload: e.payload }))
+    rerender({ entries: refetched })
+    // System Prompt block must survive the re-render.
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+  })
+
   it('handles empty entries', () => {
     const { result } = renderHook(() => useTranscriptMessages([], 's1'))
     expect(result.current).toEqual([])
@@ -247,5 +281,43 @@ describe('useTranscriptMessages', () => {
   it('handles null sessionId', () => {
     const { result } = renderHook(() => useTranscriptMessages([], null))
     expect(result.current).toEqual([])
+  })
+
+  it('detects session change by sessionId even when first entry ids match', () => {
+    // Regression: all sessions that clone the same repo share the same
+    // first entry id (e.g., '1-setuprepo'). The renderer's session-change
+    // detection used to compare firstEntryId, which failed to detect the
+    // change. Fix: detect session changes by sessionId instead.
+    const session1 = threeEntryTranscript()
+    // Session 2 has the SAME first entry id as session 1 but different content.
+    const session2: TranscriptEntry[] = [
+      makeEntry({
+        id: 'e1', // Same id as session1's first entry!
+        direction: 'request',
+        payload: JSON.stringify({
+          system: 'Completely different system prompt.',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'session 2 message' }] }],
+        }),
+      }),
+      makeEntry({
+        id: 'e2b',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'session 2 response' }] }),
+      }),
+    ]
+
+    const { result, rerender } = renderHook(
+      ({ entries, sid }) => useTranscriptMessages(entries, sid),
+      { initialProps: { entries: session1, sid: 's1' } },
+    )
+    const s1Count = result.current.length
+    expect(s1Count).toBeGreaterThan(0)
+
+    // Switch to session 2 — same first entry id 'e1', but different session.
+    // The renderer MUST detect the session change and reset its cache.
+    rerender({ entries: session2, sid: 's2' })
+    const expected = resolveRawJson(transcriptToMessages(session2))
+    expect(resolveRawJson(result.current)).toEqual(expected)
   })
 })

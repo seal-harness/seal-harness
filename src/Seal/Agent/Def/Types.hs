@@ -9,6 +9,7 @@ module Seal.Agent.Def.Types
   ( AgentDefId (..)
   , mkAgentDefId
   , isValidAgentDefId
+  , bareAgentDefIdText
   , agentDefIdText
   , AgentDef (..)
   , sanitizeAgentTextField
@@ -53,6 +54,18 @@ mkAgentDefId t
 agentDefIdText :: AgentDefId -> Text
 agentDefIdText (AgentDefId t) = t
 
+-- | The bare (unqualified) id component — the text after the first @--@
+-- separator. Workdir-discovered agent defs are prefixed with
+-- @\<repo\>--\<id\>@ (see 'Seal.Agent.Def.Workdir.prefixWorkdirDef'); this
+-- function extracts the @\<id\>@ part. For a non-prefixed id (no @--@),
+-- returns the id unchanged. Mirrors 'Seal.Skills.Types.bareSkillIdText'
+-- but uses @--@ as the separator (the agent-def charset forbids @\/@).
+bareAgentDefIdText :: AgentDefId -> Text
+bareAgentDefIdText (AgentDefId t) =
+  case T.breakOn "--" t of
+    (_, rest) | not (T.null rest) -> T.drop 2 rest
+    _ -> t
+
 -- | One agent definition. 'adProvider' is a provider label (e.g. @\"ollama\"@);
 -- 'adTools' is the opcode allow-list (which opcodes this agent may call). The
 -- system prompt and tool list are agent-visible data (not vault secrets); they
@@ -86,6 +99,11 @@ data AgentDef = AgentDef
     -- @\<available_agents\>@ catalog and AGENT_DEF_LIST output.
     -- Sanitized (single line, no control chars, no catalog-fence tokens,
     -- capped) — the same injection defense as every other def field.
+  , adAllowSpawn :: Maybe Bool
+    -- ^ Per-agent-definition spawn permission. @Nothing@ = role-based
+    -- default (orchestrator can spawn, leaf cannot). @Just False@ = never
+    -- allow spawn, even if role is orchestrator. @Just True@ = allow
+    -- spawn even if role is leaf (escape hatch for special defs).
   , adCreatedAt :: UTCTime
   , adUpdatedAt :: UTCTime
   , adSession   :: SessionId
@@ -171,6 +189,7 @@ instance ToJSON AgentDef where
     , "group"      .= adGroup d
     , "role"       .= adRole d
     , "description" .= adDescription d
+    , "allow_spawn" .= adAllowSpawn d
     , "created_at" .= adCreatedAt d
     , "updated_at" .= adUpdatedAt d
     , "session"    .= adSession d
@@ -187,6 +206,7 @@ instance FromJSON AgentDef where
     <*> o .:? "group"
     <*> o .:? "role"
     <*> o .:? "description"
+    <*> o .:? "allow_spawn"
     <*> o .:  "created_at"
     <*> o .:  "updated_at"
     <*> o .:  "session"

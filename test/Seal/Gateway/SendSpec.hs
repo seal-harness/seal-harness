@@ -29,12 +29,13 @@ import Test.Hspec
 import Seal.Agent.Def.Types (AgentDefId, mkAgentDefId)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Channel.Cli (newBackends)
+import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex )
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
@@ -172,6 +173,7 @@ mkSendDepsWith paths resolveStub = do
   ensureConfigRepo configRoot
   let repo = openConfigRepo configRoot
   backends <- newBackends (SealPaths { spHome = configRoot, spState = configRoot </> "state", spConfig = configRoot, spKeys = configRoot </> "keys", spCache = configRoot </> "cache" }) repo nullEmbeddingBackend
+  wakeMutex <- newSessionWakeMutex
   reg   <- newHarnessRegistry
   tmuxR <- mkRealTmuxRunner
   askReply <- newAskReplyStore 0
@@ -219,9 +221,12 @@ mkSendDepsWith paths resolveStub = do
         , sdIsRemote    = False
         , sdExecCache   = execCache
         , sdRemoteRunner = Nothing
+        , sdHostKeyAdoption = Nothing
         , sdMkWorker    = Nothing
         , sdResolveProviderOverride = Nothing
         , sdMkWorkerStubDepth = 2
+        , sdWakeMutex = wakeMutex
+        , sdEnableIdleWake = True
         }
   pure sendDeps
 
@@ -775,7 +780,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- stopCommandSpecForSession closing over the request's sid. Simulate
         -- that here: the registry carries the per-request stop spec for
         -- targetSid, so the command aborts targetSid (not srActive).
-        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) targetSid noStopTranscriptWriter
+        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) (bRunRecords (sdBackends baseDeps)) targetSid noStopTranscriptWriter
             sendDeps = baseDeps
               { sdTabsHandle = tabsH
               , sdRegistry = mkRegistry [stopSpec]
@@ -805,7 +810,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let targetSid = mkSid "20260819-130000-stop-transcript"
         seedSession paths targetSid
-        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) targetSid
+        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) (bRunRecords (sdBackends baseDeps)) targetSid
                          (mkStopTranscriptWriter paths Nothing)
             sendDeps = baseDeps
               { sdTabsHandle = tabsH
@@ -833,7 +838,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
       -- printed "Invalid option '--help'". With the fix, -h/--help renders
       -- the full help (Usage + description + the -h,--help line).
       let targetSid = mkSid "20260825-120000-stop-help"
-      let stopSpec = stopCommandSpecForSession undefined targetSid noStopTranscriptWriter
+      let stopSpec = stopCommandSpecForSession undefined undefined targetSid noStopTranscriptWriter
           -- undefined SessionAbortRegistry is never forced: -h short-circuits
           -- to help before the action runs.
       case Opt.execParserPure Opt.defaultPrefs (csParserInfo stopSpec) ["-h"] of

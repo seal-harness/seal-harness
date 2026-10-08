@@ -147,6 +147,7 @@ library
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
+        Seal.Channels.Chat.WatchPersist
         Seal.Channels.Cursor
         Seal.Channels.Cursor.Persist
         Seal.Channels.Loop
@@ -198,7 +199,8 @@ library
          Seal.Text.LineFile
           Seal.Tools.Args
           Seal.Tools.Exec.Abort
-          Seal.Tools.Exec.Remote
+           Seal.Tools.Exec.HostKeyAdoption
+           Seal.Tools.Exec.Remote
           Seal.Tools.Exec.Timeout
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
@@ -213,7 +215,6 @@ library
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
         Seal.Web.UrlSafety
-        Seal.Web.Browser
         Seal.Web.UiState
         Seal.Media.Image
         Seal.Media.Tts
@@ -238,6 +239,7 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.ContextTruncation
         Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
@@ -245,12 +247,14 @@ library
         Seal.Agent.Runtime.Registry
         Seal.Agent.Runtime.Delegation
         Seal.Agent.Runtime.Delegation.Worker
+        Seal.Agent.Runtime.RunRecord
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
         Seal.ISA.Ops.Shell
         Seal.ISA.Ops.Process
+        Seal.ISA.Ops.Browser
         Seal.ISA.Ops.Bin
         Seal.ISA.Ops.Search
         Seal.ISA.Ops.Harness
@@ -450,6 +454,7 @@ test-suite tests
         Seal.Agent.Runtime.RegistrySpec
         Seal.Agent.Runtime.Delegation.WorkerSpec
         Seal.Agent.Runtime.Delegation.ConcurrentSpec
+        Seal.Agent.Runtime.RunRecordSpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
@@ -471,7 +476,9 @@ test-suite tests
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
         Seal.Channels.Chat.WsClientSpec
+        Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
         Seal.Command.HelpSpec
@@ -533,11 +540,11 @@ test-suite tests
          Seal.ISA.Ops.UIOUnrestrictedFailSpec
          Seal.ISA.Ops.UIOConstructionFailSpec
          Seal.Tools.TimeoutSpec
-         Seal.Tools.Exec.AbortSpec
-         Seal.Tools.Exec.TimeoutSpec
+          Seal.Tools.Exec.AbortSpec
+          Seal.Tools.Exec.HostKeyAdoptionSpec
+          Seal.Tools.Exec.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
-        Seal.Web.BrowserSpec
         Seal.Media.ImageSpec
         Seal.Media.TtsSpec
         Seal.Security.Vault.AgeSpec
@@ -558,16 +565,19 @@ test-suite tests
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
+        Seal.Providers.ContextWindowSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
+        Seal.Agent.ContextTruncationSpec
         Seal.ISA.DispatchSpec
         Seal.ISA.IntegrationSpec
         Seal.ISA.Ops.HumanSpec
         Seal.ISA.Ops.FileSpec
         Seal.ISA.Ops.ShellSpec
         Seal.ISA.Ops.ProcessSpec
+        Seal.ISA.Ops.BrowserSpec
         Seal.ISA.Ops.BinGitSpec
         Seal.ISA.Ops.BinSpec
         Seal.ISA.Ops.BinGhSpec

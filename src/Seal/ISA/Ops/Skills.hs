@@ -34,8 +34,8 @@ import Seal.Core.Types (OpName (..), SessionId, TrustLevel (..))
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
-import Seal.Skills.Backend (SkillBackend (..))
-import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+import Seal.Skills.Backend (SkillBackend (..), ResolveResult (..), resolveSkillEntry)
+import Seal.Skills.Types (Skill (..), SkillId, mkSkillId, skillIdText)
 
 -- ---------------------------------------------------------------------------
 -- Action enum
@@ -152,10 +152,13 @@ handleSkillLoad backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
     Just sid -> do
-      mSkill <- liftIO (sbRead backend sid)
-      case mSkill of
-        Nothing -> pure (OpResult [TrpText "skill not found"] True (object ["id" .= skillIdText sid]))
-        Just s  -> do
+      rSkill <- liftIO (resolveSkillEntry backend sid)
+      case rSkill of
+        ResolveNotFound ->
+          pure (OpResult [TrpText "skill not found"] True (object ["id" .= skillIdText sid]))
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousSkillMsg sid ids)] True (object ["id" .= skillIdText sid]))
+        ResolveFound s  -> do
           let rendered = "# " <> skillIdText (skId s) <> "\n\n"
                   <> skDescription s <> "\n\n---\n\n" <> skBody s
               recorded = object
@@ -190,13 +193,24 @@ handleSkillDelete backend v = do
   case mId of
     Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
     Just sid -> do
-      mExisting <- liftIO (sbRead backend sid)
-      liftIO (sbDelete backend sid)
-      let msg = case mExisting of
-            Nothing -> "deleted (was not present)"
-            Just _  -> "deleted"
-          recorded = object ["id" .= skillIdText sid]
-      pure (OpResult [TrpText msg] False recorded)
+      rExisting <- liftIO (resolveSkillEntry backend sid)
+      case rExisting of
+        ResolveAmbiguous ids ->
+          pure (OpResult [TrpText (ambiguousSkillMsg sid ids)] True (object ["id" .= skillIdText sid]))
+        ResolveNotFound -> do
+          liftIO (sbDelete backend sid)
+          pure (OpResult [TrpText "deleted (was not present)"] False (object ["id" .= skillIdText sid]))
+        ResolveFound _ -> do
+          liftIO (sbDelete backend sid)
+          pure (OpResult [TrpText "deleted"] False (object ["id" .= skillIdText sid]))
+
+-- | Format an ambiguity error for a skill id, listing the fully-qualified
+-- ids that matched so the user can disambiguate.
+ambiguousSkillMsg :: SkillId -> [Text] -> Text
+ambiguousSkillMsg sid ids =
+  "ambiguous skill id \"" <> skillIdText sid <> "\". Matching ids: "
+    <> T.intercalate ", " ids
+    <> ". Use the full id to disambiguate."
 
 -- ---------------------------------------------------------------------------
 -- Authorize gate

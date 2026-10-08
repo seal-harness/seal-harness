@@ -5,6 +5,8 @@
 -- breaks on tool calls, late-update handling after finalize, state reset).
 module Seal.Channels.Chat.LoopSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent.STM (newTVarIO, readTVarIO, TVar)
 import Data.IORef
 import Data.Aeson ((.=))
@@ -30,7 +32,7 @@ import Seal.Channels.Chat.Types
   , defaultGatewayConfig
   )
 import Seal.Channels.Chat.WsClient (WsClient (..))
-import Seal.Gateway.Types.Core (SessionId, mkSessionId)
+import Seal.Gateway.Types.Core (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 
 -- | A mock 'ChatChannel' that records every send, sendWithId, and edit.
@@ -290,6 +292,25 @@ spec = do
       let val = A.object ["id" .= ("q1" :: Text)]
       extractAskQuestion val `shouldBe` ""
 
+
+  describe "extractThinkingSessionIds" $ do
+    it "extracts valid session IDs from the thinkingSessionIds array" $ do
+      let val = A.object
+            [ "type" .= ("lists" :: Text)
+            , "thinkingSessionIds" .= ["abc-123" :: Text, "def-456" :: Text]
+            ]
+      extractThinkingSessionIds val `shouldBe` [mkSid "abc-123", mkSid "def-456"]
+
+    it "returns empty list when thinkingSessionIds is missing" $ do
+      let val = A.object ["type" .= ("lists" :: Text)]
+      extractThinkingSessionIds val `shouldBe` []
+
+    it "filters out invalid session IDs" $ do
+      let val = A.object
+            [ "thinkingSessionIds" .= ["valid-id" :: Text, ".invalid" :: Text]
+            ]
+      extractThinkingSessionIds val `shouldBe` [mkSid "valid-id"]
+
   describe "extractToolName" $ do
     it "extracts the tool field from a tool-call activity" $ do
       let val = A.object ["kind" .= ("tool-call" :: Text), "tool" .= ("SHELL_EXEC" :: Text), "input" .= ("ls" :: Text)]
@@ -531,6 +552,41 @@ spec = do
       watchOn <- lookupWatch watchState key
       watchOn `shouldBe` False
 
+    it "/watch status shows 'off' when watch is disabled" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch status"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "off")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
+    it "/watch status shows 'on' when watch is enabled" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleWatchToggle chan watchState key "/watch status"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "on")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` True
+
+    it "/watch -h prints help and does not change state" $ do
+      chan <- mkMockChan
+      watchState <- newWatchState
+      let key = ConversationKey "signal" "conv1"
+      handleWatchToggle chan watchState key "/watch -h"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "on")
+      sends `shouldSatisfy` any (T.isInfixOf "off")
+      sends `shouldSatisfy` any (T.isInfixOf "status")
+      sends `shouldSatisfy` any (T.isInfixOf "/watch")
+      watchOn <- lookupWatch watchState key
+      watchOn `shouldBe` False
+
     it "watch is per-conversation — toggling one does not affect another" $ do
       chan <- mkMockChan
       watchState <- newWatchState
@@ -542,6 +598,38 @@ spec = do
       watchOn2 <- lookupWatch watchState key2
       watchOn1 `shouldBe` True
       watchOn2 `shouldBe` False
+
+    it "persist calls are serialized — no stale-snapshot overwrite race" $ do
+      -- A save function that tracks concurrent executions. Without a
+      -- mutation+persist lock, two concurrent toggleWatch calls can have
+      -- overlapping save invocations, and a stale snapshot (taken before
+      -- the other thread's mutation) can overwrite the newer on-disk
+      -- state — the "watch flag spontaneously changes from on to off"
+      -- bug. With the lock, saves are serialized and each save reflects
+      -- the latest in-memory state.
+      activeSaves   <- newIORef (0 :: Int)
+      maxConcurrent <- newIORef (0 :: Int)
+      savedMaps     <- newIORef ([] :: [Map ConversationKey Bool])
+      let saveFn m = do
+            cur <- atomicModifyIORef' activeSaves (\n -> (n + 1, n + 1))
+            atomicModifyIORef' maxConcurrent (\m' -> (max m' cur, ()))
+            threadDelay 10000  -- 10 ms — widen the race window
+            modifyIORef' savedMaps (m :)
+            atomicModifyIORef' activeSaves (\n -> (n - 1, ()))
+      watchState <- newPersistingWatchState saveFn
+      let key1 = ConversationKey "signal" "conv1"
+          key2 = ConversationKey "signal" "conv2"
+      withAsync (toggleWatch watchState key1) $ \a1 ->
+        withAsync (toggleWatch watchState key2) $ \a2 -> do
+          _ <- wait a1
+          _ <- wait a2
+          pure ()
+      maxC <- readIORef maxConcurrent
+      maxC `shouldBe` 1  -- saves never overlap
+      saves <- readIORef savedMaps
+      case saves of
+        (m:_) -> Map.size m `shouldBe` 2
+        []    -> expectationFailure "expected at least one save"
 
     it "non-focused session thinking then idle sends a notification when watch is on" $ do
       chan <- mkMockChan
@@ -654,3 +742,67 @@ spec = do
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
 
+    it "SeLists seeds thinking tabs from snapshot — idle after lists notifies" $ do
+      -- The core fix: when a SeLists event arrives (e.g. on WS connect),
+      -- the thinkingSessionIds from the snapshot seed the ThinkingTabs
+      -- set. This means tabs that were already thinking BEFORE the WS
+      -- connection was established will still trigger a notification when
+      -- they finish (idle event arrives, wasThinking is true).
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+          listsVal = A.object
+            [ "type" .= ("lists" :: T.Text)
+            , "thinkingSessionIds" .= [sessionIdText otherSid]
+            ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      -- Simulate the SeLists event arriving on WS connect (no prior
+      -- thinking event was received — the turn started before WS connect).
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeLists listsVal)
+      -- Now the idle event arrives — should notify because the thinking
+      -- set was seeded from the lists snapshot.
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "finished thinking")
+
+    it "SeLists without thinkingSessionIds does not seed thinking tabs" $ do
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      pendingAsks <- newTVarIO Map.empty
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let focusedSid = mkSid "focused"
+          otherSid = mkSid "other"
+          listsVal = A.object
+            [ "type" .= ("lists" :: T.Text)
+            , "thinkingSessionIds" .= ([] :: [T.Text])
+            ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeLists listsVal)
+      handleServerEvent cfg chan key conns pendingAsks tabTracker
+        watchState thinkingTabs focusedSid
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")

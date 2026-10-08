@@ -35,6 +35,7 @@ module Seal.Tools.Exec.UntrustedIO
   , mkRemoteUntrustedIO
   , mkRemoteUntrustedIOFromRunner
   , mkRemoteUntrustedIOStub
+  , mkRemoteUntrustedIOStubWithReason
   , applyUnifiedDiff
   , lineWindowFromText
   , buildRgCmd
@@ -765,6 +766,29 @@ mkRemoteUntrustedIOStub = UntrustedIO
   , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioBinExecEnv   = \_ _ _ _  -> pure (Left (UeExec ExecNotImplemented))
   , uioBinExecGitEnv = \_ _ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  }
+
+-- | A fail-closed stub that carries a descriptive reason (instead of the
+-- content-free 'ExecNotImplemented'). Used by 'mkSessionExec' when the
+-- remote workdir bootstrap fails — the model sees *why* every untrusted
+-- opcode is failing, not just "ExecNotImplemented". The reason is wrapped
+-- in 'ExecNotImplementedReason' so 'renderUntrustedErr' surfaces it.
+mkRemoteUntrustedIOStubWithReason :: Text -> UntrustedIO
+mkRemoteUntrustedIOStubWithReason reason =
+  let err = UeExec (ExecNotImplementedReason reason)
+  in UntrustedIO
+  { uioReadFile    = \_ _      -> pure (Left err)
+  , uioWriteFile   = \_ _ _ _ -> pure (Left err)
+  , uioPatchFile   = \_ _      -> pure (Left err)
+  , uioShellExec   = \_ _      -> pure (Left err)
+  , uioBinExec     = \_ _ _  -> pure (Left err)
+  , uioProcessList =             pure (Left err)
+  , uioProcessKill = \_         -> pure (Left err)
+  , uioSearchFiles = \_ _ _     -> pure (Left err)
+  , uioShellExecEnv = \_ _ _    -> pure (Left err)
+  , uioShellExecGitEnv = \_ _ _ _ -> pure (Left err)
+  , uioBinExecEnv   = \_ _ _ _  -> pure (Left err)
+  , uioBinExecGitEnv = \_ _ _ _ _ -> pure (Left err)
   }
 
 -- | The workspace root for remote confinement. The 'SshConfig' carries

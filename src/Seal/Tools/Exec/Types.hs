@@ -180,7 +180,9 @@ data ExecError
   | ExecRemoteRequired            -- ^ mode=remote but no remote configured/reachable
   | ExecRemoteUnreachable         -- ^ SSH connect failed (not a host-key mismatch)
   | ExecHostKeyMismatch           -- ^ hard security failure; never bypassed
+  | ExecHostKeyUnknown            -- ^ no host key in known_hosts (TOFU adoption candidate)
   | ExecNotImplemented            -- ^ the backend is stubbed (e.g. TbContainer, TbTmux-as-tool-call)
+  | ExecNotImplementedReason Text -- ^ the backend is stubbed with a specific reason
   deriving stock (Eq, Show)
 
 -- ---------------------------------------------------------------------------

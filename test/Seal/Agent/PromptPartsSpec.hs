@@ -11,7 +11,7 @@ import Test.QuickCheck (Gen, chooseInt, elements, listOf, forAll, sized, vectorO
 import Seal.Agent.Def.Types
 import Seal.Agent.PromptParts
   ( availableAgentsBlock, credentialToolGuidance, injectAvailableAgents, injectStaticGuidance
-  , leafAgentNote, parallelToolGuidance, taskCompletionGuidance
+  , childAutoAnnounceNote, leafAgentNote, parallelToolGuidance, taskCompletionGuidance
   , toolUseEnforcement )
 import Seal.Core.Types (ModelId (..), mkSystemSessionId)
 import Seal.Security.Policy (AllowList (..))
@@ -101,6 +101,7 @@ catalogDef defId mGroup mRole mDesc = case mkAgentDefId defId of
     , adGroup = mGroup
     , adRole = mRole
     , adDescription = mDesc
+    , adAllowSpawn = Nothing
     , adCreatedAt = sampleCatalogTime
     , adUpdatedAt = sampleCatalogTime
     , adSession = mkSystemSessionId "catalog"
@@ -213,3 +214,9 @@ agentsCatalogSpec = describe "availableAgentsBlock" $ do
   describe "leaf note" $ do
     it "leafAgentNote is the one-line delegation-unavailable note" $
       leafAgentNote `shouldSatisfy` ("leaf agent" `T.isInfixOf`)
+
+  describe "child auto-announce note" $ do
+    it "childAutoAnnounceNote tells the child results are auto-announced" $
+      childAutoAnnounceNote `shouldSatisfy` ("auto-announced" `T.isInfixOf`)
+    it "childAutoAnnounceNote tells the child not to busy-poll" $
+      childAutoAnnounceNote `shouldSatisfy` ("busy-poll" `T.isInfixOf`)

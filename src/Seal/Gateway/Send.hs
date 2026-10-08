@@ -22,10 +22,13 @@ module Seal.Gateway.Send
   , webCallDispatcher
   , mkWebTurnDeps
   , webAskCaps
+  , SessionWakeMutex
+  , newSessionWakeMutex
   ) where
 
-import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar, tryTakeMVar, putMVar)
 import Control.Concurrent (forkIO)
+import Control.Concurrent.STM (TVar, newTVarIO, readTVar, readTVarIO, writeTVar, atomically)
 import Control.Monad (unless, void, when)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
@@ -33,6 +36,9 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -87,8 +93,9 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
-  , SessionLocks )
+  , SessionLocks, sessionTurnInFlight )
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
@@ -187,6 +194,10 @@ data SendDeps = SendDeps
     -- API integration tests inject a recording fake so the composed ssh
     -- argv — the fully-rendered remote command — is observable without a
     -- live SSH host.
+  , sdHostKeyAdoption :: Maybe HostKeyAdoption
+    -- ^ Optional TOFU host-key adoption capability (mirrors
+    -- 'TurnDeps.tdHostKeyAdoption'). 'Nothing' in tests / when no
+    -- human-interaction surface is wired.
   , sdMkWorker :: Maybe AgentWorkerBuilder
     -- ^ Test seam (mirrors 'sdRemoteRunner' / 'TurnDeps.tdMkWorker'): when
     -- 'Just', replaces 'buildWorker' as the 'AGENT_START' worker-builder.
@@ -205,6 +216,16 @@ data SendDeps = SendDeps
     -- production leaves 'sdMkWorker' = 'Nothing'). The harness's default
     -- (2) stubs depth-2+ spawns so orchestrator children run real
     -- scripted turns while grandchildren get the stub.
+  , sdWakeMutex :: SessionWakeMutex
+    -- ^ Per-session wake-up mutex: ensures only one synthetic turn is
+    -- triggered when multiple background sub-agents complete while the
+    -- parent session is idle. Without this, N completions fire N
+    -- wake-up calls, each consuming a scripted response in tests or
+    -- causing redundant LLM calls in production.
+  , sdEnableIdleWake :: Bool
+    -- ^ When True, the wake-up hook is wired into 'TurnDeps'. When False
+    -- (tests with scripted providers), the wake-up is disabled so
+    -- synthetic turns don't consume scripted responses.
   }
 
 -- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
@@ -248,12 +269,80 @@ mkWebTurnDeps deps = TurnDeps
   , tdBaseBackends = sdBackends deps
   , tdExecCache    = sdExecCache deps
   , tdRemoteRunner = sdRemoteRunner deps
+  , tdHostKeyAdoption = sdHostKeyAdoption deps
   , tdMkWorker    = sdMkWorker deps
   , tdResolveProviderOverride = sdResolveProviderOverride deps
   , tdMkWorkerStubDepth = sdMkWorkerStubDepth deps
+  , tdOnIdleCompletion = if sdEnableIdleWake deps then Just (wakeIdleSession deps) else Nothing
   }
 
--- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:
+-- | Per-session wake-up mutex: a map from 'SessionId' to an 'MVar ()'.
+-- The first wake-up takes the MVar (non-blocking); subsequent wake-ups
+-- find it empty and skip. The MVar is put back after the turn is
+-- triggered.
+newtype SessionWakeMutex = SessionWakeMutex (TVar (Map SessionId (MVar ())))
+
+newSessionWakeMutex :: IO SessionWakeMutex
+newSessionWakeMutex = SessionWakeMutex <$> newTVarIO Map.empty
+
+-- | Try to acquire the wake-up mutex for a session. Returns True if
+-- acquired (caller should trigger the wake-up), False if another
+-- wake-up is already in progress.
+tryAcquireWake :: SessionWakeMutex -> SessionId -> IO Bool
+tryAcquireWake (SessionWakeMutex tv) sid = do
+  mv <- do
+    m <- readTVarIO tv
+    case Map.lookup sid m of
+      Just l  -> pure l
+      Nothing -> do
+        l <- newMVar ()
+        atomically $ do
+          m' <- readTVar tv
+          case Map.lookup sid m' of
+            Just existing -> pure existing
+            Nothing -> do
+              writeTVar tv (Map.insert sid l m')
+              pure l
+  isJust <$> tryTakeMVar mv
+
+-- | Release the wake-up mutex for a session.
+releaseWake :: SessionWakeMutex -> SessionId -> IO ()
+releaseWake (SessionWakeMutex tv) sid = do
+  m <- readTVarIO tv
+  case Map.lookup sid m of
+    Nothing -> pure ()
+    Just mv -> putMVar mv ()
+
+-- | Wake-up hook for idle-session completion delivery. When a background
+-- sub-agent completes and the parent session is idle (no turn in
+-- flight), this function triggers a synthetic turn so the sidecar
+-- completions are read and processed by 'runTurnBody'. The per-session
+-- wake mutex ensures only one synthetic turn is triggered when multiple
+-- completions arrive while idle — the first completion takes the mutex
+-- and triggers the turn; subsequent completions find the mutex held and
+-- skip (the turn reads ALL completions from the sidecar at once).
+wakeIdleSession :: SendDeps -> SessionId -> IO ()
+wakeIdleSession deps sid = do
+  inFlight <- sessionTurnInFlight (sdLocks deps) sid
+  if inFlight
+    then pure ()  -- turn already running; sidecar will be read at its start
+    else do
+      acquired <- tryAcquireWake (sdWakeMutex deps) sid
+      if not acquired
+        then pure ()  -- another wake-up is already in progress
+        else do
+          mMeta <- loadSessionMeta (sdPaths deps) sid
+          case mMeta of
+            Nothing -> releaseWake (sdWakeMutex deps) sid
+            Just meta -> do
+              caps <- webAskCaps (sdBroker deps) (sdAskReply deps) sid
+              let td = mkWebTurnDeps deps
+                  adapter = mkWebTurnAdapter deps td caps
+              -- The synthetic message is a minimal prompt; the real
+              -- content the LLM sees comes from the sidecar completions
+              -- injected by runTurnBody.
+              _ <- runSessionTurn td adapter meta Nothing "."
+              releaseWake (sdWakeMutex deps) sid
 -- * @taPreTurn@ — fans out the user's message to subscribed chat channels
 --   (cross-channel mirroring, @"web"@ label). No 'replySubscribe' (the web
 --   isn't an inbox-driven channel handle).
@@ -475,7 +564,7 @@ runSlash deps meta fullLine = do
   let perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
         (skillCommandSpec sessionSkills perRequestCallDispatcher)
         (callCommandSpec perRequestCallDispatcher)
-        (stopCommandSpecForSession (sdAbortReg deps) sid
+        (stopCommandSpecForSession (sdAbortReg deps) (bRunRecords (sdBackends deps)) sid
            (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))
         (modelCommandSpecForSession (sdProvider deps) (sdPaths deps) (pure sid)
            (mkModelTranscriptWriter (sdPaths deps) (sdBroker deps)))

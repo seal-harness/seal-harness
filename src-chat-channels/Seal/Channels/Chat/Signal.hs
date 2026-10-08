@@ -166,36 +166,14 @@ mkRealSignalChatTransport account = do
           pure (Right SignalChatTransport
             { sctReceive = receiveBlocking inbox readerDead
             , sctSend = \recipient body -> do
-                let frame = A.object
-                      [ "jsonrpc" A..= ("2.0" :: Text)
-                      , "method"  A..= ("send" :: Text)
-                      , "params"  A..= A.object
-                          [ "recipient" A..= [recipient]
-                          , "message"   A..= body
-                          ]
-                      ]
+                let frame = signalSendFrame recipient body Nothing
                 writeFrame frame
             , sctSendWithId = \recipient body -> do
-                let frame = A.object
-                      [ "jsonrpc" A..= ("2.0" :: Text)
-                      , "method"  A..= ("send" :: Text)
-                      , "params"  A..= A.object
-                          [ "recipient" A..= [recipient]
-                          , "message"   A..= body
-                          ]
-                      ]
+                let frame = signalSendFrame recipient body Nothing
                 mResp <- sendRequest frame
                 pure (extractTimestamp =<< mResp)
             , sctEditMessage = \recipient ts content -> do
-                let frame = A.object
-                      [ "jsonrpc" A..= ("2.0" :: Text)
-                      , "method"  A..= ("send" :: Text)
-                      , "params"  A..= A.object
-                          [ "recipient" A..= [recipient]
-                          , "message"   A..= content
-                          , "editTimestamp" A..= (read (T.unpack ts) :: Int)
-                          ]
-                      ]
+                let frame = signalSendFrame recipient content (Just (read (T.unpack ts) :: Int))
                 mResp <- sendRequest frame
                 pure (case mResp of
                   Just _  -> True
@@ -292,9 +270,17 @@ parseSignalEnvelope v = do
   env <- unwrapEnvelope v
   source <- fieldText "source" env
   let mUuid = fieldTextMaybe "sourceUuid" env
-  cid <- conversationIdForSignal (Just source) mUuid
+      -- Check for a group ID in the dataMessage. V1 groups carry
+      -- @groupInfo.groupId@; V2 groups carry @groupV2.id@. Both are
+      -- base64-encoded. When present, the conversation is the group
+      -- (not the individual sender), so the conversation ID and reply
+      -- target must reference the group, not the sender's phone.
+      mGroupId = extractGroupId env
+  cid <- conversationIdForSignal (Just source) mUuid mGroupId
   let body = extractBody env
-      replyTo = source
+      replyTo = case mGroupId of
+        Just gid -> "group:" <> gid
+        Nothing  -> source
   Right ReceivedMessage
     { rmConversationId = cid
     , rmSender = Just source
@@ -306,18 +292,61 @@ parseSignalEnvelope v = do
     }
 
 -- | Derive the 'ConversationId' from the peer's authenticated transport
--- metadata.
-conversationIdForSignal :: Maybe Text -> Maybe Text -> Either Text ConversationId
-conversationIdForSignal mSource mUuid =
-  case mSource of
-    Nothing        -> Left "signal envelope missing source (peer phone number)"
-    Just src
-      | T.null src -> Left "signal envelope source is empty"
-      | otherwise  -> mkConversationId full
-      where
-        full = case mUuid of
-          Nothing   -> "sig:" <> src
-          Just uuid -> "sig:" <> src <> ":" <> uuid
+-- metadata, or from the group ID when the message is from a group chat.
+-- For group messages, the conversation ID is @sig:group:<sanitized-id>@
+-- so watch state and session routing are per-group-chat, not per-sender.
+-- For DMs, the conversation ID is @sig:<phone>:<uuid>@ as before.
+conversationIdForSignal :: Maybe Text -> Maybe Text -> Maybe Text -> Either Text ConversationId
+conversationIdForSignal mSource mUuid mGroupId =
+  case mGroupId of
+    Just gid -> mkConversationId ("sig:group:" <> sanitizeGroupId gid)
+    Nothing  -> dmConversationId
+  where
+    dmConversationId =
+      case mSource of
+        Nothing        -> Left "signal envelope missing source (peer phone number)"
+        Just src
+          | T.null src -> Left "signal envelope source is empty"
+          | otherwise  -> mkConversationId full
+          where
+            full = case mUuid of
+              Nothing   -> "sig:" <> src
+              Just uuid -> "sig:" <> src <> ":" <> uuid
+
+-- | Extract a group ID from a signal-cli envelope. Checks V1 groups
+-- (@dataMessage.groupInfo.groupId@) and V2 groups
+-- (@dataMessage.groupV2.id@). Returns 'Nothing' for DMs.
+extractGroupId :: Value -> Maybe Text
+extractGroupId env = do
+  dm <- fieldValueMaybe "dataMessage" env
+  -- V2 groups take precedence (modern Signal uses V2).
+  case fieldTextMaybe "id" =<< fieldValueMaybe "groupV2" dm of
+    Just gid -> Just gid
+    Nothing  -> fieldTextMaybe "groupId" =<< fieldValueMaybe "groupInfo" dm
+
+-- | Sanitize a base64 group ID for use in a 'ConversationId'. The valid
+-- charset is @A-Za-z0-9_-:+@; base64 uses @A-Za-z0-9+/=@. Replace @/@
+-- with @_@ and strip @=@ padding. The result is unique per group and
+-- round-trippable (base64url without padding).
+sanitizeGroupId :: Text -> Text
+sanitizeGroupId = T.filter (/= '=') . T.map (\c -> if c == '/' then '_' else c)
+
+-- | Build a signal-cli JSON-RPC send frame. If the recipient starts with
+-- @group:@, the remainder is the group ID and the frame uses
+-- @groupId@ instead of @recipient@ (signal-cli routes group messages
+-- via @--group-id@, not @--recipient@). The optional edit timestamp is
+-- included for message edits.
+signalSendFrame :: Text -> Text -> Maybe Int -> Value
+signalSendFrame recipient body mEditTs =
+  A.object
+    [ "jsonrpc" A..= ("2.0" :: Text)
+    , "method"  A..= ("send" :: Text)
+    , "params"  A..= A.object (target <> [ "message" A..= body ] <> editField)
+    ]
+  where
+    (target, editField) = case T.stripPrefix "group:" recipient of
+      Just gid -> (["groupId" A..= gid], maybe [] (\ts -> ["editTimestamp" A..= ts]) mEditTs)
+      Nothing  -> (["recipient" A..= [recipient]], maybe [] (\ts -> ["editTimestamp" A..= ts]) mEditTs)
 
 -- | Unwrap a raw envelope or a JSON-RPC-wrapped message.
 unwrapEnvelope :: Value -> Either Text Value

@@ -62,6 +62,7 @@ import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mk
 import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #endif
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption, mkHostKeyAdoption)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
 import Seal.Agent.Def.Types (agentDefIdText)
@@ -168,6 +169,14 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
         }
+      -- TOFU host-key adoption: use the CLI prompt to ask the human.
+      confirmHostKey :: Text -> IO Bool
+      confirmHostKey prompt = do
+        reply <- ccPrompt caps (AskPrompt prompt [])
+        let lower = T.toLower (T.strip reply)
+        pure (lower == "y" || lower == "yes")
+      hostKeyAdoption :: Maybe HostKeyAdoption
+      hostKeyAdoption = Just (mkHostKeyAdoption confirmHostKey)
   -- Startup diagnostic: show which provider+model the active session will use
   -- for plain-text turns (resolved from config at session creation), and the
   -- bound default agent (if any).
@@ -226,9 +235,11 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdBaseBackends = backends
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
+              , tdHostKeyAdoption = hostKeyAdoption
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
             bgAdapter = TurnAdapter
               { taCaps          = bgCaps
@@ -280,9 +291,11 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdBaseBackends = backends
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
+              , tdHostKeyAdoption = hostKeyAdoption
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
         TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
@@ -309,9 +322,11 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdBaseBackends = backends
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
+              , tdHostKeyAdoption = hostKeyAdoption
               , tdMkWorker    = Nothing
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
+              , tdOnIdleCompletion = Nothing
               }
             adapter = TurnAdapter
               { taCaps          = caps

@@ -45,9 +45,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-build-once"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       n2 <- length <$> readIORef calls
       -- The first build runs the remote mkdir -p bootstrap; the cached hit
       -- must not run anything.
@@ -58,9 +58,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-fingerprint"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths otherRemoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths otherRemoteSecCfg sidA deps (recordingRunner calls) Nothing
       n2 <- length <$> readIORef calls
       (n1, n2) `shouldBe` (1 :: Int, 2 :: Int)
 
@@ -69,9 +69,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-invalidate"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       invalidateExec cache sidA
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
@@ -80,8 +80,8 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-persid"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
-      _ <- cachedSessionExec cache paths remoteSecCfg sidB deps (recordingRunner calls)
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths remoteSecCfg sidB deps (recordingRunner calls) Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
@@ -93,10 +93,10 @@ spec = describe "Seal.Session.ExecCache" $ do
           -- mode=remote with NO remote block → fail-closed at build time.
           brokenCfg = defaultSecurityConfig
             { scUntrustedExec = Just (UntrustedExecFileConfig "remote" Nothing) }
-      e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls)
+      e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls) Nothing
       execRoot e1 `shouldBe` "/nonexistent-workdir-fail-closed"
       -- The failed build was NOT cached; a later VALID config builds fresh.
-      e2 <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls)
+      e2 <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
       execRoot e2 `shouldBe` "/srv/agent-workspace/workdirs/" <> sessionIdText sidA
 
   --------------------------------------------------------------------------

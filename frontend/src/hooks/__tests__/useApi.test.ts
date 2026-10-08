@@ -59,7 +59,7 @@ import {
   fetchModelContext,
 } from '../useApi'
 import type { TabInfoWire } from '../useApi'
-import { POLL_INTERVAL } from '../useApi'
+import { POLL_INTERVAL, WS_GRACE_MS } from '../useApi'
 
 /** Capture fetch calls so each test can assert the URL + method + body. */
 type FetchCall = { url: string; init?: RequestInit }
@@ -136,11 +136,14 @@ describe('useArchivedSessions', () => {
 
 describe('useListsPoll', () => {
   it('fetches GET /api/lists on mount and returns the four arrays + error=false', async () => {
+    vi.useFakeTimers()
     const wire: TabInfoWire = { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 's1', ext_modified: false, stale: false, origin: undefined, attach_command: null }
     const sess = { id: 's2', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null, lastUserMessageAt: null, repoUrl: null }
     setNextResponse({ tabs: [wire], recentSessions: [sess], archivedSessions: [], tabSessions: [] })
     const { result } = renderHook(() => useListsPoll())
-    await waitFor(() => expect(result.current.tabs).toHaveLength(1))
+    // Advance past the WS grace period so the first REST poll fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
+    expect(result.current.tabs).toHaveLength(1)
     expect(result.current.tabs[0]!.index).toBe(0)
     expect(result.current.recentSessions).toHaveLength(1)
     expect(result.current.recentSessions[0]!.id).toBe('s2')
@@ -148,13 +151,16 @@ describe('useListsPoll', () => {
     expect(result.current.tabSessions).toHaveLength(0)
     expect(result.current.error).toBe(false)
     expect(fetchCalls.some((c) => c.url === '/api/lists' && (c.init?.method ?? 'GET') === 'GET')).toBe(true)
+    vi.useRealTimers()
   })
 
   it('maps TabInfoWire[] to TabInfo[] via mapTabInfo', async () => {
+    vi.useFakeTimers()
     const wire: TabInfoWire = { index: 1, kind: 'session:provider', label: 'work', status: 'running', session_id: 's9', ext_modified: true, stale: false, origin: 'spawned', attach_command: 'tmux attach -t 1' }
     setNextResponse({ tabs: [wire], recentSessions: [], archivedSessions: [], tabSessions: [] })
     const { result } = renderHook(() => useListsPoll())
-    await waitFor(() => expect(result.current.tabs).toHaveLength(1))
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
+    expect(result.current.tabs).toHaveLength(1)
     const t = result.current.tabs[0]!
     expect(t.index).toBe(1)
     expect(t.kind).toBe('session:provider')
@@ -167,9 +173,68 @@ describe('useListsPoll', () => {
   })
 
   it('on 404, sets error=true', async () => {
+    vi.useFakeTimers()
     setNextResponse('not found', 404)
     const { result } = renderHook(() => useListsPoll())
-    await waitFor(() => expect(result.current.error).toBe(true))
+    await act(async () => { await vi.advanceTimersByTimeAsync(WS_GRACE_MS + 100) })
+    expect(result.current.error).toBe(true)
+    vi.useRealTimers()
+  })
+})
+
+describe('useListsPoll — WS grace period', () => {
+  it('does NOT fetch during the grace period on initial mount', async () => {
+    vi.useFakeTimers()
+    setNextResponse({ tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    renderHook(() => useListsPoll())
+    // Advance to just before the grace period elapses.
+    act(() => { vi.advanceTimersByTime(WS_GRACE_MS - 1) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('does NOT fetch if disabled flips to true during the grace period', async () => {
+    vi.useFakeTimers()
+    setNextResponse({ tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    const { rerender } = renderHook(({ d }: { d: boolean } = { d: false }) => useListsPoll(d))
+    // WS connects mid-grace — disabled becomes true (before the grace elapses).
+    act(() => { vi.advanceTimersByTime(WS_GRACE_MS - 100) })
+    rerender({ d: true })
+    // Advance well past the grace period — no fetch should have fired.
+    act(() => { vi.advanceTimersByTime(WS_GRACE_MS + POLL_INTERVAL * 2) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('fetches after the grace period elapses, then polls on interval', async () => {
+    vi.useFakeTimers()
+    setNextResponse({ tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    renderHook(() => useListsPoll())
+    // No fetch during grace.
+    act(() => { vi.advanceTimersByTime(WS_GRACE_MS - 1) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(0)
+    // Grace elapses → first fetch fires.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(1)
+    // Interval tick → second fetch.
+    await act(async () => { await vi.advanceTimersByTimeAsync(POLL_INTERVAL) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(2)
+    vi.useRealTimers()
+  })
+
+  it('polls immediately on re-enable after being disabled (no grace period)', async () => {
+    vi.useFakeTimers()
+    setNextResponse({ tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    // Start disabled (WS is live).
+    const { rerender } = renderHook(({ d }: { d: boolean } = { d: true }) => useListsPoll(d))
+    act(() => { vi.advanceTimersByTime(WS_GRACE_MS * 2) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(0)
+    // WS drops — re-enable. Should poll immediately (no grace period).
+    act(() => { rerender({ d: false }) })
+    // The effect scheduled setTimeout(fn, 0) — advance to fire it.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(1)
+    vi.useRealTimers()
   })
 })
 
@@ -876,5 +941,104 @@ describe('useRepos', () => {
     })
     await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
     await waitFor(() => expect(result.current.repos).toHaveLength(2))
+  })
+})
+
+// ── Vault secrets CRUD ──────────────────────────────────────────────────
+
+import {
+  fetchSecrets,
+  createSecret,
+  updateSecret,
+  deleteSecret,
+  useSecrets,
+} from '../useApi'
+
+describe('Vault secrets CRUD', () => {
+  it('fetchSecrets GETs /api/secrets and returns key names', async () => {
+    setNextResponse(['API_KEY', 'DB_PASS'])
+    const res = await fetchSecrets()
+    expect(res).toEqual(['API_KEY', 'DB_PASS'])
+  })
+
+  it('createSecret POSTs /api/secrets with {name, value}', async () => {
+    setNextResponse({ name: 'NEW_KEY' }, 201)
+    const res = await createSecret({ name: 'NEW_KEY', value: 'secret_val' })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.name).toBe('NEW_KEY')
+    const call = fetchCalls.find((c) => c.url === '/api/secrets' && c.init?.method === 'POST')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ name: 'NEW_KEY', value: 'secret_val' })
+  })
+
+  it('createSecret surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'name is required' }, 400)
+    const res = await createSecret({ name: '', value: 'v' })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('name is required')
+  })
+
+  it('createSecret falls back to HTTP status when the body has no error', async () => {
+    setNextResponse('oops', 500)
+    const res = await createSecret({ name: 'K', value: 'v' })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('HTTP 500')
+  })
+
+  it('updateSecret PUTs /api/secrets/:name with {value}', async () => {
+    setNextResponse({ name: 'K' })
+    const res = await updateSecret('K', 'new_val')
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.name).toBe('K')
+    const call = fetchCalls.find((c) => c.url === '/api/secrets/K' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ value: 'new_val' })
+  })
+
+  it('updateSecret surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'value is required' }, 400)
+    const res = await updateSecret('K', '')
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('value is required')
+  })
+
+  it('deleteSecret DELETEs /api/secrets/:name and returns true on 204', async () => {
+    nextResponse = new Response(null, { status: 204 })
+    const ok = await deleteSecret('gone')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/secrets/gone' && c.init?.method === 'DELETE')
+    expect(call).toBeTruthy()
+  })
+
+  it('deleteSecret returns false on a 500', async () => {
+    setNextResponse('err', 500)
+    const ok = await deleteSecret('bad')
+    expect(ok).toBe(false)
+  })
+})
+
+describe('useSecrets', () => {
+  it('fetches GET /api/secrets on mount and populates state', async () => {
+    setNextResponse(['API_KEY', 'DB_PASS'])
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.secrets).toHaveLength(2))
+    expect(result.current.secrets).toEqual(['API_KEY', 'DB_PASS'])
+    expect(result.current.loaded).toBe(true)
+    expect(result.current.error).toBe(false)
+  })
+
+  it('sets error=true on a 500', async () => {
+    setNextResponse('err', 500)
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.error).toBe(true))
+  })
+
+  it('refresh() triggers a re-fetch', async () => {
+    setNextResponse(['K1'])
+    const { result } = renderHook(() => useSecrets())
+    await waitFor(() => expect(result.current.secrets).toHaveLength(1))
+    const initialCalls = fetchCalls.length
+    act(() => result.current.refresh())
+    await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
   })
 })

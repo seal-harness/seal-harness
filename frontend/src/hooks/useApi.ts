@@ -9,6 +9,7 @@ import type {
   ProviderInfo,
   RepoInfo,
   RepoInput,
+  SecretInput,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -22,6 +23,14 @@ import { streamClient } from '../lib/streamClient'
 
 export const POLL_INTERVAL = 3000
 
+/** Grace period (ms) before the first REST `/api/lists` poll on initial
+ *  mount. Gives the WebSocket time to connect and deliver a `lists` frame;
+ *  if WS arrives during this window the REST poll never fires — zero
+ *  unnecessary XHRs. Set to 2 seconds to accommodate VPN/mesh networks
+ *  (Nebula, Tailscale, etc.) where the WS handshake involves multiple
+ *  round trips. The REST fallback (older servers without WS) is only
+ *  briefly delayed. */
+export const WS_GRACE_MS = 2000
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
  *  already in their final shape; the rest map to camelCase TabInfo keys.
@@ -239,11 +248,30 @@ export function useListsPoll(disabled = false): ListsPollResult {
     }
   }, [])
 
+  // Track whether the hook has ever been disabled (WS was live). On the
+  // very first enable (initial mount with disabled=false) we delay the
+  // first poll by WS_GRACE_MS to give the WebSocket a chance to connect.
+  // If `disabled` flips to true during the grace period, the cleanup
+  // clears the timeout and no REST request fires at all. On a subsequent
+  // re-enable (WS dropped), we poll immediately — no grace period needed
+  // because WS was already established and the REST fallback is urgent.
+  const everDisabledRef = useRef(false)
+
   useEffect(() => {
-    if (disabled) return
-    poll()
-    const id = setInterval(poll, POLL_INTERVAL)
-    return () => clearInterval(id)
+    if (disabled) {
+      everDisabledRef.current = true
+      return
+    }
+    const delay = everDisabledRef.current ? 0 : WS_GRACE_MS
+    let intervalId: ReturnType<typeof setInterval> | undefined
+    const timer = setTimeout(() => {
+      poll()
+      intervalId = setInterval(poll, POLL_INTERVAL)
+    }, delay)
+    return () => {
+      clearTimeout(timer)
+      if (intervalId !== undefined) clearInterval(intervalId)
+    }
   }, [poll, disabled])
 
   return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }
@@ -1261,6 +1289,106 @@ export function useRepos() {
   }, [refresh])
 
   return { repos, loaded, error, refresh }
+}
+
+// ── Vault secrets ───────────────────────────────────────────────────────
+
+/** Fetch all vault secret key names. Returns null on any failure. Values
+ *  are NEVER returned by this endpoint — only the key names. */
+export async function fetchSecrets(): Promise<string[] | null> {
+  return fetchJson<string[]>('/api/secrets')
+}
+
+/** The outcome of a secret create/update mutation. On success `name`
+ *  carries the key name returned by the backend; on failure `error`
+ *  carries the backend's error message. The secret value is NEVER echoed
+ *  back — only the key name. */
+export type SecretMutationResult =
+  | { ok: true; name: string }
+  | { ok: false; error: string }
+
+/** Read the backend's `{"error": "..."}` body for a secret mutation,
+ *  falling back to the HTTP status. (Mirrors `repoMutationError`.) */
+async function secretMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new vault secret (upsert). Body: {name, value}. Returns the
+ *  key name on success, or the backend's error message on failure. */
+export async function createSecret(input: SecretInput): Promise<SecretMutationResult> {
+  try {
+    const res = await fetch('/api/secrets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await secretMutationError(res) }
+    const data = (await res.json()) as { name: string }
+    return { ok: true, name: data.name }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing vault secret (upsert). The name is taken from the
+ *  path; the body carries only {value}. Returns the key name on success,
+ *  or the backend's error message on failure. */
+export async function updateSecret(name: string, value: string): Promise<SecretMutationResult> {
+  try {
+    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    })
+    if (!res.ok) return { ok: false, error: await secretMutationError(res) }
+    const data = (await res.json()) as { name: string }
+    return { ok: true, name: data.name }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a vault secret by key name. Returns true when the backend
+ *  accepted the delete (204 — idempotent). */
+export async function deleteSecret(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of vault secret key names. Mirrors `useRepos` — fetches on
+ *  mount and when `refresh` is called. The list endpoint returns only key
+ *  names (never values). The `refresh` action forces an immediate re-fetch
+ *  so callers see their own mutations. */
+export function useSecrets() {
+  const [secrets, setSecrets] = useState<string[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchSecrets().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setSecrets(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { secrets, loaded, error, refresh }
 }
 
 // ── Default agent ────────────────────────────────────────────────────────

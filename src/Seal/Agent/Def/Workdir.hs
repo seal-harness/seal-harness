@@ -39,6 +39,8 @@
 module Seal.Agent.Def.Workdir
   ( -- * Backend record
     AgentDefBackend (..)
+  , ResolveResult (..)
+  , resolveAgentDefEntry
     -- * Workdir backend
   , workdirAgentDefBackend
   , listWorkdirAgentDefs
@@ -103,7 +105,7 @@ import Toml qualified
 
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
-  , isValidAgentDefId, sanitizeAgentDefFields
+  , bareAgentDefIdText, isValidAgentDefId, sanitizeAgentDefFields
   )
 import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Security.Policy (AllowList (..))
@@ -124,6 +126,35 @@ import Seal.Tools.Exec.WorkdirFs
 -- without an import cycle with "Seal.Agent.Def.Backend", which re-exports
 -- this module's workdir API and builds the user store on top of it).
 -- ---------------------------------------------------------------------------
+
+-- | The result of resolving a (possibly bare) agent def id against a
+-- backend. Mirrors 'Seal.Skills.Backend.ResolveResult'.
+data ResolveResult a
+  = ResolveFound a
+  | ResolveAmbiguous [Text]
+  | ResolveNotFound
+  deriving stock (Eq, Show)
+
+-- | Resolve a (possibly bare) agent def id against an 'AgentDefBackend',
+-- with ambiguity detection. First tries 'adbRead' (which handles
+-- fully-qualified ids and bare-id resolution in the workdir/union
+-- backends). If 'adbRead' returns 'Nothing', lists all defs and searches
+-- for bare-id matches to distinguish "not found" from "ambiguous".
+-- When multiple defs share the same bare id, returns 'ResolveAmbiguous'
+-- with their fully-qualified ids so the caller can present them as
+-- disambiguation options. Mirrors 'Seal.Skills.Backend.resolveSkillEntry'.
+resolveAgentDefEntry :: AgentDefBackend -> AgentDefId -> IO (ResolveResult AgentDef)
+resolveAgentDefEntry backend aid = do
+  mDef <- adbRead backend aid
+  case mDef of
+    Just d  -> pure (ResolveFound d)
+    Nothing -> do
+      allDefs <- adbList backend
+      let matches = [d | d <- allDefs, bareAgentDefIdText (adId d) == agentDefIdText aid]
+      case matches of
+        []  -> pure ResolveNotFound
+        [d] -> pure (ResolveFound d)
+        ds  -> pure (ResolveAmbiguous (map (agentDefIdText . adId) ds))
 
 -- | The agent-definition store capability. Each operation is IO; 'adbList'
 -- returns all defs sorted by id.
@@ -268,6 +299,7 @@ encodeAgentDef d = encodeDoc fm body
       ] ++ maybe [] (\g -> [("group", g)]) (adGroup d)
         ++ maybe [] (\r -> [("role", r)]) (adRole d)
         ++ maybe [] (\desc -> [("description", desc)]) (adDescription d)
+        ++ maybe [] (\b -> [("allow_spawn", if b then "true" else "false")]) (adAllowSpawn d)
 
 -- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkAgentDefId'. Every renderable field passes
@@ -289,6 +321,7 @@ decodeAgentDef content =
         , adGroup = fmLookup "group" fm
         , adRole = fmLookup "role" fm
         , adDescription = fmLookup "description" fm
+        , adAllowSpawn = parseBoolField (fmLookup "allow_spawn" fm)
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
         , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
@@ -334,6 +367,21 @@ isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
 parseTime :: Maybe Text -> UTCTime
 parseTime Nothing    = epochZero
 parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
+
+-- | Parse a boolean from a frontmatter value. Recognizes @true@/@false@
+-- (case-insensitive) and @yes@/@no@; anything else (including absent) is
+-- 'Nothing'.
+parseBoolField :: Maybe Text -> Maybe Bool
+parseBoolField Nothing  = Nothing
+parseBoolField (Just raw) =
+  case T.toLower (T.strip raw) of
+    "true"  -> Just True
+    "yes"   -> Just True
+    "1"     -> Just True
+    "false" -> Just False
+    "no"    -> Just False
+    "0"     -> Just False
+    _       -> Nothing
 
 -- | The epoch fallback for missing/unparseable timestamps.
 epochZero :: UTCTime
@@ -414,6 +462,7 @@ loadDirAgentDef fs aid = do
         , adGroup = Nothing
         , adRole = Nothing
         , adDescription = Nothing
+    , adAllowSpawn = Nothing
         , adCreatedAt = mtime
         , adUpdatedAt = mtime
         , adSession = mkSystemSessionId "manual"
@@ -467,6 +516,7 @@ decodeProjectAgentsMd content =
           , adGroup = Nothing
           , adRole = Nothing
           , adDescription = Nothing
+    , adAllowSpawn = Nothing
           , adCreatedAt = epochZero
           , adUpdatedAt = epochZero
           , adSession = mkSystemSessionId "manual"
@@ -497,6 +547,7 @@ decodeProtocolAgentMd subDirName content =
                  , adGroup = Nothing
                  , adRole = fmLookup "role" fm
                  , adDescription = fmLookup "description" fm
+    , adAllowSpawn = Nothing
                  , adCreatedAt = epochZero
                  , adUpdatedAt = epochZero
                  , adSession = mkSystemSessionId "manual"
@@ -587,6 +638,12 @@ listAgentsDotAgents fs = do
 -- ship a def with the same id): the alphabetically-first repo wins
 -- (deterministic; same as the skill backend's policy).
 --
+-- 'adbRead' resolves bare ids: a direct 'Map.lookup' is tried first, then
+-- a bare-id search (finds @myrepo--foo@ when queried with @foo@). This
+-- mirrors 'Seal.Skills.Backend.resolveSkillId' so @AGENT_DEF_MANAGE@ with
+-- a bare id finds the proj-prefixed workdir def before the union falls
+-- through to the user store.
+--
 -- Every file open goes through the 'WorkdirFs' handle (symlink-escape
 -- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
 -- 'maxScanBytes' + 'truncateSection'.
@@ -594,11 +651,26 @@ workdirAgentDefBackend :: WorkdirFs -> IO AgentDefBackend
 workdirAgentDefBackend fs = pure AgentDefBackend
     { adbRead   = \aid -> do
         defs <- listWorkdirAgentDefs fs
-        pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+        pure (resolveAgentDefId aid (Map.fromList [(adId d, d) | d <- defs]))
     , adbUpdate = \_ -> pure ()
     , adbList   = listWorkdirAgentDefs fs
     , adbDelete = \_ -> pure ()
     }
+
+-- | Resolve an 'AgentDefId' against a 'Map' of workdir-discovered defs,
+-- handling bare ids. A direct (fully-qualified) id is a 'Map.lookup';
+-- a bare id (e.g. @foo@) searches all defs whose 'bareAgentDefIdText'
+-- matches. If exactly one matches, it is returned; if zero or multiple
+-- match, 'Nothing' (ambiguous or absent). Mirrors
+-- 'Seal.Skills.Backend.resolveSkillId'.
+resolveAgentDefId :: AgentDefId -> Map.Map AgentDefId AgentDef -> Maybe AgentDef
+resolveAgentDefId aid m =
+  case Map.lookup aid m of
+    Just d  -> Just d
+    Nothing ->
+      case [ d | (aid', d) <- Map.toList m, bareAgentDefIdText aid' == agentDefIdText aid ] of
+        [d] -> Just d
+        _   -> Nothing
 
 -- | Enumerate every agent def found under the conventional locations across
 -- all top-level directories (cloned repos) in the workdir anchored at the
@@ -661,7 +733,7 @@ snapBasename = snd . T.breakOnEnd "/"
 -- are no-ops (repo-local defs are immutable from the model's perspective).
 staticAgentDefBackend :: [AgentDef] -> IO AgentDefBackend
 staticAgentDefBackend defs = pure AgentDefBackend
-  { adbRead   = \aid -> pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+  { adbRead   = \aid -> pure (resolveAgentDefId aid (Map.fromList [(adId d, d) | d <- defs]))
   , adbUpdate = \_ -> pure ()
   , adbList   = pure defs
   , adbDelete = \_ -> pure ()

@@ -52,7 +52,6 @@ import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
 import qualified Seal.Web.UrlSafetySpec
 import qualified Seal.Config.WorkdirSpec
-import qualified Seal.Web.BrowserSpec
 import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
@@ -91,10 +90,12 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
+import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
+import qualified Seal.Channels.Chat.WatchPersistSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
@@ -135,6 +136,7 @@ import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.Agent.Runtime.Delegation.WorkerSpec
 import qualified Seal.Agent.Runtime.Delegation.ConcurrentSpec
+import qualified Seal.Agent.Runtime.RunRecordSpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
@@ -157,8 +159,10 @@ import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
 import qualified Seal.Providers.OllamaSpec
+import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
+import qualified Seal.Agent.ContextTruncationSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
@@ -166,6 +170,7 @@ import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
+import qualified Seal.ISA.Ops.BrowserSpec
 import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
 import qualified Seal.ISA.Ops.BinGhSpec
@@ -177,6 +182,7 @@ import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
 import qualified Seal.Tools.TimeoutSpec
 import qualified Seal.Tools.Exec.AbortSpec
+import qualified Seal.Tools.Exec.HostKeyAdoptionSpec
 import qualified Seal.Tools.Exec.TimeoutSpec
 
 main :: IO ()
@@ -233,7 +239,6 @@ specs = do
   Seal.Web.FetchSpec.spec
   Seal.Web.UrlSafetySpec.spec
   Seal.Config.WorkdirSpec.spec
-  Seal.Web.BrowserSpec.spec
   Seal.Media.ImageSpec.spec
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
@@ -272,10 +277,12 @@ specs = do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.Chat.TypesSpec.spec
+  Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
+  Seal.Channels.Chat.WatchPersistSpec.spec
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
@@ -316,6 +323,7 @@ specs = do
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.Agent.Runtime.Delegation.WorkerSpec.spec
   Seal.Agent.Runtime.Delegation.ConcurrentSpec.spec
+  Seal.Agent.Runtime.RunRecordSpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
@@ -337,9 +345,11 @@ specs = do
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
+  Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
+  Seal.Agent.ContextTruncationSpec.spec
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.IntegrationSpec.spec
   Seal.ISA.Ops.HumanSpec.spec
@@ -347,6 +357,7 @@ specs = do
   Seal.ISA.Ops.ShellSpec.spec
   Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
+  Seal.ISA.Ops.BrowserSpec.spec
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.BinGhSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
@@ -358,4 +369,5 @@ specs = do
   Seal.Logging.ExceptionsSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
+  Seal.Tools.Exec.HostKeyAdoptionSpec.spec
   Seal.Tools.Exec.TimeoutSpec.spec
