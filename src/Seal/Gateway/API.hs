@@ -89,7 +89,7 @@ import Seal.Gateway.SessionJson
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
-  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
+  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso, ttEntryCount)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -1924,16 +1924,17 @@ handleTranscript deps sidTxt req =
       let paths = srPaths (adSessionRuntime deps)
       active <- readIORef (srActive (adSessionRuntime deps))
       tReadStart <- getCurrentTime
-      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid
+      let mLimit = parseLimitQuery req
+      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid mLimit
       tEncStart <- getCurrentTime
-      let totalCount = length entries
-          mLimit = parseLimitQuery req
-          (limited, hasMore) = case mLimit of
-            Just n  -> let n' = min n totalCount
-                           dropped = totalCount - n'
-                       in (drop dropped entries, dropped > 0)
-            Nothing -> (entries, False)
-          body = A.encode limited
+      -- When a limit was applied, readTranscriptEntriesTimed already
+      -- returned only the last N entries. totalCount comes from the
+      -- timings (ttEntryCount is the full count before limiting).
+      let totalCount = ttEntryCount tt0
+          hasMore = case mLimit of
+            Just n  -> n < totalCount
+            Nothing -> False
+          body = A.encode entries
       tEncEnd <- getCurrentTime
       -- Fold the encode duration + the gap between read-complete and
       -- encode-start (negligible) into the timings so the @en@ token

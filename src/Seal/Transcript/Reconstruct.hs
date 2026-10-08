@@ -26,6 +26,7 @@
 module Seal.Transcript.Reconstruct
   ( reconstruct
   , reconstructStreaming
+  , reconstructStreamingPage
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
@@ -240,6 +241,97 @@ reconstructStreaming convPath idxPath entries = do
   lc <- convLineCount idxPath
   withConvIndex convPath idxPath $ \hs -> go hs lc 0 Nothing entries
   where
+    go :: ConvIndexHandles -> Int -> Int -> Maybe Envelope -> [EntryRecord] -> IO [TranscriptEntry]
+    go _ _ _ _       [] = pure []
+    go hs lc start mEnv (e : es) =
+      case erKind e of
+        EKRequest -> do
+          let env = effectiveAtE e mEnv
+              end = erConvLen e
+          eMsgs <- readMsgsH hs lc start end
+          let sys = if envSystem env /= (envSystem =<< mEnv)
+                      then envSystem env
+                      else Nothing
+              tools = if envTools env /= maybe [] envTools mEnv
+                        then Just (envTools env)
+                        else Nothing
+              payload = requestPayload env sys tools (msgsFromEither eMsgs)
+              entry = toEntry e Request payload
+          rest <- go hs lc end (Just env) es
+          pure (entry : rest)
+        EKResponse -> do
+          let end = erConvLen e
+          eMsgs <- readMsgsH hs lc start end
+          let payload = responsePayload mEnv (msgsFromEither eMsgs) e
+              entry = toEntry e Response payload
+          rest <- go hs lc end mEnv es
+          pure (entry : rest)
+        EKHarness -> do
+          eMsgs <- readMsgsH hs lc start (erConvLen e)
+          let payload = harnessPayload (msgsFromEither eMsgs) e
+              entry = toEntry e Request payload
+          rest <- go hs lc start mEnv es
+          pure (entry : rest)
+        EKCompaction -> do
+          let entry = toEntry e Request Null
+          rest <- go hs lc (erConvLen e) mEnv es
+          pure (entry : rest)
+
+    readMsgsH :: ConvIndexHandles -> Int -> Int -> Int -> IO (Either a [Message])
+    readMsgsH hs lc s e
+      | s >= e = pure (Right [])
+      | otherwise = do
+          result <- readConvLinesWith hs lc s e
+          pure (case result of
+                   Right ms -> Right ms
+                   Left _   -> Right [])
+
+    msgsFromEither :: Either a [Message] -> [Message]
+    msgsFromEither (Right ms) = ms
+    msgsFromEither (Left _)   = []
+
+-- | Paginated streaming reconstruction: folds envelopes over ALL entries
+-- (pure, no IO — needed for correct envelope deltas), but only reads
+-- conversation lines (IO via the index) for the entries in the requested
+-- page [@startEntry, startEntry + limit@). This avoids processing 1775
+-- entries' conversation lines when only the last 5 are needed.
+--
+-- Returns the reconstructed TranscriptEntries for the page only.
+reconstructStreamingPage
+  :: FilePath       -- ^ conversation.jsonl path
+  -> FilePath       -- ^ conversation.idx path
+  -> [EntryRecord]  -- ^ all entries (small file, read fully)
+  -> Int            -- ^ start entry index (0-based, inclusive)
+  -> Int            -- ^ limit (max entries to process)
+  -> IO [TranscriptEntry]
+reconstructStreamingPage convPath idxPath entries startEntry limit = do
+  lc <- convLineCount idxPath
+  -- Phase 1: fold envelopes over all entries to find the effective
+  -- envelope + conversation cursor at the start of the page.
+  let (startConv, mEnv, _) = foldToStart entries 0 Nothing startEntry
+      pageEntries = take limit (drop startEntry entries)
+  -- Phase 2: read conversation lines only for the page entries.
+  withConvIndex convPath idxPath $ \hs -> go hs lc startConv mEnv pageEntries
+  where
+    -- Fold over entries [0, startEntry) to find the conversation cursor
+    -- and effective envelope at the page start. Pure — no IO.
+    foldToStart :: [EntryRecord] -> Int -> Maybe Envelope -> Int -> (Int, Maybe Envelope, [EntryRecord])
+    foldToStart [] start mEnv _ = (start, mEnv, [])
+    foldToStart (e : es) start mEnv n
+      | n <= 0    = (start, mEnv, e : es)
+      | otherwise =
+          case erKind e of
+            EKRequest ->
+              let env = effectiveAtE e mEnv
+              in foldToStart es (erConvLen e) (Just env) (n - 1)
+            EKResponse ->
+              foldToStart es (erConvLen e) mEnv (n - 1)
+            EKHarness ->
+              foldToStart es start mEnv (n - 1)
+            EKCompaction ->
+              foldToStart es (erConvLen e) mEnv (n - 1)
+
+    -- Same go as reconstructStreaming, reused for the page entries.
     go :: ConvIndexHandles -> Int -> Int -> Maybe Envelope -> [EntryRecord] -> IO [TranscriptEntry]
     go _ _ _ _       [] = pure []
     go hs lc start mEnv (e : es) =

@@ -49,7 +49,7 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.ConvIndex
   (convLineCount, ensureIndex, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
-import Seal.Transcript.Reconstruct (reconstructStreaming)
+import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict)
 
@@ -134,16 +134,21 @@ zipWithMaybe f (a : as) (b : bs) = case f a b of
 readTranscriptEntries
   :: SealPaths -> Text -> String -> SessionId -> IO [Value]
 readTranscriptEntries paths model fallbackTs sid =
-  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid Nothing
 
 -- | Instrumented variant of 'readTranscriptEntries': returns the frontend
 -- values alongside per-phase wall-clock timings. Used by the @/transcript@
 -- HTTP handler to emit a @Server-Timing@ header; other callers (broadcast,
 -- snippet helpers) can use the plain 'readTranscriptEntries' and ignore the
 -- overhead of timing capture.
+--
+-- When @mLimit@ is @'Just' n@, only the last @n@ entries are processed
+-- (reconstructed + rewritten), avoiding O(all entries) work when the
+-- caller only needs a page. The total count is still computed from the
+-- entries file so the caller can report @hasMore@.
 readTranscriptEntriesTimed
-  :: SealPaths -> Text -> String -> SessionId -> IO ([Value], TranscriptTimings)
-readTranscriptEntriesTimed paths model fallbackTs sid = do
+  :: SealPaths -> Text -> String -> SessionId -> Maybe Int -> IO ([Value], TranscriptTimings)
+readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
   tStart <- getCurrentTime
   let legacyPath = sessionTranscriptPath paths sid
       convPath   = sessionConversationPath paths sid
@@ -190,9 +195,13 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
             -- Ensure the conversation index exists and is current
             let idxPath = sessionConversationIndexPath paths sid
             _ <- ensureIndex convPath idxPath
-            -- Stream-reconstruct: read conversation lines per entry via index
+            -- Stream-reconstruct: use paginated variant when a limit is
+            -- specified (only process the last N entries' conversation lines)
             tRc0 <- getCurrentTime
-            reconstructed <- reconstructStreaming convPath idxPath evs
+            reconstructed <- case mLim of
+              Just n | n > 0 && n < length evs ->
+                reconstructStreamingPage convPath idxPath evs (length evs - n) n
+              _ -> reconstructStreaming convPath idxPath evs
             let reconFrontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
             -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
             totalLines <- convLineCount idxPath
@@ -208,7 +217,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
                   { ttSource        = TSConvEntries
-                  , ttEntryCount    = length frontend
+                  , ttEntryCount    = length evs
                   , ttFileReadMs    = ms tFr2 tFr3
                   , ttParseMs       = ms tPr2 tPr3
                   , ttReconstructMs = ms tRc0 tRc1
@@ -223,17 +232,21 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
             let idxPath = sessionConversationIndexPath paths sid
             _ <- ensureIndex convPath idxPath
             totalLines <- convLineCount idxPath
+            -- Apply limit: read only the last N lines if a limit is set
+            let (readStart, readCount) = case mLim of
+                  Just n | n >= 0 && n < totalLines -> (totalLines - n, n)
+                  _ -> (0, totalLines)
             tRw0 <- getCurrentTime
-            eMsgs <- readConvLinesRaw convPath idxPath 0 totalLines
+            eMsgs <- readConvLinesRaw convPath idxPath readStart (readStart + readCount)
             let msgVals = case eMsgs of
                   Right vs -> vs
                   Left _ -> []
-                frontend = zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals
+                frontend = zipWith (convLineToFrontend model [] fallbackTs) [readStart..] msgVals
             tRw1 <- getCurrentTime
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
                   { ttSource        = TSConvOnly
-                  , ttEntryCount    = length frontend
+                  , ttEntryCount    = totalLines
                   , ttFileReadMs    = 0
                   , ttParseMs       = 0
                   , ttReconstructMs = 0
