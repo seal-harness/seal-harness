@@ -28,7 +28,7 @@ import Data.ByteString.Builder (toLazyByteString, word64LE)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Word (Word64)
-import System.Directory (doesFileExist, renameFile)
+import System.Directory (doesFileExist, removeFile, renameFile)
 import System.IO
   ( Handle, IOMode(..), SeekMode(..), hFileSize, hGetBuf
   , hSeek, withBinaryFile )
@@ -167,7 +167,9 @@ scanLineOffsets :: FilePath -> IO [Word64]
 scanLineOffsets path = do
   bs <- BS.readFile path
   let lns = BS.split 0x0a bs
-      chunks = if not (null lns) && BS.null (last lns) then init lns else lns
+      chunks = case reverse lns of
+        (lastChunk : _) | BS.null lastChunk -> init lns
+        _ -> lns
       offsets = scanl (\off chunk -> off + fromIntegral (BS.length chunk) + 1) 0 chunks
   pure offsets
 
@@ -179,13 +181,122 @@ writeIndexFile path offsets = do
   mapM_ (writeIdxEntry fd) offsets
   closeFd fd
 
+-- | Result of validating an existing index file.
+data IndexStatus
+  = IndexCurrent  -- ^ Index is up-to-date (lastOffset == convSize)
+  | IndexBehind   -- ^ Index is behind (lastOffset < convSize) — tail-recovery needed
+  deriving stock (Eq, Show)
+
 -- | Ensure the index exists and is up to date. Builds from scratch
 -- if missing; recovers the tail if stale; returns Left IndexCorrupt
 -- if structurally invalid (rebuild deferred to next startup — runtime
 -- rebuild would invalidate the daemon's long-lived fd via atomic rename).
 -- Idempotent and safe to call concurrently (MVar serializes all index writers).
 ensureIndex :: FilePath -> FilePath -> IO (Either ConvIndexError ())
-ensureIndex = error "Seal.Transcript.ConvIndex.ensureIndex: not implemented"
+ensureIndex convPath idxPath = do
+  convExists <- doesFileExist convPath
+  idxExists  <- doesFileExist idxPath
+  if not convExists
+    then -- No conversation file; remove stale orphan index if present
+      if idxExists
+        then do removeFile idxPath; pure (Right ())
+        else pure (Right ())
+    else if not idxExists
+      then buildIndex convPath idxPath >>= \case
+        Left _ -> pure (Left IndexCorrupt)
+        Right _ -> pure (Right ())
+      else do
+        -- Index exists; validate it
+        eValid <- validateIndex convPath idxPath
+        case eValid of
+          Left _ -> pure (Left IndexCorrupt)
+          Right IndexBehind -> do
+            eRecover <- recoverTail convPath idxPath
+            case eRecover of
+              Left _ -> pure (Left IndexCorrupt)
+              Right _ -> pure (Right ())
+          Right IndexCurrent -> pure (Right ())
+
+-- | Validate the index file structurally. Returns:
+-- 'Right IndexCurrent' if the index is up-to-date.
+-- 'Right IndexBehind' if the index is behind (lastOffset < convSize).
+-- 'Left IndexCorrupt' if the index is structurally invalid.
+validateIndex :: FilePath -> FilePath -> IO (Either ConvIndexError IndexStatus)
+validateIndex convPath idxPath = do
+  idxSize <- withBinaryFile idxPath ReadMode hFileSize
+  let entryCount = fromIntegral idxSize `div` word64Size
+  if entryCount <= 1
+    then pure (Left IndexCorrupt)  -- need at least 2 entries (offset[0]=0, offset[1])
+    else do
+      offsets <- readAllOffsets idxPath
+      case offsets of
+        [] -> pure (Left IndexCorrupt)
+        (firstOff : _) ->
+          if firstOff /= 0
+            then pure (Left IndexCorrupt)
+            else case reverse offsets of
+              (_lastOff : _) | not (isMonotonic offsets) -> pure (Left IndexCorrupt)
+              (lastOff : _) -> do
+                convSize <- withBinaryFile convPath ReadMode hFileSize
+                if fromIntegral lastOff > convSize
+                  then pure (Left IndexCorrupt)
+                  else if fromIntegral lastOff < convSize
+                    then pure (Right IndexBehind)
+                    else pure (Right IndexCurrent)
+              [] -> pure (Left IndexCorrupt)
+
+-- | Check that a list of Word64 values is strictly monotonically increasing.
+isMonotonic :: [Word64] -> Bool
+isMonotonic [] = True
+isMonotonic [_] = True
+isMonotonic (a : b : rest) = a < b && isMonotonic (b : rest)
+
+-- | Read all Word64 offsets from the index file.
+readAllOffsets :: FilePath -> IO [Word64]
+readAllOffsets idxPath =
+  withBinaryFile idxPath ReadMode $ \h -> do
+    size <- hFileSize h
+    let count = fromIntegral size `div` word64Size
+    if count == 0
+      then pure []
+      else do
+        hSeek h AbsoluteSeek 0
+        readNWord64s h count
+
+-- | Read N Word64 values sequentially from an open handle.
+readNWord64s :: Handle -> Int -> IO [Word64]
+readNWord64s h count = go 0 []
+  where
+    go i acc
+      | i >= count = pure (reverse acc)
+      | otherwise = do
+          w <- readWord64At h i
+          go (i + 1) (w : acc)
+
+-- | Recover the index tail: scan conversation.jsonl from the last index
+-- offset to EOF and append the missing offsets.
+recoverTail :: FilePath -> FilePath -> IO (Either Text ())
+recoverTail convPath idxPath = do
+  offsets <- readAllOffsets idxPath
+  case reverse offsets of
+    [] -> pure (Left "cannot recover: index is empty")
+    (lastOffW : _) -> do
+      let lastOff = fromIntegral lastOffW :: Int
+      convSize <- fromIntegral <$> withBinaryFile convPath ReadMode hFileSize
+      let tailBytes = convSize - lastOff
+      if tailBytes <= 0
+        then pure (Right ())
+        else do
+          raw <- readByteRange convPath lastOff convSize
+          let lns = BS.split 0x0a raw
+              chunks = if not (null lns) && BS.null (last lns) then init lns else lns
+              relOffsets = scanl (\off chunk -> off + fromIntegral (BS.length chunk) + 1) (fromIntegral lastOff) chunks
+              newOffsets = drop 1 relOffsets
+          let flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }
+          fd <- openFd idxPath WriteOnly flags
+          mapM_ (writeIdxEntry fd) newOffsets
+          closeFd fd
+          pure (Right ())
 
 -- | Append a Word64 LE offset to the index file via the given fd.
 -- Used by the writer daemon and 'appendConversationMessage'.
