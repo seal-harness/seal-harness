@@ -11,8 +11,9 @@ import { ActivityDot } from './StatusDot'
 // null when the field has no data). The parent TabRow iterates over the
 // configured field list and joins non-null results with "·" separators.
 
-/** The default field order, matching the pre-config behavior. */
-const DEFAULT_FIELDS: TabLineField[] = ['provider', 'model', 'repo']
+/** The default field order: repo + channel (the most identifying per-tab
+ *  signals). Provider/model are opt-in via the config popover. */
+const DEFAULT_FIELDS: TabLineField[] = ['repo', 'channel']
 
 export interface TabLineData {
   provider: string
@@ -234,7 +235,7 @@ export function TabRow({
    *  "cli"), or null/empty when no channel was recorded. */
   channel?: string | null
   /** Ordered list of fields to render on the second line. When omitted,
-   *  defaults to provider → model → repo (the pre-config behavior). */
+   *  defaults to repo → channel. */
   fields?: TabLineField[]
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
