@@ -1,0 +1,272 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The @TerminalBackend@ family — the typed selector for *where* a tool
+<span class="lineno">    4 </span>-- call runs ('Local' / 'Tmux' / 'Ssh' / 'Container'). This is the
+<span class="lineno">    5 </span>-- tool-call-execution counterpart to the tmux-only harness backend fixed
+<span class="lineno">    6 </span>-- in Phase 6a: distinct concern, distinct type.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- This module is the shared home of the executor-layer types that
+<span class="lineno">    9 </span>-- 'Seal.Tools.Exec.Untrusted' and 'Seal.Tools.Exec.Local' both import
+<span class="lineno">   10 </span>-- (breaking what would otherwise be a mutual-import cycle — see the Phase
+<span class="lineno">   11 </span>-- 4 plan 4b-T1 &quot;Import-cycle resolution&quot;). It holds:
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>--   * 'TerminalBackend' — the selector ADT
+<span class="lineno">   14 </span>--   * 'TmuxConfig' / 'SshConfig' / 'ContainerSpec' / 'ContainerTarget' —
+<span class="lineno">   15 </span>--     the per-variant config
+<span class="lineno">   16 </span>--   * 'SshHost' / 'SshUser' / 'RemotePath' — validated argv/path newtypes
+<span class="lineno">   17 </span>--     (option-injection defense, Invariant 2)
+<span class="lineno">   18 </span>--   * 'ExecError' — the executor-layer error ADT
+<span class="lineno">   19 </span>--   * 'LocalExecHandle' — the local-executor handle (TYPE and CONSTRUCTOR,
+<span class="lineno">   20 </span>--     both in this module per Haskell's rule that a type and its
+<span class="lineno">   21 </span>--     constructors must be co-located). 4a ships an opaque placeholder
+<span class="lineno">   22 </span>--     (no exported constructors); 4b-T1 widens this declaration to the real
+<span class="lineno">   23 </span>--     record of IO actions. The constructor stays here; the smart
+<span class="lineno">   24 </span>--     constructor 'mkLocalExecHandle' lands in 'Seal.Tools.Exec.Local'.
+<span class="lineno">   25 </span>--   * 'ExecBackend' — the sum the dispatcher consumes. Added in 4a-T2.
+<span class="lineno">   26 </span>module Seal.Tools.Exec.Types
+<span class="lineno">   27 </span>  ( TerminalBackend (..)
+<span class="lineno">   28 </span>  , TmuxConfig (..)
+<span class="lineno">   29 </span>  , SshConfig (..)
+<span class="lineno">   30 </span>  , ContainerSpec (..)
+<span class="lineno">   31 </span>  , ContainerTarget
+<span class="lineno">   32 </span>  , mkContainerTarget
+<span class="lineno">   33 </span>  , getContainerTarget
+<span class="lineno">   34 </span>  , SshHost
+<span class="lineno">   35 </span>  , mkSshHost
+<span class="lineno">   36 </span>  , getSshHost
+<span class="lineno">   37 </span>  , SshUser
+<span class="lineno">   38 </span>  , mkSshUser
+<span class="lineno">   39 </span>  , getSshUser
+<span class="lineno">   40 </span>  , RemotePath
+<span class="lineno">   41 </span>  , mkRemotePath
+<span class="lineno">   42 </span>  , getRemotePath
+<span class="lineno">   43 </span>  , ExecError (..)
+<span class="lineno">   44 </span>  , LocalExecHandle (..)
+<span class="lineno">   45 </span>  , mkLocalExecHandlePlaceholder
+<span class="lineno">   46 </span>  , ExecBackend (..)
+<span class="lineno">   47 </span>  ) where
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Data.Char (isControl)
+<span class="lineno">   50 </span>import Data.Text (Text)
+<span class="lineno">   51 </span>import Data.Text qualified as T
+<span class="lineno">   52 </span>import GHC.Generics (Generic)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>import Seal.Tools.Args (BinName, BinArg, ShellCommand)
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   57 </span>-- TerminalBackend family
+<span class="lineno">   58 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Where a tool call runs. 'TbLocal' is the untrusted local executor
+<span class="lineno">   61 </span>-- (absent under the @-f remote-only-untrusted@ Cabal flag); 'TbTmux' is
+<span class="lineno">   62 </span>-- the already-existing harness backend (Phase 6a); 'TbSsh' is the remote
+<span class="lineno">   63 </span>-- SSH executor (Phase 4 4g); 'TbContainer' is forward-compat (stubbed).
+<span class="lineno">   64 </span>data TerminalBackend
+<span class="lineno">   65 </span>  = TbLocal
+<span class="lineno">   66 </span>  | TbTmux TmuxConfig
+<span class="lineno">   67 </span>  | TbSsh SshConfig
+<span class="lineno">   68 </span>  | TbContainer ContainerSpec
+<span class="lineno">   69 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | The tmux coordinates for a 'TbTmux' tool call. Phase 4 leaves this as a
+<span class="lineno">   72 </span>-- minimal placeholder — the harness backend ('Seal.Session.Kind.HarnessSpec')
+<span class="lineno">   73 </span>-- is the load-bearing tmux consumer; 'TbTmux' as a *tool-call* backend is
+<span class="lineno">   74 </span>-- forward-compat. Widened in a future phase if/when tool calls route
+<span class="lineno">   75 </span>-- through tmux directly.
+<span class="lineno">   76 </span>data TmuxConfig = TmuxConfig
+<span class="lineno">   77 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | SSH coordinates for a 'TbSsh' tool call (the remote-only untrusted
+<span class="lineno">   80 </span>-- executor, spec §4-§5). The 'scWorkspace' anchors 'SafePath' on the
+<span class="lineno">   81 </span>-- remote machine.
+<span class="lineno">   82 </span>data SshConfig = SshConfig
+<span class="lineno">   83 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scHost</span></span></span>       :: SshHost
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scUser</span></span></span>       :: SshUser
+<span class="lineno">   85 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scPort</span></span></span>       :: Int            -- ^ 1..65535 (validated by the caller)
+<span class="lineno">   86 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scIdentity</span></span></span>   :: Maybe FilePath -- ^ SSH key file (or ssh-agent)
+<span class="lineno">   87 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scKnownHosts</span></span></span> :: FilePath       -- ^ pinned; StrictHostKeyChecking=yes
+<span class="lineno">   88 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scWorkspace</span></span></span>  :: RemotePath     -- ^ remote workspace root (validated)
+<span class="lineno">   89 </span>  }
+<span class="lineno">   90 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>data ContainerSpec = ContainerSpec
+<span class="lineno">   93 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csTarget</span></span></span> :: ContainerTarget
+<span class="lineno">   94 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csImage</span></span></span>  :: Text
+<span class="lineno">   95 </span>  }
+<span class="lineno">   96 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   99 </span>-- Validated newtypes (Invariant 2 — type-guaranteed argument sanitization)
+<span class="lineno">  100 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>-- | A container target name (e.g. @ubuntu-22.04@). Smart-constructed: rejects
+<span class="lineno">  103 </span>-- leading-dash (option injection), path separators (@/@ @\\@), colon
+<span class="lineno">  104 </span>-- (option-injection / port-syntax defense), control chars, empty.
+<span class="lineno">  105 </span>newtype ContainerTarget = ContainerTarget Text
+<span class="lineno">  106 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>mkContainerTarget :: Text -&gt; Either Text ContainerTarget
+<span class="lineno">  109 </span><span class="decl"><span class="istickedoff">mkContainerTarget t</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">| T.null t              = Left <span class="nottickedoff">&quot;container target is empty&quot;</span></span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-'       = Left <span class="nottickedoff">&quot;container target must not start with '-'&quot;</span></span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">| T.any isBad t         = Left <span class="nottickedoff">&quot;container target has invalid characters&quot;</span></span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = Right (ContainerTarget t)</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">isBad c = c == '/' || c == '\\' || c == ':' || isControl c</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>getContainerTarget :: ContainerTarget -&gt; Text
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">getContainerTarget (ContainerTarget t) = t</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | An SSH host. Smart-constructed: rejects control chars, space, colon
+<span class="lineno">  121 </span>-- (the colon guards against @host:port@ being parsed as two argv tokens
+<span class="lineno">  122 </span>-- by some tooling).
+<span class="lineno">  123 </span>newtype SshHost = SshHost Text
+<span class="lineno">  124 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>mkSshHost :: Text -&gt; Either Text SshHost
+<span class="lineno">  127 </span><span class="decl"><span class="istickedoff">mkSshHost t</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">| T.null t        = Left <span class="nottickedoff">&quot;ssh host is empty&quot;</span></span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">| T.any isBad t   = Left <span class="nottickedoff">&quot;ssh host has invalid characters&quot;</span></span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = Right (SshHost t)</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">isBad c = isControl c || c == ' ' || c == ':'</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>getSshHost :: SshHost -&gt; Text
+<span class="lineno">  135 </span><span class="decl"><span class="istickedoff">getSshHost (SshHost t) = t</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | An SSH user. Same validation as 'SshHost'.
+<span class="lineno">  138 </span>newtype SshUser = SshUser Text
+<span class="lineno">  139 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>mkSshUser :: Text -&gt; Either Text SshUser
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">mkSshUser t</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">| T.null t        = Left <span class="nottickedoff">&quot;ssh user is empty&quot;</span></span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">| T.any isBad t   = Left <span class="nottickedoff">&quot;ssh user has invalid characters&quot;</span></span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = Right (SshUser t)</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">isBad c = isControl c || c == ' ' || c == ':'</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>getSshUser :: SshUser -&gt; Text
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">getSshUser (SshUser t) = t</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | A workspace-relative path on the remote machine. Smart-constructed:
+<span class="lineno">  153 </span>-- rejects leading-dash (option injection), and rejects a @..@ escape. 4a
+<span class="lineno">  154 </span>-- ships a permissive validator (the lexical re-anchoring against the
+<span class="lineno">  155 </span>-- remote root is the job of 'Seal.Security.Path.mkSafePathRemote' in 4g);
+<span class="lineno">  156 </span>-- 4a only needs a validated newtype the 'SshConfig' can carry.
+<span class="lineno">  157 </span>newtype RemotePath = RemotePath Text
+<span class="lineno">  158 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>mkRemotePath :: Text -&gt; Either Text RemotePath
+<span class="lineno">  161 </span><span class="decl"><span class="istickedoff">mkRemotePath t</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">| T.null t              = Left <span class="nottickedoff">&quot;remote path is empty&quot;</span></span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-'       = Left <span class="nottickedoff">&quot;remote path must not start with '-'&quot;</span></span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.any isControl t</span>     = <span class="nottickedoff">Left &quot;remote path has control characters&quot;</span></span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = Right (RemotePath t)</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>getRemotePath :: RemotePath -&gt; Text
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">getRemotePath (RemotePath t) = t</span></span>
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  171 </span>-- ExecError
+<span class="lineno">  172 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | The executor-layer error ADT. Lives here (not in
+<span class="lineno">  175 </span>-- 'Seal.Tools.Exec.Untrusted') to break the import cycle with
+<span class="lineno">  176 </span>-- 'Seal.Tools.Exec.Local'.
+<span class="lineno">  177 </span>data ExecError
+<span class="lineno">  178 </span>  = ExecNotAllowed                -- ^ the operator policy denies the call
+<span class="lineno">  179 </span>  | ExecLocalNotPermittedForUntrusted -- ^ 'selectUntrustedBackend' got a non-Ssh backend
+<span class="lineno">  180 </span>  | ExecRemoteRequired            -- ^ mode=remote but no remote configured/reachable
+<span class="lineno">  181 </span>  | ExecRemoteUnreachable         -- ^ SSH connect failed (not a host-key mismatch)
+<span class="lineno">  182 </span>  | ExecHostKeyMismatch           -- ^ hard security failure; never bypassed
+<span class="lineno">  183 </span>  | ExecNotImplemented            -- ^ the backend is stubbed (e.g. TbContainer, TbTmux-as-tool-call)
+<span class="lineno">  184 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  187 </span>-- LocalExecHandle (placeholder — widened in 4b-T1)
+<span class="lineno">  188 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  189 </span>
+<span class="lineno">  190 </span>-- | The local-executor handle. The TYPE and its CONSTRUCTOR both live here
+<span class="lineno">  191 </span>-- (Haskell requires a type and its constructors in the same module — the
+<span class="lineno">  192 </span>-- 4a placeholder was an opaque `data LocalExecHandle` with no constructors;
+<span class="lineno">  193 </span>-- 4b-T1 widens it to the real handle). The smart constructor that wires
+<span class="lineno">  194 </span>-- the real `System.Process`-backed IO actions lives in
+<span class="lineno">  195 </span>-- 'Seal.Tools.Exec.Local' ('mkLocalExecHandle'); the tests also use the
+<span class="lineno">  196 </span>-- placeholder constructor directly for fakes.
+<span class="lineno">  197 </span>--
+<span class="lineno">  198 </span>-- The fields are the IO actions the Untrusted opcodes call. Each returns
+<span class="lineno">  199 </span>-- an 'Either ExecError' so the opcode can surface a structured error
+<span class="lineno">  200 </span>-- (fail-closed) instead of throwing.
+<span class="lineno">  201 </span>data LocalExecHandle = LocalExecHandle
+<span class="lineno">  202 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lehExecShell</span></span></span> :: ShellCommand -&gt; Maybe RemotePath -&gt; IO (Either ExecError Text)
+<span class="lineno">  203 </span>    -- ^ run a validated 'ShellCommand' via @/bin/sh -c@ (single arg, fixed
+<span class="lineno">  204 </span>    -- argv), with an optional cwd ('SafePath'-confined to the workspace root)
+<span class="lineno">  205 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lehExecBin</span></span></span> :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath
+<span class="lineno">  206 </span>                 -&gt; IO (Either ExecError Text)
+<span class="lineno">  207 </span>    -- ^ run a named binary (resolved on PATH or by absolute/relative path,
+<span class="lineno">  208 </span>    -- via 'System.Process.proc' RawCommand — no shell) with validated argv
+<span class="lineno">  209 </span>    -- args and an optional cwd. Used by the BIN_EXEC opcode.
+<span class="lineno">  210 </span>  }
+<span class="lineno">  211 </span>
+<span class="lineno">  212 </span>-- | A placeholder constructor for tests that don't exercise the IO
+<span class="lineno">  213 </span>-- (mirrors the 4a opaque form). Real callers use
+<span class="lineno">  214 </span>-- 'Seal.Tools.Exec.Local.mkLocalExecHandle'.
+<span class="lineno">  215 </span>mkLocalExecHandlePlaceholder :: LocalExecHandle
+<span class="lineno">  216 </span><span class="decl"><span class="nottickedoff">mkLocalExecHandlePlaceholder = LocalExecHandle</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="nottickedoff">{ lehExecShell = \_ _ -&gt; pure (Right &quot;&quot;)</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="nottickedoff">, lehExecBin = \_ _ _ -&gt; pure (Right &quot;&quot;)</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  220 </span>
+<span class="lineno">  221 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  222 </span>-- ExecBackend (added in 4a-T2)
+<span class="lineno">  223 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  224 </span>
+<span class="lineno">  225 </span>-- | The execution backend the dispatcher consumes. The 'EbLocal' arm is
+<span class="lineno">  226 </span>-- the untrusted local executor (absent under @-f remote-only-untrusted@);
+<span class="lineno">  227 </span>-- the 'EbRemote' arm is the SSH executor. 'selectExecBackend' (4a-T2)
+<span class="lineno">  228 </span>-- returns this; 'selectUntrustedBackend' (4a-T2) returns ONLY the remote
+<span class="lineno">  229 </span>-- arm (the spec's 'UntrustedExecBackend' is Ssh-only by construction).
+<span class="lineno">  230 </span>--
+<span class="lineno">  231 </span>-- No 'Eq' is derived: 'LocalExecHandle' carries IO actions which have no
+<span class="lineno">  232 </span>-- 'Eq' instances. A custom 'Show' is provided (the 'LocalExecHandle' shows
+<span class="lineno">  233 </span>-- as @&lt;local&gt;@, the 'SshConfig' via its own 'Show').
+<span class="lineno">  234 </span>data ExecBackend
+<span class="lineno">  235 </span>  = EbLocal LocalExecHandle
+<span class="lineno">  236 </span>  | EbRemote SshConfig
+<span class="lineno">  237 </span>
+<span class="lineno">  238 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show ExecBackend</span></span></span></span> where
+<span class="lineno">  239 </span>  <span class="decl"><span class="nottickedoff">show (EbLocal _) = &quot;EbLocal &lt;local executor&gt;&quot;</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="nottickedoff">show (EbRemote c) = &quot;EbRemote &quot; &lt;&gt; show c</span></span>
+<span class="lineno">  241 </span>
+<span class="lineno">  242 </span>-- | Structural 'Eq'. Two 'EbLocal' handles are always 'equal' (they carry
+<span class="lineno">  243 </span>-- opaque IO actions; no meaningful equality — used only by test `shouldBe`
+<span class="lineno">  244 </span>-- on the 'Left' arms, where both sides are 'Left'). Two 'EbRemote' compare
+<span class="lineno">  245 </span>-- by 'SshConfig'.
+<span class="lineno">  246 </span>instance <span class="decl"><span class="nottickedoff">Eq ExecBackend</span></span> where
+<span class="lineno">  247 </span>  <span class="decl"><span class="nottickedoff">EbLocal _ == EbLocal _ = True</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="nottickedoff">EbRemote a == EbRemote b = a == b</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="nottickedoff">_ == _ = False</span></span>
+
+</pre>
+</body>
+</html>

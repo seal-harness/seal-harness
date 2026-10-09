@@ -1,0 +1,252 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Anthropic Messages-API provider. JSON mapping is pure ('encodeRequest' /
+<span class="lineno">    3 </span>-- 'decodeResponse'); 'complete' adds the HTTP round-trip and supplies
+<span class="lineno">    4 </span>-- credentials via the CPS accessors ('withApiKey' / 'withBearerToken') so
+<span class="lineno">    5 </span>-- secrets only ever live on the request header inside the continuation —
+<span class="lineno">    6 </span>-- never returned, never logged. Non-streaming.
+<span class="lineno">    7 </span>module Seal.Providers.Anthropic
+<span class="lineno">    8 </span>  ( Anthropic (..)
+<span class="lineno">    9 </span>  , AnthropicAuth (..)
+<span class="lineno">   10 </span>  , OAuthSession (..)
+<span class="lineno">   11 </span>  , mkAnthropic
+<span class="lineno">   12 </span>  , mkAnthropicOAuth
+<span class="lineno">   13 </span>  , ensureFresh
+<span class="lineno">   14 </span>  , apiKeyHeaders
+<span class="lineno">   15 </span>  , oauthHeaders
+<span class="lineno">   16 </span>  , httpErrorText
+<span class="lineno">   17 </span>  , encodeRequest
+<span class="lineno">   18 </span>  , decodeResponse
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Control.Exception
+<span class="lineno">   22 </span>import Data.Aeson
+<span class="lineno">   23 </span>import Data.Aeson.Types (Parser, parseEither)
+<span class="lineno">   24 </span>import Data.ByteString (ByteString)
+<span class="lineno">   25 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   26 </span>import Data.IORef (IORef, readIORef, writeIORef)
+<span class="lineno">   27 </span>import Data.Text (Text)
+<span class="lineno">   28 </span>import Data.Text qualified as T
+<span class="lineno">   29 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   30 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   31 </span>import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
+<span class="lineno">   32 </span>import Network.HTTP.Client
+<span class="lineno">   33 </span>import Network.HTTP.Types (statusCode)
+<span class="lineno">   34 </span>import Network.HTTP.Types.Header (RequestHeaders)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import Seal.Core.Types
+<span class="lineno">   37 </span>import Seal.Providers.Anthropic.OAuth (OAuthTokens (..), anthropicBeta, anthropicVersion)
+<span class="lineno">   38 </span>import Seal.Providers.Class
+<span class="lineno">   39 </span>import Seal.Security.Secrets
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- Auth types ---------------------------------------------------------------
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | How the provider authenticates. OAuth carries a mutable token cell plus
+<span class="lineno">   44 </span>-- injected refresh/persist actions so 'ensureFresh' can rotate tokens in place.
+<span class="lineno">   45 </span>data AnthropicAuth
+<span class="lineno">   46 </span>  = AuthApiKey ApiKey
+<span class="lineno">   47 </span>  | AuthOAuth  OAuthSession
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>data OAuthSession = OAuthSession
+<span class="lineno">   50 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">osTokens</span></span></span> :: IORef OAuthTokens
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">osRefresh</span></span></span> :: OAuthTokens -&gt; IO (Either Text OAuthTokens)
+<span class="lineno">   52 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">osPersist</span></span></span> :: OAuthTokens -&gt; IO ()
+<span class="lineno">   53 </span>  }
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>data Anthropic = Anthropic
+<span class="lineno">   56 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">anModel</span></span></span> :: ModelId
+<span class="lineno">   57 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">anManager</span></span></span> :: Manager
+<span class="lineno">   58 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">anAuth</span></span></span> :: AnthropicAuth
+<span class="lineno">   59 </span>  }
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>mkAnthropic :: Manager -&gt; ApiKey -&gt; ModelId -&gt; Anthropic
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">mkAnthropic mgr key model = Anthropic model <span class="nottickedoff">mgr</span> <span class="nottickedoff">(AuthApiKey key)</span></span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>mkAnthropicOAuth :: Manager -&gt; OAuthSession -&gt; ModelId -&gt; Anthropic
+<span class="lineno">   65 </span><span class="decl"><span class="nottickedoff">mkAnthropicOAuth mgr sess model = Anthropic model mgr (AuthOAuth sess)</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- Header builders ----------------------------------------------------------
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | Refresh this many seconds BEFORE the real expiry, so a token cannot lapse
+<span class="lineno">   70 </span>-- mid-request.
+<span class="lineno">   71 </span>refreshSkew :: NominalDiffTime
+<span class="lineno">   72 </span><span class="decl"><span class="istickedoff">refreshSkew = 60</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>apiKeyHeaders :: ByteString -&gt; RequestHeaders
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">apiKeyHeaders keyBytes =</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">[ (&quot;content-type&quot;,      <span class="nottickedoff">&quot;application/json&quot;</span>)</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;anthropic-version&quot;, TE.encodeUtf8 anthropicVersion)</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;x-api-key&quot;,         keyBytes)</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>oauthHeaders :: ByteString -&gt; RequestHeaders
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">oauthHeaders accessBytes =</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">[ (&quot;content-type&quot;,      <span class="nottickedoff">&quot;application/json&quot;</span>)</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;anthropic-version&quot;, <span class="nottickedoff">TE.encodeUtf8 anthropicVersion</span>)</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;anthropic-beta&quot;,    TE.encodeUtf8 anthropicBeta)</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;authorization&quot;,     &quot;Bearer &quot; &lt;&gt; accessBytes)</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Return current tokens, refreshing first if within 'refreshSkew' of expiry.
+<span class="lineno">   90 </span>-- On refresh success, update the in-memory ref AND persist.
+<span class="lineno">   91 </span>ensureFresh :: OAuthSession -&gt; IO (Either Text OAuthTokens)
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">ensureFresh sess = do</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">toks &lt;- readIORef (osTokens sess)</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">now  &lt;- getCurrentTime</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">if otExpiresAt toks &lt;= addUTCTime refreshSkew now</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">then do</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">r &lt;- osRefresh sess <span class="nottickedoff">toks</span></span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">case r of</span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">Left e    -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  100 </span><span class="spaces">        </span><span class="istickedoff">Right new -&gt; do</span>
+<span class="lineno">  101 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (osTokens sess) new</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="istickedoff">osPersist sess new</span>
+<span class="lineno">  103 </span><span class="spaces">          </span><span class="istickedoff">pure (Right new)</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">else pure (Right <span class="nottickedoff">toks</span>)</span></span>
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>-- Pure request mapping -----------------------------------------------------
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>encodeRequest :: CompletionRequest -&gt; Value
+<span class="lineno">  109 </span><span class="decl"><span class="istickedoff">encodeRequest cr = object $</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;model&quot;      .= crModel cr</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">, &quot;max_tokens&quot; .= crMaxTokens cr</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">, &quot;messages&quot;   .= map encMsg (crMessages cr)</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; maybe [] <span class="nottickedoff">(\s -&gt; [&quot;system&quot; .= s])</span> (crSystem cr)</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; [&quot;tools&quot; .= map encTool (crTools cr) | not (null (crTools cr))]</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>encMsg :: Message -&gt; Value
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">encMsg (Message r blocks) = object</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;role&quot; .= roleText r, &quot;content&quot; .= map encBlock blocks ]</span></span>
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>roleText :: Role -&gt; Text
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">roleText User = &quot;user&quot;</span>
+<span class="lineno">  123 </span><span class="spaces"></span><span class="istickedoff">roleText Assistant = <span class="nottickedoff">&quot;assistant&quot;</span></span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>encBlock :: ContentBlock -&gt; Value
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">encBlock (CbText t) = object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= t]</span>
+<span class="lineno">  127 </span><span class="spaces"></span><span class="istickedoff">encBlock (CbToolUse (ToolCallId i) (OpName n) inp) =</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">object [&quot;type&quot; .= (&quot;tool_use&quot; :: Text), &quot;id&quot; .= i, &quot;name&quot; .= n, &quot;input&quot; .= inp]</span></span>
+<span class="lineno">  129 </span><span class="spaces"></span><span class="istickedoff">encBlock (CbToolResult (ToolCallId i) parts isErr) =</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">object [ &quot;type&quot;        .= (&quot;tool_result&quot; :: Text)</span></span>
+<span class="lineno">  131 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;tool_use_id&quot; .= i</span></span>
+<span class="lineno">  132 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;is_error&quot;    .= isErr</span></span>
+<span class="lineno">  133 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;content&quot;     .= [object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= t] | TrpText t &lt;- parts]</span></span>
+<span class="lineno">  134 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">]</span></span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>encTool :: ToolDefinition -&gt; Value
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">encTool (ToolDefinition (OpName n) d sch) =</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">-- Omit input_schema entirely when it's the on-demand stub. Anthropic</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">-- normally requires input_schema on every tool; sending it only when the</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">-- model has a real schema to follow keeps the stub tools (the common case</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">-- under on-demand mode) at zero schema-token cost. The model retrieves a</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">-- tool's real schema via OPCODE_DESCRIBE before calling it.</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">if sch == stubSchema</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">then object [&quot;name&quot; .= n, &quot;description&quot; .= d]</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">else object [&quot;name&quot; .= n, &quot;description&quot; .= d, &quot;input_schema&quot; .= sch]</span></span>
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>-- Pure response mapping ----------------------------------------------------
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>decodeResponse :: Value -&gt; Either Text CompletionResponse
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">decodeResponse = mapLeft <span class="nottickedoff">T.pack</span> . parseEither parseResp</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">where mapLeft f = either <span class="nottickedoff">(Left . f)</span> Right</span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>parseResp :: Value -&gt; Parser CompletionResponse
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">parseResp = withObject <span class="nottickedoff">&quot;response&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">blocks &lt;- o .: &quot;content&quot; &gt;&gt;= mapM parseBlock</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">stop   &lt;- parseStop &lt;$&gt; o .: &quot;stop_reason&quot;</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">usageV &lt;- o .: &quot;usage&quot;</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">uin    &lt;- usageV .: &quot;input_tokens&quot;</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">uout   &lt;- usageV .: &quot;output_tokens&quot;</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">pure (CompletionResponse blocks stop (Usage uin uout))</span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>parseBlock :: Value -&gt; Parser ContentBlock
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">parseBlock = withObject <span class="nottickedoff">&quot;block&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">ty &lt;- o .: &quot;type&quot; :: Parser Text</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">case ty of</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">&quot;text&quot;     -&gt; CbText &lt;$&gt; o .: &quot;text&quot;</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">&quot;tool_use&quot; -&gt; CbToolUse . ToolCallId &lt;$&gt; o .: &quot;id&quot;</span>
+<span class="lineno">  168 </span><span class="spaces">                  </span><span class="istickedoff">&lt;*&gt; (OpName &lt;$&gt; o .: &quot;name&quot;)</span>
+<span class="lineno">  169 </span><span class="spaces">                  </span><span class="istickedoff">&lt;*&gt; o .: &quot;input&quot;</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">other      -&gt; <span class="nottickedoff">fail (&quot;unknown content block type: &quot; &lt;&gt; T.unpack other)</span></span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>parseStop :: Text -&gt; StopReason
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">parseStop &quot;end_turn&quot;   = StopEnd</span>
+<span class="lineno">  174 </span><span class="spaces"></span><span class="istickedoff">parseStop &quot;tool_use&quot;   = StopToolUse</span>
+<span class="lineno">  175 </span><span class="spaces"></span><span class="istickedoff">parseStop &quot;max_tokens&quot; = <span class="nottickedoff">StopMaxTokens</span></span>
+<span class="lineno">  176 </span><span class="spaces"></span><span class="istickedoff">parseStop other        = <span class="nottickedoff">StopOther other</span></span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- HTTP round-trip ----------------------------------------------------------
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>-- | POST /v1/messages with the given auth headers; decode the response, or
+<span class="lineno">  181 </span>-- return the HTTP status + response body (the body carries no secret).
+<span class="lineno">  182 </span>sendMessages
+<span class="lineno">  183 </span>  :: Manager -&gt; RequestHeaders -&gt; CompletionRequest
+<span class="lineno">  184 </span>  -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  185 </span><span class="decl"><span class="nottickedoff">sendMessages mgr hdrs cr = do</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="nottickedoff">let body = encode (encodeRequest cr)</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="nottickedoff">initReq &lt;- parseRequest &quot;POST https://api.anthropic.com/v1/messages&quot;</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">let req = initReq { requestBody = RequestBodyLBS body, requestHeaders = hdrs }</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  191 </span><span class="spaces">    </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="nottickedoff">pure (Left &quot;HTTP request to Anthropic failed (connection or transport error)&quot;)</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  196 </span><span class="spaces">        </span><span class="nottickedoff">then pure $ case eitherDecode (responseBody resp) of</span>
+<span class="lineno">  197 </span><span class="spaces">          </span><span class="nottickedoff">Left e  -&gt; Left (T.pack e)</span>
+<span class="lineno">  198 </span><span class="spaces">          </span><span class="nottickedoff">Right v -&gt; decodeResponse v</span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="nottickedoff">else pure $ Left $ httpErrorText code</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))</span></span>
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- | Render a non-2xx Anthropic response into a user-facing message. HTTP 429
+<span class="lineno">  203 </span>-- gets a friendlier hint: the subscription backend's rate-limit body is terse
+<span class="lineno">  204 </span>-- and unhelpful (e.g. @{&quot;error&quot;:{&quot;type&quot;:&quot;rate_limit_error&quot;,&quot;message&quot;:&quot;Error&quot;}}@),
+<span class="lineno">  205 </span>-- so we explain the likely cause and next steps instead of echoing it. Every
+<span class="lineno">  206 </span>-- other status keeps the full response body, which is diagnostic and key-safe.
+<span class="lineno">  207 </span>httpErrorText :: Int -&gt; Text -&gt; Text
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">httpErrorText 429 _ =</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">&quot;Anthropic rate limit (HTTP 429) — the account behind this credential is being \</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">\throttled; a subscription usage cap is the common cause. Wait a moment and \</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">\retry, or switch models with /model use.&quot;</span>
+<span class="lineno">  212 </span><span class="spaces"></span><span class="istickedoff">httpErrorText code body =</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">&quot;Anthropic API returned HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; body</span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- Provider instance --------------------------------------------------------
+<span class="lineno">  216 </span>
+<span class="lineno">  217 </span>instance <span class="decl"><span class="nottickedoff">Provider Anthropic</span></span> where
+<span class="lineno">  218 </span>  <span class="decl"><span class="istickedoff">listModels a = pure (Right [anModel a])</span></span>
+<span class="lineno">  219 </span>  <span class="decl"><span class="nottickedoff">complete a cr = case anAuth a of</span>
+<span class="lineno">  220 </span><span class="spaces">    </span><span class="nottickedoff">AuthApiKey key -&gt;</span>
+<span class="lineno">  221 </span><span class="spaces">      </span><span class="nottickedoff">withApiKey key $ \keyBytes -&gt;</span>
+<span class="lineno">  222 </span><span class="spaces">        </span><span class="nottickedoff">sendMessages (anManager a) (apiKeyHeaders keyBytes) cr</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="nottickedoff">AuthOAuth sess -&gt; do</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="nottickedoff">ef &lt;- ensureFresh sess</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="nottickedoff">case ef of</span>
+<span class="lineno">  226 </span><span class="spaces">        </span><span class="nottickedoff">Left e     -&gt; pure (Left e)</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="nottickedoff">Right toks -&gt;</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="nottickedoff">withBearerToken (otAccess toks) $ \accessBytes -&gt;</span>
+<span class="lineno">  229 </span><span class="spaces">            </span><span class="nottickedoff">sendMessages (anManager a) (oauthHeaders accessBytes) cr</span></span>
+
+</pre>
+</body>
+</html>

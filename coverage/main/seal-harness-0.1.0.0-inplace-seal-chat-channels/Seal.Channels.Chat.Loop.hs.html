@@ -1,0 +1,1250 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The generic chat-channel main loop. Handles routing (@/N@ focus, slash
+<span class="lineno">    3 </span>-- commands, plain text), WS focus + streaming, HTTP send, session tracking,
+<span class="lineno">    4 </span>module Seal.Channels.Chat.Loop
+<span class="lineno">    5 </span>  ( runChatChannel
+<span class="lineno">    6 </span>  , ChatChannelConfig (..)
+<span class="lineno">    7 </span>  , defaultChatChannelConfig
+<span class="lineno">    8 </span>    -- * Event handlers (for testing)
+<span class="lineno">    9 </span>  , handleInbound
+<span class="lineno">   10 </span>  , handleFocus
+<span class="lineno">   11 </span>  , handleServerEvent
+<span class="lineno">   12 </span>    -- * Pure helpers (for testing)
+<span class="lineno">   13 </span>  , extractEntryText
+<span class="lineno">   14 </span>  , extractActivityKind
+<span class="lineno">   15 </span>  , extractDirection
+<span class="lineno">   16 </span>  , extractActivityStatus
+<span class="lineno">   17 </span>  , extractToolName
+<span class="lineno">   18 </span>  , extractToolInput
+<span class="lineno">   19 </span>  , extractAskQuestion
+<span class="lineno">   20 </span>  , extractAskId
+<span class="lineno">   21 </span>  , extractAskOptions
+<span class="lineno">   22 </span>  , extractThinkingSessionIds
+<span class="lineno">   23 </span>  , lastAssistantText
+<span class="lineno">   24 </span>  , formatQuestionWithOptions
+<span class="lineno">   25 </span>  , parseCallbackData
+<span class="lineno">   26 </span>    -- * Watch-all-tabs (for testing)
+<span class="lineno">   27 </span>  , WatchState
+<span class="lineno">   28 </span>  , ThinkingTabs
+<span class="lineno">   29 </span>  , newWatchState
+<span class="lineno">   30 </span>  , newThinkingTabs
+<span class="lineno">   31 </span>  , handleWatchToggle
+<span class="lineno">   32 </span>  , handleWatchActivity
+<span class="lineno">   33 </span>  , lookupWatch
+<span class="lineno">   34 </span>  , toggleWatch
+<span class="lineno">   35 </span>  , newPersistingWatchState
+<span class="lineno">   36 </span>  , seedWatchState
+<span class="lineno">   37 </span>  , snapshotWatch
+<span class="lineno">   38 </span>  ) where
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
+<span class="lineno">   41 </span>import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+<span class="lineno">   42 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   43 </span>import Control.Monad (when, unless, void)
+<span class="lineno">   44 </span>import Data.Foldable (for_)
+<span class="lineno">   45 </span>import Data.Aeson (Value)
+<span class="lineno">   46 </span>import Data.Aeson qualified as A
+<span class="lineno">   47 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   48 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   49 </span>import Data.IORef (readIORef, writeIORef)
+<span class="lineno">   50 </span>import Data.Map.Strict (Map)
+<span class="lineno">   51 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   52 </span>import Data.Maybe (fromMaybe, isJust, mapMaybe)
+<span class="lineno">   53 </span>import Data.Set (Set)
+<span class="lineno">   54 </span>import Data.Set qualified as Set
+<span class="lineno">   55 </span>import Data.Text (Text)
+<span class="lineno">   56 </span>import Data.Char (isDigit)
+<span class="lineno">   57 </span>import Data.Text qualified as T
+<span class="lineno">   58 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   59 </span>import System.IO (hPutStrLn, stderr)
+<span class="lineno">   60 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+<span class="lineno">   63 </span>import Seal.Channels.Chat.HttpClient
+<span class="lineno">   64 </span>  (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
+<span class="lineno">   65 </span>   SendResult (..), TabJson (..))
+<span class="lineno">   66 </span>import Seal.Channels.Chat.RateLimit
+<span class="lineno">   67 </span>  (StreamProgressConfig (..), defaultStreamProgressConfig,
+<span class="lineno">   68 </span>   shouldEdit, addCursor, stripCursor)
+<span class="lineno">   69 </span>import Seal.Channels.Chat.Route
+<span class="lineno">   70 </span>  (ChatRoute (..), route, parseTabFocus)
+<span class="lineno">   71 </span>import Seal.Channels.Chat.Types
+<span class="lineno">   72 </span>  (InboundMessage (..), ConversationKey (..),
+<span class="lineno">   73 </span>   convKeyFromSource, SessionMap, newSessionMap, sessionLookup,
+<span class="lineno">   74 </span>   sessionInsert, GatewayConfig (..), StreamingState (..),
+<span class="lineno">   75 </span>   newStreamingState, resetStreamingState)
+<span class="lineno">   76 </span>import Seal.Channels.Chat.ToolRender
+<span class="lineno">   77 </span>  (formatToolLine)
+<span class="lineno">   78 </span>import Seal.Channels.Chat.WsClient
+<span class="lineno">   79 </span>  (WsClient (..), startWsClient)
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>import Seal.Gateway.Types.Core
+<span class="lineno">   82 </span>  (SessionId, mkSessionId, sessionIdText)
+<span class="lineno">   83 </span>import Seal.Gateway.Types.Stream (ServerEvent (..))
+<span class="lineno">   84 </span>import Seal.Gateway.Types.MessageSource (MessageSource)
+<span class="lineno">   85 </span>import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToChar)
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | A pending ASK_HUMAN question tracked by the loop: the ask id text +
+<span class="lineno">   88 </span>-- the offered options (so the callback handler can resolve a button index
+<span class="lineno">   89 </span>-- to the option label). Keyed by session id + ask id prefix.
+<span class="lineno">   90 </span>data PendingAsk = PendingAsk
+<span class="lineno">   91 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">paAskId</span></span></span> :: !Text
+<span class="lineno">   92 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">paOptions</span></span></span> :: ![QuestionOption]
+<span class="lineno">   93 </span>  }
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>-- | The pending-asks store: session id → list of pending asks. Thread-safe
+<span class="lineno">   96 </span>-- via 'TVar'.
+<span class="lineno">   97 </span>type PendingAsks = TVar (Map SessionId [PendingAsk])
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Per-conversation watch-all-tabs toggle state. When 'True' for a
+<span class="lineno">  100 </span>-- conversation, the channel receives a notification every time any
+<span class="lineno">  101 </span>-- non-focused tab finishes thinking (harness-status transitions from
+<span class="lineno">  102 </span>-- @thinking@ to @idle@). Thread-safe via 'TVar'.
+<span class="lineno">  103 </span>data WatchState = WatchState
+<span class="lineno">  104 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">wsVar</span></span></span>  :: TVar (Map ConversationKey Bool)
+<span class="lineno">  105 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wsSave</span></span></span> :: Maybe (IO ())
+<span class="lineno">  106 </span>  -- ^ The save action (snapshots the TVar and writes to disk). Called
+<span class="lineno">  107 </span>  -- inside the 'wsLock' critical section so the snapshot is consistent
+<span class="lineno">  108 </span>  -- with the mutation.
+<span class="lineno">  109 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wsLock</span></span></span> :: MVar ()
+<span class="lineno">  110 </span>  -- ^ Serializes the mutation+persist sequence so a stale snapshot from
+<span class="lineno">  111 </span>  -- one thread cannot overwrite a newer on-disk write from another.
+<span class="lineno">  112 </span>  -- Without this lock, concurrent toggles from Signal + Telegram (which
+<span class="lineno">  113 </span>  -- share one 'WatchState') can lose state after a restart.
+<span class="lineno">  114 </span>  }
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Create a new empty watch-state map (watch mode off for all
+<span class="lineno">  117 </span>-- conversations).
+<span class="lineno">  118 </span>newWatchState :: IO WatchState
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">newWatchState = do</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">tv &lt;- newTVarIO Map.empty</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">lock &lt;- newMVar <span class="nottickedoff">()</span></span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">pure (WatchState tv Nothing lock)</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | Create a persisting watch-state store. The supplied save function is
+<span class="lineno">  125 </span>-- called after every mutation (snapshotting the full current map, so the
+<span class="lineno">  126 </span>-- last writer wins with a consistent view). Mirrors
+<span class="lineno">  127 </span>-- 'Seal.Channels.Cursor.newPersistingCursorStore'.
+<span class="lineno">  128 </span>newPersistingWatchState :: (Map ConversationKey Bool -&gt; IO ()) -&gt; IO WatchState
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">newPersistingWatchState saveFn = do</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">tv &lt;- newTVarIO Map.empty</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">lock &lt;- newMVar <span class="nottickedoff">()</span></span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">let ws = WatchState tv (Just (saveAction ws)) lock</span>
+<span class="lineno">  133 </span><span class="spaces">      </span><span class="istickedoff">saveAction s = saveFn =&lt;&lt; snapshotWatch s</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">pure ws</span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>-- | Replace the store's map in one STM transaction. Used at boot to seed
+<span class="lineno">  137 </span>-- the in-memory store from the persisted @watch_state.json@. Does NOT
+<span class="lineno">  138 </span>-- persist (the caller is loading FROM disk).
+<span class="lineno">  139 </span>seedWatchState :: WatchState -&gt; Map ConversationKey Bool -&gt; IO ()
+<span class="lineno">  140 </span><span class="decl"><span class="nottickedoff">seedWatchState ws m = atomically (writeTVar (wsVar ws) m)</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | Snapshot the current map. Used by the save action.
+<span class="lineno">  143 </span>snapshotWatch :: WatchState -&gt; IO (Map ConversationKey Bool)
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">snapshotWatch ws = readTVarIO (wsVar ws)</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Look up whether watch mode is enabled for a conversation. 'False'
+<span class="lineno">  147 </span>-- when the conversation has no entry (the default).
+<span class="lineno">  148 </span>lookupWatch :: WatchState -&gt; ConversationKey -&gt; IO Bool
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">lookupWatch ws key = fromMaybe False . Map.lookup key &lt;$&gt; readTVarIO (wsVar ws)</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>-- | Toggle watch mode for a conversation. Returns the new state.
+<span class="lineno">  152 </span>toggleWatch :: WatchState -&gt; ConversationKey -&gt; IO Bool
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">toggleWatch ws key = do</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">-- Hold the lock through mutation+persist so no concurrent thread can</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">-- mutate the TVar between our snapshot and our save (which would let a</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">-- stale snapshot overwrite a newer on-disk write).</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">withMVar (wsLock ws) $ \_ -&gt; do</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">newVal &lt;- atomically $ do</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">m &lt;- readTVar (wsVar ws)</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">let v = not (fromMaybe False (Map.lookup key m))</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">writeTVar (wsVar ws) (Map.insert key v m)</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">pure v</span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="istickedoff">persistWatch ws</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">pure newVal</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>-- | Run the persist action (if any) after a successful mutation. A save
+<span class="lineno">  167 </span>-- failure is logged to stderr and swallowed — the in-memory store stays
+<span class="lineno">  168 </span>-- authoritative within the session; the next successful mutation will
+<span class="lineno">  169 </span>-- retry the save (writing the full current map, so a missed save
+<span class="lineno">  170 </span>-- self-heals). Mirrors 'Seal.Channels.Cursor.persistCursor'.
+<span class="lineno">  171 </span>persistWatch :: WatchState -&gt; IO ()
+<span class="lineno">  172 </span><span class="decl"><span class="istickedoff">persistWatch ws =</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">case wsSave ws of</span>
+<span class="lineno">  174 </span><span class="spaces">    </span><span class="istickedoff">Nothing  -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">Just act -&gt; act `catch` <span class="nottickedoff">\e -&gt;</span></span>
+<span class="lineno">  176 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">dbg (&quot;[watch] watch_state.json save failed: &quot; &lt;&gt; T.pack (show (e :: SomeException)))</span></span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- | Per-conversation set of non-focused sessions currently in a thinking
+<span class="lineno">  179 </span>-- turn. Used to detect the thinking→idle transition so a watch
+<span class="lineno">  180 </span>-- notification is sent exactly once per completed turn (not on every
+<span class="lineno">  181 </span>-- idle activity for a session that was never thinking). Thread-safe via
+<span class="lineno">  182 </span>-- 'TVar'.
+<span class="lineno">  183 </span>type ThinkingTabs = TVar (Map ConversationKey (Set SessionId))
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>-- | Create a new empty thinking-tabs map.
+<span class="lineno">  186 </span>newThinkingTabs :: IO ThinkingTabs
+<span class="lineno">  187 </span><span class="decl"><span class="istickedoff">newThinkingTabs = newTVarIO Map.empty</span></span>
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>-- | Configuration for the generic loop.
+<span class="lineno">  190 </span>data ChatChannelConfig = ChatChannelConfig
+<span class="lineno">  191 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cccGateway</span></span></span>     :: GatewayConfig
+<span class="lineno">  192 </span>    -- ^ The gateway connection config (HTTP + WS endpoints).
+<span class="lineno">  193 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cccStreamCfg</span></span></span>   :: StreamProgressConfig
+<span class="lineno">  194 </span>    -- ^ Rate-limiting config for streaming edits.
+<span class="lineno">  195 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cccHttpManager</span></span></span> :: Manager
+<span class="lineno">  196 </span>    -- ^ The shared HTTP manager for gateway API calls.
+<span class="lineno">  197 </span>  }
+<span class="lineno">  198 </span>
+<span class="lineno">  199 </span>-- | Default config with sensible defaults.
+<span class="lineno">  200 </span>defaultChatChannelConfig :: Manager -&gt; GatewayConfig -&gt; ChatChannelConfig
+<span class="lineno">  201 </span><span class="decl"><span class="istickedoff">defaultChatChannelConfig mgr gw = ChatChannelConfig</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">{ cccGateway = gw</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">, cccStreamCfg = <span class="nottickedoff">defaultStreamProgressConfig</span></span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">, cccHttpManager = mgr</span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  206 </span>
+<span class="lineno">  207 </span>-- | Debug log to stderr.
+<span class="lineno">  208 </span>dbg :: Text -&gt; IO ()
+<span class="lineno">  209 </span><span class="decl"><span class="istickedoff">dbg msg = hPutStrLn stderr (&quot;[chat-channel] &quot; &lt;&gt; T.unpack msg)</span></span>
+<span class="lineno">  210 </span>
+<span class="lineno">  211 </span>-- | Run the generic chat-channel loop. Blocks until the channel's
+<span class="lineno">  212 </span>-- 'ccReceive' returns EOF. Each conversation gets its own WS connection
+<span class="lineno">  213 </span>-- for streaming.
+<span class="lineno">  214 </span>runChatChannel :: ChatChannel c =&gt; ChatChannelConfig -&gt; c -&gt; WatchState -&gt; IO ()
+<span class="lineno">  215 </span><span class="decl"><span class="nottickedoff">runChatChannel cfg chan watchState = do</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="nottickedoff">sessions &lt;- newSessionMap</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="nottickedoff">-- Map of conversation keys to their WS client + streaming state.</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="nottickedoff">wsConns &lt;- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="nottickedoff">pendingAsks &lt;- newTVarIO Map.empty :: IO PendingAsks</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="nottickedoff">tabTracker &lt;- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="nottickedoff">thinkingTabs &lt;- newThinkingTabs</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="nottickedoff">loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="nottickedoff">loop sessions wsConns pendingAsks tabTracker ws tt = do</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="nottickedoff">mMsg &lt;- ccReceive chan</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="nottickedoff">case mMsg of</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; pure ()  -- EOF</span>
+<span class="lineno">  228 </span><span class="spaces">        </span><span class="nottickedoff">Just (InboundMessage src body mCbData) -&gt; do</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="nottickedoff">dbg (&quot;received: &quot; &lt;&gt; body)</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="nottickedoff">let key = convKeyFromSource src</span>
+<span class="lineno">  231 </span><span class="spaces">          </span><span class="nottickedoff">case mCbData of</span>
+<span class="lineno">  232 </span><span class="spaces">            </span><span class="nottickedoff">Just cbData -&gt; do</span>
+<span class="lineno">  233 </span><span class="spaces">              </span><span class="nottickedoff">-- Callback query (button tap): resolve to a pending ask,</span>
+<span class="lineno">  234 </span><span class="spaces">              </span><span class="nottickedoff">-- answer via HTTP, acknowledge, and remove keyboard.</span>
+<span class="lineno">  235 </span><span class="spaces">              </span><span class="nottickedoff">handleCallback cfg chan sessions pendingAsks key src cbData</span>
+<span class="lineno">  236 </span><span class="spaces">            </span><span class="nottickedoff">Nothing -&gt;</span>
+<span class="lineno">  237 </span><span class="spaces">              </span><span class="nottickedoff">-- Regular text message: route normally.</span>
+<span class="lineno">  238 </span><span class="spaces">              </span><span class="nottickedoff">handleInbound cfg chan sessions wsConns pendingAsks tabTracker ws tt key body</span>
+<span class="lineno">  239 </span><span class="spaces">          </span><span class="nottickedoff">loop sessions wsConns pendingAsks tabTracker ws tt</span></span>
+<span class="lineno">  240 </span>
+<span class="lineno">  241 </span>-- | Handle one inbound message: resolve the session, route, and dispatch.
+<span class="lineno">  242 </span>handleInbound
+<span class="lineno">  243 </span>  :: ChatChannel c
+<span class="lineno">  244 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap
+<span class="lineno">  245 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  246 </span>  -&gt; PendingAsks
+<span class="lineno">  247 </span>  -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  248 </span>  -&gt; WatchState
+<span class="lineno">  249 </span>  -&gt; ThinkingTabs
+<span class="lineno">  250 </span>  -&gt; ConversationKey -&gt; Text
+<span class="lineno">  251 </span>  -&gt; IO ()
+<span class="lineno">  252 </span><span class="decl"><span class="istickedoff">handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body = do</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">apiBase = gcApiBase (cccGateway cfg)</span></span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">mgr = cccHttpManager cfg</span></span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">-- Intercept /watch (and /watch on|off) before normal routing — it</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">-- toggles per-conversation loop state, not a gateway command.</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">isWatchCommand body</span></span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">do</span></span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">dbg (&quot;[watch] /watch command received, key=&quot; &lt;&gt; ckConv key)</span></span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">handleWatchToggle chan watchState key body</span></span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- When watch mode is turned ON, ensure a WS connection exists so</span></span>
+<span class="lineno">  262 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- the channel receives BeActivity events for all tabs. Without</span></span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- this, /watch as the first message would enable watch mode but</span></span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">-- never receive any events (no WS connection = no event source).</span></span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">watchOn &lt;- lookupWatch watchState key</span></span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">dbg (&quot;[watch] watchOn=&quot; &lt;&gt; (if watchOn then &quot;true&quot; else &quot;false&quot;) &lt;&gt; &quot;, ensuring WS conn&quot;)</span></span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">when watchOn $</span></span>
+<span class="lineno">  268 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">void (resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key)</span></span>
+<span class="lineno">  269 </span><span class="spaces">    </span><span class="istickedoff">else case parseTabFocus body of</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">Just idx -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  271 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx</span></span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case route body of</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatFocus idx) -&gt;</span>
+<span class="lineno">  274 </span><span class="spaces">        </span><span class="istickedoff">handleFocus cfg chan <span class="nottickedoff">sessions</span> <span class="nottickedoff">wsConns</span> <span class="nottickedoff">pendingAsks</span> <span class="nottickedoff">tabTracker</span> <span class="nottickedoff">watchState</span> <span class="nottickedoff">thinkingTabs</span> <span class="nottickedoff">key</span> <span class="nottickedoff">idx</span></span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatInject idx payload) -&gt; do</span>
+<span class="lineno">  276 </span><span class="spaces">        </span><span class="istickedoff">-- Send the payload to the target tab's session WITHOUT changing</span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff">-- the focused tab (no FocusOp, no &quot;focused tab N&quot; confirmation).</span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="istickedoff">handleInject cfg chan <span class="nottickedoff">idx</span> <span class="nottickedoff">payload</span></span>
+<span class="lineno">  279 </span><span class="spaces">      </span><span class="istickedoff">Right ChatCurrentTab -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  280 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- Send the current tab info via HTTP (the gateway routes /tab).</span></span>
+<span class="lineno">  281 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">mSid &lt;- sessionLookup sessions key</span></span>
+<span class="lineno">  282 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case mSid of</span></span>
+<span class="lineno">  283 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Just sid -&gt; do</span></span>
+<span class="lineno">  284 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">eResult &lt;- httpSend mgr apiBase sid &quot;/tab&quot;</span></span>
+<span class="lineno">  285 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">case eResult of</span></span>
+<span class="lineno">  286 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right sr -&gt; ccSend chan (srResponse sr)</span></span>
+<span class="lineno">  287 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left e -&gt; ccSend chan (&quot;error: &quot; &lt;&gt; e)</span></span>
+<span class="lineno">  288 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; ccSend chan &quot;no current tab&quot;</span></span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatNewSession args) -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">-- Create a new session via HTTP, update the session map.</span></span>
+<span class="lineno">  291 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key args</span></span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatSlash _cmd) -&gt;</span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body</span></span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatTabCommand _) -&gt;</span>
+<span class="lineno">  295 </span><span class="spaces">        </span><span class="istickedoff">-- Tab commands go through the HTTP API (the gateway routes them).</span>
+<span class="lineno">  296 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body</span></span>
+<span class="lineno">  297 </span><span class="spaces">      </span><span class="istickedoff">Right (ChatPlain text) -&gt;</span>
+<span class="lineno">  298 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text</span></span>
+<span class="lineno">  299 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">ccSend chan &quot;error: invalid command&quot;</span></span></span>
+<span class="lineno">  300 </span>
+<span class="lineno">  301 </span>-- | Handle a focus command: resolve the tab index to a session id via
+<span class="lineno">  302 </span>-- @GET /api/tabs@, send a @FocusOp@ over WS, send &quot;focused tab N&quot; to the
+<span class="lineno">  303 </span>-- platform, and optionally send the last assistant reply.
+<span class="lineno">  304 </span>handleFocus
+<span class="lineno">  305 </span>  :: ChatChannel c
+<span class="lineno">  306 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap
+<span class="lineno">  307 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  308 </span>  -&gt; PendingAsks
+<span class="lineno">  309 </span>  -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  310 </span>  -&gt; WatchState
+<span class="lineno">  311 </span>  -&gt; ThinkingTabs
+<span class="lineno">  312 </span>  -&gt; ConversationKey -&gt; TabIndex
+<span class="lineno">  313 </span>  -&gt; IO ()
+<span class="lineno">  314 </span><span class="decl"><span class="istickedoff">handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx = do</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">eTabs &lt;- httpGetTabs mgr apiBase</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="istickedoff">case eTabs of</span>
+<span class="lineno">  319 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; ccSend chan (&quot;focus failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  320 </span><span class="spaces">    </span><span class="istickedoff">Right tabs -&gt;</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case [ t | t &lt;- tabs, tjIndex t == tabIndexToInt idx ] of</span></span>
+<span class="lineno">  322 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[] -&gt; ccSend chan &quot;focus failed: tab index out of range&quot;</span></span>
+<span class="lineno">  323 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(tab : _) -&gt;</span></span>
+<span class="lineno">  324 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case tjSessionId tab of</span></span>
+<span class="lineno">  325 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; ccSend chan &quot;focus failed: tab has no session&quot;</span></span>
+<span class="lineno">  326 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just sidText -&gt; case mkSessionId sidText of</span></span>
+<span class="lineno">  327 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left _ -&gt; ccSend chan &quot;focus failed: invalid session id&quot;</span></span>
+<span class="lineno">  328 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right sid -&gt; do</span></span>
+<span class="lineno">  329 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Update the session map so subsequent messages route here.</span></span>
+<span class="lineno">  330 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">sessionInsert sessions key sid</span></span>
+<span class="lineno">  331 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Track the focused session + current tab list for tab-close detection.</span></span>
+<span class="lineno">  332 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">atomically (modifyTVar' tabTracker (Map.insert key (sid, tabs)))</span></span>
+<span class="lineno">  333 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Ensure a WS connection exists for this conversation.</span></span>
+<span class="lineno">  334 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid</span></span>
+<span class="lineno">  335 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Send &quot;focused tab N&quot; confirmation.</span></span>
+<span class="lineno">  336 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">ccSend chan (&quot;focused tab &quot; &lt;&gt; T.singleton (tabIndexToChar idx))</span></span>
+<span class="lineno">  337 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Fetch and send the last assistant reply for context.</span></span>
+<span class="lineno">  338 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">sendLastReply cfg chan sid</span></span></span>
+<span class="lineno">  339 </span>
+<span class="lineno">  340 </span>-- | Handle an inject command (@\/N payload@): resolve the tab index to a
+<span class="lineno">  341 </span>-- session id via @GET /api/tabs@, then send the payload to that session
+<span class="lineno">  342 </span>-- via @POST /api/sessions/:id/send@. Unlike 'handleFocus', this does NOT
+<span class="lineno">  343 </span>-- change the focused tab, send a FocusOp over WS, update the session map,
+<span class="lineno">  344 </span>-- send a &quot;focused tab N&quot; confirmation, or send the last assistant reply.
+<span class="lineno">  345 </span>-- The payload is delivered to the target session; any response will be
+<span class="lineno">  346 </span>-- visible when the user later focuses on that tab.
+<span class="lineno">  347 </span>handleInject
+<span class="lineno">  348 </span>  :: ChatChannel c
+<span class="lineno">  349 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; TabIndex -&gt; Text
+<span class="lineno">  350 </span>  -&gt; IO ()
+<span class="lineno">  351 </span><span class="decl"><span class="istickedoff">handleInject cfg chan idx payload = do</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="istickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">eTabs &lt;- httpGetTabs mgr apiBase</span>
+<span class="lineno">  355 </span><span class="spaces">  </span><span class="istickedoff">case eTabs of</span>
+<span class="lineno">  356 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; ccSend chan (&quot;inject failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  357 </span><span class="spaces">    </span><span class="istickedoff">Right tabs -&gt;</span>
+<span class="lineno">  358 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case [ t | t &lt;- tabs, tjIndex t == tabIndexToInt idx ] of</span></span>
+<span class="lineno">  359 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[] -&gt; ccSend chan &quot;inject failed: tab index out of range&quot;</span></span>
+<span class="lineno">  360 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(tab : _) -&gt;</span></span>
+<span class="lineno">  361 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case tjSessionId tab of</span></span>
+<span class="lineno">  362 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; ccSend chan &quot;inject failed: tab has no session&quot;</span></span>
+<span class="lineno">  363 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just sidText -&gt; case mkSessionId sidText of</span></span>
+<span class="lineno">  364 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left _ -&gt; ccSend chan &quot;inject failed: invalid session id&quot;</span></span>
+<span class="lineno">  365 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right sid -&gt; do</span></span>
+<span class="lineno">  366 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Send the payload to the target session via HTTP.</span></span>
+<span class="lineno">  367 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Do NOT update the session map, send a FocusOp, or</span></span>
+<span class="lineno">  368 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- send a focus confirmation — the current focused tab</span></span>
+<span class="lineno">  369 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- is unchanged.</span></span>
+<span class="lineno">  370 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">eResult &lt;- httpSend mgr apiBase sid payload</span></span>
+<span class="lineno">  371 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">case eResult of</span></span>
+<span class="lineno">  372 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Right sr | srKind sr == &quot;error&quot; -&gt; ccSend chan (fromMaybe &quot;error&quot; (srError sr))</span></span>
+<span class="lineno">  373 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Right sr | not (T.null (srResponse sr)) -&gt; ccSend chan (srResponse sr)</span></span>
+<span class="lineno">  374 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Right _ -&gt; pure ()  -- assistant response comes via WS</span></span>
+<span class="lineno">  375 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Left e -&gt; ccSend chan (&quot;error: &quot; &lt;&gt; e)</span></span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>-- | Ensure a WS connection exists for the conversation. If one exists,
+<span class="lineno">  378 </span>-- send a FocusOp to change focus. If not, start a new WS connection with
+<span class="lineno">  379 </span>-- the streaming event handler and send a FocusOp.
+<span class="lineno">  380 </span>ensureWsConn
+<span class="lineno">  381 </span>  :: ChatChannel c
+<span class="lineno">  382 </span>  =&gt; ChatChannelConfig -&gt; c
+<span class="lineno">  383 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  384 </span>  -&gt; PendingAsks
+<span class="lineno">  385 </span>  -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  386 </span>  -&gt; WatchState
+<span class="lineno">  387 </span>  -&gt; ThinkingTabs
+<span class="lineno">  388 </span>  -&gt; ConversationKey -&gt; SessionId
+<span class="lineno">  389 </span>  -&gt; IO ()
+<span class="lineno">  390 </span><span class="decl"><span class="nottickedoff">ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid = do</span>
+<span class="lineno">  391 </span><span class="spaces">  </span><span class="nottickedoff">let gwCfg = cccGateway cfg</span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="nottickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  393 </span><span class="spaces">  </span><span class="nottickedoff">dbg (&quot;[watch] ensureWsConn key=&quot; &lt;&gt; ckConv key &lt;&gt; &quot; hasConn=&quot; &lt;&gt; (case Map.lookup key conns of Just _ -&gt; &quot;true&quot;; Nothing -&gt; &quot;false&quot;))</span>
+<span class="lineno">  394 </span><span class="spaces">  </span><span class="nottickedoff">case Map.lookup key conns of</span>
+<span class="lineno">  395 </span><span class="spaces">    </span><span class="nottickedoff">Just (ws, _) -&gt; wcFocus ws sid  -- already connected; just change focus</span>
+<span class="lineno">  396 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; do</span>
+<span class="lineno">  397 </span><span class="spaces">      </span><span class="nottickedoff">-- Start a new WS connection with the streaming event handler.</span>
+<span class="lineno">  398 </span><span class="spaces">      </span><span class="nottickedoff">let callback = handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs sid</span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="nottickedoff">eWs &lt;- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback</span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="nottickedoff">case eWs of</span>
+<span class="lineno">  401 </span><span class="spaces">        </span><span class="nottickedoff">Left e -&gt; dbg (&quot;[watch] WS connect FAILED: &quot; &lt;&gt; e)</span>
+<span class="lineno">  402 </span><span class="spaces">        </span><span class="nottickedoff">Right ws -&gt; do</span>
+<span class="lineno">  403 </span><span class="spaces">          </span><span class="nottickedoff">ss &lt;- newStreamingState</span>
+<span class="lineno">  404 </span><span class="spaces">          </span><span class="nottickedoff">atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))</span>
+<span class="lineno">  405 </span><span class="spaces">          </span><span class="nottickedoff">wcFocus ws sid</span></span>
+<span class="lineno">  406 </span>
+<span class="lineno">  407 </span>-- | The WS event handler: processes streaming events for one conversation.
+<span class="lineno">  408 </span>-- Creates/edits/finalizes platform messages from entry-update/entry/activity
+<span class="lineno">  409 </span>-- events.
+<span class="lineno">  410 </span>handleServerEvent
+<span class="lineno">  411 </span>  :: ChatChannel c
+<span class="lineno">  412 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  413 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  414 </span>  -&gt; PendingAsks
+<span class="lineno">  415 </span>  -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  416 </span>  -&gt; WatchState
+<span class="lineno">  417 </span>  -&gt; ThinkingTabs
+<span class="lineno">  418 </span>  -&gt; SessionId -&gt; ServerEvent -&gt; IO ()
+<span class="lineno">  419 </span><span class="decl"><span class="istickedoff">handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs focusedSid ev =</span>
+<span class="lineno">  420 </span><span class="spaces">  </span><span class="istickedoff">case ev of</span>
+<span class="lineno">  421 </span><span class="spaces">    </span><span class="istickedoff">SeEntryUpdate sid val</span>
+<span class="lineno">  422 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">sid == focusedSid</span> -&gt; handleEntryUpdate cfg chan key wsConns val</span>
+<span class="lineno">  423 </span><span class="spaces">    </span><span class="istickedoff">SeEntry sid val</span>
+<span class="lineno">  424 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">sid == focusedSid</span> -&gt; handleEntry cfg chan key wsConns val</span>
+<span class="lineno">  425 </span><span class="spaces">    </span><span class="istickedoff">SeActivity sid val</span>
+<span class="lineno">  426 </span><span class="spaces">      </span><span class="istickedoff">| sid == focusedSid -&gt; do</span>
+<span class="lineno">  427 </span><span class="spaces">          </span><span class="istickedoff">dbg (&quot;[watch] SeActivity focused sid=&quot; &lt;&gt; sessionIdText sid &lt;&gt; &quot; kind=&quot; &lt;&gt; extractActivityKind val &lt;&gt; &quot; status=&quot; &lt;&gt; extractActivityStatus val)</span>
+<span class="lineno">  428 </span><span class="spaces">          </span><span class="istickedoff">handleActivity cfg chan key wsConns val</span>
+<span class="lineno">  429 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>         -&gt; do</span>
+<span class="lineno">  430 </span><span class="spaces">          </span><span class="istickedoff">dbg (&quot;[watch] SeActivity non-focused sid=&quot; &lt;&gt; sessionIdText sid &lt;&gt; &quot; focusedSid=&quot; &lt;&gt; sessionIdText focusedSid &lt;&gt; &quot; kind=&quot; &lt;&gt; extractActivityKind val &lt;&gt; &quot; status=&quot; &lt;&gt; extractActivityStatus val)</span>
+<span class="lineno">  431 </span><span class="spaces">          </span><span class="istickedoff">handleWatchActivity cfg chan key watchState thinkingTabs <span class="nottickedoff">focusedSid</span> sid val</span>
+<span class="lineno">  432 </span><span class="spaces">    </span><span class="istickedoff">-- Tool-call events are BeActivity with kind=&quot;tool-call&quot;, broadcast</span>
+<span class="lineno">  433 </span><span class="spaces">    </span><span class="istickedoff">-- by the server's aeOnToolCall hook. They arrive as SeActivity.</span>
+<span class="lineno">  434 </span><span class="spaces">    </span><span class="istickedoff">-- handleActivity dispatches on kind internally.</span>
+<span class="lineno">  435 </span><span class="spaces">    </span><span class="istickedoff">SeAsk sid val</span>
+<span class="lineno">  436 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">sid == focusedSid</span> -&gt; <span class="nottickedoff">handleAsk cfg chan key pendingAsks sid val</span></span>
+<span class="lineno">  437 </span><span class="spaces">    </span><span class="istickedoff">SeLists val -&gt; handleLists cfg <span class="nottickedoff">chan</span> key <span class="nottickedoff">tabTracker</span> watchState thinkingTabs val</span>
+<span class="lineno">  438 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure ()</span></span></span>  -- ignore events for other sessions or irrelevant types
+<span class="lineno">  439 </span>
+<span class="lineno">  440 </span>-- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
+<span class="lineno">  441 </span>-- or @/watch on@ / @/watch off@ / @/watch status@ / @/watch -h@). Pure.
+<span class="lineno">  442 </span>isWatchCommand :: Text -&gt; Bool
+<span class="lineno">  443 </span><span class="decl"><span class="istickedoff">isWatchCommand body =</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">case T.words (T.toLower (T.strip body)) of</span>
+<span class="lineno">  445 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;]           -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  446 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;on&quot;]     -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  447 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;off&quot;]    -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  448 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;status&quot;] -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  449 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;-h&quot;]     -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">  450 </span><span class="spaces">    </span><span class="istickedoff">_                    -&gt; False</span></span>
+<span class="lineno">  451 </span>
+<span class="lineno">  452 </span>-- | Handle the @/watch@ slash command: toggle (or set) watch-all-tabs
+<span class="lineno">  453 </span>-- mode for the conversation and send a confirmation to the platform.
+<span class="lineno">  454 </span>-- @/watch@ toggles; @/watch on@ and @/watch off@ set explicitly;
+<span class="lineno">  455 </span>-- @/watch status@ prints the current state; @/watch -h@ prints help.
+<span class="lineno">  456 </span>handleWatchToggle
+<span class="lineno">  457 </span>  :: ChatChannel c =&gt; c -&gt; WatchState -&gt; ConversationKey -&gt; Text -&gt; IO ()
+<span class="lineno">  458 </span><span class="decl"><span class="istickedoff">handleWatchToggle chan watchState key body =</span>
+<span class="lineno">  459 </span><span class="spaces">  </span><span class="istickedoff">case T.words (T.toLower body) of</span>
+<span class="lineno">  460 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;on&quot;]  -&gt; setWatch True</span>
+<span class="lineno">  461 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;off&quot;] -&gt; setWatch False</span>
+<span class="lineno">  462 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;status&quot;] -&gt; do</span>
+<span class="lineno">  463 </span><span class="spaces">      </span><span class="istickedoff">cur &lt;- lookupWatch watchState key</span>
+<span class="lineno">  464 </span><span class="spaces">      </span><span class="istickedoff">ccSend chan (watchStatusMsg cur)</span>
+<span class="lineno">  465 </span><span class="spaces">    </span><span class="istickedoff">[&quot;/watch&quot;, &quot;-h&quot;] -&gt; ccSend chan watchHelp</span>
+<span class="lineno">  466 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do  -- bare /watch — toggle</span>
+<span class="lineno">  467 </span><span class="spaces">      </span><span class="istickedoff">cur &lt;- lookupWatch watchState key</span>
+<span class="lineno">  468 </span><span class="spaces">      </span><span class="istickedoff">dbg (&quot;[watch] toggle: currently &quot; &lt;&gt; (if cur then &quot;on&quot; else &quot;off&quot;))</span>
+<span class="lineno">  469 </span><span class="spaces">      </span><span class="istickedoff">newVal &lt;- toggleWatch watchState key</span>
+<span class="lineno">  470 </span><span class="spaces">      </span><span class="istickedoff">ccSend chan (watchConfirm newVal)</span>
+<span class="lineno">  471 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  472 </span><span class="spaces">    </span><span class="istickedoff">setWatch v = do</span>
+<span class="lineno">  473 </span><span class="spaces">      </span><span class="istickedoff">-- Hold the lock through mutation+persist (same reason as</span>
+<span class="lineno">  474 </span><span class="spaces">      </span><span class="istickedoff">-- 'toggleWatch').</span>
+<span class="lineno">  475 </span><span class="spaces">      </span><span class="istickedoff">withMVar (wsLock watchState) $ \_ -&gt; do</span>
+<span class="lineno">  476 </span><span class="spaces">        </span><span class="istickedoff">atomically (modifyTVar' (wsVar watchState) (Map.insert key v))</span>
+<span class="lineno">  477 </span><span class="spaces">        </span><span class="istickedoff">persistWatch watchState</span>
+<span class="lineno">  478 </span><span class="spaces">      </span><span class="istickedoff">ccSend chan (watchConfirm v)</span></span>
+<span class="lineno">  479 </span>
+<span class="lineno">  480 </span>-- | The confirmation message for a watch-mode change.
+<span class="lineno">  481 </span>watchConfirm :: Bool -&gt; Text
+<span class="lineno">  482 </span><span class="decl"><span class="istickedoff">watchConfirm True =</span>
+<span class="lineno">  483 </span><span class="spaces">  </span><span class="istickedoff">&quot;watch mode enabled — you will be notified when any tab finishes thinking&quot;</span>
+<span class="lineno">  484 </span><span class="spaces"></span><span class="istickedoff">watchConfirm False =</span>
+<span class="lineno">  485 </span><span class="spaces">  </span><span class="istickedoff">&quot;watch mode disabled&quot;</span></span>
+<span class="lineno">  486 </span>
+<span class="lineno">  487 </span>-- | The status message for the current watch-mode state.
+<span class="lineno">  488 </span>watchStatusMsg :: Bool -&gt; Text
+<span class="lineno">  489 </span><span class="decl"><span class="istickedoff">watchStatusMsg True  = &quot;watch mode is on&quot;</span>
+<span class="lineno">  490 </span><span class="spaces"></span><span class="istickedoff">watchStatusMsg False = &quot;watch mode is off&quot;</span></span>
+<span class="lineno">  491 </span>
+<span class="lineno">  492 </span>-- | The help text for @/watch@, rendered in the same style as the
+<span class="lineno">  493 </span>-- optparse-applicative help used by all other slash commands.
+<span class="lineno">  494 </span>watchHelp :: Text
+<span class="lineno">  495 </span><span class="decl"><span class="istickedoff">watchHelp = T.unlines</span>
+<span class="lineno">  496 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;Toggle watch-all-tabs notifications for this conversation&quot;</span>
+<span class="lineno">  497 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  498 </span><span class="spaces">  </span><span class="istickedoff">, &quot;Usage: /watch [on|off|status]&quot;</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  500 </span><span class="spaces">  </span><span class="istickedoff">, &quot;Available commands:&quot;</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  on          Enable watch mode — notify when any tab finishes thinking&quot;</span>
+<span class="lineno">  502 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  off         Disable watch mode&quot;</span>
+<span class="lineno">  503 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  status      Show the current watch mode state&quot;</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="istickedoff">, &quot;Options:&quot;</span>
+<span class="lineno">  506 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  -h          Show this help&quot;</span>
+<span class="lineno">  507 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  508 </span><span class="spaces">  </span><span class="istickedoff">, &quot;With no subcommand, /watch toggles the current state.&quot;</span>
+<span class="lineno">  509 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  510 </span>
+<span class="lineno">  511 </span>-- | Handle a @harness-status@ activity event for a non-focused session.
+<span class="lineno">  512 </span>-- When watch mode is enabled for the conversation:
+<span class="lineno">  513 </span>--
+<span class="lineno">  514 </span>-- * @thinking@ — record the session as thinking (so we can detect the
+<span class="lineno">  515 </span>--   transition to @idle@).
+<span class="lineno">  516 </span>-- * @idle@ — if the session was previously thinking, remove it from the
+<span class="lineno">  517 </span>--   thinking set and send a \&quot;tab finished thinking\&quot; notification with
+<span class="lineno">  518 </span>--   the last assistant reply.
+<span class="lineno">  519 </span>--
+<span class="lineno">  520 </span>-- When watch mode is disabled, this is a no-op.
+<span class="lineno">  521 </span>handleWatchActivity
+<span class="lineno">  522 </span>  :: ChatChannel c
+<span class="lineno">  523 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  524 </span>  -&gt; WatchState -&gt; ThinkingTabs
+<span class="lineno">  525 </span>  -&gt; SessionId -&gt; SessionId -&gt; Value -&gt; IO ()
+<span class="lineno">  526 </span><span class="decl"><span class="istickedoff">handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = do</span>
+<span class="lineno">  527 </span><span class="spaces">  </span><span class="istickedoff">watchOn &lt;- lookupWatch watchState key</span>
+<span class="lineno">  528 </span><span class="spaces">  </span><span class="istickedoff">dbg (&quot;[watch] handleWatchActivity sid=&quot; &lt;&gt; sessionIdText sid &lt;&gt; &quot; watchOn=&quot; &lt;&gt; (if watchOn then &quot;true&quot; else &quot;false&quot;))</span>
+<span class="lineno">  529 </span><span class="spaces">  </span><span class="istickedoff">when watchOn $ do</span>
+<span class="lineno">  530 </span><span class="spaces">    </span><span class="istickedoff">let kind = extractActivityKind val</span>
+<span class="lineno">  531 </span><span class="spaces">    </span><span class="istickedoff">dbg (&quot;[watch] kind=&quot; &lt;&gt; kind &lt;&gt; &quot; status=&quot; &lt;&gt; extractActivityStatus val)</span>
+<span class="lineno">  532 </span><span class="spaces">    </span><span class="istickedoff">case kind of</span>
+<span class="lineno">  533 </span><span class="spaces">      </span><span class="istickedoff">&quot;harness-status&quot; -&gt; do</span>
+<span class="lineno">  534 </span><span class="spaces">        </span><span class="istickedoff">let status = extractActivityStatus val</span>
+<span class="lineno">  535 </span><span class="spaces">        </span><span class="istickedoff">case status of</span>
+<span class="lineno">  536 </span><span class="spaces">          </span><span class="istickedoff">&quot;thinking&quot; -&gt; do</span>
+<span class="lineno">  537 </span><span class="spaces">            </span><span class="istickedoff">dbg (&quot;[watch] adding to thinking set: sid=&quot; &lt;&gt; sessionIdText sid)</span>
+<span class="lineno">  538 </span><span class="spaces">            </span><span class="istickedoff">atomically (modifyTVar' thinkingTabs (Map.insertWith <span class="nottickedoff">Set.union</span> key (Set.singleton sid)))</span>
+<span class="lineno">  539 </span><span class="spaces">          </span><span class="istickedoff">&quot;idle&quot; -&gt; do</span>
+<span class="lineno">  540 </span><span class="spaces">            </span><span class="istickedoff">wasThinking &lt;- atomically $ do</span>
+<span class="lineno">  541 </span><span class="spaces">              </span><span class="istickedoff">m &lt;- readTVar thinkingTabs</span>
+<span class="lineno">  542 </span><span class="spaces">              </span><span class="istickedoff">case Map.lookup key m of</span>
+<span class="lineno">  543 </span><span class="spaces">                </span><span class="istickedoff">Just sids | <span class="tickonlytrue">sid `Set.member` sids</span> -&gt; do</span>
+<span class="lineno">  544 </span><span class="spaces">                  </span><span class="istickedoff">let <span class="nottickedoff">sids' = Set.delete sid sids</span></span>
+<span class="lineno">  545 </span><span class="spaces">                  </span><span class="istickedoff">writeTVar thinkingTabs <span class="nottickedoff">(if Set.null sids' then Map.delete key m else Map.insert key sids' m)</span></span>
+<span class="lineno">  546 </span><span class="spaces">                  </span><span class="istickedoff">pure True</span>
+<span class="lineno">  547 </span><span class="spaces">                </span><span class="istickedoff">_ -&gt; pure False</span>
+<span class="lineno">  548 </span><span class="spaces">            </span><span class="istickedoff">dbg (&quot;[watch] idle received, wasThinking=&quot; &lt;&gt; (if wasThinking then &quot;true&quot; else &quot;false&quot;) &lt;&gt; &quot; sid=&quot; &lt;&gt; sessionIdText sid)</span>
+<span class="lineno">  549 </span><span class="spaces">            </span><span class="istickedoff">when wasThinking $</span>
+<span class="lineno">  550 </span><span class="spaces">              </span><span class="istickedoff">sendWatchNotification cfg chan sid</span>
+<span class="lineno">  551 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  552 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  553 </span>
+<span class="lineno">  554 </span>-- | Send a \&quot;tab finished thinking\&quot; notification to the channel. Fetches
+<span class="lineno">  555 </span>-- the tab list (to resolve the tab label) and the transcript (to get the
+<span class="lineno">  556 </span>-- last assistant reply). If either fetch fails, the notification is still
+<span class="lineno">  557 </span>-- sent with whatever information is available — the notification must not
+<span class="lineno">  558 </span>-- be silently dropped just because a gateway call failed.
+<span class="lineno">  559 </span>sendWatchNotification
+<span class="lineno">  560 </span>  :: ChatChannel c
+<span class="lineno">  561 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionId -&gt; IO ()
+<span class="lineno">  562 </span><span class="decl"><span class="istickedoff">sendWatchNotification cfg chan sid = do</span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="istickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  564 </span><span class="spaces">      </span><span class="istickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  565 </span><span class="spaces">      </span><span class="istickedoff">sidText = sessionIdText sid</span>
+<span class="lineno">  566 </span><span class="spaces">  </span><span class="istickedoff">dbg (&quot;[watch] sendWatchNotification sid=&quot; &lt;&gt; sidText)</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">-- Resolve the tab index (for the &quot;Tab N&quot; prefix) from GET /api/tabs,</span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">-- and the session display title (the same label the web frontend's</span>
+<span class="lineno">  569 </span><span class="spaces">  </span><span class="istickedoff">-- sidebar shows) from GET /api/sessions. The title cascade mirrors</span>
+<span class="lineno">  570 </span><span class="spaces">  </span><span class="istickedoff">-- the frontend's sessionDisplayTitle: description, autoSummary,</span>
+<span class="lineno">  571 </span><span class="spaces">  </span><span class="istickedoff">-- firstMessageSnippet, agent, short id.</span>
+<span class="lineno">  572 </span><span class="spaces">  </span><span class="istickedoff">tabIdx &lt;- do</span>
+<span class="lineno">  573 </span><span class="spaces">    </span><span class="istickedoff">eTabs &lt;- httpGetTabs mgr apiBase</span>
+<span class="lineno">  574 </span><span class="spaces">    </span><span class="istickedoff">case eTabs of</span>
+<span class="lineno">  575 </span><span class="spaces">      </span><span class="istickedoff">Right tabs -&gt;</span>
+<span class="lineno">  576 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case [ t | t &lt;- tabs, tjSessionId t == Just sidText ] of</span></span>
+<span class="lineno">  577 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(t : _) -&gt; pure (case mkTabIndex (tjIndex t) of</span></span>
+<span class="lineno">  578 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right idx -&gt; T.singleton (tabIndexToChar idx)</span></span>
+<span class="lineno">  579 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left _    -&gt; T.pack (show (tjIndex t)))</span></span>
+<span class="lineno">  580 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[]      -&gt; pure &quot;?&quot;</span></span>
+<span class="lineno">  581 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; pure &quot;?&quot;</span>
+<span class="lineno">  582 </span><span class="spaces">  </span><span class="istickedoff">sessionTitle &lt;- do</span>
+<span class="lineno">  583 </span><span class="spaces">    </span><span class="istickedoff">eSessions &lt;- httpGetSessions mgr apiBase</span>
+<span class="lineno">  584 </span><span class="spaces">    </span><span class="istickedoff">case eSessions of</span>
+<span class="lineno">  585 </span><span class="spaces">      </span><span class="istickedoff">Right sessions -&gt;</span>
+<span class="lineno">  586 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case [ s | s &lt;- sessions, sessionJsonId s == Just sidText ] of</span></span>
+<span class="lineno">  587 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(s : _) -&gt; pure (sessionDisplayTitle s)</span></span>
+<span class="lineno">  588 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[]      -&gt; pure sidText</span></span>
+<span class="lineno">  589 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; pure sidText</span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">mReply &lt;- do</span>
+<span class="lineno">  591 </span><span class="spaces">    </span><span class="istickedoff">eEntries &lt;- httpGetTranscript mgr apiBase sid</span>
+<span class="lineno">  592 </span><span class="spaces">    </span><span class="istickedoff">case eEntries of</span>
+<span class="lineno">  593 </span><span class="spaces">      </span><span class="istickedoff">Right entries -&gt; <span class="nottickedoff">pure (lastAssistantText entries)</span></span>
+<span class="lineno">  594 </span><span class="spaces">      </span><span class="istickedoff">Left _        -&gt; pure Nothing</span>
+<span class="lineno">  595 </span><span class="spaces">  </span><span class="istickedoff">dbg (&quot;[watch] notification tabIdx=&quot; &lt;&gt; tabIdx &lt;&gt; &quot; sessionTitle=&quot; &lt;&gt; sessionTitle &lt;&gt; &quot; hasReply=&quot; &lt;&gt; (case mReply of Just _ -&gt; <span class="nottickedoff">&quot;true&quot;</span>; Nothing -&gt; &quot;false&quot;))</span>
+<span class="lineno">  596 </span><span class="spaces">  </span><span class="istickedoff">let header = &quot;\x1F4D4 Tab &quot; &lt;&gt; tabIdx &lt;&gt; &quot; (&quot; &lt;&gt; sessionTitle &lt;&gt; &quot;) finished thinking&quot;</span>
+<span class="lineno">  597 </span><span class="spaces">  </span><span class="istickedoff">case mReply of</span>
+<span class="lineno">  598 </span><span class="spaces">    </span><span class="istickedoff">Just reply | <span class="nottickedoff">not (T.null reply)</span> -&gt; <span class="nottickedoff">ccSend chan (header &lt;&gt; &quot;:\n&quot; &lt;&gt; reply)</span></span>
+<span class="lineno">  599 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; ccSend chan header</span></span>
+<span class="lineno">  600 </span>
+<span class="lineno">  601 </span>-- | Extract the @id@ field from a session info JSON object (from
+<span class="lineno">  602 </span>-- @GET /api/sessions@). Returns 'Nothing' when the field is missing or
+<span class="lineno">  603 </span>-- not a string. Pure.
+<span class="lineno">  604 </span>sessionJsonId :: Value -&gt; Maybe Text
+<span class="lineno">  605 </span><span class="decl"><span class="nottickedoff">sessionJsonId (A.Object o) = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;id&quot;) o</span>
+<span class="lineno">  606 </span><span class="spaces"></span><span class="nottickedoff">sessionJsonId _ = Nothing</span></span>
+<span class="lineno">  607 </span>
+<span class="lineno">  608 </span>-- | Derive the display title from a session info JSON object, mirroring
+<span class="lineno">  609 </span>-- the web frontend's @sessionDisplayTitle@ cascade:
+<span class="lineno">  610 </span>-- @description -&gt; autoSummary -&gt; firstMessageSnippet -&gt; agent -&gt; short id@.
+<span class="lineno">  611 </span>-- Pure.
+<span class="lineno">  612 </span>sessionDisplayTitle :: Value -&gt; Text
+<span class="lineno">  613 </span><span class="decl"><span class="nottickedoff">sessionDisplayTitle val =</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="nottickedoff">case val of</span>
+<span class="lineno">  615 </span><span class="spaces">    </span><span class="nottickedoff">A.Object o -&gt;</span>
+<span class="lineno">  616 </span><span class="spaces">      </span><span class="nottickedoff">fromMaybe (shortId o) (firstNonEmpty</span>
+<span class="lineno">  617 </span><span class="spaces">        </span><span class="nottickedoff">[ asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;description&quot;) o</span>
+<span class="lineno">  618 </span><span class="spaces">        </span><span class="nottickedoff">, asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;auto_summary&quot;) o</span>
+<span class="lineno">  619 </span><span class="spaces">        </span><span class="nottickedoff">, asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;autoSummary&quot;) o</span>
+<span class="lineno">  620 </span><span class="spaces">        </span><span class="nottickedoff">, asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;first_message_snippet&quot;) o</span>
+<span class="lineno">  621 </span><span class="spaces">        </span><span class="nottickedoff">, asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;firstMessageSnippet&quot;) o</span>
+<span class="lineno">  622 </span><span class="spaces">        </span><span class="nottickedoff">, asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;agent&quot;) o</span>
+<span class="lineno">  623 </span><span class="spaces">        </span><span class="nottickedoff">])</span>
+<span class="lineno">  624 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; &quot;?&quot;</span>
+<span class="lineno">  625 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  626 </span><span class="spaces">    </span><span class="nottickedoff">firstNonEmpty = foldr (\m acc -&gt; case m of</span>
+<span class="lineno">  627 </span><span class="spaces">      </span><span class="nottickedoff">Just t | not (T.null t) -&gt; Just t</span>
+<span class="lineno">  628 </span><span class="spaces">      </span><span class="nottickedoff">_                       -&gt; acc) Nothing</span>
+<span class="lineno">  629 </span><span class="spaces">    </span><span class="nottickedoff">shortId o =</span>
+<span class="lineno">  630 </span><span class="spaces">      </span><span class="nottickedoff">maybe &quot;?&quot; (T.take 12)</span>
+<span class="lineno">  631 </span><span class="spaces">        </span><span class="nottickedoff">(asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;id&quot;) o)</span></span>
+<span class="lineno">  632 </span>
+<span class="lineno">  633 </span>
+<span class="lineno">  634 </span>-- | Handle an @entry-update@ event: create or edit the streaming bubble.
+<span class="lineno">  635 </span>handleEntryUpdate
+<span class="lineno">  636 </span>  :: ChatChannel c
+<span class="lineno">  637 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  638 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  639 </span>  -&gt; Value -&gt; IO ()
+<span class="lineno">  640 </span><span class="decl"><span class="istickedoff">handleEntryUpdate cfg chan key wsConns val = do</span>
+<span class="lineno">  641 </span><span class="spaces">  </span><span class="istickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  642 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup key conns of</span>
+<span class="lineno">  643 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span>  -- no streaming state; ignore</span>
+<span class="lineno">  644 </span><span class="spaces">    </span><span class="istickedoff">Just (_, ss) -&gt; do</span>
+<span class="lineno">  645 </span><span class="spaces">      </span><span class="istickedoff">let streamCfg = cccStreamCfg cfg</span>
+<span class="lineno">  646 </span><span class="spaces">          </span><span class="istickedoff">text = extractEntryText val</span>
+<span class="lineno">  647 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">T.null text</span></span>
+<span class="lineno">  648 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  649 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  650 </span><span class="spaces">          </span><span class="istickedoff">-- Post-finalize guard (issue #198 follow-up): a late</span>
+<span class="lineno">  651 </span><span class="spaces">          </span><span class="istickedoff">-- entry-update can arrive AFTER the turn's recorded entry</span>
+<span class="lineno">  652 </span><span class="spaces">          </span><span class="istickedoff">-- (the server's streaming path and the post-turn broadcast</span>
+<span class="lineno">  653 </span><span class="spaces">          </span><span class="istickedoff">-- are unsynchronized). Editing now would overwrite the</span>
+<span class="lineno">  654 </span><span class="spaces">          </span><span class="istickedoff">-- finalized text and re-add the cursor. Ignore updates</span>
+<span class="lineno">  655 </span><span class="spaces">          </span><span class="istickedoff">-- entirely while the turn is finalized.</span>
+<span class="lineno">  656 </span><span class="spaces">          </span><span class="istickedoff">finalized &lt;- readIORef (ssFinalized ss)</span>
+<span class="lineno">  657 </span><span class="spaces">          </span><span class="istickedoff">unless finalized $ do</span>
+<span class="lineno">  658 </span><span class="spaces">            </span><span class="istickedoff">writeIORef (ssAccumulated ss) text</span>
+<span class="lineno">  659 </span><span class="spaces">            </span><span class="istickedoff">-- For channels that don't support streaming (Signal), just</span>
+<span class="lineno">  660 </span><span class="spaces">            </span><span class="istickedoff">-- accumulate the text without sending intermediate edits.</span>
+<span class="lineno">  661 </span><span class="spaces">            </span><span class="istickedoff">-- The final text is sent as a single message when the</span>
+<span class="lineno">  662 </span><span class="spaces">            </span><span class="istickedoff">-- recorded entry or idle status arrives (finalizeBubble).</span>
+<span class="lineno">  663 </span><span class="spaces">            </span><span class="istickedoff">when (ccSupportsStreaming <span class="nottickedoff">chan</span>) $ do</span>
+<span class="lineno">  664 </span><span class="spaces">              </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  665 </span><span class="spaces">              </span><span class="istickedoff">mLastEdit &lt;- readIORef (ssLastEdit ss)</span>
+<span class="lineno">  666 </span><span class="spaces">              </span><span class="istickedoff">mMsgId &lt;- readIORef (ssMsgId ss)</span>
+<span class="lineno">  667 </span><span class="spaces">              </span><span class="istickedoff">-- Gate on NEW text since the last edit, not the total length</span>
+<span class="lineno">  668 </span><span class="spaces">              </span><span class="istickedoff">-- (issue #198, part 3). The accumulator only grows within a</span>
+<span class="lineno">  669 </span><span class="spaces">              </span><span class="istickedoff">-- response, so a total-length threshold degenerates to an edit</span>
+<span class="lineno">  670 </span><span class="spaces">              </span><span class="istickedoff">-- on EVERY frame once the text passes spcBufferThreshold —</span>
+<span class="lineno">  671 </span><span class="spaces">              </span><span class="istickedoff">-- one outbound platform edit per arriving WS frame (the</span>
+<span class="lineno">  672 </span><span class="spaces">              </span><span class="istickedoff">-- 'lots of small updates' flood). Measuring the delta since</span>
+<span class="lineno">  673 </span><span class="spaces">              </span><span class="istickedoff">-- the last edit keeps the cadence the config intends: an edit</span>
+<span class="lineno">  674 </span><span class="spaces">              </span><span class="istickedoff">-- per interval, or per 80 NEW codepoints, whichever first.</span>
+<span class="lineno">  675 </span><span class="spaces">              </span><span class="istickedoff">lastLen &lt;- readIORef (ssLastLen ss)</span>
+<span class="lineno">  676 </span><span class="spaces">              </span><span class="istickedoff">when (shouldEdit streamCfg <span class="nottickedoff">now</span> mLastEdit (T.length text - lastLen)) $ do</span>
+<span class="lineno">  677 </span><span class="spaces">                </span><span class="istickedoff">let content = addCursor streamCfg text</span>
+<span class="lineno">  678 </span><span class="spaces">                </span><span class="istickedoff">case mMsgId of</span>
+<span class="lineno">  679 </span><span class="spaces">                  </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  680 </span><span class="spaces">                    </span><span class="istickedoff">mId &lt;- ccSendWithId chan content</span>
+<span class="lineno">  681 </span><span class="spaces">                    </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  682 </span><span class="spaces">                      </span><span class="istickedoff">Just id' -&gt; do</span>
+<span class="lineno">  683 </span><span class="spaces">                        </span><span class="istickedoff">writeIORef (ssMsgId ss) (Just <span class="nottickedoff">id'</span>)</span>
+<span class="lineno">  684 </span><span class="spaces">                        </span><span class="istickedoff">writeIORef (ssLastEdit ss) <span class="nottickedoff">(Just now)</span></span>
+<span class="lineno">  685 </span><span class="spaces">                        </span><span class="istickedoff">writeIORef (ssLastLen ss) <span class="nottickedoff">(T.length text)</span></span>
+<span class="lineno">  686 </span><span class="spaces">                      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  687 </span><span class="spaces">                  </span><span class="istickedoff">Just id' -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  688 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">ok &lt;- ccEditMessage chan id' content</span></span>
+<span class="lineno">  689 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">when ok $ do</span></span>
+<span class="lineno">  690 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">writeIORef (ssLastEdit ss) (Just now)</span></span>
+<span class="lineno">  691 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">writeIORef (ssLastLen ss) (T.length text)</span></span></span>
+<span class="lineno">  692 </span>
+<span class="lineno">  693 </span>-- | Finalize the current streaming bubble for one conversation: edit it
+<span class="lineno">  694 </span>-- without the cursor (or, if the edit fails, send the full text as a new
+<span class="lineno">  695 </span>-- message), then reset the bubble state so the next entry-update starts
+<span class="lineno">  696 </span>-- a fresh bubble. Does nothing when no bubble exists or nothing was
+<span class="lineno">  697 </span>-- streamed. When @markFinal@ is 'True' (the turn's recorded response
+<span class="lineno">  698 </span>-- entry — the definitive delivery), sets 'ssFinalized' so late
+<span class="lineno">  699 </span>-- entry-updates are ignored until the next turn starts.
+<span class="lineno">  700 </span>finalizeBubble
+<span class="lineno">  701 </span>  :: ChatChannel c
+<span class="lineno">  702 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; StreamingState -&gt; Text -&gt; Bool -&gt; IO ()
+<span class="lineno">  703 </span><span class="decl"><span class="istickedoff">finalizeBubble cfg chan ss text markFinal = do</span>
+<span class="lineno">  704 </span><span class="spaces">  </span><span class="istickedoff">let streamCfg = cccStreamCfg cfg</span>
+<span class="lineno">  705 </span><span class="spaces">      </span><span class="istickedoff">finalText = stripCursor streamCfg text</span>
+<span class="lineno">  706 </span><span class="spaces">  </span><span class="istickedoff">mMsgId &lt;- readIORef (ssMsgId ss)</span>
+<span class="lineno">  707 </span><span class="spaces">  </span><span class="istickedoff">delivered &lt;- case mMsgId of</span>
+<span class="lineno">  708 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">isJust</span> &lt;$&gt; ccSendWithId chan finalText</span>
+<span class="lineno">  709 </span><span class="spaces">    </span><span class="istickedoff">Just id' -&gt; do</span>
+<span class="lineno">  710 </span><span class="spaces">      </span><span class="istickedoff">ok &lt;- ccEditMessage chan <span class="nottickedoff">id'</span> finalText</span>
+<span class="lineno">  711 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlytrue">ok</span></span>
+<span class="lineno">  712 </span><span class="spaces">        </span><span class="istickedoff">then pure True</span>
+<span class="lineno">  713 </span><span class="spaces">        </span><span class="istickedoff">else <span class="nottickedoff">isJust &lt;$&gt; ccSendWithId chan finalText</span></span>
+<span class="lineno">  714 </span><span class="spaces">  </span><span class="istickedoff">when (markFinal &amp;&amp; delivered) $ writeIORef (ssFinalized ss) True</span>
+<span class="lineno">  715 </span><span class="spaces">  </span><span class="istickedoff">resetStreamingState ss</span></span>
+<span class="lineno">  716 </span>
+<span class="lineno">  717 </span>-- | Handle an @entry@ event (complete transcript entry): finalize the
+<span class="lineno">  718 </span>-- streaming bubble with the definitive text (mark the turn final).
+<span class="lineno">  719 </span>handleEntry
+<span class="lineno">  720 </span>  :: ChatChannel c
+<span class="lineno">  721 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  722 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  723 </span>  -&gt; Value -&gt; IO ()
+<span class="lineno">  724 </span><span class="decl"><span class="istickedoff">handleEntry cfg chan key wsConns val = do</span>
+<span class="lineno">  725 </span><span class="spaces">  </span><span class="istickedoff">-- Only process response entries (skip request entries which would</span>
+<span class="lineno">  726 </span><span class="spaces">  </span><span class="istickedoff">-- incorrectly finalize the streaming bubble with the user's text).</span>
+<span class="lineno">  727 </span><span class="spaces">  </span><span class="istickedoff">let direction = extractDirection val</span>
+<span class="lineno">  728 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">direction /= &quot;response&quot;</span></span>
+<span class="lineno">  729 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  730 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  731 </span><span class="spaces">      </span><span class="istickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  732 </span><span class="spaces">      </span><span class="istickedoff">case Map.lookup key conns of</span>
+<span class="lineno">  733 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  734 </span><span class="spaces">        </span><span class="istickedoff">Just (_, ss) -&gt; do</span>
+<span class="lineno">  735 </span><span class="spaces">          </span><span class="istickedoff">let text = extractEntryText val</span>
+<span class="lineno">  736 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">T.null text</span></span>
+<span class="lineno">  737 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  738 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  739 </span><span class="spaces">              </span><span class="istickedoff">-- The recorded entry is the definitive delivery: mark the</span>
+<span class="lineno">  740 </span><span class="spaces">              </span><span class="istickedoff">-- turn finalized so late entry-updates are ignored.</span>
+<span class="lineno">  741 </span><span class="spaces">              </span><span class="istickedoff">-- For non-streaming channels, the recorded entry's text</span>
+<span class="lineno">  742 </span><span class="spaces">              </span><span class="istickedoff">-- is the authoritative full response — send it even if</span>
+<span class="lineno">  743 </span><span class="spaces">              </span><span class="istickedoff">-- we already sent the accumulated text via idle (the</span>
+<span class="lineno">  744 </span><span class="spaces">              </span><span class="istickedoff">-- recorded entry is the canonical source). Skip if we</span>
+<span class="lineno">  745 </span><span class="spaces">              </span><span class="istickedoff">-- already delivered via finalizeBubble (mMsgId was set</span>
+<span class="lineno">  746 </span><span class="spaces">              </span><span class="istickedoff">-- and finalized).</span>
+<span class="lineno">  747 </span><span class="spaces">              </span><span class="istickedoff">alreadyDelivered &lt;- readIORef (ssFinalized ss)</span>
+<span class="lineno">  748 </span><span class="spaces">              </span><span class="istickedoff">if <span class="tickonlyfalse">alreadyDelivered</span></span>
+<span class="lineno">  749 </span><span class="spaces">                </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  750 </span><span class="spaces">                </span><span class="istickedoff">else finalizeBubble cfg chan ss text True</span></span>
+<span class="lineno">  751 </span>
+<span class="lineno">  752 </span>-- | Handle an @activity@ event: if harness-status is idle, finalize any
+<span class="lineno">  753 </span>-- in-progress streaming bubble.
+<span class="lineno">  754 </span>handleActivity
+<span class="lineno">  755 </span>  :: ChatChannel c
+<span class="lineno">  756 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  757 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  758 </span>  -&gt; Value -&gt; IO ()
+<span class="lineno">  759 </span><span class="decl"><span class="istickedoff">handleActivity cfg chan key wsConns val = do</span>
+<span class="lineno">  760 </span><span class="spaces">  </span><span class="istickedoff">let kind = extractActivityKind val</span>
+<span class="lineno">  761 </span><span class="spaces">  </span><span class="istickedoff">case kind of</span>
+<span class="lineno">  762 </span><span class="spaces">    </span><span class="istickedoff">&quot;harness-status&quot; -&gt; handleHarnessStatus cfg chan key wsConns val</span>
+<span class="lineno">  763 </span><span class="spaces">    </span><span class="istickedoff">&quot;tool-call&quot; -&gt; handleToolCallActivity cfg chan key wsConns val</span>
+<span class="lineno">  764 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure ()</span></span></span>
+<span class="lineno">  765 </span>
+<span class="lineno">  766 </span>-- | Handle a @harness-status@ activity: on @thinking@ (turn start),
+<span class="lineno">  767 </span>-- clear the finalized flag so the new turn streams. On @idle@ (turn
+<span class="lineno">  768 </span>-- end), finalize any in-progress streaming bubble with the accumulated
+<span class="lineno">  769 </span>-- text (a safety net — the recorded entry is the normal finalize path)
+<span class="lineno">  770 </span>-- and reset all streaming state.
+<span class="lineno">  771 </span>handleHarnessStatus
+<span class="lineno">  772 </span>  :: ChatChannel c
+<span class="lineno">  773 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  774 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  775 </span>  -&gt; Value -&gt; IO ()
+<span class="lineno">  776 </span><span class="decl"><span class="istickedoff">handleHarnessStatus cfg chan key wsConns val = do</span>
+<span class="lineno">  777 </span><span class="spaces">    </span><span class="istickedoff">let status = extractActivityStatus val</span>
+<span class="lineno">  778 </span><span class="spaces">    </span><span class="istickedoff">case status of</span>
+<span class="lineno">  779 </span><span class="spaces">      </span><span class="istickedoff">&quot;thinking&quot; -&gt; do</span>
+<span class="lineno">  780 </span><span class="spaces">        </span><span class="istickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  781 </span><span class="spaces">        </span><span class="istickedoff">for_ (Map.lookup key conns) $ \(_, ss) -&gt;</span>
+<span class="lineno">  782 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (ssFinalized ss) False</span>
+<span class="lineno">  783 </span><span class="spaces">      </span><span class="istickedoff">&quot;idle&quot; -&gt; do</span>
+<span class="lineno">  784 </span><span class="spaces">        </span><span class="istickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  785 </span><span class="spaces">        </span><span class="istickedoff">case Map.lookup key conns of</span>
+<span class="lineno">  786 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  787 </span><span class="spaces">          </span><span class="istickedoff">Just (_, ss) -&gt; do</span>
+<span class="lineno">  788 </span><span class="spaces">            </span><span class="istickedoff">mMsgId &lt;- readIORef (ssMsgId ss)</span>
+<span class="lineno">  789 </span><span class="spaces">            </span><span class="istickedoff">accum &lt;- readIORef (ssAccumulated ss)</span>
+<span class="lineno">  790 </span><span class="spaces">            </span><span class="istickedoff">-- For non-streaming channels (Signal), the accumulated text</span>
+<span class="lineno">  791 </span><span class="spaces">            </span><span class="istickedoff">-- is the full response. Send it as a new message (mMsgId is</span>
+<span class="lineno">  792 </span><span class="spaces">            </span><span class="istickedoff">-- Nothing because no streaming bubble was created). For</span>
+<span class="lineno">  793 </span><span class="spaces">            </span><span class="istickedoff">-- streaming channels, only finalize if there's an active</span>
+<span class="lineno">  794 </span><span class="spaces">            </span><span class="istickedoff">-- streaming bubble (mMsgId is Just).</span>
+<span class="lineno">  795 </span><span class="spaces">            </span><span class="istickedoff">-- Don't mark as finalized — the recorded entry is the</span>
+<span class="lineno">  796 </span><span class="spaces">            </span><span class="istickedoff">-- canonical finalize path. This is just a safety net.</span>
+<span class="lineno">  797 </span><span class="spaces">            </span><span class="istickedoff">when (not (T.null accum) &amp;&amp;</span>
+<span class="lineno">  798 </span><span class="spaces">                  </span><span class="istickedoff">(not (ccSupportsStreaming <span class="nottickedoff">chan</span>) || isJust mMsgId)) $</span>
+<span class="lineno">  799 </span><span class="spaces">              </span><span class="istickedoff">finalizeBubble cfg chan ss accum False</span>
+<span class="lineno">  800 </span><span class="spaces">            </span><span class="istickedoff">resetStreamingState ss</span>
+<span class="lineno">  801 </span><span class="spaces">            </span><span class="istickedoff">writeIORef (ssFinalized ss) <span class="nottickedoff">True</span></span>
+<span class="lineno">  802 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure ()</span></span></span>
+<span class="lineno">  803 </span>
+<span class="lineno">  804 </span>-- | Handle a @tool-call@ activity: finalize the current text bubble
+<span class="lineno">  805 </span>-- (segment break — the pre-tool text stays its own message, and the
+<span class="lineno">  806 </span>-- next entry-update starts a NEW bubble below the tool line), then send
+<span class="lineno">  807 </span>-- the tool-progress line as its own platform message.
+<span class="lineno">  808 </span>handleToolCallActivity
+<span class="lineno">  809 </span>  :: ChatChannel c
+<span class="lineno">  810 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno">  811 </span>  -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  812 </span>  -&gt; Value -&gt; IO ()
+<span class="lineno">  813 </span><span class="decl"><span class="istickedoff">handleToolCallActivity cfg chan key wsConns val = do</span>
+<span class="lineno">  814 </span><span class="spaces">  </span><span class="istickedoff">-- Segment break (issue #198 follow-up, symptom 1): the pre-tool</span>
+<span class="lineno">  815 </span><span class="spaces">  </span><span class="istickedoff">-- streamed text and the post-tool streamed text must be SEPARATE</span>
+<span class="lineno">  816 </span><span class="spaces">  </span><span class="istickedoff">-- platform messages, with the tool line between them. Without this,</span>
+<span class="lineno">  817 </span><span class="spaces">  </span><span class="istickedoff">-- the next entry-update edits the pre-tool bubble (ssMsgId is still</span>
+<span class="lineno">  818 </span><span class="spaces">  </span><span class="istickedoff">-- set) and appends the post-tool text onto the pre-tool text.</span>
+<span class="lineno">  819 </span><span class="spaces">  </span><span class="istickedoff">conns &lt;- readTVarIO wsConns</span>
+<span class="lineno">  820 </span><span class="spaces">  </span><span class="istickedoff">for_ (Map.lookup key conns) $ \(_, ss) -&gt; do</span>
+<span class="lineno">  821 </span><span class="spaces">    </span><span class="istickedoff">mMsgId &lt;- readIORef (ssMsgId ss)</span>
+<span class="lineno">  822 </span><span class="spaces">    </span><span class="istickedoff">accum &lt;- readIORef (ssAccumulated ss)</span>
+<span class="lineno">  823 </span><span class="spaces">    </span><span class="istickedoff">-- For non-streaming channels, finalize when there's accumulated text</span>
+<span class="lineno">  824 </span><span class="spaces">    </span><span class="istickedoff">-- even without a streaming bubble (mMsgId is Nothing). For streaming</span>
+<span class="lineno">  825 </span><span class="spaces">    </span><span class="istickedoff">-- channels, only finalize when there's an in-progress bubble.</span>
+<span class="lineno">  826 </span><span class="spaces">    </span><span class="istickedoff">when (not (T.null accum) &amp;&amp;</span>
+<span class="lineno">  827 </span><span class="spaces">          </span><span class="istickedoff">(not (ccSupportsStreaming <span class="nottickedoff">chan</span>) || isJust mMsgId)) $</span>
+<span class="lineno">  828 </span><span class="spaces">      </span><span class="istickedoff">finalizeBubble cfg chan ss accum False</span>
+<span class="lineno">  829 </span><span class="spaces">  </span><span class="istickedoff">case extractToolName val of</span>
+<span class="lineno">  830 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  831 </span><span class="spaces">    </span><span class="istickedoff">Just toolName -&gt; do</span>
+<span class="lineno">  832 </span><span class="spaces">      </span><span class="istickedoff">let mInput = extractToolInput val</span>
+<span class="lineno">  833 </span><span class="spaces">          </span><span class="istickedoff">line = formatToolLine mempty toolName (fromMaybe <span class="nottickedoff">&quot;&quot;</span> mInput)</span>
+<span class="lineno">  834 </span><span class="spaces">      </span><span class="istickedoff">ccSend chan line</span></span>
+<span class="lineno">  835 </span>
+<span class="lineno">  836 </span>-- | Handle an @ask@ event: render the question on the platform. When the
+<span class="lineno">  837 </span>-- ask has options and the channel supports inline keyboards, sends the
+<span class="lineno">  838 </span>-- question + an inline keyboard (one button per option). Otherwise falls
+<span class="lineno">  839 </span>-- back to the numbered-list text rendering. Registers the pending ask so
+<span class="lineno">  840 </span>-- the callback handler can resolve a button tap to the option label.
+<span class="lineno">  841 </span>handleAsk
+<span class="lineno">  842 </span>  :: ChatChannel c
+<span class="lineno">  843 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey -&gt; PendingAsks -&gt; SessionId -&gt; Value
+<span class="lineno">  844 </span>  -&gt; IO ()
+<span class="lineno">  845 </span><span class="decl"><span class="nottickedoff">handleAsk _cfg chan _key pendingAsks sid val = do</span>
+<span class="lineno">  846 </span><span class="spaces">  </span><span class="nottickedoff">let question = extractAskQuestion val</span>
+<span class="lineno">  847 </span><span class="spaces">      </span><span class="nottickedoff">askId = extractAskId val</span>
+<span class="lineno">  848 </span><span class="spaces">      </span><span class="nottickedoff">opts = extractAskOptions val</span>
+<span class="lineno">  849 </span><span class="spaces">  </span><span class="nottickedoff">if null opts</span>
+<span class="lineno">  850 </span><span class="spaces">    </span><span class="nottickedoff">then ccSend chan question</span>
+<span class="lineno">  851 </span><span class="spaces">    </span><span class="nottickedoff">else do</span>
+<span class="lineno">  852 </span><span class="spaces">      </span><span class="nottickedoff">let prefix = T.take 8 askId</span>
+<span class="lineno">  853 </span><span class="spaces">      </span><span class="nottickedoff">mMsgId &lt;- ccSendWithOptions chan question opts prefix</span>
+<span class="lineno">  854 </span><span class="spaces">      </span><span class="nottickedoff">case mMsgId of</span>
+<span class="lineno">  855 </span><span class="spaces">        </span><span class="nottickedoff">Just _  -&gt; pure ()</span>
+<span class="lineno">  856 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; ccSend chan (formatQuestionWithOptions question opts)</span>
+<span class="lineno">  857 </span><span class="spaces">      </span><span class="nottickedoff">let entry = PendingAsk { paAskId = askId, paOptions = opts }</span>
+<span class="lineno">  858 </span><span class="spaces">      </span><span class="nottickedoff">atomically (modifyTVar' pendingAsks (Map.insertWith (++) sid [entry]))</span></span>
+<span class="lineno">  859 </span>
+<span class="lineno">  860 </span>-- | Send a plain text message via the HTTP API. Resolves the conversation's
+<span class="lineno">  861 </span>-- session (creating one if it doesn't exist yet).
+<span class="lineno">  862 </span>sendPlain
+<span class="lineno">  863 </span>  :: ChatChannel c
+<span class="lineno">  864 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  865 </span>  -&gt; PendingAsks -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  866 </span>  -&gt; WatchState -&gt; ThinkingTabs
+<span class="lineno">  867 </span>  -&gt; ConversationKey -&gt; Text
+<span class="lineno">  868 </span>  -&gt; IO ()
+<span class="lineno">  869 </span><span class="decl"><span class="nottickedoff">sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text = do</span>
+<span class="lineno">  870 </span><span class="spaces">  </span><span class="nottickedoff">sid &lt;- resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key</span>
+<span class="lineno">  871 </span><span class="spaces">  </span><span class="nottickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  872 </span><span class="spaces">      </span><span class="nottickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  873 </span><span class="spaces">  </span><span class="nottickedoff">eResult &lt;- httpSend mgr apiBase sid text</span>
+<span class="lineno">  874 </span><span class="spaces">  </span><span class="nottickedoff">case eResult of</span>
+<span class="lineno">  875 </span><span class="spaces">    </span><span class="nottickedoff">Right sr | srKind sr == &quot;error&quot; -&gt; ccSend chan (fromMaybe &quot;error&quot; (srError sr))</span>
+<span class="lineno">  876 </span><span class="spaces">    </span><span class="nottickedoff">Right sr | not (T.null (srResponse sr)) -&gt; ccSend chan (srResponse sr)</span>
+<span class="lineno">  877 </span><span class="spaces">    </span><span class="nottickedoff">Right _ -&gt; pure ()  -- assistant response comes via WS</span>
+<span class="lineno">  878 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; ccSend chan (&quot;error: &quot; &lt;&gt; e)</span></span>
+<span class="lineno">  879 </span>
+<span class="lineno">  880 </span>-- | Send a slash command via the HTTP API.
+<span class="lineno">  881 </span>sendSlash
+<span class="lineno">  882 </span>  :: ChatChannel c
+<span class="lineno">  883 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  884 </span>  -&gt; PendingAsks -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  885 </span>  -&gt; WatchState -&gt; ThinkingTabs
+<span class="lineno">  886 </span>  -&gt; ConversationKey -&gt; Text
+<span class="lineno">  887 </span>  -&gt; IO ()
+<span class="lineno">  888 </span><span class="decl"><span class="nottickedoff">sendSlash = sendPlain</span></span>  -- same mechanism; the gateway routes slash commands
+<span class="lineno">  889 </span>
+<span class="lineno">  890 </span>-- | Handle /new: create a new session via HTTP, update the session map.
+<span class="lineno">  891 </span>handleNewSession
+<span class="lineno">  892 </span>  :: ChatChannel c
+<span class="lineno">  893 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  894 </span>  -&gt; PendingAsks -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  895 </span>  -&gt; WatchState -&gt; ThinkingTabs
+<span class="lineno">  896 </span>  -&gt; ConversationKey -&gt; Text
+<span class="lineno">  897 </span>  -&gt; IO ()
+<span class="lineno">  898 </span><span class="decl"><span class="nottickedoff">handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key _args = do</span>
+<span class="lineno">  899 </span><span class="spaces">  </span><span class="nottickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  900 </span><span class="spaces">      </span><span class="nottickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  901 </span><span class="spaces">  </span><span class="nottickedoff">eSid &lt;- httpNewSession mgr apiBase (A.object [])</span>
+<span class="lineno">  902 </span><span class="spaces">  </span><span class="nottickedoff">case eSid of</span>
+<span class="lineno">  903 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; ccSend chan (&quot;new session failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  904 </span><span class="spaces">    </span><span class="nottickedoff">Right sidText -&gt; case mkSessionId sidText of</span>
+<span class="lineno">  905 </span><span class="spaces">      </span><span class="nottickedoff">Left _ -&gt; ccSend chan &quot;new session failed: invalid session id&quot;</span>
+<span class="lineno">  906 </span><span class="spaces">      </span><span class="nottickedoff">Right sid -&gt; do</span>
+<span class="lineno">  907 </span><span class="spaces">        </span><span class="nottickedoff">sessionInsert sessions key sid</span>
+<span class="lineno">  908 </span><span class="spaces">        </span><span class="nottickedoff">-- Ensure a WS connection exists for this conversation.</span>
+<span class="lineno">  909 </span><span class="spaces">        </span><span class="nottickedoff">ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid</span>
+<span class="lineno">  910 </span><span class="spaces">        </span><span class="nottickedoff">ccSend chan (&quot;new session &quot; &lt;&gt; sessionIdText sid)</span></span>
+<span class="lineno">  911 </span>
+<span class="lineno">  912 </span>-- | Resolve the conversation's session. If the conversation has no session
+<span class="lineno">  913 </span>-- yet, create one via the HTTP API.
+<span class="lineno">  914 </span>resolveSession
+<span class="lineno">  915 </span>  :: ChatChannel c =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap -&gt; TVar (Map ConversationKey (WsClient, StreamingState))
+<span class="lineno">  916 </span>  -&gt; PendingAsks -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno">  917 </span>  -&gt; WatchState -&gt; ThinkingTabs
+<span class="lineno">  918 </span>  -&gt; ConversationKey
+<span class="lineno">  919 </span>  -&gt; IO SessionId
+<span class="lineno">  920 </span><span class="decl"><span class="nottickedoff">resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key = do</span>
+<span class="lineno">  921 </span><span class="spaces">  </span><span class="nottickedoff">mSid &lt;- sessionLookup sessions key</span>
+<span class="lineno">  922 </span><span class="spaces">  </span><span class="nottickedoff">case mSid of</span>
+<span class="lineno">  923 </span><span class="spaces">    </span><span class="nottickedoff">Just sid -&gt; pure sid</span>
+<span class="lineno">  924 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; do</span>
+<span class="lineno">  925 </span><span class="spaces">      </span><span class="nottickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  926 </span><span class="spaces">          </span><span class="nottickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  927 </span><span class="spaces">      </span><span class="nottickedoff">eSid &lt;- httpNewSession mgr apiBase (A.object [])</span>
+<span class="lineno">  928 </span><span class="spaces">      </span><span class="nottickedoff">case eSid of</span>
+<span class="lineno">  929 </span><span class="spaces">        </span><span class="nottickedoff">Right sidText -&gt; case mkSessionId sidText of</span>
+<span class="lineno">  930 </span><span class="spaces">          </span><span class="nottickedoff">Right sid -&gt; do</span>
+<span class="lineno">  931 </span><span class="spaces">            </span><span class="nottickedoff">sessionInsert sessions key sid</span>
+<span class="lineno">  932 </span><span class="spaces">            </span><span class="nottickedoff">ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid</span>
+<span class="lineno">  933 </span><span class="spaces">            </span><span class="nottickedoff">pure sid</span>
+<span class="lineno">  934 </span><span class="spaces">          </span><span class="nottickedoff">Left _ -&gt; fallbackSid</span>
+<span class="lineno">  935 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; fallbackSid</span>
+<span class="lineno">  936 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  937 </span><span class="spaces">    </span><span class="nottickedoff">fallbackSid = pure (case mkSessionId &quot;default&quot; of Right s -&gt; s; Left _ -&gt; error &quot;unreachable&quot;)</span></span>
+<span class="lineno">  938 </span>
+<span class="lineno">  939 </span>-- | Fetch and send the last assistant reply from the session's transcript.
+<span class="lineno">  940 </span>sendLastReply
+<span class="lineno">  941 </span>  :: ChatChannel c
+<span class="lineno">  942 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionId -&gt; IO ()
+<span class="lineno">  943 </span><span class="decl"><span class="nottickedoff">sendLastReply cfg chan sid = do</span>
+<span class="lineno">  944 </span><span class="spaces">  </span><span class="nottickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  945 </span><span class="spaces">      </span><span class="nottickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  946 </span><span class="spaces">  </span><span class="nottickedoff">eEntries &lt;- httpGetTranscript mgr apiBase sid</span>
+<span class="lineno">  947 </span><span class="spaces">  </span><span class="nottickedoff">case eEntries of</span>
+<span class="lineno">  948 </span><span class="spaces">    </span><span class="nottickedoff">Left _ -&gt; pure ()</span>
+<span class="lineno">  949 </span><span class="spaces">    </span><span class="nottickedoff">Right entries -&gt; for_ (lastAssistantText entries) (ccSend chan)</span></span>
+<span class="lineno">  950 </span>
+<span class="lineno">  951 </span>-- | Handle a callback query (button tap) from the platform. The callback_data
+<span class="lineno">  952 </span>-- is @&quot;&lt;8hex&gt;:&lt;index&gt;&quot;@. Resolves the 8-hex prefix to a pending ask, resolves
+<span class="lineno">  953 </span>-- the index to the option label, answers via the HTTP API, acknowledges the
+<span class="lineno">  954 </span>-- callback (dismiss the spinner), removes the keyboard, and sends a
+<span class="lineno">  955 </span>-- @✓ &lt;label&gt;@ confirmation. If no pending ask matches, the callback is
+<span class="lineno">  956 </span>-- silently dropped (stale button tap).
+<span class="lineno">  957 </span>handleCallback
+<span class="lineno">  958 </span>  :: ChatChannel c
+<span class="lineno">  959 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; SessionMap -&gt; PendingAsks
+<span class="lineno">  960 </span>  -&gt; ConversationKey -&gt; MessageSource -&gt; Text
+<span class="lineno">  961 </span>  -&gt; IO ()
+<span class="lineno">  962 </span><span class="decl"><span class="nottickedoff">handleCallback cfg chan sessions pendingAsks key _src cbData = do</span>
+<span class="lineno">  963 </span><span class="spaces">  </span><span class="nottickedoff">case parseCallbackData cbData of</span>
+<span class="lineno">  964 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure ()  -- not a valid callback_data format</span>
+<span class="lineno">  965 </span><span class="spaces">    </span><span class="nottickedoff">Just (prefix, idx) -&gt; do</span>
+<span class="lineno">  966 </span><span class="spaces">      </span><span class="nottickedoff">mSid &lt;- sessionLookup sessions key</span>
+<span class="lineno">  967 </span><span class="spaces">      </span><span class="nottickedoff">case mSid of</span>
+<span class="lineno">  968 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  969 </span><span class="spaces">        </span><span class="nottickedoff">Just sid -&gt; do</span>
+<span class="lineno">  970 </span><span class="spaces">          </span><span class="nottickedoff">asksMap &lt;- readTVarIO pendingAsks</span>
+<span class="lineno">  971 </span><span class="spaces">          </span><span class="nottickedoff">case Map.lookup sid asksMap of</span>
+<span class="lineno">  972 </span><span class="spaces">            </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  973 </span><span class="spaces">            </span><span class="nottickedoff">Just asks -&gt;</span>
+<span class="lineno">  974 </span><span class="spaces">              </span><span class="nottickedoff">case [ a | a &lt;- asks, T.isPrefixOf prefix (paAskId a) ] of</span>
+<span class="lineno">  975 </span><span class="spaces">                </span><span class="nottickedoff">(ask : _) -&gt;</span>
+<span class="lineno">  976 </span><span class="spaces">                  </span><span class="nottickedoff">case atIndex (paOptions ask) idx of</span>
+<span class="lineno">  977 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  978 </span><span class="spaces">                    </span><span class="nottickedoff">Just opt -&gt; do</span>
+<span class="lineno">  979 </span><span class="spaces">                      </span><span class="nottickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno">  980 </span><span class="spaces">                          </span><span class="nottickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno">  981 </span><span class="spaces">                      </span><span class="nottickedoff">-- Answer the question via the HTTP API.</span>
+<span class="lineno">  982 </span><span class="spaces">                      </span><span class="nottickedoff">_ &lt;- httpAnswerQuestion mgr apiBase sid (paAskId ask) (qoLabel opt) &quot;once&quot;</span>
+<span class="lineno">  983 </span><span class="spaces">                      </span><span class="nottickedoff">-- Acknowledge the callback (dismiss spinner).</span>
+<span class="lineno">  984 </span><span class="spaces">                      </span><span class="nottickedoff">-- We don't have the callback_query_id here (it's in</span>
+<span class="lineno">  985 </span><span class="spaces">                      </span><span class="nottickedoff">-- the InboundMessage but not passed through). The</span>
+<span class="lineno">  986 </span><span class="spaces">                      </span><span class="nottickedoff">-- ccAnswerCallback method needs it. For now, skip</span>
+<span class="lineno">  987 </span><span class="spaces">                      </span><span class="nottickedoff">-- the callback ack — the button still works, the</span>
+<span class="lineno">  988 </span><span class="spaces">                      </span><span class="nottickedoff">-- spinner just persists a bit longer.</span>
+<span class="lineno">  989 </span><span class="spaces">                      </span><span class="nottickedoff">-- Send a confirmation to the chat.</span>
+<span class="lineno">  990 </span><span class="spaces">                      </span><span class="nottickedoff">ccSend chan (&quot;✓ &quot; &lt;&gt; qoLabel opt)</span>
+<span class="lineno">  991 </span><span class="spaces">                      </span><span class="nottickedoff">let remaining = filter (not . T.isPrefixOf prefix . paAskId) asks</span>
+<span class="lineno">  992 </span><span class="spaces">                      </span><span class="nottickedoff">atomically (modifyTVar' pendingAsks (Map.insert sid remaining))</span>
+<span class="lineno">  993 </span><span class="spaces">                </span><span class="nottickedoff">[] -&gt; pure ()</span></span>
+<span class="lineno">  994 </span>
+<span class="lineno">  995 </span>-- | Handle a @lists@ WS event: compare the new tab list with the last known
+<span class="lineno">  996 </span>-- one for this conversation. If the focused session's tab was removed (closed),
+<span class="lineno">  997 </span>-- send the &quot;tab closed&quot; notification and clear the tracking state so the next
+<span class="lineno">  998 </span>-- message creates a fresh tab. Also seeds the 'ThinkingTabs' set from the
+<span class="lineno">  999 </span>-- snapshot's @thinkingSessionIds@ so tabs already thinking before the WS
+<span class="lineno"> 1000 </span>-- connection was established still trigger a finished notification.
+<span class="lineno"> 1001 </span>handleLists
+<span class="lineno"> 1002 </span>  :: ChatChannel c
+<span class="lineno"> 1003 </span>  =&gt; ChatChannelConfig -&gt; c -&gt; ConversationKey
+<span class="lineno"> 1004 </span>  -&gt; TVar (Map ConversationKey (SessionId, [TabJson]))
+<span class="lineno"> 1005 </span>  -&gt; WatchState -&gt; ThinkingTabs -&gt; Value -&gt; IO ()
+<span class="lineno"> 1006 </span><span class="decl"><span class="istickedoff">handleLists cfg chan key tabTracker watchState thinkingTabs val = do</span>
+<span class="lineno"> 1007 </span><span class="spaces">  </span><span class="istickedoff">-- Seed the thinking-tabs set from the snapshot's thinkingSessionIds.</span>
+<span class="lineno"> 1008 </span><span class="spaces">  </span><span class="istickedoff">-- This is the core fix for the &quot;missed thinking event&quot; problem: when a</span>
+<span class="lineno"> 1009 </span><span class="spaces">  </span><span class="istickedoff">-- WS connection is established (or a lists snapshot is broadcast on tab</span>
+<span class="lineno"> 1010 </span><span class="spaces">  </span><span class="istickedoff">-- changes), sessions that were already thinking before the connection</span>
+<span class="lineno"> 1011 </span><span class="spaces">  </span><span class="istickedoff">-- existed are included in the snapshot. Without this seeding, the</span>
+<span class="lineno"> 1012 </span><span class="spaces">  </span><span class="istickedoff">-- ThinkingTabs set starts empty and the thinking→idle transition is</span>
+<span class="lineno"> 1013 </span><span class="spaces">  </span><span class="istickedoff">-- never detected for those sessions (the idle event arrives but</span>
+<span class="lineno"> 1014 </span><span class="spaces">  </span><span class="istickedoff">-- wasThinking is false → no notification).</span>
+<span class="lineno"> 1015 </span><span class="spaces">  </span><span class="istickedoff">seedThinkingTabsFromLists watchState thinkingTabs key val</span>
+<span class="lineno"> 1016 </span><span class="spaces">  </span><span class="istickedoff">-- Fetch the current tabs from the gateway to get an accurate list.</span>
+<span class="lineno"> 1017 </span><span class="spaces">  </span><span class="istickedoff">let apiBase = gcApiBase (cccGateway cfg)</span>
+<span class="lineno"> 1018 </span><span class="spaces">      </span><span class="istickedoff">mgr = cccHttpManager cfg</span>
+<span class="lineno"> 1019 </span><span class="spaces">  </span><span class="istickedoff">eTabs &lt;- httpGetTabs mgr apiBase</span>
+<span class="lineno"> 1020 </span><span class="spaces">  </span><span class="istickedoff">case eTabs of</span>
+<span class="lineno"> 1021 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno"> 1022 </span><span class="spaces">    </span><span class="istickedoff">Right newTabs -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno"> 1023 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tracker &lt;- readTVarIO tabTracker</span></span>
+<span class="lineno"> 1024 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case Map.lookup key tracker of</span></span>
+<span class="lineno"> 1025 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure ()  -- no tracked session for this conversation</span></span>
+<span class="lineno"> 1026 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just (focusedSid, _oldTabs) -&gt; do</span></span>
+<span class="lineno"> 1027 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">-- Check if the focused session's tab was removed.</span></span>
+<span class="lineno"> 1028 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let newSessionIds = mapMaybe tjSessionId newTabs</span></span>
+<span class="lineno"> 1029 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">if focusedSid `elem` mapMaybe mkSessionId' newSessionIds</span></span>
+<span class="lineno"> 1030 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">then do</span></span>
+<span class="lineno"> 1031 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">-- Tab still exists; update the tracked tab list.</span></span>
+<span class="lineno"> 1032 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">atomically (modifyTVar' tabTracker (Map.insert key (focusedSid, newTabs)))</span></span>
+<span class="lineno"> 1033 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">else do</span></span>
+<span class="lineno"> 1034 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">-- The focused session's tab was closed. Send the notification.</span></span>
+<span class="lineno"> 1035 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">ccSend chan (&quot;tab closed (session &quot; &lt;&gt; sessionIdText focusedSid</span></span>
+<span class="lineno"> 1036 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;); a new tab will be created on your next message&quot;)</span></span>
+<span class="lineno"> 1037 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">-- Clear the tracking state so the next message creates a fresh tab.</span></span>
+<span class="lineno"> 1038 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">atomically (modifyTVar' tabTracker (Map.delete key))</span></span>
+<span class="lineno"> 1039 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1040 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">mkSessionId' t = case mkSessionId t of Right s -&gt; Just s; Left _ -&gt; Nothing</span></span></span>
+<span class="lineno"> 1041 </span>
+<span class="lineno"> 1042 </span>-- | Seed the 'ThinkingTabs' set for a conversation from the
+<span class="lineno"> 1043 </span>-- @thinkingSessionIds@ field in a @lists@ WS event payload. This ensures
+<span class="lineno"> 1044 </span>-- sessions that were already thinking before the WS connection was
+<span class="lineno"> 1045 </span>-- established are tracked, so their eventual @idle@ transition triggers a
+<span class="lineno"> 1046 </span>-- watch notification. Replaces the per-conversation thinking set (rather
+<span class="lineno"> 1047 </span>-- than unioning) so sessions that finished between snapshots are not kept
+<span class="lineno"> 1048 </span>-- stale — the next @thinking@ activity event will re-add them if needed.
+<span class="lineno"> 1049 </span>-- No-op when watch mode is off (the thinking set is only consulted by
+<span class="lineno"> 1050 </span>-- 'handleWatchActivity', which itself checks watch mode, but seeding
+<span class="lineno"> 1051 </span>-- when off would waste memory for no benefit).
+<span class="lineno"> 1052 </span>seedThinkingTabsFromLists :: WatchState -&gt; ThinkingTabs -&gt; ConversationKey -&gt; Value -&gt; IO ()
+<span class="lineno"> 1053 </span><span class="decl"><span class="istickedoff">seedThinkingTabsFromLists watchState thinkingTabs key val = do</span>
+<span class="lineno"> 1054 </span><span class="spaces">  </span><span class="istickedoff">watchOn &lt;- lookupWatch watchState key</span>
+<span class="lineno"> 1055 </span><span class="spaces">  </span><span class="istickedoff">when watchOn $ do</span>
+<span class="lineno"> 1056 </span><span class="spaces">    </span><span class="istickedoff">let sids = extractThinkingSessionIds val</span>
+<span class="lineno"> 1057 </span><span class="spaces">    </span><span class="istickedoff">unless (null sids) $ do</span>
+<span class="lineno"> 1058 </span><span class="spaces">      </span><span class="istickedoff">dbg (&quot;[watch] seeding thinking tabs from lists snapshot: key=&quot; &lt;&gt; ckConv key</span>
+<span class="lineno"> 1059 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; count=&quot; &lt;&gt; T.pack (show (length sids)))</span>
+<span class="lineno"> 1060 </span><span class="spaces">      </span><span class="istickedoff">atomically (modifyTVar' thinkingTabs (Map.insert key (Set.fromList sids)))</span></span>
+<span class="lineno"> 1061 </span>
+<span class="lineno"> 1062 </span>-- | Extract the @thinkingSessionIds@ array from a @lists@ WS event
+<span class="lineno"> 1063 </span>-- payload. Returns the list of valid 'SessionId's. Pure.
+<span class="lineno"> 1064 </span>extractThinkingSessionIds :: Value -&gt; [SessionId]
+<span class="lineno"> 1065 </span><span class="decl"><span class="istickedoff">extractThinkingSessionIds val =</span>
+<span class="lineno"> 1066 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1067 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromText &quot;thinkingSessionIds&quot;) o of</span>
+<span class="lineno"> 1068 </span><span class="spaces">      </span><span class="istickedoff">Just (A.Array arr) -&gt; mapMaybe (\case</span>
+<span class="lineno"> 1069 </span><span class="spaces">        </span><span class="istickedoff">A.String t -&gt; either (const Nothing) Just (mkSessionId t)</span>
+<span class="lineno"> 1070 </span><span class="spaces">        </span><span class="istickedoff">_           -&gt; <span class="nottickedoff">Nothing</span>) (foldr (:) [] arr)</span>
+<span class="lineno"> 1071 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno"> 1072 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span></span>
+<span class="lineno"> 1073 </span>
+<span class="lineno"> 1074 </span>-- | Parse callback_data of the form @&quot;&lt;8hex&gt;:&lt;index&gt;&quot;@. Returns 'Nothing'
+<span class="lineno"> 1075 </span>-- for malformed data. Pure.
+<span class="lineno"> 1076 </span>parseCallbackData :: Text -&gt; Maybe (Text, Int)
+<span class="lineno"> 1077 </span><span class="decl"><span class="istickedoff">parseCallbackData cbData =</span>
+<span class="lineno"> 1078 </span><span class="spaces">  </span><span class="istickedoff">case T.splitOn &quot;:&quot; cbData of</span>
+<span class="lineno"> 1079 </span><span class="spaces">    </span><span class="istickedoff">[prefix, idxTxt]</span>
+<span class="lineno"> 1080 </span><span class="spaces">      </span><span class="istickedoff">| T.length prefix == 8 &amp;&amp; T.all isHexChar prefix</span>
+<span class="lineno"> 1081 </span><span class="spaces">        </span><span class="istickedoff">-&gt; case T.unpack idxTxt of</span>
+<span class="lineno"> 1082 </span><span class="spaces">             </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno"> 1083 </span><span class="spaces">             </span><span class="istickedoff">s  -&gt; case reads s of</span>
+<span class="lineno"> 1084 </span><span class="spaces">                     </span><span class="istickedoff">[(n, &quot;&quot;)] | n &gt;= 0 -&gt; Just (prefix, n)</span>
+<span class="lineno"> 1085 </span><span class="spaces">                     </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno"> 1086 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno"> 1087 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1088 </span><span class="spaces">    </span><span class="istickedoff">isHexChar c = isDigit c || (c &gt;= 'a' &amp;&amp; c &lt;= 'f') || (c &gt;= 'A' &amp;&amp; c &lt;= 'F')</span></span>
+<span class="lineno"> 1089 </span>
+<span class="lineno"> 1090 </span>-- | Safe indexing: return the element at position @n@ or 'Nothing'.
+<span class="lineno"> 1091 </span>atIndex :: [a] -&gt; Int -&gt; Maybe a
+<span class="lineno"> 1092 </span><span class="decl"><span class="nottickedoff">atIndex [] _ = Nothing</span>
+<span class="lineno"> 1093 </span><span class="spaces"></span><span class="nottickedoff">atIndex (x:_) 0 = Just x</span>
+<span class="lineno"> 1094 </span><span class="spaces"></span><span class="nottickedoff">atIndex (_:xs) n = atIndex xs (n - 1)</span></span>
+<span class="lineno"> 1095 </span>
+<span class="lineno"> 1096 </span>-- | Extract the @id@ field from an @ask@ event payload.
+<span class="lineno"> 1097 </span>extractAskId :: Value -&gt; Text
+<span class="lineno"> 1098 </span><span class="decl"><span class="istickedoff">extractAskId val =</span>
+<span class="lineno"> 1099 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1100 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;id&quot;) o)</span>
+<span class="lineno"> 1101 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno"> 1102 </span>
+<span class="lineno"> 1103 </span>-- | Extract the @options@ array from an @ask@ event payload. Each option
+<span class="lineno"> 1104 </span>-- is a JSON object with @label@ and @description@ fields.
+<span class="lineno"> 1105 </span>extractAskOptions :: Value -&gt; [QuestionOption]
+<span class="lineno"> 1106 </span><span class="decl"><span class="istickedoff">extractAskOptions val =</span>
+<span class="lineno"> 1107 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1108 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromText &quot;options&quot;) o of</span>
+<span class="lineno"> 1109 </span><span class="spaces">      </span><span class="istickedoff">Just (A.Array arr) -&gt; mapMaybe parseOption (foldr (:) [] arr)</span>
+<span class="lineno"> 1110 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno"> 1111 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno"> 1112 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1113 </span><span class="spaces">    </span><span class="istickedoff">parseOption (A.Object ob) =</span>
+<span class="lineno"> 1114 </span><span class="spaces">      </span><span class="istickedoff">QuestionOption</span>
+<span class="lineno"> 1115 </span><span class="spaces">        </span><span class="istickedoff">&lt;$&gt; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;label&quot;) ob)</span>
+<span class="lineno"> 1116 </span><span class="spaces">        </span><span class="istickedoff">&lt;*&gt; pure (fromMaybe <span class="nottickedoff">&quot;&quot;</span> (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;description&quot;) ob))</span>
+<span class="lineno"> 1117 </span><span class="spaces">    </span><span class="istickedoff">parseOption _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno"> 1118 </span>
+<span class="lineno"> 1119 </span>-- | Format a question + its options as a numbered list for chat channels
+<span class="lineno"> 1120 </span>-- that don't support inline keyboards (Signal, CLI). Mirrors
+<span class="lineno"> 1121 </span>-- 'Seal.Handles.AskReply.formatQuestionWithOptions'. Pure.
+<span class="lineno"> 1122 </span>formatQuestionWithOptions :: Text -&gt; [QuestionOption] -&gt; Text
+<span class="lineno"> 1123 </span><span class="decl"><span class="istickedoff">formatQuestionWithOptions question [] = question</span>
+<span class="lineno"> 1124 </span><span class="spaces"></span><span class="istickedoff">formatQuestionWithOptions question opts =</span>
+<span class="lineno"> 1125 </span><span class="spaces">  </span><span class="istickedoff">question</span>
+<span class="lineno"> 1126 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno"> 1127 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; T.intercalate &quot;\n&quot; (zipWith formatLine [1 :: Int ..] opts)</span>
+<span class="lineno"> 1128 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n\nReply with a number or type your own answer.&quot;</span>
+<span class="lineno"> 1129 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1130 </span><span class="spaces">    </span><span class="istickedoff">formatLine n (QuestionOption lbl desc)</span>
+<span class="lineno"> 1131 </span><span class="spaces">      </span><span class="istickedoff">| T.null desc = T.pack (show n &lt;&gt; &quot;) &quot;) &lt;&gt; lbl</span>
+<span class="lineno"> 1132 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   = T.pack (show n &lt;&gt; &quot;) &quot;) &lt;&gt; lbl &lt;&gt; &quot; — &quot; &lt;&gt; desc</span></span>
+<span class="lineno"> 1133 </span>
+<span class="lineno"> 1134 </span>-- ---------------------------------------------------------------------------
+<span class="lineno"> 1135 </span>-- Pure helpers for extracting text from WS event payloads
+<span class="lineno"> 1136 </span>-- ---------------------------------------------------------------------------
+<span class="lineno"> 1137 </span>
+<span class="lineno"> 1138 </span>-- | Extract the accumulated text from an @entry-update@ or @entry@ event's
+<span class="lineno"> 1139 </span>-- @entry@ payload. The payload is a JSON object with a @payload@ field
+<span class="lineno"> 1140 </span>-- containing the message content.
+<span class="lineno"> 1141 </span>extractEntryText :: Value -&gt; Text
+<span class="lineno"> 1142 </span><span class="decl"><span class="istickedoff">extractEntryText val =</span>
+<span class="lineno"> 1143 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1144 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromText &quot;payload&quot;) o of</span>
+<span class="lineno"> 1145 </span><span class="spaces">      </span><span class="istickedoff">Just (A.Object p) -&gt; case KeyMap.lookup (Key.fromText &quot;content&quot;) p of</span>
+<span class="lineno"> 1146 </span><span class="spaces">        </span><span class="istickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno"> 1147 </span><span class="spaces">          </span><span class="istickedoff">-- content is an array of {text: &quot;...&quot;, type: &quot;text&quot;} blocks</span>
+<span class="lineno"> 1148 </span><span class="spaces">          </span><span class="istickedoff">T.concat (mapMaybe extractTextBlock (toList arr))</span>
+<span class="lineno"> 1149 </span><span class="spaces">        </span><span class="istickedoff">Just (A.String t) -&gt; t</span>
+<span class="lineno"> 1150 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno"> 1151 </span><span class="spaces">      </span><span class="istickedoff">Just (A.String t) -&gt; <span class="nottickedoff">t</span></span>
+<span class="lineno"> 1152 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; &quot;&quot;</span>
+<span class="lineno"> 1153 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; &quot;&quot;</span>
+<span class="lineno"> 1154 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1155 </span><span class="spaces">    </span><span class="istickedoff">extractTextBlock (A.Object b) = case KeyMap.lookup (Key.fromText &quot;text&quot;) b of</span>
+<span class="lineno"> 1156 </span><span class="spaces">      </span><span class="istickedoff">Just (A.String t) -&gt; Just t</span>
+<span class="lineno"> 1157 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno"> 1158 </span><span class="spaces">    </span><span class="istickedoff">extractTextBlock _ = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno"> 1159 </span><span class="spaces">    </span><span class="istickedoff">toList = foldr (:) []</span></span>
+<span class="lineno"> 1160 </span>
+<span class="lineno"> 1161 </span>-- | Extract the @kind@ field from an @activity@ event payload.
+<span class="lineno"> 1162 </span>extractActivityKind :: Value -&gt; Text
+<span class="lineno"> 1163 </span><span class="decl"><span class="istickedoff">extractActivityKind val =</span>
+<span class="lineno"> 1164 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1165 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;kind&quot;) o)</span>
+<span class="lineno"> 1166 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno"> 1167 </span>
+<span class="lineno"> 1168 </span>-- | Extract the @direction@ field from an entry event payload.
+<span class="lineno"> 1169 </span>-- Returns @&quot;&quot;@ when absent. Used to filter request entries (direction
+<span class="lineno"> 1170 </span>-- @&quot;request&quot;@) from response entries (direction @&quot;response&quot;@).
+<span class="lineno"> 1171 </span>extractDirection :: Value -&gt; Text
+<span class="lineno"> 1172 </span><span class="decl"><span class="istickedoff">extractDirection val =</span>
+<span class="lineno"> 1173 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1174 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; fromMaybe <span class="nottickedoff">&quot;&quot;</span> (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;direction&quot;) o)</span>
+<span class="lineno"> 1175 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno"> 1176 </span>
+<span class="lineno"> 1177 </span>-- | Extract the @status@ field from an @activity@ event payload.
+<span class="lineno"> 1178 </span>extractActivityStatus :: Value -&gt; Text
+<span class="lineno"> 1179 </span><span class="decl"><span class="istickedoff">extractActivityStatus val =</span>
+<span class="lineno"> 1180 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1181 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;status&quot;) o)</span>
+<span class="lineno"> 1182 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno"> 1183 </span>
+<span class="lineno"> 1184 </span>-- | Extract the @tool@ field from a @tool-call@ activity event payload.
+<span class="lineno"> 1185 </span>-- Returns 'Nothing' when the payload is not a @tool-call@ activity or the
+<span class="lineno"> 1186 </span>-- @tool@ field is missing. Pure.
+<span class="lineno"> 1187 </span>extractToolName :: Value -&gt; Maybe Text
+<span class="lineno"> 1188 </span><span class="decl"><span class="istickedoff">extractToolName val =</span>
+<span class="lineno"> 1189 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1190 </span><span class="spaces">    </span><span class="istickedoff">A.Object o</span>
+<span class="lineno"> 1191 </span><span class="spaces">      </span><span class="istickedoff">| extractActivityKind val == &quot;tool-call&quot;</span>
+<span class="lineno"> 1192 </span><span class="spaces">        </span><span class="istickedoff">-&gt; asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;tool&quot;) o</span>
+<span class="lineno"> 1193 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno"> 1194 </span>
+<span class="lineno"> 1195 </span>-- | Extract the @input@ field from a @tool-call@ activity event payload.
+<span class="lineno"> 1196 </span>-- Returns 'Nothing' when the payload is not a @tool-call@ activity or the
+<span class="lineno"> 1197 </span>-- @input@ field is missing. Pure.
+<span class="lineno"> 1198 </span>extractToolInput :: Value -&gt; Maybe Text
+<span class="lineno"> 1199 </span><span class="decl"><span class="istickedoff">extractToolInput val =</span>
+<span class="lineno"> 1200 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1201 </span><span class="spaces">    </span><span class="istickedoff">A.Object o</span>
+<span class="lineno"> 1202 </span><span class="spaces">      </span><span class="istickedoff">| extractActivityKind val == &quot;tool-call&quot;</span>
+<span class="lineno"> 1203 </span><span class="spaces">        </span><span class="istickedoff">-&gt; asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;input&quot;) o</span>
+<span class="lineno"> 1204 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno"> 1205 </span>
+<span class="lineno"> 1206 </span>-- | Extract the @question@ field from an @ask@ event payload.
+<span class="lineno"> 1207 </span>extractAskQuestion :: Value -&gt; Text
+<span class="lineno"> 1208 </span><span class="decl"><span class="istickedoff">extractAskQuestion val =</span>
+<span class="lineno"> 1209 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno"> 1210 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt; fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;question&quot;) o)</span>
+<span class="lineno"> 1211 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno"> 1212 </span>lastAssistantText :: [Value] -&gt; Maybe Text
+<span class="lineno"> 1213 </span><span class="decl"><span class="istickedoff">lastAssistantText entries =</span>
+<span class="lineno"> 1214 </span><span class="spaces">  </span><span class="istickedoff">case reverse (filter isAssistantEntry entries) of</span>
+<span class="lineno"> 1215 </span><span class="spaces">    </span><span class="istickedoff">(e : _) -&gt; Just (extractEntryText e)</span>
+<span class="lineno"> 1216 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; Nothing</span>
+<span class="lineno"> 1217 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno"> 1218 </span><span class="spaces">    </span><span class="istickedoff">isAssistantEntry (A.Object o) =</span>
+<span class="lineno"> 1219 </span><span class="spaces">      </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;direction&quot;) o of</span>
+<span class="lineno"> 1220 </span><span class="spaces">        </span><span class="istickedoff">Just (A.String &quot;response&quot;) -&gt; True</span>
+<span class="lineno"> 1221 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; False</span>
+<span class="lineno"> 1222 </span><span class="spaces">    </span><span class="istickedoff">isAssistantEntry _ = <span class="nottickedoff">False</span></span></span>
+<span class="lineno"> 1223 </span>
+<span class="lineno"> 1224 </span>-- | Extract text from a JSON string value.
+<span class="lineno"> 1225 </span>asText :: Value -&gt; Maybe Text
+<span class="lineno"> 1226 </span><span class="decl"><span class="istickedoff">asText (A.String t) = Just t</span>
+<span class="lineno"> 1227 </span><span class="spaces"></span><span class="istickedoff">asText _ = <span class="nottickedoff">Nothing</span></span></span>
+
+</pre>
+</body>
+</html>

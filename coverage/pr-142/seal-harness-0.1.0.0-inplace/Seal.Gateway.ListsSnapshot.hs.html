@@ -1,0 +1,98 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The wire snapshot for the WS @lists@ frame and the REST @GET /api/lists@
+<span class="lineno">    4 </span>-- endpoint. Carries the partitioned session lists (mutually exclusive by
+<span class="lineno">    5 </span>-- construction via 'partitionSessions') plus the set of sessions currently
+<span class="lineno">    6 </span>-- in a @thinking@ turn (so a freshly-connected web client can hydrate its
+<span class="lineno">    7 </span>-- sidebar without waiting for the next harness-status event). The WS frame
+<span class="lineno">    8 </span>-- wraps this with @{&quot;type&quot;: &quot;lists&quot;, ...}@ (added by the broadcast path);
+<span class="lineno">    9 </span>-- the REST body is the bare record (no @type@ field).
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Takes 'TabsHandle' + 'SealPaths' directly (NOT 'ApiDeps') so this module
+<span class="lineno">   12 </span>-- does NOT import 'Seal.Gateway.API' — avoids a source-level import cycle
+<span class="lineno">   13 </span>-- ('Seal.Gateway.API' imports this module for the /api/lists route).
+<span class="lineno">   14 </span>module Seal.Gateway.ListsSnapshot
+<span class="lineno">   15 </span>  ( ListsSnapshotWire (..)
+<span class="lineno">   16 </span>  , buildListsSnapshot
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Aeson (ToJSON (..), object, (.=))
+<span class="lineno">   20 </span>import Data.Aeson qualified as A
+<span class="lineno">   21 </span>import Data.Set (Set)
+<span class="lineno">   22 </span>import qualified Data.Set as Set
+<span class="lineno">   23 </span>import Data.Text (Text)
+<span class="lineno">   24 </span>import GHC.Generics (Generic)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   27 </span>import Seal.Core.Types (SessionId, sessionIdText)
+<span class="lineno">   28 </span>import Seal.Gateway.SessionJson (sessionInfoJsonWithSnippet, tabToJson)
+<span class="lineno">   29 </span>import Seal.Session.Store (listArchivedSessions, listSessions)
+<span class="lineno">   30 </span>import Seal.Tabs (snapshotTabs, TabsHandle)
+<span class="lineno">   31 </span>import Seal.Tabs.Partition (PartitionedSessions (..), partitionSessions)
+<span class="lineno">   32 </span>import Seal.Tabs.Types (tlTabs)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | The partitioned snapshot. Haskell record fields use the @lsw@ prefix;
+<span class="lineno">   35 </span>-- the 'ToJSON' instance drops it (wire keys: @tabs@, @recentSessions@,
+<span class="lineno">   36 </span>-- @archivedSessions@, @tabSessions@, @thinkingSessionIds@).
+<span class="lineno">   37 </span>data ListsSnapshotWire = ListsSnapshotWire
+<span class="lineno">   38 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lswTabs</span></span></span>             :: [A.Value]
+<span class="lineno">   39 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswRecentSessions</span></span></span>   :: [A.Value]
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswArchivedSessions</span></span></span> :: [A.Value]
+<span class="lineno">   41 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswTabSessions</span></span></span>      :: [A.Value]
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswThinkingSessionIds</span></span></span> :: [Text]
+<span class="lineno">   43 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ListsSnapshotWire</span></span></span></span></span></span></span></span> where
+<span class="lineno">   46 </span>  <span class="decl"><span class="istickedoff">toJSON s = object</span>
+<span class="lineno">   47 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;tabs&quot;             .= lswTabs s</span>
+<span class="lineno">   48 </span><span class="spaces">    </span><span class="istickedoff">, &quot;recentSessions&quot;   .= lswRecentSessions s</span>
+<span class="lineno">   49 </span><span class="spaces">    </span><span class="istickedoff">, &quot;archivedSessions&quot; .= lswArchivedSessions s</span>
+<span class="lineno">   50 </span><span class="spaces">    </span><span class="istickedoff">, &quot;tabSessions&quot;      .= lswTabSessions s</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">, &quot;thinkingSessionIds&quot; .= lswThinkingSessionIds s</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | Build the partitioned snapshot. Takes the components directly (not
+<span class="lineno">   55 </span>-- 'ApiDeps') so this module stays free of a cycle with 'Seal.Gateway.API'.
+<span class="lineno">   56 </span>-- The @thinking@ set is the broker's current in-memory view of which
+<span class="lineno">   57 </span>-- sessions are mid-turn, so a freshly-connected web client can hydrate
+<span class="lineno">   58 </span>-- its sidebar (the live activity stream only carries forward from here).
+<span class="lineno">   59 </span>buildListsSnapshot :: TabsHandle -&gt; SealPaths -&gt; Set SessionId -&gt; IO ListsSnapshotWire
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">buildListsSnapshot tabsH paths thinkingSids = do</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">tl &lt;- snapshotTabs tabsH</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">let tabsJson = map tabToJson (tlTabs tl)</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">recent   &lt;- listSessions paths</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">archived &lt;- listArchivedSessions paths</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">let ps = partitionSessions tl recent archived</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">recentJson   &lt;- mapM (sessionInfoJsonWithSnippet paths) (psRecentSessions ps)</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">archivedJson &lt;- mapM (sessionInfoJsonWithSnippet paths) (psArchivedSessions ps)</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">tabbedJson   &lt;- mapM (sessionInfoJsonWithSnippet paths) (psTabSessions ps)</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">pure ListsSnapshotWire</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">{ lswTabs = tabsJson</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">, lswRecentSessions = recentJson</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">, lswArchivedSessions = archivedJson</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">, lswTabSessions = tabbedJson</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">, lswThinkingSessionIds = map sessionIdText (Set.toList thinkingSids)</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

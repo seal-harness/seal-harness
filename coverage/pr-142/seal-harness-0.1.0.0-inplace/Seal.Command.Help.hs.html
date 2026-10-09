@@ -1,0 +1,154 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>module Seal.Command.Help
+<span class="lineno">    3 </span>  ( renderHelpIndex
+<span class="lineno">    4 </span>  , renderHelpFor
+<span class="lineno">    5 </span>  ) where
+<span class="lineno">    6 </span>
+<span class="lineno">    7 </span>import Data.Map.Strict (Map)
+<span class="lineno">    8 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">    9 </span>import Data.Text (Text)
+<span class="lineno">   10 </span>import Data.Text qualified as T
+<span class="lineno">   11 </span>import Options.Applicative
+<span class="lineno">   12 </span>  ( ParserResult(..)
+<span class="lineno">   13 </span>  , defaultPrefs
+<span class="lineno">   14 </span>  , execParserPure
+<span class="lineno">   15 </span>  , renderFailure
+<span class="lineno">   16 </span>  )
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Seal.Command.Spec
+<span class="lineno">   19 </span>  ( CommandGroup(..)
+<span class="lineno">   20 </span>  , CommandName(..)
+<span class="lineno">   21 </span>  , CommandSpec(..)
+<span class="lineno">   22 </span>  , Registry(..)
+<span class="lineno">   23 </span>  , csGroup
+<span class="lineno">   24 </span>  , csName
+<span class="lineno">   25 </span>  , csParserInfo
+<span class="lineno">   26 </span>  , csSynopsis
+<span class="lineno">   27 </span>  , lookupSpec
+<span class="lineno">   28 </span>  , registrySpecs
+<span class="lineno">   29 </span>  )
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   32 </span>-- Help index
+<span class="lineno">   33 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | Render the grouped \/help index.
+<span class="lineno">   36 </span>--
+<span class="lineno">   37 </span>-- Output format:
+<span class="lineno">   38 </span>-- @
+<span class="lineno">   39 </span>-- Available commands:
+<span class="lineno">   40 </span>--
+<span class="lineno">   41 </span>--   /help [command]   Show this help, or detailed help for a command
+<span class="lineno">   42 </span>--
+<span class="lineno">   43 </span>-- General
+<span class="lineno">   44 </span>--   /ping             Check connectivity
+<span class="lineno">   45 </span>--
+<span class="lineno">   46 </span>-- Vault
+<span class="lineno">   47 </span>--   /vault            Manage the encrypted secret vault
+<span class="lineno">   48 </span>-- @
+<span class="lineno">   49 </span>--
+<span class="lineno">   50 </span>-- The synthetic @\/help@ entry is always present at the top even though
+<span class="lineno">   51 </span>-- @\/help@ is not a registered 'CommandSpec' (to avoid a registry-knot).
+<span class="lineno">   52 </span>renderHelpIndex :: Registry -&gt; Text
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">renderHelpIndex reg =</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">T.unlines $</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;Available commands:&quot;</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">, syntheticHelpLine</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">++ concatMap renderGroup (Map.toAscList grouped)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">specs   = registrySpecs reg</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">-- Group specs preserving original insertion order within each group.</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">grouped :: Map CommandGroup [CommandSpec]</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">grouped =</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="istickedoff">Map.fromListWith (flip (++))</span>
+<span class="lineno">   67 </span><span class="spaces">        </span><span class="istickedoff">[(csGroup s, [s]) | s &lt;- specs]</span>
+<span class="lineno">   68 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">syntheticHelpLine :: Text</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">syntheticHelpLine =</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">&quot;  &quot; &lt;&gt; T.justifyLeft colWidth ' ' &quot;/help [command]&quot;</span>
+<span class="lineno">   72 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; &quot;Show this help, or detailed help for a command&quot;</span>
+<span class="lineno">   73 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">renderGroup :: (CommandGroup, [CommandSpec]) -&gt; [Text]</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">renderGroup (grp, grpSpecs) =</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">[ groupHeader grp ]</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="istickedoff">++ map renderSpec grpSpecs</span>
+<span class="lineno">   78 </span><span class="spaces">      </span><span class="istickedoff">++ [ &quot;&quot; ]</span>
+<span class="lineno">   79 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">groupHeader :: CommandGroup -&gt; Text</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupGeneral  = &quot;General&quot;</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupProvider = &quot;Providers&quot;</span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupSession  = &quot;Sessions&quot;</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupModel    = &quot;Model&quot;</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupVault    = &quot;Vault&quot;</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupSkills   = <span class="nottickedoff">&quot;Skills&quot;</span></span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupAgent    = <span class="nottickedoff">&quot;Agents&quot;</span></span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupTools    = &quot;Tools&quot;</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">groupHeader GroupRepos    = <span class="nottickedoff">&quot;Repos&quot;</span></span>
+<span class="lineno">   90 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">renderSpec :: CommandSpec -&gt; Text</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">renderSpec s =</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">let CommandName n = csName s</span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="istickedoff">label         = &quot;/&quot; &lt;&gt; n</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">in &quot;  &quot; &lt;&gt; T.justifyLeft colWidth ' ' label &lt;&gt; csSynopsis s</span>
+<span class="lineno">   96 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">-- Column width for the command label column (includes the leading slash).</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">colWidth :: Int</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">colWidth = 18</span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  102 </span>-- Per-command help
+<span class="lineno">  103 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | Render a specific command's full optparse help by running its
+<span class="lineno">  106 </span>-- 'ParserInfo' with @[&quot;--help&quot;]@ via 'execParserPure'.
+<span class="lineno">  107 </span>--
+<span class="lineno">  108 </span>-- @execParserPure defaultPrefs info [&quot;--help&quot;]@ always returns
+<span class="lineno">  109 </span>-- @Failure (ParserFailure ParserHelp)@ because @--help@ is optparse's
+<span class="lineno">  110 </span>-- built-in action. 'renderFailure' converts that to @(String, ExitCode)@;
+<span class="lineno">  111 </span>-- we take the 'String', pack it to 'Text', and discard the exit code
+<span class="lineno">  112 </span>-- ('ExitSuccess' for @--help@).
+<span class="lineno">  113 </span>--
+<span class="lineno">  114 </span>-- This means the rendered text is 100% derived from the optparse parser
+<span class="lineno">  115 </span>-- and cannot drift from the actual flags the command accepts.
+<span class="lineno">  116 </span>renderHelpFor :: Registry -&gt; CommandName -&gt; Text
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">renderHelpFor reg name@(CommandName n) =</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">case lookupSpec reg name of</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="istickedoff">Nothing   -&gt; &quot;No such command: &quot; &lt;&gt; n &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">Just spec -&gt;</span>
+<span class="lineno">  121 </span><span class="spaces">      </span><span class="istickedoff">case execParserPure defaultPrefs (csParserInfo spec) [&quot;--help&quot;] of</span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="istickedoff">Failure f -&gt;</span>
+<span class="lineno">  123 </span><span class="spaces">          </span><span class="istickedoff">-- progName argument to renderFailure is used as the program name</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">-- in the rendered usage line; we use the slash-command name.</span>
+<span class="lineno">  125 </span><span class="spaces">          </span><span class="istickedoff">let (msg, _exitCode) = renderFailure f (&quot;/&quot; &lt;&gt; T.unpack n)</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="istickedoff">in T.pack msg</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">-- The following two branches are unreachable when the input is</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">-- [&quot;--help&quot;] against a well-formed ParserInfo, but we must be</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">-- total to satisfy -Wall -Werror.</span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="istickedoff">Success _           -&gt; <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  131 </span><span class="spaces">        </span><span class="istickedoff">CompletionInvoked _ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+
+</pre>
+</body>
+</html>

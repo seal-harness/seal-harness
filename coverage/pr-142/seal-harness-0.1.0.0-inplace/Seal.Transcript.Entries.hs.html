@@ -1,0 +1,258 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @entries.jsonl@ model: one line per event, 1:1 with the old
+<span class="lineno">    3 </span>-- 'TranscriptEntry' stream but payload-free. The giant 'tePayload' is replaced
+<span class="lineno">    4 </span>-- by a @convLen@ prefix pointer (into @conversation.jsonl@) plus, for 'Request'
+<span class="lineno">    5 </span>-- events, an envelope-delta recorded only when changed from the prior request
+<span class="lineno">    6 </span>-- (omit-if-unchanged). 'Response' events store all 'CompletionResponse' fields
+<span class="lineno">    7 </span>-- /except/ the content blocks (those live in @conversation.jsonl@ and are
+<span class="lineno">    8 </span>-- re-inserted on reconstruction). 'Harness' and 'compaction' events keep their
+<span class="lineno">    9 </span>-- metadata columns and a @convLen@.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Integrity, like the conversation file, rests on the append-only single-writer
+<span class="lineno">   12 </span>-- + fsync — not a hash chain.
+<span class="lineno">   13 </span>module Seal.Transcript.Entries
+<span class="lineno">   14 </span>  ( EntryKind (..)
+<span class="lineno">   15 </span>  , Envelope (..)
+<span class="lineno">   16 </span>  , EnvelopeDelta (..)
+<span class="lineno">   17 </span>  , EntryRecord (..)
+<span class="lineno">   18 </span>  , emptyEnvelopeDelta
+<span class="lineno">   19 </span>  , applyDelta
+<span class="lineno">   20 </span>  , effectiveEnvelope
+<span class="lineno">   21 </span>  , encodeEntryRecordRaw
+<span class="lineno">   22 </span>  ) where
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Data.Aeson
+<span class="lineno">   25 </span>  ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.=), (.!=) )
+<span class="lineno">   26 </span>import Data.Aeson qualified as A
+<span class="lineno">   27 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   28 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   29 </span>import Data.Aeson.Types (withText)
+<span class="lineno">   30 </span>import Data.ByteString (ByteString)
+<span class="lineno">   31 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   32 </span>import Data.Map.Strict (Map)
+<span class="lineno">   33 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Data.Time (UTCTime)
+<span class="lineno">   37 </span>import GHC.Generics (Generic)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Seal.Core.Types (ModelId)
+<span class="lineno">   40 </span>import Seal.Providers.Class (StopReason, ToolChoice (..), ToolDefinition (..), Usage (..))
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | Event discriminator. Mirrors the old 'Direction' plus the two call-less
+<span class="lineno">   43 </span>-- kinds ('EKHarness', 'EKCompaction').
+<span class="lineno">   44 </span>data EntryKind
+<span class="lineno">   45 </span>  = EKRequest
+<span class="lineno">   46 </span>  | EKResponse
+<span class="lineno">   47 </span>  | EKHarness
+<span class="lineno">   48 </span>  | EKCompaction
+<span class="lineno">   49 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON EntryKind</span></span></span></span></span></span></span></span> where
+<span class="lineno">   52 </span>  <span class="decl"><span class="istickedoff">toJSON EKRequest    = &quot;request&quot;</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">toJSON EKResponse   = &quot;response&quot;</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">toJSON EKHarness    = &quot;harness&quot;</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">toJSON EKCompaction = &quot;compaction&quot;</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON EntryKind</span></span></span></span> where
+<span class="lineno">   58 </span>  <span class="decl"><span class="istickedoff">parseJSON = withText <span class="nottickedoff">&quot;EntryKind&quot;</span> $ \t -&gt;</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">case t of</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="istickedoff">&quot;request&quot;    -&gt; pure EKRequest</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="istickedoff">&quot;response&quot;   -&gt; pure EKResponse</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">&quot;harness&quot;    -&gt; pure EKHarness</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">&quot;compaction&quot; -&gt; pure EKCompaction</span>
+<span class="lineno">   64 </span><span class="spaces">      </span><span class="istickedoff">_            -&gt; <span class="nottickedoff">fail (&quot;unknown EntryKind: &quot; &lt;&gt; T.unpack t)</span></span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | The full envelope in effect at a given turn. Folded from deltas.
+<span class="lineno">   67 </span>data Envelope = Envelope
+<span class="lineno">   68 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">envModel</span></span></span>      :: ModelId
+<span class="lineno">   69 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">envSystem</span></span></span>     :: Maybe Text
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">envTools</span></span></span>      :: [ToolDefinition]
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">envToolChoice</span></span></span> :: ToolChoice
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">envMaxTokens</span></span></span>  :: Int
+<span class="lineno">   73 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | A per-request change to the envelope. Each field is 'Maybe'; 'Nothing'
+<span class="lineno">   76 </span>-- means \&quot;inherit from the prior request\&quot; (omit-if-unchanged). For
+<span class="lineno">   77 </span>-- 'envSystem' the 'Maybe' is nested: 'Nothing' = inherit, @'Just' 'Nothing'@ =
+<span class="lineno">   78 </span>-- clear the system prompt, @'Just' ('Just' t)@ = set it to @t@.
+<span class="lineno">   79 </span>data EnvelopeDelta = EnvelopeDelta
+<span class="lineno">   80 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">edModel</span></span></span>      :: Maybe ModelId
+<span class="lineno">   81 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">edSystem</span></span></span>     :: Maybe (Maybe Text)
+<span class="lineno">   82 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">edTools</span></span></span>      :: Maybe [ToolDefinition]
+<span class="lineno">   83 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">edToolChoice</span></span></span> :: Maybe ToolChoice
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">edMaxTokens</span></span></span>  :: Maybe Int
+<span class="lineno">   85 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | The neutral delta: inherit everything. The writer compares the current
+<span class="lineno">   88 </span>-- request's envelope against the prior effective envelope and emits a delta
+<span class="lineno">   89 </span>-- with 'Just' only on the fields that differ.
+<span class="lineno">   90 </span>emptyEnvelopeDelta :: EnvelopeDelta
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">emptyEnvelopeDelta = EnvelopeDelta Nothing Nothing Nothing Nothing Nothing</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON EnvelopeDelta</span></span></span></span></span></span></span></span> where
+<span class="lineno">   94 </span>  <span class="decl"><span class="istickedoff">toJSON d = object (catMaybes'</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">[ (&quot;model&quot; .=)      &lt;$&gt; edModel d</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">, (&quot;tools&quot; .=)      &lt;$&gt; edTools d</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">, (&quot;toolChoice&quot; .=) &lt;$&gt; edToolChoice d</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">, (&quot;maxTokens&quot; .=)  &lt;$&gt; edMaxTokens d</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">] &lt;&gt; systemField)</span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">where</span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff">-- The nested Maybe on system distinguishes inherit (omit the key) from</span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff">-- clear (&quot;system&quot;: null) from set (&quot;system&quot;: &quot;text&quot;). Omitting the key</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">-- is the default aeson behavior for the outer Nothing; the inner cases</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">-- are encoded explicitly so a clear is distinguishable from an inherit.</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">systemField = case edSystem d of</span>
+<span class="lineno">  106 </span><span class="spaces">        </span><span class="istickedoff">Nothing       -&gt; []</span>
+<span class="lineno">  107 </span><span class="spaces">        </span><span class="istickedoff">Just Nothing  -&gt; [&quot;system&quot; .= A.Null]</span>
+<span class="lineno">  108 </span><span class="spaces">        </span><span class="istickedoff">Just (Just t) -&gt; [&quot;system&quot; .= t]</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON EnvelopeDelta</span></span></span></span> where
+<span class="lineno">  111 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;EnvelopeDelta&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">-- The nested Maybe on system distinguishes inherit (key absent) from clear</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">-- (key present, value null) from set (key present, value string). aeson's</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">-- '.:?' conflates absent and null, so we use 'KeyMap.lookup' to detect</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">-- presence, then decode the value when present.</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">let mSystem = case KeyMap.lookup (Key.fromString &quot;system&quot;) o of</span>
+<span class="lineno">  117 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; Nothing                         -- inherit</span>
+<span class="lineno">  118 </span><span class="spaces">          </span><span class="istickedoff">Just v  -&gt; Just (case v of</span>
+<span class="lineno">  119 </span><span class="spaces">            </span><span class="istickedoff">A.Null     -&gt; Nothing                     -- clear</span>
+<span class="lineno">  120 </span><span class="spaces">            </span><span class="istickedoff">A.String t -&gt; Just t                      -- set</span>
+<span class="lineno">  121 </span><span class="spaces">            </span><span class="istickedoff">_          -&gt; <span class="nottickedoff">Nothing</span>)                    -- malformed: treat as clear</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">EnvelopeDelta</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; o .:? &quot;model&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; pure mSystem</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;tools&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;toolChoice&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;maxTokens&quot;</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | Apply a delta to an envelope, producing the next effective envelope.
+<span class="lineno">  130 </span>-- 'Nothing' fields inherit; the nested 'Maybe' on system distinguishes
+<span class="lineno">  131 </span>-- inherit from clear.
+<span class="lineno">  132 </span>applyDelta :: Envelope -&gt; EnvelopeDelta -&gt; Envelope
+<span class="lineno">  133 </span><span class="decl"><span class="istickedoff">applyDelta env d = Envelope</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">{ envModel      = fromMaybe (envModel env) (edModel d)</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">, envSystem     = case edSystem d of</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">Nothing     -&gt; envSystem env</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">Just system -&gt; system</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">, envTools      = fromMaybe (envTools env) (edTools d)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">, envToolChoice = fromMaybe (envToolChoice env) (edToolChoice d)</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">, envMaxTokens  = fromMaybe (envMaxTokens env) (edMaxTokens d)</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Left-fold over the entry stream, returning the effective envelope at each
+<span class="lineno">  144 </span>-- 'EKRequest' entry. Non-request entries inherit the prior envelope (so a
+<span class="lineno">  145 </span>-- 'Response' knows the envelope in effect for its paired request). The fold
+<span class="lineno">  146 </span>-- starts from the given initial envelope (typically the first request's full
+<span class="lineno">  147 </span>-- envelope, since there is no prior to delta against).
+<span class="lineno">  148 </span>--
+<span class="lineno">  149 </span>-- Returns the pairs @(entry, effective-envelope-at-entry)@ in input order.
+<span class="lineno">  150 </span>effectiveEnvelope :: Envelope -&gt; [EntryRecord] -&gt; [(EntryRecord, Envelope)]
+<span class="lineno">  151 </span><span class="decl"><span class="istickedoff">effectiveEnvelope = go</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">go _ [] = []</span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">go env (e : es) =</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">let env' = case erKind e of</span>
+<span class="lineno">  156 </span><span class="spaces">            </span><span class="istickedoff">EKRequest -&gt; case erEnvelope e of</span>
+<span class="lineno">  157 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">env</span></span>
+<span class="lineno">  158 </span><span class="spaces">              </span><span class="istickedoff">Just d  -&gt; applyDelta env d</span>
+<span class="lineno">  159 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; env</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">in (<span class="nottickedoff">e</span>, env') : go env' es</span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>-- | One event line. Fields are kind-specific; the 'Maybe' columns are present
+<span class="lineno">  163 </span>-- only for the kinds that use them (e.g. 'erEnvelope' is 'Just' only for
+<span class="lineno">  164 </span>-- 'EKRequest', 'erUsage' only for 'EKResponse'). The on-disk encoding omits
+<span class="lineno">  165 </span>-- 'Nothing' fields (aeson's @omitIfNothing@ would do this; we encode manually to
+<span class="lineno">  166 </span>-- keep the shape explicit and stable for reconstruction).
+<span class="lineno">  167 </span>data EntryRecord = EntryRecord
+<span class="lineno">  168 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">erId</span></span></span>          :: Text
+<span class="lineno">  169 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erTimestamp</span></span></span>   :: UTCTime
+<span class="lineno">  170 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erKind</span></span></span>        :: EntryKind
+<span class="lineno">  171 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erConvLen</span></span></span>     :: Int
+<span class="lineno">  172 </span>  -- | 'EKRequest' only: the envelope delta vs the prior request. 'Nothing' on
+<span class="lineno">  173 </span>  -- non-request kinds.
+<span class="lineno">  174 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erEnvelope</span></span></span>    :: Maybe EnvelopeDelta
+<span class="lineno">  175 </span>  -- | 'EKResponse' only: token usage.
+<span class="lineno">  176 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erUsage</span></span></span>       :: Maybe Usage
+<span class="lineno">  177 </span>  -- | 'EKResponse' only: stop reason.
+<span class="lineno">  178 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erStop</span></span></span>        :: Maybe StopReason
+<span class="lineno">  179 </span>  -- | 'EKResponse' / 'EKHarness' only: wall-clock duration in ms.
+<span class="lineno">  180 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erDurationMs</span></span></span>  :: Maybe Int
+<span class="lineno">  181 </span>  -- | 'EKHarness' only: the harness name.
+<span class="lineno">  182 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erHarness</span></span></span>     :: Maybe Text
+<span class="lineno">  183 </span>  -- | Common: correlation id linking a request to its response.
+<span class="lineno">  184 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erCorrelation</span></span></span> :: Maybe Text
+<span class="lineno">  185 </span>  -- | Common: extensible metadata (e.g. @op@ for opcode invocations).
+<span class="lineno">  186 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">erMeta</span></span></span>        :: Map Text A.Value
+<span class="lineno">  187 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON EntryRecord</span></span></span></span></span></span></span></span> where
+<span class="lineno">  190 </span>  <span class="decl"><span class="istickedoff">toJSON e = object $</span>
+<span class="lineno">  191 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;id&quot;          .= erId e</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ts&quot;          .= erTimestamp e</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="istickedoff">, &quot;kind&quot;        .= erKind e</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="istickedoff">, &quot;convLen&quot;     .= erConvLen e</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="istickedoff">] &lt;&gt; envelopeField &lt;&gt; responseFields &lt;&gt; harnessField &lt;&gt; commonFields</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="istickedoff">where</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">envelopeField   = maybe [] (\d -&gt; [&quot;envelope&quot; .= d]) (erEnvelope e)</span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="istickedoff">responseFields  = case erKind e of</span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="istickedoff">EKResponse -&gt; catMaybes'</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="istickedoff">[ (&quot;usage&quot; .=)      &lt;$&gt; erUsage e</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="istickedoff">, (&quot;stop&quot; .=)       &lt;$&gt; erStop e</span>
+<span class="lineno">  202 </span><span class="spaces">          </span><span class="istickedoff">, (&quot;durationMs&quot; .=) &lt;$&gt; erDurationMs e</span>
+<span class="lineno">  203 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  204 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">harnessField    = maybe [] <span class="nottickedoff">(\h -&gt; [&quot;harness&quot; .= h])</span> (erHarness e)</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">commonFields    =</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">catMaybes'</span>
+<span class="lineno">  208 </span><span class="spaces">          </span><span class="istickedoff">[ (&quot;correlation&quot; .=) &lt;$&gt; erCorrelation e</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="istickedoff">] &lt;&gt; [&quot;meta&quot; .= erMeta e | not (null (erMeta e))]</span></span>
+<span class="lineno">  210 </span>
+<span class="lineno">  211 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON EntryRecord</span></span></span></span> where
+<span class="lineno">  212 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;EntryRecord&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">kind &lt;- o .: &quot;kind&quot;</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">EntryRecord</span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; o .:  &quot;id&quot;</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:  &quot;ts&quot;</span>
+<span class="lineno">  217 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; pure kind</span>
+<span class="lineno">  218 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:  &quot;convLen&quot;</span>
+<span class="lineno">  219 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;envelope&quot;</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;usage&quot;</span>
+<span class="lineno">  221 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;stop&quot;</span>
+<span class="lineno">  222 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;durationMs&quot;</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;harness&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;correlation&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .:? &quot;meta&quot; .!= mempty</span></span>
+<span class="lineno">  226 </span>
+<span class="lineno">  227 </span>-- | Canonical strict encoding of one entry line, no trailing newline. The
+<span class="lineno">  228 </span>-- writer appends the newline.
+<span class="lineno">  229 </span>encodeEntryRecordRaw :: EntryRecord -&gt; ByteString
+<span class="lineno">  230 </span><span class="decl"><span class="istickedoff">encodeEntryRecordRaw = BL.toStrict . A.encode</span></span>
+<span class="lineno">  231 </span>
+<span class="lineno">  232 </span>-- | A small 'catMaybes' for key-value pairs that keeps the code warning-clean
+<span class="lineno">  233 </span>-- under @-Wincomplete-record-updates@.
+<span class="lineno">  234 </span>catMaybes' :: [Maybe (a, b)] -&gt; [(a, b)]
+<span class="lineno">  235 </span><span class="decl"><span class="istickedoff">catMaybes' = foldr (\mx acc -&gt; maybe acc (: acc) mx) []</span></span>
+
+</pre>
+</body>
+</html>

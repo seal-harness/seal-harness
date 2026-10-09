@@ -1,0 +1,446 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DataKinds #-}
+<span class="lineno">    2 </span>{-# LANGUAGE GADTs #-}
+<span class="lineno">    3 </span>{-# LANGUAGE KindSignatures #-}
+<span class="lineno">    4 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    5 </span>-- | The declarative route spec for the Seal Harness REST API (design §4.2).
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- One 'SealRoute' constructor per route. The 'routeMeta' table maps each
+<span class="lineno">    8 </span>-- constructor to its path shape + HTTP method + capture/body codecs. The
+<span class="lineno">    9 </span>-- 'sealRouter' is the 'Trasa.Core.Router' built from 'allRoutes'.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- This module is pure: no 'IO', no 'ApiDeps'. The handler functions live in
+<span class="lineno">   12 </span>-- 'Seal.Gateway.API' and are dispatched by the wrapper there.
+<span class="lineno">   13 </span>module Seal.Gateway.Route
+<span class="lineno">   14 </span>  ( SealRoute (..)
+<span class="lineno">   15 </span>  , routeMeta
+<span class="lineno">   16 </span>  , allRoutes
+<span class="lineno">   17 </span>  , sealRouter
+<span class="lineno">   18 </span>  , Resp
+<span class="lineno">   19 </span>  , Req
+<span class="lineno">   20 </span>  , AnswerReq (..)
+<span class="lineno">   21 </span>  , SessionIdOrErr (..)
+<span class="lineno">   22 </span>  , AgentDefIdOrErr (..)
+<span class="lineno">   23 </span>  , SkillIdOrErr (..)
+<span class="lineno">   24 </span>  , RepoIdOrErr (..)
+<span class="lineno">   25 </span>  , TabIndexOrErr (..)
+<span class="lineno">   26 </span>  , AskIdOrErr (..)
+<span class="lineno">   27 </span>  , sessionIdCapture
+<span class="lineno">   28 </span>  , agentDefIdCapture
+<span class="lineno">   29 </span>  , skillIdCapture
+<span class="lineno">   30 </span>  , repoIdCapture
+<span class="lineno">   31 </span>  , tabIndexCapture
+<span class="lineno">   32 </span>  , askIdCapture
+<span class="lineno">   33 </span>  , textCapture
+<span class="lineno">   34 </span>  , freeFormBodyCodec
+<span class="lineno">   35 </span>  , respCodec
+<span class="lineno">   36 </span>  , reqCodec
+<span class="lineno">   37 </span>  , answerReqCodec
+<span class="lineno">   38 </span>  ) where
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>import Control.Lens ((&amp;), (?~))
+<span class="lineno">   41 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   42 </span>import Data.Either (fromRight)
+<span class="lineno">   43 </span>import Data.Kind (Type)
+<span class="lineno">   44 </span>import Data.List.NonEmpty (NonEmpty (..))
+<span class="lineno">   45 </span>import Data.OpenApi
+<span class="lineno">   46 </span>  ( OpenApiType (..), OpenApiTypeValue (..), ToParamSchema (..), ToSchema (..)
+<span class="lineno">   47 </span>  , AdditionalProperties (..), NamedSchema (..), Schema, type_, additionalProperties )
+<span class="lineno">   48 </span>import Data.Text (Text)
+<span class="lineno">   49 </span>import Trasa.Codec (BodyCodec (..), jsonBodyCodec)
+<span class="lineno">   50 </span>import Trasa.Core
+<span class="lineno">   51 </span>  ( Router, Meta (..), MetaCodec, CaptureCodec (..)
+<span class="lineno">   52 </span>  , Bodiedness (..), Param
+<span class="lineno">   53 </span>  , match, end, capture, qend, bodyless, body, one, (./), resp
+<span class="lineno">   54 </span>  , routerWith, mapMeta, Constructed (..), captureCodecToCaptureDecoding )
+<span class="lineno">   55 </span>import qualified Trasa.Method as M
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | The response type for all JSON routes. The handler builds the full
+<span class="lineno">   58 </span>-- 'Response' itself (the wrapper passes it verbatim); this type is just the
+<span class="lineno">   59 </span>-- route's response type index. It carries no data — the actual JSON is
+<span class="lineno">   60 </span>-- produced by the handler.
+<span class="lineno">   61 </span>data Resp
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | The request-body type for JSON-body routes. The wrapper parses the body
+<span class="lineno">   64 </span>-- bytes itself (ignoring Content-Type) and hands them to the handler; this
+<span class="lineno">   65 </span>-- type is just the route's request-body type index.
+<span class="lineno">   66 </span>data Req
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | The Seal Harness route GADT. One constructor per REST route. The type
+<span class="lineno">   69 </span>-- parameters are: @caps@ (path captures), @qrys@ (query params, always @'[]@
+<span class="lineno">   70 </span>-- here — all routes are queryless), @req@ (request body bodiedness), @resp@
+<span class="lineno">   71 </span>-- (response type).
+<span class="lineno">   72 </span>--
+<span class="lineno">   73 </span>-- Captures use 'Text' for unvalidated captures and the validated capture
+<span class="lineno">   74 </span>-- newtypes ('SessionIdOrErr', etc.) for validated ones. The handler
+<span class="lineno">   75 </span>-- pattern-matches via the 'withSessionId' / 'withAgentDefId' / etc. helpers
+<span class="lineno">   76 </span>-- (in 'Seal.Gateway.Route.Codec') to emit the exact legacy error messages.
+<span class="lineno">   77 </span>data SealRoute :: [Type] -&gt; [Param] -&gt; Bodiedness -&gt; Type -&gt; Type where
+<span class="lineno">   78 </span>  -- Health
+<span class="lineno">   79 </span>  RouteHealth        :: SealRoute '[] '[] Bodyless Text
+<span class="lineno">   80 </span>  -- Tabs
+<span class="lineno">   81 </span>  RouteTabsList       :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">   82 </span>  RouteTabsNew       :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">   83 </span>  RouteTabsClose     :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+<span class="lineno">   84 </span>  RouteTabsDismiss   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+<span class="lineno">   85 </span>  RouteTabsAcknowledge :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+<span class="lineno">   86 </span>  RouteTabsRelease   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+<span class="lineno">   87 </span>  RouteTabsDestroy   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+<span class="lineno">   88 </span>  -- Lists
+<span class="lineno">   89 </span>  RouteLists         :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">   90 </span>  -- Sessions
+<span class="lineno">   91 </span>  RouteSessionsList  :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">   92 </span>  RouteSessionsArchived :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">   93 </span>  RouteSessionTranscript :: SealRoute '[SessionIdOrErr] '[] Bodyless Resp
+<span class="lineno">   94 </span>  RouteSessionSend   :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">   95 </span>  RouteSessionStop   :: SealRoute '[SessionIdOrErr] '[] Bodyless Resp
+<span class="lineno">   96 </span>  RouteSessionSetupRepo :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">   97 </span>  RouteSessionAgents :: SealRoute '[SessionIdOrErr] '[] Bodyless Resp
+<span class="lineno">   98 </span>  RouteSessionDescription :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">   99 </span>  RouteSessionArchived :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  100 </span>  RouteSessionPrompt :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  101 </span>  RouteSessionAgent  :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  102 </span>  RouteSessionQuestions :: SealRoute '[SessionIdOrErr] '[] Bodyless Resp
+<span class="lineno">  103 </span>  RouteSessionAnswer :: SealRoute '[SessionIdOrErr, AskIdOrErr] '[] (Body AnswerReq) Resp
+<span class="lineno">  104 </span>  RouteSessionAskCancel :: SealRoute '[SessionIdOrErr, AskIdOrErr] '[] Bodyless Resp
+<span class="lineno">  105 </span>  RouteSessionNew    :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  106 </span>  RouteSessionNewFrom :: SealRoute '[SessionIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  107 </span>  -- Harnesses
+<span class="lineno">  108 </span>  RouteHarnesses      :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  109 </span>  RouteHarnessDiscover :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  110 </span>  -- Agents
+<span class="lineno">  111 </span>  RouteAgentsList    :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  112 </span>  RouteAgentDefaultGet :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  113 </span>  RouteAgentDefaultPut :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  114 </span>  RouteAgentGet      :: SealRoute '[AgentDefIdOrErr] '[] Bodyless Resp
+<span class="lineno">  115 </span>  RouteAgentCreate   :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  116 </span>  RouteAgentUpdate   :: SealRoute '[AgentDefIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  117 </span>  RouteAgentDelete   :: SealRoute '[AgentDefIdOrErr] '[] Bodyless Resp
+<span class="lineno">  118 </span>  -- Skills
+<span class="lineno">  119 </span>  RouteSkillsList    :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  120 </span>  RouteSkillGet      :: SealRoute '[SkillIdOrErr] '[] Bodyless Resp
+<span class="lineno">  121 </span>  RouteSkillCreate   :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  122 </span>  RouteSkillUpdate   :: SealRoute '[SkillIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  123 </span>  RouteSkillDelete   :: SealRoute '[SkillIdOrErr] '[] Bodyless Resp
+<span class="lineno">  124 </span>  -- Repos
+<span class="lineno">  125 </span>  RouteReposList     :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  126 </span>  RouteRepoCreate    :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  127 </span>  RouteRepoGet       :: SealRoute '[RepoIdOrErr] '[] Bodyless Resp
+<span class="lineno">  128 </span>  RouteRepoUpdate    :: SealRoute '[RepoIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  129 </span>  RouteRepoDelete    :: SealRoute '[RepoIdOrErr] '[] Bodyless Resp
+<span class="lineno">  130 </span>  RouteRepoDeployKey :: SealRoute '[RepoIdOrErr] '[] Bodyless Resp
+<span class="lineno">  131 </span>  RouteRepoDeployKeyGenerate :: SealRoute '[RepoIdOrErr] '[] (Body Req) Resp
+<span class="lineno">  132 </span>  -- Providers
+<span class="lineno">  133 </span>  RouteProvidersList :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  134 </span>  RouteProviderModels :: SealRoute '[Text] '[] Bodyless Resp
+<span class="lineno">  135 </span>  RouteProviderModelContext :: SealRoute '[Text, Text] '[] Bodyless Resp
+<span class="lineno">  136 </span>  -- UI
+<span class="lineno">  137 </span>  RouteUiStateGet    :: SealRoute '[] '[] Bodyless Resp
+<span class="lineno">  138 </span>  RouteUiStatePut    :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  139 </span>  RouteUiCustomModels :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  140 </span>  RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  141 </span>  -- Adopt
+<span class="lineno">  142 </span>  RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
+<span class="lineno">  145 </span>-- path building, @end@ for path termination, @capture@ for path captures.
+<span class="lineno">  146 </span>-- All routes are queryless (@qend@). Body-bearing routes use
+<span class="lineno">  147 </span>-- @body (one reqCodec)@ (a dummy 'BodyCodec' — the handler builds the
+<span class="lineno">  148 </span>-- 'Response' directly; trasa's response encoding is never invoked);
+<span class="lineno">  149 </span>-- bodyless routes use @bodyless@. Response codecs are @resp (one respCodec)@
+<span class="lineno">  150 </span>-- (also a dummy — see 'freeFormBodyCodec'). 'RouteHealth' uses
+<span class="lineno">  151 </span>-- 'jsonBodyCodec' since its response type is 'Text' (which has real
+<span class="lineno">  152 </span>-- 'ToJSON'/'FromJSON' instances).
+<span class="lineno">  153 </span>routeMeta :: SealRoute caps qrys req resp -&gt; MetaCodec caps qrys req resp
+<span class="lineno">  154 </span><span class="decl"><span class="nottickedoff">routeMeta = \case</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="nottickedoff">RouteHealth -&gt; Meta (match &quot;health&quot; ./ end) qend bodyless (resp (one jsonBodyCodec)) M.get</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsList -&gt; Meta (match &quot;tabs&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsNew -&gt; Meta (match &quot;tabs&quot; ./ match &quot;new&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsClose -&gt; Meta (match &quot;tabs&quot; ./ capture tabIndexCapture ./ match &quot;close&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsDismiss -&gt; Meta (match &quot;tabs&quot; ./ capture tabIndexCapture ./ match &quot;dismiss&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsAcknowledge -&gt; Meta (match &quot;tabs&quot; ./ capture tabIndexCapture ./ match &quot;acknowledge&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsRelease -&gt; Meta (match &quot;tabs&quot; ./ capture tabIndexCapture ./ match &quot;release&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="nottickedoff">RouteTabsDestroy -&gt; Meta (match &quot;tabs&quot; ./ capture tabIndexCapture ./ match &quot;destroy&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="nottickedoff">RouteLists -&gt; Meta (match &quot;lists&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionsList -&gt; Meta (match &quot;sessions&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionsArchived -&gt; Meta (match &quot;sessions&quot; ./ match &quot;archived&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionTranscript -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;transcript&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionSend -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;send&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionStop -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;stop&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionSetupRepo -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;setup-repo&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionAgents -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;agents&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionDescription -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;description&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionArchived -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;archived&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionPrompt -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;prompt&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionAgent -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;agent&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionQuestions -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;questions&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionAnswer -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;questions&quot; ./ capture askIdCapture ./ match &quot;answer&quot; ./ end) qend (body (one answerReqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionAskCancel -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;questions&quot; ./ capture askIdCapture ./ match &quot;cancel&quot; ./ end) qend bodyless (resp (one respCodec)) M.post</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionNew -&gt; Meta (match &quot;sessions&quot; ./ match &quot;new&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="nottickedoff">RouteSessionNewFrom -&gt; Meta (match &quot;sessions&quot; ./ capture sessionIdCapture ./ match &quot;new&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="nottickedoff">RouteHarnesses -&gt; Meta (match &quot;harnesses&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="nottickedoff">RouteHarnessDiscover -&gt; Meta (match &quot;harnesses&quot; ./ match &quot;discover&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentsList -&gt; Meta (match &quot;agents&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentDefaultGet -&gt; Meta (match &quot;agents&quot; ./ match &quot;default&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentDefaultPut -&gt; Meta (match &quot;agents&quot; ./ match &quot;default&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentGet -&gt; Meta (match &quot;agents&quot; ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentCreate -&gt; Meta (match &quot;agents&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentUpdate -&gt; Meta (match &quot;agents&quot; ./ capture agentDefIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">RouteAgentDelete -&gt; Meta (match &quot;agents&quot; ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="nottickedoff">RouteSkillsList -&gt; Meta (match &quot;skills&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">RouteSkillGet -&gt; Meta (match &quot;skills&quot; ./ capture skillIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">RouteSkillCreate -&gt; Meta (match &quot;skills&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="nottickedoff">RouteSkillUpdate -&gt; Meta (match &quot;skills&quot; ./ capture skillIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="nottickedoff">RouteSkillDelete -&gt; Meta (match &quot;skills&quot; ./ capture skillIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="nottickedoff">RouteReposList -&gt; Meta (match &quot;repos&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoCreate -&gt; Meta (match &quot;repos&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoGet -&gt; Meta (match &quot;repos&quot; ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoUpdate -&gt; Meta (match &quot;repos&quot; ./ capture repoIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoDelete -&gt; Meta (match &quot;repos&quot; ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoDeployKey -&gt; Meta (match &quot;repos&quot; ./ capture repoIdCapture ./ match &quot;deploy-key&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="nottickedoff">RouteRepoDeployKeyGenerate -&gt; Meta (match &quot;repos&quot; ./ capture repoIdCapture ./ match &quot;deploy-key&quot; ./ match &quot;generate&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="nottickedoff">RouteProvidersList -&gt; Meta (match &quot;providers&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="nottickedoff">RouteProviderModels -&gt; Meta (match &quot;providers&quot; ./ capture textCapture ./ match &quot;models&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="nottickedoff">RouteProviderModelContext -&gt; Meta (match &quot;providers&quot; ./ capture textCapture ./ match &quot;models&quot; ./ capture textCapture ./ match &quot;context&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="nottickedoff">RouteUiStateGet -&gt; Meta (match &quot;ui&quot; ./ match &quot;state&quot; ./ end) qend bodyless (resp (one respCodec)) M.get</span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="nottickedoff">RouteUiStatePut -&gt; Meta (match &quot;ui&quot; ./ match &quot;state&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="nottickedoff">RouteUiCustomModels -&gt; Meta (match &quot;ui&quot; ./ match &quot;custom-models&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="nottickedoff">RouteUiRepos -&gt; Meta (match &quot;ui&quot; ./ match &quot;repos&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="nottickedoff">RouteAdopt -&gt; Meta (match &quot;adopt&quot; ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- | All routes, listed as 'Constructed' values (existential 'SealRoute').
+<span class="lineno">  211 </span>-- The order controls literal-vs-capture matching at the FIRST segment only
+<span class="lineno">  212 </span>-- (trasa tries literal matches before captures at each segment).
+<span class="lineno">  213 </span>allRoutes :: [Constructed SealRoute]
+<span class="lineno">  214 </span><span class="decl"><span class="istickedoff">allRoutes =</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">[ Constructed RouteHealth</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsList</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsNew</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsClose</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsDismiss</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsAcknowledge</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsRelease</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteTabsDestroy</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteLists</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionsList</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionsArchived</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionTranscript</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionSend</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionStop</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionSetupRepo</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionAgents</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionDescription</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionArchived</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionPrompt</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionAgent</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionQuestions</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionAnswer</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionAskCancel</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionNew</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSessionNewFrom</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteHarnesses</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteHarnessDiscover</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentsList</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentDefaultGet</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentDefaultPut</span>
+<span class="lineno">  245 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentGet</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentCreate</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentUpdate</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAgentDelete</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSkillsList</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSkillGet</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSkillCreate</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSkillUpdate</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteSkillDelete</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteReposList</span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoCreate</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoGet</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoUpdate</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoDelete</span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoDeployKey</span>
+<span class="lineno">  260 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteRepoDeployKeyGenerate</span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteProvidersList</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteProviderModels</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteProviderModelContext</span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteUiStateGet</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteUiStatePut</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteUiCustomModels</span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteUiRepos</span>
+<span class="lineno">  268 </span><span class="spaces">  </span><span class="istickedoff">, Constructed RouteAdopt</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  270 </span>
+<span class="lineno">  271 </span>-- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.
+<span class="lineno">  272 </span>sealRouter :: Router SealRoute
+<span class="lineno">  273 </span><span class="decl"><span class="nottickedoff">sealRouter = routerWith (mapMeta captureCodecToCaptureDecoding captureCodecToCaptureDecoding id id . routeMeta) allRoutes</span></span>
+<span class="lineno">  274 </span>
+<span class="lineno">  275 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  276 </span>-- Capture codecs (design §4.3 — the always-succeed pattern)
+<span class="lineno">  277 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  278 </span>
+<span class="lineno">  279 </span>-- | A validated 'SessionId' capture (or the parse error). The codec never
+<span class="lineno">  280 </span>-- returns 'Nothing', so trasa's path-not-found interception is never
+<span class="lineno">  281 </span>-- triggered by a capture decode failure.
+<span class="lineno">  282 </span>newtype SessionIdOrErr = SessionIdOrErr (Either Text Text)
+<span class="lineno">  283 </span>
+<span class="lineno">  284 </span>sessionIdCapture :: CaptureCodec SessionIdOrErr
+<span class="lineno">  285 </span><span class="decl"><span class="istickedoff">sessionIdCapture = CaptureCodec</span>
+<span class="lineno">  286 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(SessionIdOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . SessionIdOrErr . Right</span></span>
+<span class="lineno">  288 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  289 </span>
+<span class="lineno">  290 </span>-- | A validated 'AgentDefId' capture (or the parse error).
+<span class="lineno">  291 </span>newtype AgentDefIdOrErr = AgentDefIdOrErr (Either Text Text)
+<span class="lineno">  292 </span>
+<span class="lineno">  293 </span>agentDefIdCapture :: CaptureCodec AgentDefIdOrErr
+<span class="lineno">  294 </span><span class="decl"><span class="istickedoff">agentDefIdCapture = CaptureCodec</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(AgentDefIdOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  296 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . AgentDefIdOrErr . Right</span></span>
+<span class="lineno">  297 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  298 </span>
+<span class="lineno">  299 </span>-- | A validated 'SkillId' capture (or the parse error).
+<span class="lineno">  300 </span>newtype SkillIdOrErr = SkillIdOrErr (Either Text Text)
+<span class="lineno">  301 </span>
+<span class="lineno">  302 </span>skillIdCapture :: CaptureCodec SkillIdOrErr
+<span class="lineno">  303 </span><span class="decl"><span class="istickedoff">skillIdCapture = CaptureCodec</span>
+<span class="lineno">  304 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(SkillIdOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . SkillIdOrErr . Right</span></span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  307 </span>
+<span class="lineno">  308 </span>-- | A validated 'RepoId' capture (or the parse error).
+<span class="lineno">  309 </span>newtype RepoIdOrErr = RepoIdOrErr (Either Text Text)
+<span class="lineno">  310 </span>
+<span class="lineno">  311 </span>repoIdCapture :: CaptureCodec RepoIdOrErr
+<span class="lineno">  312 </span><span class="decl"><span class="istickedoff">repoIdCapture = CaptureCodec</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(RepoIdOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . RepoIdOrErr . Right</span></span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>-- | A tab index capture (or the parse error).
+<span class="lineno">  318 </span>newtype TabIndexOrErr = TabIndexOrErr (Either Text Text)
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>tabIndexCapture :: CaptureCodec TabIndexOrErr
+<span class="lineno">  321 </span><span class="decl"><span class="istickedoff">tabIndexCapture = CaptureCodec</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(TabIndexOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  323 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . TabIndexOrErr . Right</span></span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | An 'AskId' capture (or the parse error).
+<span class="lineno">  327 </span>newtype AskIdOrErr = AskIdOrErr (Either Text Text)
+<span class="lineno">  328 </span>
+<span class="lineno">  329 </span>askIdCapture :: CaptureCodec AskIdOrErr
+<span class="lineno">  330 </span><span class="decl"><span class="istickedoff">askIdCapture = CaptureCodec</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">\(AskIdOrErr e) -&gt; fromRight &quot;&quot; e</span></span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just . AskIdOrErr . Right</span></span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  334 </span>
+<span class="lineno">  335 </span>-- | A plain 'Text' capture (unvalidated — used for provider labels + model
+<span class="lineno">  336 </span>-- names where the legacy router did no validation).
+<span class="lineno">  337 </span>textCapture :: CaptureCodec Text
+<span class="lineno">  338 </span><span class="decl"><span class="istickedoff">textCapture = CaptureCodec</span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">{ captureCodecEncode = <span class="nottickedoff">id</span></span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">, captureCodecDecode = <span class="nottickedoff">Just</span></span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  344 </span>-- ToParamSchema instances for the capture newtypes (OpenAPI generation)
+<span class="lineno">  345 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  346 </span>
+<span class="lineno">  347 </span>-- | All the validated-capture newtypes ('SessionIdOrErr', 'AgentDefIdOrErr',
+<span class="lineno">  348 </span>-- etc.) represent path segments serialized as strings. The 'ToParamSchema'
+<span class="lineno">  349 </span>-- instance renders a plain string schema so @trasa-openapi-hs@ can emit a
+<span class="lineno">  350 </span>-- 'OpenApiSchema' for each path parameter without needing the underlying
+<span class="lineno">  351 </span>-- validated type.
+<span class="lineno">  352 </span>instance ToParamSchema SessionIdOrErr where
+<span class="lineno">  353 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  354 </span>instance ToParamSchema AgentDefIdOrErr where
+<span class="lineno">  355 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  356 </span>instance ToParamSchema SkillIdOrErr where
+<span class="lineno">  357 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  358 </span>instance ToParamSchema RepoIdOrErr where
+<span class="lineno">  359 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  360 </span>instance ToParamSchema TabIndexOrErr where
+<span class="lineno">  361 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  362 </span>instance ToParamSchema AskIdOrErr where
+<span class="lineno">  363 </span>  <span class="decl"><span class="istickedoff">toParamSchema _ = mempty &amp; type_ ?~ OpenApiTypeSingle OpenApiString</span></span>
+<span class="lineno">  364 </span>
+<span class="lineno">  365 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  366 </span>-- Body + response codecs (TODO W6b — implement in Seal.Gateway.Route.Codec)
+<span class="lineno">  367 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  368 </span>
+<span class="lineno">  369 </span>-- | The 'AnswerReq' sum body type.
+<span class="lineno">  370 </span>data AnswerReq = AnswerReq
+<span class="lineno">  371 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">arAnswer</span></span></span> :: !Text
+<span class="lineno">  372 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">arScope</span></span></span> :: !Text
+<span class="lineno">  373 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  374 </span>
+<span class="lineno">  375 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  376 </span>-- Free-form JSON schema + dummy JSON instances for the opaque body/response
+<span class="lineno">  377 </span>-- marker types (OpenAPI generation). The handlers build 'Value's directly, so
+<span class="lineno">  378 </span>-- these instances exist solely so 'Trasa.OpenApi.Codec.openApiJsonBody' can
+<span class="lineno">  379 </span>-- produce an 'OpenApiBodyCodec' for each route. The 'ToJSON'/'FromJSON'
+<span class="lineno">  380 </span>-- instances are never called by the OpenAPI generator (it only reads the
+<span class="lineno">  381 </span>-- schema + media types); they're total dummies that satisfy the class
+<span class="lineno">  382 </span>-- constraints. The 'ToSchema' instances render a free-form object schema
+<span class="lineno">  383 </span>-- (@{&quot;type&quot;:&quot;object&quot;,&quot;additionalProperties&quot;:true}@).
+<span class="lineno">  384 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  385 </span>
+<span class="lineno">  386 </span>freeFormObjectSchema :: Schema
+<span class="lineno">  387 </span><span class="decl"><span class="istickedoff">freeFormObjectSchema = mempty</span>
+<span class="lineno">  388 </span><span class="spaces">  </span><span class="istickedoff">&amp; type_ ?~ OpenApiTypeSingle OpenApiObject</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">&amp; additionalProperties ?~ AdditionalPropertiesAllowed True</span></span>
+<span class="lineno">  390 </span>
+<span class="lineno">  391 </span>instance ToSchema Resp where
+<span class="lineno">  392 </span>  <span class="decl"><span class="istickedoff">declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)</span></span>
+<span class="lineno">  393 </span>instance ToSchema Req where
+<span class="lineno">  394 </span>  <span class="decl"><span class="istickedoff">declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)</span></span>
+<span class="lineno">  395 </span>instance ToSchema AnswerReq where
+<span class="lineno">  396 </span>  <span class="decl"><span class="istickedoff">declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)</span></span>
+<span class="lineno">  397 </span>
+<span class="lineno">  398 </span>-- | A dummy 'BodyCodec' for the opaque marker types ('Resp', 'Req',
+<span class="lineno">  399 </span>-- 'AnswerReq'). The OpenAPI generator only reads the media types from
+<span class="lineno">  400 </span>-- 'bodyCodecNames' (the encode/decode functions are never called — the
+<span class="lineno">  401 </span>-- generator builds a schema document, not a server). The functions are total
+<span class="lineno">  402 </span>-- bottoms ('Left &quot;unused&quot;) so they can't accidentally produce a value of the
+<span class="lineno">  403 </span>-- uninhabited 'Resp'/'Req' types.
+<span class="lineno">  404 </span>freeFormBodyCodec :: BodyCodec a
+<span class="lineno">  405 </span><span class="decl"><span class="istickedoff">freeFormBodyCodec = BodyCodec</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">{ bodyCodecNames = &quot;application/json&quot; :| <span class="nottickedoff">[]</span></span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">, bodyCodecEncode = <span class="nottickedoff">const BL.empty</span></span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">, bodyCodecDecode = <span class="nottickedoff">\_ -&gt; Left &quot;freeFormBodyCodec: unused (OpenAPI generation only)&quot;</span></span>
+<span class="lineno">  409 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  410 </span>
+<span class="lineno">  411 </span>-- | The response codec for 'Resp' routes (dummy — the handler builds the
+<span class="lineno">  412 </span>-- 'Response' directly; trasa's response encoding is never invoked).
+<span class="lineno">  413 </span>respCodec :: BodyCodec Resp
+<span class="lineno">  414 </span><span class="decl"><span class="nottickedoff">respCodec = freeFormBodyCodec</span></span>
+<span class="lineno">  415 </span>
+<span class="lineno">  416 </span>-- | The request codec for 'Req'-body routes (dummy — the wrapper parses the
+<span class="lineno">  417 </span>-- body bytes itself and hands them to the handler).
+<span class="lineno">  418 </span>reqCodec :: BodyCodec Req
+<span class="lineno">  419 </span><span class="decl"><span class="nottickedoff">reqCodec = freeFormBodyCodec</span></span>
+<span class="lineno">  420 </span>
+<span class="lineno">  421 </span>-- | The request codec for 'AnswerReq'-body routes (dummy).
+<span class="lineno">  422 </span>answerReqCodec :: BodyCodec AnswerReq
+<span class="lineno">  423 </span><span class="decl"><span class="nottickedoff">answerReqCodec = freeFormBodyCodec</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+<span class="lineno">    2 </span>-- | The restricted monad for untrusted opcode execution. Carries an
+<span class="lineno">    3 </span>-- 'UntrustedIO' handle (+ the Git 'CloneDeps' surface) internally; the only
+<span class="lineno">    4 </span>-- IO an opcode can perform is the lifted 'UntrustedIO'/'CloneDeps' surface.
+<span class="lineno">    5 </span>-- NO 'MonadIO' — a bare 'liftIO'\/'IO' action in an opcode body typed
+<span class="lineno">    6 </span>-- @UIO OpResult@ won't compile. Constructed ONLY by 'mkLocalUIO'/
+<span class="lineno">    7 </span>-- 'mkRemoteUIO'\/'mkUIOStub'; the constructor + 'unUIO' + 'runUIO' +
+<span class="lineno">    8 </span>-- 'UIOEnv' are unexported. 'runUIOWithEnv' is exported to the dispatcher +
+<span class="lineno">    9 </span>-- 'WorkdirFs' (NOT to opcode modules — W6 grep check).
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- This turns the \&quot;don't import 'System.Directory'\/don't shell out in
+<span class="lineno">   12 </span>-- opcodes\&quot; convention into a **type-level guarantee**, categorically
+<span class="lineno">   13 </span>-- eliminating future local\/remote parity gaps: there is one construction
+<span class="lineno">   14 </span>-- path per mode, and the only IO an untrusted opcode can perform is the
+<span class="lineno">   15 </span>-- 'UIO'-lifted 'UntrustedIO' (+ 'CloneDeps') surface.
+<span class="lineno">   16 </span>-- | Internal module: exports the 'UIO' constructor, 'unUIO', 'UIOEnv', and
+<span class="lineno">   17 </span>-- all internals. Imported ONLY by 'Seal.Tools.Exec.UIO' (the restricted
+<span class="lineno">   18 </span>-- re-export) and 'Seal.Tools.Exec.UIOGit' (the Git 'CloneDeps' surface).
+<span class="lineno">   19 </span>-- NEVER imported by opcode modules — the W6 grep check asserts no
+<span class="lineno">   20 </span>-- @Seal.Tools.Exec.UIO.Internal@ reference in @src\/Seal\/ISA\/Ops\/@.
+<span class="lineno">   21 </span>module Seal.Tools.Exec.UIO.Internal
+<span class="lineno">   22 </span>  ( UIO (..)
+<span class="lineno">   23 </span>  , UIOEnv (..)
+<span class="lineno">   24 </span>  , mkLocalUIO
+<span class="lineno">   25 </span>  , mkRemoteUIO
+<span class="lineno">   26 </span>  , mkUIOStub
+<span class="lineno">   27 </span>  , runUIOWithEnv
+<span class="lineno">   28 </span>  , mkTestUIOEnv
+<span class="lineno">   29 </span>  , uioRead
+<span class="lineno">   30 </span>  , uioWrite
+<span class="lineno">   31 </span>  , uioPatch
+<span class="lineno">   32 </span>  , uioShellExec
+<span class="lineno">   33 </span>  , uioBinExec
+<span class="lineno">   34 </span>  , uioProcessList
+<span class="lineno">   35 </span>  , uioProcessKill
+<span class="lineno">   36 </span>  , uioSearchFiles
+<span class="lineno">   37 </span>  , uioShellExecEnv
+<span class="lineno">   38 </span>  , uioShellExecGitEnv
+<span class="lineno">   39 </span>  , uioBinExecEnv
+<span class="lineno">   40 </span>  , uioBinExecGitEnv
+<span class="lineno">   41 </span>  , uioLiftIO
+<span class="lineno">   42 </span>  , uioUntrustedIO
+<span class="lineno">   43 </span>  , WriteMode (..)
+<span class="lineno">   44 </span>  , UntrustedErr (..)
+<span class="lineno">   45 </span>  , renderUntrustedErr
+<span class="lineno">   46 </span>  , mkLocalUntrustedIO
+<span class="lineno">   47 </span>  , mkRemoteUntrustedIO
+<span class="lineno">   48 </span>  , mkRemoteUntrustedIOStub
+<span class="lineno">   49 </span>  ) where
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   52 </span>import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
+<span class="lineno">   53 </span>import Data.ByteString (ByteString)
+<span class="lineno">   54 </span>import Data.Text (Text)
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>import Seal.Security.Path (WorkspaceRoot)
+<span class="lineno">   57 </span>import Seal.SourceControl.Clone (CloneDeps)
+<span class="lineno">   58 </span>import Seal.Text.LineFile (LineWindow)
+<span class="lineno">   59 </span>import Seal.Tools.Args (BinArg, BinName, SearchPattern, ShellCommand)
+<span class="lineno">   60 </span>import Seal.Tools.Exec.Remote (RemoteRunner)
+<span class="lineno">   61 </span>import Seal.Tools.Exec.Types (RemotePath, SshConfig)
+<span class="lineno">   62 </span>import Seal.Tools.Exec.UntrustedIO
+<span class="lineno">   63 </span>  ( UntrustedIO  -- the type only; record fields accessed via UIORec.*
+<span class="lineno">   64 </span>  , WriteMode (..)
+<span class="lineno">   65 </span>  , UntrustedErr (..)
+<span class="lineno">   66 </span>  , renderUntrustedErr
+<span class="lineno">   67 </span>  , mkLocalUntrustedIO
+<span class="lineno">   68 </span>  , mkRemoteUntrustedIO
+<span class="lineno">   69 </span>  , mkRemoteUntrustedIOStub
+<span class="lineno">   70 </span>  )
+<span class="lineno">   71 </span>import Seal.Tools.Exec.UntrustedIO qualified as UIORec
+<span class="lineno">   72 </span>  ( uioReadFile, uioWriteFile, uioPatchFile, uioShellExec, uioBinExec
+<span class="lineno">   73 </span>  , uioProcessList, uioProcessKill, uioSearchFiles
+<span class="lineno">   74 </span>  , uioShellExecEnv, uioShellExecGitEnv, uioBinExecEnv, uioBinExecGitEnv )
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | The restricted monad. Exposes 'Functor', 'Applicative', 'Monad' — and
+<span class="lineno">   77 </span>-- deliberately **no** 'MonadIO', no 'MonadReader', no 'MonadThrow', no
+<span class="lineno">   78 </span>-- 'Katip'. An opcode body typed @UIO OpResult@ literally cannot call
+<span class="lineno">   79 </span>-- 'liftIO', 'ask', 'throwM', or import 'System.Directory' (compile error).
+<span class="lineno">   80 </span>-- The only IO is the module-level 'uio*' functions below.
+<span class="lineno">   81 </span>newtype UIO a = UIO { <span class="istickedoff"><span class="decl"><span class="istickedoff">unUIO</span></span></span> :: ReaderT UIOEnv IO a }
+<span class="lineno">   82 </span>  deriving newtype (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">Functor</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Applicative</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Monad</span></span></span></span></span></span>)
+<span class="lineno">   83 </span>  -- deliberately NOT: MonadIO, MonadReader, MonadThrow
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | The environment carried by 'UIO'. Holds the 'UntrustedIO' handle + the
+<span class="lineno">   86 </span>-- Git 'CloneDeps' surface. NOT exported (opaque — no caller can forge
+<span class="lineno">   87 </span>-- one); only 'mkLocalUIO'\/'mkRemoteUIO'\/'mkUIOStub'\/'mkTestUIOEnv'
+<span class="lineno">   88 </span>-- construct it.
+<span class="lineno">   89 </span>data UIOEnv = UIOEnv
+<span class="lineno">   90 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uieUntrustedIO</span></span></span> :: !UntrustedIO
+<span class="lineno">   91 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uieCloneDeps</span></span></span>   :: !CloneDeps
+<span class="lineno">   92 </span>  }
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Run a 'UIO' action with a pre-built 'UIOEnv'. Exported to the
+<span class="lineno">   95 </span>-- dispatcher + 'WorkdirFs' (NOT to opcode modules — W6 grep check). The
+<span class="lineno">   96 </span>-- 'UIOEnv' is opaque; callers obtain one from 'mkSessionExec'
+<span class="lineno">   97 </span>-- ('seUIOEnv') or 'mkTestUIOEnv'.
+<span class="lineno">   98 </span>runUIOWithEnv :: UIOEnv -&gt; UIO a -&gt; IO a
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">runUIOWithEnv env (UIO action) = runReaderT action env</span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | Build a 'UIOEnv' from an 'UntrustedIO' + 'CloneDeps'. Exported with
+<span class="lineno">  102 </span>-- the 'Test' prefix as the naming gate (matching
+<span class="lineno">  103 </span>-- 'mkFakeRemoteRunnerRecording' — the @Fake@\/@Test@ prefix is the
+<span class="lineno">  104 </span>-- convention; no @#ifdef TESTING@). Used by the 'uoRunLegacy' back-compat
+<span class="lineno">  105 </span>-- wrapper (W-A3) + tests (Git specs seed a stub 'CloneDeps' into the
+<span class="lineno">  106 </span>-- 'UIOEnv' via this helper).
+<span class="lineno">  107 </span>mkTestUIOEnv :: UntrustedIO -&gt; CloneDeps -&gt; UIOEnv
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">mkTestUIOEnv = UIOEnv</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  111 </span>-- Smart constructors (the only way to obtain a 'UIO' execution context)
+<span class="lineno">  112 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | @mode=local@: the workdir is a local path; 'UntrustedIO' is local.
+<span class="lineno">  115 </span>-- Builds a local 'UntrustedIO' + a local 'CloneDeps' internally, runs the
+<span class="lineno">  116 </span>-- action via 'runUIOWithEnv'.
+<span class="lineno">  117 </span>mkLocalUIO :: WorkspaceRoot -&gt; CloneDeps -&gt; UIO a -&gt; IO a
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">mkLocalUIO wsRoot cloneDeps action =</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">let uio = mkLocalUntrustedIO wsRoot</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">env = UIOEnv uio cloneDeps</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">in runUIOWithEnv env action</span></span>
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | @mode=remote@: the workdir is a remote workspace path; 'UntrustedIO'
+<span class="lineno">  124 </span>-- is remote (SSH via the 'RemoteRunner'). The runner is shared with
+<span class="lineno">  125 </span>-- 'WorkdirFs' (§3.12, via 'runUIOWithEnv').
+<span class="lineno">  126 </span>mkRemoteUIO :: SshConfig -&gt; RemoteRunner -&gt; WorkspaceRoot -&gt; CloneDeps
+<span class="lineno">  127 </span>            -&gt; UIO a -&gt; IO a
+<span class="lineno">  128 </span><span class="decl"><span class="nottickedoff">mkRemoteUIO sshCfg runner _wsRoot cloneDeps action =</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="nottickedoff">let uio = mkRemoteUntrustedIO sshCfg runner</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="nottickedoff">env = UIOEnv uio cloneDeps</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="nottickedoff">in runUIOWithEnv env action</span></span>
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>-- | Fail-closed: every operation returns 'Left'\/stub. For misconfigured
+<span class="lineno">  134 </span>-- or unreachable remotes; mirrors 'mkRemoteUntrustedIOStub'.
+<span class="lineno">  135 </span>mkUIOStub :: CloneDeps -&gt; UIO a -&gt; IO a
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">mkUIOStub cloneDeps action =</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">let env = UIOEnv mkRemoteUntrustedIOStub cloneDeps</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">in runUIOWithEnv env action</span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  141 </span>-- Lifted 'UntrustedIO' operations (module-level 'UIO'-typed functions)
+<span class="lineno">  142 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Read a workspace-relative file as a 'LineWindow' (paged, bounded).
+<span class="lineno">  145 </span>uioRead :: RemotePath -&gt; Int -&gt; UIO (Either UntrustedErr LineWindow)
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">uioRead rp scanBytes = UIO $ do</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioReadFile (uieUntrustedIO env) rp scanBytes)</span></span>
+<span class="lineno">  149 </span>
+<span class="lineno">  150 </span>-- | Write or append content to a workspace-relative file (bounded).
+<span class="lineno">  151 </span>uioWrite :: RemotePath -&gt; Text -&gt; WriteMode -&gt; Int
+<span class="lineno">  152 </span>         -&gt; UIO (Either UntrustedErr Int)
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">uioWrite rp content mode ceiling' = UIO $ do</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioWriteFile (uieUntrustedIO env) rp content mode ceiling')</span></span>
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>-- | Apply a unified diff to a workspace-relative file (atomic write).
+<span class="lineno">  158 </span>uioPatch :: RemotePath -&gt; Text -&gt; UIO (Either UntrustedErr ())
+<span class="lineno">  159 </span><span class="decl"><span class="istickedoff">uioPatch rp patch = UIO $ do</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioPatchFile (uieUntrustedIO env) rp patch)</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Run a validated shell command (single arg to @/bin/sh -c@), with an
+<span class="lineno">  164 </span>-- optional SafePath-confined cwd.
+<span class="lineno">  165 </span>uioShellExec :: ShellCommand -&gt; Maybe RemotePath
+<span class="lineno">  166 </span>             -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">uioShellExec cmd mCwd = UIO $ do</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioShellExec (uieUntrustedIO env) cmd mCwd)</span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | Run a named binary (no shell, fixed argv) with an optional cwd.
+<span class="lineno">  172 </span>uioBinExec :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath
+<span class="lineno">  173 </span>           -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  174 </span><span class="decl"><span class="istickedoff">uioBinExec bin bargs mCwd = UIO $ do</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioBinExec (uieUntrustedIO env) bin bargs mCwd)</span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- | List processes on the untrusted plane (bounded output).
+<span class="lineno">  179 </span>uioProcessList :: UIO (Either UntrustedErr Text)
+<span class="lineno">  180 </span><span class="decl"><span class="istickedoff">uioProcessList = UIO $ do</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioProcessList (uieUntrustedIO env))</span></span>
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | Kill a process by PID (validated positive integer) on the untrusted plane.
+<span class="lineno">  185 </span>uioProcessKill :: Int -&gt; UIO (Either UntrustedErr ())
+<span class="lineno">  186 </span><span class="decl"><span class="istickedoff">uioProcessKill pid = UIO $ do</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioProcessKill (uieUntrustedIO env) pid)</span></span>
+<span class="lineno">  189 </span>
+<span class="lineno">  190 </span>-- | Search workspace files for a pattern (@rg -n -- &lt;pattern&gt; &lt;path&gt;@).
+<span class="lineno">  191 </span>uioSearchFiles :: SearchPattern -&gt; Maybe RemotePath -&gt; Int
+<span class="lineno">  192 </span>               -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  193 </span><span class="decl"><span class="istickedoff">uioSearchFiles pat mPath limit = UIO $ do</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioSearchFiles (uieUntrustedIO env) <span class="nottickedoff">pat</span> <span class="nottickedoff">mPath</span> <span class="nottickedoff">limit</span>)</span></span>
+<span class="lineno">  196 </span>
+<span class="lineno">  197 </span>-- | Like 'uioShellExec' but with env overrides MERGED over the inherited
+<span class="lineno">  198 </span>-- environment (local arm) / @env VAR=val@-prefixed (remote arm). Used by
+<span class="lineno">  199 </span>-- the git-credential opcodes.
+<span class="lineno">  200 </span>uioShellExecEnv :: [(String, String)] -&gt; ShellCommand -&gt; Maybe RemotePath
+<span class="lineno">  201 </span>                -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  202 </span><span class="decl"><span class="nottickedoff">uioShellExecEnv extras cmd mCwd = UIO $ do</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="nottickedoff">env &lt;- ask</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="nottickedoff">liftIO' (UIORec.uioShellExecEnv (uieUntrustedIO env) extras cmd mCwd)</span></span>
+<span class="lineno">  205 </span>
+<span class="lineno">  206 </span>-- | Like 'uioShellExecEnv' but with an optional @known_hosts@ content
+<span class="lineno">  207 </span>-- payload for the REMOTE deploy-key path. Used by 'cloneWithCredential'
+<span class="lineno">  208 </span>-- + 'runGitCommand' for deploy-key ops.
+<span class="lineno">  209 </span>uioShellExecGitEnv :: [(String, String)] -&gt; Maybe ByteString -&gt; ShellCommand
+<span class="lineno">  210 </span>                   -&gt; Maybe RemotePath -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  211 </span><span class="decl"><span class="nottickedoff">uioShellExecGitEnv extras mKnownHosts cmd mCwd = UIO $ do</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="nottickedoff">env &lt;- ask</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="nottickedoff">liftIO' (UIORec.uioShellExecGitEnv (uieUntrustedIO env) extras mKnownHosts cmd mCwd)</span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | Like 'uioBinExec' but with env overrides + an optional cwd. Used by
+<span class="lineno">  216 </span>-- the PAT clone path.
+<span class="lineno">  217 </span>uioBinExecEnv :: [(String, String)] -&gt; BinName -&gt; [BinArg] -&gt; Maybe RemotePath
+<span class="lineno">  218 </span>              -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  219 </span><span class="decl"><span class="istickedoff">uioBinExecEnv extras bin bargs mCwd = UIO $ do</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioBinExecEnv (uieUntrustedIO env) extras bin bargs mCwd)</span></span>
+<span class="lineno">  222 </span>
+<span class="lineno">  223 </span>-- | Like 'uioBinExecEnv' but with optional @known_hosts@ content for the
+<span class="lineno">  224 </span>-- REMOTE deploy-key path (mirrors 'uioShellExecGitEnv'). Used by BIN_EXEC
+<span class="lineno">  225 </span>-- when @binary == &quot;git&quot;@ and the cwd is inside a registered repo with a
+<span class="lineno">  226 </span>-- deploy-key credential.
+<span class="lineno">  227 </span>uioBinExecGitEnv :: [(String, String)] -&gt; Maybe ByteString -&gt; BinName -&gt; [BinArg]
+<span class="lineno">  228 </span>                 -&gt; Maybe RemotePath -&gt; UIO (Either UntrustedErr Text)
+<span class="lineno">  229 </span><span class="decl"><span class="istickedoff">uioBinExecGitEnv extras mKnownHosts bin bargs mCwd = UIO $ do</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">liftIO' (UIORec.uioBinExecGitEnv (uieUntrustedIO env) extras <span class="nottickedoff">mKnownHosts</span> bin bargs <span class="nottickedoff">mCwd</span>)</span></span>
+<span class="lineno">  232 </span>
+<span class="lineno">  233 </span>-- | Internal: lift an 'IO' action into the 'ReaderT' carrier. This is the
+<span class="lineno">  234 </span>-- ONE place 'liftIO' is used in this module — it is NOT exposed to opcode
+<span class="lineno">  235 </span>-- modules (the 'UIO' newtype hides 'ReaderT' and its 'MonadIO' instance).
+<span class="lineno">  236 </span>-- Opcode bodies call the 'uio*' functions above, never 'liftIO' directly.
+<span class="lineno">  237 </span>liftIO' :: IO a -&gt; ReaderT UIOEnv IO a
+<span class="lineno">  238 </span><span class="decl"><span class="istickedoff">liftIO' = liftIO</span></span>
+<span class="lineno">  239 </span>
+<span class="lineno">  240 </span>-- | The escape hatch for untrusted opcodes that perform IO NOT through
+<span class="lineno">  241 </span>-- 'UntrustedIO' (e.g. 'WEB_FETCH' uses an HTTP @Manager@, 'IMAGE_ANALYZE'
+<span class="lineno">  242 </span>-- uses a vision API). These opcodes live outside @src\/Seal\/ISA\/Ops\/@
+<span class="lineno">  243 </span>-- (in @src\/Seal\/Web\/@, @src\/Seal\/Media\/@) — the W-A2 compile-fail
+<span class="lineno">  244 </span>-- fixture asserts that @liftIO@ (from 'MonadIO') does NOT work in a 'UIO'
+<span class="lineno">  245 </span>-- body, and the ISA opcode modules (File\/Shell\/Search\/Bin\/Process\/
+<span class="lineno">  246 </span>-- Git\/Repo) use the typed 'uio*' surface instead. This function is the
+<span class="lineno">  247 </span>-- explicit, audited escape hatch for the Web\/Media opcodes that need
+<span class="lineno">  248 </span>-- direct IO access.
+<span class="lineno">  249 </span>uioLiftIO :: IO a -&gt; UIO a
+<span class="lineno">  250 </span><span class="decl"><span class="istickedoff">uioLiftIO = UIO . liftIO'</span></span>
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | Read the 'UntrustedIO' handle from the 'UIOEnv'. Escape hatch for
+<span class="lineno">  253 </span>-- opcodes that delegate to functions taking a raw 'UntrustedIO' (e.g.
+<span class="lineno">  254 </span>-- 'cloneRepoIO' in 'Seal.ISA.Ops.Repo', which is shared between the opcode
+<span class="lineno">  255 </span>-- path and the API endpoint). W6 will fully migrate these to the 'uio*'
+<span class="lineno">  256 </span>-- surface.
+<span class="lineno">  257 </span>uioUntrustedIO :: UIO UntrustedIO
+<span class="lineno">  258 </span><span class="decl"><span class="istickedoff">uioUntrustedIO = UIO $ asks uieUntrustedIO</span></span>
+
+</pre>
+</body>
+</html>

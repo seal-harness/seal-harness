@@ -1,0 +1,64 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The wire snapshot type for the WS @lists@ frame and the REST @GET
+<span class="lineno">    4 </span>-- /api/lists@ endpoint. Carries the partitioned session lists plus the set
+<span class="lineno">    5 </span>-- of sessions currently in a @thinking@ turn.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- Only the data type + 'ToJSON' instance live here. The builder
+<span class="lineno">    8 </span>-- ('buildListsSnapshot') stays in the server ('Seal.Gateway.ListsSnapshot')
+<span class="lineno">    9 </span>-- because it depends on 'TabsHandle', 'SealPaths', and 'SessionStore' —
+<span class="lineno">   10 </span>-- server-internal types.
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- Canonical home; 'Seal.Gateway.ListsSnapshot' in the server re-exports the
+<span class="lineno">   13 </span>-- type from here.
+<span class="lineno">   14 </span>module Seal.Gateway.Types.ListsSnapshot
+<span class="lineno">   15 </span>  ( ListsSnapshotWire (..)
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.Aeson (ToJSON (..), object, (.=))
+<span class="lineno">   19 </span>import Data.Aeson qualified as A
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import GHC.Generics (Generic)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | The partitioned snapshot. Haskell record fields use the @lsw@ prefix;
+<span class="lineno">   24 </span>-- the 'ToJSON' instance drops it (wire keys: @tabs@, @recentSessions@,
+<span class="lineno">   25 </span>-- @archivedSessions@, @tabSessions@, @thinkingSessionIds@).
+<span class="lineno">   26 </span>data ListsSnapshotWire = ListsSnapshotWire
+<span class="lineno">   27 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lswTabs</span></span></span>             :: [A.Value]
+<span class="lineno">   28 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswRecentSessions</span></span></span>   :: [A.Value]
+<span class="lineno">   29 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswArchivedSessions</span></span></span> :: [A.Value]
+<span class="lineno">   30 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswTabSessions</span></span></span>      :: [A.Value]
+<span class="lineno">   31 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lswThinkingSessionIds</span></span></span> :: [Text]
+<span class="lineno">   32 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ListsSnapshotWire</span></span></span></span></span></span></span></span> where
+<span class="lineno">   35 </span>  <span class="decl"><span class="istickedoff">toJSON s = object</span>
+<span class="lineno">   36 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;tabs&quot;             .= lswTabs s</span>
+<span class="lineno">   37 </span><span class="spaces">    </span><span class="istickedoff">, &quot;recentSessions&quot;   .= lswRecentSessions s</span>
+<span class="lineno">   38 </span><span class="spaces">    </span><span class="istickedoff">, &quot;archivedSessions&quot; .= lswArchivedSessions s</span>
+<span class="lineno">   39 </span><span class="spaces">    </span><span class="istickedoff">, &quot;tabSessions&quot;      .= lswTabSessions s</span>
+<span class="lineno">   40 </span><span class="spaces">    </span><span class="istickedoff">, &quot;thinkingSessionIds&quot; .= lswThinkingSessionIds s</span>
+<span class="lineno">   41 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+
+</pre>
+</body>
+</html>

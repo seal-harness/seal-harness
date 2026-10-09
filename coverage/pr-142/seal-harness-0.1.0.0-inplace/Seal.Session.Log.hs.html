@@ -1,0 +1,130 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Best-effort per-session diagnostic log (@\&lt;sessionDir\&gt;\/seal.log@).
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Records turn lifecycle events (start/end/duration) and failures (exceptions,
+<span class="lineno">    5 </span>-- provider errors) that are NOT already captured in @entries.jsonl@ or
+<span class="lineno">    6 </span>-- @conversation.jsonl@. The transcript files record what the model + opcodes
+<span class="lineno">    7 </span>-- did; this log records what the /harness/ did — where it started, where it
+<span class="lineno">    8 </span>-- stopped, and why it failed when it failed.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Design constraints:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- 1. /Best-effort, never throws./ A write error (full disk, permissions,
+<span class="lineno">   13 </span>--    missing parent dir) is swallowed — the log must never break the agent
+<span class="lineno">   14 </span>--    loop. The worst case is a missing log line, not a crashed session.
+<span class="lineno">   15 </span>-- 2. /Append-only, one line per event./ Each line carries an ISO-8601
+<span class="lineno">   16 </span>--    timestamp prefix + a level tag + the message. Human-readable,
+<span class="lineno">   17 </span>--    grep-friendly.
+<span class="lineno">   18 </span>-- 3. /No duplication of transcript data./ Message content, tool-call inputs,
+<span class="lineno">   19 </span>--    and opcode results are already in @conversation.jsonl@ / @entries.jsonl@.
+<span class="lineno">   20 </span>--    This log records only lifecycle boundaries + failure diagnostics.
+<span class="lineno">   21 </span>module Seal.Session.Log
+<span class="lineno">   22 </span>  ( appendSessionLog
+<span class="lineno">   23 </span>  , logTurnStart
+<span class="lineno">   24 </span>  , logTurnEnd
+<span class="lineno">   25 </span>  , logTurnError
+<span class="lineno">   26 </span>  , logProviderError
+<span class="lineno">   27 </span>  , logMaxTurns
+<span class="lineno">   28 </span>  , logTruncation
+<span class="lineno">   29 </span>  , logTruncationGiveUp
+<span class="lineno">   30 </span>  , maxLengthContinueRetries
+<span class="lineno">   31 </span>  ) where
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>import Control.Exception (catch, SomeException)
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Data.Time (UTCTime, getCurrentTime, formatTime, defaultTimeLocale)
+<span class="lineno">   37 </span>import System.IO (withFile, IOMode (AppendMode), hPutStr)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | Maximum number of auto-continuation retries when the provider returns
+<span class="lineno">   40 </span>-- 'StopMaxTokens' with no tool calls (text was truncated mid-generation).
+<span class="lineno">   41 </span>-- After this many retries the loop surfaces a user-visible truncation
+<span class="lineno">   42 </span>-- notice and stops. Mirrors Hermes' @length_continue_retries &lt; 3@ cap.
+<span class="lineno">   43 </span>maxLengthContinueRetries :: Int
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">maxLengthContinueRetries = 3</span></span>
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | Append a single line to the session log. Best-effort: any IO error is
+<span class="lineno">   47 </span>-- swallowed. The line is prefixed with an ISO-8601 timestamp and the given
+<span class="lineno">   48 </span>-- level tag. A 'Nothing' path is a no-op (logging disabled).
+<span class="lineno">   49 </span>appendSessionLog :: Maybe FilePath -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">appendSessionLog Nothing       _     _ = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   51 </span><span class="spaces"></span><span class="istickedoff">appendSessionLog (Just path) level msg = do</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">let line = T.unpack (formatLogLine now level msg)</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">withFile path AppendMode (`hPutStr` (line &lt;&gt; &quot;\n&quot;))</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">`catch` \(_ :: SomeException) -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | Format a log line: @\&lt;ISO-8601 ts\&gt; [LEVEL] message@
+<span class="lineno">   58 </span>formatLogLine :: UTCTime -&gt; Text -&gt; Text -&gt; Text
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">formatLogLine ts level msg =</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">T.pack (formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%S%3QZ&quot; ts)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot; [&quot; &lt;&gt; level &lt;&gt; &quot;] &quot; &lt;&gt; msg</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Log a turn start. @turnN@ is the 0-based remaining-turns counter from
+<span class="lineno">   64 </span>-- 'runTurn' (the first turn is @aeMaxTurns@).
+<span class="lineno">   65 </span>logTurnStart :: Maybe FilePath -&gt; Int -&gt; IO ()
+<span class="lineno">   66 </span><span class="decl"><span class="istickedoff">logTurnStart mPath turnN =</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;TURN&quot; (&quot;start (turns remaining: &quot; &lt;&gt; T.pack (show turnN) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | Log a turn end with a duration in milliseconds.
+<span class="lineno">   70 </span>logTurnEnd :: Maybe FilePath -&gt; Int -&gt; Integer -&gt; IO ()
+<span class="lineno">   71 </span><span class="decl"><span class="istickedoff">logTurnEnd mPath turnN ms =</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;TURN&quot; (&quot;end (turns remaining: &quot; &lt;&gt; T.pack (show turnN)</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot;, &quot; &lt;&gt; T.pack (show ms) &lt;&gt; &quot;ms)&quot;)</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | Log a turn failure (caught exception). The message is the exception text.
+<span class="lineno">   76 </span>logTurnError :: Maybe FilePath -&gt; Text -&gt; IO ()
+<span class="lineno">   77 </span><span class="decl"><span class="istickedoff">logTurnError mPath err =</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;ERROR&quot; (&quot;turn failed: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>-- | Log a provider error (the 'Left' branch of 'providerComplete').
+<span class="lineno">   81 </span>logProviderError :: Maybe FilePath -&gt; Text -&gt; IO ()
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">logProviderError mPath err =</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;ERROR&quot; (&quot;provider error: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Log the max-turns stop (the loop hit @aeMaxTurns@ without a final text
+<span class="lineno">   86 </span>-- response).
+<span class="lineno">   87 </span>logMaxTurns :: Maybe FilePath -&gt; IO ()
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">logMaxTurns mPath =</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;WARN&quot; &quot;stopped: too many tool turns (hit aeMaxTurns)&quot;</span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | Log a @StopMaxTokens@ truncation that triggered an auto-continuation
+<span class="lineno">   92 </span>-- retry. @attempt@ is 1-based (1 = first retry requested). Mirrors Hermes'
+<span class="lineno">   93 </span>-- @↻ Requesting continuation (N/3)@ log line.
+<span class="lineno">   94 </span>logTruncation :: Maybe FilePath -&gt; Int -&gt; IO ()
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">logTruncation mPath attempt =</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath &quot;WARN&quot;</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">(&quot;response truncated (StopMaxTokens) - requesting continuation (&quot;</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; T.pack (show attempt) &lt;&gt; &quot;/&quot; &lt;&gt; T.pack (show maxLengthContinueRetries) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | Log a @StopMaxTokens@ truncation after all continuation retries are
+<span class="lineno">  101 </span>-- exhausted. The loop surfaces a user-visible truncation notice and stops.
+<span class="lineno">  102 </span>logTruncationGiveUp :: Maybe FilePath -&gt; IO ()
+<span class="lineno">  103 </span><span class="decl"><span class="istickedoff">logTruncationGiveUp mPath =</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">appendSessionLog mPath <span class="nottickedoff">&quot;WARN&quot;</span></span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">(&quot;stopped: response remained truncated after &quot;</span></span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show maxLengthContinueRetries)</span></span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; continuation attempts&quot;)</span></span></span>
+
+</pre>
+</body>
+</html>

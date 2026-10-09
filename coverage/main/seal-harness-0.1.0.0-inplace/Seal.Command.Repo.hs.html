@@ -1,0 +1,421 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @/repo@ command group: list, add, remove, inspect, or test the
+<span class="lineno">    3 </span>-- source-control repos registered in @config\/repos.toml@ (design §4.6).
+<span class="lineno">    4 </span>-- Mirrors 'Seal.Command.Skill' (hsubparser with @list@/@info@ subcommands,
+<span class="lineno">    5 </span>-- 'InteractiveOnly' availability, plain-language renderers). Mutations
+<span class="lineno">    6 </span>-- (@add@\/@remove@) go through 'RepoRegistryHandle' (the service layer over
+<span class="lineno">    7 </span>-- @repos.toml@); the credential /value/ is NEVER read by this command (only
+<span class="lineno">    8 </span>-- the vault key /name/) — secret bytes live in the vault and are fetched at
+<span class="lineno">    9 </span>-- clone time by W3's 'Seal.SourceControl.Clone.resolveCloneTarget'.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- /repo test runs @git ls-remote@ through the injected 'RepoTestSeam' (the
+<span class="lineno">   12 </span>-- real seam is 'lsRemoteRepo'; tests inject a stub) so the command is fully
+<span class="lineno">   13 </span>-- testable without running real git. The /repo test error-message mapping
+<span class="lineno">   14 </span>-- (AC6) reconciles the W3 'renderCloneError' wording for the slash surface:
+<span class="lineno">   15 </span>-- @git failed (exit N)@ becomes @git ls-remote failed (exit N)@ here, since
+<span class="lineno">   16 </span>-- the only git invocation /repo test performs is @git ls-remote@.
+<span class="lineno">   17 </span>module Seal.Command.Repo
+<span class="lineno">   18 </span>  ( repoCommandSpec
+<span class="lineno">   19 </span>  , renderRepoLine
+<span class="lineno">   20 </span>  , renderRepoInfo
+<span class="lineno">   21 </span>  , credentialKindLabel
+<span class="lineno">   22 </span>  , RepoTestSeam (..)
+<span class="lineno">   23 </span>  ) where
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Data.ByteString (ByteString)
+<span class="lineno">   26 </span>import Data.Foldable (for_)
+<span class="lineno">   27 </span>import Data.Text (Text)
+<span class="lineno">   28 </span>import Data.Text qualified as T
+<span class="lineno">   29 </span>import qualified Data.Text.Encoding as TE
+<span class="lineno">   30 </span>import Options.Applicative
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   33 </span>import Seal.Command.Spec
+<span class="lineno">   34 </span>  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
+<span class="lineno">   35 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   36 </span>import Seal.Security.Vault.Age (VaultError (..))
+<span class="lineno">   37 </span>import Seal.SourceControl.Clone (CloneError (..))
+<span class="lineno">   38 </span>import Seal.SourceControl.Repo
+<span class="lineno">   39 </span>  ( RepoCredential (..), RepoId, SourceRepo (..)
+<span class="lineno">   40 </span>  , hostAllowed, mkRepoId, parseCredentialKind, parseRepoHost, parseVcsKind
+<span class="lineno">   41 </span>  , repoIdText, urlShapeValid, vcsKindText )
+<span class="lineno">   42 </span>import Seal.SourceControl.Registry
+<span class="lineno">   43 </span>  ( RepoRegistryHandle (..), removeRepo, upsertRepo )
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>----------------------------------------------------------------------------
+<span class="lineno">   46 </span>-- Test seam
+<span class="lineno">   47 </span>----------------------------------------------------------------------------
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | The /repo command depends on the live vault + @repoCloneStateDir@ for
+<span class="lineno">   50 </span>-- @/repo test@, and on the vault's key list for the @/repo info@ non-blocking
+<span class="lineno">   51 </span>-- advisory. To keep the command testable without running real git, the
+<span class="lineno">   52 </span>-- ls-remote seam is injected. Production wiring (in 'Seal.Command.Serve')
+<span class="lineno">   53 </span>-- passes a real seam built from 'Seal.SourceControl.Clone.lsRemoteRepo' and
+<span class="lineno">   54 </span>-- 'Seal.Security.Vault.vhList'; tests pass a stub.
+<span class="lineno">   55 </span>data RepoTestSeam = RepoTestSeam
+<span class="lineno">   56 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rtsLsRemote</span></span></span>  :: SourceRepo -&gt; IO (Either CloneError Text)
+<span class="lineno">   57 </span>    -- ^ The @git ls-remote@ seam (production: 'lsRemoteRepo').
+<span class="lineno">   58 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rtsVaultList</span></span></span> :: IO (Either VaultError [Text])
+<span class="lineno">   59 </span>    -- ^ The vault key list (production: 'vhList') for the /repo info advisory.
+<span class="lineno">   60 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rtsVaultPut</span></span></span> :: Text -&gt; ByteString -&gt; IO (Either VaultError ())
+<span class="lineno">   61 </span>    -- ^ The vault put seam (production: 'vhPut') for /repo add's PAT/MachineUser
+<span class="lineno">   62 </span>    -- token ingestion (hidden stdin prompt → vault, never argv/disk).
+<span class="lineno">   63 </span>  }
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>----------------------------------------------------------------------------
+<span class="lineno">   66 </span>-- Command spec
+<span class="lineno">   67 </span>----------------------------------------------------------------------------
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | The @/repo@ command spec. Closes over the 'RepoRegistryHandle' (for
+<span class="lineno">   70 </span>-- list/add/remove/info) and a 'RepoTestSeam' (for /repo test + /repo info
+<span class="lineno">   71 </span>-- advisory). 'InteractiveOnly' (mirrors /skill) so it dispatches only on the
+<span class="lineno">   72 </span>-- channel the operator is typing on — not reachable by the agent's tool
+<span class="lineno">   73 </span>-- surface.
+<span class="lineno">   74 </span>repoCommandSpec :: RepoRegistryHandle -&gt; RepoTestSeam -&gt; CommandSpec
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">repoCommandSpec regH seam = CommandSpec</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = <span class="nottickedoff">CommandName &quot;repo&quot;</span></span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = <span class="nottickedoff">[]</span></span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = <span class="nottickedoff">GroupRepos</span></span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = <span class="nottickedoff">&quot;List, add, remove, inspect, or test source-control repos&quot;</span></span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = repoParserInfo regH seam</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">InteractiveOnly</span></span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>repoParserInfo :: RepoRegistryHandle -&gt; RepoTestSeam -&gt; ParserInfo CommandAction
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">repoParserInfo regH seam =</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">info (repoParser regH seam &lt;**&gt; helper)</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;List, add, remove, inspect, or test source-control repos&quot;</span></span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;repo — manage the source-control repo registry&quot;</span></span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>repoParser :: RepoRegistryHandle -&gt; RepoTestSeam -&gt; Parser CommandAction
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">repoParser regH seam = hsubparser</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">(  command &quot;list&quot;</span>
+<span class="lineno">   94 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (listCmd regH))</span>
+<span class="lineno">   95 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;List all registered repos (id, url, credential kind)&quot;</span>))</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;add&quot;</span>
+<span class="lineno">   97 </span><span class="spaces">       </span><span class="istickedoff">(info (addCmd regH seam &lt;$&gt; idArg &lt;*&gt; urlArg &lt;*&gt; vcsOpt &lt;*&gt; credOpt</span>
+<span class="lineno">   98 </span><span class="spaces">                      </span><span class="istickedoff">&lt;*&gt; vaultKeyOpt &lt;*&gt; usernameOpt)</span>
+<span class="lineno">   99 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Add or replace a source-control repo&quot;</span>))</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;remove&quot;</span>
+<span class="lineno">  101 </span><span class="spaces">       </span><span class="istickedoff">(info (removeCmd regH &lt;$&gt; idArg)</span>
+<span class="lineno">  102 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Remove a source-control repo by id&quot;</span>))</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;info&quot;</span>
+<span class="lineno">  104 </span><span class="spaces">       </span><span class="istickedoff">(info (infoCmd regH seam &lt;$&gt; idArg)</span>
+<span class="lineno">  105 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Show a repo's descriptor + a vault-key advisory&quot;</span>))</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;test&quot;</span>
+<span class="lineno">  107 </span><span class="spaces">       </span><span class="istickedoff">(info (testCmd regH seam &lt;$&gt; idArg)</span>
+<span class="lineno">  108 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Run git ls-remote to verify the credential resolves&quot;</span>))</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;COMMAND&quot;</span></span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>----------------------------------------------------------------------------
+<span class="lineno">  113 </span>-- Arguments / options
+<span class="lineno">  114 </span>----------------------------------------------------------------------------
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Required repo-id argument.
+<span class="lineno">  117 </span>idArg :: Parser Text
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">idArg = T.pack &lt;$&gt; strArgument (metavar <span class="nottickedoff">&quot;ID&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Repo id (e.g. myrepo)&quot;</span>)</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | Required repo URL argument.
+<span class="lineno">  121 </span>urlArg :: Parser Text
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">urlArg = T.pack &lt;$&gt; strArgument (metavar <span class="nottickedoff">&quot;URL&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Repo URL (git@github.com:owner/repo.git or https://github.com/owner/repo.git)&quot;</span>)</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | @--vcs@ option (default @github@).
+<span class="lineno">  125 </span>vcsOpt :: Parser Text
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">vcsOpt = T.pack &lt;$&gt; strOption</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">(  long &quot;vcs&quot;</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;KIND&quot;</span></span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; value &quot;github&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; showDefault</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">&quot;VCS kind: git or github (default github)&quot;</span></span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | @--cred@ option (default @pat@). The help text enumerates each kind with
+<span class="lineno">  135 </span>-- a plain-language description so the operator understands what each stores
+<span class="lineno">  136 </span>-- before adding a repo.
+<span class="lineno">  137 </span>credOpt :: Parser Text
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">credOpt = T.pack &lt;$&gt; strOption</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">(  long &quot;cred&quot;</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;KIND&quot;</span></span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; value <span class="nottickedoff">&quot;pat&quot;</span></span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; showDefault</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">( &quot;Credential kind: pat (Personal Access Token: a token stored in &quot;</span></span>
+<span class="lineno">  144 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;the vault, used to clone over HTTPS — token never in URL or &quot;</span></span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;process list); &quot;</span></span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;deploy_key (SSH deploy key: an encrypted keyfile on the harness &quot;</span></span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;disk + a passphrase in the vault); &quot;</span></span>
+<span class="lineno">  148 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;machine_user (bot account: a username + token stored in the vault, &quot;</span></span>
+<span class="lineno">  149 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;used to clone over HTTPS as the bot user — requires --username)&quot;</span></span>
+<span class="lineno">  150 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">)</span></span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | @--vault-key@ option (required). The vault key NAME (the secret value
+<span class="lineno">  154 </span>-- is NEVER read by this command — only at clone time).
+<span class="lineno">  155 </span>vaultKeyOpt :: Parser Text
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">vaultKeyOpt = T.pack &lt;$&gt; strOption</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">(  long &quot;vault-key&quot;</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;KEY&quot;</span></span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">&quot;Vault key name under which the credential value is stored&quot;</span></span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>-- | @--username@ option (optional; required iff @--cred machine_user@).
+<span class="lineno">  163 </span>usernameOpt :: Parser (Maybe Text)
+<span class="lineno">  164 </span><span class="decl"><span class="istickedoff">usernameOpt = optional (T.pack &lt;$&gt; strOption</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">(  long &quot;username&quot;</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;USER&quot;</span></span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">&quot;Public bot account handle (required iff --cred machine_user)&quot;</span></span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">))</span></span>
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>----------------------------------------------------------------------------
+<span class="lineno">  171 </span>-- list
+<span class="lineno">  172 </span>----------------------------------------------------------------------------
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>listCmd :: RepoRegistryHandle -&gt; CommandAction
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">listCmd regH = commandAction $ \caps -&gt; do</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">eRepos &lt;- rrhList regH</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">case eRepos of</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">Left err      -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">Right []      -&gt; ccSend caps &quot;no repos registered&quot;</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">Right repos   -&gt; mapM_ (ccSend caps . renderRepoLine) repos</span></span>
+<span class="lineno">  181 </span>
+<span class="lineno">  182 </span>----------------------------------------------------------------------------
+<span class="lineno">  183 </span>-- add
+<span class="lineno">  184 </span>----------------------------------------------------------------------------
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- | @/repo add &lt;id&gt; &lt;url&gt; --vcs --cred --vault-key [--username]@. Validates
+<span class="lineno">  187 </span>-- the id, URL shape, host allow-list, VCS kind, and credential kind before
+<span class="lineno">  188 </span>-- mutating. The credential /value/ is NEVER read (only the vault key name).
+<span class="lineno">  189 </span>-- On a successful mutation, echoes @added repo \&lt;id\&gt;@.
+<span class="lineno">  190 </span>addCmd
+<span class="lineno">  191 </span>  :: RepoRegistryHandle
+<span class="lineno">  192 </span>  -&gt; RepoTestSeam  -- ^ vault put seam (for PAT/MachineUser token ingestion)
+<span class="lineno">  193 </span>  -&gt; Text   -- ^ raw id
+<span class="lineno">  194 </span>  -&gt; Text   -- ^ url
+<span class="lineno">  195 </span>  -&gt; Text   -- ^ vcs kind (text)
+<span class="lineno">  196 </span>  -&gt; Text   -- ^ credential kind (text)
+<span class="lineno">  197 </span>  -&gt; Text   -- ^ vault key name
+<span class="lineno">  198 </span>  -&gt; Maybe Text  -- ^ optional username (machine_user only)
+<span class="lineno">  199 </span>  -&gt; CommandAction
+<span class="lineno">  200 </span><span class="decl"><span class="istickedoff">addCmd regH seam rawId url rawVcs rawCred vaultKey mUsername =</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">commandAction $ \caps -&gt; do</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">case validateAdd rawId url rawVcs rawCred vaultKey mUsername of</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; ccSend caps err</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">Right repo -&gt; case srCredential repo of</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">CredDeployKey _      -&gt; doUpsert caps repo</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="istickedoff">CredPat _            -&gt; doTokenPrompt caps repo</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">CredMachineUser _ _ -&gt; doTokenPrompt caps repo</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  209 </span><span class="spaces">    </span><span class="istickedoff">doUpsert caps repo = do</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- rrhMutate regH (upsertRepo repo)</span>
+<span class="lineno">  211 </span><span class="spaces">      </span><span class="istickedoff">case res of</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">ccSend caps e</span></span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; ccSend caps (&quot;added repo &quot; &lt;&gt; repoIdText (srId repo))</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">doTokenPrompt caps repo = do</span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">token &lt;- ccPromptSecret caps <span class="nottickedoff">(&quot;PAT for &quot; &lt;&gt; repoIdText (srId repo) &lt;&gt; &quot;: &quot;)</span></span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">ePut &lt;- rtsVaultPut seam (cVaultKey (srCredential repo)) (TE.encodeUtf8 token)</span>
+<span class="lineno">  217 </span><span class="spaces">      </span><span class="istickedoff">case ePut of</span>
+<span class="lineno">  218 </span><span class="spaces">        </span><span class="istickedoff">Left VaultLocked -&gt; ccSend caps &quot;vault locked — run /vault unlock&quot;</span>
+<span class="lineno">  219 </span><span class="spaces">        </span><span class="istickedoff">Left _           -&gt; <span class="nottickedoff">ccSend caps &quot;vault error — could not store token&quot;</span></span>
+<span class="lineno">  220 </span><span class="spaces">        </span><span class="istickedoff">Right _          -&gt; doUpsert caps repo</span></span>
+<span class="lineno">  221 </span>
+<span class="lineno">  222 </span>-- | Pure validation for @/repo add@. Runs every write-time check from the
+<span class="lineno">  223 </span>-- security table (§Security): id charset, URL shape, host allow-list, VCS
+<span class="lineno">  224 </span>-- kind, credential kind (with the machine_user username requirement).
+<span class="lineno">  225 </span>validateAdd
+<span class="lineno">  226 </span>  :: Text -&gt; Text -&gt; Text -&gt; Text -&gt; Text -&gt; Maybe Text
+<span class="lineno">  227 </span>  -&gt; Either Text SourceRepo
+<span class="lineno">  228 </span><span class="decl"><span class="istickedoff">validateAdd rawId url rawVcs rawCred vaultKey mUsername = do</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">rid       &lt;- mkRepoId rawId</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">vcs       &lt;- parseVcsKind rawVcs</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">-- URL shape (defense in depth on top of host allow-list).</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not (urlShapeValid url)</span></span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">Left &quot;URL is neither SSH (git@&lt;host&gt;:...) nor HTTPS (https://&lt;host&gt;/...)&quot;</span></span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">host &lt;- parseRepoHost url</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">if not (hostAllowed host)</span>
+<span class="lineno">  237 </span><span class="spaces">        </span><span class="istickedoff">then Left (&quot;host &quot; &lt;&gt; host &lt;&gt; &quot; not supported (only github.com is supported in this pass)&quot;)</span>
+<span class="lineno">  238 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  239 </span><span class="spaces">          </span><span class="istickedoff">cred &lt;- parseCredentialKind rawCred vaultKey mUsername</span>
+<span class="lineno">  240 </span><span class="spaces">          </span><span class="istickedoff">Right SourceRepo</span>
+<span class="lineno">  241 </span><span class="spaces">            </span><span class="istickedoff">{ srId               = rid</span>
+<span class="lineno">  242 </span><span class="spaces">            </span><span class="istickedoff">, srUrl              = <span class="nottickedoff">url</span></span>
+<span class="lineno">  243 </span><span class="spaces">            </span><span class="istickedoff">, srVcsKind          = <span class="nottickedoff">vcs</span></span>
+<span class="lineno">  244 </span><span class="spaces">            </span><span class="istickedoff">, srCredential       = cred</span>
+<span class="lineno">  245 </span><span class="spaces">            </span><span class="istickedoff">, srDeployKeyPublic  = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  246 </span><span class="spaces">            </span><span class="istickedoff">, srKeyfilePath      = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  247 </span><span class="spaces">            </span><span class="istickedoff">}</span></span>
+<span class="lineno">  248 </span>
+<span class="lineno">  249 </span>----------------------------------------------------------------------------
+<span class="lineno">  250 </span>-- remove
+<span class="lineno">  251 </span>----------------------------------------------------------------------------
+<span class="lineno">  252 </span>
+<span class="lineno">  253 </span>-- | @/repo remove &lt;id&gt;@. Idempotent (204 semantics mirror the REST API): a
+<span class="lineno">  254 </span>-- missing id is still reported as @removed@.
+<span class="lineno">  255 </span>removeCmd :: RepoRegistryHandle -&gt; Text -&gt; CommandAction
+<span class="lineno">  256 </span><span class="decl"><span class="istickedoff">removeCmd regH raw = commandAction $ \caps -&gt;</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">case mkRepoId raw of</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">Right rid -&gt; do</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- rrhMutate regH (removeRepo rid)</span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">case res of</span>
+<span class="lineno">  262 </span><span class="spaces">        </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">ccSend caps e</span></span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; ccSend caps (&quot;removed repo &quot; &lt;&gt; repoIdText rid)</span></span>
+<span class="lineno">  264 </span>
+<span class="lineno">  265 </span>----------------------------------------------------------------------------
+<span class="lineno">  266 </span>-- info
+<span class="lineno">  267 </span>----------------------------------------------------------------------------
+<span class="lineno">  268 </span>
+<span class="lineno">  269 </span>-- | @/repo info &lt;id&gt;@. Renders the descriptor and appends a NON-BLOCKING
+<span class="lineno">  270 </span>-- vault-key advisory: if the vault lists its keys and the repo's
+<span class="lineno">  271 </span>-- @cVaultKey@ is not among them, the operator gets immediate feedback
+<span class="lineno">  272 </span>-- (@vault key \&lt;name\&gt; not found — clone will fail until it is added@) —
+<span class="lineno">  273 </span>-- without failing the command. Lazy-verify is preserved (the vault key is
+<span class="lineno">  274 </span>-- not actually fetched here; only its name is cross-checked against the
+<span class="lineno">  275 </span>-- vault's key list). A locked vault surfaces @vault locked — run /vault
+<span class="lineno">  276 </span>-- unlock to check@; any other vault error skips the advisory silently.
+<span class="lineno">  277 </span>infoCmd :: RepoRegistryHandle -&gt; RepoTestSeam -&gt; Text -&gt; CommandAction
+<span class="lineno">  278 </span><span class="decl"><span class="istickedoff">infoCmd regH seam raw = commandAction $ \caps -&gt;</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">case mkRepoId raw of</span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">  281 </span><span class="spaces">    </span><span class="istickedoff">Right rid -&gt; do</span>
+<span class="lineno">  282 </span><span class="spaces">      </span><span class="istickedoff">eRepos &lt;- rrhList regH</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">case eRepos of</span>
+<span class="lineno">  284 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">ccSend caps e</span></span>
+<span class="lineno">  285 </span><span class="spaces">        </span><span class="istickedoff">Right repos -&gt; case findRepo rid repos of</span>
+<span class="lineno">  286 </span><span class="spaces">          </span><span class="istickedoff">Nothing  -&gt; ccSend caps (&quot;repo not found: &quot; &lt;&gt; repoIdText rid)</span>
+<span class="lineno">  287 </span><span class="spaces">          </span><span class="istickedoff">Just r  -&gt; do</span>
+<span class="lineno">  288 </span><span class="spaces">            </span><span class="istickedoff">mapM_ (ccSend caps) (renderRepoInfo r)</span>
+<span class="lineno">  289 </span><span class="spaces">            </span><span class="istickedoff">advisory &lt;- vaultKeyAdvisory seam (srCredential r)</span>
+<span class="lineno">  290 </span><span class="spaces">            </span><span class="istickedoff">for_ advisory (ccSend caps)</span></span>
+<span class="lineno">  291 </span>
+<span class="lineno">  292 </span>-- | Find a repo by id in a list (helper to avoid a Map.fromList round-trip).
+<span class="lineno">  293 </span>findRepo :: RepoId -&gt; [SourceRepo] -&gt; Maybe SourceRepo
+<span class="lineno">  294 </span><span class="decl"><span class="istickedoff">findRepo rid = go</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">go []       = Nothing</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">go (r : rs) = if <span class="tickonlytrue">srId r == rid</span> then Just r else <span class="nottickedoff">go rs</span></span></span>
+<span class="lineno">  298 </span>
+<span class="lineno">  299 </span>-- | Compute the non-blocking vault-key advisory for /repo info. Returns
+<span class="lineno">  300 </span>-- 'Nothing' when no advisory applies (the vault key is present, or a
+<span class="lineno">  301 </span>-- non-lock vault error occurred — silent skip).
+<span class="lineno">  302 </span>vaultKeyAdvisory :: RepoTestSeam -&gt; RepoCredential -&gt; IO (Maybe Text)
+<span class="lineno">  303 </span><span class="decl"><span class="istickedoff">vaultKeyAdvisory seam cred = do</span>
+<span class="lineno">  304 </span><span class="spaces">  </span><span class="istickedoff">eKeys &lt;- rtsVaultList seam</span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="istickedoff">let vaultKey = cVaultKey cred</span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="istickedoff">pure $ case eKeys of</span>
+<span class="lineno">  307 </span><span class="spaces">    </span><span class="istickedoff">Left VaultLocked -&gt; Just &quot;vault locked — run /vault unlock to check&quot;</span>
+<span class="lineno">  308 </span><span class="spaces">    </span><span class="istickedoff">Left _           -&gt; <span class="nottickedoff">Nothing</span>  -- other vault error: skip the advisory</span>
+<span class="lineno">  309 </span><span class="spaces">    </span><span class="istickedoff">Right keys -&gt;</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">vaultKey `elem` keys</span></span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">Nothing</span>  -- key present: no advisory</span>
+<span class="lineno">  312 </span><span class="spaces">        </span><span class="istickedoff">else Just (&quot;vault key &quot; &lt;&gt; vaultKey &lt;&gt; &quot; not found — clone will fail until it is added&quot;)</span></span>
+<span class="lineno">  313 </span>
+<span class="lineno">  314 </span>----------------------------------------------------------------------------
+<span class="lineno">  315 </span>-- test
+<span class="lineno">  316 </span>----------------------------------------------------------------------------
+<span class="lineno">  317 </span>
+<span class="lineno">  318 </span>-- | @/repo test &lt;id&gt;@. Resolves the repo, runs @git ls-remote@ via the
+<span class="lineno">  319 </span>-- injected seam, and echoes the head sha on success
+<span class="lineno">  320 </span>-- (@credential verified — \&lt;sha\&gt;@). On failure, renders the 'CloneError'
+<span class="lineno">  321 </span>-- via the /repo test-specific mapping (AC6): notably @CloneGitFailed n@
+<span class="lineno">  322 </span>-- becomes @git ls-remote failed (exit n)@ (NOT W3's @git failed (exit n)@),
+<span class="lineno">  323 </span>-- since the only git invocation /repo test performs is @git ls-remote@.
+<span class="lineno">  324 </span>testCmd :: RepoRegistryHandle -&gt; RepoTestSeam -&gt; Text -&gt; CommandAction
+<span class="lineno">  325 </span><span class="decl"><span class="istickedoff">testCmd regH seam raw = commandAction $ \caps -&gt;</span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="istickedoff">case mkRepoId raw of</span>
+<span class="lineno">  327 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">  328 </span><span class="spaces">    </span><span class="istickedoff">Right rid -&gt; do</span>
+<span class="lineno">  329 </span><span class="spaces">      </span><span class="istickedoff">eRepos &lt;- rrhList regH</span>
+<span class="lineno">  330 </span><span class="spaces">      </span><span class="istickedoff">case eRepos of</span>
+<span class="lineno">  331 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">ccSend caps e</span></span>
+<span class="lineno">  332 </span><span class="spaces">        </span><span class="istickedoff">Right repos -&gt; case findRepo rid repos of</span>
+<span class="lineno">  333 </span><span class="spaces">          </span><span class="istickedoff">Nothing  -&gt; ccSend caps (&quot;repo not found: &quot; &lt;&gt; repoIdText rid)</span>
+<span class="lineno">  334 </span><span class="spaces">          </span><span class="istickedoff">Just r   -&gt; do</span>
+<span class="lineno">  335 </span><span class="spaces">            </span><span class="istickedoff">res &lt;- rtsLsRemote seam <span class="nottickedoff">r</span></span>
+<span class="lineno">  336 </span><span class="spaces">            </span><span class="istickedoff">case res of</span>
+<span class="lineno">  337 </span><span class="spaces">              </span><span class="istickedoff">Left e  -&gt; ccSend caps (renderRepoTestError e)</span>
+<span class="lineno">  338 </span><span class="spaces">              </span><span class="istickedoff">Right s -&gt; ccSend caps (&quot;credential verified — &quot; &lt;&gt; s)</span></span>
+<span class="lineno">  339 </span>
+<span class="lineno">  340 </span>-- | /repo test error-message mapping (AC6). Mirrors W3's 'renderCloneError'
+<span class="lineno">  341 </span>-- EXCEPT for @CloneGitFailed@, which is reconciled to @git ls-remote failed@
+<span class="lineno">  342 </span>-- per the W3 reviewer's non-blocking note (the slash surface invokes
+<span class="lineno">  343 </span>-- @git ls-remote@, not @git@; the W3 wording was generic and is sharpened
+<span class="lineno">  344 </span>-- here for the operator-facing message).
+<span class="lineno">  345 </span>renderRepoTestError :: CloneError -&gt; Text
+<span class="lineno">  346 </span><span class="decl"><span class="istickedoff">renderRepoTestError = \case</span>
+<span class="lineno">  347 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError VaultLocked -&gt;</span>
+<span class="lineno">  348 </span><span class="spaces">    </span><span class="istickedoff">&quot;vault locked — run /vault unlock&quot;</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError (VaultKeyNotFound k) -&gt;</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="istickedoff">&quot;vault key &quot; &lt;&gt; k &lt;&gt; &quot; not found&quot;</span>
+<span class="lineno">  351 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError _ -&gt;</span>
+<span class="lineno">  352 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;vault error&quot;</span></span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="istickedoff">CloneNoCredentialForUrl u -&gt;</span>
+<span class="lineno">  354 </span><span class="spaces">    </span><span class="istickedoff">&quot;no credential resolvable for &quot; &lt;&gt; u</span>
+<span class="lineno">  355 </span><span class="spaces">  </span><span class="istickedoff">CloneUnsupportedVcs v -&gt;</span>
+<span class="lineno">  356 </span><span class="spaces">    </span><span class="istickedoff">&quot;unsupported VCS: &quot; &lt;&gt; vcsKindText v</span>
+<span class="lineno">  357 </span><span class="spaces">  </span><span class="istickedoff">CloneHostNotSupported h -&gt;</span>
+<span class="lineno">  358 </span><span class="spaces">    </span><span class="istickedoff">&quot;host &quot; &lt;&gt; h &lt;&gt; &quot; not supported (only github.com is supported in this pass)&quot;</span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">CloneGitFailed n -&gt;</span>
+<span class="lineno">  360 </span><span class="spaces">    </span><span class="istickedoff">&quot;git ls-remote failed (exit &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">CloneAgentError msg -&gt;</span>
+<span class="lineno">  362 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;ssh-agent error: &quot; &lt;&gt; msg</span></span></span>
+<span class="lineno">  363 </span>
+<span class="lineno">  364 </span>----------------------------------------------------------------------------
+<span class="lineno">  365 </span>-- Renderers
+<span class="lineno">  366 </span>----------------------------------------------------------------------------
+<span class="lineno">  367 </span>
+<span class="lineno">  368 </span>-- | One line per repo for @/repo list@: @id  url  &lt;human-credential-label&gt;@.
+<span class="lineno">  369 </span>renderRepoLine :: SourceRepo -&gt; Text
+<span class="lineno">  370 </span><span class="decl"><span class="istickedoff">renderRepoLine r =</span>
+<span class="lineno">  371 </span><span class="spaces">  </span><span class="istickedoff">repoIdText (srId r) &lt;&gt; &quot;  &quot; &lt;&gt; srUrl r &lt;&gt; &quot;  &quot; &lt;&gt; credentialKindLabel (srCredential r)</span></span>
+<span class="lineno">  372 </span>
+<span class="lineno">  373 </span>-- | Multi-line detail for @/repo info@. The @username@ line is emitted ONLY
+<span class="lineno">  374 </span>-- for 'CredMachineUser' (a public bot handle); PAT/DeployKey have no
+<span class="lineno">  375 </span>-- username.
+<span class="lineno">  376 </span>renderRepoInfo :: SourceRepo -&gt; [Text]
+<span class="lineno">  377 </span><span class="decl"><span class="istickedoff">renderRepoInfo r =</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">baseLines &lt;&gt; usernameLine</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="istickedoff">baseLines =</span>
+<span class="lineno">  381 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;id:          &quot; &lt;&gt; repoIdText (srId r)</span>
+<span class="lineno">  382 </span><span class="spaces">      </span><span class="istickedoff">, &quot;url:         &quot; &lt;&gt; srUrl r</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="istickedoff">, &quot;vcs:         &quot; &lt;&gt; vcsKindText (srVcsKind r)</span>
+<span class="lineno">  384 </span><span class="spaces">      </span><span class="istickedoff">, &quot;credential:  &quot; &lt;&gt; credentialKindLabel (srCredential r)</span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="istickedoff">, &quot;vault key:   &quot; &lt;&gt; cVaultKey (srCredential r)</span>
+<span class="lineno">  386 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  387 </span><span class="spaces">    </span><span class="istickedoff">usernameLine = case srCredential r of</span>
+<span class="lineno">  388 </span><span class="spaces">      </span><span class="istickedoff">CredMachineUser _ u -&gt; [&quot;username:    &quot; &lt;&gt; u]</span>
+<span class="lineno">  389 </span><span class="spaces">      </span><span class="istickedoff">_                   -&gt; []</span></span>
+<span class="lineno">  390 </span>
+<span class="lineno">  391 </span>-- | Human-readable label for a 'RepoCredential' (the @credential_kind@ wire
+<span class="lineno">  392 </span>-- string is @pat@\/@deploy_key@\/@machine_user@; this is the long form for
+<span class="lineno">  393 </span>-- @/repo list@ + @/repo info@).
+<span class="lineno">  394 </span>credentialKindLabel :: RepoCredential -&gt; Text
+<span class="lineno">  395 </span><span class="decl"><span class="istickedoff">credentialKindLabel = \case</span>
+<span class="lineno">  396 </span><span class="spaces">  </span><span class="istickedoff">CredPat _         -&gt; &quot;Personal Access Token&quot;</span>
+<span class="lineno">  397 </span><span class="spaces">  </span><span class="istickedoff">CredDeployKey _   -&gt; <span class="nottickedoff">&quot;SSH Deploy Key&quot;</span></span>
+<span class="lineno">  398 </span><span class="spaces">  </span><span class="istickedoff">CredMachineUser {} -&gt; &quot;Bot Account&quot;</span></span>
+
+</pre>
+</body>
+</html>
