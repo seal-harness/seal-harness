@@ -2070,9 +2070,8 @@ describe('Scroll-to-bottom behavior', () => {
       expect(scrollToSpy).toHaveBeenCalled()
 
       // Now simulate a new streaming message arriving. Because the button
-      // pinned to bottom, the sticky-bottom effect should fire
-      // scrollIntoView.
-      scrollIntoViewSpy.mockClear()
+      // pinned to bottom, the sticky-bottom effect should fire scrollTo.
+      scrollToSpy.mockClear()
       const msgsWithNew = [...msgsA, {
         id: 'a-m3',
         entryId: 'a-e3',
@@ -2090,7 +2089,7 @@ describe('Scroll-to-bottom behavior', () => {
         />,
       )
       // sticky-bottom scroll should have been called.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
       Element.prototype.scrollTo = origScrollTo
@@ -2204,7 +2203,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Clear calls from session switch.
-      scrollIntoViewSpy.mockClear()
+      scrollToSpy.mockClear()
 
       // A new message arrives in s2 (streaming update — same first id, count+1).
       const msgsWithNew = [...msgsB, {
@@ -2227,7 +2226,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Sticky-bottom scroll should have fired for the new message.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
      Element.prototype.scrollTo = origScrollTo

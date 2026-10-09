@@ -2608,10 +2608,12 @@ export function ChatArea({
       if (el) {
         el.scrollTo({ top: el.scrollHeight })
         // Follow-up scroll on the next frame to catch layout shifts from
-        // async content rendering (code blocks, images, markdown).
+        // async content rendering (code blocks, images, markdown). Use a
+        // very large value so the browser clamps to the true bottom even
+        // if scrollHeight changed after the initial scrollTo.
         requestAnimationFrame(() => {
           const el2 = scrollerRef.current
-          if (el2) el2.scrollTo({ top: el2.scrollHeight })
+          if (el2) el2.scrollTo({ top: 999999 })
         })
         pendingScrollToBottom.current = false
       }
@@ -2658,7 +2660,12 @@ export function ChatArea({
       return
     }
     if (wasAtBottom.current) {
-      messagesEndRef.current?.scrollIntoView({ block: 'end' })
+      // Use scrollTo with a large value instead of scrollIntoView on the
+      // sentinel — the sentinel sits above the container's bottom padding
+      // (py-6 = 24px), so scrollIntoView leaves a ~23px gap. A large
+      // value is clamped by the browser to the true bottom.
+      const el = scrollerRef.current
+      if (el) el.scrollTo({ top: 999999 })
     }
   }, [messages, hasFragment, selectedSession?.id])
 
@@ -2771,12 +2778,14 @@ export function ChatArea({
               onClick={() => {
                 console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
                 if (loadLatest) {
+                  pendingScrollToBottom.current = true
+                  wasAtBottom.current = true
                   loadLatest()
                 } else {
                   const el = scrollerRef.current
                   if (el) el.scrollTo({ top: el.scrollHeight })
+                  wasAtBottom.current = true
                 }
-                wasAtBottom.current = true
               }}
             >
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
