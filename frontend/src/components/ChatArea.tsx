@@ -2566,6 +2566,14 @@ export function ChatArea({
   // rather than on the loading view.
   const pendingScrollToBottom = useRef(false)
 
+  // Stays true from a "scroll to top" / loadFromBeginning click until the
+  // oldest entries arrive and we've scrolled to top: 0. Without this, the
+  // sticky-bottom effect (wasAtBottom still true from the initial load)
+  // would scroll to the BOTTOM of the newly-arrived oldest entries instead
+  // of the top — the user would see the last of the oldest chunk, not the
+  // first message (SETUP_REPO / System Prompt).
+  const pendingScrollToTop = useRef(false)
+
   // Session-switch scroll: useLayoutEffect fires after DOM commit but
   // BEFORE paint, so the user never sees a flash of the wrong position.
   // This is critical for tab clicks — the user expects to see the latest
@@ -2611,6 +2619,28 @@ export function ChatArea({
     } else if (pendingScrollToBottom.current && !loading && messages.length === 0) {
       pendingScrollToBottom.current = false
     }
+
+    // Scroll to the top when a "scroll to top" / loadFromBeginning is
+    // pending and the new (oldest) entries have arrived. The pending flag
+    // survives the async gap between the button click (WS request) and
+    // the chunk arrival (setEntries → messages prop changes).
+    if (pendingScrollToTop.current && !loading && messages.length > 0) {
+      const el = scrollerRef.current
+      if (el) {
+        el.scrollTo({ top: 0 })
+        requestAnimationFrame(() => {
+          const el2 = scrollerRef.current
+          if (el2) el2.scrollTo({ top: 0 })
+        })
+      }
+      // Don't clear here — the sticky-bottom useEffect clears it after
+      // guarding against it. If we clear here, the scroll listener's
+      // onScroll() (which re-runs when hasMore changes) resets
+      // wasAtBottom before the sticky-bottom effect runs, causing an
+      // erroneous scroll-to-bottom.
+    } else if (pendingScrollToTop.current && !loading && messages.length === 0) {
+      pendingScrollToTop.current = false
+    }
   }, [messages, hasFragment, selectedSession?.id, loading])
 
   // Sticky-bottom scroll for streaming messages: only auto-scroll when the
@@ -2621,6 +2651,13 @@ export function ChatArea({
   useEffect(() => {
     if (hasFragment) return
     if (pendingScrollToBottom.current) return
+    if (pendingScrollToTop.current) {
+      // Clear the flag here (not in useLayoutEffect) so the guard is
+      // still active when this effect runs — after the scroll listener's
+      // onScroll() may have reset wasAtBottom.
+      pendingScrollToTop.current = false
+      return
+    }
     if (wasAtBottom.current) {
       messagesEndRef.current?.scrollIntoView({ block: 'end' })
     }
@@ -2714,6 +2751,8 @@ export function ChatArea({
               onClick={() => {
                 console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
                 if (hasMore && loadFromBeginning) {
+                  pendingScrollToTop.current = true
+                  wasAtBottom.current = false
                   loadFromBeginning()
                 } else {
                   scrollerRef.current?.scrollTo({ top: 0 })
