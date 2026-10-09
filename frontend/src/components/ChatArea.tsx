@@ -2304,7 +2304,7 @@ export function ChatArea({
   onAnswerQuestionText,
   isSessionThinking,
   onCancelQuestion,
-  hasMore, loadingMore, totalCount, loadOlder, loadFromBeginning, loadLatest,
+  hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2313,7 +2313,6 @@ export function ChatArea({
   loading?: boolean
   hasMore?: boolean
   loadingMore?: boolean
-  totalCount?: number
   loadOlder?: () => void
   loadFromBeginning?: () => void
   loadLatest?: () => void
@@ -2810,11 +2809,6 @@ export function ChatArea({
           )}
           {loadingMore && (
             <div className="self-center text-xs text-slate-400 py-1">Loading older messages…</div>
-          )}
-          {totalCount !== undefined && totalCount > 0 && !loading && (
-            <div className="self-center text-xs text-slate-400 dark:text-slate-500 py-0.5">
-              Showing {messages.length} of {totalCount}
-            </div>
           )}
           {composerControls ? (
             <>
