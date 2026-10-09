@@ -32,6 +32,8 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
+
 const OVERSCAN = 50
 const ESTIMATED_ROW_HEIGHT = 120
 const MIN_RENDERED = 100
@@ -77,8 +79,12 @@ export function useVirtualWindow(
   // measurement → adjustment → ..., an infinite feedback loop.
   const syntheticScrollRef = useRef(false)
 
+  const measureCountRef = useRef(0)
+
   // Reset to bottom on session change.
   useEffect(() => {
+    logMemoryNow(`VW.reset key=${resetKey}`)
+    rateLimitedLog('VW.reset', 1000, () => `resetKey=${resetKey} msgCount=${messageCount}`)
     const start = Math.max(0, messageCount - MIN_RENDERED)
     setVisibleRange([start, messageCount])
     setAvgRowHeight(ESTIMATED_ROW_HEIGHT)
@@ -99,6 +105,13 @@ export function useVirtualWindow(
   useLayoutEffect(() => {
     const el = contentRef.current
     if (!el) return
+    // ── Diagnostic: detect measurement feedback loops ──
+    measureCountRef.current++
+    detectLoop('VW.measure', 200, 10)
+    rateLimitedLog('VW.measure', 1000, () =>
+      `range=[${visibleRange[0]},${visibleRange[1]}) avgH=${avgRowHeight} rendered=${visibleRange[1] - visibleRange[0]} measured=${el.offsetHeight}`,
+    )
+
     const renderedCount = visibleRange[1] - visibleRange[0]
     if (renderedCount <= 0) return
     const measuredHeight = el.offsetHeight
@@ -120,10 +133,21 @@ export function useVirtualWindow(
     const spacerDelta = visibleRange[0] * (blendedAvg - avgRowHeight)
     setAvgRowHeight(blendedAvg)
     const scroller = scrollerRef.current
+    const willAdjustScroll = scroller && Math.abs(spacerDelta) >= 1
     if (scroller && Math.abs(spacerDelta) >= 1) {
       syntheticScrollRef.current = true
       scroller.scrollTop += spacerDelta
     }
+    // Log when avgRowHeight changes — the primary driver of feedback loops.
+    // spacerDelta < 1 skips the synthetic scroll flag but setAvgRowHeight
+    // still fires, changing spacer heights, which can trigger a
+    // browser-initiated scroll event that bypasses the guard.
+    if (!willAdjustScroll && Math.abs(spacerDelta) < 1) {
+      console.warn(`[diag] VW.measure: avgRowHeight ${avgRowHeight}→${blendedAvg} (delta<1, no synthetic guard) — spacer heights changed, browser may fire scroll`)
+    }
+    rateLimitedLog('VW.avgRowHeight', 2000, () =>
+      `${avgRowHeight}→${blendedAvg} spacerDelta=${spacerDelta.toFixed(1)} synthetic=${willAdjustScroll ? 'yes' : 'no'}`,
+    )
   }, [visibleRange]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Recalculate the visible range from the current scroll position.
@@ -170,10 +194,20 @@ export function useVirtualWindow(
       // Ignore the synthetic scroll event from the scrollTop adjustment
       // in the measurement useLayoutEffect. This breaks the feedback
       // loop: measure → adjust scrollTop → scroll event → (suppressed).
+      // ── Diagnostic: track scroll suppression ──
+      detectLoop('VW.scroll.suppressed', 200, 10)
+      rateLimitedLog('VW.scroll', 500, () =>
+        `suppressed (synthetic) scrollTop=${el.scrollTop.toFixed(0)}`,
+      )
       if (syntheticScrollRef.current) {
         syntheticScrollRef.current = false
         return
       }
+      // ── Diagnostic: track real scroll events ──
+      detectLoop('VW.scroll.real', 200, 15)
+      rateLimitedLog('VW.scroll', 500, () =>
+        `real scrollTop=${el.scrollTop.toFixed(0)} scrollH=${el.scrollHeight} clientH=${el.clientHeight}`,
+      )
       if (rafId !== null) return
       rafId = requestAnimationFrame(() => {
         rafId = null
@@ -190,9 +224,15 @@ export function useVirtualWindow(
   // When new messages arrive, stick to bottom or keep the current range.
   useEffect(() => {
     if (messageCount === 0) {
+      rateLimitedLog('VW.msgCount', 1000, () =>
+        `messageCount=0 — clearing range`,
+      )
       setVisibleRange([0, 0])
       return
     }
+    rateLimitedLog('VW.msgCount', 1000, () =>
+      `messageCount=${messageCount} wasAtBottom=${wasAtBottom.current}`,
+    )
     if (wasAtBottom.current) {
       // Extend the window to include new messages at the bottom.
       setVisibleRange((prev) => {

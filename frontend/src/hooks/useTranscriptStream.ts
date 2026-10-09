@@ -12,6 +12,7 @@ import type { TranscriptEntry } from '../types'
 import type { StreamClient, StreamStatus, UseTranscriptStream } from '../types/stream'
 import { streamClient } from '../lib/streamClient'
 import { fetchPendingQuestions, type PendingQuestion } from './useApi'
+import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
 import * as perf from '../lib/perf'
 
 // ── Module-level transcript data cache ──────────────────────────────────
@@ -204,6 +205,7 @@ export function useTranscriptStream(
       // Cache hit on session switch — instantly show cached data, no
       // loading spinner. Focus with `since` = last cached entry id so
       // the WS replay delivers only new entries. No background re-seed —
+      logMemoryNow(`transcript.cache-hit sid=${sessionId} count=${cached.length}`)
       // the WS `since` replay is the sole mechanism for catching entries
       // that arrived since the last visit. A background re-seed would
       // race with WS-delivered entries and cause flickering (the re-seed
@@ -249,6 +251,8 @@ export function useTranscriptStream(
         }
         setLoading(false)
         console.log(`[transcript] SEED ${isFirstLoad ? 'http-fetch' : 'http-merge'} session=${sessionId} count=${seed.length} prevEntries=${dataCache.get(sessionId)?.length ?? 0}`)
+        logMemoryNow(`transcript.http-seed sid=${sessionId} count=${seed.length}`)
+        rateLimitedLog('transcript.seed', 2000, () => `sid=${sessionId} count=${seed.length}`)
         loadedSessionRef.current = sessionId
         // Use the data cache's last id for focus — it includes
         // WS-delivered entries that may have arrived after the seed.
@@ -270,7 +274,13 @@ export function useTranscriptStream(
   // WS entry subscription (focused session only).
   useEffect(() => {
     if (sessionId === null) return
+    let wsEntryCount = 0
     const unsub = sc.onEntry((e) => {
+      wsEntryCount++
+      detectLoop('WS.entry', 200, 20)
+      rateLimitedLog('WS.entry', 1000, (collapsed) =>
+        `id=${e.id} total=${wsEntryCount} entries=${collapsed + 1}`,
+      )
       setEntries((prev) => {
         const next = reconcileEntries(prev, e)
         // Update the data cache so it stays fresh for this session.

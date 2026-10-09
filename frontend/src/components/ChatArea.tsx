@@ -9,6 +9,7 @@ import { BottomBar } from './BottomBar'
 import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
+import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -2408,6 +2409,15 @@ export function ChatArea({
     messages.length, scrollerRef, selectedId ?? null,
   )
   const useVirtualization = messages.length > 500
+
+  // ── Diagnostic: render state logging ──
+  detectLoop('ChatArea.render', 200, 20)
+  rateLimitedLog('ChatArea.render', 1000, () =>
+    `msgs=${messages.length} virtual=${useVirtualization} range=[${virtualWindow.startIndex},${virtualWindow.endIndex}) spacers=${virtualWindow.topSpacerHeight}+${virtualWindow.bottomSpacerHeight}`,
+  )
+  if (messages.length > 500) {
+    logMemoryNow(`ChatArea.render msgs=${messages.length}`)
+  }
 
   // Track ASK_HUMAN tool call IDs that had a real pending question which
   // was subsequently removed (answered/cancelled via WS ask_resolved).
