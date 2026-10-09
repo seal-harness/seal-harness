@@ -31,6 +31,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Git.Repo (openConfigRepo)
+import Seal.Logging.Logger (SealLogger, testSealLogger)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
@@ -41,6 +42,11 @@ import Seal.Web.UiState (newUiStateHandle)
 testAbortReg :: SessionAbortRegistry
 testAbortReg = unsafePerformIO newSessionAbortRegistry
 {-# NOINLINE testAbortReg #-}
+
+-- | A shared test logger (no-op scribe — tests don't assert log output).
+testLogger :: SealLogger
+testLogger = unsafePerformIO testSealLogger
+{-# NOINLINE testLogger #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
@@ -98,13 +104,13 @@ spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
   it "gatewayApp routes /api/health to the API" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "gatewayApp returns 404 for a non-api path with no static dir" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["foo", "bar"] })
     status `shouldBe` 404
 
@@ -112,19 +118,19 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp deps (Just dir)
+      let app = gatewayApp testLogger deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi.json as JSON" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi.json"], requestMethod = methodGet })
     status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi as HTML (Swagger UI)" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
     status `shouldBe` 200
 
