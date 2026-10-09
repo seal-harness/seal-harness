@@ -2,11 +2,13 @@
 module Seal.Gateway.ServerSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Data.IORef (newIORef)
+import Data.List (isInfixOf)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Time (UTCTime(..), fromGregorian)
-import Network.HTTP.Types (methodGet, statusCode)
+import Network.HTTP.Types (methodGet, methodPost, status200, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus )
+  ( Application, Request, defaultRequest, pathInfo, requestMethod
+  , responseLBS, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -17,7 +19,7 @@ import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
-import Seal.Gateway.Server
+import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -125,3 +127,41 @@ spec = describe "Seal.Gateway.Server" $ do
     let app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
     status `shouldBe` 200
+
+  -- ── requestTimingMiddleware ─────────────────────────────────────────
+
+  describe "Seal.Gateway.Server.requestTimingMiddlewareWith" $ do
+    let okApp _ respond = respond (responseLBS status200 [] "ok")
+
+    it "logs the HTTP method, path, status, and duration for each request" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      status <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "lists"], requestMethod = methodGet })
+      status `shouldBe` 200
+      logs <- readIORef logRef
+      length logs `shouldBe` 1
+      case logs of
+        (entry : _) -> do
+          entry `shouldSatisfy` ("GET" `isInfixOf`)
+          entry `shouldSatisfy` ("api/lists" `isInfixOf`)
+          entry `shouldSatisfy` ("200" `isInfixOf`)
+          entry `shouldSatisfy` ("ms" `isInfixOf`)
+        [] -> expectationFailure "expected at least one log entry"
+
+    it "is transparent — the response is unchanged" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      status <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "health"], requestMethod = methodGet })
+      status `shouldBe` 200
+
+    it "logs POST method correctly" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      _ <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "sessions", "new"], requestMethod = methodPost })
+      logs <- readIORef logRef
+      case logs of
+        (entry : _) -> entry `shouldSatisfy` ("POST" `isInfixOf`)
+        [] -> expectationFailure "expected at least one log entry"
