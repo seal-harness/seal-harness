@@ -14,6 +14,8 @@
 module Seal.Gateway.Types.Stream
   ( BrokerEvent (..)
   , FocusOp (..)
+  , RequestEntriesOp (..)
+  , ClientMessage (..)
   , ServerEvent (..)
   , decodeServerEvent
   , StreamErrorCode (..)
@@ -70,6 +72,41 @@ instance A.ToJSON FocusOp where
       <> maybe [] (\s -> ["since" A..= s]) mSince
     )
 
+-- | The @request-entries@ op the client sends to load a chunk of
+-- transcript entries (for chunked / infinite-scroll-upward loading).
+-- @before@ is the entry-id cursor (exclusive); when 'Nothing' the server
+-- returns the latest N entries. @limit@ is advisory — the server clamps
+-- it to [1, 200] with a default of 50.
+data RequestEntriesOp = RequestEntriesOp
+  { reoSessionId :: Text
+  , reoBefore    :: Maybe Text
+  , reoLimit     :: Maybe Int
+  } deriving stock (Eq, Show)
+
+instance A.FromJSON RequestEntriesOp where
+  parseJSON = A.withObject "request-entries" $ \o ->
+    RequestEntriesOp
+      <$> o .: "sessionId"
+      <*> o .:? "before"
+      <*> o .:? "limit"
+
+-- | The discriminated union of client-to-server messages. Dispatches on
+-- the @op@ field: @"focus"@ → 'CmFocus', @"request-entries"@ →
+-- 'CmRequestEntries'. When @op@ is absent, falls back to 'CmFocus'
+-- (preserving the existing tolerance for the legacy @{"session":"..."}@
+-- shape).
+data ClientMessage = CmFocus FocusOp | CmRequestEntries RequestEntriesOp
+  deriving stock (Eq, Show)
+
+instance A.FromJSON ClientMessage where
+  parseJSON = A.withObject "ClientMessage" $ \o -> do
+    mOp <- o .:? "op"
+    case (mOp :: Maybe Text) of
+      Just "focus"           -> CmFocus <$> A.parseJSON (A.Object o)
+      Just "request-entries" -> CmRequestEntries <$> A.parseJSON (A.Object o)
+      Nothing                -> CmFocus <$> A.parseJSON (A.Object o)
+      _                      -> fail "unknown op"
+
 -- | Decode a WS wire frame (raw JSON bytes) into a 'ServerEvent'. Returns
 -- 'Nothing' for unparseable frames. Used by the chat-channel WS client's
 -- background reader. Pure.
@@ -98,6 +135,7 @@ data ServerEvent
   | SeAgentDefsChanged         -- ^ @agent-defs-changed@
   | SeSkillsChanged            -- ^ @skills-changed@
   | SeReposChanged             -- ^ @repos-changed@
+  | SeEntriesChunk SessionId Value  -- ^ @entries-chunk@: a chunk of transcript entries (whole object, matching 'SeLists')
   | SeError StreamErrorCode Text  -- ^ @error@: an error code + message
   deriving stock (Eq, Show)
 
@@ -166,6 +204,9 @@ parseServerEvent (A.Object o) =
       "agent-defs-changed" -> Just SeAgentDefsChanged
       "skills-changed" -> Just SeSkillsChanged
       "repos-changed" -> Just SeReposChanged
+      "entries-chunk" -> SeEntriesChunk
+        <$> (asSessionId =<< KeyMap.lookup (Key.fromText "sessionId") o)
+        <*> pure (A.Object o)  -- whole object, matching SeLists pattern
       "error" -> SeError
         <$> (asErrCode =<< KeyMap.lookup (Key.fromText "code") o)
         <*> pure (fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "message") o))

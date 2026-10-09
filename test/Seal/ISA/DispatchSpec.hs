@@ -20,7 +20,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types
-import Seal.Handles.Transcript (TwoFileHandle (..), fakeTwoFileTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), fakeIndexedTranscript)
 import Seal.ISA.Dispatch
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Shell (shellExecSchema)
@@ -49,36 +49,36 @@ testAbortFlag :: AbortFlag
 testAbortFlag = unsafePerformIO newAbortFlag
 {-# NOINLINE testAbortFlag #-}
 
--- | A two-file transcript handle that records @"ack"@ for a 'tfwRecordAndAck'
--- call and @"async"@ for a 'tfwRecordAsync' call, so the test asserts the
+-- | A indexed transcript handle that records @"ack"@ for a 'itwRecordAndAck'
+-- call and @"async"@ for a 'itwRecordAsync' call, so the test asserts the
 -- ACK-before-execute ordering for Untrusted opcodes. Returns a probe
 -- opcode of the requested trust level (Trusted or Untrusted).
-probe :: IORef [String] -> TrustLevel -> (TwoFileHandle, Opcode)
+probe :: IORef [String] -> TrustLevel -> (IndexedTranscriptHandle, Opcode)
 probe ref tl =
-  ( TwoFileHandle
-      { tfwRecordAndAck = \_ -> modifyIORef' ref (++ ["ack"])
-      , tfwRecordAsync  = \_ -> modifyIORef' ref (++ ["async"])
-      , tfwReadConversation = pure []
-      , tfwReadEntries     = pure []
-      , tfwSetSecretOps    = \_ -> pure ()
-      , tfwCloseTranscript = pure ()
-      , tfwIsAlive         = pure True
+  ( IndexedTranscriptHandle
+      { itwRecordAndAck = \_ -> modifyIORef' ref (++ ["ack"])
+      , itwRecordAsync  = \_ -> modifyIORef' ref (++ ["async"])
+      , itwReadConversation = pure []
+      , itwReadEntries     = pure []
+      , itwSetSecretOps    = \_ -> pure ()
+      , itwCloseTranscript = pure ()
+      , itwIsAlive         = pure True
       }
   , mkProbeOpcode ref tl
   )
 
 -- | A variant of 'probe' that returns just the transcript handle (for when
 -- the test supplies its own opcode, e.g. ASK_HUMAN).
-probeHandle :: IORef [String] -> TwoFileHandle
+probeHandle :: IORef [String] -> IndexedTranscriptHandle
 probeHandle ref =
-  TwoFileHandle
-    { tfwRecordAndAck = \_ -> modifyIORef' ref (++ ["ack"])
-    , tfwRecordAsync  = \_ -> modifyIORef' ref (++ ["async"])
-    , tfwReadConversation = pure []
-    , tfwReadEntries     = pure []
-    , tfwSetSecretOps    = \_ -> pure ()
-    , tfwCloseTranscript = pure ()
-    , tfwIsAlive         = pure True
+  IndexedTranscriptHandle
+    { itwRecordAndAck = \_ -> modifyIORef' ref (++ ["ack"])
+    , itwRecordAsync  = \_ -> modifyIORef' ref (++ ["async"])
+    , itwReadConversation = pure []
+    , itwReadEntries     = pure []
+    , itwSetSecretOps    = \_ -> pure ()
+    , itwCloseTranscript = pure ()
+    , itwIsAlive         = pure True
     }
 
 mkProbeOpcode :: IORef [String] -> TrustLevel -> Opcode
@@ -231,14 +231,14 @@ spec = describe "Seal.ISA.Dispatch" $ do
     -- | Regression: /skill load displays the "Command output" box but the
     -- skill body never reaches the model's context. The agent loop builds
     -- its next-turn context from @conversation.jsonl@ (Loop.hs:61 reads
-    -- @tfwReadConversation@), but @recordSkillLoadResult@ wrote only an
+    -- @itwReadConversation@), but @recordSkillLoadResult@ wrote only an
     -- @EKHarness@ entry to @entries.jsonl@ with an EMPTY message list —
     -- so the skill body was invisible to the next turn. The fix: the
     -- skill body must be appended to @conversation.jsonl@ as a User
     -- message carrying the rendered body, so @runTurn@'s @prior@ read
     -- picks it up.
     it "writes the skill body to conversation.jsonl so the next turn sees it" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "# greet\n\ngreeting skill\n\n---\n\nsay hi"
           result = OpResult
@@ -258,7 +258,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       T.unlines bodies `shouldSatisfy` ("say hi" `T.isInfixOf`)
 
     it "does not write to conversation.jsonl for non-SKILL_LOAD opcodes" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let result = OpResult
             { orParts = [TrpText "ok"]
             , orIsError = False
@@ -269,7 +269,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       conv `shouldBe` []
 
     it "does not write to conversation.jsonl for error results" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let result = OpResult
             { orParts = [TrpText "skill not found"]
             , orIsError = True
@@ -280,7 +280,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       conv `shouldBe` []
 
     it "stamps the channel label into erMeta so the frontend can surface origin" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let result = OpResult
             { orParts = [TrpText "body"]
             , orIsError = False
@@ -295,7 +295,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
         _ -> expectationFailure ("expected exactly one entry, got " <> show (length entries))
 
     it "omits the channel key from erMeta when Nothing is supplied" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let result = OpResult
             { orParts = [TrpText "body"]
             , orIsError = False
@@ -312,7 +312,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       -- as an Assistant message. The trailing message "#123" is NOT written
       -- here — the command's follow-up turn writes it as a User message via
       -- runTurn, so the model sees the skill followed by the user's request.
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "# start\n\nstart skill\n\n---\n\nbody"
           result = OpResult
@@ -331,7 +331,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       texts `shouldBe` [bodyText]
 
     it "writes only the skill body when the message is blank" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "skill body"
           result = OpResult
@@ -349,7 +349,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       texts `shouldBe` [bodyText]
 
     it "writes only the skill body when the message key is absent" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "skill body"
           result = OpResult
@@ -364,7 +364,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
       texts `shouldBe` [bodyText]
 
     it "writes the skill body as an Assistant message (harness output, not user input)" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "skill body"
           result = OpResult
@@ -379,7 +379,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
         _   -> expectationFailure ("expected exactly one message, got " <> show (length conv))
 
     it "does NOT write the trailing message (the follow-up turn handles it)" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "# start\n\nstart skill\n\n---\n\nbody"
           result = OpResult
@@ -402,7 +402,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
 
   describe "recordSetupRepoResult" $ do
     it "writes the clone result as an Assistant message (harness output, not user input)" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "Cloned git@github.com:seal-harness/seal-harness.git into seal-harness (shallow)."
           result = OpResult
@@ -417,7 +417,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
         _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
 
     it "writes the clone failure as an Assistant message" $ do
-      (h, readState) <- fakeTwoFileTranscript
+      (h, readState) <- fakeIndexedTranscript
       let bodyText :: Text
           bodyText = "SETUP_REPO: clone failed: connection refused"
           result = OpResult

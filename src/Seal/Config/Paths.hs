@@ -16,6 +16,7 @@ module Seal.Config.Paths
   , sessionArchivedMarkerPath
   , sessionTranscriptPath
   , sessionConversationPath
+  , sessionConversationIndexPath
   , sessionEntriesPath
   , sessionRequestsPath
   , sessionLogPath
@@ -172,13 +173,21 @@ sessionArchivedMarkerPath paths sid = sessionDir paths sid </> "archived"
 sessionTranscriptPath :: SealPaths -> SessionId -> FilePath
 sessionTranscriptPath paths sid = sessionDir paths sid </> "transcript.jsonl"
 
--- | The session's conversation file (new two-file format): @\<sessionDir\>\/conversation.jsonl@.
+-- | The session's conversation file (new indexed transcript format): @\<sessionDir\>\/conversation.jsonl@.
 sessionConversationPath :: SealPaths -> SessionId -> FilePath
 sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl"
 
--- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
+-- | The session's entry log (new indexed transcript format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | The session's conversation index file: @\<sessionDir\>\/conversation.idx@.
+-- A binary file of contiguous little-endian 'Word64' values storing the byte
+-- offset of the start of each line in @conversation.jsonl@. N lines → N+1
+-- offsets (offset[0]=0, offset[N]=fileSize). Used by
+-- 'Seal.Transcript.ConvIndex' for random-access reads.
+sessionConversationIndexPath :: SealPaths -> SessionId -> FilePath
+sessionConversationIndexPath paths sid = sessionDir paths sid </> "conversation.idx"
 
 -- | The session's debug requests file: @\<sessionDir\>\/requests.jsonl@. Each
 -- line is the complete 'CompletionRequest' JSON exactly as sent to the LLM,
@@ -225,7 +234,7 @@ cursorMapPath paths = spState paths </> "cursors.json"
 -- state is lost on restart and every conversation resets to watch-off.
 watchMapPath :: SealPaths -> FilePath
 watchMapPath paths = spState paths </> "watch_state.json"
--- instance gets its own two-file transcript here so the parent's
+-- instance gets its own indexed transcript here so the parent's
 -- @conversation.jsonl@ \/ @entries.jsonl@ stay uncontaminated (the two-file
 -- format's @erConvLen@ and envelope-delta fold are per-session; mixing a
 -- sub-agent's entries into the parent's files would corrupt reconstruction).

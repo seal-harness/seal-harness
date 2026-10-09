@@ -63,7 +63,7 @@ entryId _ = Nothing
 epoch :: UTCTime
 epoch = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 0)
 
--- | A two-file-transcript 'EntryRecord' (the shape the agent loop writes).
+-- | A indexed-transcript 'EntryRecord' (the shape the agent loop writes).
 mkEntry :: EntryKind -> Int -> EntryRecord
 mkEntry kind len = EntryRecord
   { erId = ""

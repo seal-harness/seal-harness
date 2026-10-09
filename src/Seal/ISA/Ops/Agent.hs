@@ -525,7 +525,7 @@ agentDefDeleteOp backend = TrustedOpcode
 
 -- | The wiring-layer bundle the AGENT_START opcode closes over. The
 -- 'AgentWorkerBuilder' resolves the def's provider+model, opens a fresh
--- two-file transcript under @\<parent-session\>\/agents\/\<child-id\>@, builds
+-- indexed transcript under @\<parent-session\>\/agents\/\<child-id\>@, builds
 -- a fresh 'AgentEnv' bound to the new session + child transcript, runs the
 -- turn with the goal as the first user message, and reports the outcome via
 -- 'ChildWorkerOutcome'. The 'DelegationConfig' / 'SpawnPauseFlag' /
@@ -819,7 +819,7 @@ handleStartBackground wiring _v di = do
                 -- engine reads this file at the start of the parent's next turn
                 -- and injects the messages into the conversation. This avoids
                 -- interfering with the single-writer daemon's in-memory diff
-                -- state (tfsWritten) during the ongoing turn — writing directly
+                -- state (itsWritten) during the ongoing turn — writing directly
                 -- to conversation.jsonl while the daemon is active causes the
                 -- daemon's diff to desynchronize, corrupting the transcript.
                 appendCompletionToSidecar paths parentSid (completionMessage result)

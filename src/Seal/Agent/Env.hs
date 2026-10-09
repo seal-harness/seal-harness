@@ -14,7 +14,7 @@ import Seal.Core.MessageSource (MessageSource)
 import Data.Aeson (Value)
 import Seal.Core.Types (ModelId, OpName, SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
-import Seal.Handles.Transcript (TwoFileHandle (..))
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..))
 import Seal.ISA.Opcode (BackendExec, localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
@@ -34,7 +34,7 @@ data AgentEnv = AgentEnv
     -- main session this comes from the bound default agent's 'adSystem';
     -- for a forked sub-agent it comes from the def's 'adSystem'.
   , aeRegistry :: Registry
-  , aeTranscript :: TwoFileHandle
+  , aeTranscript :: IndexedTranscriptHandle
   , aeBackend :: BackendExec
   , aeUIOEnv :: UIOEnv
     -- ^ The untrusted-execution environment (carrying the 'UntrustedIO'
@@ -106,7 +106,7 @@ data AgentEnv = AgentEnv
     -- (redundantly, in full) to this file as one JSONL line per request.
     -- The contract: each line is the complete 'CompletionRequest' exactly as
     -- passed to the provider — including the full 'crMessages' history — so
-    -- we can debug whether the two-file storage format is correctly feeding
+    -- we can debug whether the indexed transcript storage format is correctly feeding
     -- the session history to the LLM. 'Nothing' (the default) means no
     -- debug file is written.
   , aeOnEntry :: IO ()
@@ -118,13 +118,13 @@ data AgentEnv = AgentEnv
     -- Signal channels set this to @pure ()@ (no live broadcast needed).
   , aeOnUserMessage :: Maybe (IO ())
     -- ^ When 'Just action', the loop records the initial user message with
-    -- 'tfwRecordAndAck' (synchronously fsync'd) and then runs @action@ —
+    -- 'itwRecordAndAck' (synchronously fsync'd) and then runs @action@ —
     -- guaranteeing the user message is durable on disk before @action@
     -- runs. Used by the @/bg@ channel path to broadcast a @lists@ snapshot
     -- whose snippet (the first user message) is populated, so the web
     -- sidebar shows the session name immediately rather than after the
     -- first LLM response. 'Nothing' (the default) keeps the async
-    -- 'tfwRecordAsync' write (no fsync latency at turn start).
+    -- 'itwRecordAsync' write (no fsync latency at turn start).
   , aeOnStop     :: Maybe (Text -> IO ())
     -- ^ When 'Just fanout', the loop calls @fanout text@ with the final
     -- user-visible text at every stop branch (final answer, truncation
@@ -185,7 +185,7 @@ data TurnEnv = TurnEnv
   , teSession       :: SessionId
   , teSystem        :: Maybe Text
   , teRegistry      :: Registry
-  , teTranscript    :: TwoFileHandle
+  , teTranscript    :: IndexedTranscriptHandle
   , teUioEnv        :: UIOEnv
   , teDebugReqPath  :: Maybe FilePath
   , teAutonomy      :: AutonomyLevel

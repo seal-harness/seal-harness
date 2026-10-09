@@ -47,7 +47,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.Handles.Harness (HarnessError (..))
 import Seal.Harness.Id (harnessIdToText, newHarnessId)
 import Seal.Harness.Registry
@@ -154,7 +154,7 @@ dispatchOne reg = dispatchOneWith reg mkRemoteUntrustedIOStub
 dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
                -> App (Either DispatchError OpResult)
 dispatchOneWith reg uio name input = do
-  (h, _) <- liftIO fakeTwoFileTranscript
+  (h, _) <- liftIO fakeIndexedTranscript
   abortFlag <- liftIO newAbortFlag
   dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig abortFlag name input
 
@@ -243,7 +243,7 @@ spec = describe "Seal.ISA.Integration" $ do
               , CompletionResponse [CbText "the file says: hello world"] StopEnd (Usage 0 0)
               ]
         ref <- newIORef script
-        (h, _) <- fakeTwoFileTranscript
+        (h, _) <- fakeIndexedTranscript
         abortFlag <- newAbortFlag
         stopFanoutDoneRef <- newIORef False
         let env = AgentEnv

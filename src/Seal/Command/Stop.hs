@@ -44,7 +44,7 @@ import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Agent.Runtime.RunRecord (RunRecordRegistry, cancelRunsForParent)
 import Seal.Gateway.StreamBroker (StreamBroker)
-import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..), withTwoFileTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
 import Seal.Providers.Class (Message (..), Role (..), ContentBlock (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -74,7 +74,7 @@ mkStopTranscriptWriter paths mBroker =
     now <- getCurrentTime
     let model = maybe "" smModel mMeta
         createdAt = maybe now smCreatedAt mMeta
-    withTwoFileTranscript dir $ \h -> do
+    withIndexedTranscript dir $ \h -> do
       let assistantMsg = Message Assistant [CbText stopMsg]
           entry = EntryRecord
             { erId = ""
@@ -89,7 +89,7 @@ mkStopTranscriptWriter paths mBroker =
             , erCorrelation = Nothing
             , erMeta = mempty
             }
-      tfwRecordAndAck h (TwoFileWrite [assistantMsg] entry)
+      itwRecordAndAck h (IndexedTranscriptWrite [assistantMsg] entry)
       broadcastNewEntries mBroker paths sid model createdAt
 
 -- | The @\/stop@ command spec for single-session channels (CLI, Signal,

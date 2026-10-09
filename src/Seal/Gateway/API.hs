@@ -30,13 +30,14 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Read (decimal)
+import Text.Read (readMaybe)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
   , status200, status201, status204, status400, status403, status404, status500, status501 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
-  , requestMethod, responseLBS )
+  , queryString, requestMethod, responseLBS )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
@@ -88,7 +89,7 @@ import Seal.Gateway.SessionJson
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
-  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
+  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso, ttEntryCount)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -196,7 +197,7 @@ apiApp deps req respond =
     -- lines, as a JSON array. Missing file -> @[]@; unparseable lines are
     -- skipped.
     (m', ["api", "sessions", sid, "transcript"]) | m' == methodGet ->
-      respond =<< handleTranscript deps sid
+      respond =<< handleTranscript deps sid req
     -- POST /api/sessions/:id/send. When the agent-loop plumbing is wired
     -- ('adSend' = 'Just'), route the message through the real agent loop
     -- (slash registry vs plain turn) and return the outcome. When 'adSend'
@@ -1915,17 +1916,25 @@ tabRefAt h idx = do
 -- entry count. The frontend parses this via @performance.getEntriesByName@ or
 -- by reading the @Server-Timing@ response header directly to direct
 -- optimization work without needing a separate tracing harness.
-handleTranscript :: ApiDeps -> Text -> IO Response
-handleTranscript deps sidTxt =
+handleTranscript :: ApiDeps -> Text -> Request -> IO Response
+handleTranscript deps sidTxt req =
   case mkSessionId sidTxt of
     Left _  -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
     Right sid -> do
       let paths = srPaths (adSessionRuntime deps)
       active <- readIORef (srActive (adSessionRuntime deps))
       tReadStart <- getCurrentTime
-      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid
+      let mLimit = parseLimitQuery req
+      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid mLimit
       tEncStart <- getCurrentTime
-      let body = A.encode entries
+      -- When a limit was applied, readTranscriptEntriesTimed already
+      -- returned only the last N entries. totalCount comes from the
+      -- timings (ttEntryCount is the full count before limiting).
+      let totalCount = ttEntryCount tt0
+          hasMore = case mLimit of
+            Just n  -> n < totalCount
+            Nothing -> False
+          body = A.encode entries
       tEncEnd <- getCurrentTime
       -- Fold the encode duration + the gap between read-complete and
       -- encode-start (negligible) into the timings so the @en@ token
@@ -1935,9 +1944,21 @@ handleTranscript deps sidTxt =
       -- carrying full page HTML) is pathologically slow on large strings.
       let tt = setEncodeMs (msDiff tEncStart tEncEnd) (msDiff tReadStart tEncEnd) tt0
           timingHeader = (mkHN "Server-Timing", renderServerTiming tt)
-      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader]) body)
+          hasMoreHdr = (mkHN "X-Has-More", if hasMore then "true" else "false")
+          totalCountHdr = (mkHN "X-Total-Count", BC.pack (show totalCount))
+      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader, hasMoreHdr, totalCountHdr]) body)
   where
     msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
+
+-- | Parse the @limit@ query parameter from a WAI request. Returns
+-- 'Nothing' when absent or unparseable; clamps to @[0, 1000]@.
+parseLimitQuery :: Request -> Maybe Int
+parseLimitQuery req =
+  case lookup "limit" (queryString req) of
+    Just (Just bs) -> case readMaybe (BC.unpack bs) of
+      Just n  -> Just (max 0 (min n 1000))
+      Nothing -> Nothing
+    _ -> Nothing
 
 -- | Handle GET /api/sessions/:id/questions. Returns the session's pending
 -- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@/@meta?@/

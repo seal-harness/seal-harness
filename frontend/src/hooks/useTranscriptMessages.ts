@@ -353,6 +353,7 @@ class TranscriptRenderer {
     // that clone the same repo share the same first entry id (e.g.,
     // '1-setuprepo'), so comparing firstEntryId fails to detect the change.
     if (this.lastSessionId !== null && sessionId !== this.lastSessionId) {
+      console.log(`[renderer] session change ${this.lastSessionId} → ${sessionId}, clearing cache`)
       this.reset()
     }
     this.lastSessionId = sessionId
@@ -458,6 +459,7 @@ class TranscriptRenderer {
       const cached = this.cache.get(e.id)
       if (cached) messages.push(...cached.messages)
     }
+    console.log(`[renderer] update session=${sessionId} entries=${entries.length} msgs=${messages.length} firstEntryId=${entries[0]?.id} lastEntryId=${entries[entries.length-1]?.id} cacheSize=${this.cache.size}`)
     return messages
   }
 
@@ -542,8 +544,6 @@ function getGlobalRendererCache(): RendererCache {
   return globalRendererCache
 }
 
-const prevMsgCountRef: { value: number } = { value: 0 }
-
 /** React hook: incrementally convert transcript entries to messages.
  *  Uses a multi-session renderer cache (Map<sessionId, TranscriptRenderer>)
  *  that persists across session switches. When the user switches back to a
@@ -572,14 +572,6 @@ export function useTranscriptMessages(
     }
     const msgs = renderer.update(entries, sessionId!)
     lastMsgsRef.current = msgs
-    // Log message array changes for debugging. The message array should
-    // only grow (append-only) or stay the same length (in-place updates).
-    // A decrease in length indicates an entry was removed, which would
-    // cause messages to disappear from the DOM. Search `[transcript] MSGS`.
-    if (msgs.length !== prevMsgCountRef.value) {
-      console.log(`[transcript] MSGS ${prevMsgCountRef.value} -> ${msgs.length} entries=${entries.length} first=${msgs.length > 0 ? msgs[0]!.id : 'none'} last=${msgs.length > 0 ? msgs[msgs.length - 1]!.id : 'none'}`)
-      prevMsgCountRef.value = msgs.length
-    }
     return msgs
   }, [entries, renderer, sessionId])
 }

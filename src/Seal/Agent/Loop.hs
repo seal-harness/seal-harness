@@ -6,7 +6,7 @@ module Seal.Agent.Loop
   ( runTurn
   , defaultMaxTokens
   , aggregateStreamEvents
-  , stripToolCallXml
+  , stripToolCallXml, findAllInvokeCalls
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -16,6 +16,7 @@ import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BLC
@@ -23,6 +24,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import qualified System.IO as IO
 import System.Timeout (timeout)
@@ -32,11 +34,11 @@ import Seal.Agent.ContextTruncation
   ( estimateTokenCount, truncateMessages, defaultTruncationConfig )
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
-import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
+import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..), TrustLevel (..))
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
-import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
@@ -105,12 +107,12 @@ runTurn env userText = do
   -- flag set until the next turn begins).
   liftIO (clearAbort (aeAbortFlag env))
   -- Load the prior conversation from disk so the model sees the full history
-  -- (not just this turn's new message). The two-file writer's diff-based
+  -- (not just this turn's new message). The indexed transcript writer's diff-based
   -- appender requires the incoming message list to be a prefix-extension of
   -- the on-disk conversation; without the prior messages, the diff falls back
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
-  prior <- liftIO (tfwReadConversation (aeTranscript env))
+  prior <- liftIO (itwReadConversation (aeTranscript env))
   let userMsg = textMsg User userText
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
@@ -145,7 +147,7 @@ runTurn env userText = do
           }
     -- When a caller wants to react to the user message being durable
     -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows
-    -- the session name immediately), record it with tfwRecordAndAck
+    -- the session name immediately), record it with itwRecordAndAck
     -- (synchronously fsync'd) and run the hook. Otherwise keep the async
     -- write (no fsync latency at turn start). In the fsync path, also fire
     -- the per-entry broadcast hook (aeOnEntry) so the web frontend sees the
@@ -156,11 +158,11 @@ runTurn env userText = do
     -- not be on disk yet (the read would return stale data).
     case aeOnUserMessage env of
       Just after -> do
-        tfwRecordAndAck (aeTranscript env) (TwoFileWrite turn0 entry)
+        itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite turn0 entry)
         liftIO after
         liftIO (aeOnEntry env)
       Nothing ->
-        tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
+        itwRecordAsync (aeTranscript env) (IndexedTranscriptWrite turn0 entry)
   go (aeMaxTurns env) 0 turn0
   where
     -- | Fan out the final user-visible text to every chat channel subscribed
@@ -217,7 +219,7 @@ runTurn env userText = do
             , erCorrelation = Nothing
             , erMeta = Map.empty
             }
-      tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+      itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite conv entry)
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
       notifyStop stopMsg
@@ -320,7 +322,7 @@ runTurn env userText = do
                 , erCorrelation = Nothing
                 , erMeta = Map.empty
                 }
-          tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+          itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite conv entry)
           aeOnEntry env
           ccSend (aeCaps env) errMsg
           notifyStop errMsg
@@ -354,7 +356,7 @@ runTurn env userText = do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+        itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv entry)
         aeOnEntry env'
       let toolUses = [b | b@CbToolUse{} <- rsContent resp]
       if null toolUses
@@ -382,7 +384,7 @@ runTurn env userText = do
                       -- synthetic continuation prompt from the chat view.
                       , erMeta = Map.singleton "internal" (Bool True)
                       }
-                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv2 entry2)
                 aeOnEntry env'
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
@@ -452,7 +454,7 @@ runTurn env userText = do
                     , erCorrelation = Nothing
                     , erMeta = Map.empty
                     }
-              tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+              itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv entry)
               aeOnEntry env'
               ccSend (aeCaps env') stopMsg
               notifyStop stopMsg
@@ -475,7 +477,7 @@ runTurn env userText = do
                       , erCorrelation = Nothing
                       , erMeta = Map.empty
                       }
-                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                itwRecordAndAck (aeTranscript env') (IndexedTranscriptWrite conv2 entry2)
                 aeOnEntry env'
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
@@ -605,7 +607,7 @@ runTurn env userText = do
                     , ("approval", object ["scope" .= scope])
                     ]
                 }
-          tfwRecordAndAck (aeTranscript env) (TwoFileWrite [] entry)
+          itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite [] entry)
           aeOnEntry env
     dispatchOne other = pure other  -- non-tool blocks never reach dispatchOne
 
@@ -658,11 +660,16 @@ aggregateStreamEvents events outcome =
   where
     textChunks = [t | StreamTextChunk t <- events]
     thinkingChunks = [t | StreamThinkingChunk t <- events]
-    textBlocks = [CbText (stripToolCallXml (T.intercalate "" textChunks))
-                 | not (null textChunks)]
+    -- When the provider didn't emit structured tool_calls but the text
+    -- contains XML-style invoke blocks (observed with GLM via Ollama),
+    -- extract them as CbToolUse blocks before stripping tags.
+    (xmlCalls, cleanedText) = case textChunks of
+      [] -> ([], "")
+      _ -> parseXmlToolCalls 0 (T.intercalate "" textChunks)
+    textBlocks = [CbText cleanedText | not (null textChunks)]
     thinkingBlocks = [CbThinking (T.intercalate "" thinkingChunks)
                      | not (null thinkingChunks)]
-    toolBlocks = [CbToolUse tcid name args
+    toolBlocks = xmlCalls <> [CbToolUse tcid name args
                 | StreamToolEnd tcid name args <- events]
     -- Thinking blocks come before text blocks (matching the model's
     -- generation order: reasoning first, then visible output).
@@ -697,6 +704,92 @@ maxPartialTagScan = 512
 --   * a complete @\<invoke name="..."\>...\<\/invoke>@ block
 --   * orphan @\<\/invoke>@ / @\<function_calls>@ / @\<\/function_calls>@ /
 --     @\<tool_call>@ / @\<\/tool_call>@ tags
+
+-- | Fallback parser for XML-style tool calls that some models (notably
+-- GLM via Ollama) emit in the text content field instead of the
+-- structured tool_calls field. When the text contains proper invoke
+-- blocks (with a name attribute and arg_key/arg_value parameters), this
+-- extracts them as CbToolUse blocks. The text is always cleaned by
+-- stripToolCallXml (which removes all invoke blocks, including extracted
+-- ones), so the returned text never contains garbled parameter values.
+parseXmlToolCalls :: Int -> Text -> ([ContentBlock], Text)
+parseXmlToolCalls startIdx txt =
+  let calls = findAllInvokeCalls startIdx txt
+  in (calls, stripToolCallXml txt)
+
+-- | Scan the text for all proper invoke blocks with a name attribute
+-- and arg_key/arg_value parameters. Returns only the extracted calls;
+-- the text is not modified (stripToolCallXml handles tag removal).
+findAllInvokeCalls :: Int -> Text -> [ContentBlock]
+findAllInvokeCalls startIdx txt = go txt 0
+  where
+    invokeOpen = T.pack [toEnum 60, toEnum 105, toEnum 110, toEnum 118, toEnum 111, toEnum 107, toEnum 101]
+    invokeClose = T.pack [toEnum 60, toEnum 47, toEnum 105, toEnum 110, toEnum 118, toEnum 111, toEnum 107, toEnum 101, toEnum 62]
+    gt = toEnum 62
+    quote = toEnum 34
+    nameKey = T.pack [toEnum 110, toEnum 97, toEnum 109, toEnum 101]
+    eqSign = toEnum 61
+    akOpen = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+    akClose = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+    avOpen = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+    avClose = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+    go acc idx =
+      case T.breakOn invokeOpen acc of
+        (_, rest)
+          | T.null rest -> []
+          | otherwise ->
+              let afterName = T.drop (T.length invokeOpen) rest
+              in case tryExtractName afterName of
+                   Just (toolName, body, afterBlock) ->
+                     let params = extractParams body
+                         argObj = A.object params
+                     
+                         tcid = ToolCallId (T.pack ("call_xml_" <> show (startIdx + idx)))
+                         call = CbToolUse tcid (OpName toolName) argObj
+                     in call : go afterBlock (idx + 1)
+                   Nothing ->
+                     -- Not a proper invoke tag; advance past this match
+                     go (T.drop 1 afterName) idx
+    -- Try to extract name="..." and the block body. Returns Nothing when
+    -- the tag doesn't have a proper name attribute.
+    tryExtractName t =
+      case T.breakOn (T.singleton gt) t of
+        (attrs, rest)
+          | T.null rest -> Nothing
+          | otherwise ->
+              case T.breakOn nameKey attrs of
+                (_, namePart)
+                  | T.null namePart -> Nothing
+                  | otherwise ->
+                      let afterNameKw = T.drop (T.length nameKey) namePart
+                          trimmed = T.dropWhile (\c -> c == toEnum 32 || c == eqSign) afterNameKw
+                      in case T.uncons trimmed of
+                           Just (q, rest2) | q == quote ->
+                            let (val, _) = T.breakOn (T.singleton quote) rest2
+                             in case T.breakOn invokeClose (T.drop 1 rest) of
+                                  (body, afterClose)
+                                    | T.null afterClose -> Nothing
+                                    | otherwise -> Just (val, body, T.drop (T.length invokeClose) afterClose)
+                           _ -> Nothing
+    -- Extract arg_key/arg_value pairs from the block body
+    extractParams t = goParams t []
+      where
+        goParams p acc =
+          case T.breakOn akOpen p of
+            (_, r)
+              | T.null r -> reverse acc
+              | otherwise ->
+                  let afterAkO = T.drop (T.length akOpen) r
+                      (keyStr, afterKey) = T.breakOn akClose afterAkO
+                      afterAkC = T.drop (T.length akClose) afterKey
+                      (_, avStart) = T.breakOn avOpen afterAkC
+                      afterAvO = T.drop (T.length avOpen) avStart
+                      (valStr, afterVal) = T.breakOn avClose afterAvO
+                      afterAvC = T.drop (T.length avClose) afterVal
+                      val = case A.decode (BL.fromStrict (TE.encodeUtf8 valStr)) of
+                        Just v -> v
+                        Nothing -> A.String valStr
+                  in goParams afterAvC ((Key.fromText keyStr, val) : acc)
 stripToolCallXml :: Text -> Text
 stripToolCallXml t0 =
   let -- 0. Remove complete blocks FIRST: an intact closer at the tail
@@ -713,6 +806,7 @@ stripToolCallXml t0 =
       t4 = T.replace oFcOpen "" t3
       t5 = T.replace oFcClose "" t4
       t6 = T.replace oToolOpen "" t5
+
       t7 = T.replace oToolClose "" t6
       -- 3. Remove orphan param key+value spans (leaked args wrap key/value
       --    in arg_key/arg_value tags; when the surrounding <invoke> block

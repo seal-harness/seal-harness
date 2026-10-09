@@ -7,7 +7,7 @@
 --
 -- Each child gets:
 --
---   * a fresh 'SessionId' and its own two-file transcript nested under
+--   * a fresh 'SessionId' and its own indexed transcript nested under
 --     @\<parent-session\>\/agents\/\<child-id\>@ (the worker-builder opens it);
 --   * a focused system prompt built from the def's @adSystem@ + the goal +
 --     optional context (the worker-builder assembles it);

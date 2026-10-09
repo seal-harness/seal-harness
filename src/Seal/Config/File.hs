@@ -106,7 +106,7 @@ data RuntimeConfig = RuntimeConfig
     -- @conversation.jsonl@ / @entries.jsonl@. The contract: each line is
     -- the complete JSON-encoded 'CompletionRequest' exactly as passed to
     -- the provider, including the full @crMessages@ history. Used to
-    -- debug whether the two-file storage format is correctly feeding the
+    -- debug whether the indexed transcript storage format is correctly feeding the
     -- session history to the LLM. Absent (the default) means the file is
     -- not written.
   , rcOnDemandSchemas :: Maybe Bool

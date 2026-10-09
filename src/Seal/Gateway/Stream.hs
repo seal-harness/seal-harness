@@ -17,8 +17,14 @@ module Seal.Gateway.Stream
   ( runStreamServer
   , StreamGuard (..)
   , FocusOp (..)
+  , handleRequestEntries
+  , RequestEntriesOp (..)
+  , ClientMessage (..)
   , filterAfterId
   , extractId
+  , entriesBeforeId
+  , clampLimit
+  , sendErrorFrame
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -45,12 +51,12 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
 
-import Seal.Gateway.Types.Stream (FocusOp (..))
+import Seal.Gateway.Types.Stream (FocusOp (..), RequestEntriesOp (..), ClientMessage (..))
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
@@ -146,8 +152,8 @@ streamApp guard broker pending = do
       withPingThread conn 30 (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
-              case A.decode msg of
-                Just (focusOp :: FocusOp) ->
+              case A.decode msg :: Maybe ClientMessage of
+                Just (CmFocus focusOp) ->
                   case mkSessionId (foSession focusOp) of
                     Right s  -> do
                       globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
@@ -157,8 +163,10 @@ streamApp guard broker pending = do
                       -- entries broadcast during the WS gap are recovered.
                       forM_ (foSince focusOp) $ \sinceId ->
                         replayEntriesSince conn (sgPaths guard) s sinceId
-                    Left _e  -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("invalid session id" :: Text)]))
-                Nothing -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("expected a focus op" :: Text)]))
+                    Left _e  -> sendErrorFrame conn "invalid session id"
+                Just (CmRequestEntries reqOp) ->
+                  handleRequestEntries conn (sgPaths guard) reqOp
+                Nothing -> sendErrorFrame conn "unknown op"
         readerLoop `catch` \(_e :: SomeException) -> pure ()
 
 -- | Replay transcript entries after the given entry id, then send a
@@ -172,7 +180,7 @@ streamApp guard broker pending = do
 -- @live@, falling back to the HTTP seed for any missing entries).
 --
 -- Entry ids are either the on-disk @teId@ (a Text) or a synthetic index
--- (@\"0\"@, @\"1\"@, ...) when the two-file format has no per-entry id. We
+-- (@\"0\"@, @\"1\"@, ...) when the indexed transcript format has no per-entry id. We
 -- compare by the @id@ field in the frontend JSON shape, which is the same
 -- shape @readTranscriptEntries@ returns.
 replayEntriesSince
@@ -182,7 +190,12 @@ replayEntriesSince conn paths sid sinceId = do
         mMeta <- loadSessionMeta paths sid
         let model = maybe "" smModel mMeta
             fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-        entries <- readTranscriptEntries paths model fallbackTs sid
+        -- Read only the last 200 entries (limit) to avoid flooding the
+        -- frontend with thousands of WS entry events on large sessions.
+        -- The frontend dedupes by id, and the HTTP seed already provided
+        -- the initial page. The replay only needs to catch up entries
+        -- that arrived since the last visit.
+        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (Just 200)
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
           sendTextData conn (A.encode (object
@@ -212,7 +225,7 @@ replayEntriesSince conn paths sid sinceId = do
       ]))
 
 -- | Filter the frontend-shaped transcript entries to those whose @id@
--- field is strictly after @sinceId@. Entry ids from the two-file format
+-- field is strictly after @sinceId@. Entry ids from the indexed transcript format
 -- are synthetic line indices (@\"0\"@, @\"1\"@, ...) which sort
 -- lexicographically the same as numerically for single-digit counts but
 -- diverge for multi-digit (e.g. @\"10\"@ < @\"2\"@ lexically). To be
@@ -243,6 +256,91 @@ extractId v = case v of
     Just (A.String t) -> t
     _                 -> ""
   _ -> ""
+
+-- | Handle a @request-entries@ op: read the transcript from disk, slice it
+-- to the requested chunk, and send an @entries-chunk@ event. Includes a
+-- catch handler so a corrupt/missing transcript sends an error frame
+-- instead of propagating to the readerLoop's top-level catch and
+-- disconnecting the entire WS connection.
+handleRequestEntries :: Connection -> SealPaths -> RequestEntriesOp -> IO ()
+handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
+  case mkSessionId sidTxt of
+    Left _ -> sendErrorFrame conn "invalid session id"
+    Right sid -> do
+      let go = do
+            mMeta <- loadSessionMeta paths sid
+            let model = maybe "" smModel mMeta
+                fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
+                limit = clampLimit mLimit
+            -- Use the paginated read to avoid loading all entries into
+            -- memory. For the initial chunk (mBefore == Nothing), read
+            -- only the last `limit` entries. For before/id pagination,
+            -- read a wider window. For __beginning__, we need the FIRST
+            -- entries — read without limit (the conv-only path is rare
+            -- and typically small; the entries path uses the page).
+            (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
+              (case mBefore of
+                Nothing          -> Just limit
+                Just "__beginning__" -> Nothing  -- need first entries, not last
+                Just _           -> Just (limit * 3))
+            -- totalCount comes from the timings (full entry count before
+            -- limiting), NOT from length allEntries (which is the limited count).
+            let totalCount = ttEntryCount tt
+                (chunk, hasMore) = case mBefore of
+                  Nothing ->
+                    -- allEntries already contains only the last `limit`
+                    -- entries; the chunk is all of them, hasMore = totalCount > limit
+                    (allEntries, totalCount > limit)
+                  Just before ->
+                   if before == "__beginning__"
+                     then (take limit allEntries, totalCount > limit)
+                     else
+                    case entriesBeforeId before allEntries of
+                      Just beforeEntries ->
+                        let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries
+                            hasMoreBefore = length beforeEntries > limit
+                        in (taken, hasMoreBefore)
+                      Nothing -> ([], False)
+            sendTextData conn (A.encode (A.object
+              [ "type" A..= ("entries-chunk" :: Text)
+              , "sessionId" A..= sidTxt
+              , "entries" A..= chunk
+              , "hasMore" A..= hasMore
+              , "totalCount" A..= totalCount
+              , "requestBefore" A..= mBefore
+              ]))
+      go `catch` \(e :: SomeException) -> do
+        globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
+        sendTextData conn (A.encode (A.object
+          [ "type" A..= ("entries-chunk" :: Text)
+          , "sessionId" A..= sidTxt
+          , "entries" A..= ([] :: [A.Value])
+          , "requestBefore" A..= mBefore
+          ]))
+
+-- | Return entries before the entry with id @before@ (exclusive).
+-- Returns 'Nothing' when the id is not found (distinct from
+-- 'filterAfterId' which falls back to all entries on a miss).
+entriesBeforeId :: Text -> [A.Value] -> Maybe [A.Value]
+entriesBeforeId beforeId = go
+  where
+    go [] = Nothing
+    go (v : vs) =
+      if extractId v == beforeId
+        then Just []
+        else case go vs of
+          Just rest -> Just (v : rest)
+          Nothing   -> Nothing
+
+-- | Clamp the limit to [1, 200], defaulting to 50.
+clampLimit :: Maybe Int -> Int
+clampLimit = min 200 . max 1 . fromMaybe 50
+
+-- | Send an error frame to the WS peer. Extracted from the inline
+-- pattern in 'readerLoop' for reuse.
+sendErrorFrame :: Connection -> Text -> IO ()
+sendErrorFrame conn msg = sendTextData conn (A.encode (object
+  [ "type" .= ("error" :: Text), "message" .= msg ]))
 
 -- | Look up a header value from the pending request headers (case-insensitive).
 lookupHeader :: Text -> WS.RequestHead -> Maybe String

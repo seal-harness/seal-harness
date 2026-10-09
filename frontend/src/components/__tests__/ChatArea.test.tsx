@@ -2070,9 +2070,8 @@ describe('Scroll-to-bottom behavior', () => {
       expect(scrollToSpy).toHaveBeenCalled()
 
       // Now simulate a new streaming message arriving. Because the button
-      // pinned to bottom, the sticky-bottom effect should fire
-      // scrollIntoView.
-      scrollIntoViewSpy.mockClear()
+      // pinned to bottom, the sticky-bottom effect should fire scrollTo.
+      scrollToSpy.mockClear()
       const msgsWithNew = [...msgsA, {
         id: 'a-m3',
         entryId: 'a-e3',
@@ -2090,7 +2089,7 @@ describe('Scroll-to-bottom behavior', () => {
         />,
       )
       // sticky-bottom scroll should have been called.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
       Element.prototype.scrollTo = origScrollTo
@@ -2204,7 +2203,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Clear calls from session switch.
-      scrollIntoViewSpy.mockClear()
+      scrollToSpy.mockClear()
 
       // A new message arrives in s2 (streaming update — same first id, count+1).
       const msgsWithNew = [...msgsB, {
@@ -2227,7 +2226,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Sticky-bottom scroll should have fired for the new message.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
      Element.prototype.scrollTo = origScrollTo
@@ -2286,6 +2285,96 @@ describe('Scroll-to-bottom behavior', () => {
       expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollTo = origScrollTo
+    }
+  })
+})
+
+describe('Scroll-to-top behavior', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    cleanup()
+  })
+
+  it('"Scroll to top" with hasMore calls loadFromBeginning and scrolls to top when entries arrive', () => {
+    // When hasMore is true and the user clicks "Scroll to top", the
+    // component calls loadFromBeginning() to fetch the oldest entries.
+    // When those entries arrive (messages prop changes), the scroller
+    // must scroll to top: 0 — NOT to the bottom (which is the
+    // sticky-bottom default). This is the regression: the sticky-bottom
+    // effect was firing after loadFromBeginning because wasAtBottom was
+    // still true from the initial session load.
+    const msgsLatest = makeMessages('latest', 3)
+    const msgsOldest = makeMessages('oldest', 3)
+
+    const loadFromBeginning = vi.fn()
+    const scrollToSpy = vi.fn()
+    const scrollIntoViewSpy = vi.fn()
+
+    const origScrollTo = Element.prototype.scrollTo
+    const origScrollIntoView = Element.prototype.scrollIntoView
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+    Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsLatest}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+      // Clear calls from initial render effects.
+      scrollToSpy.mockClear()
+      scrollIntoViewSpy.mockClear()
+
+      // Click "Scroll to top" — should call loadFromBeginning.
+      fireEvent.click(screen.getByLabelText('Scroll to top'))
+      expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+
+      // Clear any calls from the click's re-render effects.
+      scrollToSpy.mockClear()
+      scrollIntoViewSpy.mockClear()
+
+      // Simulate the WS chunk arriving: entries replaced with oldest.
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsOldest}
+            hasMore={false}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // The scroller must have been scrolled to top: 0, not to the
+      // bottom. scrollTo({ top: 0 }) should have been called.
+      const topZeroCalls = scrollToSpy.mock.calls.filter(
+        (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+      )
+      expect(topZeroCalls.length).toBeGreaterThan(0)
+
+      // scrollIntoView (sticky-bottom) must NOT have fired after the
+      // entries arrived — that would scroll to the bottom of the new
+      // entries instead of the top.
+      expect(scrollIntoViewSpy).not.toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+      Element.prototype.scrollIntoView = origScrollIntoView
     }
   })
 })

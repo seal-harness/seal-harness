@@ -4,7 +4,7 @@
 -- defines a skill, defines an agent, starts the agent in a forked session,
 -- and stops it — with every mutation landing as a Markdown file under
 -- @config\/@ (disk is canonical) and auto-committed to the config git repo.
--- The session transcript stays in the two-file format.
+-- The session transcript stays in the indexed transcript format.
 module Seal.Phase5Spec (spec) where
 
 import Control.Concurrent (threadDelay)
@@ -32,7 +32,7 @@ import Data.Default (def)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend, OpResult (..))
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -170,7 +170,7 @@ buildRegistry cfgRoot workerRan sid = do
 
 spec :: Spec
 spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
-  it "one chat turn: MEMORY_WRITE + RECALL + SKILL_WRITE + AGENT_DEF_WRITE — files land on disk + git, transcript in two-file format" $
+  it "one chat turn: MEMORY_WRITE + RECALL + SKILL_WRITE + AGENT_DEF_WRITE — files land on disk + git, transcript in indexed transcript format" $
     withSystemTempDirectory "seal-phase5" $ \root -> do
       approvals <- newApprovalCache
       let cfgRoot = root </> "config"
@@ -181,7 +181,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
       reg <- buildRegistry cfgRoot workerRan sampleSession
       ref <- newIORef capstoneScript
-      (tHandle, readTranscript) <- fakeTwoFileTranscript
+      (tHandle, readTranscript) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -265,7 +265,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             , agentStopOp rt
             , agentInterruptOp rt
             ]
-      (tHandle, _) <- fakeTwoFileTranscript
+      (tHandle, _) <- fakeIndexedTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
       _ <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_DEF_WRITE")
                          (object

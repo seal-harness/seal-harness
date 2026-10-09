@@ -121,6 +121,7 @@ library
         Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
+        Seal.Transcript.ConvIndex
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
@@ -430,6 +431,7 @@ test-suite tests
         Seal.Routing.RouteSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
+        Seal.Transcript.ConvIndexSpec
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec

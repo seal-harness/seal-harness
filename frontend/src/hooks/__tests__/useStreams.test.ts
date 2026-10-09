@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useListsStream } from '../useListsStream'
-import { useTranscriptStream, reconcileEntries, _resetDataCacheForTests } from '../useTranscriptStream'
+import { useTranscriptStream, reconcileEntries, prependChunkEntries, _resetDataCacheForTests } from '../useTranscriptStream'
 import { useSessionActivityStream, applyActivity, clearUnread } from '../useSessionActivityStream'
 import type { StreamClient, ListsSnapshot, ActivityEvent, SessionActivityState } from '../../types/stream'
 import type { TranscriptEntry } from '../../types'
@@ -15,6 +15,8 @@ function fakeClient(): StreamClient & {
   pushAskResolved(sid: string, ask: { id: string; resolution: string }): void
   setStatus(s: StreamClient['status']): void
   setError(e: string | null): void
+  pushEntriesChunk(sid: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }): void
+  requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[]
 } {
   const listsCbs = new Set<(s: ListsSnapshot) => void>()
   const entryCbs = new Set<(e: TranscriptEntry) => void>()
@@ -25,6 +27,8 @@ function fakeClient(): StreamClient & {
   const agentDefsChangedCbs = new Set<() => void>()
   const skillsChangedCbs = new Set<() => void>()
   const reposChangedCbs = new Set<() => void>()
+  const requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[] = []
+  const entriesChunkCbs = new Set<(sessionId: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void>()
   let lastError: string | null = null
   return {
     status: 'live' as StreamClient['status'],
@@ -39,6 +43,8 @@ function fakeClient(): StreamClient & {
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
+    requestEntries: (sessionId: string, before: string | null, limit: number) => { requestEntriesCalls.push({ sessionId, before, limit }) },
+    onEntriesChunk: (cb) => { entriesChunkCbs.add(cb); return () => { entriesChunkCbs.delete(cb) } },
     // test drivers:
     pushLists: (s) => { for (const cb of listsCbs) cb(s) },
     pushEntry: (e) => { for (const cb of entryCbs) cb(e) },
@@ -47,6 +53,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid, ask) => { for (const cb of askResolvedCbs) cb(sid, ask) },
     setStatus: (s) => { for (const cb of statusCbs) cb(s); },
     setError: (e) => { lastError = e },
+    pushEntriesChunk: (sid, chunk) => { for (const cb of entriesChunkCbs) cb(sid, chunk) },
+    requestEntriesCalls,
   } as StreamClient & {
     pushLists: (s: ListsSnapshot) => void
     pushEntry: (e: TranscriptEntry) => void
@@ -55,6 +63,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid: string, ask: { id: string; resolution: string }) => void
     setStatus: (s: StreamClient['status']) => void
     setError: (e: string | null) => void
+    pushEntriesChunk: (sid: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void
+    requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[]
   }
 }
 
@@ -216,6 +226,129 @@ describe('useTranscriptStream', () => {
     expect(result.current.entries).toHaveLength(1)
     expect(result.current.entries[0]!.id).toBe('f1')
     vi.unstubAllGlobals()
+  })
+})
+
+  it('loads initial entries via HTTP with hasMore/totalCount headers', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e1', '2026-01-01T00:00:00Z'), makeEntry('e2', '2026-01-01T00:00:01Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '10' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.loading).toBe(false)
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.totalCount).toBe(10)
+    vi.unstubAllGlobals()
+  })
+
+  it('loadOlder prepends older entries via WS requestEntries', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '10' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(1)
+    expect(result.current.hasMore).toBe(true)
+    // Load older via WS
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls).toHaveLength(1)
+    expect(c.requestEntriesCalls[0]!.before).toBe('e5')
+    expect(result.current.loadingMore).toBe(true)
+    // Server responds with older entries
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e3', '2026-01-01T00:00:02Z'), makeEntry('e4', '2026-01-01T00:00:03Z')],
+        hasMore: true,
+        totalCount: 10,
+        requestBefore: 'e5',
+      })
+    })
+    expect(result.current.entries).toHaveLength(3)
+    expect(result.current.entries[0]!.id).toBe('e3')
+    expect(result.current.entries[1]!.id).toBe('e4')
+    expect(result.current.entries[2]!.id).toBe('e5')
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('loadOlder does nothing when hasMore is false', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z')]), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'false', 'X-Total-Count': '1' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(false)
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls).toHaveLength(0)
+    vi.unstubAllGlobals()
+  })
+
+  it('loadOlder does nothing when loadingMore is true', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z')]), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '10' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+    // First loadOlder sets loadingMore=true
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls).toHaveLength(1)
+    expect(result.current.loadingMore).toBe(true)
+    // Second loadOlder should be a no-op (loadingMore is true)
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls).toHaveLength(1)
+    // Server responds — loadingMore resets
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e0', '2026-01-01T00:00:00Z')],
+        hasMore: false,
+        totalCount: 10,
+        requestBefore: 'e1',
+      })
+    })
+    expect(result.current.loadingMore).toBe(false)
+    expect(result.current.hasMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+
+describe('prependChunkEntries', () => {
+  it('prepends older entries before existing', () => {
+    const existing = [makeEntry('e3', 't3'), makeEntry('e4', 't4')]
+    const older = [makeEntry('e1', 't1'), makeEntry('e2', 't2')]
+    expect(prependChunkEntries(existing, older)).toEqual([
+      makeEntry('e1', 't1'), makeEntry('e2', 't2'),
+      makeEntry('e3', 't3'), makeEntry('e4', 't4'),
+    ])
+  })
+
+  it('deduplicates by id (existing entry wins)', () => {
+    const existing = [makeEntry('e2', 't2'), makeEntry('e3', 't3')]
+    const older = [makeEntry('e1', 't1'), makeEntry('e2', 't2-old')]
+    const result = prependChunkEntries(existing, older)
+    expect(result).toHaveLength(3)
+    expect(result[1]!.id).toBe('e2')
+    // The existing entry wins — older duplicate is dropped.
+  })
+
+  it('handles empty older array', () => {
+    const existing = [makeEntry('e1', 't1')]
+    expect(prependChunkEntries(existing, [])).toEqual([makeEntry('e1', 't1')])
   })
 })
 
