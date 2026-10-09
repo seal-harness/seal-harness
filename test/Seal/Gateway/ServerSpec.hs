@@ -2,11 +2,13 @@
 module Seal.Gateway.ServerSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Data.IORef (newIORef)
+import Data.List (isInfixOf)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Time (UTCTime(..), fromGregorian)
-import Network.HTTP.Types (methodGet, statusCode)
+import Network.HTTP.Types (methodGet, methodPost, status200, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus )
+  ( Application, Request, defaultRequest, pathInfo, requestMethod
+  , responseLBS, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -17,7 +19,7 @@ import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
-import Seal.Gateway.Server
+import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -29,6 +31,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Git.Repo (openConfigRepo)
+import Seal.Logging.Logger (SealLogger, testSealLogger)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
@@ -39,6 +42,11 @@ import Seal.Web.UiState (newUiStateHandle)
 testAbortReg :: SessionAbortRegistry
 testAbortReg = unsafePerformIO newSessionAbortRegistry
 {-# NOINLINE testAbortReg #-}
+
+-- | A shared test logger (no-op scribe — tests don't assert log output).
+testLogger :: SealLogger
+testLogger = unsafePerformIO testSealLogger
+{-# NOINLINE testLogger #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
@@ -96,13 +104,13 @@ spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
   it "gatewayApp routes /api/health to the API" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "gatewayApp returns 404 for a non-api path with no static dir" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["foo", "bar"] })
     status `shouldBe` 404
 
@@ -110,18 +118,56 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp deps (Just dir)
+      let app = gatewayApp testLogger deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi.json as JSON" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi.json"], requestMethod = methodGet })
     status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi as HTML (Swagger UI)" $ do
     deps <- mkDeps
-    let app = gatewayApp deps Nothing
+    let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
     status `shouldBe` 200
+
+  -- ── requestTimingMiddleware ─────────────────────────────────────────
+
+  describe "Seal.Gateway.Server.requestTimingMiddlewareWith" $ do
+    let okApp _ respond = respond (responseLBS status200 [] "ok")
+
+    it "logs the HTTP method, path, status, and duration for each request" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      status <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "lists"], requestMethod = methodGet })
+      status `shouldBe` 200
+      logs <- readIORef logRef
+      length logs `shouldBe` 1
+      case logs of
+        (entry : _) -> do
+          entry `shouldSatisfy` ("GET" `isInfixOf`)
+          entry `shouldSatisfy` ("api/lists" `isInfixOf`)
+          entry `shouldSatisfy` ("200" `isInfixOf`)
+          entry `shouldSatisfy` ("ms" `isInfixOf`)
+        [] -> expectationFailure "expected at least one log entry"
+
+    it "is transparent — the response is unchanged" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      status <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "health"], requestMethod = methodGet })
+      status `shouldBe` 200
+
+    it "logs POST method correctly" $ do
+      logRef <- newIORef ([] :: [String])
+      let logger msg = modifyIORef' logRef (++ [msg])
+          timedApp = requestTimingMiddlewareWith logger okApp
+      _ <- runAppStatus timedApp (defaultRequest { pathInfo = ["api", "sessions", "new"], requestMethod = methodPost })
+      logs <- readIORef logRef
+      case logs of
+        (entry : _) -> entry `shouldSatisfy` ("POST" `isInfixOf`)
+        [] -> expectationFailure "expected at least one log entry"

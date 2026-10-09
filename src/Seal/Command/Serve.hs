@@ -378,7 +378,7 @@ runServeMain autonomy logger = do
   let isRemote = case scUntrustedExec secCfg of
         Just uefc -> uefcMode uefc == "remote"
         Nothing   -> False
-  runGateway gwCfg isRemote deps
+  runGateway logger gwCfg isRemote deps
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
