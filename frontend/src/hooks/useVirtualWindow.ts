@@ -203,12 +203,21 @@ export function useVirtualWindow(
         return [start, messageCount]
       })
     } else {
-      console.log(`[vwindow] NEW-MSGS-NOT-BOTTOM msgCount=${messageCount} wasAtBottom=false`)
+      // Clamp the existing range to valid bounds. When loadLatest or
+      // loadFromBeginning replaces entries with a different count, the
+      // old range may be out of bounds (e.g., [0, 28] for 16 messages),
+      // producing a negative bottomSpacerHeight that traps the scroll.
+      // If the range is still valid, keep it unchanged.
+      setVisibleRange((prev) => {
+        if (prev[1] <= messageCount && prev[0] < messageCount) {
+          console.log(`[vwindow] NEW-MSGS-NOT-BOTTOM msgCount=${messageCount} wasAtBottom=false range=keep`)
+          return prev
+        }
+        const start = Math.max(0, messageCount - MIN_RENDERED)
+        console.log(`[vwindow] NEW-MSGS-NOT-BOTTOM msgCount=${messageCount} wasAtBottom=false range=clamp [${start}, ${messageCount}]`)
+        return [start, messageCount]
+      })
     }
-    // If not at bottom, the existing range is still valid — the new
-    // messages are below the viewport and will be rendered when the
-    // user scrolls down. But the bottom spacer height changes, which
-    // is handled by the spacer calculation below.
   }, [messageCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const [startIndex, endIndex] = visibleRange

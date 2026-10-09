@@ -735,6 +735,13 @@ body {
   box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 4px rgba(124, 108, 246, 0.4);
 }
 .header-scroll-btn svg { display: block; }
+.header-scroll-btn:disabled { opacity: 0.5; cursor: default; }
+.header-scroll-btn svg.spin {
+  animation: btn-spin 0.8s linear infinite;
+}
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
 
 /* Stop button: same base as header-scroll-btn, with a red accent to
    signal its destructive/interrupting nature. */

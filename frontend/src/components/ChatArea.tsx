@@ -2752,8 +2752,9 @@ export function ChatArea({
             {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
-              title="Scroll to top of transcript"
+              title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
               aria-label="Scroll to top"
+              disabled={loadingMore}
               onClick={() => {
                 console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
                 if (hasMore && loadFromBeginning) {
@@ -2765,16 +2766,25 @@ export function ChatArea({
                 }
               }}
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
-                aria-hidden="true">
-                <path d="M3 10 L8 5 L13 10" />
-              </svg>
+              {loadingMore ? (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                  className="spin" aria-hidden="true">
+                  <path d="M8 3 a5 5 0 1 0 5 5" />
+                </svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden="true">
+                  <path d="M3 10 L8 5 L13 10" />
+                </svg>
+              )}
             </button>
             <button
               className="header-scroll-btn"
-              title="Scroll to bottom of transcript"
+              title={loadingMore ? "Loading…" : "Scroll to bottom of transcript"}
               aria-label="Scroll to bottom"
+              disabled={loadingMore}
               onClick={() => {
                 console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
                 if (loadLatest) {
@@ -2788,11 +2798,19 @@ export function ChatArea({
                 }
               }}
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
-                aria-hidden="true">
-                <path d="M3 6 L8 11 L13 6" />
-              </svg>
+              {loadingMore ? (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                  className="spin" aria-hidden="true">
+                  <path d="M8 3 a5 5 0 1 0 5 5" />
+                </svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden="true">
+                  <path d="M3 6 L8 11 L13 6" />
+                </svg>
+              )}
             </button>
           </div>
         )}
