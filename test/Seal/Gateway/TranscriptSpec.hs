@@ -18,6 +18,7 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
+import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -28,7 +29,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
@@ -38,6 +39,7 @@ import Seal.Gateway.Transcript
   , reconEntryToFrontend
   , renderServerTiming
   , trailingConvEntries
+  , firstUserMessageSnippetFast
   , setEncodeMs
   )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
@@ -46,7 +48,7 @@ import Seal.Transcript.Entries (encodeEntryRecordRaw)
 import Seal.Transcript.Entries qualified as Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 
-import Seal.Providers.Class (ContentBlock (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Providers.Class qualified as PC (Message (..), Role (..))
 
 sampleTime :: UTCTime
@@ -348,15 +350,15 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
         setupSession entryCount trailingCount = do
           dir <- withSystemTempDirectory "seal-transcript" pure
           let paths = mkPaths dir
-              sessionDir = dir </> "state" </> "sessions" </> "test-session"
-              convPath = sessionDir </> "conversation.jsonl"
-              entriesPath = sessionDir </> "entries.jsonl"
-              idxPath = sessionDir </> "conversation.idx"
+              sdir = dir </> "state" </> "sessions" </> "test-session"
+              convPath = sdir </> "conversation.jsonl"
+              entriesPath = sdir </> "entries.jsonl"
+              idxPath = sdir </> "conversation.idx"
               totalLines = entryCount + trailingCount
           let convMsgs = [ PC.Message (if even i then PC.User else PC.Assistant) [CbText (T.pack ("msg-" <> show i))]
                          | i <- [0 .. totalLines - 1] ]
               convBs = BS.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") convMsgs)
-          createDirectoryIfMissing True sessionDir
+          createDirectoryIfMissing True sdir
           BS.writeFile convPath convBs
           now <- getCurrentTime
           let entries = [ Entries.EntryRecord
@@ -489,3 +491,78 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
       -- Other phases are untouched:
       ttFileReadMs tt1 `shouldBe` ttFileReadMs tt0
       ttSource tt1 `shouldBe` ttSource tt0
+
+  -- ── firstUserMessageSnippetFast ─────────────────────────────────────
+
+  describe "Seal.Gateway.Transcript.firstUserMessageSnippetFast" $ do
+    -- | A fake SealPaths with spState pointing at the temp dir.
+    let fakePaths stateDir =
+          SealPaths { spHome = "", spState = stateDir, spConfig = ""
+                    , spKeys = "", spCache = "" }
+        -- | Encode a Message as a conversation.jsonl line (JSON + newline).
+        convLine :: Message -> BL.ByteString
+        convLine m = A.encode m <> "\n"
+        testSid = case mkSessionId "20260701-120000-042" of
+          Right s -> s
+          Left e  -> error ("invalid sid: " ++ show e)
+
+    it "returns the first user message snippet from conversation.jsonl" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "Fix the login bug"]
+                   , Message Assistant [CbText "Sure"]
+                   ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLine conv)))
+        result <- firstUserMessageSnippetFast paths testSid
+        result `shouldBe` Just "Fix the login bug"
+
+    it "finds the first user message even when preceded by assistant messages" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message Assistant [CbText "system prompt"]
+                   , Message Assistant [CbText "preamble"]
+                   , Message User [CbText "hello world"]
+                   , Message Assistant [CbText "hi there"]
+                   ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLine conv)))
+        result <- firstUserMessageSnippetFast paths testSid
+        result `shouldBe` Just "hello world"
+
+    it "returns Nothing when no user message exists" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message Assistant [CbText "just assistant"]
+                   ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLine conv)))
+        result <- firstUserMessageSnippetFast paths testSid
+        result `shouldBe` Nothing
+
+    it "returns Nothing when no transcript file exists" $ do
+      let paths = fakePaths "/nonexistent-seal-test"
+      result <- firstUserMessageSnippetFast paths testSid
+      result `shouldBe` Nothing
+
+    it "truncates long snippets to 80 chars + ellipsis" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let longMsg = T.replicate 120 "x"
+            conv = [ Message User [CbText longMsg] ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLine conv)))
+        result <- firstUserMessageSnippetFast paths testSid
+        case result of
+          Just snippet -> do
+            T.length snippet `shouldBe` 81  -- 80 chars + ellipsis
+            T.last snippet `shouldBe` '…'
+          Nothing -> expectationFailure "expected Just snippet, got Nothing"

@@ -600,7 +600,7 @@ mkSetupRepoFakeRunner markerPath ref = do
   let record argv mStdin = case reverse argv of
         (cmd : _) -> do
           modifyIORef' ref (++ [(argv, mStdin)])
-          respondGhFake markerPath cloneCredOkRef cmd
+          respondGhFake markerPath cloneCredOkRef cmd mStdin
         [] -> pure (Right "")
   pure RemoteRunner
     { runRemote      = (`record` Nothing)
@@ -610,15 +610,15 @@ mkSetupRepoFakeRunner markerPath ref = do
 
 -- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').
 respondGhFake
-  :: FilePath -> IORef Bool -> String -> IO (Either ExecError Text)
-respondGhFake markerPath cloneCredOkRef cmdStr = do
+  :: FilePath -> IORef Bool -> String -> Maybe ByteString -> IO (Either ExecError Text)
+respondGhFake markerPath cloneCredOkRef cmdStr mStdin = do
   let cmd = T.pack cmdStr
   case () of
     _ | "remote.origin.url" `T.isInfixOf` cmd -> pure (Right "__NONE__\n")
       | "__OK__" `T.isInfixOf` cmd -> do
           ok <- readIORef cloneCredOkRef
           pure (Right (if ok then "__OK__\n" else "__MISSING__\n"))
-      | otherwise -> case parseGhCloneCmd cmd of
+      | otherwise -> case parseGhCloneCmd cmd mStdin of
           Nothing -> pure (Right "")  -- bootstrap / discovery scans
           Just (url, effEnv) -> do
             appendFile markerPath (ghMarkerLines url effEnv)
@@ -630,14 +630,55 @@ ghCredsOk effEnv =
   lookup "GH_TOKEN" effEnv == Just testPatToken
   && lookup "GIT_TERMINAL_PROMPT" effEnv == Just "0"
 
--- | Parse a composed remote command of the shape
--- @cd '<ws>' && env K='V' … gh repo clone '<url>' '<dest>' -- --depth 1@
--- (the POST-fix form) into the token-free URL and the env visible to the
--- TRAILING command. Returns 'Nothing' when the trailing command is not an
--- env-prefixed gh clone — including the BUGGY pre-fix form where the env
--- prefix sits BEFORE the @cd@ and therefore binds nothing for gh.
-parseGhCloneCmd :: Text -> Maybe (Text, [(Text, Text)])
-parseGhCloneCmd cmd = case reverse (T.splitOn " && " cmd) of
+-- | Parse a composed remote command into the token-free URL and the env
+-- visible to the trailing gh command. Handles TWO shapes:
+--
+-- 1. @env K='V' … gh repo clone '<url>' '<dest>' -- --depth 1@
+--    (the non-secret path — env vars in the command string)
+--
+-- 2. @sh -c 'read -r K1; read -r K2; …; export K1 K2 …; exec gh repo
+--    clone '<url>' '<dest>' -- --depth 1'@ (the stdin-based secret path
+--    — env var VALUES are on stdin, newline-separated in the same order
+--    as the @read -r@ statements)
+--
+-- Returns 'Nothing' when the trailing command is not a gh clone.
+parseGhCloneCmd :: Text -> Maybe ByteString -> Maybe (Text, [(Text, Text)])
+parseGhCloneCmd cmd mStdin
+  | "sh -c " `T.isInfixOf` cmd = parseStdinGhCloneCmd cmd mStdin
+  | otherwise = parseEnvGhCloneCmd cmd
+
+-- | Parse the stdin-based format: @sh -c 'read -r K1; ...; exec gh repo clone ...'@
+-- with the values on stdin (newline-separated, same order as the reads).
+-- The inner command's single quotes are escaped as @'\''@ — unescape them
+-- before parsing.
+parseStdinGhCloneCmd :: Text -> Maybe ByteString -> Maybe (Text, [(Text, Text)])
+parseStdinGhCloneCmd cmd mStdin = do
+  stdin <- mStdin
+  -- Extract the sh -c '...' segment (the last segment after " && ").
+  let segments = T.splitOn " && " cmd
+      shSegment = case reverse segments of (s : _) -> s; [] -> cmd
+      -- Strip the "sh -c '" prefix and the trailing "'".
+      fullInner = T.dropEnd 1 (T.drop (T.length "sh -c '") shSegment)
+      -- Unescape '\'' → ' for parsing.
+      unescaped = T.replace "'\\''" "'" fullInner
+  -- Parse the read -r KEY statements.
+  let parts = T.splitOn "; " unescaped
+      readKeys = [ T.drop (T.length "read -r ") p
+                 | p <- parts, "read -r " `T.isPrefixOf` p
+                 ]
+      stdinLines = T.lines (TE.decodeUtf8Lenient stdin)
+  -- Zip the keys with the stdin values.
+  let effEnv = zip (map T.strip readKeys) stdinLines
+  -- Find the exec command.
+  case [ T.drop (T.length "exec ") p | p <- parts, "exec " `T.isPrefixOf` p ] of
+    (execCmd : _) -> do
+      url <- T.stripPrefix "gh repo clone '" execCmd
+      pure (T.takeWhile (/= '\'') url, effEnv)
+    [] -> Nothing
+
+-- | Parse the env-prefix format: @env K='V' … gh repo clone '<url>' …@
+parseEnvGhCloneCmd :: Text -> Maybe (Text, [(Text, Text)])
+parseEnvGhCloneCmd cmd = case reverse (T.splitOn " && " cmd) of
   [] -> Nothing
   (final : _) -> do
     afterEnv <- T.stripPrefix "env " final
@@ -646,15 +687,15 @@ parseGhCloneCmd cmd = case reverse (T.splitOn " && " cmd) of
         effEnv = mapMaybe parseAssign assigns
         trailing = T.unwords rest
     url <- T.stripPrefix "gh repo clone '" trailing
-    pure (T.takeWhile (/= '\x27') url, effEnv)
+    pure (T.takeWhile (/= '\'') url, effEnv)
   where
     isAssign w = case T.uncons w of
-      Just (c, _) -> c /= '\x27' && T.any (== '=') w && "=" `T.isPrefixOf` T.dropWhile isNameChar w
+      Just (c, _) -> c /= '\'' && T.any (== '=') w && "=" `T.isPrefixOf` T.dropWhile isNameChar w
       Nothing     -> False
     isNameChar c = isAsciiLower c || isAsciiUpper c || c == '_'
     parseAssign w = case T.breakOn "=" w of
       (k, v) | not (T.null k), "='" `T.isPrefixOf` v ->
-        Just (k, T.takeWhile (/= '\x27') (T.drop 2 v))
+        Just (k, T.takeWhile (/= '\'') (T.drop 2 v))
       _ -> Nothing
 
 -- | The marker lines recording what the gh invocation saw.

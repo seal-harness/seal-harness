@@ -44,6 +44,7 @@ module Seal.Tools.Exec.Types
   , LocalExecHandle (..)
   , mkLocalExecHandlePlaceholder
   , ExecBackend (..)
+  , formatExitResult
   ) where
 
 import Data.Char (isControl)
@@ -249,3 +250,22 @@ instance Eq ExecBackend where
   EbLocal _ == EbLocal _ = True
   EbRemote a == EbRemote b = a == b
   _ == _ = False
+
+-- | Format a non-zero exit result for the tool-call consumer. Combines
+-- stdout and stderr (if non-empty) and annotates the exit code so the
+-- frontend can surface it. The result is returned via 'Right' (not an
+-- 'ExecError') so the dispatcher records @is_error = False@ — the
+-- command ran successfully, it just returned a non-zero exit code. The
+-- frontend treats the exit code annotation as the success/failure
+-- signal.
+--
+-- Shared by the local executor ('Seal.Tools.Exec.Local'), the remote SSH
+-- executor ('Seal.Tools.Exec.Remote'), and the unified UntrustedIO
+-- handle ('Seal.Tools.Exec.UntrustedIO') so both arms format non-zero
+-- exits identically — the model sees the same shape whether the command
+-- ran locally or over SSH.
+formatExitResult :: Int -> Text -> Text -> Text
+formatExitResult n out err =
+  let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
+      body  = if null parts then "" else T.intercalate "\n" parts
+  in body <> "\n[exit code: " <> T.pack (show n) <> "]"

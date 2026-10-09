@@ -449,9 +449,11 @@ spec = describe "Seal.ISA.Ops.Bin (gh credential injection — BinGhSpec)" $ do
       -- http.extraHeader). ceRawToken carries the raw bytes; the gh
       -- path injects them verbatim via BS.unpack.
       lookup "GH_TOKEN" (greEnvExtras ghExec) `shouldBe` Just "mhp_MACHINEUSER_TOKEN_999"
-      -- The base64 header (Authorization: Basic ...) is NOT in the env.
-      let envVals = map snd (greEnvExtras ghExec)
-      any ("Basic " `isInfixOf`) envVals `shouldBe` False
+      -- The raw token is NOT in any env value except GH_TOKEN.
+      -- (GIT_CONFIG_PARAMETERS contains the base64-encoded header, not
+      -- the raw token.)
+      let nonTokenEnvVals = map snd (filter ((/= "GH_TOKEN") . fst) (greEnvExtras ghExec))
+      any ("mhp_MACHINEUSER_TOKEN_999" `isInfixOf`) nonTokenEnvVals `shouldBe` False
 
   --------------------------------------------------------------------
   -- Test 3: Deploy-key repo — falls through to plain uioBinExec

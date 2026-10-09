@@ -377,10 +377,13 @@ resolveCloneTarget deps repo =
               Left ve -> pure (Left (CloneVaultError ve))
               Right tokenBytes -> do
                 let header = renderPatHeader repo tokenBytes
-                    envExtras = [("GIT_TERMINAL_PROMPT", "0")]
+                    gitConfigParams = "'http.extraHeader=" <> header <> "'"
+                    envExtras = [ ("GIT_TERMINAL_PROMPT", "0")
+                                , ("GIT_CONFIG_PARAMETERS", T.unpack gitConfigParams)
+                                ]
                     env = CloneEnv
                       { ceUrl = httpsUrl
-                      , ceGitConfigArgs = ["-c", "http.extraHeader=" <> header]
+                      , ceGitConfigArgs = []
                       , ceSshCommand = Nothing
                       , ceEnvExtras = envExtras
                       , ceKnownHostsContent = Nothing

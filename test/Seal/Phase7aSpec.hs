@@ -27,6 +27,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
+import Seal.Logging.Logger (SealLogger, testSealLogger)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
@@ -47,6 +48,11 @@ import Seal.Web.UiState (newUiStateHandle)
 testAbortReg :: SessionAbortRegistry
 testAbortReg = unsafePerformIO newSessionAbortRegistry
 {-# NOINLINE testAbortReg #-}
+
+-- | A shared test logger (no-op scribe — tests don't assert log output).
+testLogger :: SealLogger
+testLogger = unsafePerformIO testSealLogger
+{-# NOINLINE testLogger #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
@@ -105,7 +111,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp deps Nothing
+        app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
@@ -164,6 +170,6 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp deps Nothing
+        app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })
     status `shouldBe` 200
