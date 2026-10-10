@@ -832,7 +832,7 @@ handleStartBackground wiring _v di = do
                 forM_ (aswOnIdleCompletion wiring) id
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =
-            registerRunningAgent runtime (adId def) sid childSid (aswParentDepth wiring + 1)
+            registerRunningAgent runtime (adId def) sid parentSid childSid (aswParentDepth wiring + 1)
       eSpawnInfos <- liftIO (runDelegateAsync
                                cfg
                                (aswPauseFlag wiring)

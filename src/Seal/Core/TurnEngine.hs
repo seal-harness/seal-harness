@@ -57,6 +57,7 @@ import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
   (mkDelegateWorker, DelegationWorkerDeps (..))
+import Seal.Agent.Runtime.Registry (hasRunningChildren)
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
@@ -531,7 +532,8 @@ runSessionTurn td adapter meta mSrc t = do
       -- same last-assistant text again (double delivery to every
       -- subscribed chat channel — observed as a duplicate final message on
       -- Telegram after /tab focus mid-turn). The cleanup still fires the
-      -- @reply-delivered@ signal and the idle broadcast on every path.
+      -- @reply-delivered@ signal on every path; the idle broadcast is
+      -- skipped when background children are still running.
       stopFanoutDoneRef <- newIORef False
       mErr <- bracket
         (pure ())
@@ -539,10 +541,15 @@ runSessionTurn td adapter meta mSrc t = do
           -- [engine] Guaranteed cleanup: signal idle + fan out the last
           -- assistant reply to subscribed chat channels (so a turn that
           -- dies mid-way still releases the tab + delivers any partial
-          -- reply). Skipped when the loop's stop branch already delivered
+          -- reply). The idle broadcast is SKIPPED when the session has
+          -- running background children ('hasRunningChildren') — the
+          -- session must stay "thinking" until the last child completes,
+          -- at which point the synthetic turn's cleanup broadcasts idle.
+          -- Skipped when the loop's stop branch already delivered
           -- the final reply ('notifyStop') — the cleanup would re-send the
           -- identical text (duplicate delivery).
-          broadcastHarnessStatus (tdBroker td) sid "idle"
+          hasChildren <- hasRunningChildren (bRuntime (tdBaseBackends td)) sid
+          unless hasChildren $ broadcastHarnessStatus (tdBroker td) sid "idle"
           stopFanoutDone <- readIORef stopFanoutDoneRef
           if stopFanoutDone
             then broadcastReplyDelivered (tdBroker td) sid
