@@ -1,13 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.Runtime.RegistrySpec (spec) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (throwIO)
 import Data.IORef
 import Test.Hspec
 
 import Seal.Agent.Def.Types (AgentDefId (..), mkAgentDefId)
-import Seal.Agent.Runtime.Delegation (SubagentId (..))
+import Seal.Agent.Runtime.Delegation
+  ( SubagentId (..), ChildResult (..), ChildStatus (..), ChildExitReason (..) )
 import Seal.Agent.Runtime.Registry
 import Seal.Core.Types (SessionId, mkSystemSessionId)
 
@@ -18,6 +19,9 @@ sampleDefId = case mkAgentDefId "a1" of
 
 sampleSession :: SessionId
 sampleSession = mkSystemSessionId "s1"
+
+sampleParentSession :: SessionId
+sampleParentSession = mkSystemSessionId "parent"
 
 sampleSubagentId :: SubagentId
 sampleSubagentId = SubagentId "sa-a1-00000001"
@@ -35,7 +39,7 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
     it "forks the worker and records the instance as Running" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
-      res <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (blockingWorker ran)
+      res <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
       res `shouldSatisfy` isRight
       -- give the fork a moment to run the worker
       threadDelay 50000
@@ -52,7 +56,7 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
 
     it "records Crashed when the worker throws" $ do
       rt <- newAgentRuntime
-      _ <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (throwIO (userError "boom"))
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (throwIO (userError "boom"))
       -- Poll for the async crash transition instead of one fixed sleep:
       -- under full-suite load a bare 50ms wait can observe Running and
       -- flake. Bounded at ~2s (200 × 10ms) so the suite stays fast.
@@ -73,12 +77,12 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
     it "removes the instance (a fresh start can proceed)" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
-      _ <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (blockingWorker ran)
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
       _ <- stopAgent rt sampleSubagentId
       agentStatus rt sampleSubagentId `shouldReturn` Nothing
       -- a fresh start succeeds after stop
       let sid2 = SubagentId "sa-a1-00000002"
-      r2 <- startAgent rt sampleDefId sid2 sampleSession 0 (blockingWorker ran)
+      r2 <- startAgent rt sampleDefId sid2 sampleParentSession sampleSession 0 (blockingWorker ran)
       r2 `shouldSatisfy` isRight
       _ <- stopAgent rt sid2
       pure ()
@@ -91,7 +95,7 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
     it "sets the status to Interrupted for a running instance" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
-      _ <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (blockingWorker ran)
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
       found <- interruptAgent rt sampleSubagentId
       found `shouldBe` True
       agentStatus rt sampleSubagentId `shouldReturn` Just Interrupted
@@ -107,13 +111,61 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
     it "snapshots running instances" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
-      _ <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (blockingWorker ran)
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
       threadDelay 50000
       insts <- listAgents rt
       length insts `shouldBe` 1
       case insts of
         [i] -> aiId i `shouldBe` sampleDefId
         _   -> expectationFailure "expected exactly one instance"
+      _ <- stopAgent rt sampleSubagentId
+      pure ()
+
+  describe "hasRunningChildren" $ do
+    it "returns False when no agents are registered" $ do
+      rt <- newAgentRuntime
+      hasRunningChildren rt sampleParentSession `shouldReturn` False
+
+    it "returns True when a running child is registered for the parent" $ do
+      rt <- newAgentRuntime
+      ran <- newIORef False
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
+      threadDelay 50000  -- let the fork record the instance
+      hasRunningChildren rt sampleParentSession `shouldReturn` True
+      _ <- stopAgent rt sampleSubagentId
+      pure ()
+
+    it "returns False after the child completes (status transitions to Stopped)" $ do
+      rt <- newAgentRuntime
+      let sid = SubagentId "sa-a1-00000003"
+      registerRunningAgent rt sampleDefId sid sampleParentSession sampleSession 0 =<< myThreadId
+      hasRunningChildren rt sampleParentSession `shouldReturn` True
+      let result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsCompleted
+            , crSummary = Just "done"
+            , crExitReason = CerCompleted
+            , crDurationSeconds = 0.1
+            , crSubagentId = sid
+            , crTokensInput = 0
+            , crTokensOutput = 0
+            , crToolTrace = []
+            , crError = Nothing
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just sampleSession
+            }
+      registerCompletedAgentResult rt sid result
+      hasRunningChildren rt sampleParentSession `shouldReturn` False
+
+    it "returns False for a parent with no children even when another parent has running children" $ do
+      rt <- newAgentRuntime
+      ran <- newIORef False
+      let otherParent = mkSystemSessionId "other-parent"
+      _ <- startAgent rt sampleDefId sampleSubagentId otherParent sampleSession 0 (blockingWorker ran)
+      threadDelay 50000
+      hasRunningChildren rt sampleParentSession `shouldReturn` False
+      hasRunningChildren rt otherParent `shouldReturn` True
       _ <- stopAgent rt sampleSubagentId
       pure ()
 
