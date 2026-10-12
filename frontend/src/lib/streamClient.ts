@@ -30,6 +30,8 @@ import type {
 } from '../types/stream'
 import type { TranscriptEntry } from '../types'
 
+import { rateLimitedLog, detectLoop } from './diag'
+
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
 const HEARTBEAT_TIMEOUT_MS = 90_000
@@ -269,6 +271,8 @@ class StreamClientImpl implements StreamClient {
     // First server frame after (re)connect is evidence the connection is healthy.
     this.reconnectAttempt = 0
     const event = parsed as ServerEvent
+    detectLoop('WS.msg', 200, 30)
+    rateLimitedLog('WS.msg', 1000, (c) => `type=${event.type}${c > 0 ? ` (+${c} suppressed)` : ""}`)
     switch (event.type) {
       case 'hello':
         this._lastServerStartedAt = event.serverStartedAt
