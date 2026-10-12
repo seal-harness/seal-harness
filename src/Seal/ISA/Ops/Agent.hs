@@ -99,6 +99,8 @@ import Seal.Agent.Runtime.RunRecord qualified as RunRecord
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Handles.Transcript (appendCompletionToSidecar)
+import Katip (Severity (..), ls)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -801,6 +803,8 @@ handleStartBackground wiring _v di = do
           callback :: AgentCompletionCallback
           callback result = do
             registerCompletedAgentResult runtime (crSubagentId result) result
+            globalLogIO DebugS (ls ("[idle-diag] completion callback fired: subagent=" <> subagentIdText (crSubagentId result)
+              <> " parentSid=" <> sessionIdText parentSid))
             -- WU-5: descendant settle — if the child has pending
             -- descendants, defer the completion delivery. The child's
             -- results would be partial; wait for its descendants to
@@ -813,7 +817,7 @@ handleStartBackground wiring _v di = do
               (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
               _ -> pure False
             if defer
-              then pure ()  -- delivery deferred until descendants settle
+              then globalLogIO DebugS (ls ("[idle-diag] completion deferred (descendants pending): subagent=" <> subagentIdText (crSubagentId result)))
               else do
                 -- Append the completion message to a sidecar file. The turn
                 -- engine reads this file at the start of the parent's next turn
@@ -823,12 +827,15 @@ handleStartBackground wiring _v di = do
                 -- to conversation.jsonl while the daemon is active causes the
                 -- daemon's diff to desynchronize, corrupting the transcript.
                 appendCompletionToSidecar paths parentSid (completionMessage result)
+                globalLogIO DebugS (ls ("[idle-diag] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
+                  <> " parentSid=" <> sessionIdText parentSid))
                 -- Wake-up hook: if the parent session is idle (no turn in
                 -- flight), trigger a synthetic turn so the sidecar
                 -- completions are read and processed. Without this, the
                 -- completions sit in the sidecar until the user sends
                 -- another message — the session appears dead even though
                 -- sub-agents have finished.
+                globalLogIO DebugS (ls ("[idle-diag] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
                 forM_ (aswOnIdleCompletion wiring) id
           spawnCb :: SpawnCallback
           spawnCb sid def childSid =

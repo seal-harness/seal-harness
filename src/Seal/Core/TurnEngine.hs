@@ -78,7 +78,7 @@ import Seal.Config.Security
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast
   (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, takeNewEntries)
@@ -524,6 +524,7 @@ runSessionTurn td adapter meta mSrc t = do
       -- [engine] Broadcast "thinking" (before the lock, matches the existing
       -- web + channel paths).
       broadcastHarnessStatus (tdBroker td) sid "thinking"
+      globalLogIO K2.DebugS (K2.ls ("[idle-diag] turn start: broadcast thinking for sid=" <> sessionIdText sid))
       -- Whether the agent loop's stop branch already fanned out the final
       -- reply via 'aeOnStop' (see 'Seal.Agent.Loop.notifyStop'). The loop
       -- sets this ONLY in the final-answer stop branch (the normal
@@ -548,8 +549,13 @@ runSessionTurn td adapter meta mSrc t = do
           -- Skipped when the loop's stop branch already delivered
           -- the final reply ('notifyStop') — the cleanup would re-send the
           -- identical text (duplicate delivery).
+          globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: checking hasRunningChildren for sid=" <> sessionIdText sid))
           hasChildren <- hasRunningChildren (bRuntime (tdBaseBackends td)) sid
-          unless hasChildren $ broadcastHarnessStatus (tdBroker td) sid "idle"
+          if hasChildren
+            then globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: SUPPRESSING idle (hasChildren=true) for sid=" <> sessionIdText sid))
+            else do
+              globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: BROADCASTING IDLE (hasChildren=false) for sid=" <> sessionIdText sid))
+              broadcastHarnessStatus (tdBroker td) sid "idle"
           stopFanoutDone <- readIORef stopFanoutDoneRef
           if stopFanoutDone
             then broadcastReplyDelivered (tdBroker td) sid
