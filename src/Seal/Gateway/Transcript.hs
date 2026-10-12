@@ -11,6 +11,8 @@
 module Seal.Gateway.Transcript
   ( readTranscriptEntries
   , readTranscriptEntriesTimed
+  , ReadLimit (..)
+  , limitFromMaybe
   , TranscriptSource (..)
   , TranscriptTimings (..)
   , renderServerTiming
@@ -53,6 +55,21 @@ import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict, streamFirstMatch)
+
+-- | How much of the transcript to read. Replaces the old @Maybe Int@
+-- parameter (where @Just n@ meant "last N" and @Nothing@ meant "all").
+data ReadLimit
+  = ReadAll    -- ^ read every entry (no limit)
+  | ReadLastN Int  -- ^ read only the last N entries
+  | ReadFirstN Int -- ^ read only the first N entries (for scroll-to-top)
+  deriving (Eq, Show)
+
+-- | Convert a legacy @Maybe Int@ (where @Just n@ = last N, @Nothing@ = all)
+-- to a 'ReadLimit'. Callers that previously passed @Maybe Int@ can use this
+-- for a minimal diff.
+limitFromMaybe :: Maybe Int -> ReadLimit
+limitFromMaybe Nothing  = ReadAll
+limitFromMaybe (Just n) = ReadLastN n
 
 -- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
 -- so the @Server-Timing@ header can name the path the request took.
@@ -135,7 +152,7 @@ zipWithMaybe f (a : as) (b : bs) = case f a b of
 readTranscriptEntries
   :: SealPaths -> Text -> String -> SessionId -> IO [Value]
 readTranscriptEntries paths model fallbackTs sid =
-  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid Nothing
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid ReadAll
 
 -- | Instrumented variant of 'readTranscriptEntries': returns the frontend
 -- values alongside per-phase wall-clock timings. Used by the @/transcript@
@@ -143,13 +160,13 @@ readTranscriptEntries paths model fallbackTs sid =
 -- snippet helpers) can use the plain 'readTranscriptEntries' and ignore the
 -- overhead of timing capture.
 --
--- When @mLimit@ is @'Just' n@, only the last @n@ entries are processed
+-- When the limit is @'Just' n@, only the last @n@ entries are processed
 -- (reconstructed + rewritten), avoiding O(all entries) work when the
 -- caller only needs a page. The total count is still computed from the
 -- entries file so the caller can report @hasMore@.
 readTranscriptEntriesTimed
-  :: SealPaths -> Text -> String -> SessionId -> Maybe Int -> IO ([Value], TranscriptTimings)
-readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
+  :: SealPaths -> Text -> String -> SessionId -> ReadLimit -> IO ([Value], TranscriptTimings)
+readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
   tStart <- getCurrentTime
   let legacyPath = sessionTranscriptPath paths sid
       convPath   = sessionConversationPath paths sid
@@ -166,6 +183,10 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
       tPr1 <- getCurrentTime
       tRw0 <- getCurrentTime
       let frontend = map teLineToFrontend vals
+          limited = case rlim of
+            ReadAll     -> frontend
+            ReadLastN n -> drop (max 0 (length frontend - n)) frontend
+            ReadFirstN n -> take n frontend
       tRw1 <- getCurrentTime
       tEnd <- getCurrentTime
       let tt = TranscriptTimings
@@ -178,7 +199,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             , ttEncodeMs      = 0
             , ttTotalMs       = ms tStart tEnd
             }
-      pure (frontend, tt)
+      pure (limited, tt)
     else if convExists
       then do
         entriesExist <- doesFileExist (sessionEntriesPath paths sid)
@@ -201,29 +222,45 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
                 trailingCount = totalLines - maxConvLen
             -- Split the limit between reconstructed entries and trailing
-            -- conv entries. Trailing entries are the most recent activity
+            -- conv entries.
+            --
+            -- 'ReadLastN': trailing entries are the most recent activity
             -- (they have no entry records), so they get priority: allocate
             -- up to half the limit to trailing, the rest to reconstruction.
             -- Without this, a limit fully consumed by reconstructed entries
             -- starves the trailing range — the user sees old entries instead
             -- of the end of the session.
-            let (reconLimit, trailingLimit) = case mLim of
-                  Just n | n > 0 ->
+            --
+            -- 'ReadFirstN': prioritize reconstructed entries from the
+            -- beginning. Only read trailing lines if there aren't enough
+            -- entry records to fill the limit. Trailing lines are read from
+            -- the START of the trailing range (the earliest ones), not the
+            -- end.
+            let (reconLimit, trailingLimit, fromBeginning) = case rlim of
+                  ReadLastN n | n > 0 ->
                     let trailingBudget = min n (min trailingCount (n `div` 2))
                         reconBudget = n - trailingBudget
-                    in (Just reconBudget, trailingBudget)
-                  _ -> (Nothing, trailingCount)
+                    in (Just reconBudget, trailingBudget, False)
+                  ReadFirstN n | n > 0 ->
+                    let reconBudget = min n (length evs)
+                        trailingBudget = max 0 (n - reconBudget)
+                    in (Just reconBudget, min trailingBudget trailingCount, True)
+                  _ -> (Nothing, trailingCount, False)
             -- Stream-reconstruct: use paginated variant when a limit is
             -- specified (only process the last N entries' conversation lines)
             tRc0 <- getCurrentTime
             (reconstructed, reconStartIdx) <- case reconLimit of
               Just n | n > 0 && n < length evs ->
-                let start = length evs - n
+                let start = if fromBeginning then 0 else length evs - n
                 in (, start) <$> reconstructStreamingPage convPath idxPath evs start n
               _ -> (, 0) <$> reconstructStreaming convPath idxPath evs
             let reconFrontend = zipWithMaybe reconEntryToFrontend [reconStartIdx..] reconstructed
-            -- Read the last trailingLimit trailing conv lines
-            let trailingStart = max 0 (trailingCount - trailingLimit)
+            -- Read trailing conv lines. For ReadLastN, read the LAST
+            -- trailingLimit lines (most recent). For ReadFirstN, read the
+            -- FIRST trailingLimit lines (earliest, right after the entries).
+            let trailingStart = if fromBeginning
+                                then 0
+                                else max 0 (trailingCount - trailingLimit)
             trailing <- if trailingCount > 0 && trailingLimit > 0
               then do
                 let readStart = maxConvLen + trailingStart
@@ -246,7 +283,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
                      <> " totalLines=" <> show totalLines
                      <> " maxConvLen=" <> show maxConvLen
                      <> " trailingCount=" <> show trailingCount
-                     <> " mLim=" <> show mLim
+                    <> " rlim=" <> show rlim
                      <> " reconLimit=" <> show reconLimit
                      <> " trailingLimit=" <> show trailingLimit
                      <> " reconFrontend=" <> show (length reconFrontend)
@@ -269,9 +306,10 @@ readTranscriptEntriesTimed paths model fallbackTs sid mLim = do
             let idxPath = sessionConversationIndexPath paths sid
             _ <- ensureIndex convPath idxPath
             totalLines <- convLineCount idxPath
-            -- Apply limit: read only the last N lines if a limit is set
-            let (readStart, readCount) = case mLim of
-                  Just n | n >= 0 && n < totalLines -> (totalLines - n, n)
+            -- Apply limit: read only the needed lines.
+            let (readStart, readCount) = case rlim of
+                  ReadLastN n | n >= 0 && n < totalLines -> (totalLines - n, n)
+                  ReadFirstN n | n >= 0 && n < totalLines -> (0, n)
                   _ -> (0, totalLines)
             tRw0 <- getCurrentTime
             eMsgs <- readConvLinesRaw convPath idxPath readStart (readStart + readCount)

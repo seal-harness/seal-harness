@@ -326,6 +326,60 @@ describe('useTranscriptStream', () => {
     vi.unstubAllGlobals()
   })
 
+  it('loadFromBeginning uses pinned first chunk on second call (no WS request)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '100' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    // First loadFromBeginning sends WS request
+    await act(async () => { result.current.loadFromBeginning() })
+    expect(c.requestEntriesCalls).toHaveLength(1)
+    expect(c.requestEntriesCalls[0]!.before).toBe('__beginning__')
+    // Server responds with beginning entries
+    const begEntries = [makeEntry('e0', '2026-01-01T00:00:00Z'), makeEntry('e1', '2026-01-01T00:00:01Z')]
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: begEntries,
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[0]!.id).toBe('e0')
+    // Second loadFromBeginning should use pinned cache — no WS request
+    await act(async () => { result.current.loadFromBeginning() })
+    expect(c.requestEntriesCalls).toHaveLength(1) // still 1, no new WS call
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[0]!.id).toBe('e0')
+    vi.unstubAllGlobals()
+  })
+
+  it('loadLatest uses pinned last chunk from initial seed (no WS request)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '100' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(1)
+    // The initial HTTP seed pins the last chunk, so loadLatest should
+    // use the pinned cache instead of sending a WS request.
+    await act(async () => { result.current.loadLatest() })
+    expect(c.requestEntriesCalls).toHaveLength(0) // no WS request — pinned hit
+    expect(result.current.entries).toHaveLength(1)
+    expect(result.current.entries[0]!.id).toBe('e5')
+    vi.unstubAllGlobals()
+  })
+
 
 describe('prependChunkEntries', () => {
   it('prepends older entries before existing', () => {

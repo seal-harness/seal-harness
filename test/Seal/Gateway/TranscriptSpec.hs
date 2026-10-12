@@ -34,7 +34,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
   , TranscriptTimings (..)
-  , readTranscriptEntriesTimed
+  , readTranscriptEntriesTimed, ReadLimit (..)
   , ttEntryCount
   , reconEntryToFrontend
   , renderServerTiming
@@ -386,7 +386,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
       -- (remaining = 10 - 10 = 0 → no trailing). The fix splits the limit
       -- so trailing entries get up to half: 5 reconstructed + 5 trailing.
       paths <- setupSession 10 20
-      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (Just 10)
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadLastN 10)
       -- The fix ensures trailing entries are sent alongside reconstructed
       -- entries. At minimum, we should get trailing entries (the most
       -- recent activity). The exact split depends on the limit allocation.
@@ -396,7 +396,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
 
     it "returns all trailing entries when no limit is set" $ do
       paths <- setupSession 5 10
-      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid Nothing
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid ReadAll
       -- Without a limit, all entries + all trailing are returned.
       -- reconEntryToFrontend may filter some entries, so we check
       -- that trailing entries are present and totalCount is correct.
@@ -405,9 +405,81 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
 
     it "returns only trailing entries when entries.jsonl is empty" $ do
       paths <- setupSession 0 5
-      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (Just 10)
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadLastN 10)
       -- No entries → all 5 trailing lines are returned.
       length frontend `shouldBe` 5
+
+  -- ── readTranscriptEntriesTimed: ReadFirstN (scroll-to-top) ──────────
+
+  describe "readTranscriptEntriesTimed ReadFirstN" $ do
+    let mkPaths root = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
+        mkSid = case mkSessionId "test-session" of Right s -> s; Left _ -> error "bad sid"
+        setupSession' :: Int -> Int -> IO SealPaths
+        setupSession' entryCount trailingCount = do
+          dir <- withSystemTempDirectory "seal-transcript" pure
+          let paths = mkPaths dir
+              sdir = dir </> "state" </> "sessions" </> "test-session"
+              convPath = sdir </> "conversation.jsonl"
+              entriesPath = sdir </> "entries.jsonl"
+              idxPath = sdir </> "conversation.idx"
+              totalLines = entryCount + trailingCount
+          let convMsgs = [ PC.Message (if even i then PC.User else PC.Assistant) [CbText (T.pack ("msg-" <> show i))]
+                         | i <- [0 .. totalLines - 1] ]
+              convBs = BS.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") convMsgs)
+          createDirectoryIfMissing True sdir
+          BS.writeFile convPath convBs
+          now <- getCurrentTime
+          let entries = [ Entries.EntryRecord
+                          { Entries.erId = ""
+                          , Entries.erTimestamp = now
+                          , Entries.erKind = Entries.EKRequest
+                          , Entries.erConvLen = i + 1
+                          , Entries.erEnvelope = Just Entries.emptyEnvelopeDelta
+                          , Entries.erUsage = Nothing
+                          , Entries.erStop = Nothing
+                          , Entries.erDurationMs = Nothing
+                          , Entries.erHarness = Nothing
+                          , Entries.erCorrelation = Nothing
+                          , Entries.erMeta = Map.empty
+                          }
+                        | i <- [0 .. entryCount - 1] ]
+              entriesBs = BS.concat (map (\e -> encodeEntryRecordRaw e <> "\n") entries)
+          BS.writeFile entriesPath entriesBs
+          _ <- buildIndex convPath idxPath
+          pure paths
+
+    it "ReadFirstN returns only the first N entries, not all" $ do
+      -- 10 entries + 20 trailing = 30 total. ReadFirstN 5 should return
+      -- at most 5 entries (the first 5 reconstructed entries), NOT all 30.
+      paths <- setupSession' 10 20
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 5)
+      length frontend `shouldSatisfy` (<= 5)
+      -- totalCount is still the full count.
+      ttEntryCount tt `shouldBe` 10 + 20
+
+    it "ReadFirstN returns fewer entries than ReadLastN for large trailing" $ do
+      -- With 5 entries and 100 trailing, ReadFirstN 10 should only
+      -- process the 5 entries + 5 trailing from the start, while
+      -- ReadLastN 10 would process 5 entries + 5 trailing from the end.
+      -- Both should return <=10 entries, but ReadFirstN should NOT
+      -- read all 100 trailing lines.
+      paths <- setupSession' 5 100
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 10)
+      length frontend `shouldSatisfy` (<= 10)
+      ttEntryCount tt `shouldBe` 5 + 100
+
+    it "ReadFirstN with 0 entries returns first trailing lines" $ do
+      paths <- setupSession' 0 10
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 5)
+      -- No entries → first 5 trailing lines are returned.
+      length frontend `shouldBe` 5
+
+    it "ReadFirstN with limit > entry count reads entries + trailing fill" $ do
+      -- 3 entries + 20 trailing. ReadFirstN 10 should return up to 10:
+      -- 3 reconstructed entries + 7 trailing from the start.
+      paths <- setupSession' 3 20
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 10)
+      length frontend `shouldSatisfy` (<= 10)
 
   -- ── renderServerTiming ───────────────────────────────────────────────
 

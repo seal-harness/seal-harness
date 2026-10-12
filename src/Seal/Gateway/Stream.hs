@@ -51,7 +51,7 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
-import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso)
+import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso, ReadLimit (..))
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -195,7 +195,7 @@ replayEntriesSince conn paths sid sinceId = do
         -- The frontend dedupes by id, and the HTTP seed already provided
         -- the initial page. The replay only needs to catch up entries
         -- that arrived since the last visit.
-        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (Just 200)
+        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (ReadLastN 200)
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
           sendTextData conn (A.encode (object
@@ -276,13 +276,13 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
             -- memory. For the initial chunk (mBefore == Nothing), read
             -- only the last `limit` entries. For before/id pagination,
             -- read a wider window. For __beginning__, we need the FIRST
-            -- entries — read without limit (the conv-only path is rare
-            -- and typically small; the entries path uses the page).
+            -- entries — use ReadFirstN to read only the first `limit`
+            -- entries instead of loading the entire transcript.
             (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
               (case mBefore of
-                Nothing          -> Just limit
-                Just "__beginning__" -> Nothing  -- need first entries, not last
-                Just _           -> Just (limit * 3))
+                Nothing              -> ReadLastN limit
+                Just "__beginning__" -> ReadFirstN limit
+                Just _               -> ReadLastN (limit * 3))
             -- totalCount comes from the timings (full entry count before
             -- limiting), NOT from length allEntries (which is the limited count).
             let totalCount = ttEntryCount tt
@@ -293,7 +293,9 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
                     (allEntries, totalCount > limit)
                   Just before ->
                    if before == "__beginning__"
-                     then (take limit allEntries, totalCount > limit)
+                     -- allEntries already contains only the first `limit`
+                     -- entries (ReadFirstN); no take needed.
+                     then (allEntries, totalCount > limit)
                      else
                     case entriesBeforeId before allEntries of
                       Just beforeEntries ->
