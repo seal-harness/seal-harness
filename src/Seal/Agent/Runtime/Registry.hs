@@ -32,6 +32,7 @@ module Seal.Agent.Runtime.Registry
   , listAgents
   , agentStatus
   , agentInstanceBySubagentId
+  , hasRunningChildren
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
@@ -69,6 +70,10 @@ data AgentInstance = AgentInstance
     -- ^ The parent's delegation depth (0 = top-level parent). The child's
     -- depth is @aiDepth + 1@; checked against @max_spawn_depth@ before
     -- spawning.
+  , aiParentSession :: SessionId
+    -- ^ The parent session that spawned this child. Used by
+    -- 'hasRunningChildren' to check whether a parent session has pending
+    -- background children before transitioning it to idle.
   , aiResult     :: Maybe ChildResult
     -- ^ The 'ChildResult' when the child has completed ('Nothing' while
     -- running, 'Just' after completion). Populated by
@@ -85,21 +90,34 @@ newtype AgentRuntime = AgentRuntime (TVar (Map SubagentId AgentInstance))
 newAgentRuntime :: IO AgentRuntime
 newAgentRuntime = AgentRuntime <$> newTVarIO Map.empty
 
+-- | Check whether a parent session has any children still in a Running or
+-- Starting state. Used by the turn engine to decide whether to broadcast
+-- \"idle\" when a turn ends: if background children are still running, the
+-- parent session should stay \"thinking\" until the last child completes.
+hasRunningChildren :: AgentRuntime -> SessionId -> IO Bool
+hasRunningChildren (AgentRuntime tv) parentSid = do
+  insts <- readTVarIO tv
+  pure (any (\i -> aiParentSession i == parentSid && isRunning (aiStatus i)) insts)
+  where
+    isRunning Starting = True
+    isRunning Running  = True
+    isRunning _        = False
+
 -- | Start a new agent instance bound to the given def id + fresh session +
 -- subagent id. The worker action is forked; its 'ThreadId' is recorded.
 -- Returns @Left err@ if an instance is already running for this subagent id
 -- (shouldn't happen since subagent ids are freshly minted, but the check is
 -- race-safe). The worker's status transitions to 'Running' once the fork
 -- succeeds, or 'Crashed' on exception.
-startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
-startAgent (AgentRuntime tv) aid subagentId session depth worker = do
+startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
+startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker = do
   tid <- forkIO (runWorker tv subagentId worker)
   mInst <- atomically $ do
     insts <- readTVar tv
     if Map.member subagentId insts
       then pure Nothing  -- lost the race; shouldn't happen with random ids
       else do
-        let inst = AgentInstance aid subagentId session Running tid depth Nothing
+        let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
         writeTVar tv (Map.insert subagentId inst insts)
         pure (Just inst)
   case mInst of
@@ -115,10 +133,10 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
 -- (passed in by 'spawnOne' after the fork) so 'stopAgent' can kill the
 -- correct thread. Idempotent: re-registering overwrites.
 registerRunningAgent
-  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> ThreadId -> IO ()
-registerRunningAgent (AgentRuntime tv) aid subagentId session depth tid =
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> ThreadId -> IO ()
+registerRunningAgent (AgentRuntime tv) aid subagentId parentSession session depth tid =
   atomically $ do
-    let inst = AgentInstance aid subagentId session Running tid depth Nothing
+    let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
     modifyTVar' tv (Map.insert subagentId inst)
 
 -- | Register a synchronously-completed child in the runtime registry. The
@@ -132,12 +150,12 @@ registerRunningAgent (AgentRuntime tv) aid subagentId session depth tid =
 -- but harmless). Idempotent: re-registering the same subagent id overwrites
 -- the prior entry (the second registration wins).
 registerCompletedAgent
-  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> IO ()
-registerCompletedAgent (AgentRuntime tv) aid subagentId session depth = do
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO ()
+registerCompletedAgent (AgentRuntime tv) aid subagentId parentSession session depth = do
   tid <- myThreadId
   atomically $ do
     insts <- readTVar tv
-    let inst = AgentInstance aid subagentId session Stopped tid depth Nothing
+    let inst = AgentInstance aid subagentId session Stopped tid depth parentSession Nothing
     writeTVar tv (Map.insert subagentId inst insts)
 
 -- | Register a completed async child's result in the runtime registry.
