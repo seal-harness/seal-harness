@@ -9,6 +9,7 @@ import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
 import { PerfOverlay } from './components/PerfOverlay'
+import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
   useSendMessage,
@@ -287,6 +288,9 @@ export default function App() {
   // provider/model selection + persisted
   // last-options are consistent. Constructed unconditionally (the hook
   // loads providers/models on mount regardless of which composer opens).
+  // ── Diagnostic: start memory monitor on mount ──
+  useEffect(() => { startMemoryMonitor() }, [])
+
   const composerSpec = useNewTabSpec()
 
   // ── Preserve the focused session across tab-list mutations ──────────────
@@ -553,6 +557,10 @@ export default function App() {
   }, [syncPath])
 
   const transcriptMessages = useTranscriptMessages(entries, currentSessionId)
+  // ── Diagnostic: log transcript message count changes ──
+  rateLimitedLog('App.transcriptMessages', 2000, () =>
+    `count=${transcriptMessages.length} entries=${entries.length} sid=${currentSessionId ?? 'null'}`,
+  )
   // Keep the ref in sync so handleSendResult can read the current count
   // without depending on transcriptMessages in its callback deps.
   transcriptMsgCountRef.current = transcriptMessages.length
@@ -629,6 +637,8 @@ export default function App() {
   })()
 
   const messages = useMemo(() => {
+    // ── Diagnostic: log messages memo recomputation ──
+    detectLoop('App.messages useMemo', 200, 15)
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z'
     // Transient slash-command output rows. Each bubble carries the
     // transcript-messages count at the time the command response arrived
