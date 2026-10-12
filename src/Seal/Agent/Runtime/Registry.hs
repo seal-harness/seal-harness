@@ -44,9 +44,11 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Katip (Severity (..), ls)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Agent.Def.Types (AgentDefId)
-import Seal.Agent.Runtime.Delegation (SubagentId (..), ChildResult (..), ChildStatus (..))
-import Seal.Core.Types (SessionId)
+import Seal.Agent.Runtime.Delegation (SubagentId (..), ChildResult (..), ChildStatus (..), subagentIdText)
+import Seal.Core.Types (SessionId, sessionIdText)
 
 -- | The lifecycle status of a running agent instance. 'Crashed' carries the
 -- exception message; 'Interrupted' means the parent/operator requested a
@@ -97,11 +99,22 @@ newAgentRuntime = AgentRuntime <$> newTVarIO Map.empty
 hasRunningChildren :: AgentRuntime -> SessionId -> IO Bool
 hasRunningChildren (AgentRuntime tv) parentSid = do
   insts <- readTVarIO tv
-  pure (any (\i -> aiParentSession i == parentSid && isRunning (aiStatus i)) insts)
+  let allInsts = Map.elems insts
+      matching = filter (\i -> aiParentSession i == parentSid) allInsts
+      running = filter (isRunning . aiStatus) matching
+      result = not (null running)
+  globalLogIO DebugS (ls ("[idle-diag] hasRunningChildren: sid=" <> sessionIdText parentSid
+    <> " result=" <> (if result then "true" else "false")
+    <> " totalInstances=" <> T.pack (show (length allInsts))
+    <> " matchingChildren=" <> T.pack (show (length matching))
+    <> " runningChildren=" <> T.pack (show (length running))
+    <> " childStatuses=[" <> T.intercalate "," (map (statusText . aiStatus) matching) <> "]"))
+  pure result
   where
     isRunning Starting = True
     isRunning Running  = True
     isRunning _        = False
+    statusText s = T.pack (show s)
 
 -- | Start a new agent instance bound to the given def id + fresh session +
 -- subagent id. The worker action is forked; its 'ThreadId' is recorded.
@@ -135,9 +148,17 @@ startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker =
 registerRunningAgent
   :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> ThreadId -> IO ()
 registerRunningAgent (AgentRuntime tv) aid subagentId parentSession session depth tid =
-  atomically $ do
-    let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
-    modifyTVar' tv (Map.insert subagentId inst)
+  do
+    atomically $ do
+      let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
+      modifyTVar' tv (Map.insert subagentId inst)
+    -- Log outside STM (globalLogIO is IO). This is the critical registration
+    -- point: if the bracket cleanup's hasRunningChildren check runs before
+    -- this line, the child is invisible and idle is broadcast prematurely.
+    globalLogIO DebugS (ls ("[idle-diag] registerRunningAgent: subagent=" <> subagentIdText subagentId
+      <> " parentSid=" <> sessionIdText parentSession
+      <> " childSid=" <> sessionIdText session
+      <> " depth=" <> T.pack (show depth)))
 
 -- | Register a synchronously-completed child in the runtime registry. The
 -- synchronous delegation model runs the worker to completion BEFORE this is
@@ -179,6 +200,11 @@ registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
               _       -> Stopped
             inst' = inst { aiStatus = newStatus, aiResult = Just result, aiThreadId = tid }
         writeTVar tv (Map.insert subagentId inst' insts)
+  -- Log outside STM. If this fires before registerRunningAgent (the race
+  -- the in-fork spawnCallback was meant to fix), this is a no-op and the
+  -- log will show the child was never registered.
+  globalLogIO DebugS (ls ("[idle-diag] registerCompletedAgentResult: subagent=" <> subagentIdText subagentId
+    <> " newStatus=" <> (case crStatus result of CsError -> "Crashed"; _ -> "Stopped")))
 
 -- | Run the worker action, transitioning the instance to 'Crashed' on
 -- exception. A normal completion leaves the status as 'Running' until the

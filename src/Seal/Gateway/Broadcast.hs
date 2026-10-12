@@ -37,9 +37,11 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 
 import Control.Exception (onException)
+import Katip (Severity (..), ls)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (OpName (..), SessionId)
+import Seal.Core.Types (OpName (..), SessionId, sessionIdText)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
@@ -76,6 +78,7 @@ broadcastHarnessStatus mBroker sid status =
   case mBroker of
     Nothing -> pure ()
     Just broker -> do
+      globalLogIO DebugS (ls ("[idle-diag] broadcastHarnessStatus: sid=" <> sessionIdText sid <> " status=" <> status))
       setThinking broker sid (status == "thinking")
       broadcast broker (BeActivity sid (object
         [ "kind" .= ("harness-status" :: Text)
