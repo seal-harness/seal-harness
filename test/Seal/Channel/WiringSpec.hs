@@ -67,6 +67,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeAutonomy = Full
           , aeApprovals = approvals
           , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
           , aeOnEntry = pure ()
           , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing

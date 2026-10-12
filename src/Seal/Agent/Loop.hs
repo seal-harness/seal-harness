@@ -306,6 +306,7 @@ runTurn env userText = do
           -- else is a provider failure.
           let isStop = err == "(stopped)"
           unless isStop $ logProviderError (aeLogPath env) err
+          appendDebugResponseError (aeDebugResponsePath env) n err
           let errMsg = if isStop then err else "provider error: " <> err
               assistantMsg = Message Assistant [CbText errMsg]
               conv = msgs <> [assistantMsg]
@@ -331,6 +332,7 @@ runTurn env userText = do
           events <- liftIO (readIORef collectedRef)
           let resp = aggregateStreamEvents events outcome
           liftIO (logModelResponse (aeLogPath env) (rsStop resp) (rsContent resp))
+          liftIO (appendDebugResponse (aeDebugResponsePath env) n events outcome resp)
           handleResponse env tStart n lenContinue msgs resp streamSends
 
     -- | Handle a completed provider response: record it to the transcript,
@@ -655,6 +657,38 @@ appendDebugRequest (Just path) req =
   let line = BL.toStrict (A.encode req) <> "\n"
   in IO.withFile path IO.AppendMode (`BS.hPutStr` line)
      `catch` \(_ :: SomeException) -> pure ()
+
+-- | When the debug-responses flag is set, append the exact raw stream
+-- events + outcome + aggregated response as one JSONL line to
+-- @responses.jsonl@. Best-effort: IO errors are swallowed.
+appendDebugResponse :: Maybe FilePath -> Int -> [StreamEvent]
+                    -> StreamOutcome -> CompletionResponse -> IO ()
+appendDebugResponse Nothing _ _ _ _ = pure ()
+appendDebugResponse (Just path) turn events outcome resp = do
+  now <- getCurrentTime
+  let line = A.encode (A.object
+        [ "ts" A..= now
+        , "turn" A..= turn
+        , "streamEvents" A..= events
+        , "outcome" A..= outcome
+        , "aggregated" A..= resp
+        ]) <> "\n"
+  IO.withFile path IO.AppendMode (`BS.hPutStr` BL.toStrict line)
+    `catch` \(_ :: SomeException) -> pure ()
+
+-- | Error-case variant: log the error text for a failed turn (stream
+-- returned 'Left err'). Best-effort.
+appendDebugResponseError :: Maybe FilePath -> Int -> Text -> IO ()
+appendDebugResponseError Nothing _ _ = pure ()
+appendDebugResponseError (Just path) turn err = do
+  now <- getCurrentTime
+  let line = A.encode (A.object
+        [ "ts" A..= now
+        , "turn" A..= turn
+        , "error" A..= err
+        ]) <> "\n"
+  IO.withFile path IO.AppendMode (`BS.hPutStr` BL.toStrict line)
+    `catch` \(_ :: SomeException) -> pure ()
 
 -- | Compute the millisecond difference between two 'UTCTime' timestamps
 -- (for turn-duration logging).

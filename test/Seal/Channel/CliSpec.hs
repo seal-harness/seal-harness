@@ -153,6 +153,7 @@ spec = do
                   , teTranscript    = th
                   , teUioEnv        = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , teDebugReqPath  = Nothing
+      , teDebugRespPath = Nothing
                   , teAutonomy      = Full
                   , teApprovals     = approvals
                   , teOnEntry       = pure ()

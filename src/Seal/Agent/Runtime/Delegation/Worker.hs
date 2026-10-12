@@ -281,6 +281,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeAutonomy   = dwdAutonomy deps
               , aeApprovals  = dwdApprovals deps
               , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
               , aeOnEntry    = dwdOnEntry deps
               , aeOnUserMessage = Nothing
               , aeOnStop     = childEnvOnStop

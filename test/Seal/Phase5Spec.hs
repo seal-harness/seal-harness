@@ -200,6 +200,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeAutonomy = Full
                 , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing

@@ -218,7 +218,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -261,7 +261,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -322,7 +322,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Nothing
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -381,7 +381,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -456,7 +456,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -567,7 +567,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -613,7 +613,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -659,7 +659,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -716,7 +716,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -761,7 +761,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -805,7 +805,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -855,7 +855,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -911,7 +911,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -958,7 +958,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1003,7 +1003,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1047,7 +1047,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1092,7 +1092,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1134,7 +1134,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1185,7 +1185,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1201,6 +1201,281 @@ spec = describe "Seal.Agent.Loop" $ do
       content `shouldContain` "tool dispatch:"
       content `shouldContain` "PING"
       content `shouldContain` "result=ok"
+
+
+  -- ── New WU-1 logging tests ─────────────────────────────────────────────
+
+  it "logs model response summary to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello world"] StopEnd (Usage 10 5) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[DEBUG]"
+      content `shouldContain` "model response:"
+      content `shouldContain` "stop=StopEnd"
+      content `shouldContain` "textLen=11"
+
+  it "logs stream result to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "stream result: success"
+
+  it "logs degenerate response warning to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[WARN]"
+      content `shouldContain` "degenerate response"
+
+
+  it "logs tool dispatch to seal.log when a tool call is executed" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                     (const (Right ())) False
+                     (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
+          script = [ CompletionResponse
+                       [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+                       StopToolUse (Usage 0 0)
+                   , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+                   ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry [stubOp]
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "tool dispatch:"
+      content `shouldContain` "PING"
+      content `shouldContain` "result=ok"
+
+
+  -- ── WU-2: debug response logging tests ─────────────────────────────────
+
+  it "writes responses.jsonl when aeDebugResponsePath is set" $
+    withSystemTempDirectory "seal-debug-resp" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 5 3) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let respPath = Just (dir </> "responses.jsonl")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = respPath
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
+      runTestApp (runTurn env "hi")
+      doesFileExist (fromJust respPath) `shouldReturn` True
+      content <- readFile (fromJust respPath)
+      content `shouldContain` "streamEvents"
+      content `shouldContain` "aggregated"
+      content `shouldContain` "StopEnd"
+
+  it "does NOT write responses.jsonl when aeDebugResponsePath is Nothing" $
+    withSystemTempDirectory "seal-debug-resp" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
+      runTestApp (runTurn env "hi")
+      doesFileExist (dir </> "responses.jsonl") `shouldReturn` False
 
   it "logs the max-turns stop to seal.log" $
     withSystemTempDirectory "seal-log" $ \logDir -> do
@@ -1237,7 +1512,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1333,7 +1608,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1386,7 +1661,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1436,7 +1711,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1482,7 +1757,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1529,7 +1804,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1586,7 +1861,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1677,7 +1952,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1725,7 +2000,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1778,7 +2053,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1847,7 +2122,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1920,7 +2195,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeAutonomy = Full
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
-            , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
@@ -1993,7 +2268,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeAutonomy = Full
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
-            , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
