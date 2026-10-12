@@ -41,6 +41,13 @@ interface CachedTranscript {
 /** LRU cache of per-session transcript data. */
 class TranscriptDataCache {
   private map: Map<string, CachedTranscript> = new Map()
+  /** Pinned first/last chunks, never evicted by LRU. Keyed by session id.
+    * The first chunk (from loadFromBeginning) and last chunk (from
+    * loadLatest/initial seed) are small and frequently accessed, so they
+    * are stored separately from the LRU cache to guarantee instant
+    * scroll-to-top and scroll-to-bottom. */
+  private pinnedFirst: Map<string, CachedTranscript> = new Map()
+  private pinnedLast: Map<string, CachedTranscript> = new Map()
 
   get(sessionId: string): CachedTranscript | undefined {
     const data = this.map.get(sessionId)
@@ -58,6 +65,26 @@ class TranscriptDataCache {
       const oldest = this.map.keys().next().value
       if (oldest) this.map.delete(oldest)
     }
+  }
+
+  /** Pin the first chunk (oldest entries) for a session. Called when
+   *  a __beginning__ chunk arrives. Never evicted by LRU. */
+  pinFirst(sessionId: string, data: CachedTranscript): void {
+    this.pinnedFirst.set(sessionId, data)
+  }
+
+  /** Pin the last chunk (newest entries) for a session. Called when
+   *  a latest chunk or initial HTTP seed arrives. Never evicted. */
+  pinLast(sessionId: string, data: CachedTranscript): void {
+    this.pinnedLast.set(sessionId, data)
+  }
+
+  getPinnedFirst(sessionId: string): CachedTranscript | undefined {
+    return this.pinnedFirst.get(sessionId)
+  }
+
+  getPinnedLast(sessionId: string): CachedTranscript | undefined {
+    return this.pinnedLast.get(sessionId)
   }
 
   /** Update cached entries for a session (preserving metadata).
@@ -269,6 +296,8 @@ export function useTranscriptStream(
           setHasMore(seed.hasMore)
           setTotalCount(seed.totalCount)
           dataCache.set(sessionId, seed)
+          // Pin the last chunk (the HTTP seed is the latest entries).
+          dataCache.pinLast(sessionId, seed)
           console.log(`[transcript] SEED http-fetch session=${sessionId} count=${seed.entries.length} totalCount=${seed.totalCount} hasMore=${seed.hasMore} firstId=${seed.entries[0]?.id} lastId=${seed.entries[seed.entries.length-1]?.id}`)
         } else {
           setEntries((prev) => {
@@ -337,6 +366,12 @@ export function useTranscriptStream(
           hasMore: chunk.hasMore,
           totalCount: chunk.totalCount ?? chunk.entries.length,
         })
+        // Pin the last chunk so scroll-to-bottom is always instant.
+        getGlobalDataCache().pinLast(chunkSid, {
+          entries: chunk.entries,
+          hasMore: chunk.hasMore,
+          totalCount: chunk.totalCount ?? chunk.entries.length,
+        })
         // Focus for live tail + replay.
         const lastId = chunk.entries.length > 0
           ? chunk.entries[chunk.entries.length - 1]!.id : undefined
@@ -355,6 +390,12 @@ export function useTranscriptStream(
         setLoadingMore(false)
         loadedSessionRef.current = chunkSid
         getGlobalDataCache().set(chunkSid, {
+          entries: chunk.entries,
+          hasMore: false,
+          totalCount: chunk.totalCount ?? chunk.entries.length,
+        })
+        // Pin the first chunk so scroll-to-top is always instant.
+        getGlobalDataCache().pinFirst(chunkSid, {
           entries: chunk.entries,
           hasMore: false,
           totalCount: chunk.totalCount ?? chunk.entries.length,
@@ -410,6 +451,18 @@ export function useTranscriptStream(
   const loadFromBeginning = useCallback(() => {
     const sid = currentSessionRef.current
     if (sid === null) return
+    // Check pinned first chunk for instant scroll-to-top.
+    const pinned = getGlobalDataCache().getPinnedFirst(sid)
+    if (pinned) {
+      console.log(`[transcript] PINNED-FIRST hit session=${sid} count=${pinned.entries.length}`)
+      setEntries(pinned.entries)
+      setHasMore(pinned.hasMore)
+      setTotalCount(pinned.totalCount)
+      setLoadingMore(false)
+      // Update LRU cache too.
+      getGlobalDataCache().set(sid, pinned)
+      return
+    }
     console.log(`[transcript] REQ beginning session=${sid} limit=${CHUNK_SIZE} currentCount=${entries.length}`)
     setLoadingMore(true)
     sc.requestEntries(sid, '__beginning__', CHUNK_SIZE)
@@ -423,6 +476,22 @@ export function useTranscriptStream(
   const loadLatest = useCallback(() => {
     const sid = currentSessionRef.current
     if (sid === null) return
+    // Check pinned last chunk for instant scroll-to-bottom.
+    const pinned = getGlobalDataCache().getPinnedLast(sid)
+    if (pinned) {
+      console.log(`[transcript] PINNED-LAST hit session=${sid} count=${pinned.entries.length}`)
+      setEntries(pinned.entries)
+      setHasMore(pinned.hasMore)
+      setTotalCount(pinned.totalCount)
+      setLoadingMore(false)
+      getGlobalDataCache().set(sid, pinned)
+      // Re-focus for live tail to catch any new entries since the pin.
+      const lastId = pinned.entries.length > 0
+        ? pinned.entries[pinned.entries.length - 1]!.id : undefined
+      if (lastId !== undefined) sc.focus(sid, lastId)
+      else sc.focus(sid)
+      return
+    }
     console.log(`[transcript] REQ latest session=${sid} limit=${CHUNK_SIZE} currentCount=${entries.length}`)
     setLoadingMore(true)
     sc.requestEntries(sid, null, CHUNK_SIZE)
