@@ -12,7 +12,7 @@ module Seal.Agent.Loop
 import Control.Exception (SomeException, catch)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -46,7 +46,9 @@ import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
   ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
-  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries )
+  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries
+  , logModelResponse, logStreamResult, logToolDispatch
+  , logDegenerateResponse )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
@@ -296,6 +298,7 @@ runTurn env userText = do
             Nothing -> Left "stream timed out (no data for 5 minutes)"
             Just (Left ()) -> Left "(stopped)"
             Just (Right r) -> r
+      liftIO (logStreamResult (aeLogPath env) estream)
       case estream of
         Left err -> liftIO $ do
           -- Distinguish a user-initiated stop from a genuine provider
@@ -327,6 +330,7 @@ runTurn env userText = do
         Right outcome -> do
           events <- liftIO (readIORef collectedRef)
           let resp = aggregateStreamEvents events outcome
+          liftIO (logModelResponse (aeLogPath env) (rsStop resp) (rsContent resp))
           handleResponse env tStart n lenContinue msgs resp streamSends
 
     -- | Handle a completed provider response: record it to the transcript,
@@ -418,6 +422,11 @@ runTurn env userText = do
                   -- 'ccSend' for non-streaming caps with no fan-out.
                   -- Sending via BOTH would double-deliver. Streaming caps
                   -- with no fan-out already saw the text live (skip).
+                  -- Degenerate response detection: no tool calls, no text,
+                  -- and not a truncation case. Log a warning so the
+                  -- operator can see this in seal.log.
+                  when (null texts) $
+                    logDegenerateResponse (aeLogPath env') (rsStop resp) (rsContent resp)
                   deliverFinal alreadySentText (prefix <> T.intercalate "\n" texts)
         else do
           results <- mapM dispatchOne toolUses
@@ -508,9 +517,14 @@ runTurn env userText = do
       res <- case mConfirmed of
         Left denyMsg -> pure (Left (Denied denyMsg))
         Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
-      pure $ case res of
-        Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
-        Right r -> CbToolResult tcid (orParts r) (orIsError r)
+      let result = case res of
+            Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
+            Right r -> CbToolResult tcid (orParts r) (orIsError r)
+          (isErr, partCount) = case result of
+            CbToolResult _ parts err -> (err, length parts)
+            _ -> (False, 0)
+      liftIO (logToolDispatch (aeLogPath env) name isErr partCount)
+      pure result
       where
         -- | The human-confirmation gate. 'Full' autonomy (@--yolo@) bypasses
         -- the gate. 'Supervised' checks the approval cache first; on a miss,
