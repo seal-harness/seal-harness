@@ -815,7 +815,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , crChildSession = Just childSid
             }
       -- First register a running instance (simulates startAgent)
-      _ <- startAgent rt sampleDefId sid childSid 0 (pure ())
+      _ <- startAgent rt sampleDefId sid (mkSystemSessionId "parent") childSid 0 (pure ())
       -- Then register the completed result
       registerCompletedAgentResult rt sid result
       mInst <- agentInstanceBySubagentId rt sid
