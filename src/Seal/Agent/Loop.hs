@@ -48,7 +48,8 @@ import Seal.Session.Log
   ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
   , logTruncation, logTruncationGiveUp, maxLengthContinueRetries
   , logModelResponse, logStreamResult, logToolDispatch
-  , logDegenerateResponse )
+  , logDegenerateResponse
+  , logRetryAttempt, logRetryExhausted )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
@@ -198,7 +199,10 @@ runTurn env userText = do
           | streamed  -> pure ()
           | otherwise -> ccSend (aeCaps env) text
     go :: Int -> Int -> [Message] -> App ()
-    go 0 _ msgs = liftIO $ do
+    go n l m = goWithRetry n l m (aeMaxModelRetries env)
+
+    goWithRetry :: Int -> Int -> [Message] -> Int -> App ()
+    goWithRetry 0 _ msgs _ = liftIO $ do
       logMaxTurns (aeLogPath env)
       let stopMsg = "(stopped: reached the " <> T.pack (show (aeMaxTurns env))
             <> "-turn limit for this message. Ask again to continue, "
@@ -223,7 +227,7 @@ runTurn env userText = do
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
       notifyStop stopMsg
-    go n lenContinue msgs = do
+    goWithRetry n lenContinue msgs retriesRemaining = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
       -- Context window management: if the model has a known context window,
@@ -333,7 +337,50 @@ runTurn env userText = do
           let resp = aggregateStreamEvents events outcome
           liftIO (logModelResponse (aeLogPath env) (rsStop resp) (rsContent resp))
           liftIO (appendDebugResponse (aeDebugResponsePath env) n events outcome resp)
-          handleResponse env tStart n lenContinue msgs resp streamSends
+          let toolUses = [b | b@CbToolUse{} <- rsContent resp]
+              texts = [t | CbText t <- rsContent resp]
+              isDegenerate = null toolUses && null texts && rsStop resp /= StopMaxTokens
+          if isDegenerate
+            then do
+              liftIO (logDegenerateResponse (aeLogPath env) (rsStop resp) (rsContent resp))
+              -- Degenerate: do NOT call handleResponse (preserves transcript
+              -- invariant). Retry with backoff or show user-facing error.
+              let retriesUsed = aeMaxModelRetries env - retriesRemaining
+                  attempt = retriesUsed + 1
+              if retriesRemaining > 0
+                then do
+                  let delayMs = backoffDelayMs (aeRetryBaseDelayMs env) attempt
+                  liftIO (logRetryAttempt (aeLogPath env) attempt (aeMaxModelRetries env) "degenerate response" delayMs)
+                  liftIO (threadDelay (delayMs * 1000))
+                  goWithRetry n lenContinue msgs (retriesRemaining - 1)
+                else liftIO $ do
+                  let ModelId m = aeModel env
+                      prefix = aeProviderLabel env <> "/" <> m <> "> "
+                      errMsg = "The model returned an unusable response (no text or tool calls) after "
+                        <> T.pack (show (aeMaxModelRetries env))
+                        <> " attempts. This is typically a temporary model issue \8212 try sending your message again. Details are in the session's seal.log."
+                      assistantMsg = Message Assistant [CbText errMsg]
+                      conv = msgs <> [assistantMsg]
+                  now <- getCurrentTime
+                  let entry = EntryRecord
+                        { erId = ""
+                        , erTimestamp = now
+                        , erKind = EKResponse
+                        , erConvLen = length conv
+                        , erEnvelope = Nothing
+                        , erUsage = Nothing
+                        , erStop = Nothing
+                        , erDurationMs = Nothing
+                        , erHarness = Nothing
+                        , erCorrelation = Nothing
+                        , erMeta = Map.empty
+                        }
+                  logRetryExhausted (aeLogPath env) (aeMaxModelRetries env) "degenerate response"
+                  tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+                  aeOnEntry env
+                  ccSend (aeCaps env) (prefix <> errMsg)
+                  notifyStop (prefix <> errMsg)
+            else handleResponse env tStart n lenContinue msgs resp streamSends
 
     -- | Handle a completed provider response: record it to the transcript,
     -- then branch on tool calls vs final text vs StopMaxTokens. When
@@ -644,6 +691,11 @@ isTransientError err =
       , "HTTP 503"                  -- service unavailable
       , "HTTP 504"                  -- gateway timeout
       ]
+-- | Exponential backoff delay in milliseconds. base * 2^(attempt-1),
+-- capped at 30 seconds.
+backoffDelayMs :: Int -> Int -> Int
+backoffDelayMs baseDelay attempt =
+  min 30000 (baseDelay * (2 ^ (attempt - 1)))
 
 -- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
 -- append the full 'CompletionRequest' (one JSONL line, with trailing newline)

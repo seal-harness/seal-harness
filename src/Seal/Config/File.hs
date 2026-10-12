@@ -110,6 +110,8 @@ data RuntimeConfig = RuntimeConfig
     -- session history to the LLM. Absent (the default) means the file is
     -- not written.
   , rcDebugModelResponses :: Maybe Bool
+  , rcMaxModelRetries :: Maybe Int
+  , rcRetryBaseDelayMs :: Maybe Int
     -- ^ Optional @debug_model_responses@ flag. When @true@, the exact
     -- raw 'StreamEvent' values received from the model at every turn
     -- are written to a @responses.jsonl@ file alongside the session's
@@ -290,6 +292,8 @@ defaultRuntimeConfig = RuntimeConfig
   , rcGateway         = Nothing
   , rcDebugSessionTranscript = Nothing
   , rcDebugModelResponses = Nothing
+  , rcMaxModelRetries = Nothing
+  , rcRetryBaseDelayMs = Nothing
   , rcOnDemandSchemas = Nothing
   , rcDelegation      = Nothing
   , rcWeb             = Nothing
@@ -445,6 +449,8 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= rcGateway
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
   <*> Toml.dioptional (Toml.bool "debug_model_responses") .= rcDebugModelResponses
+  <*> Toml.dioptional (Toml.int "max_model_retries") .= rcMaxModelRetries
+  <*> Toml.dioptional (Toml.int "model_retry_base_delay_ms") .= rcRetryBaseDelayMs
   <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= rcOnDemandSchemas
   <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= rcDelegation
   <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb

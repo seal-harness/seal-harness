@@ -219,6 +219,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -262,6 +264,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -323,6 +327,8 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -382,6 +388,8 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
                   , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -457,6 +465,8 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
                   , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -568,6 +578,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -614,6 +626,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -660,6 +674,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -717,6 +733,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -762,6 +780,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -806,6 +826,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -856,6 +878,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -912,6 +936,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -959,6 +985,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1004,6 +1032,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1048,6 +1078,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1093,6 +1125,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1135,6 +1169,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 0
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1186,6 +1222,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1233,6 +1271,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1278,6 +1318,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1320,6 +1362,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1371,6 +1415,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
                   , aeStopFanoutDone = stopFanoutDoneRef
@@ -1420,6 +1466,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = respPath
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
@@ -1465,6 +1513,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                   , aeOnStop = Nothing
@@ -1476,6 +1526,111 @@ spec = describe "Seal.Agent.Loop" $ do
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (dir </> "responses.jsonl") `shouldReturn` False
+
+
+  -- ── WU-3: retry logic tests ─────────────────────────────────────────────
+
+  it "retries degenerate response and succeeds on second attempt" $
+    withSystemTempDirectory "seal-retry" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          -- First response is degenerate, second is normal
+          script = [ CompletionResponse [] StopEnd (Usage 0 0)
+                   , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1)
+                   ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (dir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1
+                  }
+      runTestApp (runTurn env "hi")
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("recovered" `T.isInfixOf`)
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "retry attempt 1/3"
+      content `shouldContain` "degenerate response"
+
+  it "shows user-facing error after retry exhaustion" $
+    withSystemTempDirectory "seal-retry" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          -- All responses are degenerate
+          script = replicate 5 (CompletionResponse [] StopEnd (Usage 0 0))
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (dir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeMaxModelRetries = 2
+                  , aeRetryBaseDelayMs = 1
+                  }
+      runTestApp (runTurn env "hi")
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("unusable response" `T.isInfixOf`)
+      sentMsgs `shouldSatisfy` any ("2 attempts" `T.isInfixOf`)
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "retry exhausted"
+      content `shouldContain` "retry attempt 1/2"
+      content `shouldContain` "retry attempt 2/2"
 
   it "logs the max-turns stop to seal.log" $
     withSystemTempDirectory "seal-log" $ \logDir -> do
@@ -1513,6 +1668,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1609,6 +1766,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1662,6 +1821,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1712,6 +1873,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1758,6 +1921,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1805,6 +1970,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1862,6 +2029,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1953,6 +2122,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -2001,6 +2172,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -2054,6 +2227,8 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -2123,6 +2298,8 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -2196,6 +2373,8 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
@@ -2269,6 +2448,8 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
                   , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
