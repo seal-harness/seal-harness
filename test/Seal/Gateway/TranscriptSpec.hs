@@ -46,7 +46,6 @@ import Seal.Gateway.Transcript
   )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
 import Seal.Transcript.ConvIndex (buildIndex)
-import Seal.Transcript.Entries (encodeEntryRecordRaw)
 import Seal.Transcript.Entries qualified as Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Transcript.Entries
