@@ -191,12 +191,13 @@ replayEntriesSince conn paths sid sinceId = do
         let model = maybe "" smModel mMeta
             fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
         -- Read only the last 200 entries (limit) to avoid flooding the
+        -- Read only the last 50 entries (limit) to avoid flooding the
         -- frontend with thousands of WS entry events on large sessions.
         -- The frontend dedupes by id, and the HTTP seed already provided
         -- the initial page. The replay only needs to catch up entries
         -- that arrived since the last visit.
-        putStrLn "[ws] replayEntriesSince: calling readTranscriptEntriesTimed (ReadLastN 200)"
-        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (ReadLastN 200)
+        putStrLn "[ws] replayEntriesSince: calling readTranscriptEntriesTimed (ReadLastN 50)"
+        (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (ReadLastN 50)
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
           sendTextData conn (A.encode (object

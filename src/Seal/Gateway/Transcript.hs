@@ -28,6 +28,7 @@ module Seal.Gateway.Transcript
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Control.Exception (catch, SomeException)
 import Data.Aeson qualified as A
 import Data.Aeson.Key (Key)
 import Data.Aeson.Key qualified as Key
@@ -44,6 +45,8 @@ import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
+import System.Posix.Process (getProcessID)
+import System.Process (readProcess)
 
 import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionConversationIndexPath
@@ -57,19 +60,27 @@ import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPa
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict, streamFirstMatch)
 
--- | Read VmRSS from /proc/self/status (Linux only). Returns "N/A" on
--- non-Linux or when /proc is unavailable. Used for debug logging to
--- track memory growth at key transcript-read phases.
+-- | Read RSS (resident set size) for the current process. On Linux,
+-- reads @VmRSS@ from @/proc/self/status@. On macOS (no @/proc@), shells
+-- out to @ps -o rss= -p <pid>@. Returns "N/A" if both fail. Used for
+-- debug logging to track memory growth at key transcript-read phases.
 vmRSS :: IO Text
 vmRSS = do
   exists <- doesFileExist "/proc/self/status"
-  if not exists
-    then pure "N/A"
-    else do
+  if exists
+    then do
       raw <- readFileTextStrict "/proc/self/status"
       pure $ case [l | l <- T.lines raw, T.isPrefixOf "VmRSS:" l] of
         (l : _) -> T.strip l
         []      -> "N/A"
+    else vmRSSMacOS `catch` \(_ :: SomeException) -> pure "N/A"
+
+-- | macOS fallback: use @ps@ to get RSS for the current PID.
+vmRSSMacOS :: IO Text
+vmRSSMacOS = do
+  pid <- getProcessID
+  rss <- readProcess "ps" ["-o", "rss=", "-p", show pid] ""
+  pure (T.strip (T.pack rss))
 
 -- | How much of the transcript to read. Replaces the old @Maybe Int@
 -- parameter (where @Just n@ meant "last N" and @Nothing@ meant "all").
