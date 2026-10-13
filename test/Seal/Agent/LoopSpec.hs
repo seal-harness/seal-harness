@@ -1057,7 +1057,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello world"] StopEnd (Usage 10 5) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1104,7 +1104,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1148,7 +1148,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1201,7 +1201,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
                    ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1250,7 +1250,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello world"] StopEnd (Usage 10 5) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1297,7 +1297,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1341,7 +1341,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1394,7 +1394,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
                    ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1443,7 +1443,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 5 3) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let respPath = Just (dir </> "responses.jsonl")
           env = AgentEnv
@@ -1491,7 +1491,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1540,7 +1540,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1)
                    ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (dir </> "seal.log")
           env = AgentEnv
@@ -1589,7 +1589,7 @@ spec = describe "Seal.Agent.Loop" $ do
           -- All responses are degenerate
           script = replicate 5 (CompletionResponse [] StopEnd (Usage 0 0))
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (dir </> "seal.log")
           env = AgentEnv
