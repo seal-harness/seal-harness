@@ -101,6 +101,7 @@ import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
+import qualified Seal.Transcript.ConvIndexSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.AskReplySpec
@@ -288,6 +289,7 @@ specs = do
   Seal.Channels.Chat.TelegramAdapterSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
+  Seal.Transcript.ConvIndexSpec.spec
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.AskReplySpec.spec

@@ -48,7 +48,7 @@ import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Gateway.StreamBroker (StreamBroker)
-import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..), withTwoFileTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
@@ -84,7 +84,7 @@ mkModelTranscriptWriter paths mBroker =
     now <- getCurrentTime
     let model = maybe "" smModel mMeta
         createdAt = maybe now smCreatedAt mMeta
-    withTwoFileTranscript dir $ \h -> do
+    withIndexedTranscript dir $ \h -> do
       let assistantMsg = Message Assistant [CbText msg]
           entry = EntryRecord
             { erId = ""
@@ -99,7 +99,7 @@ mkModelTranscriptWriter paths mBroker =
             , erCorrelation = Nothing
             , erMeta = mempty
             }
-      tfwRecordAndAck h (TwoFileWrite [assistantMsg] entry)
+      itwRecordAndAck h (IndexedTranscriptWrite [assistantMsg] entry)
       broadcastNewEntries mBroker paths sid model createdAt
 
 -- | The @\/model@ command spec for single-session channels (CLI, TUI).

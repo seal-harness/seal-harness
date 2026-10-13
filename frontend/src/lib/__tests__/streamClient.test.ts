@@ -251,4 +251,142 @@ describe('streamClient', () => {
     ref.socket!.simulateMessage({ type: 'replay-end', sessionId: 'sess-1', lastReplayedEntryId: null })
     expect(client.status).toBe('live')
   })
+
+  // ── requestEntries ─────────────────────────────────────────────────────
+
+  it('requestEntries sends correct WS message after open', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.sent.length = 0
+    client.requestEntries('sess-1', null, 50)
+    expect(ref.socket!.sent).toHaveLength(1)
+    expect(JSON.parse(ref.socket!.sent[0]!)).toEqual({
+      op: 'request-entries',
+      sessionId: 'sess-1',
+      before: null,
+      limit: 50,
+    })
+  })
+
+  it('requestEntries sends with before cursor', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.sent.length = 0
+    client.requestEntries('sess-1', 'entry-3', 50)
+    expect(ref.socket!.sent).toHaveLength(1)
+    const op = JSON.parse(ref.socket!.sent[0]!)
+    expect(op).toEqual({
+      op: 'request-entries',
+      sessionId: 'sess-1',
+      before: 'entry-3',
+      limit: 50,
+    })
+  })
+
+  it('requestEntries does NOT send when socket is not open', () => {
+    // Socket is still CONNECTING (simulateOpen not called yet).
+    client.requestEntries('sess-1', null, 50)
+    expect(ref.socket!.sent).toHaveLength(0)
+  })
+
+  // ── onEntriesChunk ──────────────────────────────────────────────────────
+
+  const makeEntry = (id: string): import('../../types').TranscriptEntry => ({
+    id,
+    timestamp: 't',
+    direction: 'response',
+    payload: 'hi',
+    harness: null,
+    model: 'm',
+    channel: null,
+    internal: null,
+    raw: '{}',
+  })
+
+  it('onEntriesChunk fires on entries-chunk event with correct payload', () => {
+    ref.socket!.simulateOpen()
+    const received: Array<{ sessionId: string; chunk: import('../../types/stream').EntriesChunkPayload }> = []
+    client.onEntriesChunk((sessionId, chunk) => received.push({ sessionId, chunk }))
+    const entries = [makeEntry('e1'), makeEntry('e2')]
+    ref.socket!.simulateMessage({
+      type: 'entries-chunk',
+      sessionId: 'sess-1',
+      entries,
+      hasMore: true,
+      totalCount: 42,
+      requestBefore: null,
+    })
+    expect(received).toHaveLength(1)
+    expect(received[0]!.sessionId).toBe('sess-1')
+    expect(received[0]!.chunk.entries).toHaveLength(2)
+    expect(received[0]!.chunk.entries[0]!.id).toBe('e1')
+    expect(received[0]!.chunk.hasMore).toBe(true)
+    expect(received[0]!.chunk.totalCount).toBe(42)
+    expect(received[0]!.chunk.requestBefore).toBeNull()
+  })
+
+  it('onEntriesChunk does NOT fire for other event types', () => {
+    ref.socket!.simulateOpen()
+    const received: unknown[] = []
+    client.onEntriesChunk((_sid, _chunk) => received.push(_chunk))
+    ref.socket!.simulateMessage({ type: 'lists', tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    expect(received).toHaveLength(0)
+  })
+
+  it('onEntriesChunk: multiple subscribers all receive the event', () => {
+    ref.socket!.simulateOpen()
+    const recv1: unknown[] = []
+    const recv2: unknown[] = []
+    client.onEntriesChunk((_sid, chunk) => recv1.push(chunk))
+    client.onEntriesChunk((_sid, chunk) => recv2.push(chunk))
+    ref.socket!.simulateMessage({
+      type: 'entries-chunk',
+      sessionId: 'sess-1',
+      entries: [makeEntry('e1')],
+      hasMore: false,
+      totalCount: 1,
+      requestBefore: 'entry-3',
+    })
+    expect(recv1).toHaveLength(1)
+    expect(recv2).toHaveLength(1)
+  })
+
+  it('onEntriesChunk: unsubscribe stops receiving events', () => {
+    ref.socket!.simulateOpen()
+    const received: unknown[] = []
+    const unsub = client.onEntriesChunk((_sid, chunk) => received.push(chunk))
+    ref.socket!.simulateMessage({
+      type: 'entries-chunk',
+      sessionId: 'sess-1',
+      entries: [makeEntry('e1')],
+      hasMore: false,
+      totalCount: 1,
+      requestBefore: null,
+    })
+    expect(received).toHaveLength(1)
+    unsub()
+    ref.socket!.simulateMessage({
+      type: 'entries-chunk',
+      sessionId: 'sess-1',
+      entries: [makeEntry('e2')],
+      hasMore: false,
+      totalCount: 1,
+      requestBefore: null,
+    })
+    expect(received).toHaveLength(1)
+  })
+
+  it('onEntriesChunk handles undefined totalCount (error path)', () => {
+    ref.socket!.simulateOpen()
+    const received: Array<import('../../types/stream').EntriesChunkPayload> = []
+    client.onEntriesChunk((_sid, chunk) => received.push(chunk))
+    // Server omits totalCount in the error path.
+    ref.socket!.simulateMessage({
+      type: 'entries-chunk',
+      sessionId: 'sess-1',
+      entries: [],
+      hasMore: false,
+      requestBefore: null,
+    })
+    expect(received).toHaveLength(1)
+    expect(received[0]!.totalCount).toBeUndefined()
+  })
 })

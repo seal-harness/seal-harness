@@ -28,9 +28,7 @@ module Seal.Session.Search
   , resolveSessionSearchBackend
   ) where
 
-import Data.Aeson qualified as A
 import Data.ByteString qualified as BS
-import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
@@ -46,14 +44,14 @@ import System.Process
   , withCreateProcess )
 
 import Seal.Config.Paths
-  ( SealPaths, sessionConversationPath
+  ( SealPaths, sessionConversationPath, sessionConversationIndexPath
   , sessionsRoot )
 import Seal.Core.Types (OpName (..), SessionId, mkSessionId)
 import Seal.Memory.Embedding (EmbeddingBackend (..))
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (listArchivedSessions, listSessions)
-import Seal.Util.StrictIO (readFileTextStrict)
+import Seal.Transcript.ConvIndex (convLineCount, ensureIndex, readConvLines)
 
 -- | A session search result: the session metadata + a snippet showing
 -- the match context.
@@ -105,20 +103,35 @@ searchSessionFull paths qLower meta = do
       Just snip -> pure (meta, Just snip)
       Nothing   -> pure (meta, Nothing)
 
--- | Read a session's full conversation and find the first content block
+-- | Read a session's conversation and find the first content block
 -- that contains the query (case-insensitive). Returns a truncated snippet
--- of the matching text.
+-- of the matching text. Uses the conversation index to read in batches
+-- (avoid OOM on multi-GB sessions). The ripgrep backend is the primary
+-- search path for large sessions; this is the in-memory fallback.
 fullTranscriptSnippet :: SealPaths -> SessionId -> Text -> IO (Maybe Text)
 fullTranscriptSnippet paths sid qLower = do
   let convPath = sessionConversationPath paths sid
+      idxPath  = sessionConversationIndexPath paths sid
   exists <- doesFileExist convPath
   if not exists
     then pure Nothing
     else do
-      raw <- readFileTextStrict convPath
-      let msgs = mapMaybe decodeMsg (T.lines raw)
+      _ <- ensureIndex convPath idxPath
+      totalLines <- convLineCount idxPath
+      searchBatch convPath idxPath qLower 0 totalLines
+
+-- | Search conversation lines in batches of 500, returning the first match.
+searchBatch :: FilePath -> FilePath -> Text -> Int -> Int -> IO (Maybe Text)
+searchBatch convPath idxPath qLower start total
+  | start >= total = pure Nothing
+  | otherwise = do
+      let end = min (start + 500) total
+      eMsgs <- readConvLines convPath idxPath start end
+      let msgs = case eMsgs of Right ms -> ms; Left _ -> []
           rendered = concatMap renderMsgForSearch msgs
-      pure (firstMatchSnippet qLower rendered)
+      case firstMatchSnippet qLower rendered of
+        Just snip -> pure (Just snip)
+        Nothing   -> searchBatch convPath idxPath qLower end total
 
 -- | Render a message into searchable text blocks (role label + each
 -- content block rendered as text).
@@ -149,10 +162,6 @@ truncateSnippet :: Int -> Text -> Text
 truncateSnippet n t
   | T.length t <= n = t
   | otherwise       = T.take n t <> "\x2026"
-
--- | Decode a JSON line into a Message.
-decodeMsg :: Text -> Maybe Message
-decodeMsg line = A.decode (BL.fromStrict (TE.encodeUtf8 line))
 
 -- ---------------------------------------------------------------------------
 -- Ripgrep search (literal subprocess — fast for many sessions)
