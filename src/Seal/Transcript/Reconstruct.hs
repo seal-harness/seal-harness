@@ -310,6 +310,13 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
   -- envelope + conversation cursor at the start of the page.
   let (startConv, mEnv, _) = foldToStart entries 0 Nothing startEntry
       pageEntries = take limit (drop startEntry entries)
+      endConv = case reverse pageEntries of
+        [] -> startConv
+        (lastE : _) -> erConvLen lastE
+  putStrLn $ "[reconstruct] page entries=" <> show (length pageEntries)
+           <> " startEntry=" <> show startEntry
+           <> " convLines=" <> show (endConv - startConv)
+           <> " convRange=[" <> show startConv <> ".." <> show endConv <> "]"
   -- Phase 2: read conversation lines only for the page entries.
   withConvIndex convPath idxPath $ \hs -> go hs lc startConv mEnv pageEntries
   where

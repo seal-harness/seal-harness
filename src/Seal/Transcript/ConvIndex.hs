@@ -240,6 +240,7 @@ buildIndex convPath idxPath = do
 -- For N lines, returns N+1 offsets.
 scanLineOffsets :: FilePath -> IO [Word64]
 scanLineOffsets path = do
+  putStrLn "[scanLineOffsets] reading full file into memory (BS.readFile)"
   bs <- BS.readFile path
   let lns = BS.split 0x0a bs
       chunks = case reverse lns of
@@ -277,11 +278,14 @@ ensureIndex convPath idxPath = do
         then do removeFile idxPath; pure (Right ())
         else pure (Right ())
     else if not idxExists
-      then buildIndex convPath idxPath >>= \case
-        Left _ -> pure (Left IndexCorrupt)
-        Right _ -> pure (Right ())
+      then do
+        putStrLn "[ensureIndex] BUILDING from scratch (BS.readFile on full conversation.jsonl)"
+        buildIndex convPath idxPath >>= \case
+          Left _ -> pure (Left IndexCorrupt)
+          Right _ -> pure (Right ())
       else do
         -- Index exists; validate it
+        putStrLn "[ensureIndex] VALIDATING existing index"
         eValid <- validateIndex convPath idxPath
         case eValid of
           Left _ -> pure (Left IndexCorrupt)
@@ -300,6 +304,7 @@ validateIndex :: FilePath -> FilePath -> IO (Either ConvIndexError IndexStatus)
 validateIndex convPath idxPath = do
   idxSize <- withBinaryFile idxPath ReadMode hFileSize
   let entryCount = fromIntegral idxSize `div` word64Size
+  putStrLn $ "[validateIndex] reading " <> show entryCount <> " offsets one-by-one"
   if entryCount == 0
     then pure (Left IndexCorrupt)  -- empty index file (0 bytes)
     else do

@@ -195,6 +195,7 @@ replayEntriesSince conn paths sid sinceId = do
         -- The frontend dedupes by id, and the HTTP seed already provided
         -- the initial page. The replay only needs to catch up entries
         -- that arrived since the last visit.
+        putStrLn "[ws] replayEntriesSince: calling readTranscriptEntriesTimed (ReadLastN 200)"
         (entries, _tt) <- readTranscriptEntriesTimed paths model fallbackTs sid (ReadLastN 200)
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
@@ -272,6 +273,7 @@ handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
             let model = maybe "" smModel mMeta
                 fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
                 limit = clampLimit mLimit
+            putStrLn $ "[ws] handleRequestEntries: limit=" <> show limit <> " mBefore=" <> show mBefore
             -- Use the paginated read to avoid loading all entries into
             -- memory. For the initial chunk (mBefore == Nothing), read
             -- only the last `limit` entries. For before/id pagination,
