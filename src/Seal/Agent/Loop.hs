@@ -378,7 +378,7 @@ runTurn env userText = do
                         , erMeta = Map.empty
                         }
                   logRetryExhausted (aeLogPath env) (aeMaxModelRetries env) "degenerate response"
-                  tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+                  itwRecordAndAck (aeTranscript env) (IndexedTranscriptWrite conv entry)
                   aeOnEntry env
                   ccSend (aeCaps env) (prefix <> errMsg)
                   notifyStop (prefix <> errMsg)
