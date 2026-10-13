@@ -102,7 +102,7 @@ import Seal.Providers.Class
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
-import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
+import Seal.Session.Lock (newSessionLocks, newReplyRegistry, sessionTurnInFlight)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.SourceControl.Repo
@@ -763,22 +763,66 @@ sendMsgToSession env sid msg = do
   waitForTurnComplete env sid
   pure body
 
--- | Poll the transcript until the entry count stabilizes (same count
--- on two consecutive reads 50ms apart), or timeout after 5 seconds.
+-- | Poll the transcript until the turn is complete.
+--
+-- The turn runs asynchronously (forked by 'handleSend'), so the HTTP
+-- response returns before the turn finishes. We need to wait for the
+-- full script to play out before reading the transcript.
+--
+-- Strategy: first wait for at least one entry to appear (the turn has
+-- started writing), then poll 'sessionTurnInFlight' (which checks the
+-- session lock MVar) until it returns 'False' — the turn has released
+-- the lock and is truly done. This is robust against mid-turn gaps
+-- where the entry count temporarily stabilizes (e.g. between writing a
+-- response entry and its tool_result, when an Audited opcode performs
+-- an fsync that takes >50ms on a loaded CI machine).
+--
+-- Falls back to the count-stability heuristic (two consecutive reads
+-- with the same count 50ms apart) when 'adSend' is not wired (tests
+-- without the full runtime).
 waitForTurnComplete :: ApiTestEnv -> Text -> IO ()
-waitForTurnComplete env sid = go 5000000 Nothing
+waitForTurnComplete env sid = case adSend (ateDeps env) of
+  Nothing -> countStabilityFallback
+  Just sendDeps -> case mkSessionId sid of
+    Left _ -> countStabilityFallback
+    Right sId -> do
+      -- Phase 1: wait for at least one entry (turn has started).
+      waitForFirstEntry
+      -- Phase 2: poll until the turn is no longer in flight.
+      waitForNotInFlight sendDeps sId
   where
     gapUs = 50000
-    go remaining mLastCount
-      | remaining <= 0 = pure ()
-      | otherwise = do
-          entries <- getTranscript env sid
-          let count = length entries
-          case mLastCount of
-            Just prev | prev == count -> pure ()  -- stable
-            _ -> do
-              threadDelay gapUs
-              go (remaining - gapUs) (Just count)
+    timeoutUs = 5000000
+    countStabilityFallback = go timeoutUs Nothing
+      where
+        go remaining mLastCount
+          | remaining <= 0 = pure ()
+          | otherwise = do
+              entries <- getTranscript env sid
+              let count = length entries
+              case mLastCount of
+                Just prev | prev == count -> pure ()  -- stable
+                _ -> do
+                  threadDelay gapUs
+                  go (remaining - gapUs) (Just count)
+    waitForFirstEntry = go timeoutUs
+      where
+        go remaining
+          | remaining <= 0 = pure ()
+          | otherwise = do
+              entries <- getTranscript env sid
+              when (null entries) $ do
+                threadDelay gapUs
+                go (remaining - gapUs)
+    waitForNotInFlight sendDeps sId = go timeoutUs
+      where
+        go remaining
+          | remaining <= 0 = pure ()
+          | otherwise = do
+              inFlight <- sessionTurnInFlight (sdLocks sendDeps) sId
+              when inFlight $ do
+                threadDelay gapUs
+                go (remaining - gapUs)
 
 -- | Like 'sendMsgToSession' but returns the (status, body) for debugging.
 sendMsgToSessionRaw :: ApiTestEnv -> Text -> Text -> IO (Int, BL.ByteString)
