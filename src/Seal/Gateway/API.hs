@@ -88,7 +88,7 @@ import Seal.Gateway.SessionJson
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
-  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
+  (readTranscriptEntriesTimedLimited, ReadLimit (..), renderServerTiming, setEncodeMs, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -1923,7 +1923,7 @@ handleTranscript deps sidTxt =
       let paths = srPaths (adSessionRuntime deps)
       active <- readIORef (srActive (adSessionRuntime deps))
       tReadStart <- getCurrentTime
-      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid
+      (entries, tt0) <- readTranscriptEntriesTimedLimited (ReadLastN 200) paths (smModel active) (showIso (smCreatedAt active)) sid
       tEncStart <- getCurrentTime
       let body = A.encode entries
       tEncEnd <- getCurrentTime

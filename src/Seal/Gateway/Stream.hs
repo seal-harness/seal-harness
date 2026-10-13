@@ -45,7 +45,7 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Gateway.Transcript (readTranscriptEntriesLimited, ReadLimit (..), showIso)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -182,7 +182,7 @@ replayEntriesSince conn paths sid sinceId = do
         mMeta <- loadSessionMeta paths sid
         let model = maybe "" smModel mMeta
             fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-        entries <- readTranscriptEntries paths model fallbackTs sid
+        entries <- readTranscriptEntriesLimited (ReadLastN 200) paths model fallbackTs sid
         let after = filterAfterId sinceId entries
         forM_ after $ \entry -> do
           sendTextData conn (A.encode (object
