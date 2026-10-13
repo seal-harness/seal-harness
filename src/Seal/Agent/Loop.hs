@@ -12,7 +12,7 @@ module Seal.Agent.Loop
 import Control.Exception (SomeException, catch)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -46,7 +46,10 @@ import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
   ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
-  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries )
+  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries
+  , logModelResponse, logStreamResult, logToolDispatch
+  , logDegenerateResponse
+  , logRetryAttempt, logRetryExhausted )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
@@ -196,7 +199,10 @@ runTurn env userText = do
           | streamed  -> pure ()
           | otherwise -> ccSend (aeCaps env) text
     go :: Int -> Int -> [Message] -> App ()
-    go 0 _ msgs = liftIO $ do
+    go n l m = goWithRetry n l m (aeMaxModelRetries env)
+
+    goWithRetry :: Int -> Int -> [Message] -> Int -> App ()
+    goWithRetry 0 _ msgs _ = liftIO $ do
       logMaxTurns (aeLogPath env)
       let stopMsg = "(stopped: reached the " <> T.pack (show (aeMaxTurns env))
             <> "-turn limit for this message. Ask again to continue, "
@@ -221,7 +227,7 @@ runTurn env userText = do
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
       notifyStop stopMsg
-    go n lenContinue msgs = do
+    goWithRetry n lenContinue msgs retriesRemaining = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
       -- Context window management: if the model has a known context window,
@@ -296,6 +302,7 @@ runTurn env userText = do
             Nothing -> Left "stream timed out (no data for 5 minutes)"
             Just (Left ()) -> Left "(stopped)"
             Just (Right r) -> r
+      liftIO (logStreamResult (aeLogPath env) estream)
       case estream of
         Left err -> liftIO $ do
           -- Distinguish a user-initiated stop from a genuine provider
@@ -303,6 +310,7 @@ runTurn env userText = do
           -- else is a provider failure.
           let isStop = err == "(stopped)"
           unless isStop $ logProviderError (aeLogPath env) err
+          appendDebugResponseError (aeDebugResponsePath env) n err
           let errMsg = if isStop then err else "provider error: " <> err
               assistantMsg = Message Assistant [CbText errMsg]
               conv = msgs <> [assistantMsg]
@@ -327,7 +335,52 @@ runTurn env userText = do
         Right outcome -> do
           events <- liftIO (readIORef collectedRef)
           let resp = aggregateStreamEvents events outcome
-          handleResponse env tStart n lenContinue msgs resp streamSends
+          liftIO (logModelResponse (aeLogPath env) (rsStop resp) (rsContent resp))
+          liftIO (appendDebugResponse (aeDebugResponsePath env) n events outcome resp)
+          let toolUses = [b | b@CbToolUse{} <- rsContent resp]
+              texts = [t | CbText t <- rsContent resp]
+              isDegenerate = null toolUses && null texts && rsStop resp /= StopMaxTokens
+          if isDegenerate
+            then do
+              liftIO (logDegenerateResponse (aeLogPath env) (rsStop resp) (rsContent resp))
+              -- Degenerate: do NOT call handleResponse (preserves transcript
+              -- invariant). Retry with backoff or show user-facing error.
+              let retriesUsed = aeMaxModelRetries env - retriesRemaining
+                  attempt = retriesUsed + 1
+              if retriesRemaining > 0
+                then do
+                  let delayMs = backoffDelayMs (aeRetryBaseDelayMs env) attempt
+                  liftIO (logRetryAttempt (aeLogPath env) attempt (aeMaxModelRetries env) "degenerate response" delayMs)
+                  liftIO (threadDelay (delayMs * 1000))
+                  goWithRetry n lenContinue msgs (retriesRemaining - 1)
+                else liftIO $ do
+                  let ModelId m = aeModel env
+                      prefix = aeProviderLabel env <> "/" <> m <> "> "
+                      errMsg = "The model returned an unusable response (no text or tool calls) after "
+                        <> T.pack (show (aeMaxModelRetries env))
+                        <> " attempts. This is typically a temporary model issue \8212 try sending your message again. Details are in the session's seal.log."
+                      assistantMsg = Message Assistant [CbText errMsg]
+                      conv = msgs <> [assistantMsg]
+                  now <- getCurrentTime
+                  let entry = EntryRecord
+                        { erId = ""
+                        , erTimestamp = now
+                        , erKind = EKResponse
+                        , erConvLen = length conv
+                        , erEnvelope = Nothing
+                        , erUsage = Nothing
+                        , erStop = Nothing
+                        , erDurationMs = Nothing
+                        , erHarness = Nothing
+                        , erCorrelation = Nothing
+                        , erMeta = Map.empty
+                        }
+                  logRetryExhausted (aeLogPath env) (aeMaxModelRetries env) "degenerate response"
+                  tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+                  aeOnEntry env
+                  ccSend (aeCaps env) (prefix <> errMsg)
+                  notifyStop (prefix <> errMsg)
+            else handleResponse env tStart n lenContinue msgs resp streamSends
 
     -- | Handle a completed provider response: record it to the transcript,
     -- then branch on tool calls vs final text vs StopMaxTokens. When
@@ -418,6 +471,11 @@ runTurn env userText = do
                   -- 'ccSend' for non-streaming caps with no fan-out.
                   -- Sending via BOTH would double-deliver. Streaming caps
                   -- with no fan-out already saw the text live (skip).
+                  -- Degenerate response detection: no tool calls, no text,
+                  -- and not a truncation case. Log a warning so the
+                  -- operator can see this in seal.log.
+                  when (null texts) $
+                    logDegenerateResponse (aeLogPath env') (rsStop resp) (rsContent resp)
                   deliverFinal alreadySentText (prefix <> T.intercalate "\n" texts)
         else do
           results <- mapM dispatchOne toolUses
@@ -508,9 +566,14 @@ runTurn env userText = do
       res <- case mConfirmed of
         Left denyMsg -> pure (Left (Denied denyMsg))
         Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
-      pure $ case res of
-        Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
-        Right r -> CbToolResult tcid (orParts r) (orIsError r)
+      let result = case res of
+            Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
+            Right r -> CbToolResult tcid (orParts r) (orIsError r)
+          (isErr, partCount) = case result of
+            CbToolResult _ parts err -> (err, length parts)
+            _ -> (False, 0)
+      liftIO (logToolDispatch (aeLogPath env) name isErr partCount)
+      pure result
       where
         -- | The human-confirmation gate. 'Full' autonomy (@--yolo@) bypasses
         -- the gate. 'Supervised' checks the approval cache first; on a miss,
@@ -628,6 +691,11 @@ isTransientError err =
       , "HTTP 503"                  -- service unavailable
       , "HTTP 504"                  -- gateway timeout
       ]
+-- | Exponential backoff delay in milliseconds. base * 2^(attempt-1),
+-- capped at 30 seconds.
+backoffDelayMs :: Int -> Int -> Int
+backoffDelayMs baseDelay attempt =
+  min 30000 (baseDelay * (2 ^ (attempt - 1)))
 
 -- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
 -- append the full 'CompletionRequest' (one JSONL line, with trailing newline)
@@ -641,6 +709,38 @@ appendDebugRequest (Just path) req =
   let line = BL.toStrict (A.encode req) <> "\n"
   in IO.withFile path IO.AppendMode (`BS.hPutStr` line)
      `catch` \(_ :: SomeException) -> pure ()
+
+-- | When the debug-responses flag is set, append the exact raw stream
+-- events + outcome + aggregated response as one JSONL line to
+-- @responses.jsonl@. Best-effort: IO errors are swallowed.
+appendDebugResponse :: Maybe FilePath -> Int -> [StreamEvent]
+                    -> StreamOutcome -> CompletionResponse -> IO ()
+appendDebugResponse Nothing _ _ _ _ = pure ()
+appendDebugResponse (Just path) turn events outcome resp = do
+  now <- getCurrentTime
+  let line = A.encode (A.object
+        [ "ts" A..= now
+        , "turn" A..= turn
+        , "streamEvents" A..= events
+        , "outcome" A..= outcome
+        , "aggregated" A..= resp
+        ]) <> "\n"
+  IO.withFile path IO.AppendMode (`BS.hPutStr` BL.toStrict line)
+    `catch` \(_ :: SomeException) -> pure ()
+
+-- | Error-case variant: log the error text for a failed turn (stream
+-- returned 'Left err'). Best-effort.
+appendDebugResponseError :: Maybe FilePath -> Int -> Text -> IO ()
+appendDebugResponseError Nothing _ _ = pure ()
+appendDebugResponseError (Just path) turn err = do
+  now <- getCurrentTime
+  let line = A.encode (A.object
+        [ "ts" A..= now
+        , "turn" A..= turn
+        , "error" A..= err
+        ]) <> "\n"
+  IO.withFile path IO.AppendMode (`BS.hPutStr` BL.toStrict line)
+    `catch` \(_ :: SomeException) -> pure ()
 
 -- | Compute the millisecond difference between two 'UTCTime' timestamps
 -- (for turn-duration logging).

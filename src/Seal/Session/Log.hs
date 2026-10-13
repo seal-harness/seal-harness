@@ -27,6 +27,12 @@ module Seal.Session.Log
   , logMaxTurns
   , logTruncation
   , logTruncationGiveUp
+  , logModelResponse
+  , logStreamResult
+  , logToolDispatch
+  , logDegenerateResponse
+  , logRetryAttempt
+  , logRetryExhausted
   , maxLengthContinueRetries
   ) where
 
@@ -35,6 +41,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime, formatTime, defaultTimeLocale)
 import System.IO (withFile, IOMode (AppendMode), hPutStr)
+import Seal.Providers.Class (StopReason (..), ContentBlock (..))
+import Seal.Core.Types (OpName (..))
 
 -- | Maximum number of auto-continuation retries when the provider returns
 -- 'StopMaxTokens' with no tool calls (text was truncated mid-generation).
@@ -105,3 +113,69 @@ logTruncationGiveUp mPath =
     ("stopped: response remained truncated after "
       <> T.pack (show maxLengthContinueRetries)
       <> " continuation attempts")
+
+-- ── New logging for session-loop diagnostics ────────────────────────────
+
+-- | Log a summary of the model response after aggregation. Records metadata
+-- (stop reason, content block count, tool call count, text length) — NOT the
+-- actual text content (which is in conversation.jsonl).
+logModelResponse :: Maybe FilePath -> StopReason -> [ContentBlock] -> IO ()
+logModelResponse mPath stopReason blocks =
+  appendSessionLog mPath "DEBUG"
+    ("model response: stop=" <> stopReasonText stopReason
+      <> " blocks=" <> T.pack (show (length blocks))
+      <> " toolCalls=" <> T.pack (show (length [ () | CbToolUse{} <- blocks ]))
+      <> " textLen=" <> T.pack (show (sum [ T.length t | CbText t <- blocks ]))
+      <> " thinkingLen=" <> T.pack (show (sum [ T.length t | CbThinking t <- blocks ])))
+
+-- | Log the result of the stream race (success, timeout, abort, or error).
+logStreamResult :: Maybe FilePath -> Either Text a -> IO ()
+logStreamResult mPath result =
+  appendSessionLog mPath "DEBUG" $
+    case result of
+      Right _ -> "stream result: success"
+      Left err
+        | err == "(stopped)" -> "stream result: aborted (user stop)"
+        | "stream timed out" `T.isInfixOf` err -> "stream result: timeout"
+        | otherwise -> "stream result: error (" <> err <> ")"
+
+-- | Log a tool dispatch outcome. Records tool name, success/error, and
+-- result size — NOT the actual result content.
+logToolDispatch :: Maybe FilePath -> OpName -> Bool -> Int -> IO ()
+logToolDispatch mPath (OpName name) isError resultSize =
+  appendSessionLog mPath "DEBUG"
+    ("tool dispatch: " <> name
+      <> " result=" <> (if isError then "error" else "ok")
+      <> " parts=" <> T.pack (show resultSize))
+
+-- | Log a degenerate response warning (no tool calls, no text, stop ≠ MaxTokens).
+logDegenerateResponse :: Maybe FilePath -> StopReason -> [ContentBlock] -> IO ()
+logDegenerateResponse mPath stopReason blocks =
+  appendSessionLog mPath "WARN"
+    ("degenerate response: stop=" <> stopReasonText stopReason
+      <> " blocks=" <> T.pack (show (length blocks))
+      <> " — model returned no usable content (no tool calls, no text)")
+
+-- | Log a retry attempt before it fires. Records attempt number, max,
+-- reason, and backoff delay.
+logRetryAttempt :: Maybe FilePath -> Int -> Int -> Text -> Int -> IO ()
+logRetryAttempt mPath attempt maxRetries reason delayMs =
+  appendSessionLog mPath "INFO"
+    ("retry attempt " <> T.pack (show attempt) <> "/" <> T.pack (show maxRetries)
+      <> ": reason=" <> reason
+      <> " backoff=" <> T.pack (show delayMs) <> "ms")
+
+-- | Log retry exhaustion after all attempts fail.
+logRetryExhausted :: Maybe FilePath -> Int -> Text -> IO ()
+logRetryExhausted mPath maxRetries reason =
+  appendSessionLog mPath "ERROR"
+    ("retry exhausted after " <> T.pack (show maxRetries)
+      <> " attempts: " <> reason
+      <> " — see seal.log for full diagnostic details")
+
+-- | Render a 'StopReason' as short text for log lines.
+stopReasonText :: StopReason -> Text
+stopReasonText StopEnd        = "StopEnd"
+stopReasonText StopToolUse    = "StopToolUse"
+stopReasonText StopMaxTokens  = "StopMaxTokens"
+stopReasonText (StopOther t)  = "StopOther:" <> t

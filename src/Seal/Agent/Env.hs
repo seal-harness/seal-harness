@@ -109,6 +109,14 @@ data AgentEnv = AgentEnv
     -- we can debug whether the two-file storage format is correctly feeding
     -- the session history to the LLM. 'Nothing' (the default) means no
     -- debug file is written.
+  , aeDebugResponsePath :: Maybe FilePath
+  , aeMaxModelRetries :: Int
+  , aeRetryBaseDelayMs :: Int
+    -- ^ When 'Just', the exact raw 'StreamEvent' values received from the
+    -- model at every turn are appended to this file as one JSONL line per
+    -- turn. Independent from 'aeDebugRequestsPath' (which logs outgoing
+    -- requests). 'Nothing' (the default) means no debug response file is
+    -- written.
   , aeOnEntry :: IO ()
     -- ^ A hook called by the loop after each transcript entry is recorded
     -- (response entries, tool-result entries, approval-evidence entries).
@@ -188,6 +196,9 @@ data TurnEnv = TurnEnv
   , teTranscript    :: TwoFileHandle
   , teUioEnv        :: UIOEnv
   , teDebugReqPath  :: Maybe FilePath
+  , teDebugRespPath :: Maybe FilePath
+  , teMaxModelRetries :: Int
+  , teRetryBaseDelayMs :: Int
   , teAutonomy      :: AutonomyLevel
   , teApprovals     :: ApprovalCache
   , teOnEntry       :: IO ()
@@ -234,6 +245,9 @@ mkSessionAgentEnv te = AgentEnv
   , aeAutonomy   = teAutonomy te
   , aeApprovals  = teApprovals te
   , aeDebugRequestsPath = teDebugReqPath te
+  , aeDebugResponsePath = teDebugRespPath te
+  , aeMaxModelRetries = teMaxModelRetries te
+  , aeRetryBaseDelayMs = teRetryBaseDelayMs te
   , aeOnEntry    = teOnEntry te
   , aeOnUserMessage = teOnUserMessage te
   , aeOnStop     = teOnStop te

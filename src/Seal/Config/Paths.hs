@@ -18,6 +18,7 @@ module Seal.Config.Paths
   , sessionConversationPath
   , sessionEntriesPath
   , sessionRequestsPath
+  , sessionResponsesPath
   , sessionLogPath
   , agentSessionDir
   , resolveChildSessionPath
@@ -186,6 +187,13 @@ sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
 -- @debug_session_transcript@ config flag is set.
 sessionRequestsPath :: SealPaths -> SessionId -> FilePath
 sessionRequestsPath paths sid = sessionDir paths sid </> "requests.jsonl"
+
+-- | The session's debug response log: @\<sessionDir\>\/responses.jsonl@.
+-- Each line is a JSON object with the raw 'StreamEvent' values, the
+-- 'StreamOutcome', and the aggregated 'CompletionResponse'. Only written
+-- when the @debug_model_responses@ config flag is set.
+sessionResponsesPath :: SealPaths -> SessionId -> FilePath
+sessionResponsesPath paths sid = sessionDir paths sid </> "responses.jsonl"
 
 -- | The session's diagnostic log: @\<sessionDir\>\/seal.log@. Records turn
 -- lifecycle events (start/end/duration) and failures (exceptions, provider

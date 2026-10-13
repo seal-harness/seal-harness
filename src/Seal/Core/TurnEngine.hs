@@ -62,7 +62,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
-  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript
+  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
@@ -71,7 +71,7 @@ import Seal.Config.File
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
    sessionDir,
-   sessionLogPath, sessionRequestsPath, sessionWorkdir)
+   sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
@@ -695,6 +695,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               , teTranscript    = tHandle
               , teUioEnv        = uioEnv
               , teDebugReqPath  = debugRequestsPath paths sid eCfg
+              , teDebugRespPath = debugResponsesPath paths sid eCfg
+              , teMaxModelRetries = modelRetriesFromConfig eCfg
+              , teRetryBaseDelayMs = retryBaseDelayFromConfig eCfg
               , teAutonomy      = tdAutonomy td
               , teApprovals     = tdApprovals td
               , teOnEntry       = onEntry
@@ -879,6 +882,27 @@ debugRequestsPath paths sid eCfg =
     Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
+
+debugResponsesPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
+debugResponsesPath paths sid eCfg =
+  case eCfg of
+    Right cfg | Just True <- rcDebugModelResponses cfg ->
+      Just (sessionResponsesPath paths sid)
+    _ -> Nothing
+
+-- | Extract max_model_retries from config (default 3).
+modelRetriesFromConfig :: Either a RuntimeConfig -> Int
+modelRetriesFromConfig eCfg =
+  case eCfg of
+    Right cfg | Just n <- rcMaxModelRetries cfg -> n
+    _ -> 3
+
+-- | Extract model_retry_base_delay_ms from config (default 1000).
+retryBaseDelayFromConfig :: Either a RuntimeConfig -> Int
+retryBaseDelayFromConfig eCfg =
+  case eCfg of
+    Right cfg | Just n <- rcRetryBaseDelayMs cfg -> n
+    _ -> 1000
 
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or
