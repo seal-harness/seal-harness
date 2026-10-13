@@ -5,9 +5,12 @@ import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import qualified Data.Vector as V
@@ -17,6 +20,8 @@ import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), Usage (..)
   , ToolDefinition (..) )
 import Seal.TestHelpers.Arbitrary ()
+import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
+import Seal.Transcript.ConvIndex (buildIndex)
 import Seal.Transcript.Entries
 import Seal.Transcript.Reconstruct
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
@@ -230,7 +235,7 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
         -- prior turn (start=2, end=3): the user message "what is 2+2?".
         -- The cumulative conversation history (the prior user+assistant
         -- pair) is NOT re-embedded — that's the whole point of the
-        -- two-file delta format. Re-embedding the full prefix at every
+        -- indexed transcript delta format. Re-embedding the full prefix at every
         -- request would be O(N²) in the conversation length (a 146-turn
         -- session would ship ~5,000 redundant message copies, turning
         -- 280KB on disk into ~18MB on the wire). The envelope still
@@ -294,6 +299,74 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
               other -> expectationFailure ("expected op.name=SKILL_LOAD, got " ++ show other)
           other -> expectationFailure ("expected op object in payload, got " ++ show other)
       other -> expectationFailure ("expected 1 entry, got " ++ show (length other))
+
+  -- ------------------------------------------------------------------
+  -- Streaming reconstruction equivalence
+  -- ------------------------------------------------------------------
+
+  describe "reconstructStreaming" $ do
+    it "produces the same output as pure reconstruct for request/response pairs" $
+      withSystemTempDirectory "seal-recon" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello there"]
+                   , Message User [CbText "how are you"]
+                   , Message Assistant [CbText "good"]
+                   ]
+            entries = [ reqEntry emptyEnvelopeDelta 1
+                      , respEntry 2
+                      , reqEntry emptyEnvelopeDelta 3
+                      , respEntry 4
+                      ]
+            expected = reconstruct conv entries
+        -- Write conversation file
+        BS.writeFile convPath (BS8.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") conv))
+        -- Build index
+        _ <- buildIndex convPath idxPath
+        -- Run streaming reconstruction
+        actual <- reconstructStreaming convPath idxPath entries
+        actual `shouldBe` expected
+
+    it "handles harness entries with convLen=0 (preserves conversation cursor)" $
+      withSystemTempDirectory "seal-recon" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   , Message User [CbText "run a tool"]
+                   , Message Assistant [CbText "result"]
+                   ]
+            entries = [ reqEntry emptyEnvelopeDelta 1
+                      , respEntry 2
+                      , harnessEntry 0    -- convLen=0, cursor preserved
+                      , reqEntry emptyEnvelopeDelta 3
+                      , respEntry 4
+                      ]
+            expected = reconstruct conv entries
+        BS.writeFile convPath (BS8.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") conv))
+        _ <- buildIndex convPath idxPath
+        actual <- reconstructStreaming convPath idxPath entries
+        actual `shouldBe` expected
+
+    it "handles compaction entries (advances cursor to erConvLen)" $
+      withSystemTempDirectory "seal-recon" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            conv = [ Message User [CbText "a"]
+                   , Message Assistant [CbText "b"]
+                   , Message User [CbText "c"]
+                   ]
+            entries = [ reqEntry emptyEnvelopeDelta 1
+                      , respEntry 2
+                      , compactionEntry 2   -- compaction at convLen=2
+                      , reqEntry emptyEnvelopeDelta 3
+                      ]
+            expected = reconstruct conv entries
+        BS.writeFile convPath (BS8.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") conv))
+        _ <- buildIndex convPath idxPath
+        actual <- reconstructStreaming convPath idxPath entries
+        actual `shouldBe` expected
 
 isJustArray :: Maybe Value -> Bool
 isJustArray (Just (Array _)) = True

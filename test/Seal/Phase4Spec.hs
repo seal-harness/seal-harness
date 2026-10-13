@@ -13,7 +13,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types (OpName (..))
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend, OpResult (..))
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -67,7 +67,7 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
         shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full)
         fileWriteOp' = fileWriteOp wsRoot 65536
         reg = mkRegistry [shellOp, fileWriteOp']
-    (h, _readState) <- fakeTwoFileTranscript
+    (h, _readState) <- fakeIndexedTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)
     r1 <- runTestApp (dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "SHELL_EXEC")
                        (object ["command" .= ("echo ok" :: String)]))

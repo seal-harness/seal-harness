@@ -12,8 +12,8 @@ module Seal.Gateway.Transcript
   ( readTranscriptEntries
   , readTranscriptEntriesTimed
   , readTranscriptEntriesLimited
-  , readTranscriptEntriesTimedLimited
   , ReadLimit (..)
+  , limitFromMaybe
   , TranscriptSource (..)
   , TranscriptTimings (..)
   , renderServerTiming
@@ -37,6 +37,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Debug.Trace (trace)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -45,13 +46,32 @@ import Data.Vector qualified as V
 import System.Directory (doesFileExist)
 
 import Seal.Config.Paths
-  (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
+  (SealPaths, sessionConversationPath, sessionConversationIndexPath
+  , sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Transcript.ConvIndex
+  (convLineCount, ensureIndex, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
-import Seal.Util.StrictIO (readFileTextStrict, streamFirstMatch, streamDecodeLines, streamDecodeAfter)
-import Seal.Transcript.Reconstruct (reconstruct)
+import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Util.StrictIO (readFileTextStrict, streamFirstMatch)
+
+-- | How much of the transcript to read. Replaces the old @Maybe Int@
+-- parameter (where @Just n@ meant "last N" and @Nothing@ meant "all").
+data ReadLimit
+  = ReadAll    -- ^ read every entry (no limit)
+  | ReadLastN Int  -- ^ read only the last N entries
+  | ReadFirstN Int -- ^ read only the first N entries (for scroll-to-top)
+  deriving (Eq, Show)
+
+-- | Convert a legacy @Maybe Int@ (where @Just n@ = last N, @Nothing@ = all)
+-- to a 'ReadLimit'. Callers that previously passed @Maybe Int@ can use this
+-- for a minimal diff.
+limitFromMaybe :: Maybe Int -> ReadLimit
+limitFromMaybe Nothing  = ReadAll
+limitFromMaybe (Just n) = ReadLastN n
+
 -- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
 -- so the @Server-Timing@ header can name the path the request took.
 data TranscriptSource
@@ -133,44 +153,29 @@ zipWithMaybe f (a : as) (b : bs) = case f a b of
 readTranscriptEntries
   :: SealPaths -> Text -> String -> SessionId -> IO [Value]
 readTranscriptEntries paths model fallbackTs sid =
-  fst <$> readTranscriptEntriesTimedLimited ReadAll paths model fallbackTs sid
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid ReadAll
 
 -- | Like 'readTranscriptEntries' but accepts a 'ReadLimit' to cap the
--- number of entries returned. Use 'ReadLastN' for the HTTP endpoint and
--- WS replay to avoid OOM on large transcripts.
+-- number of entries returned. Delegates to 'readTranscriptEntriesTimed';
+-- discards timing information.
 readTranscriptEntriesLimited
   :: ReadLimit -> SealPaths -> Text -> String -> SessionId -> IO [Value]
-readTranscriptEntriesLimited limit paths model fallbackTs sid =
-  fst <$> readTranscriptEntriesTimedLimited limit paths model fallbackTs sid
-
--- | Controls how many transcript entries to read and return. 'ReadAll'
--- returns every entry (streamed line-by-line, no full-file materialization).
--- 'ReadLastN' reads only the last N entries, skipping the corresponding
--- conversation lines without decoding them. Used by the HTTP transcript
--- endpoint and WS replay to avoid loading 700K+ line transcripts in full.
-data ReadLimit
-  = ReadAll
-  | ReadLastN Int
+readTranscriptEntriesLimited lim paths model fallbackTs sid =
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid lim
 
 -- | Instrumented variant of 'readTranscriptEntries': returns the frontend
 -- values alongside per-phase wall-clock timings. Used by the @/transcript@
 -- HTTP handler to emit a @Server-Timing@ header; other callers (broadcast,
 -- snippet helpers) can use the plain 'readTranscriptEntries' and ignore the
 -- overhead of timing capture.
+--
+-- When the limit is @'Just' n@, only the last @n@ entries are processed
+-- (reconstructed + rewritten), avoiding O(all entries) work when the
+-- caller only needs a page. The total count is still computed from the
+-- entries file so the caller can report @hasMore@.
 readTranscriptEntriesTimed
-  :: SealPaths -> Text -> String -> SessionId -> IO ([Value], TranscriptTimings)
-readTranscriptEntriesTimed = readTranscriptEntriesTimedLimited ReadAll
-
--- | Instrumented variant that accepts a 'ReadLimit'. When 'ReadLastN' is
--- set, only the last N entries are reconstructed, and the corresponding
--- conversation lines are skipped without decoding (via 'streamDecodeAfter').
--- This is the primary defense against OOM on large transcripts: a session
--- with 725K conversation lines and 231 entries can be served as the last
--- 200 entries by reading only the tail of @conversation.jsonl@, instead of
--- materializing the entire file as a single 'Text' (hundreds of MB).
-readTranscriptEntriesTimedLimited
-  :: ReadLimit -> SealPaths -> Text -> String -> SessionId -> IO ([Value], TranscriptTimings)
-readTranscriptEntriesTimedLimited limit paths model fallbackTs sid = do
+  :: SealPaths -> Text -> String -> SessionId -> ReadLimit -> IO ([Value], TranscriptTimings)
+readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
   tStart <- getCurrentTime
   let legacyPath = sessionTranscriptPath paths sid
       convPath   = sessionConversationPath paths sid
@@ -187,6 +192,10 @@ readTranscriptEntriesTimedLimited limit paths model fallbackTs sid = do
       tPr1 <- getCurrentTime
       tRw0 <- getCurrentTime
       let frontend = map teLineToFrontend vals
+          limited = case rlim of
+            ReadAll     -> frontend
+            ReadLastN n -> drop (max 0 (length frontend - n)) frontend
+            ReadFirstN n -> take n frontend
       tRw1 <- getCurrentTime
       tEnd <- getCurrentTime
       let tt = TranscriptTimings
@@ -199,57 +208,100 @@ readTranscriptEntriesTimedLimited limit paths model fallbackTs sid = do
             , ttEncodeMs      = 0
             , ttTotalMs       = ms tStart tEnd
             }
-      pure (frontend, tt)
+      pure (limited, tt)
     else if convExists
       then do
         entriesExist <- doesFileExist (sessionEntriesPath paths sid)
         if entriesExist
           then do
-            -- conv+entries path: stream entries.jsonl (small), then stream
-            -- conversation.jsonl with skip for ReadLastN.
+            -- Indexed path: read entries.jsonl fully (small file), then
+            -- read conversation lines on demand via the index.
             tFr2 <- getCurrentTime
-            evs <- streamDecodeLines (sessionEntriesPath paths sid) :: IO [EntryRecord]
+            eraw <- readFileTextStrict (sessionEntriesPath paths sid)
             tFr3 <- getCurrentTime
             tPr2 <- getCurrentTime
-            let (entryOffset, keptEvs, startConvLen) = case limit of
-                  ReadAll -> (0, evs, 0)
-                  ReadLastN n ->
-                    let count = length evs
-                        off = max 0 (count - n)
-                        kept = drop off evs
-                        start = if off > 0 && off <= count
-                                  then erConvLen (evs !! (off - 1))
-                                  else 0
-                    in (off, kept, start)
-            tFr0 <- getCurrentTime
-            msgVals <- streamDecodeAfter startConvLen convPath :: IO [A.Value]
-            tFr1 <- getCurrentTime
-            let msgs = mapMaybe fromJSONMessage msgVals
+            let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                               (filter (not . T.null) (T.lines eraw)) :: [EntryRecord]
             tPr3 <- getCurrentTime
-            let adjustedEvs = map
-                  (\e -> e { erConvLen = erConvLen e - startConvLen }) keptEvs
+            -- Ensure the conversation index exists and is current
+            let idxPath = sessionConversationIndexPath paths sid
+            _ <- ensureIndex convPath idxPath
+            -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
+            totalLines <- convLineCount idxPath
+            let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
+                trailingCount = totalLines - maxConvLen
+            -- Split the limit between reconstructed entries and trailing
+            -- conv entries.
+            --
+            -- 'ReadLastN': trailing entries are the most recent activity
+            -- (they have no entry records), so they get priority: allocate
+            -- up to half the limit to trailing, the rest to reconstruction.
+            -- Without this, a limit fully consumed by reconstructed entries
+            -- starves the trailing range — the user sees old entries instead
+            -- of the end of the session.
+            --
+            -- 'ReadFirstN': prioritize reconstructed entries from the
+            -- beginning. Only read trailing lines if there aren't enough
+            -- entry records to fill the limit. Trailing lines are read from
+            -- the START of the trailing range (the earliest ones), not the
+            -- end.
+            let (reconLimit, trailingLimit, fromBeginning) = case rlim of
+                  ReadLastN n | n > 0 ->
+                    let trailingBudget = min n (min trailingCount (n `div` 2))
+                        reconBudget = n - trailingBudget
+                    in (Just reconBudget, trailingBudget, False)
+                  ReadFirstN n | n > 0 ->
+                    let reconBudget = min n (length evs)
+                        trailingBudget = max 0 (n - reconBudget)
+                    in (Just reconBudget, min trailingBudget trailingCount, True)
+                  _ -> (Nothing, trailingCount, False)
+            -- Stream-reconstruct: use paginated variant when a limit is
+            -- specified (only process the last N entries' conversation lines)
             tRc0 <- getCurrentTime
-            let reconstructed = reconstruct msgs adjustedEvs
-                reconFrontend = zipWithMaybe
-                  reconEntryToFrontend [entryOffset ..] reconstructed
-                maxConvLenAdj = if null adjustedEvs
-                                  then 0
-                                  else maximum (map erConvLen adjustedEvs)
-                maxConvLenOrig = maxConvLenAdj + startConvLen
-                convCount = length msgVals
-                trailing = if convCount > maxConvLenAdj
-                  then zipWith
-                         (convLineToFrontend model [] fallbackTs)
-                         [maxConvLenOrig ..]
-                         (drop maxConvLenAdj msgVals)
-                  else []
-                frontend = reconFrontend <> trailing
+            (reconstructed, reconStartIdx) <- case reconLimit of
+              Just n | n > 0 && n < length evs ->
+                let start = if fromBeginning then 0 else length evs - n
+                in (, start) <$> reconstructStreamingPage convPath idxPath evs start n
+              _ -> (, 0) <$> reconstructStreaming convPath idxPath evs
+            let reconFrontend = zipWithMaybe reconEntryToFrontend [reconStartIdx..] reconstructed
+            -- Read trailing conv lines. For ReadLastN, read the LAST
+            -- trailingLimit lines (most recent). For ReadFirstN, read the
+            -- FIRST trailingLimit lines (earliest, right after the entries).
+            let trailingStart = if fromBeginning
+                                then 0
+                                else max 0 (trailingCount - trailingLimit)
+            trailing <- if trailingCount > 0 && trailingLimit > 0
+              then do
+                let readStart = maxConvLen + trailingStart
+                    readEnd = maxConvLen + min trailingCount (trailingStart + trailingLimit)
+                putStrLn $ "[transcript] trailing-read readStart=" <> show readStart <> " readEnd=" <> show readEnd <> " (convLines " <> show readStart <> ".." <> show (readEnd - 1) <> ")"
+                eTrailingVals <- readConvLinesRaw convPath idxPath readStart readEnd
+                let trailingVals = case eTrailingVals of
+                      Right vs -> vs
+                      Left err -> trace ("[transcript] trailing-read ERROR: " <> T.unpack err) []
+                putStrLn $ "[transcript] trailing-read got " <> show (length trailingVals) <> " values"
+                pure (trailingConvEntries model fallbackTs (maxConvLen + trailingStart) trailingVals)
+              else do
+                putStrLn $ "[transcript] trailing-read SKIPPED trailingCount=" <> show trailingCount <> " trailingLimit=" <> show trailingLimit
+                pure []
+            let frontend = reconFrontend <> trailing
             tRc1 <- getCurrentTime
             tEnd <- getCurrentTime
+            putStrLn $ "[transcript] conv+entries sid=" <> show sid
+                     <> " evs=" <> show (length evs)
+                     <> " totalLines=" <> show totalLines
+                     <> " maxConvLen=" <> show maxConvLen
+                     <> " trailingCount=" <> show trailingCount
+                    <> " rlim=" <> show rlim
+                     <> " reconLimit=" <> show reconLimit
+                     <> " trailingLimit=" <> show trailingLimit
+                     <> " reconFrontend=" <> show (length reconFrontend)
+                     <> " trailing=" <> show (length trailing)
+                     <> " frontend=" <> show (length frontend)
             let tt = TranscriptTimings
                   { ttSource        = TSConvEntries
-                  , ttEntryCount    = length frontend
-                  , ttFileReadMs    = ms tFr0 tFr1 + ms tFr2 tFr3
+                  , ttEntryCount    = length evs + trailingCount
+                  , ttFileReadMs    = ms tFr2 tFr3
                   , ttParseMs       = ms tPr2 tPr3
                   , ttReconstructMs = ms tRc0 tRc1
                   , ttRewriteMs     = 0
@@ -258,27 +310,28 @@ readTranscriptEntriesTimedLimited limit paths model fallbackTs sid = do
                   }
             pure (frontend, tt)
           else do
-            -- conv-only path (no entries.jsonl): stream line-by-line.
+            -- Conv-only path: no entries.jsonl. Use the index to read
+            -- conversation lines in batches instead of the full file.
+            let idxPath = sessionConversationIndexPath paths sid
+            _ <- ensureIndex convPath idxPath
+            totalLines <- convLineCount idxPath
+            -- Apply limit: read only the needed lines.
+            let (readStart, readCount) = case rlim of
+                  ReadLastN n | n >= 0 && n < totalLines -> (totalLines - n, n)
+                  ReadFirstN n | n >= 0 && n < totalLines -> (0, n)
+                  _ -> (0, totalLines)
             tRw0 <- getCurrentTime
-            tFr0 <- getCurrentTime
-            allMsgVals <- streamDecodeLines convPath :: IO [A.Value]
-            tFr1 <- getCurrentTime
-            let frontend = case limit of
-                  ReadAll -> zipWith
-                    (convLineToFrontend model [] fallbackTs) [0 ..] allMsgVals
-                  ReadLastN n ->
-                    let total = length allMsgVals
-                        off = max 0 (total - n)
-                    in zipWith
-                         (convLineToFrontend model [] fallbackTs)
-                         [off ..]
-                         (drop off allMsgVals)
+            eMsgs <- readConvLinesRaw convPath idxPath readStart (readStart + readCount)
+            let msgVals = case eMsgs of
+                  Right vs -> vs
+                  Left _ -> []
+                frontend = zipWith (convLineToFrontend model [] fallbackTs) [readStart..] msgVals
             tRw1 <- getCurrentTime
             tEnd <- getCurrentTime
             let tt = TranscriptTimings
                   { ttSource        = TSConvOnly
-                  , ttEntryCount    = length frontend
-                  , ttFileReadMs    = ms tFr0 tFr1
+                  , ttEntryCount    = totalLines
+                  , ttFileReadMs    = 0
                   , ttParseMs       = 0
                   , ttReconstructMs = 0
                   , ttRewriteMs     = ms tRw0 tRw1
@@ -301,16 +354,10 @@ readTranscriptEntriesTimedLimited limit paths model fallbackTs sid = do
         pure ([], tt)
   where
     ms a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
-    -- | Convert an 'A.Value' to a 'Message' via aeson's 'fromJSON'. This
-    -- avoids decoding the same line twice (once as Value, once as Message)
-    -- — the streaming path decodes once as Value and converts here.
-    fromJSONMessage v = case A.fromJSON v :: A.Result Message of
-      A.Success m -> Just m
-      A.Error _   -> Nothing
 
 -- | Extract a short snippet of the first user message in a session's
 -- transcript, for use as the default session title when the user has not
--- set an explicit description. Reads the two-file format
+-- set an explicit description. Reads the indexed transcript format
 -- (@conversation.jsonl@) first, falling back to the legacy
 -- @transcript.jsonl@. Returns 'Nothing' when the session has no transcript
 -- or no user message with text content. The snippet is truncated to 80

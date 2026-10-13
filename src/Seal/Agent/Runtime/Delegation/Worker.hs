@@ -43,7 +43,7 @@ import Data.Default (def)
 import Seal.Config.Paths (SealPaths, agentSessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
-import Seal.Handles.Transcript (withTwoFileTranscript)
+import Seal.Handles.Transcript (withIndexedTranscript)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
@@ -245,7 +245,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                        (Just ("agent start failed: " <> err))
                        CerError 0 0 (Just childSid))
     Right (prov, model) ->
-      withTwoFileTranscript childDir $ \childTHandle -> do
+      withIndexedTranscript childDir $ \childTHandle -> do
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
         let capturingCaps = def

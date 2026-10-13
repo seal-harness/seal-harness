@@ -37,7 +37,7 @@ import Seal.Providers.Class (ToolResultPart (..))
 
 -- | The channel-supplied dispatcher. Built by the wiring at each channel
 -- (CLI TUI, web) with the right 'Seal.ISA.Registry.Registry',
--- 'Seal.Handles.Transcript.TwoFileHandle', 'Seal.ISA.Opcode.BackendExec',
+-- 'Seal.Handles.Transcript.IndexedTranscriptHandle', 'Seal.ISA.Opcode.BackendExec',
 -- 'Seal.Tools.Exec.Types.ExecBackend', and 'Seal.Types.App.Env' for the
 -- active session. Returns the structured 'DispatchError' \/ 'OpResult'
 -- so the command can render either outcome.

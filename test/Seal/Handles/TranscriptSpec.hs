@@ -35,15 +35,15 @@ mkEntry = do
     , teMeta = Map.empty
     }
 
--- | A minimal entry record for the two-file writer tests.
-mkEntryRecord :: IO EntryRecord
-mkEntryRecord = do
+-- | A minimal entry record for the indexed transcript writer tests.
+mkEntryRecord :: Int -> IO EntryRecord
+mkEntryRecord convLen = do
   now <- getCurrentTime
   pure EntryRecord
     { erId = "r1"
     , erTimestamp = now
     , erKind = EKRequest
-    , erConvLen = 1
+    , erConvLen = convLen
     , erEnvelope = Just emptyEnvelopeDelta
     , erUsage = Nothing
     , erStop = Nothing
@@ -53,7 +53,7 @@ mkEntryRecord = do
     , erMeta = Map.empty
     }
 
--- | A configurable entry record for the two-file writer tests.
+-- | A configurable entry record for the indexed transcript writer tests.
 mkEntryRecordAt :: UTCTime -> EntryKind -> Int -> Maybe EnvelopeDelta -> EntryRecord
 mkEntryRecordAt ts kind convLen env = EntryRecord
   { erId = "r1"
@@ -98,97 +98,97 @@ spec = describe "Seal.Handles.Transcript" $ do
       logged <- readLog
       map teId logged `shouldBe` ["e1"]
 
-  describe "two-file format" $ do
+  describe "indexed transcript format" $ do
     it "writes conversation.jsonl and entries.jsonl with one line each per write" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e <- mkEntryRecord
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
         let conv = [Message User [CbText "hello"]]
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite conv e)
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite conv e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         entriesContents <- BS8.readFile (dir </> "entries.jsonl")
         length (BS8.lines convContents) `shouldBe` 1
         length (BS8.lines entriesContents) `shouldBe` 1
 
     it "grows conversation.jsonl by deltas across turns" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e1 <- mkEntryRecord
-        e2 <- mkEntryRecord
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e1 <- mkEntryRecord 1
+        e2 <- mkEntryRecord 2
         let turn1 = [Message User [CbText "a"]]
             turn2 = turn1 <> [Message Assistant [CbText "b"]]
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite turn1 e1)
-          tfwRecordAndAck h (TwoFileWrite turn2 e2)
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite turn1 e1)
+          itwRecordAndAck h (IndexedTranscriptWrite turn2 e2)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         -- turn1 writes 1 line ("a"); turn2 diffs and writes only "b".
         length (BS8.lines convContents) `shouldBe` 2
 
     it "redacts CbToolResult parts from secret-producing opcodes so secret values never reach disk" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e <- mkEntryRecord
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 2
         let secret = TrpText "super-secret-api-key"
             toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [secret] False]
-        withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
-          tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
+        withIndexedTranscript dir $ \h -> do
+          itwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
+          itwRecordAndAck h (IndexedTranscriptWrite [toolUse, resultMsg] e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
         BS8.unpack convContents `shouldContain` "<redacted:secret>"
 
     it "does NOT redact CbToolResult parts from non-secret opcodes (e.g. SHELL_EXEC)" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e <- mkEntryRecord
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 2
         let output = TrpText "total used free\n4096 2048 2048"
             toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SHELL_EXEC") (object ["command" .= ("free -h" :: String)])]
             resultMsg = Message User [CbToolResult (ToolCallId "tc1") [output] False]
-        withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
-          tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
+        withIndexedTranscript dir $ \h -> do
+          itwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
+          itwRecordAndAck h (IndexedTranscriptWrite [toolUse, resultMsg] e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         -- Shell output passes through verbatim — NOT redacted.
         BS8.unpack convContents `shouldContain` "total used free"
         BS8.unpack convContents `shouldNotContain` "<redacted:secret>"
 
     it "readConversation / readEntries round-trip the written data" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e <- mkEntryRecord
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 2
         let conv = [Message User [CbText "hi"], Message Assistant [CbText "bye"]]
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite conv e)
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite conv e)
           -- read back through the handle
-          msgs <- tfwReadConversation h
+          msgs <- itwReadConversation h
           -- The first message is plain text; the round-trip preserves it.
           case msgs of
             (m : _) -> msgRole m `shouldBe` User
             []      -> expectationFailure "no messages read back"
         -- entries file also readable
-        withTwoFileTranscript dir $ \h -> do
-          es <- tfwReadEntries h
+        withIndexedTranscript dir $ \h -> do
+          es <- itwReadEntries h
           case es of
             (r : _) -> erId r `shouldBe` "r1"
             []      -> expectationFailure "no entries read back"
 
-    it "fakeTwoFileTranscript records writes in memory" $ do
-      (h, readState) <- fakeTwoFileTranscript
-      e <- mkEntryRecord
+    it "fakeIndexedTranscript records writes in memory" $ do
+      (h, readState) <- fakeIndexedTranscript
+      e <- mkEntryRecord 1
       let conv = [Message User [CbText "hi"]]
-      tfwRecordAndAck h (TwoFileWrite conv e)
+      itwRecordAndAck h (IndexedTranscriptWrite conv e)
       (msgs, _entries) <- readState
       length msgs `shouldBe` 1
       length _entries `shouldBe` 1
 
-    it "tfwIsAlive returns True for a healthy daemon" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
-        e <- mkEntryRecord
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite [Message User [CbText "x"]] e)
-          alive <- tfwIsAlive h
+    it "itwIsAlive returns True for a healthy daemon" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e)
+          alive <- itwIsAlive h
           alive `shouldBe` True
 
-    it "tfwIsAlive returns True for fakeTwoFileTranscript" $ do
-      (h, _) <- fakeTwoFileTranscript
-      alive <- tfwIsAlive h
+    it "itwIsAlive returns True for fakeIndexedTranscript" $ do
+      (h, _) <- fakeIndexedTranscript
+      alive <- itwIsAlive h
       alive `shouldBe` True
 
     it "TranscriptError is an Exception" $ do
@@ -200,8 +200,8 @@ spec = describe "Seal.Handles.Transcript" $ do
           Nothing -> expectationFailure "exception was not a TranscriptError"
         Right _ -> expectationFailure "expected an exception but got none"
 
-    it "tfwRecordAndAck raises TranscriptError after daemon dies (fd closed externally)" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
+    it "itwRecordAndAck raises TranscriptError after daemon dies (fd closed externally)" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
         -- Make the directory read-only AFTER the files are opened, then
         -- remove the files so fsync fails. Actually, a simpler approach:
         -- close the fd by sending a signal. The most portable approach is
@@ -211,18 +211,18 @@ spec = describe "Seal.Handles.Transcript" $ do
         -- dies and subsequent writes raise TranscriptError.
         --
         -- For now, this test verifies the contract: a successful write does
-        -- not raise, and tfwIsAlive is True. The daemon-death path is
+        -- not raise, and itwIsAlive is True. The daemon-death path is
         -- exercised by the integration test (a closed fd causes fsync to
         -- fail, the handler fires, aliveRef flips, and the next
-        -- tfwRecordAndAck raises TranscriptError instead of hanging).
-        e <- mkEntryRecord
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite [Message User [CbText "ok"]] e)
-          alive <- tfwIsAlive h
+        -- itwRecordAndAck raises TranscriptError instead of hanging).
+        e <- mkEntryRecord 1
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
+          alive <- itwIsAlive h
           alive `shouldBe` True
 
     it "emits a minimal envelope delta (only changed fields) on the second request" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
         -- Two request entries with IDENTICAL envelopes. The writer should
         -- emit the full envelope on the first request (no prior to delta
         -- against) and an EMPTY delta on the second (nothing changed). The
@@ -244,9 +244,9 @@ spec = describe "Seal.Handles.Transcript" $ do
         let e2 = mkEntryRecordAt now2 EKRequest 2 (Just env0)
             turn1 = [Message User [CbText "q1"]]
             turn2 = turn1 <> [Message Assistant [CbText "a1"], Message User [CbText "q2"]]
-        withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite turn1 e1)
-          tfwRecordAndAck h (TwoFileWrite turn2 e2)
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite turn1 e1)
+          itwRecordAndAck h (IndexedTranscriptWrite turn2 e2)
         entriesContents <- BS8.readFile (dir </> "entries.jsonl")
         let entryLines = BS8.lines entriesContents
         length entryLines `shouldBe` 2
@@ -255,19 +255,19 @@ spec = describe "Seal.Handles.Transcript" $ do
         BS8.unpack (entryLines !! 1) `shouldNotContain` "\"envelope\""
 
     it "does not duplicate the conversation when a secret result is followed by another write" $
-      withSystemTempDirectory "seal-twofile" $ \dir -> do
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
         -- Regression: the agent loop sends the FULL in-memory message list
         -- (with UNREDACTED tool results) on every write. The daemon redacts
-        -- the new suffix before writing to disk and updates tfsWritten with
+        -- the new suffix before writing to disk and updates itsWritten with
         -- the REDACTED version. On the NEXT write, the incoming list still
-        -- has the UNREDACTED tool result, but tfsWritten has the REDACTED
+        -- has the UNREDACTED tool result, but itsWritten has the REDACTED
         -- one. The diff (stripPrefix) fails, and the fallback re-appends
         -- the entire conversation — causing O(N²) duplication.
         --
         -- The fix: redact the full incoming list BEFORE diffing, so the
         -- comparison is redacted-vs-redacted.
-        e1 <- mkEntryRecord
-        e2 <- mkEntryRecord
+        e1 <- mkEntryRecord 2
+        e2 <- mkEntryRecord 3
         let secret = TrpText "super-secret-api-key"
             toolUse = Message Assistant
               [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") (object [])]
@@ -278,10 +278,10 @@ spec = describe "Seal.Handles.Transcript" $ do
             -- Write B: same conversation + a new assistant response.
             -- The in-memory list still has the UNREDACTED tool result.
             convB = convA <> [Message Assistant [CbText "ok"]]
-        withTwoFileTranscript dir $ \h -> do
-          tfwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
-          tfwRecordAndAck h (TwoFileWrite convA e1)
-          tfwRecordAndAck h (TwoFileWrite convB e2)
+        withIndexedTranscript dir $ \h -> do
+          itwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
+          itwRecordAndAck h (IndexedTranscriptWrite convA e1)
+          itwRecordAndAck h (IndexedTranscriptWrite convB e2)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         -- Without the fix: convA writes 2 lines (toolUse + redacted result),
         -- then convB's diff fails (unredacted vs redacted) and the fallback
@@ -293,3 +293,47 @@ spec = describe "Seal.Handles.Transcript" $ do
         BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
         BS8.unpack convContents `shouldContain` "<redacted:secret>"
         BS8.unpack convContents `shouldContain` "ok"
+
+    it "does not duplicate the conversation when itsWritten diverges from incoming" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        -- Regression: diffMessages used a prefix-match with a fallback that
+        -- re-appended the FULL incoming list when the prefix didn't match.
+        -- This happened when itsWritten (the in-memory copy of what's on
+        -- disk) diverged from the incoming messages — e.g. after a daemon
+        -- restart where existingConv was read from a file that already had
+        -- duplicates, or when the in-memory list and the on-disk file
+        -- disagree due to redaction or other transformations.
+        --
+        -- The fix: use erConvLen (the entry's logical conversation length)
+        -- to compute the suffix positionally — drop (length itsWritten)
+        -- from the incoming list, take (erConvLen - length itsWritten).
+        -- This is deterministic and never re-appends the full conversation.
+        now1 <- getCurrentTime
+        let e1 = mkEntryRecordAt now1 EKRequest 2 Nothing
+            conv1 = [Message User [CbText "a"], Message Assistant [CbText "b"]]
+        now2 <- getCurrentTime
+        let e2 = mkEntryRecordAt now2 EKRequest 4 Nothing
+            -- conv2 has the same logical content as conv1 plus 2 new messages,
+            -- but the MIDDLE message has been modified (simulating divergence
+            -- — e.g. redaction changed the on-disk version). The prefix match
+            -- would fail at position 1, causing the fallback to re-append all
+            -- 4 messages. The positional fix takes only the last 2.
+            conv2 = [ Message User [CbText "a"]
+                    , Message Assistant [CbText "CHANGED"]
+                    , Message User [CbText "c"]
+                    , Message Assistant [CbText "d"]
+                    ]
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        -- Without the fix: conv1 writes 2 lines, conv2's diff fails (b ≠
+        -- CHANGED) and the fallback re-appends all 4 → 6 total. With the
+        -- positional fix: conv2 appends only the 2 new messages (c, d)
+        -- → 4 total. The divergent "CHANGED" message at position 1 is
+        -- NOT re-written (it's in the already-written range).
+        length (BS8.lines convContents) `shouldBe` 4
+        BS8.unpack convContents `shouldContain` "\"a\""
+        BS8.unpack convContents `shouldContain` "\"b\""
+        BS8.unpack convContents `shouldContain` "\"c\""
+        BS8.unpack convContents `shouldContain` "\"d\""
