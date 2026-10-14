@@ -108,6 +108,8 @@ function defaultFetchDispatch(): void {
     let body: unknown = {}
     if (url === '/api/agents') body = []
     else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+   else if (url === '/api/providers/all') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514', baseUrl: null, authStatus: 'api-key' }, { name: 'ollama', isDefault: false, defaultModel: null, baseUrl: null, authStatus: 'none' }]
+   else if (url === '/api/providers/default') body = { provider: 'anthropic' }
     else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
     else if (url === '/api/sessions') body = []
     else if (url === '/api/sessions/archived') body = []
