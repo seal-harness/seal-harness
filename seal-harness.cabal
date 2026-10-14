@@ -279,6 +279,7 @@ library
         Seal.Logging.Logger
         Seal.Cron.Types
         Seal.Cron.Store
+        Seal.ISA.Ops.Cron
         Seal.Logging.ChannelContext
         Seal.Logging.Exceptions
         Seal.Logging.Global
@@ -450,6 +451,7 @@ test-suite tests
          Seal.Skills.BackendNoDirectFsFailSpec
         Seal.Cron.TypesSpec
         Seal.Cron.StoreSpec
+        Seal.ISA.Ops.CronSpec
         Seal.Skills.AutoloadSpec
         Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec
