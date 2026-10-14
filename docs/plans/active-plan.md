@@ -2,7 +2,7 @@
 <!-- approved: 2026-10-04 -->
 <!-- gate-iterations: 1 (revised) -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: abandoned (superseded by embedded static assets work, 2026-10-14) -->
 
 # Implementation Plan: Chunked Transcript Loading via WebSocket
 ## Issue: #243
