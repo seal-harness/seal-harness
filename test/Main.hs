@@ -24,6 +24,7 @@ import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
 import qualified Seal.Gateway.TranscriptSpec
+import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
@@ -212,6 +213,7 @@ specs = do
   Seal.Gateway.StreamSpec.spec
   Seal.Gateway.TranscriptSpec.spec
   Seal.Gateway.OpenApiSpec.spec
+  Seal.Util.StrictIOSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec

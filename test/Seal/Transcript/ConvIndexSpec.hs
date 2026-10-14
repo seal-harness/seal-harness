@@ -183,16 +183,25 @@ spec = describe "Seal.Transcript.ConvIndex" $ do
         eResult <- ensureIndex convPath idxPath
         eResult `shouldBe` Left IndexCorrupt
 
-    it "returns Left IndexCorrupt for non-monotonic offsets" $
+    it "returns Left IndexCorrupt when first offset is non-zero" $
       withSystemTempDirectory "seal-convindex" $ \dir -> do
         let convPath = dir <> "/conversation.jsonl"
             idxPath  = dir <> "/conversation.idx"
         writeConvFile convPath [textMsg "a", textMsg "b", textMsg "c"]
-        -- Write a corrupt index: [0, 100, 50, 60] (non-monotonic at 100→50)
-        writeIndexFileRaw idxPath [0, 100, 50, 60]
+        -- Write a corrupt index: first offset is 10 (should be 0)
+        writeIndexFileRaw idxPath [10, 50, 100, 150]
         eResult <- ensureIndex convPath idxPath
         eResult `shouldBe` Left IndexCorrupt
 
+    it "returns Left IndexCorrupt when last offset exceeds file size" $
+      withSystemTempDirectory "seal-convindex" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+        writeConvFile convPath [textMsg "a", textMsg "b", textMsg "c"]
+        -- Write a corrupt index: last offset is way too large
+        writeIndexFileRaw idxPath [0, 50, 100, 999999]
+        eResult <- ensureIndex convPath idxPath
+        eResult `shouldBe` Left IndexCorrupt
     it "concurrent ensureIndex calls are safe (temp-file + rename)" $
       withSystemTempDirectory "seal-convindex" $ \dir -> do
         let convPath = dir <> "/conversation.jsonl"

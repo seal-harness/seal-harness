@@ -20,6 +20,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -40,13 +41,15 @@ import Seal.Gateway.Transcript
   , renderServerTiming
   , trailingConvEntries
   , firstUserMessageSnippetFast
-  , setEncodeMs
+ , readTranscriptEntriesLimited
+ , setEncodeMs
   )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
 import Seal.Transcript.ConvIndex (buildIndex)
-import Seal.Transcript.Entries (encodeEntryRecordRaw)
 import Seal.Transcript.Entries qualified as Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Transcript.Entries
+  (EntryRecord (..), EntryKind (..), encodeEntryRecordRaw)
 
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Providers.Class qualified as PC (Message (..), Role (..))
@@ -638,3 +641,121 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
             T.length snippet `shouldBe` 81  -- 80 chars + ellipsis
             T.last snippet `shouldBe` '…'
           Nothing -> expectationFailure "expected Just snippet, got Nothing"
+  -- ── ReadLastN (transcript tail-read) ────────────────────────────────
+
+  describe "Seal.Gateway.Transcript.readTranscriptEntriesLimited" $ do
+    let fakePaths stateDir =
+          SealPaths { spHome = "", spState = stateDir, spConfig = ""
+                    , spKeys = "", spCache = "" }
+        testSid = case mkSessionId "20260701-120000-042" of
+          Right s -> s
+          Left e  -> error ("invalid sid: " ++ show e)
+        -- | Encode a Message as a conversation.jsonl line.
+        convLineMsg :: Message -> BL.ByteString
+        convLineMsg m = A.encode m <> "\n"
+        -- | Encode an EntryRecord as an entries.jsonl line.
+        entryLine :: EntryRecord -> BL.ByteString
+        entryLine e = BL.fromStrict (encodeEntryRecordRaw e) <> "\n"
+        -- | Build a simple EntryRecord.
+        mkEntry :: Text -> Int -> EntryKind -> EntryRecord
+        mkEntry eid convLen kind = EntryRecord
+          { erId = eid
+          , erTimestamp = sampleTime
+          , erKind = kind
+          , erConvLen = convLen
+          , erEnvelope = Nothing
+          , erUsage = Nothing
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Nothing
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+        -- | Extract the "id" field from a frontend TranscriptEntry JSON.
+        getEntryId :: A.Value -> Maybe Text
+        getEntryId (A.Object o) = case KeyMap.lookup (Key.fromString "id") o of
+          Just (A.String t) -> Just t
+          _ -> Nothing
+        getEntryId _ = Nothing
+
+    it "ReadAll returns all entries" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   , Message User [CbText "how are you?"]
+                   , Message Assistant [CbText "fine"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  , mkEntry "e2" 3 EKRequest
+                  , mkEntry "e3" 4 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited ReadAll paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        length result `shouldBe` 4
+
+    it "ReadLastN 2 returns only the last 2 entries with correct IDs" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   , Message User [CbText "how are you?"]
+                   , Message Assistant [CbText "fine"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  , mkEntry "e2" 3 EKRequest
+                  , mkEntry "e3" 4 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited (ReadLastN 2) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        -- Should return 2 entries (the last 2: e2 and e3)
+        length result `shouldBe` 2
+        -- The entry IDs should be "2" and "3" (original positions, not 0/1)
+        mapMaybe getEntryId result `shouldBe` ["e2", "e3"]
+
+    it "ReadLastN larger than total returns all entries" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited (ReadLastN 100) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        length result `shouldBe` 2
+
+    it "ReadLastN on conv-only (no entries.jsonl) returns last N conversation lines" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "msg1"]
+                   , Message Assistant [CbText "reply1"]
+                   , Message User [CbText "msg2"]
+                   , Message Assistant [CbText "reply2"]
+                   , Message User [CbText "msg3"]
+                   ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        result <- readTranscriptEntriesLimited (ReadLastN 2) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        -- Should return 2 entries (the last 2 conversation lines)
+        length result `shouldBe` 2

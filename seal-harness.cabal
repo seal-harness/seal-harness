@@ -398,6 +398,7 @@ test-suite tests
     other-modules:
         Seal.Core.ChannelKindSpec
         Seal.Core.MessageSourceSpec
+        Seal.Util.StrictIOSpec
         Seal.RepoDiscoverySpec
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec

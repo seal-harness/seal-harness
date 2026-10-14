@@ -1925,6 +1925,7 @@ handleTranscript deps sidTxt req =
       active <- readIORef (srActive (adSessionRuntime deps))
       tReadStart <- getCurrentTime
       let mLimit = parseLimitQuery req
+      putStrLn $ "[http] handleTranscript: mLimit=" <> show mLimit
       (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid (limitFromMaybe mLimit)
       tEncStart <- getCurrentTime
       -- When a limit was applied, readTranscriptEntriesTimed already
