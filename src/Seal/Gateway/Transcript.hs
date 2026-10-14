@@ -11,6 +11,7 @@
 module Seal.Gateway.Transcript
   ( readTranscriptEntries
   , readTranscriptEntriesTimed
+  , readTranscriptEntriesLimited
   , ReadLimit (..)
   , limitFromMaybe
   , TranscriptSource (..)
@@ -27,6 +28,7 @@ module Seal.Gateway.Transcript
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Control.Exception (catch, SomeException)
 import Data.Aeson qualified as A
 import Data.Aeson.Key (Key)
 import Data.Aeson.Key qualified as Key
@@ -43,6 +45,8 @@ import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
+import System.Posix.Process (getProcessID)
+import System.Process (readProcess)
 
 import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionConversationIndexPath
@@ -55,6 +59,28 @@ import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Util.StrictIO (readFileTextStrict, streamFirstMatch)
+
+-- | Read RSS (resident set size) for the current process. On Linux,
+-- reads @VmRSS@ from @/proc/self/status@. On macOS (no @/proc@), shells
+-- out to @ps -o rss= -p <pid>@. Returns "N/A" if both fail. Used for
+-- debug logging to track memory growth at key transcript-read phases.
+vmRSS :: IO Text
+vmRSS = do
+  exists <- doesFileExist "/proc/self/status"
+  if exists
+    then do
+      raw <- readFileTextStrict "/proc/self/status"
+      pure $ case [l | l <- T.lines raw, T.isPrefixOf "VmRSS:" l] of
+        (l : _) -> T.strip l
+        []      -> "N/A"
+    else vmRSSMacOS `catch` \(_ :: SomeException) -> pure "N/A"
+
+-- | macOS fallback: use @ps@ to get RSS for the current PID.
+vmRSSMacOS :: IO Text
+vmRSSMacOS = do
+  pid <- getProcessID
+  rss <- readProcess "ps" ["-o", "rss=", "-p", show pid] ""
+  pure (T.strip (T.pack rss))
 
 -- | How much of the transcript to read. Replaces the old @Maybe Int@
 -- parameter (where @Just n@ meant "last N" and @Nothing@ meant "all").
@@ -154,6 +180,14 @@ readTranscriptEntries
 readTranscriptEntries paths model fallbackTs sid =
   fst <$> readTranscriptEntriesTimed paths model fallbackTs sid ReadAll
 
+-- | Like 'readTranscriptEntries' but accepts a 'ReadLimit' to cap the
+-- number of entries returned. Delegates to 'readTranscriptEntriesTimed';
+-- discards timing information.
+readTranscriptEntriesLimited
+  :: ReadLimit -> SealPaths -> Text -> String -> SessionId -> IO [Value]
+readTranscriptEntriesLimited lim paths model fallbackTs sid =
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid lim
+
 -- | Instrumented variant of 'readTranscriptEntries': returns the frontend
 -- values alongside per-phase wall-clock timings. Used by the @/transcript@
 -- HTTP handler to emit a @Server-Timing@ header; other callers (broadcast,
@@ -216,7 +250,13 @@ readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
             tPr3 <- getCurrentTime
             -- Ensure the conversation index exists and is current
             let idxPath = sessionConversationIndexPath paths sid
-            _ <- ensureIndex convPath idxPath
+            rssIdx0 <- vmRSS
+            tIdx0 <- getCurrentTime
+            idxResult <- ensureIndex convPath idxPath
+            tIdx1 <- getCurrentTime
+            rssIdx1 <- vmRSS
+            putStrLn $ "[transcript] ensureIndex " <> show idxResult
+                     <> " (" <> show (ms tIdx0 tIdx1 :: Integer) <> "ms) rss=" <> T.unpack rssIdx0 <> " -> " <> T.unpack rssIdx1
             -- Trailing conv entries: read lines [maxConvLen..totalLines) via index
             totalLines <- convLineCount idxPath
             let maxConvLen = if null evs then 0 else maximum (map erConvLen evs)
@@ -248,6 +288,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
                   _ -> (Nothing, trailingCount, False)
             -- Stream-reconstruct: use paginated variant when a limit is
             -- specified (only process the last N entries' conversation lines)
+            rssRecon0 <- vmRSS
             tRc0 <- getCurrentTime
             (reconstructed, reconStartIdx) <- case reconLimit of
               Just n | n > 0 && n < length evs ->
@@ -276,6 +317,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
                 putStrLn $ "[transcript] trailing-read SKIPPED trailingCount=" <> show trailingCount <> " trailingLimit=" <> show trailingLimit
                 pure []
             let frontend = reconFrontend <> trailing
+            rssRecon1 <- vmRSS
             tRc1 <- getCurrentTime
             tEnd <- getCurrentTime
             putStrLn $ "[transcript] conv+entries sid=" <> show sid
@@ -289,6 +331,8 @@ readTranscriptEntriesTimed paths model fallbackTs sid rlim = do
                      <> " reconFrontend=" <> show (length reconFrontend)
                      <> " trailing=" <> show (length trailing)
                      <> " frontend=" <> show (length frontend)
+                     <> " rss=" <> T.unpack rssRecon0 <> " -> " <> T.unpack rssRecon1
+                     <> " idxMs=" <> show (ms tIdx0 tIdx1 :: Integer)
             let tt = TranscriptTimings
                   { ttSource        = TSConvEntries
                   , ttEntryCount    = length evs + trailingCount

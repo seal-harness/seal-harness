@@ -240,13 +240,31 @@ buildIndex convPath idxPath = do
 -- For N lines, returns N+1 offsets.
 scanLineOffsets :: FilePath -> IO [Word64]
 scanLineOffsets path = do
-  bs <- BS.readFile path
-  let lns = BS.split 0x0a bs
-      chunks = case reverse lns of
-        (lastChunk : _) | BS.null lastChunk -> init lns
-        _ -> lns
-      offsets = scanl (\off chunk -> off + fromIntegral (BS.length chunk) + 1) 0 chunks
-  pure offsets
+  withBinaryFile path ReadMode $ \h -> do
+    size <- hFileSize h
+    let fileSize = fromIntegral size :: Word64
+    scan h 0 [0] fileSize
+  where
+    chunkSize :: Int
+    chunkSize = 65536
+    scan h offset acc fileSize = do
+      allocaBytes chunkSize $ \ptr -> do
+        n <- hGetBuf h ptr chunkSize
+        if n == 0
+          then pure (reverse (finalizeIdx fileSize acc))
+          else do
+            bs <- BS.packCStringLen (castPtr ptr, n)
+            let nlIdxs = BS.elemIndices 10 bs
+                lineStarts = map (\i -> offset + fromIntegral i + 1) nlIdxs
+                newOffset = offset + fromIntegral n
+            scan h newOffset (reverse lineStarts ++ acc) fileSize
+
+-- | Add the file size as the final offset, avoiding a duplicate when the
+-- file ends with a newline (the last line-start already equals fileSize).
+finalizeIdx :: Word64 -> [Word64] -> [Word64]
+finalizeIdx fileSize acc = case acc of
+  (lastOff : _) | lastOff == fileSize -> acc
+  _ -> fileSize : acc
 
 -- | Write a list of Word64 offsets to an index file (little-endian).
 writeIndexFile :: FilePath -> [Word64] -> IO ()
@@ -296,35 +314,33 @@ ensureIndex convPath idxPath = do
 -- 'Right IndexCurrent' if the index is up-to-date.
 -- 'Right IndexBehind' if the index is behind (lastOffset < convSize).
 -- 'Left IndexCorrupt' if the index is structurally invalid.
+--
+-- O(1): reads only the first, middle, and last offset — not all N offsets.
+-- The previous O(N) validation (reading every offset and checking
+-- monotonicity) took 3.7s on a 724K-line index. The spot-check catches
+-- the common corruption cases (truncated file, wrong file, zeroed first
+-- offset) without the per-offset seek cost.
 validateIndex :: FilePath -> FilePath -> IO (Either ConvIndexError IndexStatus)
 validateIndex convPath idxPath = do
   idxSize <- withBinaryFile idxPath ReadMode hFileSize
   let entryCount = fromIntegral idxSize `div` word64Size
-  if entryCount == 0
-    then pure (Left IndexCorrupt)  -- empty index file (0 bytes)
+  if entryCount <= 1
+    then pure (Left IndexCorrupt)  -- need ≥2 entries: offset[0]=0, offset[N]=fileSize
     else do
-      offsets <- readAllOffsets idxPath
-      case offsets of
-        [] -> pure (Left IndexCorrupt)
-        (firstOff : _) ->
-          if firstOff /= 0
-            then pure (Left IndexCorrupt)
-            else case reverse offsets of
-              (_lastOff : _) | not (isMonotonic offsets) -> pure (Left IndexCorrupt)
-              (lastOff : _) -> do
-                convSize <- withBinaryFile convPath ReadMode hFileSize
-                if fromIntegral lastOff > convSize
-                  then pure (Left IndexCorrupt)
-                  else if fromIntegral lastOff < convSize
-                    then pure (Right IndexBehind)
-                    else pure (Right IndexCurrent)
-              [] -> pure (Left IndexCorrupt)
-
--- | Check that a list of Word64 values is strictly monotonically increasing.
-isMonotonic :: [Word64] -> Bool
-isMonotonic [] = True
-isMonotonic [_] = True
-isMonotonic (a : b : rest) = a < b && isMonotonic (b : rest)
+      (firstOff, midOff, lastOff) <- withBinaryFile idxPath ReadMode $ \h -> do
+        f <- readWord64At h 0
+        m <- readWord64At h (entryCount `div` 2)
+        l <- readWord64At h (entryCount - 1)
+        pure (f, m, l)
+      convSize <- withBinaryFile convPath ReadMode hFileSize
+      let corrupt = firstOff /= 0
+                 || not (firstOff < midOff && midOff <= lastOff)
+                 || fromIntegral lastOff > convSize
+      if corrupt
+        then pure (Left IndexCorrupt)
+        else if fromIntegral lastOff < convSize
+          then pure (Right IndexBehind)
+          else pure (Right IndexCurrent)
 
 -- | Read all Word64 offsets from the index file.
 readAllOffsets :: FilePath -> IO [Word64]

@@ -42,6 +42,21 @@ import Seal.Transcript.ConvIndex
 import Seal.Transcript.Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 
+-- | Maximum conversation lines to read per entry when reconstructing.
+-- Entries whose delta (erConvLen - priorConvLen) exceeds this are
+-- truncated to the last N messages — the most recent ones, which are
+-- what the frontend displays. This bounds total memory to
+-- pageEntries × maxLinesPerEntry × avgLineSize regardless of the
+-- conversation's total size or entry distribution. Without this cap, a
+-- session where the last 49 entries span 709K of 724K conversation lines
+-- would load ~3.6GB into memory, causing OOM.
+maxLinesPerEntry :: Int
+maxLinesPerEntry = 100
+
+-- | Cap the read range to the last 'maxLinesPerEntry' lines.
+capStart :: Int -> Int -> Int
+capStart start end = max start (end - maxLinesPerEntry)
+
 -- | Reconstruct the old 'TranscriptEntry' stream from the two new files.
 --
 -- The input is the full conversation (the @conversation.jsonl@ contents decoded
@@ -248,7 +263,7 @@ reconstructStreaming convPath idxPath entries = do
         EKRequest -> do
           let env = effectiveAtE e mEnv
               end = erConvLen e
-          eMsgs <- readMsgsH hs lc start end
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let sys = if envSystem env /= (envSystem =<< mEnv)
                       then envSystem env
                       else Nothing
@@ -261,13 +276,13 @@ reconstructStreaming convPath idxPath entries = do
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
-          eMsgs <- readMsgsH hs lc start end
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
               entry = toEntry e Response payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
-          eMsgs <- readMsgsH hs lc start (erConvLen e)
+          eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
           let payload = harnessPayload (msgsFromEither eMsgs) e
               entry = toEntry e Request payload
           rest <- go hs lc start mEnv es
@@ -310,6 +325,13 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
   -- envelope + conversation cursor at the start of the page.
   let (startConv, mEnv, _) = foldToStart entries 0 Nothing startEntry
       pageEntries = take limit (drop startEntry entries)
+      endConv = case reverse pageEntries of
+        [] -> startConv
+        (lastE : _) -> erConvLen lastE
+  putStrLn $ "[reconstruct] page entries=" <> show (length pageEntries)
+           <> " startEntry=" <> show startEntry
+           <> " convLines=" <> show (endConv - startConv)
+           <> " convRange=[" <> show startConv <> ".." <> show endConv <> "]"
   -- Phase 2: read conversation lines only for the page entries.
   withConvIndex convPath idxPath $ \hs -> go hs lc startConv mEnv pageEntries
   where
@@ -339,7 +361,7 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
         EKRequest -> do
           let env = effectiveAtE e mEnv
               end = erConvLen e
-          eMsgs <- readMsgsH hs lc start end
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let sys = if envSystem env /= (envSystem =<< mEnv)
                       then envSystem env
                       else Nothing
@@ -352,13 +374,13 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
-          eMsgs <- readMsgsH hs lc start end
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
               entry = toEntry e Response payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
-          eMsgs <- readMsgsH hs lc start (erConvLen e)
+          eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
           let payload = harnessPayload (msgsFromEither eMsgs) e
               entry = toEntry e Request payload
           rest <- go hs lc start mEnv es

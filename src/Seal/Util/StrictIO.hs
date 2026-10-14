@@ -23,6 +23,8 @@ module Seal.Util.StrictIO
   ( readFileStrict
   , readFileTextStrict
   , streamFirstMatch
+  , streamDecodeLines
+  , streamDecodeAfter
   , decodeFileStrict
   ) where
 
@@ -100,3 +102,110 @@ streamFirstMatch test path = runConduitRes
 -- expected to 'doesFileExist'-guard the path first).
 decodeFileStrict :: FromJSON a => FilePath -> IO (Maybe a)
 decodeFileStrict path = decode <$> readFileStrict path
+-- | Stream a file line-by-line via conduit, decoding each non-empty line as
+-- JSON. Unlike 'readFileTextStrict' which materializes the entire file as a
+-- single contiguous 'Text' (potentially hundreds of MB for large transcripts),
+-- this reads and decodes one line at a time. The file handle is released by
+-- the 'ResourceT' scope when the stream completes.
+--
+-- Empty lines (blank lines between entries) are skipped. Unparseable lines
+-- are silently dropped (matching the @mapMaybe A.decode@ pattern used by the
+-- existing 'readTranscriptEntriesTimed').
+streamDecodeLines :: FromJSON a => FilePath -> IO [a]
+streamDecodeLines path = runConduitRes
+  (sourceFile path .| lineDecodeLoop BS.empty)
+  where
+    lineDecodeLoop acc = do
+      mChunk <- await
+      case mChunk of
+        Nothing -> processRemaining acc
+        Just chunk -> splitLines (acc <> chunk)
+    -- | Split and decode all complete lines in the buffer, then await more.
+    -- When no newline is found in the buffer, await the next chunk. This
+    -- handles the case where a single chunk contains multiple lines (the
+    -- common case when @sourceFile@ delivers a large chunk).
+    splitLines bs =
+      case BS.elemIndex 10 bs of
+        Nothing -> lineDecodeLoop bs
+        Just idx ->
+          let line = BS.take idx bs
+              rest = BS.drop (idx + 1) bs
+          in decodeLine line (splitLines rest)
+    processRemaining bs
+      | BS.null bs = pure []
+      | otherwise = decodeLine bs (pure [])
+    decodeLine line cont =
+      if BS.null line
+        then cont
+        else case decode (BL.fromStrict line) of
+               Just a  -> fmap (a :) cont
+               Nothing -> cont
+
+-- | Stream a file line-by-line, skipping the first @skipCount@ non-empty
+-- lines, then decoding the remaining lines as JSON. This avoids both (a)
+-- materializing the entire file as a single 'Text' and (b) decoding lines
+-- that will be discarded. Used by 'readTranscriptEntriesTimed' when a
+-- 'ReadLastN' limit is set: the first @startConvLen@ conversation lines are
+-- skipped without decoding, and only the tail is decoded.
+--
+-- Empty lines are not counted toward @skipCount@ (matching the
+-- @filter (not . T.null) (T.lines raw)@ semantics of the existing code).
+streamDecodeAfter :: FromJSON a => Int -> FilePath -> IO [a]
+streamDecodeAfter skipCount path = runConduitRes
+  (sourceFile path .| skipThenDecode BS.empty skipCount)
+  where
+    skipThenDecode acc skip
+      | skip <= 0 = decodeLoop acc
+      | otherwise = do
+          mChunk <- await
+          case mChunk of
+            Nothing -> processRemainingSkip acc skip
+            Just chunk -> splitSkip (acc <> chunk) skip
+    -- | Split lines in the buffer, skipping non-empty ones until skip is
+    -- exhausted, then switching to decode mode. Handles multi-line chunks.
+    splitSkip bs skip
+      | skip <= 0 = splitDecode bs
+      | otherwise =
+          case BS.elemIndex 10 bs of
+            Nothing -> skipThenDecode bs skip
+            Just idx ->
+              let line = BS.take idx bs
+                  rest = BS.drop (idx + 1) bs
+              in if BS.null line
+                   then splitSkip rest skip
+                   else splitSkip rest (skip - 1)
+    processRemainingSkip bs skip
+      | skip <= 0 = processRemainingDecode bs
+      | BS.null bs = pure []
+      | otherwise =
+          case BS.elemIndex 10 bs of
+            Nothing -> pure []  -- remaining bytes are one last skipped line
+            Just idx ->
+              let line = BS.take idx bs
+                  rest = BS.drop (idx + 1) bs
+              in if BS.null line
+                   then processRemainingSkip rest skip
+                   else processRemainingSkip rest (skip - 1)
+    -- Decoding phase (skip exhausted): same as streamDecodeLines' loop.
+    decodeLoop acc = do
+      mChunk <- await
+      case mChunk of
+        Nothing -> processRemainingDecode acc
+        Just chunk -> splitDecode (acc <> chunk)
+    -- | Split and decode all complete lines in the buffer, then await more.
+    splitDecode bs =
+      case BS.elemIndex 10 bs of
+        Nothing -> decodeLoop bs
+        Just idx ->
+          let line = BS.take idx bs
+              rest = BS.drop (idx + 1) bs
+          in decodeLine line (splitDecode rest)
+    processRemainingDecode bs
+      | BS.null bs = pure []
+      | otherwise = decodeLine bs (pure [])
+    decodeLine line cont =
+      if BS.null line
+        then cont
+        else case decode (BL.fromStrict line) of
+               Just a  -> fmap (a :) cont
+               Nothing -> cont
