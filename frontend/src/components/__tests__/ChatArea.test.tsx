@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 
@@ -1401,12 +1401,11 @@ describe('AskHumanForm', () => {
     if (_resolve) _resolve(true)
   })
 
-  it('shows Answered (not Submitting) after POST resolves true, even without WS', async () => {
-    vi.useFakeTimers()
+  it('form dismisses immediately after POST resolves true, even without WS', async () => {
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
-    // Promise resolves true (accepted), but the pendingQuestions prop never
-    // changes (simulating WS ask_resolved never arriving).
+    // Promise resolves true (accepted). The form should dismiss immediately
+    // via onDismissed — no lingering "Answered" state, no timer.
     const onAnswerText = vi.fn(() => Promise.resolve(true))
     render(
       <ChatArea
@@ -1418,16 +1417,11 @@ describe('AskHumanForm', () => {
       />,
     )
     fireEvent.click(screen.getByText('main'))
-    // Flush the microtask so Promise.resolve(true) settles.
-    await vi.advanceTimersByTimeAsync(0)
-    // The indicator should show "Answered", not the spinner
-    expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
-    expect(screen.getByText('Answered')).toBeTruthy()
-    // Advance past the 15s grace period — no false error should appear
-    // (the timeout is gated on !answered).
-    await vi.advanceTimersByTimeAsync(16_000)
-    expect(screen.queryByText('No confirmation from server — try again')).toBeNull()
-    vi.useRealTimers()
+    // The form (and its container) should dismiss immediately after the
+    // POST resolves — no "Answered" state, no timer, no lingering border.
+    await waitFor(() => {
+      expect(screen.queryByTestId('ask-human-form')).toBeNull()
+    })
   })
 
   // Regression (session 20260921-192522-899): after the user answers an

@@ -894,22 +894,6 @@ function AskHumanForm({
   // and re-submission is blocked.
   const [answered, setAnswered] = useState(false)
 
-  // Auto-dismiss: after the answer is accepted, show the "Answered"
-  // confirmation for a brief moment, then hide the form. The WS
-  // ask_resolved event may take time to arrive (or never arrive if the
-  // connection is flaky); without this, the form stays visible in its
-  // "Answered" state indefinitely, which is especially noticeable now
-  // that the form is pinned to the bottom of the transcript.
-  const [hidden, setHidden] = useState(false)
-  useEffect(() => {
-    if (!answered) return
-    const id = window.setTimeout(() => {
-      setHidden(true)
-      onDismissed?.(pendingQuestion.id)
-    }, 1500)
-    return () => window.clearTimeout(id)
-  }, [answered, onDismissed, pendingQuestion.id])
-
   // Fallback: if the POST never resolves (network failure) and the form is
   // stuck in submitting, reset after a grace period so the user can retry.
   // This only fires when submitting=true AND answered=false (the POST is
@@ -933,11 +917,12 @@ function AskHumanForm({
     if (result && typeof result.then === 'function') {
       void result.then((accepted) => {
         if (accepted) {
-          // Answer accepted — clear submitting immediately. The form
-          // unmounts when the WS ask_resolved event removes the pending
-          // question; until then, `answered` keeps it disabled.
+          // Answer accepted — dismiss immediately. The parent removes
+          // the form and its container from the DOM via onDismissed,
+          // so there is no lingering "Answered" state or timer.
           setSubmitting(false)
           setAnswered(true)
+          onDismissed?.(pendingQuestion.id)
         } else {
           setSubmitting(false)
           setError('Answer failed — try again')
@@ -947,6 +932,7 @@ function AskHumanForm({
       // void return (older callback) — assume success.
       setSubmitting(false)
       setAnswered(true)
+      onDismissed?.(pendingQuestion.id)
     }
   }
 
@@ -960,9 +946,6 @@ function AskHumanForm({
       onCancel?.(pendingQuestion.id)
     }
   }
-
-  // Auto-dismissed — the form returns null after the "Answered" grace period.
-  if (hidden) return null
 
   const btnStyle = (color: string): React.CSSProperties => ({
     background: 'var(--bg-sunken)',
@@ -2506,16 +2489,24 @@ export function ChatArea({
     return filtered
   }, [messages, pendingQuestions])
 
-  // Track ASK_HUMAN question IDs that have been auto-dismissed (the user
-  // answered, the POST was accepted, and the 1.5s "Answered" grace period
-  // elapsed). These are filtered out of askHumanQuestions so the pinned
-  // container (including its border) unmounts immediately, without waiting
-  // for the WS ask_resolved event. Cleared when the question disappears
-  // from the raw pendingQuestions prop (WS event arrived).
-  const dismissedAskHumanIds = useRef<Set<string>>(new Set())
-  if (pendingQuestions && pendingQuestions.length > 0) {
-    for (const pq of pendingQuestions) dismissedAskHumanIds.current.delete(pq.id)
-  }
+  // Track ASK_HUMAN question IDs that have been dismissed (the user
+  // answered and the POST was accepted). Using state (not a ref) so
+  // that askHumanQuestions recomputes and the pinned container unmounts
+  // immediately — no timer needed. Stale entries (the WS event arrived
+  // and removed the question from pendingQuestions) are cleaned up in
+  // a useEffect so future questions with the same ID are not blocked.
+  const [dismissedAskHumanIds, setDismissedAskHumanIds] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    if (!Array.isArray(pendingQuestions) || pendingQuestions.length === 0) return
+    const currentIds = new Set(pendingQuestions.map((pq) => pq.id))
+    setDismissedAskHumanIds((prev) => {
+      const stale = [...prev].filter((id) => !currentIds.has(id) && !id.startsWith('synth:'))
+      if (stale.length === 0) return prev
+      const next = new Set(prev)
+      for (const id of stale) next.delete(id)
+      return next
+    })
+  }, [pendingQuestions])
 
   // Extract ASK_HUMAN questions (exclude confirmation-gate questions) for
   // the pinned bottom-of-transcript form. Guard with Array.isArray in case
@@ -2523,9 +2514,9 @@ export function ChatArea({
   // auto-dismissed questions so the container unmounts with the form.
   const askHumanQuestions = useMemo(
     () => (Array.isArray(effectivePendingQuestions)
-      ? effectivePendingQuestions.filter((pq) => isAskHumanQuestion(pq) && !dismissedAskHumanIds.current.has(pq.id))
+      ? effectivePendingQuestions.filter((pq) => isAskHumanQuestion(pq) && !dismissedAskHumanIds.has(pq.id))
       : []),
-    [effectivePendingQuestions],
+    [effectivePendingQuestions, dismissedAskHumanIds],
   )
 
   // Whether the session is actively thinking — drives the stop button's
@@ -3003,7 +2994,7 @@ export function ChatArea({
                 if (qid.startsWith('synth:')) return
                 onCancelQuestion?.(qid)
               }}
-              onDismissed={(qid) => { dismissedAskHumanIds.current.add(qid) }}
+              onDismissed={(qid) => { setDismissedAskHumanIds((prev) => new Set(prev).add(qid)) }}
             />
           ))}
         </div>
