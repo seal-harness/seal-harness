@@ -892,6 +892,19 @@ function AskHumanForm({
   // and re-submission is blocked.
   const [answered, setAnswered] = useState(false)
 
+  // Auto-dismiss: after the answer is accepted, show the "Answered"
+  // confirmation for a brief moment, then hide the form. The WS
+  // ask_resolved event may take time to arrive (or never arrive if the
+  // connection is flaky); without this, the form stays visible in its
+  // "Answered" state indefinitely, which is especially noticeable now
+  // that the form is pinned to the bottom of the transcript.
+  const [hidden, setHidden] = useState(false)
+  useEffect(() => {
+    if (!answered) return
+    const id = window.setTimeout(() => setHidden(true), 1500)
+    return () => window.clearTimeout(id)
+  }, [answered])
+
   // Fallback: if the POST never resolves (network failure) and the form is
   // stuck in submitting, reset after a grace period so the user can retry.
   // This only fires when submitting=true AND answered=false (the POST is
@@ -942,6 +955,9 @@ function AskHumanForm({
       onCancel?.(pendingQuestion.id)
     }
   }
+
+  // Auto-dismissed — the form returns null after the "Answered" grace period.
+  if (hidden) return null
 
   const btnStyle = (color: string): React.CSSProperties => ({
     background: 'var(--bg-sunken)',
