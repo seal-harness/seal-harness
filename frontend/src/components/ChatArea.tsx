@@ -874,10 +874,12 @@ function AskHumanForm({
   pendingQuestion,
   onAnswerText,
   onCancel,
+  onDismissed,
 }: {
   pendingQuestion: PendingQuestion
   onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
+  onDismissed?: (qid: string) => void
 }) {
   const [otherText, setOtherText] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -901,9 +903,12 @@ function AskHumanForm({
   const [hidden, setHidden] = useState(false)
   useEffect(() => {
     if (!answered) return
-    const id = window.setTimeout(() => setHidden(true), 1500)
+    const id = window.setTimeout(() => {
+      setHidden(true)
+      onDismissed?.(pendingQuestion.id)
+    }, 1500)
     return () => window.clearTimeout(id)
-  }, [answered])
+  }, [answered, onDismissed, pendingQuestion.id])
 
   // Fallback: if the POST never resolves (network failure) and the form is
   // stuck in submitting, reset after a grace period so the user can retry.
@@ -2501,11 +2506,25 @@ export function ChatArea({
     return filtered
   }, [messages, pendingQuestions])
 
+  // Track ASK_HUMAN question IDs that have been auto-dismissed (the user
+  // answered, the POST was accepted, and the 1.5s "Answered" grace period
+  // elapsed). These are filtered out of askHumanQuestions so the pinned
+  // container (including its border) unmounts immediately, without waiting
+  // for the WS ask_resolved event. Cleared when the question disappears
+  // from the raw pendingQuestions prop (WS event arrived).
+  const dismissedAskHumanIds = useRef<Set<string>>(new Set())
+  if (pendingQuestions && pendingQuestions.length > 0) {
+    for (const pq of pendingQuestions) dismissedAskHumanIds.current.delete(pq.id)
+  }
+
   // Extract ASK_HUMAN questions (exclude confirmation-gate questions) for
   // the pinned bottom-of-transcript form. Guard with Array.isArray in case
-  // the memo returns a non-array during error recovery.
+  // the memo returns a non-array during error recovery. Also filter out
+  // auto-dismissed questions so the container unmounts with the form.
   const askHumanQuestions = useMemo(
-    () => (Array.isArray(effectivePendingQuestions) ? effectivePendingQuestions.filter(isAskHumanQuestion) : []),
+    () => (Array.isArray(effectivePendingQuestions)
+      ? effectivePendingQuestions.filter((pq) => isAskHumanQuestion(pq) && !dismissedAskHumanIds.current.has(pq.id))
+      : []),
     [effectivePendingQuestions],
   )
 
@@ -2984,6 +3003,7 @@ export function ChatArea({
                 if (qid.startsWith('synth:')) return
                 onCancelQuestion?.(qid)
               }}
+              onDismissed={(qid) => { dismissedAskHumanIds.current.add(qid) }}
             />
           ))}
         </div>
