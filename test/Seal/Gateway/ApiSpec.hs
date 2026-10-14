@@ -3842,6 +3842,70 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
     status `shouldBe` 400
 
+  -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
+
+  it "GET /api/providers/default returns null when no default is set" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-def" "/tmp/seal-prov-def" vault
+    let app = apiApp deps
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "default"])
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "provider" o `shouldBe` Just A.Null
+      _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/providers/default sets the default + persists to config" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("anthropic" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Just "anthropic"
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/providers/default with null clears the default" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig { rcDefaultProvider = Just "anthropic" })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= A.Null ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "provider" o `shouldBe` Just A.Null
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/providers/default with unknown provider returns 400" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    req <- testPut ["api", "providers", "default"]
+      (A.encode (A.object [ "provider" .= ("unknown" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT
   -- /api/ui/state persists the last-chosen options; a follow-up GET

@@ -139,6 +139,8 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteProviderCreate :: SealRoute '[] '[] (Body Req) Resp
   RouteProviderUpdate :: SealRoute '[Text] '[] (Body Req) Resp
   RouteProviderDelete :: SealRoute '[Text] '[] Bodyless Resp
+  RouteProviderDefaultGet :: SealRoute '[] '[] Bodyless Resp
+  RouteProviderDefaultPut :: SealRoute '[] '[] (Body Req) Resp
   -- UI
   RouteUiStateGet    :: SealRoute '[] '[] Bodyless Resp
   RouteUiStatePut    :: SealRoute '[] '[] (Body Req) Resp
@@ -211,6 +213,8 @@ routeMeta = \case
   RouteProviderCreate -> Meta (match "providers" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteProviderUpdate -> Meta (match "providers" ./ capture textCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteProviderDelete -> Meta (match "providers" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
+  RouteProviderDefaultGet -> Meta (match "providers" ./ match "default" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteProviderDefaultPut -> Meta (match "providers" ./ match "default" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
@@ -275,6 +279,8 @@ allRoutes =
   , Constructed RouteProviderCreate
   , Constructed RouteProviderUpdate
   , Constructed RouteProviderDelete
+  , Constructed RouteProviderDefaultGet
+  , Constructed RouteProviderDefaultPut
   , Constructed RouteUiStateGet
   , Constructed RouteUiStatePut
   , Constructed RouteUiCustomModels

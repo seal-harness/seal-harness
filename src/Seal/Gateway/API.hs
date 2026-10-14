@@ -22,7 +22,7 @@ import Control.Applicative ((<|>))
 import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
 import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
@@ -528,6 +528,15 @@ apiApp deps req respond =
     (m', ["api", "providers"]) | m' == methodPost -> do
       body <- collectBody req
       respond =<< handleProviderCreate deps body
+    -- GET /api/providers/default -> the configured default provider.
+    -- Literal "default" must precede :name variable routes.
+    (m', ["api", "providers", "default"]) | m' == methodGet ->
+      respond =<< handleProviderDefaultGet deps
+    -- PUT /api/providers/default -> set or clear the default provider.
+    -- Literal "default" must precede :name variable routes.
+    (m', ["api", "providers", "default"]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleProviderDefaultPut deps body
     -- PUT /api/providers/:name -> update a provider's config (rotate key,
     -- set base_url / default_model). 200 on success, 400 on unknown.
     -- Literal "default" must precede this (WU-3).
@@ -2273,6 +2282,43 @@ handleProviderDelete deps name =
               _ <- updateRuntimeConfig cfgPath (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
               pure noContent
             else pure noContent
+
+-- | Handle GET /api/providers/default — returns the configured
+-- @default_provider@ from config.toml as @{"provider": "anthropic"}@ or
+-- @{"provider": null}@ when no default is set.
+handleProviderDefaultGet :: ApiDeps -> IO Response
+handleProviderDefaultGet deps = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadRuntimeConfig cfgPath
+  let def = case eCfg of
+        Right cfg -> rcDefaultProvider cfg
+        Left _    -> Nothing
+  pure (jsonOk (object ["provider" .= def]))
+
+-- | Handle PUT /api/providers/default — sets or clears the default
+-- provider. Body: @{"provider": "anthropic"}@ or @{"provider": null}@.
+-- 400 on unknown provider name. 200 on success.
+handleProviderDefaultPut :: ApiDeps -> BL.ByteString -> IO Response
+handleProviderDefaultPut deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseMaybe (withObject "default" (.: "provider")) v of
+      Nothing -> pure (errJson status400 "provider field is required")
+      Just mProv -> do
+        let cfgPath = srConfigPath (adSessionRuntime deps)
+            -- Validate non-null/non-empty provider names; null/empty clears.
+            mValid = case mProv of
+              Nothing -> Just Nothing
+              Just p | T.null p  -> Just Nothing
+                     | isNothing (parseProvider p) -> Nothing
+                     | otherwise -> Just (Just p)
+        case mValid of
+          Nothing -> pure (errJson status400 ("unknown provider: " <> T.pack (show mProv)))
+          Just validProv -> do
+            eRes <- updateRuntimeConfig cfgPath (\cfg -> cfg { rcDefaultProvider = validProv })
+            case eRes of
+              Left e  -> pure (errJson status500 e)
+              Right _ -> pure (jsonOk (object ["provider" .= validProv]))
 
 -- | T11: the STATIC model list for a provider. The real @/v1/models@
 -- upstream call needs vault credentials + a live HTTP request and is out of
