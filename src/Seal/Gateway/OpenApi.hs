@@ -127,6 +127,9 @@ openApiMeta = \case
   RouteProviderModels -> api (match "providers" ./ capture oaText ./ match "models" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProviderModelContext -> api (match "providers" ./ capture oaText ./ match "models" ./ capture oaText ./ match "context" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProvidersAll -> api (match "providers" ./ match "all" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteProviderCreate -> api (match "providers" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteProviderUpdate -> api (match "providers" ./ capture oaText ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteProviderDelete -> api (match "providers" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteUiStateGet -> api (match "ui" ./ match "state" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteUiStatePut -> api (match "ui" ./ match "state" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
   RouteUiCustomModels -> api (match "ui" ./ match "custom-models" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post

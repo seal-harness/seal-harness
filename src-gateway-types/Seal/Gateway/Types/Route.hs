@@ -136,6 +136,9 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteProviderModels :: SealRoute '[Text] '[] Bodyless Resp
   RouteProviderModelContext :: SealRoute '[Text, Text] '[] Bodyless Resp
   RouteProvidersAll :: SealRoute '[] '[] Bodyless Resp
+  RouteProviderCreate :: SealRoute '[] '[] (Body Req) Resp
+  RouteProviderUpdate :: SealRoute '[Text] '[] (Body Req) Resp
+  RouteProviderDelete :: SealRoute '[Text] '[] Bodyless Resp
   -- UI
   RouteUiStateGet    :: SealRoute '[] '[] Bodyless Resp
   RouteUiStatePut    :: SealRoute '[] '[] (Body Req) Resp
@@ -205,6 +208,9 @@ routeMeta = \case
   RouteProviderModels -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProviderModelContext -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ capture textCapture ./ match "context" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProvidersAll -> Meta (match "providers" ./ match "all" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteProviderCreate -> Meta (match "providers" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteProviderUpdate -> Meta (match "providers" ./ capture textCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteProviderDelete -> Meta (match "providers" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
@@ -266,6 +272,9 @@ allRoutes =
   , Constructed RouteProviderModels
   , Constructed RouteProviderModelContext
   , Constructed RouteProvidersAll
+  , Constructed RouteProviderCreate
+  , Constructed RouteProviderUpdate
+  , Constructed RouteProviderDelete
   , Constructed RouteUiStateGet
   , Constructed RouteUiStatePut
   , Constructed RouteUiCustomModels
