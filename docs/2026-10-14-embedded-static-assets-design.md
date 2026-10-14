@@ -235,7 +235,7 @@ embeddedAssetCount = Map.size embeddedAssets
 serveEmbedded :: Application
 serveEmbedded req respond =
   let segs = pathInfo req
-      key  = T.intercalate "/" (map T.toLower segs)
+      key  = T.intercalate "/" segs
   in case Map.lookup key embeddedAssets of
        Just bytes -> respond (embeddedResponse key bytes)
        Nothing
@@ -254,11 +254,21 @@ serveEmbedded req respond =
 -- the disk path for consistency with serveEmbedded.
 serveStatic staticDir req respond =
   let segs = pathInfo req
-      key  = T.intercalate "/" segs
-  in case mkSafePath (WorkspaceRoot staticDir) key of
-       Left _ -> respond notFoundResponse
-       Right safePath -> -- existing disk logic, now with isAssetPath→404 + cache policy
-         ...
+      key = T.intercalate "/" segs
+  eSafe <- mkSafePath (WorkspaceRoot staticDir) key
+  case eSafe of
+    Left PathEscapesWorkspace -> respond notFoundResponse
+    Left PathIsBlocked        -> respond notFoundResponse
+    Left PathDoesNotExist
+      | isAssetPath segs -> respond notFoundResponse
+      | otherwise        -> -- SPA fallback: serve index.html from disk
+          respond (responseFile status200
+            (contentTypeHeader ".html" <> cacheHeadersFor "index.html" <> nosniffHeader)
+            (staticDir </> "index.html") Nothing)
+    Right safePath -> -- serve file with MIME + cache + nosniff
+      respond (responseFile status200
+        (contentTypeHeader (takeExtension (getSafePath safePath)) <> cacheHeadersFor key <> nosniffHeader)
+        (getSafePath safePath) Nothing)
 ```
 
 **Response helper signatures** (all defined in `Server.hs`):
@@ -301,6 +311,26 @@ emptyEmbedResponse =
     \<p>Run <code>make build</code> with the frontend built, or set\
     \[gateway] static_dir in config.toml.</p></body></html>"
 ```
+
+**Auxiliary helpers** (referenced by `embeddedResponse`):
+
+```haskell
+-- | Content-Type header from a file extension (lowercases for case-insensitivity).
+contentTypeHeader :: String -> ResponseHeaders
+contentTypeHeader ext =
+  [("Content-Type", contentTypeFor (map toLower ext))]
+
+-- | Cache-Control headers per §4.4 policy: assets/ prefix → immutable,
+-- everything else (index.html, SPA fallback) → no-cache.
+cacheHeadersFor :: FilePath -> ResponseHeaders
+cacheHeadersFor key
+  | "assets/" `isPrefixOf` key = [("Cache-Control", "public, max-age=31536000, immutable")]
+  | otherwise                  = [("Cache-Control", "no-cache")]
+```
+
+Note: `contentTypeFor` should lowercase its input internally (or
+`contentTypeHeader` pre-lowercases as shown) so both serving paths get
+case-insensitive MIME matching regardless of caller.
 
 **`isAssetPath`** — the complete, pinned extension set (case-insensitive).
 EXCLUDES `.html` so extensionless SPA routes always fall back to
