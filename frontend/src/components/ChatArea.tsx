@@ -633,7 +633,7 @@ function toolCallSummary(input: unknown): string {
   const obj = input as Record<string, unknown>
   // Show the most operationally relevant arg inline. Order is intentional:
   // shell-ish args first, then file/path, then query-style args.
-  const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url']
+  const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url', 'question']
   for (const k of preferredKeys) {
     const v = obj[k]
     if (typeof v === 'string' && v.length > 0) return v
@@ -1042,14 +1042,12 @@ function ToolCallBlock({
   anchorId,
   pendingQuestion,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   tc: ToolCallInfo
   anchorId: string
   pendingQuestion?: PendingQuestion
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -1067,7 +1065,12 @@ function ToolCallBlock({
 
   useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman, isShowHuman])
 
-  const summary = toolCallSummary(tc.input)
+  const isPending = pendingQuestion !== undefined
+  // For pending ASK_HUMAN, suppress the summary — the question text is
+  // shown in the pinned AskHumanForm at the bottom of the transcript, so
+  // showing it here too would duplicate it. Answered ASK_HUMAN shows the
+  // question text as a transcript record.
+  const summary = (isAskHuman && isPending) ? '' : toolCallSummary(tc.input)
   const inputJson = (() => {
     try { return JSON.stringify(tc.input, null, 2) } catch { return String(tc.input) }
   })()
@@ -1078,7 +1081,6 @@ function ToolCallBlock({
   const failed = tc.exitCode !== undefined && tc.exitCode !== null
     ? tc.exitCode !== 0
     : tc.resultIsError ?? false
-  const isPending = pendingQuestion !== undefined
 
   const btnStyle = (color: string): React.CSSProperties => ({
     background: 'var(--bg-sunken)',
@@ -1176,16 +1178,6 @@ function ToolCallBlock({
           )}
         </div>
       )}
-      {/* The AskHumanForm renders OUTSIDE the collapsible section, attached
-          to the box but always visible — so the tool-call box can stay
-          collapsed for conciseness (AC13: opcode === 'ASK_HUMAN' &&
-          options.length > 0). Open-ended ASK_HUMAN (no options) renders the
-          same form with only the textarea. */}
-      {isPending && pendingQuestion && isAskHuman && onAnswerText && onCancel && (
-        <div className="px-3 pb-3">
-          <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
-        </div>
-      )}
     </div>
   )
 }
@@ -1268,19 +1260,27 @@ function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
   }
 }
 
+/** Distinguish ASK_HUMAN pending questions from confirmation-gate
+ *  questions. The confirmation gate uses the format
+ *  "Allow <NAME> <JSON>? [y/N] "; ASK_HUMAN questions are free-form text
+ *  from the model. Synthesized questions (id starts with "synth:") are
+ *  always ASK_HUMAN. */
+function isAskHumanQuestion(pq: PendingQuestion): boolean {
+  if (pq.id.startsWith('synth:')) return true
+  return !pq.question.match(/^Allow\s+\S+\s+\{.*\}\?/)
+}
+
 function MessageBlock({
   block,
   pendingQuestions,
   matchedQuestionIds,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   block: MessageContent
   pendingQuestions?: PendingQuestion[]
   matchedQuestionIds: Set<string>
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   if (block.toolCall) {
@@ -1302,7 +1302,6 @@ function MessageBlock({
         anchorId={block.id ?? `tc-${block.toolCall.id}`}
         pendingQuestion={pq}
         onAnswer={onAnswer}
-        onAnswerText={onAnswerText}
         onCancel={onCancel}
       />
     )
@@ -1369,7 +1368,6 @@ const ChatMessage = memo(function ChatMessage({
   sending,
   pendingQuestions,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   message: Message
@@ -1377,7 +1375,6 @@ const ChatMessage = memo(function ChatMessage({
   sending?: boolean
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const anchorId = `msg-${message.id}`
@@ -1486,7 +1483,6 @@ const ChatMessage = memo(function ChatMessage({
             pendingQuestions={pendingQuestions}
             matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
-            onAnswerText={onAnswerText}
             onCancel={onCancel}
           />
         ))}
@@ -2489,6 +2485,14 @@ export function ChatArea({
     return filtered
   }, [messages, pendingQuestions])
 
+  // Extract ASK_HUMAN questions (exclude confirmation-gate questions) for
+  // the pinned bottom-of-transcript form. Guard with Array.isArray in case
+  // the memo returns a non-array during error recovery.
+  const askHumanQuestions = useMemo(
+    () => (Array.isArray(effectivePendingQuestions) ? effectivePendingQuestions.filter(isAskHumanQuestion) : []),
+    [effectivePendingQuestions],
+  )
+
   // Whether the session is actively thinking — drives the stop button's
   // visibility. The parent (App.tsx) derives this from the live activity
  // visibility. The parent (App.tsx) derives `isSessionThinking` from the
@@ -2903,13 +2907,6 @@ export function ChatArea({
                           sending={sending}
                           pendingQuestions={effectivePendingQuestions}
                           onAnswer={onAnswerQuestion}
-                          onAnswerText={(qid, answer) => {
-                            if (qid.startsWith('synth:')) {
-                              onSend?.(answer)
-                              return Promise.resolve(true)
-                            }
-                            return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                          }}
                           onCancel={(qid) => {
                             if (qid.startsWith('synth:')) return
                             onCancelQuestion?.(qid)
@@ -2933,13 +2930,6 @@ export function ChatArea({
                       sending={sending}
                       pendingQuestions={effectivePendingQuestions}
                       onAnswer={onAnswerQuestion}
-                      onAnswerText={(qid, answer) => {
-                        if (qid.startsWith('synth:')) {
-                          onSend?.(answer)
-                          return Promise.resolve(true)
-                        }
-                        return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                      }}
                       onCancel={(qid) => {
                         if (qid.startsWith('synth:')) return
                         onCancelQuestion?.(qid)
@@ -2953,6 +2943,35 @@ export function ChatArea({
           <div ref={messagesEndRef} />
         </div>
       </div>
+
+      {/* Pinned ASK_HUMAN question — rendered at the bottom of the
+          transcript, above the input area, so it's always visible even
+          when background sub-agents add entries that would push an inline
+          form up. The tool call blocks processing, so the question UI
+          should be where the user's attention naturally is. The inline
+          tool-call block in the transcript shows a collapsed "needs input"
+          indicator; the interactive form lives here. */}
+      {askHumanQuestions.length > 0 && (
+        <div className="shrink-0 px-5 py-3" style={{ borderTop: '1px solid var(--accent-primary)' }}>
+          {askHumanQuestions.map((pq) => (
+            <AskHumanForm
+              key={pq.id}
+              pendingQuestion={pq}
+              onAnswerText={(qid, answer) => {
+                if (qid.startsWith('synth:')) {
+                  onSend?.(answer)
+                  return Promise.resolve(true)
+                }
+                return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+              }}
+              onCancel={(qid) => {
+                if (qid.startsWith('synth:')) return
+                onCancelQuestion?.(qid)
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Input area. In compose mode we keep the textarea right where it
           always lives, just rewire its submit path. For raw_shell the
