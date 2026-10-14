@@ -2492,21 +2492,10 @@ export function ChatArea({
   // Track ASK_HUMAN question IDs that have been dismissed (the user
   // answered and the POST was accepted). Using state (not a ref) so
   // that askHumanQuestions recomputes and the pinned container unmounts
-  // immediately — no timer needed. Stale entries (the WS event arrived
-  // and removed the question from pendingQuestions) are cleaned up in
-  // a useEffect so future questions with the same ID are not blocked.
+  // immediately — no timer needed. IDs are unique per session (AskIds
+  // from the store), so no cleanup is needed — the set is small and
+  // resets on session change (ChatArea re-mounts).
   const [dismissedAskHumanIds, setDismissedAskHumanIds] = useState<Set<string>>(new Set())
-  useEffect(() => {
-    if (!Array.isArray(pendingQuestions) || pendingQuestions.length === 0) return
-    const currentIds = new Set(pendingQuestions.map((pq) => pq.id))
-    setDismissedAskHumanIds((prev) => {
-      const stale = [...prev].filter((id) => !currentIds.has(id) && !id.startsWith('synth:'))
-      if (stale.length === 0) return prev
-      const next = new Set(prev)
-      for (const id of stale) next.delete(id)
-      return next
-    })
-  }, [pendingQuestions])
 
   // Extract ASK_HUMAN questions (exclude confirmation-gate questions) for
   // the pinned bottom-of-transcript form. Guard with Array.isArray in case
