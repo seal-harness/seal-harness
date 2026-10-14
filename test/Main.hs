@@ -126,6 +126,7 @@ import qualified Seal.Memory.StoreSpec
 import qualified Seal.Memory.EmbeddingSpec
 import qualified Seal.Memory.EngramBackendSpec
 import qualified Seal.Skills.TypesSpec
+import qualified Seal.Cron.TypesSpec
 import qualified Seal.Skills.BackendSpec
 import qualified Seal.Skills.BackendNoDirectFsFailSpec
 import qualified Seal.Skills.PromptSpec
@@ -313,6 +314,7 @@ specs = do
   Seal.Memory.EmbeddingSpec.spec
   Seal.Memory.EngramBackendSpec.spec
   Seal.Skills.TypesSpec.spec
+  Seal.Cron.TypesSpec.spec
   Seal.Skills.BackendSpec.spec
   Seal.Skills.PromptSpec.spec
   Seal.Agent.Def.TypesSpec.spec
