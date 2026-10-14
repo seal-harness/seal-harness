@@ -55,7 +55,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
@@ -95,7 +95,9 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
-  ( KnownProvider (..), parseProvider, providerLabel )
+  ( KnownProvider (..), anthropicOAuthKey, knownProviders
+  , parseProvider, providerLabel, vaultKeyName )
+import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -105,8 +107,8 @@ import Seal.SourceControl.Repo
   , repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
-import Seal.Security.Vault (VaultHandle (vhDelete, vhList, vhPut))
-import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound))
+import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
+import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
@@ -515,6 +517,11 @@ apiApp deps req respond =
     (m', ["api", "providers"]) | m' == methodGet -> do
       providers <- adProviders deps
       respond (jsonLBS status200 (A.encode (map providerInfoJson providers)))
+    -- GET /api/providers/all -> ALL known providers with full status
+    -- details (authStatus, isDefault, defaultModel, baseUrl) for the
+    -- ProvidersView CRUD page. Literal "all" must precede :p/models.
+    (m', ["api", "providers", "all"]) | m' == methodGet ->
+      respond =<< handleProvidersAll deps
     -- T11: GET /api/providers/:p/models -> a STATIC list of models for the
     -- provider (the real /v1/models upstream call needs vault credentials +
     -- a live HTTP request and is out of scope). Context windows come from
@@ -2055,6 +2062,67 @@ jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
 -- threaded into 'ApiDeps' for T11.
 providerInfoJson :: KnownProvider -> Value
 providerInfoJson p = object ["name" .= providerLabel p]
+
+-- | Handle GET /api/providers/all — returns ALL known providers with full
+-- status details for the ProvidersView CRUD page. Each provider object
+-- includes name, isDefault, defaultModel, baseUrl, and authStatus.
+handleProvidersAll :: ApiDeps -> IO Response
+handleProvidersAll deps = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadRuntimeConfig cfgPath
+  let cfg = fromRight defaultRuntimeConfig eCfg
+  mh <- readIORef (vrHandleRef (adVault deps))
+  details <- mapM (providerDetailJson cfg mh) knownProviders
+  pure (jsonLBS status200 (A.encode details))
+
+-- | Build the detailed JSON object for a single provider, including its
+-- auth status (derived from the vault + config), default-model, base-URL,
+-- and whether it is the configured default provider.
+providerDetailJson :: RuntimeConfig -> Maybe VaultHandle -> KnownProvider -> IO Value
+providerDetailJson cfg mh kp = do
+  authStatus <- providerAuthStatus mh cfg kp
+  let lbl = providerLabel kp
+      isDef = rcDefaultProvider cfg == Just lbl
+      dModel = providerDefaultModel cfg lbl
+      bUrl = providerBaseUrl cfg lbl
+  pure $ object
+    [ "name" .= lbl
+    , "isDefault" .= isDef
+    , "defaultModel" .= dModel
+    , "baseUrl" .= bUrl
+    , "authStatus" .= authStatus
+    ]
+
+-- | Determine the auth status for a provider by probing the vault. For
+-- Ollama, a keyless local base URL returns "keyless" without touching the
+-- vault. For Anthropic, OAuth tokens take precedence over an API key.
+providerAuthStatus :: Maybe VaultHandle -> RuntimeConfig -> KnownProvider -> IO Text
+providerAuthStatus mh cfg kp = case kp of
+  OllamaProvider -> do
+    let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg "ollama")
+    if not (ollamaNeedsKey baseUrl)
+      then pure "keyless"
+      else case mh of
+        Nothing   -> pure "none"
+        Just vh   -> probeVault vh (vaultKeyName OllamaProvider)
+  AnthropicProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> do
+      eOAuth <- vhGet vh anthropicOAuthKey
+      case eOAuth of
+        Right _         -> pure "oauth"
+        Left VaultLocked -> pure "vault-locked"
+        Left _           -> probeVault vh (vaultKeyName AnthropicProvider)
+
+-- | Probe the vault for a single key and return the auth status string.
+probeVault :: VaultHandle -> Text -> IO Text
+probeVault vh key = do
+  r <- vhGet vh key
+  pure $ case r of
+    Right _                   -> "api-key"
+    Left VaultLocked          -> "vault-locked"
+    Left (VaultKeyNotFound _) -> "none"
+    Left _                    -> "none"
 
 -- | T11: the STATIC model list for a provider. The real @/v1/models@
 -- upstream call needs vault credentials + a live HTTP request and is out of

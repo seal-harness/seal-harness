@@ -5,7 +5,7 @@ module Seal.Gateway.ApiSpec (spec) where
 import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
-import Control.Monad (replicateM_, void)
+import Control.Monad (forM_, replicateM_, void)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -3657,6 +3657,37 @@ spec = describe "Seal.Gateway.API" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
     status `shouldBe` 200
+
+  it "GET /api/providers/all returns 200 with all known providers" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+    status `shouldBe` 200
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers/all body: " ++ show body)
+    length arr `shouldBe` length knownProviders
+    forM_ arr $ \case
+      A.Object o -> do
+        lookupK "name" o `shouldSatisfy` isJust
+        lookupK "isDefault" o `shouldSatisfy` isJust
+        lookupK "authStatus" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected object"
+
+  it "GET /api/providers/all returns authStatus for locked vault" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers/all body: " ++ show body)
+    -- mkApp uses fakeLockedVaultRuntime, so Ollama with default local URL
+    -- shows "keyless" and Anthropic shows "vault-locked".
+    forM_ arr $ \case
+      A.Object o -> case lookupK "name" o of
+        Just (A.String n)
+          | n == "ollama"    -> lookupK "authStatus" o `shouldBe` Just (A.String "keyless")
+          | n == "anthropic" -> lookupK "authStatus" o `shouldBe` Just (A.String "none")
+        _ -> pure ()
+      _ -> pure ()
 
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT
