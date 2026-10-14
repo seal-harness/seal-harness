@@ -1,7 +1,7 @@
 # Seal Harness — Embedded Static Asset Distribution & Serving
 
 **Date:** 2026-10-14
-**Status:** Proposal — extends and supersedes the scoping in `docs/2026-07-22-embed-frontend-plan.md` (never implemented)
+**Status:** Revised (design review gate iteration 2) — extends and supersedes the scoping in `docs/2026-07-22-embed-frontend-plan.md` (never implemented). Revision addresses 6 blockers from 5-agent design review: embedDir key format verified, response helpers specified, isAssetPath extension list pinned, SafePath used for disk traversal fix, distManifest exported, --static-dir CLI flag specified.
 **Research provenance:** Sub-agent code studies of OpenCode, OpenClaw, and Hermes Agent (2026-10-14; repos at `/Users/zoe/code/{opencode,openclaw,hermes-agent}`). `file-embed` API verified against upstream master (`snoyberg/file-embed`); `wai-app-static` 3.2.1 verified on Hackage. seal-harness tree inspected directly at HEAD.
 **Intended repo home after review:** `docs/2026-10-14-embedded-static-assets-design.md`
 
@@ -165,12 +165,14 @@ No API or config changes.
 module Seal.Gateway.Embedded
   ( embeddedAssets      -- :: Map FilePath ByteString
   , embeddedAssetCount  -- :: Int
+  , distManifest        -- :: String
   ) where
 
 import Data.ByteString (ByteString)
 import Data.FileEmbed (embedDir, embedOneStringFileOf)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Language.Haskell.TH (Exp, Q)
 import Language.Haskell.TH.Syntax (runIO)
 import System.Directory (doesDirectoryExist)
@@ -178,8 +180,14 @@ import System.Directory (doesDirectoryExist)
 -- | Frontend bytes keyed by forward-slash path relative to the dist root
 -- ("index.html", "assets/index-De3F1a.js"). embedDir properties (verified
 -- in file-embed source): recursive, sorted, dot-prefixed entries skipped
--- (so the .seal-manifest sentinel never appears in the served map), and
--- every embedded file registered with qAddDependentFile.
+-- (so the .seal-manifest sentinel never appears in the served map), every
+-- embedded file registered with qAddDependentFile, and keys are relative
+-- paths joined with System.FilePath.(</>) — which uses "/" on Unix
+-- (verified in file-embed source: `fileList'` builds keys via
+-- `top </> filename` where top starts as ""). This matches the
+-- `T.intercalate "/"` lookup in serveEmbedded. Target platforms are Unix-only.
+-- every embedded file registered with qAddDependentFile (qAddDependentFile
+-- is called inside pairToExp in file-embed's embedDir implementation).
 embeddedAssets :: Map FilePath ByteString
 embeddedAssets = Map.fromList $(embedDistOrEmpty "frontend/dist")
 
@@ -191,6 +199,9 @@ embeddedAssets = Map.fromList $(embedDistOrEmpty "frontend/dist")
 -- build. Fallback file (committed) keeps `cabal build` working from a
 -- clean checkout with no dist.
 distManifest :: String
+-- Exported (not just a side-effect splice) to avoid -Wunused-top-binds
+-- under -Wall -Werror. Also useful for debugging: the manifest hash
+-- identifies which UI build is embedded in a running binary.
 distManifest = $(embedOneStringFileOf
   [ "frontend/dist/.seal-manifest"
   , "config/frontend-dist-absent.txt" ])
@@ -219,31 +230,109 @@ embeddedAssetCount = Map.size embeddedAssets
 -- structurally impossible (pure Map lookup, no filesystem involved).
 -- SPA routes fall back to the embedded index.html; misses on asset-like
 -- extensions 404 (OpenClaw pattern) so a bad asset URL never returns HTML.
+-- When the map is empty (fresh checkout / pure nix build), returns a
+-- helpful HTML page explaining the situation rather than a bare 404.
 serveEmbedded :: Application
 serveEmbedded req respond =
   let segs = pathInfo req
-      key  = T.intercalate "/" segs
+      key  = T.intercalate "/" (map T.toLower segs)
   in case Map.lookup key embeddedAssets of
-       Just bytes -> respond (embeddedResponse segs bytes)
+       Just bytes -> respond (embeddedResponse key bytes)
        Nothing
          | isAssetPath segs -> respond notFoundResponse
          | Just idx <- Map.lookup "index.html" embeddedAssets ->
              respond (indexResponse idx)
-         | otherwise -> respond notFoundResponse
+         | otherwise -> respond emptyEmbedResponse
 
--- | Traversal fix for the existing disk path: reject "", ".", ".."
--- segments before joining (closes the gap at Server.hs:72-83).
+-- | Traversal fix for the existing disk path: route through
+-- Seal.Security.Path.mkSafePath (already in the repo) which performs
+-- lexical collapse + canonicalizePath + post-canonical containment
+-- check — strictly stronger than a hand-rolled segment check. It
+-- handles encoded-path bypasses (..%2f → single segment ".."), symlink
+-- escapes, and blocked dotfiles (.env, .seal, etc.). The static dir
+-- is treated as the WorkspaceRoot. Also applies isAssetPath→404 to
+-- the disk path for consistency with serveEmbedded.
 serveStatic staticDir req respond =
   let segs = pathInfo req
-  in if any (`elem` ["", ".", ".."]) segs
-       then respond notFoundResponse
-       else -- existing disk logic, now with the cache policy below
+      key  = T.intercalate "/" segs
+  in case mkSafePath (WorkspaceRoot staticDir) key of
+       Left _ -> respond notFoundResponse
+       Right safePath -> -- existing disk logic, now with isAssetPath→404 + cache policy
+         ...
 ```
 
-`isAssetPath` = any segment's final component has a known static extension
-(`.js .css .map .json .png .svg ...`). `contentTypeFor` gets the missing
-extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
-.webmanifest`.
+**Response helper signatures** (all defined in `Server.hs`):
+
+```haskell
+-- | Build a 200 response for an embedded asset with MIME + cache headers.
+embeddedResponse :: FilePath -> ByteString -> Response
+embeddedResponse key bytes =
+  responseLBS status200
+    (contentTypeHeader (takeExtension key)
+      <> cacheHeadersFor key
+      <> nosniffHeader)
+    (LBS.fromStrict bytes)
+
+-- | Build a 200 response for SPA fallback (index.html) with no-cache.
+indexResponse :: ByteString -> Response
+indexResponse bytes =
+  responseLBS status200
+    [("Content-Type", "text/html; charset=utf-8")
+    ,("Cache-Control", "no-cache")
+    ,("X-Content-Type-Options", "nosniff")]
+    (LBS.fromStrict bytes)
+
+-- | 404 for missing asset-like paths (prevents content-type confusion).
+notFoundResponse :: Response
+notFoundResponse =
+  responseLBS status404
+    [("Content-Type", "text/plain")
+    ,("X-Content-Type-Options", "nosniff")]
+    "not found"
+
+-- | Helpful HTML page when no assets are embedded (fresh checkout / nix).
+emptyEmbedResponse :: Response
+emptyEmbedResponse =
+  responseLBS status404
+    [("Content-Type", "text/html; charset=utf-8")
+    ,("Cache-Control", "no-cache")
+    ,("X-Content-Type-Options", "nosniff")]
+    "<html><body><h1>No UI embedded in this build</h1>\
+    \<p>Run <code>make build</code> with the frontend built, or set\
+    \[gateway] static_dir in config.toml.</p></body></html>"
+```
+
+**`isAssetPath`** — the complete, pinned extension set (case-insensitive).
+EXCLUDES `.html` so extensionless SPA routes always fall back to
+`index.html`. Too broad → `/user.profile` 404s; too narrow → missing
+`.woff2` returns HTML.
+
+```haskell
+isAssetPath :: [Text] -> Bool
+isAssetPath segs = case segs of
+  [] -> False
+  _  -> let ext = T.toLower (T.pack (takeExtension (T.unpack (last segs))))
+        in ext `elem` assetExtensions
+
+assetExtensions :: [Text]
+assetExtensions =
+  [ ".js", ".mjs", ".css", ".map", ".json", ".txt", ".webmanifest"
+  , ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".svg", ".ico"
+  , ".woff", ".woff2", ".ttf", ".otf", ".wasm"
+  ]
+```
+
+**`contentTypeFor`** expanded (case-insensitive, shared by both paths):
+`.html`→`text/html`, `.js`/`.mjs`→`application/javascript`, `.css`→
+`text/css`, `.json`→`application/json`, `.svg`→`image/svg+xml`, `.png`→
+`image/png`, `.ico`→`image/x-icon`, `.jpg`/`.jpeg`→`image/jpeg`, `.gif`→
+`image/gif`, `.webp`→`image/webp`, `.avif`→`image/avif`, `.map`→
+`application/json`, `.txt`→`text/plain`, `.webmanifest`→
+`application/manifest+json`, `.woff`→`font/woff`, `.woff2`→`font/woff2`,
+`.ttf`→`font/ttf`, `.otf`→`font/otf`, `.wasm`→`application/wasm`.
+
+**`nosniffHeader`**: `[("X-Content-Type-Options", "nosniff")]` — added to
+ALL static responses (both embedded and disk) in M1, not deferred to M4.
 
 ### 4.4 Cache policy (harness-informed)
 
@@ -270,6 +359,15 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
   check: build test lint  # inherits the gate — CI runs make check
   ```
 
+- **`make check` npm coupling:** gating `build` (and thus `check`) on
+  `frontend-build` means every `make check` now requires npm + network
+  access for `npm install`. This changes the primary developer gate.
+  Mitigation: `frontend-install` is idempotent (npm caches in
+  `node_modules`), so the cost is a no-op after the first run. If this
+  proves burdensome, decouple by making `test`/`lint` not depend on
+  `build` (they don't embed assets) — only `build` and `serve` need the
+  frontend. This is listed as risk R8 below.
+
 - Staleness analysis (the subtle part): current `file-embed` registers
   every embedded file via `qAddDependentFile`, so *edited* files retrigger
   recompilation of the embedding module. But its own docs warn that
@@ -285,6 +383,16 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
   register deps. Upstream master *does* register (verified in source).
   Either the comment is stale or the pinned version predates it — worth
   checking when implementing; the sentinel approach is robust either way.
+  **Update (verified during design review):** upstream master *does*
+  register — `embedFile` calls `qAddDependentFile fp` unconditionally
+  when `MIN_VERSION_template_haskell(2,7,0)`. The Builtins comment is
+  stale; fix it as a low-risk drive-by during M1.
+
+- The causal chain for the sentinel: manifest file changes →
+  `qAddDependentFile` (registered inside `embedOneStringFileOf`) triggers
+  GHC's recompilation check → module recompiles → `embedDistOrEmpty`
+  splice re-runs → new dist bytes embedded. The `qAddDependentFile`
+  registration is the trigger; changed bytes are the consequence.
 
 ### 4.6 Cabal / sdist / nix
 
@@ -309,21 +417,43 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
 - **Release/default:** `seal serve`, no config → embedded UI.
 - **Hot iteration:** `npm run dev` (Vite dev server on :5173 proxying
   `/api` → :8080 — already configured). No recompile involved.
-- **Fresh-disk-without-recompile:** set `[gateway] static_dir` to
-  `frontend/dist`. Implementation detail to verify: whether `seal serve`
-  has a CLI flag for static_dir (check `Seal/Command/Serve.hs` wiring);
-  if yes, `make serve` should pass it so the just-built dist wins over a
+- **Fresh-disk-without-recompile:** `seal serve` gets a new `--static-dir`
+  CLI flag (M2 deliverable). Verified during design review: no CLI flag
+  exists today (`Seal/Command/Serve.hs` reads `static_dir` only from TOML
+  via `loadRuntimeConfig → withGatewayDefaults → gcStaticDir`; the serve
+  command parser in `Seal/Types/Command.hs` only carries `--yolo`). The
+  flag is added as:
+  ```haskell
+  -- In Seal/Types/Command.hs:
+  CommandServe AutonomyLevel (Maybe FilePath)
+  -- Parser: strOption (long "static-dir" <> metavar "DIR" <> optional)
+  ```
+  Threaded through `AppMain.hs → runServeMain → runGateway`, overriding
+  `gcStaticDir` from TOML when present. `make serve` passes
+  `--static-dir frontend/dist` so the just-built dist wins over a
   possibly-stale embedded copy.
 
 ### 4.8 Security
 
 - Embedded serving: traversal structurally impossible (Map lookup, no FS);
-  segments still validated defensively.
-- Disk path: reject `""`, `.`, `..` segments (fix above).
-- Asset-extension misses 404 instead of returning HTML (OpenClaw pattern).
+  segments still validated defensively. Dotfiles excluded by `embedDir`
+  (skips dot-prefixed entries), so `.seal-manifest` is never served.
+- Disk path: routed through `Seal.Security.Path.mkSafePath` (lexical
+  collapse + canonicalizePath + symlink containment + blocked-name
+  filtering). Handles encoded-path bypasses (`..%2f`), symlink escapes,
+  and blocks `.env`/`.seal`/`.ssh`/`.gnupg`/`.netrc` via `blockedNames`.
+  Consider extending `blockedNames` or adding a general dotfile rejection
+  for the static-serving context so `.seal-manifest` is also blocked.
+- Asset-extension misses 404 on BOTH paths (not just embedded) — prevents
+  content-type confusion (OpenClaw pattern).
+- `X-Content-Type-Options: nosniff` on ALL static responses in M1 —
+  one-line addition, zero downside, prevents MIME-sniffing. Not deferred.
+- Extension matching is case-insensitive (normalized via `T.toLower`).
 - CSP header on static responses: defer to M4 — the gateway serves the API
   on the same origin, so the policy needs joint review with the API
-  surface first.
+  surface first. A baseline restrictive CSP (`default-src 'self') could
+  ship in M1 if desired, but the embedded assets are compile-time-trusted
+  and React escapes by default, so the XSS surface is limited.
 
 ### 4.9 Testing
 
@@ -331,12 +461,18 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
   assert `"index.html"` is a key; keys are relative, forward-slash, and
   contain no `..` segments. Tolerate `count == 0` (nix/fresh checkout) —
   assert the manifest path instead.
-- Extend `test/Seal/Gateway/ServerSpec.hs` with the embedded app (existing
-  `ApiTestHarness` pattern): `GET /` → 200 `text/html` + `no-cache`;
+- Extend `test/Seal/Gateway/ServerSpec.hs` with the embedded app (following
+  the existing `mkDeps` + `runAppStatus` + `defaultRequest{pathInfo=...}`
+  pattern already established in ServerSpec.hs — there is no type called
+  `ApiTestHarness`): `GET /` → 200 `text/html` + `no-cache` + `nosniff`;
   `GET /assets/<known embedded key>` → 200, bytes equal, `immutable`;
   `GET /some/spa/route` → 200 `index.html`; `GET /assets/nonexistent.js`
-  → 404; traversal probes (`/../`, `/..%2f`) → no 200. Disk-path traversal
-  test with a temp static dir.
+  → 404; `GET /user.profile` → 200 (SPA fallback, not 404 — dot-extension
+  not in assetExtensions); traversal probes (`/../`, `/..%2f`) → no 200;
+  `X-Content-Type-Options: nosniff` present on all static responses.
+  Disk-path traversal test with a temp static dir (verify `mkSafePath`
+  rejects `..`, symlinks, and blocked dotfiles). Disk-path cache headers
+  match embedded-path policy. `.seal-manifest` is not served on either path.
 - Optional later: Playwright smoke against the built binary (the frontend
   already has a Playwright setup).
 
@@ -344,11 +480,28 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
 
 - **M1 — core embed + serving (~half day):** `Seal.Gateway.Embedded`,
   `serveEmbedded`, `gatewayApp` fallback, MIME/cache policy, traversal
-  fix, unit + WAI tests. Done when `make build && cabal run seal -- serve`
+  fix, `nosniff` header, unit + WAI tests. Explicit M1 task list:
+  1. Create and commit `config/frontend-dist-absent.txt` (placeholder
+     content `"absent"`) — fallback for `embedOneStringFileOf` so
+     clean-checkout builds succeed.
+  2. Create `Seal.Gateway.Embedded` module.
+  3. Add `Seal.Gateway.Embedded` to library `exposed-modules` in
+     `seal-harness.cabal` (alphabetically near `Seal.Gateway.Config`).
+     No new `build-depends` needed.
+  4. Add `test/Seal/Gateway/EmbeddedSpec.hs` to test-suite
+     `other-modules` in `seal-harness.cabal`; wire into `test/Main.hs`.
+  5. Implement `serveEmbedded`, response helpers, `isAssetPath`,
+     `contentTypeFor` expansion, `nosniffHeader`, cache policy in
+     `Server.hs`. Route disk `serveStatic` through `mkSafePath`.
+  6. Update `gatewayApp` to fall back to `serveEmbedded`.
+  7. Fix stale `qAddDependentFile` comment in `Seal.Skills.Builtins`.
+  8. Unit + WAI tests. Done when `make build && cabal run seal -- serve`
   serves the UI with zero config and `make check` is green.
 - **M2 — pipeline (~1–2 h):** Makefile gates + `.seal-manifest` stamp,
-  `make serve` static_dir wiring, verify CI (runs `make check`, needs npm
-  access).
+  add `--static-dir` CLI flag to `seal serve` (parser + threading
+  through `AppMain → runServeMain → runGateway`), `make serve` passes
+  `--static-dir frontend/dist`, verify CI (runs `make check`, needs npm
+  access — see risk R8).
 - **M3 — nix purity (deferred, ~2–4 h):** options: (a) accept UI-less
   pure builds, (b) override the flake source filter to include
   `frontend/dist` when present + build dist in release CI before
@@ -385,6 +538,14 @@ extensions: `.mjs .map .wasm .woff .woff2 .ttf .otf .webp .jpg .jpeg .txt
 6. Pure nix builds ship UI-less until M3 — acceptable (matches today),
    but the release pipeline must use the gated path meanwhile.
 7. sdist-based distribution is deliberately out of scope (see 4.6).
+8. **`make check` npm dependency:** gating `build` on `frontend-build`
+   couples the primary developer gate to npm + network access. Mitigation:
+   idempotent `frontend-install` (no-op after first run); decoupling
+   `test`/`lint` from `build` if it proves burdensome (see §4.5).
+9. **`isAssetPath` false positives:** SPA routes with dots (e.g.
+   `/user.profile`) could 404 if `.profile` were in `assetExtensions`.
+   Mitigated by the pinned extension list excluding non-asset dot
+   extensions. The list should be reviewed when new asset types are added.
 
 ## 5. Why this is right for seal
 
