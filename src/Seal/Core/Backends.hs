@@ -26,6 +26,8 @@ import Seal.Git.Repo (ConfigRepo)
 import Seal.Memory.Embedding qualified as Emb
 import Seal.Memory.Store qualified as Mem
 import Seal.Skills.Backend qualified as Skill
+import Seal.Cron.Store qualified as Cron
+import Seal.ISA.Ops.Cron (CronFireDelegate)
 import Seal.Session.Search qualified as Search
 import System.Directory (findExecutable)
 
@@ -62,6 +64,11 @@ data Backends = Backends
     -- ^ Process-global spawn-pause flag (operator can freeze new fan-out).
   , bParentActivity :: ParentActivity
     -- ^ Process-global parent-activity cell (heartbeat target).
+  , bCronStore :: Cron.CronStore
+    -- ^ The cron job store (file-based under @config/cron/@).
+  , bCronFire :: Maybe CronFireDelegate
+    -- ^ Optional fire delegate for @trigger@ and scheduler. 'Nothing'
+    -- in 'newBackends'; set to 'Just' in 'Serve.hs'.
   }
 
 -- | Construct the disk-backed backends for the given config repo and seal
@@ -88,6 +95,7 @@ newBackends paths repo embedding = do
   skills      <- Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo
   agentDefs   <- Def.markdownAgentDefBackend agentsDir repo
   sessionSearch <- Search.resolveSessionSearchBackend embedding paths findExecutable
+  cronStore   <- Cron.fileCronStore (spConfig paths </> "cron") repo
   pure (Backends
     { bMemory = memStore
     , bEmbedding = embedding
@@ -99,4 +107,6 @@ newBackends paths repo embedding = do
     , bDelegationConfig = pure defaultDelegationConfig
     , bSpawnPauseFlag = pauseFlag
     , bParentActivity = parentAct
+    , bCronStore = cronStore
+    , bCronFire = Nothing
     })
