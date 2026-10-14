@@ -82,6 +82,7 @@
 6. `nosniffHeader` present on ALL static responses (both embedded and disk paths)
 7. `serveStatic` routes through `Seal.Security.Path.mkSafePath` with `WorkspaceRoot`; `PathDoesNotExist` → SPA fallback for non-asset paths, `PathEscapesWorkspace`/`PathIsBlocked` → 404
 8a. `serveStatic` special-cases root path (`pathInfo = []` → serve `index.html` directly, bypassing `mkSafePath` which would return the directory itself)
+8b. Existing ServerSpec test "gatewayApp returns 404 for non-api path with no static dir" updated — the `Nothing` static-dir branch now falls back to `serveEmbedded`, not a bare 404. Test should be conditional on `embeddedAssetCount > 0`: when > 0, expect 200 (SPA fallback); when == 0, expect 404 (`emptyEmbedResponse`)
 8. `gatewayApp` falls back to `serveEmbedded` when `mStaticDir` is `Nothing`
 9. `emptyEmbedResponse` returns helpful HTML when `embeddedAssets` is empty
 10. `isAssetPath→404` applied to BOTH embedded and disk paths
