@@ -41,15 +41,19 @@ module Seal.ISA.Ops.Bin
   , extractGhRepoFlag
   ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson qualified as A (decode)
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import System.FilePath (isAbsolute)
 
 import Seal.Core.Types (OpName (..))
@@ -368,8 +372,21 @@ binaryField = parseMaybe (withObject "in" (.: "binary"))
 
 -- | Extract the optional @args@ array. Returns 'Nothing' when the field
 -- is absent; returns @'Just' []@ when present-but-empty.
+--
+-- **Defensive fallback:** some providers serialize array-typed
+-- parameters as strings when the tool definition has no @input_schema@
+-- (observed with Anthropic in on-demand mode — the model emits
+-- @args: "[\"--version\"]"@ instead of @args: ["--version"]@). When the
+-- primary array parse fails, the fallback parses @args@ as a 'Text'
+-- string and decodes it as a JSON array. Without this, args are silently
+-- dropped (binary runs with no arguments — e.g. @git@ prints usage
+-- text instead of executing the requested subcommand).
 argsField :: Value -> Maybe [Text]
-argsField = parseMaybe (withObject "in" (.: "args"))
+argsField v =
+  parseMaybe (withObject "in" (.: "args")) v
+  <|> case parseMaybe (withObject "in" (.: "args")) v :: Maybe Text of
+        Just s  -> A.decode (BL.fromStrict (TE.encodeUtf8 s))
+        Nothing -> Nothing
 
 -- | Extract the optional @cwd@ string. Returns 'Nothing' when the field
 -- is absent.

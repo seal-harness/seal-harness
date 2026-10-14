@@ -266,6 +266,21 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       orIsError r `shouldBe` False
       readIORef seen `shouldReturn` ["ls "]
 
+    it "args as JSON string (string-coerced array) is parsed correctly" $ do
+      -- Some providers serialize array-typed parameters as strings when
+      -- the tool definition has no input_schema (on-demand mode). The
+      -- defensive argsField parser must handle this by decoding the
+      -- string as a JSON array.
+      seen <- newIORef []
+      let uio = fakeUioFlat seen "ok\n"
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (runOp uio Nothing op (object
+        [ "binary" .= ("ls" :: String)
+        , "args" .= ("[\"-la\", \"/tmp\"]" :: String)
+        ]))
+      orIsError r `shouldBe` False
+      readIORef seen `shouldReturn` ["ls -la /tmp"]
+
     it "binary with NUL -> Denied (validated BinName rejects NUL)" $ do
       let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       uoAuthorize op (object
