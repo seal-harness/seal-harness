@@ -57,13 +57,13 @@ import Seal.Transcript.Entries
 import Seal.Types.App (App)
 
 -- | The output-token cap sent to the provider on every completion request.
--- Raised from 4096 to 8192 so tool-using agents (which often emit large
--- tool-call inputs, e.g. embedding file contents into @task@ prompts) have
--- headroom and are less likely to hit 'StopMaxTokens'. This alone does not
--- fix truncation handling — the loop must still handle 'StopMaxTokens'
--- explicitly (see 'go') — but it reduces the frequency.
+-- Raised to 65536 so agents generating large documents (design docs, plans,
+-- multi-file patches) have sufficient headroom and are less likely to hit
+-- 'StopMaxTokens'. This alone does not fix truncation handling — the loop
+-- must still handle 'StopMaxTokens' explicitly (see 'go') — but it reduces
+-- the frequency. The provider will clamp to its own model-specific limit.
 defaultMaxTokens :: Int
-defaultMaxTokens = 8192
+defaultMaxTokens = 65536
 
 -- | Hard timeout for a single provider streaming call, in microseconds.
 -- 5 minutes gives generous headroom for large contexts on remote models
