@@ -11,6 +11,7 @@ import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.Gateway.ConfigSpec
+import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
@@ -200,6 +201,7 @@ specs = do
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
   Seal.Gateway.ConfigSpec.spec
+  Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
