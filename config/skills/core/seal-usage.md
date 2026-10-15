@@ -191,12 +191,20 @@ explicit refspec, then check it out:
 
 ```
 BIN_EXEC { "binary": "git", "args": ["fetch", "origin", "my-feature-branch:refs/remotes/origin/my-feature-branch", "--depth", "1"], "cwd": "seal-harness" }
-BIN_EXEC { "binary": "git", "args": ["checkout", "my-feature-branch"], "cwd": "seal-harness" }
+BIN_EXEC { "binary": "git", "args": ["checkout", "-b", "my-feature-branch", "origin/my-feature-branch"], "cwd": "seal-harness" }
 ```
 
-Both steps are required. A bare `git fetch origin <branch>` only populates
-`FETCH_HEAD`, not the `refs/remotes/origin/<branch>` ref that `checkout`
-resolves the branch against — the explicit refspec is what creates it.
+**Do not skip the refspec.** A bare `git fetch origin <branch>` only
+populates `FETCH_HEAD`, not the `refs/remotes/origin/<branch>` ref that
+`checkout` resolves the branch against. Without the explicit refspec
+(`<branch>:refs/remotes/origin/<branch>`), `git checkout` will fail with
+`pathspec did not match` even though the fetch appeared to succeed.
+
+**Use `checkout -b`, not bare `checkout`.** The `-b` flag explicitly
+creates the local branch from the remote-tracking ref. A bare
+`git checkout <branch>` relies on git's DWIM auto-branch-creation, which
+is less reliable in shallow clones. Passing `origin/<branch>` as the
+start point removes any ambiguity.
 
 ### Why this matters
 

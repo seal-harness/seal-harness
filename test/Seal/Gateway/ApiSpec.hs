@@ -1001,7 +1001,7 @@ spec = describe "Seal.Gateway.API" $ do
       -- `system` field into a collapsed "System" row at the top of the
       -- session. Without the system field in the payload, the row is absent.
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
-        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":65536}}"
         ]
       deps <- mkDepsFor paths
       let app = apiApp deps
@@ -1039,7 +1039,7 @@ spec = describe "Seal.Gateway.API" $ do
           conv = [ Message User [CbText "hello world"] ]
       BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
-        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":65536}}"
         ]
       deps <- mkDepsFor paths
       let app = apiApp deps
