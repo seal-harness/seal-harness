@@ -42,7 +42,7 @@ dispatch cfg =
     runApp env $ case _config_command cfg of
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
-      CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy logger)
+      CommandServe autonomy mStaticDir -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir logger)
       CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 
 -- | Map the process arguments so that an empty argument list behaves as if
