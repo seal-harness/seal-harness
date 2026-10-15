@@ -1,0 +1,88 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The Git-specific 'UIO' operations — the 'CloneDeps' surface lifted into
+<span class="lineno">    2 </span>-- the 'UIO' monad. This is a SEPARATE module from 'Seal.Tools.Exec.UIO'
+<span class="lineno">    3 </span>-- (which holds the general 'UntrustedIO' 'uio*' surface) because the
+<span class="lineno">    4 </span>-- 'CloneDeps' capability must be lexically scoped to Git opcodes ONLY
+<span class="lineno">    5 </span>-- (restoring the round-3 property that non-Git opcodes cannot name these
+<span class="lineno">    6 </span>-- functions). A non-Git opcode that wants 'uioCdRepoRegList' must add an
+<span class="lineno">    7 </span>-- import of this module — caught at review + enforced by the W-A3 CI grep
+<span class="lineno">    8 </span>-- guard (asserts 'Seal.Tools.Exec.UIOGit' is referenced only from
+<span class="lineno">    9 </span>-- @src\/Seal\/ISA\/Ops\/Git.hs@ + this definition site).
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- The 'uioCd*' functions take the 'CloneDeps' from 'UIOEnv' via the internal
+<span class="lineno">   12 </span>-- 'ReaderT' (no 'MonadIO' — the 'UIO' newtype hides it). Opcode bodies call
+<span class="lineno">   13 </span>-- these directly: @uioCdRepoRegList@, @uioResolveClone@, @uioWithClone@ —
+<span class="lineno">   14 </span>-- never @liftIO (rrhList (cdRepoReg deps))@.
+<span class="lineno">   15 </span>module Seal.Tools.Exec.UIOGit
+<span class="lineno">   16 </span>  ( uioCdRepoRegList
+<span class="lineno">   17 </span>  , uioResolveClone
+<span class="lineno">   18 </span>  , uioWithClone
+<span class="lineno">   19 </span>  , uioCdCloneDeps
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   23 </span>import Control.Monad.Reader (ask, asks, runReaderT)
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Seal.SourceControl.Clone
+<span class="lineno">   27 </span>  ( CloneDeps (..), CloneEnv, CloneError, CloneTarget, resolveCloneTarget
+<span class="lineno">   28 </span>  , withCloneTarget )
+<span class="lineno">   29 </span>import Seal.SourceControl.Repo (SourceRepo)
+<span class="lineno">   30 </span>import Seal.SourceControl.Registry (RepoRegistryHandle (rrhList))
+<span class="lineno">   31 </span>import Seal.Tools.Exec.UIO.Internal (UIO (..), UIOEnv (..))
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | List the repo registry entries (the @cdRepoReg@ surface). Returns the
+<span class="lineno">   34 </span>-- 'Either' 'Text' error from a corrupt @repos.toml@ (surfaced to the opcode
+<span class="lineno">   35 </span>-- as-is).
+<span class="lineno">   36 </span>uioCdRepoRegList :: UIO (Either Text [SourceRepo])
+<span class="lineno">   37 </span><span class="decl"><span class="istickedoff">uioCdRepoRegList = UIO $ do</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">liftIO (rrhList (cdRepoReg (uieCloneDeps env)))</span></span>
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | Resolve a 'SourceRepo' to a 'CloneTarget' (the credential-resolution
+<span class="lineno">   42 </span>-- surface — fetches the secret from the vault, runs the per-op ssh-agent
+<span class="lineno">   43 </span>-- lifecycle for deploy keys). Returns 'Either' 'CloneError' so the opcode
+<span class="lineno">   44 </span>-- can surface a structured error (vault-locked vs. no-credential vs.
+<span class="lineno">   45 </span>-- agent-failed).
+<span class="lineno">   46 </span>uioResolveClone :: SourceRepo -&gt; UIO (Either CloneError CloneTarget)
+<span class="lineno">   47 </span><span class="decl"><span class="istickedoff">uioResolveClone repo = UIO $ do</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">liftIO (resolveCloneTarget (uieCloneDeps env) repo)</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Scope the authenticated 'CloneEnv' to a continuation (CPS — mirrors
+<span class="lineno">   52 </span>-- 'withCloneTarget' / 'Seal.Security.Secrets.withApiKey'). The cleanup
+<span class="lineno">   53 </span>-- ALWAYS runs, even if the continuation throws — bracket semantics. The
+<span class="lineno">   54 </span>-- 'UIOEnv' is threaded from the outer context, so 'CloneDeps' +
+<span class="lineno">   55 </span>-- 'UntrustedIO' are preserved across the CPS boundary.
+<span class="lineno">   56 </span>uioWithClone :: CloneTarget -&gt; (CloneEnv -&gt; UIO a) -&gt; UIO a
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">uioWithClone target k = UIO $ do</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">let runInner cloneEnv = runReaderT (unUIO (k cloneEnv)) env</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">liftIO (withCloneTarget target runInner)</span></span>
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | Read the 'CloneDeps' from the 'UIOEnv' (for Git opcodes that need
+<span class="lineno">   63 </span>-- direct access to a field not covered by the 'uioCd*' functions above).
+<span class="lineno">   64 </span>uioCdCloneDeps :: UIO CloneDeps
+<span class="lineno">   65 </span><span class="decl"><span class="nottickedoff">uioCdCloneDeps = UIO $ asks uieCloneDeps</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,207 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure context window management: token estimation and message truncation.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- The agent loop ('Seal.Agent.Loop') calls these functions before building a
+<span class="lineno">    5 </span>-- 'CompletionRequest' to ensure the conversation fits within the model's
+<span class="lineno">    6 </span>-- context window. All functions are pure — no IO, no 'AgentEnv' dependency —
+<span class="lineno">    7 </span>-- so they can be tested independently.
+<span class="lineno">    8 </span>module Seal.Agent.ContextTruncation
+<span class="lineno">    9 </span>  ( estimateTokenCount
+<span class="lineno">   10 </span>  , truncateMessages
+<span class="lineno">   11 </span>  , aggressiveTruncate
+<span class="lineno">   12 </span>  , TruncationConfig (..)
+<span class="lineno">   13 </span>  , defaultTruncationConfig
+<span class="lineno">   14 </span>  , aggressiveKeepCount
+<span class="lineno">   15 </span>  , truncationNotice
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.Aeson qualified as A
+<span class="lineno">   19 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>import Seal.Providers.Class
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>-- | Configuration for the truncation strategy.
+<span class="lineno">   26 </span>data TruncationConfig = TruncationConfig
+<span class="lineno">   27 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tcKeepRecent</span></span></span> :: Int
+<span class="lineno">   28 </span>    -- ^ The number of most-recent messages to always preserve (the &quot;active
+<span class="lineno">   29 </span>    -- context window&quot;). Default: 20.
+<span class="lineno">   30 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcMinKeep</span></span></span> :: Int
+<span class="lineno">   31 </span>    -- ^ The minimum number of messages to keep, even if they exceed the
+<span class="lineno">   32 </span>    -- budget. Prevents pathological cases where even the last few messages
+<span class="lineno">   33 </span>    -- are too large. Default: 2.
+<span class="lineno">   34 </span>  }
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | Default truncation config: keep 20 recent messages, minimum 2.
+<span class="lineno">   37 </span>defaultTruncationConfig :: TruncationConfig
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">defaultTruncationConfig = TruncationConfig</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">{ tcKeepRecent = 20</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">, tcMinKeep = 2</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | The number of messages to keep in aggressive truncation mode (used
+<span class="lineno">   44 </span>-- for prompt-too-long error recovery).
+<span class="lineno">   45 </span>aggressiveKeepCount :: Int
+<span class="lineno">   46 </span><span class="decl"><span class="istickedoff">aggressiveKeepCount = 5</span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | The synthetic message inserted when older context is truncated, so the
+<span class="lineno">   49 </span>-- model knows history is missing. Uses 'User' role because the provider-
+<span class="lineno">   50 </span>-- agnostic 'Message' type has no @System@ role (system prompt is a separate
+<span class="lineno">   51 </span>-- 'crSystem' field).
+<span class="lineno">   52 </span>truncationNotice :: Text
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">truncationNotice =</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">&quot;[System: Older conversation context was truncated to fit the model's \</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">\context window. Some earlier messages are no longer available.]&quot;</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | Estimate the token count for a completion request's components: system
+<span class="lineno">   58 </span>-- prompt + tool definitions + messages. Uses the chars/4 approximation
+<span class="lineno">   59 </span>-- (the standard rough estimate; a proper tokenizer is out of scope for MVP).
+<span class="lineno">   60 </span>estimateTokenCount :: Maybe Text -&gt; [Message] -&gt; [ToolDefinition] -&gt; Int
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">estimateTokenCount mSystem msgs tools =</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">systemTokens + toolTokens + messageTokens</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">systemTokens = maybe 0 textTokens mSystem</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">toolTokens = sum (map toolTokens' tools)</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">messageTokens = sum (map messageTokens' msgs)</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">-- chars / 4, minimum 1 for non-empty text</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">textTokens t = if T.null t then 0 else max 1 (T.length t `div` 4)</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">-- Estimate tool tokens from JSON encoding (tool definitions are already</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">-- ToJSON; their wire size is what the provider sees).</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">toolTokens' td =</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">let bs = A.encode td</span>
+<span class="lineno">   73 </span><span class="spaces">          </span><span class="istickedoff">charLen = BL.length bs</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">charLen == 0</span> then <span class="nottickedoff">0</span> else max 1 (fromIntegral charLen `div` 4)</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">-- Sum the text/thinking/tool content of a message.</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">messageTokens' (Message _ blocks) =</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="istickedoff">sum (map blockTokens' blocks)</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">blockTokens' (CbText t) = textTokens t</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">blockTokens' (CbThinking t) = <span class="nottickedoff">textTokens t</span></span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">blockTokens' (CbToolUse _ _ v) =</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">let bs = A.encode v</span>
+<span class="lineno">   82 </span><span class="spaces">          </span><span class="istickedoff">charLen = BL.length bs</span>
+<span class="lineno">   83 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">charLen == 0</span> then <span class="nottickedoff">0</span> else max 1 (fromIntegral charLen `div` 4)</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">blockTokens' (CbToolResult _ parts _) =</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">sum (map partTokens' parts)</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">partTokens' (TrpText t) = textTokens t</span></span>
+<span class="lineno">   87 </span>
+<span class="lineno">   88 </span>-- | Truncate the message list to fit within the given token budget (for
+<span class="lineno">   89 </span>-- the message portion only — system and tools are accounted for separately
+<span class="lineno">   90 </span>-- by the caller). When messages fit, they are returned unchanged. When they
+<span class="lineno">   91 </span>-- don't, the oldest messages are dropped from the middle, a synthetic
+<span class="lineno">   92 </span>-- truncation notice is inserted, and the most recent messages are preserved.
+<span class="lineno">   93 </span>-- The last tool-use + tool-result pair is never split (if the tool-result
+<span class="lineno">   94 </span>-- is kept, the preceding tool-use is also kept).
+<span class="lineno">   95 </span>truncateMessages :: TruncationConfig -&gt; Int -&gt; [Message] -&gt; [Message]
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">truncateMessages cfg budget msgs</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">| currentTokens &lt;= budget = msgs</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = truncated</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">currentTokens = estimateTokenCount Nothing msgs []</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">-- Take the last tcKeepRecent messages, but ensure we don't split a</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">-- tool-use/tool-result pair. If the first kept message is a tool-result</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">-- (User with CbToolResult), include the preceding message too.</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">keepN = tcKeepRecent cfg</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">rawKept = takeEnd keepN msgs</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">kept = alignToolPair (dropEnd keepN msgs) rawKept</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">-- Check if the kept messages fit; if not, progressively drop from front</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">keptTokens = estimateTokenCount Nothing kept []</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">finalKept = if keptTokens &lt;= budget</span>
+<span class="lineno">  110 </span><span class="spaces">                  </span><span class="istickedoff">then kept</span>
+<span class="lineno">  111 </span><span class="spaces">                  </span><span class="istickedoff">else shrinkToFit budget (tcMinKeep cfg) kept</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">-- Insert the truncation notice before the kept messages</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">truncated = truncationNoticeMsg : finalKept</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | Aggressively truncate: keep only the last 'aggressiveKeepCount' messages.
+<span class="lineno">  116 </span>-- Used for prompt-too-long error recovery, where we need to shrink the
+<span class="lineno">  117 </span>-- context as much as possible in one shot. No truncation notice is inserted
+<span class="lineno">  118 </span>-- (the caller handles messaging).
+<span class="lineno">  119 </span>aggressiveTruncate :: [Message] -&gt; [Message]
+<span class="lineno">  120 </span><span class="decl"><span class="istickedoff">aggressiveTruncate msgs</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">| length msgs &lt;= aggressiveKeepCount = msgs</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = alignToolPair <span class="nottickedoff">dropped</span> (takeEnd aggressiveKeepCount msgs)</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">dropped = dropEnd aggressiveKeepCount msgs</span></span></span>
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>-- | If the first message in @kept@ is a tool-result (User role with
+<span class="lineno">  127 </span>-- CbToolResult blocks), include the preceding message from @dropped@ (the
+<span class="lineno">  128 </span>-- Assistant message with the matching tool-use). This prevents splitting a
+<span class="lineno">  129 </span>-- tool-use/tool-result pair across the truncation boundary.
+<span class="lineno">  130 </span>alignToolPair :: [Message] -&gt; [Message] -&gt; [Message]
+<span class="lineno">  131 </span><span class="decl"><span class="istickedoff">alignToolPair dropped kept =</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">case kept of</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">(m : _) | isToolResult m -&gt;</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="istickedoff">case takeEnd 1 dropped of</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="istickedoff">(prev : _) | <span class="tickonlytrue">isToolUse prev</span> -&gt; prev : kept</span>
+<span class="lineno">  136 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">kept</span></span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; kept</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Shrink the message list from the front until it fits within the budget,
+<span class="lineno">  140 </span>-- but never below minKeep messages.
+<span class="lineno">  141 </span>shrinkToFit :: Int -&gt; Int -&gt; [Message] -&gt; [Message]
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">shrinkToFit budget minKeep = go</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">go ms</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">| length ms &lt;= minKeep = ms</span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">estimateTokenCount Nothing ms [] &lt;= budget</span> = <span class="nottickedoff">ms</span></span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go (dropOne ms)</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | Drop one message from the front. If the dropped message was a tool-use
+<span class="lineno">  150 </span>-- whose matching tool-result is the next message, drop both to avoid
+<span class="lineno">  151 </span>-- leaving an orphaned tool-result.
+<span class="lineno">  152 </span>dropOne :: [Message] -&gt; [Message]
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">dropOne [] = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  154 </span><span class="spaces"></span><span class="istickedoff">dropOne (m : rest)</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">| isToolUse m = case rest of</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">(m2 : _) | <span class="tickonlytrue">isToolResult m2</span> -&gt; drop 1 rest</span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">rest</span></span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = rest</span></span>
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>-- | The truncation notice as a 'Message' (User role).
+<span class="lineno">  161 </span>truncationNoticeMsg :: Message
+<span class="lineno">  162 </span><span class="decl"><span class="istickedoff">truncationNoticeMsg = textMsg <span class="nottickedoff">User</span> truncationNotice</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | Check if a message is a tool-result (User role with CbToolResult blocks).
+<span class="lineno">  165 </span>isToolResult :: Message -&gt; Bool
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">isToolResult (Message User blocks) = any isResultBlock blocks</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">where isResultBlock CbToolResult{} = True</span>
+<span class="lineno">  168 </span><span class="spaces">        </span><span class="istickedoff">isResultBlock _ = False</span>
+<span class="lineno">  169 </span><span class="spaces"></span><span class="istickedoff">isToolResult _ = <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | Check if a message is a tool-use (Assistant role with CbToolUse blocks).
+<span class="lineno">  172 </span>isToolUse :: Message -&gt; Bool
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">isToolUse (Message Assistant blocks) = any isUseBlock blocks</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">where isUseBlock CbToolUse{} = True</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">isUseBlock _ = <span class="nottickedoff">False</span></span>
+<span class="lineno">  176 </span><span class="spaces"></span><span class="istickedoff">isToolUse _ = False</span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- | Take the last @n@ elements of a list.
+<span class="lineno">  179 </span>takeEnd :: Int -&gt; [a] -&gt; [a]
+<span class="lineno">  180 </span><span class="decl"><span class="istickedoff">takeEnd n xs = drop (max 0 (length xs - n)) xs</span></span>
+<span class="lineno">  181 </span>
+<span class="lineno">  182 </span>-- | Drop the last @n@ elements of a list.
+<span class="lineno">  183 </span>dropEnd :: Int -&gt; [a] -&gt; [a]
+<span class="lineno">  184 </span><span class="decl"><span class="istickedoff">dropEnd n xs = take (max 0 (length xs - n)) xs</span></span>
+
+</pre>
+</body>
+</html>

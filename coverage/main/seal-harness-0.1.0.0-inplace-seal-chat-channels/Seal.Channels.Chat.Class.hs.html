@@ -1,0 +1,114 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The 'ChatChannel' type class — the seam a chat channel implements to
+<span class="lineno">    2 </span>-- be wired into the generic loop ('Seal.Channels.Chat.Loop'). Each method
+<span class="lineno">    3 </span>-- is an 'IO' action so the type is uniform between real and mock variants.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The class is minimal: receive from the platform, send to the platform,
+<span class="lineno">    6 </span>-- send with a returned message id (for editing), edit a message, and a
+<span class="lineno">    7 </span>-- label. The generic loop handles all routing, session tracking, WS
+<span class="lineno">    8 </span>-- streaming, and ASK_HUMAN through the gateway API.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Optional methods ('ccSendWithOptions', 'ccAnswerCallback',
+<span class="lineno">   11 </span>-- 'ccEditReplyMarkup', 'ccLastChatId') have default no-op / 'Nothing'
+<span class="lineno">   12 </span>-- implementations so channels that don't support inline keyboards (Signal,
+<span class="lineno">   13 </span>-- mock) fall back to the text-based question rendering.
+<span class="lineno">   14 </span>module Seal.Channels.Chat.Class
+<span class="lineno">   15 </span>  ( ChatChannel (..)
+<span class="lineno">   16 </span>  , QuestionOption (..)
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Text (Text)
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Seal.Channels.Chat.Types (InboundMessage, ChatMessageId)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | One discrete choice offered alongside an ASK_HUMAN question. Mirrors
+<span class="lineno">   24 </span>-- 'Seal.Handles.AskReply.QuestionOption' but lives in the chat-channel
+<span class="lineno">   25 </span>-- package (no dependency on server internals). The label is the value
+<span class="lineno">   26 </span>-- returned when the human picks this choice; the description is a one-line
+<span class="lineno">   27 </span>-- explanation shown alongside the button.
+<span class="lineno">   28 </span>data QuestionOption = QuestionOption
+<span class="lineno">   29 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">qoLabel</span></span></span>       :: !Text
+<span class="lineno">   30 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">qoDescription</span></span></span> :: !Text
+<span class="lineno">   31 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | The seam a chat channel implements. Each method is an 'IO' action.
+<span class="lineno">   34 </span>class ChatChannel c where
+<span class="lineno">   35 </span>  -- | Receive one inbound message from the platform. Returns 'Nothing' on
+<span class="lineno">   36 </span>  -- EOF (the platform connection closed + inbox drained).
+<span class="lineno">   37 </span>  ccReceive :: c -&gt; IO (Maybe InboundMessage)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>  -- | Send a message to the platform (plain text, no returned id).
+<span class="lineno">   40 </span>  ccSend :: c -&gt; Text -&gt; IO ()
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>  -- | Send a message and return its platform id (for later editing via
+<span class="lineno">   43 </span>  -- 'ccEditMessage'). 'Nothing' if the send failed or the platform doesn't
+<span class="lineno">   44 </span>  -- support message ids.
+<span class="lineno">   45 </span>  ccSendWithId :: c -&gt; Text -&gt; IO (Maybe ChatMessageId)
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>  -- | Edit a previously sent message: message id, new content. Returns
+<span class="lineno">   48 </span>  -- 'True' on success, 'False' on failure (or unsupported).
+<span class="lineno">   49 </span>  ccEditMessage :: c -&gt; ChatMessageId -&gt; Text -&gt; IO Bool
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>  -- | The channel's label (e.g. @&quot;signal&quot;@, @&quot;telegram&quot;@).
+<span class="lineno">   52 </span>  ccLabel :: c -&gt; Text
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>  -- | Whether the channel supports progressive message editing (streaming
+<span class="lineno">   55 </span>  -- text bubbles). When 'False', the loop sends the final text as a single
+<span class="lineno">   56 </span>  -- message after the turn completes instead of creating/editing a
+<span class="lineno">   57 </span>  -- streaming bubble per delta. Default: 'True' (most channels support
+<span class="lineno">   58 </span>  -- editing). Signal sets this to 'False' to match the old behavior.
+<span class="lineno">   59 </span>  ccSupportsStreaming :: c -&gt; Bool
+<span class="lineno">   60 </span>  <span class="decl"><span class="istickedoff">ccSupportsStreaming _ = True</span></span>
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>  -- | Send a question with multiple-choice options as an inline keyboard
+<span class="lineno">   63 </span>  -- (one button per option). The @askIdPrefix@ is the 8-hex prefix of the
+<span class="lineno">   64 </span>  -- ask id — the channel embeds it in the callback_data
+<span class="lineno">   65 </span>  -- (@\&quot;&lt;prefix&gt;:&lt;index&gt;\&quot;@) so the loop can tie a button tap back to the
+<span class="lineno">   66 </span>  -- specific pending question. The body carries the full question + option
+<span class="lineno">   67 </span>  -- descriptions; the buttons carry just the short labels. Returns the
+<span class="lineno">   68 </span>  -- platform message id of the sent message (for later keyboard removal
+<span class="lineno">   69 </span>  -- via 'ccEditReplyMarkup'). 'Nothing' if the channel doesn't support
+<span class="lineno">   70 </span>  -- inline keyboards — the loop falls back to 'ccSend' with a numbered
+<span class="lineno">   71 </span>  -- list. Default: 'Nothing' (unsupported).
+<span class="lineno">   72 </span>  ccSendWithOptions
+<span class="lineno">   73 </span>    :: c -&gt; Text -&gt; [QuestionOption] -&gt; Text -&gt; IO (Maybe ChatMessageId)
+<span class="lineno">   74 </span>  <span class="decl"><span class="nottickedoff">ccSendWithOptions _ _ _ _ = pure Nothing</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>  -- | Acknowledge a callback query (dismiss the button's loading spinner).
+<span class="lineno">   77 </span>  -- Best-effort: never throws. Default: no-op (unsupported).
+<span class="lineno">   78 </span>  ccAnswerCallback :: c -&gt; Text -&gt; IO ()
+<span class="lineno">   79 </span>  <span class="decl"><span class="nottickedoff">ccAnswerCallback _ _ = pure ()</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>  -- | Remove the inline keyboard from a previously sent message (disable
+<span class="lineno">   82 </span>  -- buttons after a tap so they can't be re-clicked). Best-effort: never
+<span class="lineno">   83 </span>  -- throws. Default: no-op (unsupported).
+<span class="lineno">   84 </span>  ccEditReplyMarkup :: c -&gt; ChatMessageId -&gt; IO ()
+<span class="lineno">   85 </span>  <span class="decl"><span class="nottickedoff">ccEditReplyMarkup _ _ = pure ()</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>  -- | The last chat id (the platform-specific reply target). 'Nothing' if
+<span class="lineno">   88 </span>  -- no message has been received yet. Used by the loop to determine whether
+<span class="lineno">   89 </span>  -- inline keyboard sends are possible. Default: 'Nothing'.
+<span class="lineno">   90 </span>  ccLastChatId :: c -&gt; IO (Maybe Text)
+<span class="lineno">   91 </span>  <span class="decl"><span class="nottickedoff">ccLastChatId _ = pure Nothing</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Skill auto-injection at session start. The harness reads a configured
+<span class="lineno">    3 </span>-- skill id (default @&quot;seal-usage&quot;@, the fresh-workdir contract), loads its
+<span class="lineno">    4 </span>-- body from the skill backend, and appends it to the resolved system prompt
+<span class="lineno">    5 </span>-- so the model is oriented to its per-session workspace from turn one.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The injected skill is /teaching/, not enforcement: it tells the model the
+<span class="lineno">    8 </span>-- workdir contract so it cooperates. The operator can disable auto-injection
+<span class="lineno">    9 </span>-- by setting @[skills] autoload = &quot;&quot;@ in @config.toml@, or override the
+<span class="lineno">   10 </span>-- injected skill id with any other value.
+<span class="lineno">   11 </span>module Seal.Skills.Autoload
+<span class="lineno">   12 </span>  ( injectAutoloadSkill
+<span class="lineno">   13 </span>  , renderSkillForPrompt
+<span class="lineno">   14 </span>  ) where
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Data.Text (Text)
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Seal.Skills.Backend (SkillBackend (..))
+<span class="lineno">   19 </span>import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>-- | Append the auto-loaded skill body to the resolved system prompt.
+<span class="lineno">   22 </span>--
+<span class="lineno">   23 </span>-- * @mSkillId = Nothing@ → no auto-injection; return the prompt unchanged.
+<span class="lineno">   24 </span>-- * @mSkillId = Just sid@ → load the skill body from @backend@; if found,
+<span class="lineno">   25 </span>--   append it under an @## Auto-loaded skill: &lt;id&gt;@ header. If the skill is
+<span class="lineno">   26 </span>--   missing from the backend, fall back to the prompt unchanged (a missing
+<span class="lineno">   27 </span>--   autoload skill is a soft failure — the session proceeds, the model
+<span class="lineno">   28 </span>--   just doesn't get the orientation note).
+<span class="lineno">   29 </span>--
+<span class="lineno">   30 </span>-- The skill body is appended /after/ any existing system prompt (the bound
+<span class="lineno">   31 </span>-- agent's @adSystem@). The header separates the agent's identity/prompt
+<span class="lineno">   32 </span>-- from the harness-injected orientation.
+<span class="lineno">   33 </span>injectAutoloadSkill
+<span class="lineno">   34 </span>  :: SkillBackend
+<span class="lineno">   35 </span>  -- ^ The skill store (reads from @~/.seal/config/skills@).
+<span class="lineno">   36 </span>  -&gt; Maybe Text
+<span class="lineno">   37 </span>  -- ^ The skill id to auto-inject ('Nothing' disables).
+<span class="lineno">   38 </span>  -&gt; Maybe Text
+<span class="lineno">   39 </span>  -- ^ The resolved system prompt (the bound agent's @adSystem@, or
+<span class="lineno">   40 </span>  -- 'Nothing' when no agent is bound).
+<span class="lineno">   41 </span>  -&gt; IO (Maybe Text)
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">injectAutoloadSkill _ Nothing prompt = <span class="nottickedoff">pure prompt</span></span>
+<span class="lineno">   43 </span><span class="spaces"></span><span class="istickedoff">injectAutoloadSkill backend (Just skillIdText_) prompt = do</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">case mkSkillId skillIdText_ of</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="istickedoff">Left _err -&gt; <span class="nottickedoff">pure prompt</span>  -- invalid id → soft-fail (no injection)</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">Right sid -&gt; do</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff">mSkill &lt;- sbRead backend sid</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">case mSkill of</span>
+<span class="lineno">   49 </span><span class="spaces">        </span><span class="istickedoff">Nothing    -&gt; <span class="nottickedoff">pure prompt</span>  -- skill missing → soft-fail</span>
+<span class="lineno">   50 </span><span class="spaces">        </span><span class="istickedoff">Just skill -&gt; pure (Just (renderSkillForPrompt prompt skill))</span></span>
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | Render the system prompt + auto-loaded skill body as a single text.
+<span class="lineno">   53 </span>-- The skill body is appended under a header; if the existing prompt is
+<span class="lineno">   54 </span>-- 'Nothing', the skill body becomes the entire prompt.
+<span class="lineno">   55 </span>renderSkillForPrompt :: Maybe Text -&gt; Skill -&gt; Text
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">renderSkillForPrompt mPrompt skill =</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">case mPrompt of</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">Nothing    -&gt; <span class="nottickedoff">rendered</span></span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">Just base  -&gt; base &lt;&gt; &quot;\n\n&quot; &lt;&gt; rendered</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">rendered =</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">&quot;# Auto-loaded skill: &quot; &lt;&gt; skillIdText (skId skill) &lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; skBody skill</span></span>
+
+</pre>
+</body>
+</html>

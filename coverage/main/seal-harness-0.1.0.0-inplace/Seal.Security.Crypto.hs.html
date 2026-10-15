@@ -1,0 +1,118 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Standalone symmetric-crypto primitives: AES-256-CTR encryption, SHA-256
+<span class="lineno">    3 </span>-- hashing, constant-time comparison, and random-byte / token generation.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- __Important — confidentiality only, no authentication.__
+<span class="lineno">    6 </span>-- The 'encrypt' and 'decrypt' functions use AES-256 in CTR mode, which
+<span class="lineno">    7 </span>-- provides /confidentiality/ but /not/ integrity or authentication.  The
+<span class="lineno">    8 </span>-- ciphertext is unauthenticated and malleable: bit-flips to the ciphertext
+<span class="lineno">    9 </span>-- produce bit-flips in the decrypted output with no error raised.  Callers
+<span class="lineno">   10 </span>-- that need tamper-detection must pair this with a MAC, switch to an AEAD
+<span class="lineno">   11 </span>-- construction, or — for at-rest secrets — use the vault API, which is backed
+<span class="lineno">   12 </span>-- by @age@ (an authenticated encryption scheme).
+<span class="lineno">   13 </span>module Seal.Security.Crypto
+<span class="lineno">   14 </span>  ( getRandomBytes
+<span class="lineno">   15 </span>  , sha256Hash
+<span class="lineno">   16 </span>  , constantTimeEq
+<span class="lineno">   17 </span>  , generateToken
+<span class="lineno">   18 </span>  , encrypt
+<span class="lineno">   19 </span>  , decrypt
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Crypto.Cipher.AES (AES256)
+<span class="lineno">   23 </span>import Crypto.Cipher.Types (ctrCombine, cipherInit, makeIV)
+<span class="lineno">   24 </span>import Crypto.Error (CryptoFailable (..))
+<span class="lineno">   25 </span>import Crypto.Hash (SHA256, hash, Digest)
+<span class="lineno">   26 </span>import Crypto.Random qualified as R
+<span class="lineno">   27 </span>import Data.ByteArray (constEq)
+<span class="lineno">   28 </span>import Data.ByteArray.Encoding (Base (Base16), convertToBase)
+<span class="lineno">   29 </span>import Data.ByteString (ByteString)
+<span class="lineno">   30 </span>import Data.ByteString qualified as BS
+<span class="lineno">   31 </span>import Data.ByteString.Char8 qualified as BC
+<span class="lineno">   32 </span>import Data.Text (Text)
+<span class="lineno">   33 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Seal.Security.Secrets (SecretKey, withSecretKey)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>ivLength :: Int
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">ivLength = 16</span></span>
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | Cryptographically secure random bytes from system entropy.
+<span class="lineno">   41 </span>getRandomBytes :: Int -&gt; IO ByteString
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">getRandomBytes = R.getRandomBytes</span></span>
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Lowercase-hex SHA-256 of the input (64 ASCII bytes).
+<span class="lineno">   45 </span>-- crypton-1.x wraps GHC's native ByteArray, which is not an instance of
+<span class="lineno">   46 </span>-- memory's ByteArrayAccess, so we go through the Show instance (which renders
+<span class="lineno">   47 </span>-- lowercase hex) rather than convertToBase.
+<span class="lineno">   48 </span>sha256Hash :: ByteString -&gt; ByteString
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">sha256Hash bs = BC.pack $ show (hash bs :: Digest SHA256)</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Constant-time equality, for comparing secrets/tokens/hashes.
+<span class="lineno">   52 </span>constantTimeEq :: ByteString -&gt; ByteString -&gt; Bool
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">constantTimeEq = constEq</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | A hex token of @n@ random bytes (so 2n hex chars).
+<span class="lineno">   56 </span>generateToken :: Int -&gt; IO Text
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">generateToken n = do</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">raw &lt;- getRandomBytes n</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">pure (TE.decodeUtf8 (convertToBase Base16 raw))</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | AES-256-CTR encrypt. A fresh random 16-byte IV is generated and prepended
+<span class="lineno">   62 </span>-- to the ciphertext. The key must be exactly 32 bytes.
+<span class="lineno">   63 </span>--
+<span class="lineno">   64 </span>-- __Warning — confidentiality only, NOT integrity\/authentication.__
+<span class="lineno">   65 </span>-- The ciphertext is unauthenticated and malleable: bit-flips in transit go
+<span class="lineno">   66 </span>-- undetected.  Callers needing tamper-detection must add a MAC or use an AEAD
+<span class="lineno">   67 </span>-- construction; for at-rest secrets prefer the vault API, which uses an
+<span class="lineno">   68 </span>-- authenticated scheme end-to-end.
+<span class="lineno">   69 </span>encrypt :: SecretKey -&gt; ByteString -&gt; IO (Either Text ByteString)
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">encrypt sk plaintext = withSecretKey sk $ \keyBytes -&gt;</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">case cipherInit keyBytes :: CryptoFailable AES256 of</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">CryptoFailed _      -&gt; pure (Left <span class="nottickedoff">&quot;key must be 32 bytes for AES-256&quot;</span>)</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">CryptoPassed cipher -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">ivBytes &lt;- getRandomBytes ivLength</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">case makeIV ivBytes of</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left &quot;could not construct a 16-byte IV&quot;)</span></span>
+<span class="lineno">   77 </span><span class="spaces">        </span><span class="istickedoff">Just iv -&gt; pure (Right (ivBytes &lt;&gt; ctrCombine cipher iv plaintext))</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Inverse of 'encrypt'. Pure: CTR needs no entropy to decrypt.
+<span class="lineno">   80 </span>--
+<span class="lineno">   81 </span>-- __Warning — confidentiality only, NOT integrity\/authentication.__
+<span class="lineno">   82 </span>-- No MAC is checked; a tampered ciphertext decrypts silently to corrupted
+<span class="lineno">   83 </span>-- plaintext.  See 'encrypt' for guidance on when to use a MAC or AEAD instead.
+<span class="lineno">   84 </span>decrypt :: SecretKey -&gt; ByteString -&gt; Either Text ByteString
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">decrypt sk blob = withSecretKey sk $ \keyBytes -&gt;</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">if BS.length blob &lt; ivLength</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;ciphertext shorter than the IV it must carry&quot;</span></span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">else</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">let (ivBytes, ciphertext) = BS.splitAt ivLength blob</span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff">in case cipherInit keyBytes :: CryptoFailable AES256 of</span>
+<span class="lineno">   91 </span><span class="spaces">           </span><span class="istickedoff">CryptoFailed _      -&gt; Left <span class="nottickedoff">&quot;key must be 32 bytes for AES-256&quot;</span></span>
+<span class="lineno">   92 </span><span class="spaces">           </span><span class="istickedoff">CryptoPassed cipher -&gt;</span>
+<span class="lineno">   93 </span><span class="spaces">             </span><span class="istickedoff">case makeIV ivBytes of</span>
+<span class="lineno">   94 </span><span class="spaces">               </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;could not construct a 16-byte IV&quot;</span></span>
+<span class="lineno">   95 </span><span class="spaces">               </span><span class="istickedoff">Just iv -&gt; Right (ctrCombine cipher iv ciphertext)</span></span>
+
+</pre>
+</body>
+</html>

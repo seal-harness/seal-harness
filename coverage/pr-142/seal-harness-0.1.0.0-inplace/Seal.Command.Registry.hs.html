@@ -1,0 +1,138 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The unified slash-command registry builder. All channels (web, CLI,
+<span class="lineno">    2 </span>-- Signal, Telegram) share the same core set of @\/@-commands, defined once
+<span class="lineno">    3 </span>-- here. Only channel-specific specs (the terse @\/N@ tab-grammar, the
+<span class="lineno">    4 </span>-- @\/channel@ channel-management command, the CLI's @\/bg@, and the
+<span class="lineno">    5 </span>-- per-request @\/call@\/@\/skill@\/@\/stop@ rebuilds on the multi-session
+<span class="lineno">    6 </span>-- web) stay at their wiring sites.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- The carve-out for the web: the @\/N@ terse grammar (@\/1@ focus, @\/1
+<span class="lineno">    9 </span>-- payload@ inject) is a tab-level operation the web frontend handles via
+<span class="lineno">   10 </span>-- the sidebar, not via the send endpoint — 'Seal.Gateway.Send.handleSend'
+<span class="lineno">   11 </span>-- short-circuits 'Focus'/'Inject'/'TabCommand' routes with a deferral
+<span class="lineno">   12 </span>-- message before they reach the registry. The @terseGrammarSpec@ is still
+<span class="lineno">   13 </span>-- included in the core list so @\/help@ displays the grammar; only its
+<span class="lineno">   14 </span>-- execution is web-rejected.
+<span class="lineno">   15 </span>module Seal.Command.Registry
+<span class="lineno">   16 </span>  ( CoreCommandDeps (..)
+<span class="lineno">   17 </span>  , coreCommandSpecs
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Agent.Def.Backend (AgentDefBackend)
+<span class="lineno">   21 </span>import Seal.Command.Agent (agentCommandSpec)
+<span class="lineno">   22 </span>import Seal.Command.Model (ModelTranscriptWriter, modelCommandSpec)
+<span class="lineno">   23 </span>import Seal.Command.Provider (ProviderRuntime, providerCommandSpec)
+<span class="lineno">   24 </span>import Seal.Command.Repo (RepoTestSeam, repoCommandSpec)
+<span class="lineno">   25 </span>import Seal.Command.Session (sessionCommandSpec)
+<span class="lineno">   26 </span>import Seal.Command.Spec (CommandSpec)
+<span class="lineno">   27 </span>import Seal.Command.Stop (StopTranscriptWriter, stopCommandSpec)
+<span class="lineno">   28 </span>import Seal.Command.Tab (TabCloseNotifier, tabCommandSpec, terseGrammarSpec)
+<span class="lineno">   29 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   30 </span>import Seal.Session.Store (SessionRuntime)
+<span class="lineno">   31 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">   32 </span>import Seal.Tabs (TabsHandle)
+<span class="lineno">   33 </span>import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+<span class="lineno">   34 </span>import Seal.Vault.Commands (VaultRuntime, vaultCommandSpec)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | The shared dependencies for the core slash-command specs. Built once
+<span class="lineno">   37 </span>-- at startup by each wiring site (web 'Seal.Command.Serve', CLI
+<span class="lineno">   38 </span>-- 'Seal.Tui', Signal/Telegram 'Seal.Channels.Signal.Run' /
+<span class="lineno">   39 </span>-- 'Seal.Channels.Telegram.Run') and passed to 'coreCommandSpecs' to
+<span class="lineno">   40 </span>-- produce the channel-agnostic slice of the 'Registry'.
+<span class="lineno">   41 </span>--
+<span class="lineno">   42 </span>-- The web's multi-session @\/stop@ (which must target the request's
+<span class="lineno">   43 </span>-- session, not the process-global @srActive@) is handled by
+<span class="lineno">   44 </span>-- 'Seal.Gateway.Send.replaceCallSkillSpecs' rebuilding the stop spec
+<span class="lineno">   45 </span>-- per-request via 'Seal.Command.Stop.stopCommandSpecForSession'; the
+<span class="lineno">   46 </span>-- @srActive@-reading spec produced here is the fallback for the
+<span class="lineno">   47 </span>-- single-session channels.
+<span class="lineno">   48 </span>data CoreCommandDeps = CoreCommandDeps
+<span class="lineno">   49 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdVault</span></span></span>       :: VaultRuntime
+<span class="lineno">   50 </span>    -- ^ For @\/vault@ (status/unlock/lock/rekey).
+<span class="lineno">   51 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdProvider</span></span></span>    :: ProviderRuntime
+<span class="lineno">   52 </span>    -- ^ For @\/provider@ (list/switch) + @\/model@.
+<span class="lineno">   53 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdSession</span></span></span>     :: SessionRuntime
+<span class="lineno">   54 </span>    -- ^ For @\/session@, @\/model@, and the single-session @\/stop@.
+<span class="lineno">   55 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdAgentDefs</span></span></span>   :: AgentDefBackend
+<span class="lineno">   56 </span>    -- ^ For @\/agent@ (list/edit/bind).
+<span class="lineno">   57 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdCfgPath</span></span></span>     :: FilePath
+<span class="lineno">   58 </span>    -- ^ The config.toml path (for @\/agent@'s file edits).
+<span class="lineno">   59 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdPaths</span></span></span>       :: SealPaths
+<span class="lineno">   60 </span>    -- ^ For @\/tab@ (session-meta lookups).
+<span class="lineno">   61 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdTabs</span></span></span>        :: TabsHandle
+<span class="lineno">   62 </span>    -- ^ For @\/tab@ (list/new/close/focus/resume/rename).
+<span class="lineno">   63 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdTabCloseNotifier</span></span></span> :: TabCloseNotifier
+<span class="lineno">   64 </span>    -- ^ Invoked after @\/tab close@ so attached channels are notified.
+<span class="lineno">   65 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdAbortReg</span></span></span>    :: SessionAbortRegistry
+<span class="lineno">   66 </span>    -- ^ For @\/stop@ (the single-session variant; the web rebuilds
+<span class="lineno">   67 </span>    -- per-request).
+<span class="lineno">   68 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdStopWriter</span></span></span>  :: StopTranscriptWriter
+<span class="lineno">   69 </span>    -- ^ Writes the stop message to the session's transcript + broadcasts
+<span class="lineno">   70 </span>    -- it so the stop appears cross-channel. Built at the wiring site from
+<span class="lineno">   71 </span>    -- 'SealPaths' + the broker.
+<span class="lineno">   72 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdModelWriter</span></span></span> :: ModelTranscriptWriter
+<span class="lineno">   73 </span>    -- ^ Writes the /model use confirmation to the session's transcript +
+<span class="lineno">   74 </span>    -- broadcasts it (twin of 'ccdStopWriter'). Built at the wiring site
+<span class="lineno">   75 </span>    -- from 'SealPaths' + the broker.
+<span class="lineno">   76 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdRepoReg</span></span></span>     :: RepoRegistryHandle
+<span class="lineno">   77 </span>    -- ^ For @\/repo@ (list/add/remove/info/test).
+<span class="lineno">   78 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ccdRepoSeam</span></span></span>    :: Maybe RepoTestSeam
+<span class="lineno">   79 </span>    -- ^ The @git ls-remote@ + vault-list seam for @\/repo test@ / @\/repo
+<span class="lineno">   80 </span>    -- info@. 'Nothing' on channels that don't wire the seam yet
+<span class="lineno">   81 </span>    -- (Signal/Telegram/TUI standalone); @\/repo@ is omitted from the
+<span class="lineno">   82 </span>    -- registry in that case.
+<span class="lineno">   83 </span>  }
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Build the core (channel-agnostic) slash-command specs. Each wiring
+<span class="lineno">   86 </span>-- site passes its 'CoreCommandDeps' + any channel-specific specs to
+<span class="lineno">   87 </span>-- 'mkRegistry':
+<span class="lineno">   88 </span>--
+<span class="lineno">   89 </span>-- @
+<span class="lineno">   90 </span>-- 'mkRegistry' ('coreCommandSpecs' coreDeps &lt;&gt; [channelSpecificSpec, ...])
+<span class="lineno">   91 </span>-- @
+<span class="lineno">   92 </span>--
+<span class="lineno">   93 </span>-- The web additionally rebuilds @\/call@, @\/skill@, and @\/stop@
+<span class="lineno">   94 </span>-- per-request via 'Seal.Gateway.Send.replaceCallSkillSpecs' so those
+<span class="lineno">   95 </span>-- commands target the request's explicit 'SessionId' (the web is
+<span class="lineno">   96 </span>-- multi-session; @srActive@ is not authoritative there).
+<span class="lineno">   97 </span>--
+<span class="lineno">   98 </span>-- @\/new@ is deliberately NOT in the core list: on inbox channels
+<span class="lineno">   99 </span>-- (Signal, Telegram) @\/new@ is handled at the loop level
+<span class="lineno">  100 </span>-- ('Seal.Channels.Loop.handleNewSession') because the conversation key +
+<span class="lineno">  101 </span>-- cursor aren't available to a registry 'CommandAction'. The CLI and web
+<span class="lineno">  102 </span>-- add @newCommandSpec@ to their registries directly (closing over their
+<span class="lineno">  103 </span>-- channel-specific @ndInsertTab@).
+<span class="lineno">  104 </span>coreCommandSpecs :: CoreCommandDeps -&gt; [CommandSpec]
+<span class="lineno">  105 </span><span class="decl"><span class="nottickedoff">coreCommandSpecs d =</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="nottickedoff">[ vaultCommandSpec (ccdVault d)</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="nottickedoff">, providerCommandSpec (ccdProvider d)</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="nottickedoff">, sessionCommandSpec (ccdSession d)</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="nottickedoff">, modelCommandSpec (ccdProvider d) (ccdSession d) (ccdModelWriter d)</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="nottickedoff">, agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="nottickedoff">, tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="nottickedoff">, stopCommandSpec (ccdAbortReg d) (ccdSession d) (ccdStopWriter d)</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="nottickedoff">, terseGrammarSpec</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="nottickedoff">]</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="nottickedoff">&lt;&gt; [ repoCommandSpec (ccdRepoReg d) seam | Just seam &lt;- [ccdRepoSeam d] ]</span></span>
+
+</pre>
+</body>
+</html>
