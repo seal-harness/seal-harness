@@ -249,6 +249,32 @@ export interface ProviderInfo {
   defaultModel?: string
 }
 
+// ── Provider CRUD (detailed) ───────────────────────────────────────────
+
+/** The auth status of a provider, as reported by GET /api/providers/all.
+ *  Mirrors the backend's authStatus field. */
+export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vault-locked'
+
+/** The detailed provider info returned by GET /api/providers/all, showing
+ *  ALL known providers (configured + unconfigured) with their auth status,
+ *  config fields, and whether the provider is the default. */
+export interface ProviderDetail {
+  name: string
+  isDefault: boolean
+  defaultModel: string | null
+  baseUrl: string | null
+  authStatus: ProviderAuthStatus
+}
+
+/** The body for POST /api/providers and PUT /api/providers/:name. The
+ *  api_key is write-only — never returned by the API. */
+export interface ProviderInput {
+  name?: string
+  api_key?: string
+  base_url?: string
+  default_model?: string
+}
+
 // ── Agent CRUD (full def) ──────────────────────────────────────────────
 
 /** The opcode-allow-list wire shape: the string "all" or an array of
