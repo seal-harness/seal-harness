@@ -2,16 +2,19 @@
 module Seal.Gateway.ServerSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Data.CaseInsensitive (mk)
 import Data.List (isInfixOf)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Time (UTCTime(..), fromGregorian)
+import Control.Monad (when)
 import Network.HTTP.Types (methodGet, methodPost, status200, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, requestMethod
-  , responseLBS, responseStatus )
+  ( Application, Request, Response, defaultRequest, pathInfo, requestMethod
+  , responseLBS, responseHeaders, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Directory (createDirectoryIfMissing)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
@@ -20,6 +23,7 @@ import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
+import Seal.Gateway.Embedded (embeddedAssetCount)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -61,6 +65,18 @@ runAppStatus app req = do
   mv <- newEmptyMVar
   _rr <- app req (\resp -> putMVar mv (statusCode (responseStatus resp)) >> pure ResponseReceived)
   takeMVar mv
+
+-- | Run an app and capture the full Response (for header/body inspection).
+runAppResp :: Application -> Request -> IO Response
+runAppResp app req = do
+  mv <- newEmptyMVar
+  _rr <- app req (\resp -> putMVar mv resp >> pure ResponseReceived)
+  takeMVar mv
+
+-- | Check if a response has a specific header value (case-insensitive).
+hasHeader :: Response -> BC.ByteString -> BC.ByteString -> Bool
+hasHeader resp name value =
+  any (\(n, v) -> n == mk name && v == value) (responseHeaders resp)
 
 mkDeps :: IO ApiDeps
 mkDeps = do
@@ -112,7 +128,49 @@ spec = describe "Seal.Gateway.Server" $ do
     deps <- mkDeps
     let app = gatewayApp testLogger deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["foo", "bar"] })
-    status `shouldBe` 404
+    -- When assets are embedded: SPA fallback → 200.
+    -- When no assets (fresh checkout): emptyEmbedResponse → 404.
+    if embeddedAssetCount > 0
+      then status `shouldBe` 200
+      else status `shouldBe` 404
+
+  -- ── Embedded serving tests (only when assets are embedded) ─────────
+
+  it "serveEmbedded: GET / returns 200 (index.html) when assets embedded" $
+    when (embeddedAssetCount > 0) $ do
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps Nothing
+      status <- runAppStatus app (defaultRequest { pathInfo = [] })
+      status `shouldBe` 200
+
+  it "serveEmbedded: GET /some/spa/route returns 200 (SPA fallback) when assets embedded" $
+    when (embeddedAssetCount > 0) $ do
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps Nothing
+      status <- runAppStatus app (defaultRequest { pathInfo = ["some", "spa", "route"] })
+      status `shouldBe` 200
+
+  it "serveEmbedded: GET /assets/nonexistent.js returns 404 (asset miss)" $
+    when (embeddedAssetCount > 0) $ do
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps Nothing
+      status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "nonexistent.js"] })
+      status `shouldBe` 404
+
+  it "serveEmbedded: GET /user.profile returns 200 (SPA fallback, .profile not in assetExtensions)" $
+    when (embeddedAssetCount > 0) $ do
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps Nothing
+      status <- runAppStatus app (defaultRequest { pathInfo = ["user.profile"] })
+      status `shouldBe` 200
+
+  it "serveEmbedded: all responses have X-Content-Type-Options: nosniff" $
+    when (embeddedAssetCount > 0) $ do
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps Nothing
+      resp <- runAppResp app (defaultRequest { pathInfo = [] })
+      responseStatus resp `shouldBe` status200
+      hasHeader resp "X-Content-Type-Options" "nosniff" `shouldBe` True
 
   it "gatewayApp serves index.html for the root with a static dir" $
     withSystemTempDirectory "seal-static-test" $ \dir -> do
@@ -121,6 +179,34 @@ spec = describe "Seal.Gateway.Server" $ do
       let app = gatewayApp testLogger deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
+
+  -- ── Disk-path traversal tests ──────────────────────────────────────
+
+  it "serveStatic: GET /../ does not return 200" $
+    withSystemTempDirectory "seal-static-test" $ \dir -> do
+      BC.writeFile (dir </> "index.html") "<html>ok</html>"
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps (Just dir)
+      status <- runAppStatus app (defaultRequest { pathInfo = [".."] })
+      status `shouldNotBe` 200
+
+  it "serveStatic: GET /subdir/file serves nested files" $
+    withSystemTempDirectory "seal-static-test" $ \dir -> do
+      createDirectoryIfMissing True (dir </> "assets")
+      BC.writeFile (dir </> "assets" </> "test.js") "console.log('hi');"
+      BC.writeFile (dir </> "index.html") "<html>ok</html>"
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps (Just dir)
+      status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "test.js"] })
+      status `shouldBe` 200
+
+  it "serveStatic: GET /nonexistent.js returns 404 (asset miss, not HTML)" $
+    withSystemTempDirectory "seal-static-test" $ \dir -> do
+      BC.writeFile (dir </> "index.html") "<html>ok</html>"
+      deps <- mkDeps
+      let app = gatewayApp testLogger deps (Just dir)
+      status <- runAppStatus app (defaultRequest { pathInfo = ["nonexistent.js"] })
+      status `shouldBe` 404
 
   it "gatewayApp serves /api/openapi.json as JSON" $ do
     deps <- mkDeps

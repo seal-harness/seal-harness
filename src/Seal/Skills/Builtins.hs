@@ -52,10 +52,11 @@ builtinStamp = UTCTime (fromGregorian 2026 7 24) (secondsToDiffTime 0)
 -- their on-disk location).
 --
 -- Each 'embedFile' splice is paired with a 'qAddDependentFile' call so
--- GHC recompiles this module when an embedded source changes (plain
--- 'embedFile' alone does not register the file as a build dependency, so
--- editing the markdown would not trigger a rebuild — a subtle footgun
--- we close here). The splice must use a literal path (GHC stage
+-- GHC recompiles this module when an embedded source changes. (Note:
+-- upstream 'embedFile' /does/ call 'qAddDependentFile' internally as of
+-- @template-haskell >= 2.7@, so the manual calls here are redundant but
+-- harmless — kept for explicitness and robustness across versions.)
+-- The splice must use a literal path (GHC stage
 -- restriction: a top-level splice cannot reference a locally-bound
 -- variable), so each entry inlines its own splice rather than sharing a
 -- single one parameterized by @path@.
