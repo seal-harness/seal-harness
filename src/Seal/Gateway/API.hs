@@ -2074,6 +2074,7 @@ staticModelsFor AnthropicProvider =
   , "claude-haiku-4-5"
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
+staticModelsFor OpenRouterProvider = ["openrouter/default"]
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value

@@ -115,6 +115,7 @@ library
         Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
+        Seal.Providers.OpenRouter
         Seal.Util.AesonUtils
         Seal.Util.AtomicJson
         Seal.Util.StrictIO
@@ -337,6 +338,8 @@ library
       , trasa-openapi-hs
       , openapi-hs
       , http-media
+      , openai
+      , servant-client
       , seal-gateway-types
       , seal-chat-channels
     hs-source-dirs: src
@@ -569,6 +572,7 @@ test-suite tests
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
         Seal.Providers.ContextWindowSpec
+        Seal.Providers.OpenRouterSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
