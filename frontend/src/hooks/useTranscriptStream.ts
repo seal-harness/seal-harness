@@ -480,6 +480,10 @@ export function useTranscriptStream(
     const pinned = getGlobalDataCache().getPinnedLast(sid)
     if (pinned) {
       console.log(`[transcript] PINNED-LAST hit session=${sid} count=${pinned.entries.length}`)
+      // Diagnostic: check if pinned entries are the same reference as
+      // current entries (React useState bails out on same ref → no
+      // re-render → pendingScrollToBottom never consumed → no scroll).
+      console.log(`[transcript] PINNED-LAST entriesRef=${pinned.entries === entries ? 'SAME-AS-CURRENT' : 'DIFFERENT'} currentCount=${entries.length} pinnedCount=${pinned.entries.length}`)
       setEntries(pinned.entries)
       setHasMore(pinned.hasMore)
       setTotalCount(pinned.totalCount)
