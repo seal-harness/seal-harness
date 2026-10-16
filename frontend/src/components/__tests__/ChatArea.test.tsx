@@ -2464,4 +2464,53 @@ describe('Scroll-to-top behavior', () => {
       Element.prototype.scrollIntoView = origScrollIntoView
     }
   })
+
+  it('scrolling to bottom when isViewingLatest is false triggers loadLatest', () => {
+    // When the user has jumped to the beginning (loadFromBeginning) and
+    // then scrolls back to the bottom via mouse/keyboard, the transcript
+    // should call loadLatest to fetch the latest entries. We verify by
+    // passing isViewingLatest={false} and checking that loadLatest is
+    // called on mount (jsdom's scroll dimensions are all 0, so the
+    // listener detects "at bottom" immediately).
+    const msgsA = makeMessages('a', 3)
+    const loadLatest = vi.fn()
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          isViewingLatest={false}
+          loadLatest={loadLatest}
+        />,
+      )
+      // The scroll listener runs onScroll() on mount. In jsdom, all
+      // scroll dimensions are 0, so wasAtBottom is true. With
+      // isViewingLatest=false, loadLatest should be called.
+      expect(loadLatest).toHaveBeenCalledTimes(1)
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('scrolling to bottom when isViewingLatest is true does NOT trigger loadLatest', () => {
+    // When the user is already viewing the latest entries, scrolling to
+    // the bottom should NOT call loadLatest (no unnecessary fetch).
+    const msgsA = makeMessages('a', 3)
+    const loadLatest = vi.fn()
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgsA}
+        isViewingLatest={true}
+        loadLatest={loadLatest}
+      />,
+    )
+    expect(loadLatest).not.toHaveBeenCalled()
+  })
 })

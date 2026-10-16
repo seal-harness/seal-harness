@@ -2306,6 +2306,7 @@ export function ChatArea({
   isSessionThinking,
   onCancelQuestion,
   hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
+  isViewingLatest,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2313,6 +2314,11 @@ export function ChatArea({
   messages: Message[]
   loading?: boolean
   hasMore?: boolean
+  /** True when loaded entries include the latest (tail) entries. When
+   *  false, scrolling to the bottom triggers loadLatest to fetch the
+   *  newest entries from the server. Defaults to true for backward
+   *  compatibility (tests that don't pass this prop). */
+  isViewingLatest?: boolean
   loadingMore?: boolean
   loadOlder?: () => void
   loadFromBeginning?: () => void
@@ -2407,6 +2413,12 @@ export function ChatArea({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+ // Guards against duplicate loadLatest calls when the user scrolls to
+ // the bottom while isViewingLatest is false. Set to true when
+ // loadLatest is triggered; reset when isViewingLatest becomes true.
+ const triggeredLoadLatest = useRef(false)
+ // Derived: treat missing prop as true (backward-compatible with tests).
+ const viewingLatest = isViewingLatest ?? true
 
   // Virtual windowing: only render visible messages + overscan buffer.
   // Only activated for large transcripts (> VIRTUALIZATION_THRESHOLD);
@@ -2554,12 +2566,30 @@ export function ChatArea({
         loadOlder()
         wasAtBottom.current = false
       }
+      // When the user reaches the bottom but the loaded entries don't
+      // include the latest (e.g. after loadFromBeginning), trigger
+      // loadLatest to fetch the newest entries and enter auto-scroll
+      // mode. The triggeredLoadLatest guard prevents duplicate calls
+      // before isViewingLatest flips to true.
+      if (
+        wasAtBottom.current && !viewingLatest &&
+        !triggeredLoadLatest.current && loadLatest && !loadingMore
+      ) {
+        triggeredLoadLatest.current = true
+        pendingScrollToBottom.current = true
+        loadLatest()
+      }
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
 
-  }, [hasFragment, hasMore, loadingMore, loadOlder])
+  }, [hasFragment, hasMore, loadingMore, loadOlder, viewingLatest, loadLatest])
+  // Reset the loadLatest trigger when entries become the latest view
+  // (after loadLatest completes or on session switch).
+  useEffect(() => {
+    if (viewingLatest) triggeredLoadLatest.current = false
+  }, [viewingLatest])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
