@@ -226,6 +226,7 @@ export function useTranscriptStream(
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
   const [hasMore, setHasMore] = useState(false)
+  const [isViewingLatest, setIsViewingLatest] = useState(true)
   const [totalCount, setTotalCount] = useState(0)
   const [loadingMore, setLoadingMore] = useState(false)
   const loadedSessionRef = useRef<string | null>(null)
@@ -274,6 +275,7 @@ export function useTranscriptStream(
       setEntries(cached.entries)
       setHasMore(cached.hasMore)
       setTotalCount(cached.totalCount)
+      setIsViewingLatest(true)
       setLoading(false)
       loadedSessionRef.current = sessionId
       console.log(`[transcript] SEED cache-hit session=${sessionId} count=${cached.entries.length} totalCount=${cached.totalCount} hasMore=${cached.hasMore} firstId=${cached.entries[0]?.id} lastId=${cached.entries[cached.entries.length-1]?.id}`)
@@ -295,6 +297,7 @@ export function useTranscriptStream(
           setEntries(seed.entries)
           setHasMore(seed.hasMore)
           setTotalCount(seed.totalCount)
+          setIsViewingLatest(true)
           dataCache.set(sessionId, seed)
           // Pin the last chunk (the HTTP seed is the latest entries).
           dataCache.pinLast(sessionId, seed)
@@ -358,6 +361,7 @@ export function useTranscriptStream(
         setEntries(chunk.entries)
         setHasMore(chunk.hasMore)
         setTotalCount(chunk.totalCount ?? chunk.entries.length)
+        setIsViewingLatest(true)
         setLoading(false)
         setLoadingMore(false)
         loadedSessionRef.current = chunkSid
@@ -386,6 +390,7 @@ export function useTranscriptStream(
         setEntries(chunk.entries)
         setHasMore(false)
         setTotalCount(chunk.totalCount ?? chunk.entries.length)
+        setIsViewingLatest(false)
         setLoading(false)
         setLoadingMore(false)
         loadedSessionRef.current = chunkSid
@@ -459,6 +464,7 @@ export function useTranscriptStream(
       setHasMore(pinned.hasMore)
       setTotalCount(pinned.totalCount)
       setLoadingMore(false)
+      setIsViewingLatest(false)
       // Update LRU cache too.
       getGlobalDataCache().set(sid, pinned)
       return
@@ -480,10 +486,15 @@ export function useTranscriptStream(
     const pinned = getGlobalDataCache().getPinnedLast(sid)
     if (pinned) {
       console.log(`[transcript] PINNED-LAST hit session=${sid} count=${pinned.entries.length}`)
+      // Diagnostic: check if pinned entries are the same reference as
+      // current entries (React useState bails out on same ref → no
+      // re-render → pendingScrollToBottom never consumed → no scroll).
+      console.log(`[transcript] PINNED-LAST entriesRef=${pinned.entries === entries ? 'SAME-AS-CURRENT' : 'DIFFERENT'} currentCount=${entries.length} pinnedCount=${pinned.entries.length}`)
       setEntries(pinned.entries)
       setHasMore(pinned.hasMore)
       setTotalCount(pinned.totalCount)
       setLoadingMore(false)
+      setIsViewingLatest(true)
       getGlobalDataCache().set(sid, pinned)
       // Re-focus for live tail to catch any new entries since the pin.
       const lastId = pinned.entries.length > 0
@@ -544,6 +555,6 @@ export function useTranscriptStream(
 
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
-    hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning, loadLatest,
+    hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest,
   }
 }

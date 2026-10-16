@@ -343,7 +343,7 @@ export default function App() {
   // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
   // fetch on every tab click). The `loading` flag and `refresh` action
   // are exposed by the stream hook.
-  const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest } = useTranscriptStream(currentSessionId)
+ const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
@@ -1003,6 +1003,7 @@ export default function App() {
               messages={messages}
               loading={loading}
              hasMore={hasMore}
+             isViewingLatest={isViewingLatest}
              loadingMore={loadingMore}
              loadOlder={loadOlder}
               loadFromBeginning={loadFromBeginning}

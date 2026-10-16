@@ -380,6 +380,74 @@ describe('useTranscriptStream', () => {
     vi.unstubAllGlobals()
   })
 
+  it('isViewingLatest is true after initial HTTP seed', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '100' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.isViewingLatest).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('isViewingLatest is false after loadFromBeginning', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '100' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    expect(result.current.isViewingLatest).toBe(true)
+    // Trigger loadFromBeginning — sends WS request
+    await act(async () => { result.current.loadFromBeginning() })
+    // Server responds with beginning entries
+    const begEntries = [makeEntry('e0', '2026-01-01T00:00:00Z')]
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: begEntries,
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.isViewingLatest).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('isViewingLatest is true after loadLatest (following loadFromBeginning)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const seedEntries = [makeEntry('e5', '2026-01-01T00:00:04Z')]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(seedEntries), { status: 200, headers: { 'Content-Type': 'application/json', 'X-Has-More': 'true', 'X-Total-Count': '100' } })
+    }))
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise(r => setTimeout(r, 10)) })
+    // Jump to beginning
+    await act(async () => { result.current.loadFromBeginning() })
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e0', '2026-01-01T00:00:00Z')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.isViewingLatest).toBe(false)
+    // Now call loadLatest — should use pinned cache (from initial seed)
+    await act(async () => { result.current.loadLatest() })
+    expect(result.current.isViewingLatest).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
 
 describe('prependChunkEntries', () => {
   it('prepends older entries before existing', () => {

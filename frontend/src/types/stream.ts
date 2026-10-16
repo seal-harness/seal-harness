@@ -279,6 +279,12 @@ export interface UseTranscriptStream {
    *  latest N entries from the backend, replacing whatever is currently
    *  loaded. */
   loadLatest: () => void
+  /** True when the loaded entries include the latest (tail) entries —
+   *  i.e. the user is viewing the newest end of the transcript. False
+   *  after `loadFromBeginning` (oldest entries loaded, latest not in
+   *  view). Used by the UI to decide whether scroll-to-bottom should
+   *  trigger a `loadLatest` fetch. */
+  isViewingLatest: boolean
 }
 
 export interface UseSessionActivityStream {
