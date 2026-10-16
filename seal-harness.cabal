@@ -338,7 +338,7 @@ library
       , trasa-openapi-hs
       , openapi-hs
       , http-media
-      , openai
+      , openai >=2.5.4
       , servant-client
       , seal-gateway-types
       , seal-chat-channels
