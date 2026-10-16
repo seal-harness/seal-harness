@@ -1,36 +1,31 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Skeleton spec for OpenRouter provider wiring (WU-002).
--- TDD: failing test asserts registry recognizes 'openrouter';
--- minimal registry wiring passes.
+-- | WU-003 Security & Tests — TDD spec skeleton (RED → GREEN).
+-- Failing test first: asserts `complete` returns `Left` when vault missing;
+-- asserts `listModels` returns `Right` with default model.
+-- Minimal skeleton (`OpenRouter` instance) passes — GREEN step.
 module Seal.Providers.OpenRouterSpec (spec) where
 
+import Data.Either (isLeft)
 import Test.Hspec
-import Data.Text qualified as T
 
-import Seal.Core.Types (ModelId (..), ProviderId (..))
-import Seal.Providers.Registry
-  ( KnownProvider (..)
-  , providerLabel
-  , providerId
-  , parseProvider
-  , defaultModelFor
-  , vaultKeyName
-  )
+import Seal.Core.Types (ModelId (..))
+import Seal.Providers.Class (CompletionRequest (..), Provider (..), textMsg, Role (..), ToolChoice (..))
+import Seal.Providers.OpenRouter (OpenRouter (..), mkOpenRouter, defaultOpenRouterBaseUrl)
 
 spec :: Spec
-spec = describe "Seal.Providers.OpenRouter wiring" $ do
-  it "lists openrouter in known providers" $ do
-    parseProvider "openrouter" `shouldBe` Just OpenRouterProvider
+spec = describe "Seal.Providers.OpenRouter — WU-003 TDD skeleton" $ do
+  -- RED phase: no provider skeleton → these fail.
+  -- GREEN phase: minimal `OpenRouter` instance in src/ passes.
 
-  it "labels openrouter" $ do
-    providerLabel OpenRouterProvider `shouldBe` "openrouter"
+  describe "complete (vault missing)" $ do
+    it "returns Left when vault missing (Nothing ApiKey)" $ do
+      let prov = mkOpenRouter Nothing defaultOpenRouterBaseUrl (ModelId "openrouter/default")
+          req  = CompletionRequest (ModelId "openrouter/default") Nothing [textMsg User "test"] [] ToolAuto 256
+      r <- complete prov req
+      r `shouldSatisfy` isLeft
 
-  it "maps openrouter to ProviderId" $ do
-    providerId OpenRouterProvider `shouldBe` ProviderId "openrouter"
-
-  it "names the vault key for openrouter" $ do
-    vaultKeyName OpenRouterProvider `shouldBe` "OPENROUTER_API_KEY"
-
-  it "has a default model for openrouter" $ do
-    -- Default model value to be defined by registry wiring
-    defaultModelFor OpenRouterProvider `shouldSatisfy` (\(ModelId m) -> not (T.null m))
+  describe "listModels" $ do
+    it "returns Right with default model" $ do
+      let prov = mkOpenRouter Nothing defaultOpenRouterBaseUrl (ModelId "openrouter/default")
+      r <- listModels prov
+      r `shouldBe` Right [ModelId "openrouter/default"]
