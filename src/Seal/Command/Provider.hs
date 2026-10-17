@@ -126,7 +126,10 @@ providerParser pr = hsubparser
   )
 
 provArg :: Parser Text
-provArg = T.pack <$> strArgument (metavar "PROVIDER" <> help "Provider id (e.g. anthropic)")
+provArg = T.pack <$> strArgument
+  ( metavar "PROVIDER"
+  <> help ("Provider id (one of: " <> T.unpack (T.intercalate ", " (map providerLabel knownProviders)) <> ")")
+  )
 
 -- Shared guards -------------------------------------------------------------
 
