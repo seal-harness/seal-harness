@@ -3596,9 +3596,11 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
-  it "GET /api/providers returns only the configured providers" $ do
-    -- adProviders is an IO action; a filtered list means only the configured
-    -- providers appear (here: ollama only, since no vault/credentials).
+  it "GET /api/providers returns all known providers with a configured flag" $ do
+    -- adProviders yields the *configured* subset (here: ollama only). The
+    -- handler emits every 'knownProviders', flagging each as @configured@
+    -- by membership — so the frontend can show all supported providers and
+    -- mark which still need a credential.
     let mkAppFiltered = do
           tabsH <- newTabsHandle
           reg   <- newHarnessRegistry
@@ -3634,13 +3636,22 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    length arr `shouldBe` 1
-    let nm = case arr of
-          (A.Object o : _) -> case lookupK "name" o of
-            Just (A.String n) -> n
-            _ -> error "no name field"
-          _ -> error "not an object"
-    nm `shouldBe` "ollama"
+    -- Every known provider is present (anthropic, ollama, openrouter).
+    length arr `shouldBe` length knownProviders
+    -- Each entry has a name; build a name -> configured map.
+    let entries = [ (n, c) | e <- arr, A.Object o <- [e]
+                          , Just (A.String n) <- [lookupK "name" o]
+                          , Just c <- [case lookupK "configured" o of
+                                        Just (A.Bool b) -> Just b
+                                        _ -> Nothing]
+                          ]
+        byName = Map.fromList entries
+    -- Ollama is configured; the others are not.
+    byName `shouldBe` Map.fromList
+              [ ("anthropic", False)
+              , ("ollama", True)
+              , ("openrouter", False)
+              ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp

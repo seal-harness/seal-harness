@@ -95,7 +95,7 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
-  ( KnownProvider (..), parseProvider, providerLabel )
+  ( KnownProvider (..), knownProviders, parseProvider, providerLabel )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -130,7 +130,7 @@ data ApiDeps = ApiDeps
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11) + /api/agents CRUD
   , adSkills          :: SkillBackend         -- ^ for /api/skills CRUD
-  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
+  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider subset (T11). The handler emits all 'knownProviders', flagging each as @configured@ by membership here.
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
@@ -509,12 +509,16 @@ apiApp deps req respond =
     -- unconfigured/locked.
     (m', ["api", "secrets", sname]) | m' == methodDelete ->
       respond =<< handleSecretDelete deps sname
-    -- T11: GET /api/providers -> the configured provider list. @isDefault@
-    -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
-    -- T11, so only @name@ is emitted.
+    -- T11: GET /api/providers -> every provider Seal knows how to build, each
+    -- flagged with whether it is *configured* (has a usable credential or is
+    -- keyless). The frontend renders all supported providers in the "new tab"
+    -- form, marking the unconfigured ones so the user knows which still need
+    -- a key. @isDefault@ / @defaultModel@ are UI conveniences not threaded into
+    -- 'ApiDeps' for T11, so only @name@ + @configured@ are emitted.
     (m', ["api", "providers"]) | m' == methodGet -> do
-      providers <- adProviders deps
-      respond (jsonLBS status200 (A.encode (map providerInfoJson providers)))
+      configured <- adProviders deps
+      let cfgSet = Set.fromList (map providerLabel configured)
+      respond (jsonLBS status200 (A.encode (map (providerInfoJson cfgSet) knownProviders)))
     -- T11: GET /api/providers/:p/models -> a STATIC list of models for the
     -- provider (the real /v1/models upstream call needs vault credentials +
     -- a live HTTP request and is out of scope). Context windows come from
@@ -2051,10 +2055,15 @@ jsonCreated :: Value -> Response
 jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
 
 -- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
--- emits only @name@; @isDefault@ / @defaultModel@ are UI conveniences not
--- threaded into 'ApiDeps' for T11.
-providerInfoJson :: KnownProvider -> Value
-providerInfoJson p = object ["name" .= providerLabel p]
+-- emits @name@ + @configured@ (membership in the configured-provider set);
+-- @isDefault@ / @defaultModel@ are UI conveniences not threaded into
+-- 'ApiDeps' for T11.
+providerInfoJson :: Set.Set Text -> KnownProvider -> Value
+providerInfoJson cfgSet p =
+  object
+    [ "name" .= providerLabel p
+    , "configured" .= Set.member (providerLabel p) cfgSet
+    ]
 
 -- | T11: the STATIC model list for a provider. The real @/v1/models@
 -- upstream call needs vault credentials + a live HTTP request and is out of
