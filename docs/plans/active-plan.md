@@ -1,119 +1,96 @@
 # Active Plan
-<!-- approved: 2026-10-04 -->
-<!-- gate-iterations: 1 (revised) -->
+<!-- approved: 2026-10-17 -->
+<!-- gate-iterations: 2 -->
 <!-- user-approved: true -->
 <!-- status: in-progress -->
 
-# Implementation Plan: Chunked Transcript Loading via WebSocket
-## Issue: #243
-## Design: docs/plans/2026-10-04-chunked-transcript-ws-design.md
+# Implementation Plan: OpenRouter Provider — Finish `complete`
+
+> Supersedes the WU-001..WU-003 skeleton plan. WU-001 (skeleton) and WU-002
+> (registry/cabal/frontend wiring) are committed (`7e50795`, `2c3d533`, `5e37dc3`);
+> the frontend `/api/providers` "show all supported providers" fix is landed on
+> this branch. What remains is the actual HTTP implementation.
+
+## Goal
+Make `Seal.Providers.OpenRouter.complete` actually round-trip a completion
+through OpenRouter's OpenAI-compatible `/api/v1/chat/completions`, with real
+TDD tests, without introducing a source-level `servant-client` dependency.
+
+## Approach (user-approved)
+**openai types + own HTTP** — import the `openai` package's *types* only
+(`OpenAI.V1.Chat.Completions`, `OpenAI.V1.Tool`, `OpenAI.V1.ToolCall`,
+`OpenAI.V1.Models`, `OpenAI.V1.Usage`) and do the HTTP ourselves with
+`Network.HTTP.Client`, passing the API key via the CPS `withApiKey` accessor
+as a `Authorization: Bearer` header — mirroring `Seal.Providers.Anthropic`
+and `Seal.Providers.Ollama` exactly. **Do not** use `OpenAI.V1.makeMethods`.
+
+## Pre-requisite
+Drop `servant-client` from `seal-harness.cabal` `build-depends` (it stays
+transitive via `openai`).
 
 ## Work Units
 
-### WU-1: Backend pure helpers + op/event types (Haskell)
+### WU-A: Drop `servant-client` from `build-depends`
+**Files:** `seal-harness.cabal` (remove `, servant-client` from the library
+`build-depends` list).
+**Verify:** `make build` clean; `rg "Servant\.Client" src` returns nothing.
+**Dependencies:** none (leaf).
+**TDD:** N/A (dependency change). Gate: `make build`.
+
+### WU-B: Implement `OpenRouter.complete` + `listModels` (openai types + own HTTP)
 **Files:**
-- `src-gateway-types/Seal/Gateway/Types/Stream.hs` — `RequestEntriesOp`, `ClientMessage`, `SeEntriesChunk`, `parseServerEvent` case
-- `src/Seal/Gateway/Stream.hs` — `entriesBeforeId`, `clampLimit`, `sendErrorFrame`, export list update
-- `seal-harness.cabal` — no new modules (additions to existing)
-- `test/Seal/Gateway/StreamSpec.hs` — tests for pure helpers
-- `test/Main.hs` — wire new test if needed
+- `src/Seal/Providers/OpenRouter.hs` — rewrite the skeleton: add `orManager`;
+  drop the `-Wno-unused-*` pragmas; export `encodeRequest`/`decodeResponse`/
+  `mapFinishReason`/`bearerHeaders`/`sendChatCompletion`/`httpErrorText`;
+  import `OpenAI.V1.*` types + `Network.HTTP.Client` + `withApiKey`
+  (forbidden: `System.Process`/`Directory`/`Posix`/`Servant.*`);
+  pure `encodeRequest` (crSystem→System message, CbThinking dropped,
+  CbToolUse→tool_calls, CbToolResult→Tool role, crMaxTokens→
+  max_completion_tokens, crTools→Tool_Function, crToolChoice→ToolChoice);
+  pure `mapFinishReason` (stop→StopEnd, tool_calls→StopToolUse, length→
+  StopMaxTokens, content_filter + unknown→StopOther);
+  pure `decodeResponse` (**empty choices → Left**; else first choice:
+  Assistant text→CbText, tool_calls→CbToolUse, mapFinishReason, usage);
+  `bearerHeaders`; `sendChatCompletion` (POST baseUrl/chat/completions,
+  catch HttpException → Left; non-2xx → httpErrorText);
+  `httpErrorText` (429 rate-limit, 401 auth, else status+body);
+  `complete` (Nothing key → Left "needs an API key"; Just key → withApiKey
+  CPS → sendChatCompletion); `listModels` stays `Right [default]`.
+- `src/Seal/Providers/Registry.hs` — un-shadow `_mgr`→`mgr` in the OpenRouter
+  branch of `resolveProvider`; call `mkOpenRouter mgr (Just (mkApiKey kb))
+  baseUrl model`.
+- `test/Seal/Providers/OpenRouterSpec.hs` — update the 2 existing
+  `mkOpenRouter` callsites to the new 4-arg signature (Manager via
+  `newTlsManager`); the skeleton assertions still pass after WU-B. Full
+  spec rewrite is WU-C.
+**Verify:** `make build` clean; `cabal test --test-options='--match=OpenRouter'`
+(skeleton assertions green); forbidden-import grep empty.
+**Dependencies:** WU-A. Gate: `make build` + `cabal test --match=OpenRouter`.
 
-**TDD:**
-- RED: Test `entriesBeforeId` (found cursor, not-found → Nothing, empty list, cursor at head/tail), `clampLimit` (default/min/max/out-of-range), `ClientMessage` FromJSON dispatch (op="focus" → CmFocus, op="request-entries" → CmRequestEntries, op absent → CmFocus fallback), `RequestEntriesOp` FromJSON (with/without before/limit)
-- GREEN: Implement types and pure helpers
-- REFACTOR: Extract shared `breakOnId` pattern if beneficial
+### WU-C: TDD spec — real tests for OpenRouter
+**Files:** `test/Seal/Providers/OpenRouterSpec.hs` — rewrite: `encodeRequest`
+(minimal, crSystem, CbToolResult, crToolChoice); `mapFinishReason`;
+`decodeResponse` (text+stop, tool_calls, **empty choices → Left**);
+`complete` (no-key → Left); `listModels`; `bearerHeaders` (Bearer + json).
+No network; sub-second.
+**Verify:** `make test` green; `make lint` clean.
+**Dependencies:** WU-B.
 
-**Dependencies:** None (leaf unit)
-**Verification:** `make test` — new tests pass; `make lint` — clean
-
-### WU-2: Backend `handleRequestEntries` handler (Haskell)
-**Files:**
-- `src/Seal/Gateway/Stream.hs` — `handleRequestEntries`, `ClientMessage` dispatch in `readerLoop`
-- `test/Seal/Gateway/StreamSpec.hs` — handler tests
-
-**TDD:**
-- RED: Test `handleRequestEntries` with fake connection: latest N (before=null), before-cursor (returns newest-of-older entries, NOT oldest), missing cursor (empty + hasMore=false), empty transcript, limit clamping, exception handler sends empty chunk
-- GREEN: Implement handler + wire into readerLoop
-- REFACTOR: N/A
-
-**Dependencies:** WU-1 (needs `entriesBeforeId`, `clampLimit`, `RequestEntriesOp`, `ClientMessage`)
-**Verification:** `make test` — handler tests pass; `make lint` — clean
-
-### WU-3: Frontend types + streamClient (TypeScript)
-**Files:**
-- `frontend/src/types/stream.ts` — `ClientOp` variant, `ServerEvent` variant, `EntriesChunkPayload` type, `UseTranscriptStream` interface update
-- `frontend/src/lib/streamClient.ts` — `requestEntries` method, `onEntriesChunk` listener, `handleMessage` case
-- `frontend/src/lib/__tests__/streamClient.test.ts` — tests
-
-**TDD:**
-- RED: Test `requestEntries` sends correct WS message; `onEntriesChunk` fires on `entries-chunk` event; `handleMessage` dispatches correctly
-- GREEN: Implement types + streamClient methods
-- REFACTOR: N/A
-
-**Dependencies:** None (frontend leaf unit, can proceed in parallel with WU-1/WU-2)
-**Verification:** `cd frontend && npx vitest run` — new tests pass
-
-### WU-4: Frontend `useTranscriptStream` hook (TypeScript)
-**Files:**
-- `frontend/src/hooks/useTranscriptStream.ts` — replace HTTP seed with WS chunk requests, `hasMore`/`totalCount`/`loadingMore`/`loadOlder` state, `CachedTranscript` type, `prependChunkEntries` function, WS status reset, response matching by sessionId + requestBefore, empty-chunk guard, initial-chunk reconnect, `refresh()` merge semantics
-- `frontend/src/hooks/__tests__/useStreams.test.ts` — tests
-
-**Perf instrumentation (design §6.2 acceptance criteria 1-3):**
-- Repurpose `perf.begin('transcript.seed')` for WS chunk seed timing
-- Add `perf.begin('transcript.loadOlder')` for load-older timing
-- Record `entries-chunk` byte size via `perf.record`
-
-**TDD:**
-- RED: Test initial load, load older, session switch, cache hit, live entry during partial load, loadingMore reset, empty-chunk guard, initial-chunk reconnect, prependChunkEntries dedup/order, refresh() merge
-- GREEN: Implement hook changes + prependChunkEntries + perf timers
-- REFACTOR: Extract prependChunkEntries as exported pure function
-
-**Dependencies:** WU-3
-**Verification:** `cd frontend && npx vitest run` — hook tests pass
-
-### WU-5: Frontend ChatArea + App wiring (TypeScript)
-**Files:**
-- `frontend/src/components/ChatArea.tsx`, `frontend/src/App.tsx`, tests
-
-**TDD:**
-- RED: Test "Load older" button + scroll trigger, loading indicator, "Showing N of M", keyboard activation, scroll preservation, wasAtBottom interaction
-- GREEN: Implement ChatArea changes + App wiring
-
-**Dependencies:** WU-4
-**Verification:** `cd frontend && npx vitest run` — ChatArea + App tests pass
-
-### WU-6: Full integration + `make check`
-**Files:** None (verification only)
-
-**Tasks:**
-- Run `make check` (build + test + lint)
-- Run `cd frontend && npx vitest run && npx tsc --noEmit`
-- Run `cd frontend && npm run build`
-- Verify no full-transcript HTTP fetch on tab switch
-- Verify perf metrics meet design §6.2 acceptance criteria
-
-**Dependencies:** WU-1 through WU-5 (all must be complete)
-**Verification:** `make check` green, frontend build green
+### WU-D: Security review + final integration
+- `rg "~/.seal|System\.Process|System\.Directory|System\.Posix|Servant\."
+  src/Seal/Providers/OpenRouter.hs` empty (incl. docstring).
+- Key only in `withApiKey` (code inspection); no `Show`/`ToJSON` on `ApiKey`;
+  no key bytes in logged/recorded paths.
+- `make check` green. Frontend already green. Update
+  `docs/context/execution-state.md` → COMPLETE.
+**Dependencies:** WU-C.
 
 ## Execution Order
-
 ```
-WU-1 (backend types/helpers) ──→ WU-2 (backend handler) ──→ WU-6 (integration)
-WU-3 (frontend types/client) ──→ WU-4 (frontend hook) ──→ WU-5 (frontend UI) ──→ WU-6
+WU-A (cabal) ──→ WU-B (impl) ──→ WU-C (tests) ──→ WU-D (security + check)
 ```
-
-WU-1 and WU-3 can proceed in parallel. WU-2 depends on WU-1. WU-4 depends on WU-3. WU-5 depends on WU-4. WU-6 depends on all.
-
-## Backward Compatibility
-
-- HTTP `GET /api/sessions/:id/transcript` remains unchanged
-- Existing `FocusOp` parsing preserved (ClientMessage falls back to CmFocus when op absent)
-- Chat-channel WS client ignores `entries-chunk` events (forward-compat)
-- `reconcileEntries` unchanged (still used for live-tail and refresh-merge)
-- `replayEntriesSince` unchanged (still used for WS since-replay)
+Linear; each unit's gate is the next's entry condition.
 
 ## Rollback
-
-1. Revert frontend `useTranscriptStream.ts` to use HTTP seed fetch
-2. Backend handler is additive — removing it has no impact
-3. New WS types are additive — existing clients ignore unknown event types
+Revert WU-B + WU-A; skeleton `Left "not yet fully implemented"` returns.
+No persistent state outside the vault.
