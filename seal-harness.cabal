@@ -370,19 +370,20 @@ test-suite tests
       , containers
       , directory
       , filepath
-      , hspec
-     , hspec-core
-      , http-client
-      , http-client-tls
-      , katip
-      , optparse-applicative
-      , stm
-      , temporary
-      , text
-      , time
-      , process
-      , unix
-      , random
+       , hspec
+      , hspec-core
+       , http-client
+       , http-client-tls
+       , katip
+       , optparse-applicative
+       , stm
+       , temporary
+       , text
+       , time
+       , process
+       , unix
+       , random
+       , openai >=2.5.4
       , websockets
       , case-insensitive
       , wai
