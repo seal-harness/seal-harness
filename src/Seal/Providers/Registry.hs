@@ -134,7 +134,7 @@ resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
         case eKey of
           Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
           Left e   -> pure (Left (vaultErrText e))
-resolveProvider mvh _mgr baseUrl OpenRouterProvider model _ =
+resolveProvider mvh mgr baseUrl OpenRouterProvider model _ =
   -- OpenRouter requires a vault-stored API key; no keyless mode.
   case mvh of
     Nothing ->
@@ -144,7 +144,7 @@ resolveProvider mvh _mgr baseUrl OpenRouterProvider model _ =
       case eKey of
         Left e -> pure (Left (credErr OpenRouterProvider e))
         Right kb ->
-          pure (Right (SomeProvider (mkOpenRouter (Just (mkApiKey kb)) baseUrl model)))
+          pure (Right (SomeProvider (mkOpenRouter mgr (Just (mkApiKey kb)) baseUrl model)))
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
