@@ -339,7 +339,6 @@ library
       , openapi-hs
       , http-media
       , openai >=2.5.4
-      , servant-client
       , seal-gateway-types
       , seal-chat-channels
     hs-source-dirs: src
