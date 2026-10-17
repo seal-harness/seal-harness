@@ -33,7 +33,7 @@ import Seal.Providers.OpenRouter
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
 minimalReq :: CompletionRequest
 minimalReq = CompletionRequest
-  { crModel = ModelId "openrouter/default"
+  { crModel = ModelId "deepseek/deepseek-v4.1-flash-1017"
   , crSystem = Nothing
   , crMessages = [textMsg User "hello"]
   , crTools = []
@@ -80,7 +80,7 @@ chatObj mContent finishReason mToolCalls = object
   [ "id" .= ("chatcmpl-1" :: Text)
   , "object" .= ("chat.completion" :: Text)
   , "created" .= (0 :: Int)
-  , "model" .= ("openrouter/default" :: Text)
+  , "model" .= ("deepseek/deepseek-v4.1-flash-1017" :: Text)
   , "choices" .=
       [ object
           [ "finish_reason" .= finishReason
@@ -116,7 +116,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
   describe "encodeRequest" $ do
     it "sets model + tool_choice and emits a user message" $ do
       let o = reqObject minimalReq
-      strAt "model" o `shouldBe` Just "openrouter/default"
+      strAt "model" o `shouldBe` Just "deepseek/deepseek-v4.1-flash-1017"
       strAt "tool_choice" o `shouldBe` Just "auto"
       case arrAt "messages" o of
         Just [msg] -> roleOf msg `shouldBe` Just "user"
@@ -190,7 +190,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
             [ "id" .= ("chatcmpl-2" :: Text)
             , "object" .= ("chat.completion" :: Text)
             , "created" .= (0 :: Int)
-            , "model" .= ("openrouter/default" :: Text)
+            , "model" .= ("deepseek/deepseek-v4.1-flash-1017" :: Text)
             , "choices" .= ([] :: [Value])
             , "usage" .= object
                 [ "prompt_tokens" .= (0 :: Int)
@@ -203,16 +203,16 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
   describe "complete (no key)" $ do
     it "returns Left when the API key is absent" $ do
       mgr <- newTlsManager
-      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "openrouter/default")
+      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- complete prov minimalReq
       r `shouldSatisfy` isLeft
 
   describe "listModels" $ do
     it "returns Right with the default model" $ do
       mgr <- newTlsManager
-      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "openrouter/default")
+      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- listModels prov
-      r `shouldBe` Right [ModelId "openrouter/default"]
+      r `shouldBe` Right [ModelId "deepseek/deepseek-v4.1-flash-1017"]
 
   describe "bearerHeaders" $ do
     it "puts the raw key bytes only in Authorization: Bearer + json content-type" $ do

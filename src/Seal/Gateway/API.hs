@@ -2083,7 +2083,7 @@ staticModelsFor AnthropicProvider =
   , "claude-haiku-4-5"
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
-staticModelsFor OpenRouterProvider = ["openrouter/default"]
+staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value

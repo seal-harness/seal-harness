@@ -82,7 +82,7 @@ vaultKeyName OpenRouterProvider = "OPENROUTER_API_KEY"
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
 defaultModelFor OllamaProvider    = ModelId "llama3.2"
-defaultModelFor OpenRouterProvider = ModelId "openrouter/default"
+defaultModelFor OpenRouterProvider = ModelId "deepseek/deepseek-v4.1-flash-1017"
 
 -- | A provider's default model: the configured value if given, else the
 -- provider's hardcoded default (Anthropic's for an unrecognized label).
