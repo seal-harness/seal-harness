@@ -54,13 +54,16 @@ counter = unsafePerformIO (newIORef 0)
 spec :: Spec
 spec = describe "Seal.Providers.Registry vocabulary" $ do
   it "lists the known providers" $
-    knownProviders `shouldBe` [AnthropicProvider, OllamaProvider]
+    knownProviders `shouldBe` [AnthropicProvider, OllamaProvider, OpenRouterProvider]
 
   it "labels Anthropic" $
     providerLabel AnthropicProvider `shouldBe` "anthropic"
 
   it "labels Ollama" $
     providerLabel OllamaProvider `shouldBe` "ollama"
+
+  it "labels OpenRouter" $
+    providerLabel OpenRouterProvider `shouldBe` "openrouter"
 
   it "maps Anthropic to its ProviderId" $
     providerId AnthropicProvider `shouldBe` ProviderId "anthropic"
