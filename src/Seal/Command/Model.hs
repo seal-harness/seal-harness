@@ -30,7 +30,6 @@ module Seal.Command.Model
 
 import Data.Either (fromRight)
 import Data.IORef (readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -43,14 +42,13 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig
-  , providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider )
+  , providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider, configuredProviders, defaultModelFor, knownProviders, listSome
   , parseProvider, providerLabel, resolveDefaultModel, resolveProvider )
@@ -211,10 +209,9 @@ reportProviderQuiet
   :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> KnownProvider -> IO ()
 reportProviderQuiet pr caps cfg kp = do
   let lbl   = providerLabel kp
-      baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg lbl)
       ModelId dm = resolveDefaultModel (providerDefaultModel cfg lbl) lbl
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
   eModels <- case eProv of
     Left _    -> pure (Left "unresolved")
     Right sp -> listSome sp
@@ -232,9 +229,8 @@ reportProviderLoud
   :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> KnownProvider -> IO ()
 reportProviderLoud pr caps cfg kp = do
   let lbl   = providerLabel kp
-      baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg lbl)
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
   case eProv of
     Left e   -> ccSend caps ("could not list " <> lbl <> " models: " <> e)
     Right sp -> do

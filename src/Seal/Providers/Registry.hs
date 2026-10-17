@@ -15,6 +15,7 @@ module Seal.Providers.Registry
   , defaultModelFor
   , resolveDefaultModel
   , resolveProvider
+  , providerBaseUrlFor
   , completeSome
   , listSome
   , vaultErrText
@@ -36,7 +37,7 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
-import Seal.Providers.OpenRouter (mkOpenRouter)
+import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl, mkOpenRouter)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -98,11 +99,11 @@ resolveDefaultModel Nothing  lbl =
 -- @call_<i>@; the counter must outlive any single 'Ollama' value, which is
 -- rebuilt each turn — see 'ProviderRuntime.prCallCounter').
 resolveProvider
-  :: Maybe VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
+  :: Maybe VaultHandle -> Manager -> RuntimeConfig -> KnownProvider -> ModelId
   -> IORef Int -> IO (Either Text SomeProvider)
 resolveProvider Nothing _ _ AnthropicProvider _ _ =
   pure (Left "vault not configured \x2014 run /vault setup")
-resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do
+resolveProvider (Just vh) mgr _cfg AnthropicProvider model _ = do
   eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
   case eOAuth of
     Right blob -> case deserializeTokens blob of
@@ -122,7 +123,7 @@ resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do
       pure $ case eKey of
         Left e         -> Left (credErr AnthropicProvider e)
         Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
-resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
+resolveProvider mvh mgr cfg OllamaProvider model callCounter
   | not (ollamaNeedsKey baseUrl) =
       -- local/custom host: keyless, never touch the vault
       Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model callCounter
@@ -134,7 +135,9 @@ resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
         case eKey of
           Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
           Left e   -> pure (Left (vaultErrText e))
-resolveProvider mvh mgr baseUrl OpenRouterProvider model _ =
+  where
+    baseUrl = providerBaseUrlFor cfg OllamaProvider
+resolveProvider mvh mgr cfg OpenRouterProvider model _ =
   -- OpenRouter requires a vault-stored API key; no keyless mode.
   case mvh of
     Nothing ->
@@ -145,6 +148,21 @@ resolveProvider mvh mgr baseUrl OpenRouterProvider model _ =
         Left e -> pure (Left (credErr OpenRouterProvider e))
         Right kb ->
           pure (Right (SomeProvider (mkOpenRouter mgr (Just (mkApiKey kb)) baseUrl model)))
+  where
+    baseUrl = providerBaseUrlFor cfg OpenRouterProvider
+
+-- | The effective base URL for a provider: the configured
+-- @[providers.&lt;label&gt;] base_url@ when set, else that provider's own
+-- built-in default. Each provider reads its OWN config section — Ollama's URL
+-- is never used for another provider. Anthropic's endpoint is fixed inside the
+-- provider, so its value here is only a placeholder.
+providerBaseUrlFor :: RuntimeConfig -> KnownProvider -> Text
+providerBaseUrlFor cfg kp =
+  fromMaybe (builtInBaseUrl kp) (providerBaseUrl cfg (providerLabel kp))
+  where
+    builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl
+    builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl
+    builtInBaseUrl AnthropicProvider  = "https://api.anthropic.com"
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
