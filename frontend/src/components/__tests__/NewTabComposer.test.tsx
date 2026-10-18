@@ -86,6 +86,37 @@ describe('NewTabComposer — provider kind', () => {
     expect(screen.queryByLabelText('Agent')).toBeNull()
   })
 
+  it('shows all supported providers, marking unconfigured ones as disabled', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', isDefault: true, configured: true }),
+            makeProvider({ name: 'ollama', configured: true }),
+            makeProvider({ name: 'openrouter', configured: false }),
+          ],
+          provider: 'anthropic',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const byValue = Object.fromEntries(Array.from(sel.options).map((o) => [o.value, o]))
+    const anthropic = byValue['anthropic']!
+    const ollama = byValue['ollama']!
+    const openrouter = byValue['openrouter']!
+    expect(anthropic).toBeDefined()
+    expect(ollama).toBeDefined()
+    expect(openrouter).toBeDefined()
+    // The unconfigured one is present but disabled + labelled.
+    expect(openrouter.disabled).toBe(true)
+    expect(openrouter.textContent).toMatch(/not configured/)
+    // Configured ones are selectable.
+    expect(anthropic.disabled).toBe(false)
+    expect(ollama.disabled).toBe(false)
+  })
+
   it('submit calls createTab then onSubmit', async () => {
     const onSubmit = vi.fn()
     render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)

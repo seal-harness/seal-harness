@@ -737,17 +737,22 @@ export interface CreateTabBody {
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For
  *  provider-backed sessions the response includes a `session_id` usable to
  *  load the transcript; for raw shell tabs it is null. */
-export async function createTab(body: CreateTabBody): Promise<NewTabResponse | null> {
+export async function createTab(body: CreateTabBody, timeoutMs = 20_000): Promise<NewTabResponse | null> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch('/api/tabs/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: ctrl.signal,
     })
     if (!res.ok) return null
     return await res.json() as NewTabResponse
   } catch {
     return null
+  } finally {
+    clearTimeout(t)
   }
 }
 
@@ -967,12 +972,15 @@ export interface SetupRepoResult {
  *  failure) is recorded in the session transcript — visible in the chat,
  *  not silent. Returns the structured result, or null on a network/parse
  *  failure. */
-export async function setupRepo(sessionId: string, url: string): Promise<SetupRepoResult | null> {
+export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
+      signal: ctrl.signal,
     })
     if (!res.ok) {
       const body = await res.json().catch(() => null)
@@ -981,6 +989,8 @@ export async function setupRepo(sessionId: string, url: string): Promise<SetupRe
     return await res.json() as SetupRepoResult
   } catch {
     return null
+  } finally {
+    clearTimeout(t)
   }
 }
 // ── Agent CRUD ──────────────────────────────────────────────────────────

@@ -23,12 +23,15 @@ import Seal.Providers.Registry
   , knownProviders
   , listSome
   , parseProvider
+  , providerBaseUrlFor
   , providerId
   , providerLabel
   , resolveDefaultModel
   , resolveProvider
   , vaultKeyName
   )
+import Seal.Providers.Ollama (defaultOllamaBaseUrl)
+import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl)
 import Seal.Security.Secrets (mkBearerToken, mkRefreshToken)
 import Seal.TestHelpers.FakeVault (makeFakeVault, makeLockedVault)
 
@@ -51,16 +54,41 @@ counter :: IORef Int
 counter = unsafePerformIO (newIORef 0)
 {-# NOINLINE counter #-}
 
+-- | A runtime config whose @[providers.ollama] base_url@ is set (or the
+-- built-in local default when 'Nothing'). Lets the tests drive the Ollama
+-- base URL through the config instead of a bare string.
+ollamaCfg :: Maybe T.Text -> RuntimeConfig
+ollamaCfg mUrl = defaultRuntimeConfig
+  { rcProviders =
+      maybe Map.empty
+        (\u -> Map.fromList
+          [("ollama", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+        mUrl
+  }
+
+-- | A runtime config whose @[providers.openrouter] base_url@ is set.
+openRouterCfg :: Maybe T.Text -> RuntimeConfig
+openRouterCfg mUrl = defaultRuntimeConfig
+  { rcProviders =
+      maybe Map.empty
+        (\u -> Map.fromList
+          [("openrouter", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+        mUrl
+  }
+
 spec :: Spec
 spec = describe "Seal.Providers.Registry vocabulary" $ do
   it "lists the known providers" $
-    knownProviders `shouldBe` [AnthropicProvider, OllamaProvider]
+    knownProviders `shouldBe` [AnthropicProvider, OllamaProvider, OpenRouterProvider]
 
   it "labels Anthropic" $
     providerLabel AnthropicProvider `shouldBe` "anthropic"
 
   it "labels Ollama" $
     providerLabel OllamaProvider `shouldBe` "ollama"
+
+  it "labels OpenRouter" $
+    providerLabel OpenRouterProvider `shouldBe` "openrouter"
 
   it "maps Anthropic to its ProviderId" $
     providerId AnthropicProvider `shouldBe` ProviderId "anthropic"
@@ -104,7 +132,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves Anthropic when the credential is present" $ do
       vh  <- makeFakeVault [("ANTHROPIC_API_KEY", "sk-test")]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig AnthropicProvider (ModelId "claude-opus-4-8") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure $ "expected Right, got Left: " <> show e
@@ -112,7 +140,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "reports a missing credential with an actionable hint" $ do
       vh  <- makeFakeVault []
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig AnthropicProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` ("provider add" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for a missing credential"
@@ -120,7 +148,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "reports a locked vault" $ do
       vh  <- makeLockedVault
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig AnthropicProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for a locked vault"
@@ -130,7 +158,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
                              (posixSecondsToUTCTime 4102444800) -- 2100: fresh
       vh  <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", serializeTokens toks)]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig AnthropicProvider (ModelId "claude-opus-4-8") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (OAuth), got Left: " <> show e)
@@ -141,14 +169,14 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
                , ("ANTHROPIC_API_KEY",      "sk-fallback")
                ]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig AnthropicProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` ("OAuth" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left: corrupt OAuth blob must not fall back to the API key"
 
     it "reports vault not configured for Anthropic with no vault handle" $ do
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider Nothing mgr "http://localhost:11434" AnthropicProvider (ModelId "m") counter
+      r   <- resolveProvider Nothing mgr defaultRuntimeConfig AnthropicProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left for no vault handle"
@@ -157,7 +185,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves local Ollama with no stored key" $ do
       vh  <- makeFakeVault []
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" OllamaProvider (ModelId "llama3.2") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig OllamaProvider (ModelId "llama3.2") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (local), got Left: " <> show e)
@@ -165,14 +193,14 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves cloud Ollama when a key is present" $ do
       vh  <- makeFakeVault [("OLLAMA_API_KEY", "k-cloud")]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "https://ollama.com" OllamaProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr (ollamaCfg (Just "https://ollama.com")) OllamaProvider (ModelId "m") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (cloud), got Left: " <> show e)
 
     it "resolves local Ollama with no vault handle at all (keyless, vault untouched)" $ do
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider Nothing mgr "http://localhost:11434" OllamaProvider (ModelId "m") counter
+      r   <- resolveProvider Nothing mgr defaultRuntimeConfig OllamaProvider (ModelId "m") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (local, no vault), got Left: " <> show e)
@@ -180,14 +208,14 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves local Ollama even with a locked vault (vault untouched)" $ do
       vh  <- makeLockedVault
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" OllamaProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig OllamaProvider (ModelId "m") counter
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (local, locked vault untouched), got Left: " <> show e)
 
     it "reports a missing key for the cloud host with no vault handle" $ do
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider Nothing mgr "https://ollama.com" OllamaProvider (ModelId "m") counter
+      r   <- resolveProvider Nothing mgr (ollamaCfg (Just "https://ollama.com")) OllamaProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` (\t -> "key" `T.isInfixOf` t || "provider add" `T.isInfixOf` t)
         Right _ -> expectationFailure "expected Left for cloud host with no vault"
@@ -195,10 +223,53 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "surfaces a locked vault for the cloud host" $ do
       vh  <- makeLockedVault
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider (Just vh) mgr "https://ollama.com" OllamaProvider (ModelId "m") counter
+      r   <- resolveProvider (Just vh) mgr (ollamaCfg (Just "https://ollama.com")) OllamaProvider (ModelId "m") counter
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left for a locked vault on the cloud host"
+
+  describe "resolveProvider (openrouter)" $ do
+    it "resolves when a key is stored" $ do
+      vh  <- makeFakeVault [("OPENROUTER_API_KEY", "sk-or")]
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig OpenRouterProvider (ModelId "m") counter
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right, got Left: " <> show e)
+
+    it "reports a missing key with an actionable hint" $ do
+      vh  <- makeFakeVault []
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig OpenRouterProvider (ModelId "m") counter
+      case r of
+        Left e  -> e `shouldSatisfy` ("provider add" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected a Left for a missing credential"
+
+    it "reports no vault handle" $ do
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider Nothing mgr defaultRuntimeConfig OpenRouterProvider (ModelId "m") counter
+      case r of
+        Left e  -> e `shouldSatisfy` ("API key" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected a Left for no vault handle"
+
+  describe "providerBaseUrlFor" $ do
+    it "uses each provider's OWN default base URL" $ do
+      providerBaseUrlFor defaultRuntimeConfig OllamaProvider
+        `shouldBe` defaultOllamaBaseUrl
+      providerBaseUrlFor defaultRuntimeConfig OpenRouterProvider
+        `shouldBe` defaultOpenRouterBaseUrl
+
+    it "OpenRouter does NOT inherit Ollama's configured base URL (regression)" $ do
+      -- The bug: an OpenRouter session POSTed to the Ollama base URL (the
+      -- local daemon), yielding \"404 page not found\". Each provider must
+      -- read its OWN [providers.<label>] section.
+      providerBaseUrlFor (ollamaCfg (Just "http://localhost:9999")) OpenRouterProvider
+        `shouldBe` defaultOpenRouterBaseUrl
+
+    it "reads [providers.<label>] base_url per provider" $ do
+      let cfg = openRouterCfg (Just "https://proxy.example/v1")
+      providerBaseUrlFor cfg OpenRouterProvider `shouldBe` "https://proxy.example/v1"
+      providerBaseUrlFor cfg OllamaProvider    `shouldBe` defaultOllamaBaseUrl
 
   describe "resolveDefaultModel" $ do
     it "uses the configured value when present" $

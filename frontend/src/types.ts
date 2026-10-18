@@ -247,6 +247,10 @@ export interface ProviderInfo {
   isDefault?: boolean
   /** The configured default model for this provider, if any. */
   defaultModel?: string
+  /** Whether this provider has a usable credential (or is keyless, like
+   *  local Ollama). The backend's /api/providers sets this for every entry;
+   *  absent is treated as configured (back-compat with older test mocks). */
+  configured?: boolean
 }
 
 // ── Agent CRUD (full def) ──────────────────────────────────────────────
