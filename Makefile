@@ -18,8 +18,13 @@ help: ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "} {printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build the library and executable (-Werror)
+build: frontend-build ## Build the library and executable (-Werror)
 	$(NIX) cabal build all
+ 
+frontend-build: frontend-install ## Build the web UI + stamp sentinel manifest
+	@cd frontend && npm run build
+	@cd frontend/dist && (find . -type f ! -name '.seal-manifest' \
+	    | LC_ALL=C sort | xargs shasum | shasum) > .seal-manifest
 
 test: ## Run the test suite
 	$(NIX) cabal test
@@ -35,9 +40,8 @@ run: ## Run the seal executable; pass flags via ARGS="..." (e.g. make run ARGS="
 frontend-install: ## Install frontend npm dependencies if missing
 	@cd frontend && [ -d node_modules ] || npm install
 
-serve: frontend-install ## Rebuild the frontend, then launch the seal gateway and web server (pass flags via ARGS, e.g. make serve ARGS="--yolo")
-	@cd frontend && npm run build
-	$(NIX) cabal run -v0 seal -- serve $(ARGS)
+serve: frontend-build ## Rebuild the frontend, then launch the seal gateway and web server (pass flags via ARGS, e.g. make serve ARGS="--yolo")
+	$(NIX) cabal run -v0 seal -- serve --static-dir frontend/dist $(ARGS)
 
 tui: ## Launch the interactive terminal UI (equivalent to `seal tui`)
 	$(NIX) cabal run -v0 seal -- tui

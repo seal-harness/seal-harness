@@ -222,6 +222,7 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.API
+         Seal.Gateway.Embedded
          Seal.Gateway.Route
          Seal.Gateway.Send
          Seal.Gateway.SessionJson
@@ -407,6 +408,7 @@ test-suite tests
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
+        Seal.Gateway.EmbeddedSpec
         Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiIntegrationSpec
