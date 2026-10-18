@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { ActiveTabs, TabRow } from '../ActiveTabs'
 import { RunningHarnesses } from '../RunningHarnesses'
 import { Sidebar } from '../Sidebar'
+import { ROW_SESSION_NAME_INDENT_PX } from '../RowLayout'
 import { DEFAULT_TAB_LINE_FIELDS } from '../../lib/tabLineConfig'
 import type { SessionInfo, TabInfo } from '../../types'
 
@@ -1112,5 +1113,147 @@ describe('Sidebar — session second-line configurable fields', () => {
     // Agent is in the config, so it should appear even though repo is present.
     const label = screen.getByTestId('session-status-label-old1')
     expect(label.textContent).toContain('zoe')
+  })
+})
+
+// ── Row indentation parity (Active Tabs ↔ Recent Sessions ↔ Archived) ──
+
+/** The row's first-line name/title element. */
+function nameOf(row: Element): HTMLElement {
+  const el = row.querySelector('span.text-sm')
+  expect(el).toBeTruthy()
+  return el as HTMLElement
+}
+
+function secondLineOf(row: Element): HTMLElement {
+  const el = row.querySelector('[data-testid^="tab-status-label"], [data-testid^="session-status-label"]')
+  expect(el).toBeTruthy()
+  return el as HTMLElement
+}
+
+describe('Sidebar — row indentation parity across sections', () => {
+  function renderSidebarWithAllThreeSections() {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 't1' })]
+    const tabSessions = [makeSession({ id: 't1', description: 'Tab row', channel: 'web' })]
+    const sessions = [makeSession({ id: 'r1', description: 'Recent row', channel: 'web' })]
+    const archivedSessions = [makeSession({ id: 'a1', description: 'Archived row', channel: 'web' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={sessions}
+        archivedSessions={archivedSessions}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The Archived section is collapsed by default — expand it so its row
+    // participates in the comparison.
+    fireEvent.click(screen.getByTestId('collapse-icon'))
+    return {
+      tabRow: screen.getByText('Tab row').closest('.agent-row') as HTMLElement,
+      recentRow: screen.getByText('Recent row').closest('.agent-row') as HTMLElement,
+      archivedRow: screen.getByText('Archived row').closest('.agent-row') as HTMLElement,
+    }
+  }
+
+  it('Recent Sessions names are indented by the tab-number inset', () => {
+    const { tabRow, recentRow } = renderSidebarWithAllThreeSections()
+    // The session name lines up with where a tab row's index digit begins.
+    expect(nameOf(recentRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
+    // A tab row's title carries no such margin — it is positioned by the two
+    // leading slots instead, which sit further right than the digit.
+    expect(nameOf(tabRow).style.marginLeft).toBe('')
+  })
+
+  it('Archived names are indented by the tab-number inset', () => {
+    const { archivedRow } = renderSidebarWithAllThreeSections()
+    expect(nameOf(archivedRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
+  })
+
+  it('session rows have no status slot, so the name starts at the number x', () => {
+    const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
+    // Tab rows reserve both leading slots; session rows reserve neither, so
+    // the name is free to sit at the tab-number position.
+    expect(tabRow.querySelector('[data-testid="row-status-slot"]')).toBeTruthy()
+    expect(recentRow.querySelector('[data-testid="row-status-slot"]')).toBeNull()
+    expect(archivedRow.querySelector('[data-testid="row-status-slot"]')).toBeNull()
+  })
+
+  it('Recent Sessions and Archived second lines are indented like the Active Tabs second line', () => {
+    const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
+    const tabIndent = secondLineOf(tabRow).style.marginLeft
+    // Guard against a vacuous pass: the tab second line must actually be
+    // indented, otherwise "all equal" would be satisfied by three zeros.
+    expect(parseFloat(tabIndent)).toBeGreaterThan(0)
+    // Session second lines use the SAME indent as the tab second line, so the
+    // provider/model/repo detail line sits at one x across every section.
+    expect(secondLineOf(recentRow).style.marginLeft).toBe(tabIndent)
+    expect(secondLineOf(archivedRow).style.marginLeft).toBe(tabIndent)
+    // The first line is unchanged: a session name still sits at the tab
+    // number's x, which is to the LEFT of the tab title.
+    expect(nameOf(recentRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
+  })
+
+  it('a thinking Recent Sessions row keeps its name at the same x as a quiet row', () => {
+    const sessions = [makeSession({ id: 'r1', description: 'Quiet row', channel: 'web' })]
+    const { rerender } = render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const quietRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
+    expect(quietRow.querySelector('.dot-thinking')).toBeNull()
+
+    rerender(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        sessionActivity={{
+          r1: { harness: 'thinking', unread: 0, lastEntryAt: null, seenAt: null, toolCall: null },
+        }}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const thinkingRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
+    // The thinking dot must not sit BEFORE the name (there is no room between
+    // the row edge and the name now) — it trails the name instead, so the
+    // name's x is identical whether or not the row is thinking.
+    expect(thinkingRow.querySelector('.dot-thinking')).toBeTruthy()
+    expect(nameOf(thinkingRow).style.marginLeft).toBe(nameOf(quietRow).style.marginLeft)
+    // The dot comes after the name in document order.
+    const name = nameOf(thinkingRow)
+    const dot = thinkingRow.querySelector('.dot-thinking')!
+    expect(name.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 })
