@@ -94,8 +94,8 @@ import Seal.Web.UiState (newUiStateHandle)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: AutonomyLevel -> SealLogger -> IO ()
-runServeMain autonomy logger = do
+runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
+runServeMain autonomy mCliStaticDir logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
@@ -314,7 +314,10 @@ runServeMain autonomy logger = do
           -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
+  let gwCfg0 = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
+      gwCfg  = case mCliStaticDir of
+        Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
+        Nothing  -> gwCfg0
       deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
