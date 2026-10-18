@@ -76,7 +76,7 @@ function authBadgeColor(status: ProviderAuthStatus): string {
 
 // ── Component ───────────────────────────────────────────────────────────
 
-/** The Providers CRUD view. Lists every known provider on the left; the
+/** The Providers CRUD view. Lists every configured provider on the left; the
  *  right pane is an editor (create or edit). Creating POSTs /api/providers;
  *  editing PUTs /api/providers/:name; the trash button DELETEs. The
  *  "Set as default" / "Clear default" button calls PUT /api/providers/default.
@@ -135,6 +135,14 @@ export function ProvidersView() {
   // Unconfigured providers available for the "New provider" dropdown.
   const unconfigured = useMemo(
     () => providers.filter((p) => p.authStatus === 'none'),
+    [providers],
+  )
+
+  // Only configured providers appear in the list. The full set still feeds
+  // the "New provider" dropdown so unconfigured ones can be set up. Providers
+  // in a locked vault stay visible so the user can see why they're unusable.
+  const configured = useMemo(
+    () => providers.filter((p) => p.authStatus !== 'none'),
     [providers],
   )
 
@@ -226,7 +234,7 @@ export function ProvidersView() {
             className="text-xs font-semibold uppercase"
             style={{ color: 'var(--text-muted)', letterSpacing: '0.08em' }}
           >
-            Providers ({providers.length})
+            Providers ({configured.length})
           </span>
           <button
             type="button"
@@ -251,12 +259,12 @@ export function ProvidersView() {
               Failed to load — the backend may be unreachable.
             </div>
           )}
-          {loaded && !error && providers.length === 0 && (
+          {loaded && !error && configured.length === 0 && (
             <div className="px-3 py-2 text-xs" style={{ color: 'var(--text-faint)' }}>
-              No providers found.
+              No providers configured.
             </div>
           )}
-          {providers.map((p) => {
+          {configured.map((p) => {
             const isActive = (creating ? false : editing === p.name) && !confirmingDelete
             return (
               <div
@@ -365,7 +373,7 @@ export function ProvidersView() {
                     </option>
                   ))}
                   {/* Allow already-configured providers too (upsert) */}
-                  {providers.filter((p) => p.authStatus !== 'none').map((p) => (
+                  {configured.map((p) => (
                     <option key={p.name} value={p.name}>
                       {PROVIDER_LABELS[p.name] ?? p.name} (reconfigure)
                     </option>

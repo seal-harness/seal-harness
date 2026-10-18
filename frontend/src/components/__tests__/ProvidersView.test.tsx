@@ -81,7 +81,38 @@ describe('ProvidersView', () => {
   it('shows empty state when no providers', () => {
     providersState = []
     render(<ProvidersView />)
-    expect(screen.getByText('No providers found.')).toBeDefined()
+    expect(screen.getByText('No providers configured.')).toBeDefined()
+  })
+
+  it('hides unconfigured providers from the list', () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
+      makeProvider({ name: 'ollama', authStatus: 'none' }),
+    ]
+    render(<ProvidersView />)
+    expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
+    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
+    expect(screen.getByText('Providers (1)')).toBeDefined()
+  })
+
+  it('shows empty state when only unconfigured providers exist', () => {
+    providersState = [makeProvider({ name: 'ollama', authStatus: 'none' })]
+    render(<ProvidersView />)
+    expect(screen.getByText('No providers configured.')).toBeDefined()
+    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
+  })
+
+  it('still offers unconfigured providers in the new-provider dropdown', () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
+      makeProvider({ name: 'ollama', authStatus: 'none' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')
+    expect(select).not.toBeNull()
+    const options = Array.from(select!.querySelectorAll('option')).map((o) => o.textContent)
+    expect(options).toContain('Ollama')
   })
 
   it('shows error state on load failure', () => {
