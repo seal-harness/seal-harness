@@ -15,7 +15,7 @@ module Seal.Command.Provider
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
 import Data.IORef (IORef, readIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -32,7 +32,7 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig
-  , providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider )
+  , providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), SomeProvider, ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
@@ -126,7 +126,10 @@ providerParser pr = hsubparser
   )
 
 provArg :: Parser Text
-provArg = T.pack <$> strArgument (metavar "PROVIDER" <> help "Provider id (e.g. anthropic)")
+provArg = T.pack <$> strArgument
+  ( metavar "PROVIDER"
+  <> help ("Provider id (one of: " <> T.unpack (T.intercalate ", " (map providerLabel knownProviders)) <> ")")
+  )
 
 -- Shared guards -------------------------------------------------------------
 
@@ -291,13 +294,12 @@ testCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let canonLbl = providerLabel kp
+      let cfg     = fromRight defaultRuntimeConfig eCfg
+          canonLbl = providerLabel kp
           model = case eCfg of
             Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
             Left _  -> defaultModelFor kp
-          baseUrl = fromMaybe defaultOllamaBaseUrl
-                      (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
-      eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model (prCallCounter pr)
+      eProv <- resolveProvider (Just vh) (prManager pr) cfg kp model (prCallCounter pr)
       case eProv of
         Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
         Right sp -> do
@@ -333,8 +335,9 @@ modelText (ModelId t) = t
 
 -- | Resolve the active session's provider from the vault, or explain why
 -- not. Key bytes never surface: 'resolveProvider' returns an opaque
--- 'SomeProvider'. Reads the session's 'smProvider'/'smModel' and the
--- configured Ollama base URL (falling back to 'defaultOllamaBaseUrl').
+-- 'SomeProvider'. Reads the session's 'smProvider'/'smModel'; the base URL is
+-- resolved per-provider inside 'resolveProvider' from the runtime config (each
+-- provider reads its OWN @[providers.&lt;label&gt;]@ section).
 resolveSessionProvider
   :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
 resolveSessionProvider pr meta =
@@ -342,10 +345,10 @@ resolveSessionProvider pr meta =
     Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
     Just kp -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
-          model   = ModelId (smModel meta)
+      let cfg   = fromRight defaultRuntimeConfig eCfg
+          model = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr))
 
 -- | Resolve a provider+model from explicit labels (for AGENT_START, which
 -- builds a fresh AgentEnv from a def rather than the active session).
@@ -356,6 +359,6 @@ resolveDefProvider pr providerLabel' model =
     Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel'))
     Just kp -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
+      let cfg = fromRight defaultRuntimeConfig eCfg
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr))

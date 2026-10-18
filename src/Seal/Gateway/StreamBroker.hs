@@ -37,6 +37,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
+import System.Timeout (timeout)
 
 import Seal.Gateway.Types.Core (SessionId)
 import Seal.Gateway.Types.Stream (BrokerEvent (..))
@@ -152,10 +153,10 @@ broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
   subs <- readTVarIO (sbSubs broker)
   live <- filterM (deliverTo event) subs
-  -- Drop any subscribers whose send threw (dead connections). Call their
-  -- close actions so the WS socket is actively closed and the client
-  -- reconnects. The length check avoids a needless STM write when everyone
-  -- survived.
+  -- Drop any subscribers whose send threw OR timed out (dead / slow
+  -- connections). Call their close actions so the WS socket is actively
+  -- closed and the client reconnects. The length check avoids a needless
+  -- STM write when everyone survived.
   when (length live < length subs) $ do
     let dead = filter (\s -> subSessionRef s `notElem` map subSessionRef live) subs
     forM_ dead $ \s -> subClose s `catch` \(_ :: SomeException) -> pure ()
@@ -164,8 +165,26 @@ broadcast broker event = do
     deliverTo ev s =
       (do
          ok <- shouldSend ev s
-         if ok then subSend s ev >> pure True else pure True)
+         if ok
+           then do
+             -- Bound the send: a peer that stops draining its socket (a
+             -- zombie/half-open WS, or a backgrounded tab under TCP
+             -- backpressure) makes 'sendTextData' block indefinitely.
+             -- Without this timeout the *caller* blocks — and callers include
+             -- HTTP request handlers that broadcast synchronously (e.g.
+             -- handleTabNew -> triggerBroadcast), so a stuck WS would hang
+             -- POST /api/tabs/new forever. A timed-out send is treated as a
+             -- dead subscriber (pruned + closed, so the client reconnects).
+             sent <- timeout sendTimeoutMicros (subSend s ev)
+             pure (case sent of
+                     Just () -> True
+                     Nothing -> False)
+           else pure True)
         `catch` \(_e :: SomeException) -> pure False
+    -- 2 seconds: generous for a healthy client, short enough that a single
+    -- stuck subscriber cannot stall a request thread for long.
+    sendTimeoutMicros :: Int
+    sendTimeoutMicros = 2_000_000
     -- All-subscriber events vs session-filtered events.
     -- BeActivity is ALL-subscriber: the sidebar renders tab status for
     -- EVERY open tab, so a turn on a channel-originated session (e.g.

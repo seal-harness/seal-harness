@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Gateway.StreamBrokerSpec (spec) where
 
@@ -9,9 +10,11 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time (getCurrentTime, addUTCTime)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, atomically, writeTVar)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (void)
+import System.Timeout (timeout)
 import Test.Hspec
 
 import Seal.Core.Types (mkSessionId, SessionId)
@@ -162,6 +165,29 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
     closed <- readIORef closedRef
     closed `shouldBe` True
+
+  -- Regression: a subscriber whose send *blocks* (a zombie/half-open WS, or
+  -- a backgrounded tab under TCP backpressure) must not hang the caller.
+  -- HTTP handlers broadcast synchronously (e.g. handleTabNew ->
+  -- triggerBroadcast); before the send timeout, a stuck WS made POST
+  -- /api/tabs/new spin forever. The stuck subscriber is now timed out and
+  -- pruned; healthy subscribers still receive the event.
+  it "broadcast does not block on a subscriber whose send hangs (times out + prunes)" $ do
+    broker <- newStreamBroker 10
+    refHealthy <- newIORef ([] :: [BrokerEvent])
+    void $ subscribeTest broker (mkSid "a") (\_e -> threadDelay maxBound)
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refHealthy (e :))
+    let entry = object ["id" .= ("e1" :: T.Text)]
+    -- Outer guard (5s) is well above the broker's 2s send timeout: if the
+    -- broker's timeout regresses, this fails fast instead of hanging the suite.
+    timeout 5_000_000 (broadcast broker (BeEntryRecorded (mkSid "a") entry))
+      >>= \case
+        Nothing -> expectationFailure "broadcast blocked on a hung subscriber"
+        Just () -> pure ()
+    h <- readIORef refHealthy
+    length h `shouldBe` 1
+    count <- subscriberCount broker
+    count `shouldBe` 1
 
   -- ── reconcileStaleThinking ──────────────────────────────────────────
 

@@ -16,6 +16,7 @@ module Seal.Providers.Registry
   , defaultModelFor
   , resolveDefaultModel
   , resolveProvider
+  , providerBaseUrlFor
   , completeSome
   , listSome
   , vaultErrText
@@ -37,6 +38,7 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
+import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl, mkOpenRouter)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -50,7 +52,7 @@ anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 -- | Every provider Seal can build. M1 ships Anthropic only; later milestones
 -- extend this sum (the totality of the functions below forces each addition to
 -- be handled everywhere).
-data KnownProvider = AnthropicProvider | OllamaProvider
+data KnownProvider = AnthropicProvider | OllamaProvider | OpenRouterProvider
   deriving stock (Eq, Show, Enum, Bounded)
 
 knownProviders :: [KnownProvider]
@@ -60,6 +62,7 @@ knownProviders = [minBound .. maxBound]
 providerLabel :: KnownProvider -> Text
 providerLabel AnthropicProvider = "anthropic"
 providerLabel OllamaProvider    = "ollama"
+providerLabel OpenRouterProvider = "openrouter"
 
 providerId :: KnownProvider -> ProviderId
 providerId = ProviderId . providerLabel
@@ -74,11 +77,13 @@ parseProvider t =
 vaultKeyName :: KnownProvider -> Text
 vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
 vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
+vaultKeyName OpenRouterProvider = "OPENROUTER_API_KEY"
 
 -- | The model used when the user has not chosen one.
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
 defaultModelFor OllamaProvider    = ModelId "llama3.2"
+defaultModelFor OpenRouterProvider = ModelId "deepseek/deepseek-v4.1-flash-1017"
 
 -- | A provider's default model: the configured value if given, else the
 -- provider's hardcoded default (Anthropic's for an unrecognized label).
@@ -95,11 +100,11 @@ resolveDefaultModel Nothing  lbl =
 -- @call_<i>@; the counter must outlive any single 'Ollama' value, which is
 -- rebuilt each turn — see 'ProviderRuntime.prCallCounter').
 resolveProvider
-  :: Maybe VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
+  :: Maybe VaultHandle -> Manager -> RuntimeConfig -> KnownProvider -> ModelId
   -> IORef Int -> IO (Either Text SomeProvider)
 resolveProvider Nothing _ _ AnthropicProvider _ _ =
   pure (Left "vault not configured \x2014 run /vault setup")
-resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do
+resolveProvider (Just vh) mgr _cfg AnthropicProvider model _ = do
   eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
   case eOAuth of
     Right blob -> case deserializeTokens blob of
@@ -119,7 +124,7 @@ resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do
       pure $ case eKey of
         Left e         -> Left (credErr AnthropicProvider e)
         Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
-resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
+resolveProvider mvh mgr cfg OllamaProvider model callCounter
   | not (ollamaNeedsKey baseUrl) =
       -- local/custom host: keyless, never touch the vault
       Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model callCounter
@@ -131,6 +136,34 @@ resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
         case eKey of
           Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
           Left e   -> pure (Left (vaultErrText e))
+  where
+    baseUrl = providerBaseUrlFor cfg OllamaProvider
+resolveProvider mvh mgr cfg OpenRouterProvider model _ =
+  -- OpenRouter requires a vault-stored API key; no keyless mode.
+  case mvh of
+    Nothing ->
+      pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
+    Just vh -> do
+      eKey <- vhGet vh (vaultKeyName OpenRouterProvider)
+      case eKey of
+        Left e -> pure (Left (credErr OpenRouterProvider e))
+        Right kb ->
+          pure (Right (SomeProvider (mkOpenRouter mgr (Just (mkApiKey kb)) baseUrl model)))
+  where
+    baseUrl = providerBaseUrlFor cfg OpenRouterProvider
+
+-- | The effective base URL for a provider: the configured
+-- @[providers.&lt;label&gt;] base_url@ when set, else that provider's own
+-- built-in default. Each provider reads its OWN config section — Ollama's URL
+-- is never used for another provider. Anthropic's endpoint is fixed inside the
+-- provider, so its value here is only a placeholder.
+providerBaseUrlFor :: RuntimeConfig -> KnownProvider -> Text
+providerBaseUrlFor cfg kp =
+  fromMaybe (builtInBaseUrl kp) (providerBaseUrl cfg (providerLabel kp))
+  where
+    builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl
+    builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl
+    builtInBaseUrl AnthropicProvider  = "https://api.anthropic.com"
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
@@ -184,6 +217,8 @@ configuredProviders mvh cfg = filterM isConfigured knownProviders
       AnthropicProvider ->
         hasVaultKey mvh (vaultKeyName AnthropicProvider)
           ||^ hasVaultKey mvh anthropicOAuthKey
+      OpenRouterProvider ->
+        hasVaultKey mvh (vaultKeyName OpenRouterProvider)
 
 -- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
 -- (locked / key missing) → 'False'; a present key → 'True'.

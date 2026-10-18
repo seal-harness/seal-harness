@@ -1,12 +1,14 @@
 # Project Context (Maintained by Orchestrator)
 
 ## Tooling
+- Package manager / build: `nix develop` + `cabal` (via Makefile wrappers)
 - Build: `make build` (cabal build all, inside nix develop)
-- Test: `make test` (cabal test)
-- Lint: `make lint` (hlint src/ test/)
-- Full gate: `make check` (build + test + lint)
-- Frontend: React 18 + TS + Vite + Tailwind, tests via vitest
-- Frontend build: `cd frontend && npm run build` (must exist before cabal build)
+- Test runner: `make test` (`cabal test`); frontend `vitest`
+- Linter: `make lint` (`hlint src/ test/`)
+- Full gate: `make check` = build + test + lint
+- Frontend: React 18 + TS + Vite + Tailwind
+- Frontend gate: `cd frontend && npm run build` (tsc + vite; must exist before
+  cabal build) + `npm run test`
 
 ## Completed Work Units
 | WU | Title | Key Files | Status |
@@ -19,3 +21,14 @@
 - Config access: `srConfigPath (adSessionRuntime deps)` + `updateRuntimeConfig`
 - SealRoute GADT in src-gateway-types/Seal/Gateway/Types/Route.hs + openApiMeta in OpenApi.hs
 - Route count assertion in test/Seal/Gateway/ApiRouteSpec.hs
+- Provider module shape (mirror `Seal.Providers.Anthropic`/`Seal.Providers.Ollama`):
+  pure `encodeRequest`/`decodeResponse` + `sendX` HTTP + `withApiKey` CPS for
+  the bearer header; `Manager` field on the provider record; `mkX :: Manager -> ... `
+  constructor; `httpErrorText` special-cases 429/401.
+- `withApiKey :: ApiKey -> (ByteString -> r) -> r` (Secrets.hs) — key bytes only
+  live inside the continuation.
+- Provider modules are FORBIDDEN to import `System.Process`/`System.Directory`/
+  `System.Posix`/`Servant.*`.
+
+## Active Services
+See `docs/plans/active-plan.md`.

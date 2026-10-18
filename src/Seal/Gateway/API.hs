@@ -133,7 +133,7 @@ data ApiDeps = ApiDeps
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11) + /api/agents CRUD
   , adSkills          :: SkillBackend         -- ^ for /api/skills CRUD
-  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
+  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider subset (T11). The handler emits all 'knownProviders', flagging each as @configured@ by membership here.
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
@@ -512,12 +512,16 @@ apiApp deps req respond =
     -- unconfigured/locked.
     (m', ["api", "secrets", sname]) | m' == methodDelete ->
       respond =<< handleSecretDelete deps sname
-    -- T11: GET /api/providers -> the configured provider list. @isDefault@
-    -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
-    -- T11, so only @name@ is emitted.
+    -- T11: GET /api/providers -> every provider Seal knows how to build, each
+    -- flagged with whether it is *configured* (has a usable credential or is
+    -- keyless). The frontend renders all supported providers in the "new tab"
+    -- form, marking the unconfigured ones so the user knows which still need
+    -- a key. @isDefault@ / @defaultModel@ are UI conveniences not threaded into
+    -- 'ApiDeps' for T11, so only @name@ + @configured@ are emitted.
     (m', ["api", "providers"]) | m' == methodGet -> do
-      providers <- adProviders deps
-      respond (jsonLBS status200 (A.encode (map providerInfoJson providers)))
+      configured <- adProviders deps
+      let cfgSet = Set.fromList (map providerLabel configured)
+      respond (jsonLBS status200 (A.encode (map (providerInfoJson cfgSet) knownProviders)))
     -- GET /api/providers/all -> ALL known providers with full status
     -- details (authStatus, isDefault, defaultModel, baseUrl) for the
     -- ProvidersView CRUD page. Literal "all" must precede :p/models.
@@ -2082,10 +2086,15 @@ jsonCreated :: Value -> Response
 jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
 
 -- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
--- emits only @name@; @isDefault@ / @defaultModel@ are UI conveniences not
--- threaded into 'ApiDeps' for T11.
-providerInfoJson :: KnownProvider -> Value
-providerInfoJson p = object ["name" .= providerLabel p]
+-- emits @name@ + @configured@ (membership in the configured-provider set);
+-- @isDefault@ / @defaultModel@ are UI conveniences not threaded into
+-- 'ApiDeps' for T11.
+providerInfoJson :: Set.Set Text -> KnownProvider -> Value
+providerInfoJson cfgSet p =
+  object
+    [ "name" .= providerLabel p
+    , "configured" .= Set.member (providerLabel p) cfgSet
+    ]
 
 -- | Handle GET /api/providers/all — returns ALL known providers with full
 -- status details for the ProvidersView CRUD page. Each provider object
@@ -2137,6 +2146,9 @@ providerAuthStatus mh cfg kp = case kp of
         Right _         -> pure "oauth"
         Left VaultLocked -> pure "vault-locked"
         Left _           -> probeVault vh (vaultKeyName AnthropicProvider)
+  OpenRouterProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
 
 -- | Probe the vault for a single key and return the auth status string.
 probeVault :: VaultHandle -> Text -> IO Text
@@ -2338,6 +2350,7 @@ staticModelsFor AnthropicProvider =
   , "claude-haiku-4-5"
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
+staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value
