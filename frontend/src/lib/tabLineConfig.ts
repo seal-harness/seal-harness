@@ -28,11 +28,11 @@ export const TAB_LINE_FIELD_LABELS: Record<TabLineField, string> = {
  *  rendering the available-fields list in the config popover. */
 export const ALL_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'model', 'repo', 'channel', 'agent']
 
-/** The default field selection and order: repo + channel. Provider/model
- *  are de-emphasized (still selectable via the config popover) — repo
- *  provenance and starting channel are the most identifying per-tab signals.
- *  Agent is NOT in the default; the user can add it explicitly if desired. */
-export const DEFAULT_TAB_LINE_FIELDS: TabLineField[] = ['repo', 'channel']
+/** The default field selection and order: provider + repo + channel.
+ *  Provider identifies the model backend, repo gives provenance, and the
+ *  starting channel shows where the session came from. Model and agent are
+ *  de-emphasized (still selectable via the config popover). */
+export const DEFAULT_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'repo', 'channel']
 
 const STORAGE_KEY = 'seal.tabLineFields'
 

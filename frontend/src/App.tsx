@@ -5,6 +5,7 @@ import { ChatArea, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
+import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
@@ -61,6 +62,7 @@ function selectedIdFromPath(): string | null {
 function sectionFromPath(): TopSection {
   if (typeof window === 'undefined') return 'sessions'
   const path = window.location.pathname
+  if (path === '/providers' || path.startsWith('/providers/')) return 'providers'
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
@@ -947,7 +949,9 @@ export default function App() {
   return (
     <>
       <TopBar section={section} onSectionChange={handleSectionChange} />
-      {section === 'agents' ? (
+      {section === 'providers' ? (
+        <ProvidersView />
+      ) : section === 'agents' ? (
         <AgentsView />
       ) : section === 'skills' ? (
         <SkillsView />

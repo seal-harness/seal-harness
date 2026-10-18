@@ -56,8 +56,17 @@ source-repository-package
   tag: 06fc11713094bf39ac00353b052f4ded5a534567
   --sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r
 
+-- OpenRouter provider uses openai (v2.5.4) non-servant interface.  Source-pin
+-- the exact Hackage version until haskell.nix index is updated.
+source-repository-package
+  type: git
+  location: https://github.com/MercuryTechnologies/openai.git
+  tag: 8a357137b9d3f1727b1dbb6ea3574e7b1b0fb4b7
+  --sha256: 1ndkygkdl5rwylims4141zkr46vq4bll0akjrq9ivxip4aracqpc
+
 allow-newer:
-    trasa:*
+    openai
+  , trasa:*
   , trasa-server:*
   , trasa-openapi-hs:*
   , quantification:*

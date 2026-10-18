@@ -5,7 +5,7 @@ module Seal.Gateway.ApiSpec (spec) where
 import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
-import Control.Monad (replicateM_, void)
+import Control.Monad (forM_, replicateM_, void)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -297,6 +297,44 @@ mkDepsFor paths = do
 -- tests that need an 'ApiDeps' but don't exercise the repo CRUD path.
 mkFakeRepoRegistryHandle :: IO RepoRegistryHandle
 mkFakeRepoRegistryHandle = pure fakeRepoRegistryHandle
+
+
+-- | Build ApiDeps for provider CRUD tests. Uses a real (fake) vault + a
+-- temp config path so updateRuntimeConfig can write.
+mkProviderTestDeps :: FilePath -> FilePath -> VaultRuntime -> IO ApiDeps
+mkProviderTestDeps tmp cfgRoot vr = do
+  tabsH <- newTabsHandle
+  reg   <- newHarnessRegistry
+  adb   <- noneBackend
+  skills <- Skill.noneBackend
+  activeRef <- newIORef fakeMeta
+  uiState <- newUiStateHandle (fakePaths { spState = tmp })
+  let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+      sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
+  pure ApiDeps
+    { adSessionRuntime  = sr
+    , adTabsHandle      = tabsH
+    , adHarnessRegistry = reg
+    , adAdoptConsent    = Just CcWeb
+    , adAgentDefs       = adb
+    , adSkills          = skills
+    , adProviders       = pure knownProviders
+    , adUiState         = uiState
+    , adSend            = Nothing
+    , adDefaultAgent    = pure Nothing
+    , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adAgentRegistry    = fakeAgentRegH
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault            = vr
+    , adPaths            = fakePaths
+    , adWsPort           = 8081
+    , adAbortReg         = testAbortReg
+    , adSecurityConfig   = defaultSecurityConfig
+    , adMkSessionExec    = Nothing
+    }
+
 
 -- | The pure 'RepoRegistryHandle' value backing 'mkFakeRepoRegistryHandle'.
 -- Used by the inline @deps = ApiDeps {…}@ literals (which are in a pure
@@ -963,7 +1001,7 @@ spec = describe "Seal.Gateway.API" $ do
       -- `system` field into a collapsed "System" row at the top of the
       -- session. Without the system field in the payload, the row is absent.
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
-        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":65536}}"
         ]
       deps <- mkDepsFor paths
       let app = apiApp deps
@@ -1001,7 +1039,7 @@ spec = describe "Seal.Gateway.API" $ do
           conv = [ Message User [CbText "hello world"] ]
       BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
-        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":65536}}"
         ]
       deps <- mkDepsFor paths
       let app = apiApp deps
@@ -3596,9 +3634,11 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
-  it "GET /api/providers returns only the configured providers" $ do
-    -- adProviders is an IO action; a filtered list means only the configured
-    -- providers appear (here: ollama only, since no vault/credentials).
+  it "GET /api/providers returns all known providers with a configured flag" $ do
+    -- adProviders yields the *configured* subset (here: ollama only). The
+    -- handler emits every 'knownProviders', flagging each as @configured@
+    -- by membership — so the frontend can show all supported providers and
+    -- mark which still need a credential.
     let mkAppFiltered = do
           tabsH <- newTabsHandle
           reg   <- newHarnessRegistry
@@ -3634,13 +3674,22 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    length arr `shouldBe` 1
-    let nm = case arr of
-          (A.Object o : _) -> case lookupK "name" o of
-            Just (A.String n) -> n
-            _ -> error "no name field"
-          _ -> error "not an object"
-    nm `shouldBe` "ollama"
+    -- Every known provider is present (anthropic, ollama, openrouter).
+    length arr `shouldBe` length knownProviders
+    -- Each entry has a name; build a name -> configured map.
+    let entries = [ (n, c) | e <- arr, A.Object o <- [e]
+                          , Just (A.String n) <- [lookupK "name" o]
+                          , Just c <- [case lookupK "configured" o of
+                                        Just (A.Bool b) -> Just b
+                                        _ -> Nothing]
+                          ]
+        byName = Map.fromList entries
+    -- Ollama is configured; the others are not.
+    byName `shouldBe` Map.fromList
+              [ ("anthropic", False)
+              , ("ollama", True)
+              , ("openrouter", False)
+              ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
@@ -3657,6 +3706,216 @@ spec = describe "Seal.Gateway.API" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
     status `shouldBe` 200
+
+  it "GET /api/providers/all returns 200 with all known providers" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+    status `shouldBe` 200
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers/all body: " ++ show body)
+    length arr `shouldBe` length knownProviders
+    forM_ arr $ \case
+      A.Object o -> do
+        lookupK "name" o `shouldSatisfy` isJust
+        lookupK "isDefault" o `shouldSatisfy` isJust
+        lookupK "authStatus" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected object"
+
+  it "GET /api/providers/all returns authStatus for locked vault" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers/all body: " ++ show body)
+    -- mkApp uses fakeLockedVaultRuntime, so Ollama with default local URL
+    -- shows "keyless" and Anthropic shows "vault-locked".
+    forM_ arr $ \case
+      A.Object o -> case lookupK "name" o of
+        Just (A.String n)
+          | n == "ollama"    -> lookupK "authStatus" o `shouldBe` Just (A.String "keyless")
+          | n == "anthropic" -> lookupK "authStatus" o `shouldBe` Just (A.String "none")
+        _ -> pure ()
+      _ -> pure ()
+
+
+  -- ── Provider CRUD (POST / PUT / DELETE) ───────────────────────────────
+
+  it "POST /api/providers with name=anthropic + api_key stores key in vault + seeds config" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      let mkDeps = mkProviderTestDeps tmp cfgRoot vault
+      deps <- mkDeps
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("anthropic" :: T.Text)
+          , "api_key" .= ("sk-test-123" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      -- Response has the provider detail (no api_key echoed)
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "name" o `shouldBe` Just (A.String "anthropic")
+          lookupK "api_key" o `shouldBe` Nothing
+          lookupK "authStatus" o `shouldBe` Just (A.String "api-key")
+        _ -> expectationFailure "expected JSON object"
+      -- Config has default_provider seeded
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Just "anthropic"
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "POST /api/providers with unknown name returns 400" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    req <- testPost ["api", "providers"]
+      (A.encode (A.object [ "name" .= ("unknown" :: T.Text), "api_key" .= ("k" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/providers with ollama + base_url (no api_key) configures keyless" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("ollama" :: T.Text)
+          , "base_url" .= ("http://localhost:11434" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "authStatus" o `shouldBe` Just (A.String "keyless")
+        _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/providers/:name with default_model updates config" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "anthropic"]
+        (A.encode (A.object [ "default_model" .= ("claude-sonnet-4" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "defaultModel" o `shouldBe` Just (A.String "claude-sonnet-4")
+        _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/providers/:name with api_key rotates the vault key" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime [("ANTHROPIC_API_KEY", "old-key")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "anthropic"]
+        (A.encode (A.object [ "api_key" .= ("new-key" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "DELETE /api/providers/:name removes vault key + clears default" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      -- Seed config with default_provider = anthropic
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig { rcDefaultProvider = Just "anthropic" })
+      vault <- makeFakeVaultRuntime [("ANTHROPIC_API_KEY", "sk-test")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      status <- runAppStatus app (testRequest methodDelete ["api", "providers", "anthropic"])
+      status `shouldBe` 204
+      -- Config default should be cleared
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "DELETE /api/providers/:name with unknown provider returns 400" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
+    status `shouldBe` 400
+
+  -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
+
+  it "GET /api/providers/default returns null when no default is set" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-def" "/tmp/seal-prov-def" vault
+    let app = apiApp deps
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "default"])
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "provider" o `shouldBe` Just A.Null
+      _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/providers/default sets the default + persists to config" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("anthropic" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Just "anthropic"
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/providers/default with null clears the default" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig { rcDefaultProvider = Just "anthropic" })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= A.Null ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "provider" o `shouldBe` Just A.Null
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> rcDefaultProvider cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/providers/default with unknown provider returns 400" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    req <- testPut ["api", "providers", "default"]
+      (A.encode (A.object [ "provider" .= ("unknown" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
 
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT

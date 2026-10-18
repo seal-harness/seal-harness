@@ -42,7 +42,9 @@ interface NewTabComposerProps {
 // ── Component ─────────────────────────────────────────────────────────
 
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
-  const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
+  // `configured` absent => configured (back-compat with older test mocks).
+  const noProviders =
+    spec.providersLoaded && !spec.configuredProviders.some((p) => p.configured !== false)
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -183,11 +185,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
                   (no providers configured — set an API key or start Ollama)
                 </option>
               )}
-              {spec.configuredProviders.map((p) => (
-                <option key={p.name} value={p.name}>
-                  {PROVIDER_LABELS[p.name] ?? p.name}{p.isDefault ? ' (default)' : ''}
-                </option>
-              ))}
+              {spec.configuredProviders.map((p) => {
+                // `configured` absent => configured (back-compat).
+                const isCfg = p.configured !== false
+                return (
+                  <option key={p.name} value={p.name} disabled={!isCfg}>
+                    {PROVIDER_LABELS[p.name] ?? p.name}
+                    {p.isDefault ? ' (default)' : ''}
+                    {isCfg ? '' : ' (not configured)'}
+                  </option>
+                )
+              })}
             </select>
           </Row>
 

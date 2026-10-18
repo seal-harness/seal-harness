@@ -7,6 +7,8 @@ import type {
   DiscoverableWindow,
   HarnessInfo,
   ProviderInfo,
+  ProviderDetail,
+  ProviderInput,
   RepoInfo,
   RepoInput,
   SecretInput,
@@ -710,6 +712,132 @@ export async function fetchModelContext(provider: string, model: string): Promis
   return fetchJson<ModelContext>(`/api/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}/context`)
 }
 
+// ── Provider CRUD ───────────────────────────────────────────────────────
+
+/** Fetch ALL known providers (configured + unconfigured) with full status
+ *  details from GET /api/providers/all. Returns null on any failure. */
+export async function fetchAllProviders(): Promise<ProviderDetail[] | null> {
+  return fetchJson<ProviderDetail[]>('/api/providers/all')
+}
+
+/** The outcome of a provider create/update mutation. On success `provider`
+ *  carries the updated detail; on failure `error` carries the backend's
+ *  error message. The API key is NEVER echoed back. */
+export type ProviderMutationResult =
+  | { ok: true; provider: ProviderDetail }
+  | { ok: false; error: string }
+
+/** Read the backend's @{"error": "..."}@ body for a provider mutation,
+  *  falling back to the HTTP status. */
+async function providerMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new provider (or update an existing one — upsert semantics).
+ *  The API key is stored in the vault; never persisted in config.toml.
+ *  Returns the updated provider detail on success, or the backend's error
+ *  on failure. */
+export async function createProvider(input: ProviderInput): Promise<ProviderMutationResult> {
+  try {
+    const res = await fetch('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await providerMutationError(res) }
+    return { ok: true, provider: await res.json() as ProviderDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing provider's config (rotate API key, set base_url /
+ *  default_model). The name is taken from the path. Returns the updated
+ *  provider detail on success, or the backend's error on failure. */
+export async function updateProvider(name: string, input: ProviderInput): Promise<ProviderMutationResult> {
+  try {
+    const res = await fetch(`/api/providers/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await providerMutationError(res) }
+    return { ok: true, provider: await res.json() as ProviderDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a provider by name — removes vault credentials + clears default
+ *  if set. Returns true when the backend accepted the delete (204). */
+export async function deleteProvider(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/providers/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Fetch the configured default provider. Returns null when no default is
+ *  set or the request fails. */
+export async function fetchDefaultProvider(): Promise<string | null> {
+  try {
+    const res = await fetch('/api/providers/default')
+    if (!res.ok) return null
+    const data = (await res.json()) as { provider?: string | null }
+    return data.provider ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Set or clear the default provider. Persists to config.toml. Pass null
+ *  to clear. Returns true on success, false on failure. */
+export async function setDefaultProvider(provider: string | null): Promise<boolean> {
+  try {
+    const res = await fetch('/api/providers/default', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of all known providers. Mirrors useAgentDefs / useRepos.
+ *  Fetches on mount and when refresh is called. Separate from the existing
+ *  useConfiguredProviders() which is NOT modified. */
+export function useAllProviders() {
+  const [providers, setProviders] = useState<ProviderDetail[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchAllProviders().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setProviders(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { providers, loaded, error, refresh }
+}
+
 // ── Tab mutators ────────────────────────────────────────────────────────
 
 /** Response from POST /api/tabs/new. */
@@ -737,17 +865,22 @@ export interface CreateTabBody {
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For
  *  provider-backed sessions the response includes a `session_id` usable to
  *  load the transcript; for raw shell tabs it is null. */
-export async function createTab(body: CreateTabBody): Promise<NewTabResponse | null> {
+export async function createTab(body: CreateTabBody, timeoutMs = 20_000): Promise<NewTabResponse | null> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch('/api/tabs/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: ctrl.signal,
     })
     if (!res.ok) return null
     return await res.json() as NewTabResponse
   } catch {
     return null
+  } finally {
+    clearTimeout(t)
   }
 }
 
@@ -967,12 +1100,15 @@ export interface SetupRepoResult {
  *  failure) is recorded in the session transcript — visible in the chat,
  *  not silent. Returns the structured result, or null on a network/parse
  *  failure. */
-export async function setupRepo(sessionId: string, url: string): Promise<SetupRepoResult | null> {
+export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
+      signal: ctrl.signal,
     })
     if (!res.ok) {
       const body = await res.json().catch(() => null)
@@ -981,6 +1117,8 @@ export async function setupRepo(sessionId: string, url: string): Promise<SetupRe
     return await res.json() as SetupRepoResult
   } catch {
     return null
+  } finally {
+    clearTimeout(t)
   }
 }
 // ── Agent CRUD ──────────────────────────────────────────────────────────

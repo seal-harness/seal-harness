@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 
@@ -1401,12 +1401,11 @@ describe('AskHumanForm', () => {
     if (_resolve) _resolve(true)
   })
 
-  it('shows Answered (not Submitting) after POST resolves true, even without WS', async () => {
-    vi.useFakeTimers()
+  it('form dismisses immediately after POST resolves true, even without WS', async () => {
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
-    // Promise resolves true (accepted), but the pendingQuestions prop never
-    // changes (simulating WS ask_resolved never arriving).
+    // Promise resolves true (accepted). The form should dismiss immediately
+    // via onDismissed — no lingering "Answered" state, no timer.
     const onAnswerText = vi.fn(() => Promise.resolve(true))
     render(
       <ChatArea
@@ -1418,16 +1417,11 @@ describe('AskHumanForm', () => {
       />,
     )
     fireEvent.click(screen.getByText('main'))
-    // Flush the microtask so Promise.resolve(true) settles.
-    await vi.advanceTimersByTimeAsync(0)
-    // The indicator should show "Answered", not the spinner
-    expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
-    expect(screen.getByText('Answered')).toBeTruthy()
-    // Advance past the 15s grace period — no false error should appear
-    // (the timeout is gated on !answered).
-    await vi.advanceTimersByTimeAsync(16_000)
-    expect(screen.queryByText('No confirmation from server — try again')).toBeNull()
-    vi.useRealTimers()
+    // The form (and its container) should dismiss immediately after the
+    // POST resolves — no "Answered" state, no timer, no lingering border.
+    await waitFor(() => {
+      expect(screen.queryByTestId('ask-human-form')).toBeNull()
+    })
   })
 
   // Regression (session 20260921-192522-899): after the user answers an
@@ -1701,6 +1695,99 @@ describe('AskHumanForm', () => {
     const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
     fireEvent.keyDown(ta, { key: 'Escape' })
     expect(onCancel).toHaveBeenCalledWith('q1')
+  })
+
+  // ── Pinned-to-bottom behavior ──────────────────────────────────────
+  // The AskHumanForm should render at the bottom of the transcript (pinned
+  // between the scroll area and the input area), NOT inline inside the
+  // tool-call block. This ensures the question is always visible even when
+  // background sub-agents add entries that would push an inline form up.
+  // The inline tool-call block shows a collapsed "needs input" indicator
+  // without the question text (avoiding duplication).
+
+  it('AskHumanForm is NOT rendered inside the tool-call block (not inline)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The tool-call block should NOT contain the ask-human-form
+    const toolCallBlock = container.querySelector('.tool-call')
+    expect(toolCallBlock).toBeTruthy()
+    expect(toolCallBlock!.querySelector('[data-testid="ask-human-form"]')).toBeNull()
+  })
+
+  it('AskHumanForm is rendered outside the scroll area (pinned at bottom)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The ask-human-form should be a sibling of the scroll area, not inside it
+    const scrollArea = container.querySelector('.overflow-y-auto')
+    const form = screen.getByTestId('ask-human-form')
+    expect(scrollArea).toBeTruthy()
+    expect(scrollArea!.contains(form)).toBe(false)
+  })
+
+  it('question text is NOT shown in the tool-call header when pending (no duplication)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The question text should appear exactly once — in the pinned form at
+    // the bottom, not in the tool-call header summary.
+    const allQuestionTexts = screen.getAllByText('which branch?')
+    expect(allQuestionTexts.length).toBe(1)
+  })
+
+  it('question text IS shown in the tool-call header when answered (transcript record)', () => {
+    const messages: Message[] = [{
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question: 'which branch?', options: [{ label: 'main', description: 'd' }] },
+          result: 'main',
+        },
+      }],
+      rawJson: '{}',
+    }]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // The answered ASK_HUMAN shows the question text in the header as a
+    // transcript record.
+    expect(screen.getByText('which branch?')).toBeTruthy()
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
   })
 
   // ── Stop button tests ───────────────────────────────────────────────
