@@ -2306,6 +2306,7 @@ export function ChatArea({
   isSessionThinking,
   onCancelQuestion,
   hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
+  isViewingLatest,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2313,6 +2314,11 @@ export function ChatArea({
   messages: Message[]
   loading?: boolean
   hasMore?: boolean
+  /** True when loaded entries include the latest (tail) entries. When
+   *  false, scrolling to the bottom triggers loadLatest to fetch the
+   *  newest entries from the server. Defaults to true for backward
+   *  compatibility (tests that don't pass this prop). */
+  isViewingLatest?: boolean
   loadingMore?: boolean
   loadOlder?: () => void
   loadFromBeginning?: () => void
@@ -2407,6 +2413,12 @@ export function ChatArea({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+ // Guards against duplicate loadLatest calls when the user scrolls to
+ // the bottom while isViewingLatest is false. Set to true when
+ // loadLatest is triggered; reset when isViewingLatest becomes true.
+ const triggeredLoadLatest = useRef(false)
+ // Derived: treat missing prop as true (backward-compatible with tests).
+ const viewingLatest = isViewingLatest ?? true
 
   // Virtual windowing: only render visible messages + overscan buffer.
   // Only activated for large transcripts (> VIRTUALIZATION_THRESHOLD);
@@ -2554,12 +2566,30 @@ export function ChatArea({
         loadOlder()
         wasAtBottom.current = false
       }
+      // When the user reaches the bottom but the loaded entries don't
+      // include the latest (e.g. after loadFromBeginning), trigger
+      // loadLatest to fetch the newest entries and enter auto-scroll
+      // mode. The triggeredLoadLatest guard prevents duplicate calls
+      // before isViewingLatest flips to true.
+      if (
+        wasAtBottom.current && !viewingLatest &&
+        !triggeredLoadLatest.current && loadLatest && !loadingMore
+      ) {
+        triggeredLoadLatest.current = true
+        pendingScrollToBottom.current = true
+        loadLatest()
+      }
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
 
-  }, [hasFragment, hasMore, loadingMore, loadOlder])
+  }, [hasFragment, hasMore, loadingMore, loadOlder, viewingLatest, loadLatest])
+  // Reset the loadLatest trigger when entries become the latest view
+  // (after loadLatest completes or on session switch).
+  useEffect(() => {
+    if (viewingLatest) triggeredLoadLatest.current = false
+  }, [viewingLatest])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2635,6 +2665,7 @@ export function ChatArea({
     if (pendingScrollToBottom.current && !loading && messages.length > 0) {
       const el = scrollerRef.current
       if (el) {
+        console.log(`[chat] SCROLL-BOTTOM useLayoutEffect: scrolling to scrollHeight=${el.scrollHeight} msgs=${messages.length} loading=${loading}`)
         el.scrollTo({ top: el.scrollHeight })
         // Follow-up scroll on the next frame to catch layout shifts from
         // async content rendering (code blocks, images, markdown). Use a
@@ -2642,7 +2673,13 @@ export function ChatArea({
         // if scrollHeight changed after the initial scrollTo.
         requestAnimationFrame(() => {
           const el2 = scrollerRef.current
+          if (el2) {
+            console.log(`[chat] SCROLL-BOTTOM rAF follow-up: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
+          }
           if (el2) el2.scrollTo({ top: 999999 })
+          if (el2) {
+            console.log(`[chat] SCROLL-BOTTOM rAF post-scroll: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
+          }
         })
         pendingScrollToBottom.current = false
       }
@@ -2694,6 +2731,9 @@ export function ChatArea({
       // (py-6 = 24px), so scrollIntoView leaves a ~23px gap. A large
       // value is clamped by the browser to the true bottom.
       const el = scrollerRef.current
+      if (el) {
+        console.log(`[chat] SCROLL-BOTTOM sticky useEffect: scrollHeight=${el.scrollHeight} scrollTop=${el.scrollTop} clientHeight=${el.clientHeight} atBottom=${el.scrollHeight - el.scrollTop - el.clientHeight < 80}`)
+      }
       if (el) el.scrollTo({ top: 999999 })
     }
   }, [messages, hasFragment, selectedSession?.id])
@@ -2816,14 +2856,34 @@ export function ChatArea({
               disabled={loadingMore}
               onClick={() => {
                 console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
+                const elDebug = scrollerRef.current
+                console.log(`[chat] SCROLL-BOTTOM pre-scroll dims: scrollTop=${elDebug?.scrollTop} scrollHeight=${elDebug?.scrollHeight} clientHeight=${elDebug?.clientHeight}`)
                 if (loadLatest) {
                   pendingScrollToBottom.current = true
                   wasAtBottom.current = true
                   loadLatest()
+                  // Diagnostic: check if loadLatest was a no-op (same
+                  // entries reference → no re-render → useLayoutEffect
+                  // never fires → pendingScrollToBottom never consumed).
+                  // We use a microtask + timeout to check after React
+                  // would have processed state updates.
+                  queueMicrotask(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM microtask check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight}`)
+                  })
+                  setTimeout(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM 200ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
+                  }, 200)
+                  setTimeout(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM 500ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
+                  }, 500)
                 } else {
                   const el = scrollerRef.current
                   if (el) el.scrollTo({ top: el.scrollHeight })
                   wasAtBottom.current = true
+                  console.log(`[chat] SCROLL-BOTTOM direct scroll to ${el?.scrollHeight}`)
                 }
               }}
             >
