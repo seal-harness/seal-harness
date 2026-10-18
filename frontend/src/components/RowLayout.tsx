@@ -29,10 +29,10 @@ export const ROW_SESSION_NAME_INDENT_PX = 4
  *  glyph (● / ✕) plus a hair of slack around the 8px activity dot. */
 export const ROW_STATUS_SLOT_PX = 10
 
-/** Left indent of a TAB row's second line (provider/model/repo detail), so it
- *  sits under the title rather than under the leading slots. Session rows use
- *  `ROW_SESSION_NAME_INDENT_PX` instead, so their detail line follows their
- *  (leftward) name. */
+/** Left indent of a row's second line (provider/model/repo detail). Shared by
+ *  tab rows and session rows so the detail line sits at one x across every
+ *  section — it does NOT follow the row's first line, which differs between
+ *  the two (tab title vs. session name). */
 export const ROW_SECOND_LINE_INDENT_PX = 24
 
 /** The leading index slot: the tab's single-char badge, or an empty spacer on

@@ -7,7 +7,7 @@ import { type TabLineField, loadTabLineFields, saveTabLineFields } from '../lib/
 import { ActiveTabs, renderConfigurableLine, deriveRepoName, type TabLineData } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { TabLineConfigBar } from './TabLineConfigBar'
-import { ROW_SESSION_NAME_INDENT_PX } from './RowLayout'
+import { ROW_SESSION_NAME_INDENT_PX, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import { ActivityDot } from './StatusDot'
 
 /** A "Recent Sessions" section header — plain label, no action button.
@@ -152,7 +152,7 @@ function SessionRow({
             style={{
               color: 'var(--text-muted)',
               lineHeight: 'var(--leading-tight)',
-              marginLeft: ROW_SESSION_NAME_INDENT_PX,
+              marginLeft: ROW_SECOND_LINE_INDENT_PX,
             }}
             data-testid={`session-status-label-${session.id}`}
           >

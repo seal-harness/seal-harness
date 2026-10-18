@@ -1188,19 +1188,19 @@ describe('Sidebar — row indentation parity across sections', () => {
     expect(archivedRow.querySelector('[data-testid="row-status-slot"]')).toBeNull()
   })
 
-  it('session second lines are indented with their name, not with the tab second line', () => {
+  it('Recent Sessions and Archived second lines are indented like the Active Tabs second line', () => {
     const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
-    // A session row's second line sits under its own name (both at the
-    // tab-number inset), NOT under the tab row's second line — a session
-    // name now starts left of a tab title, so its detail line follows it.
-    for (const row of [recentRow, archivedRow]) {
-      expect(secondLineOf(row).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
-      expect(secondLineOf(row).style.marginLeft).toBe(nameOf(row).style.marginLeft)
-    }
-    // The tab row keeps its own, deeper second-line indent.
-    expect(parseFloat(secondLineOf(tabRow).style.marginLeft)).toBeGreaterThan(
-      ROW_SESSION_NAME_INDENT_PX,
-    )
+    const tabIndent = secondLineOf(tabRow).style.marginLeft
+    // Guard against a vacuous pass: the tab second line must actually be
+    // indented, otherwise "all equal" would be satisfied by three zeros.
+    expect(parseFloat(tabIndent)).toBeGreaterThan(0)
+    // Session second lines use the SAME indent as the tab second line, so the
+    // provider/model/repo detail line sits at one x across every section.
+    expect(secondLineOf(recentRow).style.marginLeft).toBe(tabIndent)
+    expect(secondLineOf(archivedRow).style.marginLeft).toBe(tabIndent)
+    // The first line is unchanged: a session name still sits at the tab
+    // number's x, which is to the LEFT of the tab title.
+    expect(nameOf(recentRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
   })
 
   it('a thinking Recent Sessions row keeps its name at the same x as a quiet row', () => {
