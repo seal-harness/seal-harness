@@ -1,32 +1,38 @@
 import type { ReactNode } from 'react'
 
-/** Shared geometry for every row in the sidebar's tab/session lists.
+/** Shared geometry for the sidebar's tab/session rows.
  *
- *  "Active Tabs", "Running Harnesses", "Recent Sessions", and "Archived" all
- *  render rows into the same column, so a row's title must start at the same
- *  x in every section. Each row therefore reserves the SAME leading gutter —
- *  a fixed-width index slot (the tab's single-char badge, empty for session
- *  rows) followed by a fixed-width status slot (the liveness/activity glyph,
- *  empty when a session row has nothing to show).
+ *  A TAB row has two leading slots before its title: the index slot (the
+ *  single-char tab number) and the status slot (the liveness/activity glyph).
+ *  Both are fixed widths so a glyph's intrinsic width can never move the
+ *  title — that is what keeps every tab title at the same x.
  *
- *  Reserving the slots rather than rendering them only when populated is what
- *  keeps titles aligned: a thinking session row that grew an inline dot
- *  sibling would otherwise push its own title right, and tab titles would
- *  drift with the width of the glyph in the status slot.
- *
- *  The slots are fixed widths, not min-widths, so a glyph's intrinsic width
- *  can never change the title's x position. */
+ *  A SESSION row ("Recent Sessions" / "Archived") has neither: it has no tab
+ *  number and no status glyph. Instead its name is inset by
+ *  `ROW_SESSION_NAME_INDENT_PX` so it starts where a tab row's number starts
+ *  rather than flush against the row edge. */
 
 /** Width of the leading index slot, sized for the widest single-char tab
  *  badge (0-9, a-z). */
 export const ROW_INDEX_SLOT_PX = 12
 
+/** Left inset of a session row's name, so it starts at the same x as the tab
+ *  number in an Active Tabs row.
+ *
+ *  The tab number is right-aligned inside its `ROW_INDEX_SLOT_PX` slot, so a
+ *  digit's visible left edge sits a digit-width in from the slot's start.
+ *  This inset reproduces that position as a single fixed value, which keeps
+ *  the name's x independent of which glyph the tab number happens to be. */
+export const ROW_SESSION_NAME_INDENT_PX = 4
+
 /** Width of the liveness/activity status slot. Sized for the widest status
  *  glyph (● / ✕) plus a hair of slack around the 8px activity dot. */
 export const ROW_STATUS_SLOT_PX = 10
 
-/** Left indent of a row's second line, shared by tab rows and session rows so
- *  the provider/model/repo detail line sits at the same x in every section. */
+/** Left indent of a TAB row's second line (provider/model/repo detail), so it
+ *  sits under the title rather than under the leading slots. Session rows use
+ *  `ROW_SESSION_NAME_INDENT_PX` instead, so their detail line follows their
+ *  (leftward) name. */
 export const ROW_SECOND_LINE_INDENT_PX = 24
 
 /** The leading index slot: the tab's single-char badge, or an empty spacer on

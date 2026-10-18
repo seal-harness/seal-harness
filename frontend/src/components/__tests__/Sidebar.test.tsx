@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { ActiveTabs, TabRow } from '../ActiveTabs'
 import { RunningHarnesses } from '../RunningHarnesses'
 import { Sidebar } from '../Sidebar'
+import { ROW_SESSION_NAME_INDENT_PX } from '../RowLayout'
 import { DEFAULT_TAB_LINE_FIELDS } from '../../lib/tabLineConfig'
 import type { SessionInfo, TabInfo } from '../../types'
 
@@ -1117,19 +1118,11 @@ describe('Sidebar — session second-line configurable fields', () => {
 
 // ── Row indentation parity (Active Tabs ↔ Recent Sessions ↔ Archived) ──
 
-/** The leading gutter every sidebar row reserves before its title: a fixed
- *  slot for the tab index badge, then a fixed slot for the liveness /
- *  activity glyph. Session rows leave the index slot empty so their titles
- *  line up with tab titles instead of starting flush against the row edge. */
-function leadingGutter(row: Element): { index: number; status: number } {
-  const indexSlot = row.querySelector('[data-testid="row-index-slot"]')
-  const statusSlot = row.querySelector('[data-testid="row-status-slot"]')
-  expect(indexSlot).toBeTruthy()
-  expect(statusSlot).toBeTruthy()
-  return {
-    index: parseFloat((indexSlot as HTMLElement).style.width),
-    status: parseFloat((statusSlot as HTMLElement).style.width),
-  }
+/** The row's first-line name/title element. */
+function nameOf(row: Element): HTMLElement {
+  const el = row.querySelector('span.text-sm')
+  expect(el).toBeTruthy()
+  return el as HTMLElement
 }
 
 function secondLineOf(row: Element): HTMLElement {
@@ -1172,27 +1165,45 @@ describe('Sidebar — row indentation parity across sections', () => {
     }
   }
 
-  it('Recent Sessions rows reserve the same leading gutter as Active Tabs rows', () => {
+  it('Recent Sessions names are indented by the tab-number inset', () => {
     const { tabRow, recentRow } = renderSidebarWithAllThreeSections()
-    expect(leadingGutter(recentRow)).toEqual(leadingGutter(tabRow))
+    // The session name lines up with where a tab row's index digit begins.
+    expect(nameOf(recentRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
+    // A tab row's title carries no such margin — it is positioned by the two
+    // leading slots instead, which sit further right than the digit.
+    expect(nameOf(tabRow).style.marginLeft).toBe('')
   })
 
-  it('Archived rows reserve the same leading gutter as Active Tabs rows', () => {
-    const { tabRow, archivedRow } = renderSidebarWithAllThreeSections()
-    expect(leadingGutter(archivedRow)).toEqual(leadingGutter(tabRow))
+  it('Archived names are indented by the tab-number inset', () => {
+    const { archivedRow } = renderSidebarWithAllThreeSections()
+    expect(nameOf(archivedRow).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
   })
 
-  it('Recent Sessions and Archived second lines are indented like the Active Tabs second line', () => {
+  it('session rows have no status slot, so the name starts at the number x', () => {
     const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
-    const tabIndent = secondLineOf(tabRow).style.marginLeft
-    // Guard against a vacuous pass: the tab second line must actually be
-    // indented, otherwise "all equal" would be satisfied by three zeros.
-    expect(parseFloat(tabIndent)).toBeGreaterThan(0)
-    expect(secondLineOf(recentRow).style.marginLeft).toBe(tabIndent)
-    expect(secondLineOf(archivedRow).style.marginLeft).toBe(tabIndent)
+    // Tab rows reserve both leading slots; session rows reserve neither, so
+    // the name is free to sit at the tab-number position.
+    expect(tabRow.querySelector('[data-testid="row-status-slot"]')).toBeTruthy()
+    expect(recentRow.querySelector('[data-testid="row-status-slot"]')).toBeNull()
+    expect(archivedRow.querySelector('[data-testid="row-status-slot"]')).toBeNull()
   })
 
-  it('a thinking Recent Sessions row puts its dot in the status slot so the title does not shift', () => {
+  it('session second lines are indented with their name, not with the tab second line', () => {
+    const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
+    // A session row's second line sits under its own name (both at the
+    // tab-number inset), NOT under the tab row's second line — a session
+    // name now starts left of a tab title, so its detail line follows it.
+    for (const row of [recentRow, archivedRow]) {
+      expect(secondLineOf(row).style.marginLeft).toBe(`${ROW_SESSION_NAME_INDENT_PX}px`)
+      expect(secondLineOf(row).style.marginLeft).toBe(nameOf(row).style.marginLeft)
+    }
+    // The tab row keeps its own, deeper second-line indent.
+    expect(parseFloat(secondLineOf(tabRow).style.marginLeft)).toBeGreaterThan(
+      ROW_SESSION_NAME_INDENT_PX,
+    )
+  })
+
+  it('a thinking Recent Sessions row keeps its name at the same x as a quiet row', () => {
     const sessions = [makeSession({ id: 'r1', description: 'Quiet row', channel: 'web' })]
     const { rerender } = render(
       <Sidebar
@@ -1212,7 +1223,7 @@ describe('Sidebar — row indentation parity across sections', () => {
       />,
     )
     const quietRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
-    expect(quietRow.querySelector('[data-testid="row-status-slot"]')!.childElementCount).toBe(0)
+    expect(quietRow.querySelector('.dot-thinking')).toBeNull()
 
     rerender(
       <Sidebar
@@ -1235,15 +1246,14 @@ describe('Sidebar — row indentation parity across sections', () => {
       />,
     )
     const thinkingRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
-    const statusSlot = thinkingRow.querySelector('[data-testid="row-status-slot"]') as HTMLElement
-    // The dot lives INSIDE the fixed-width status slot (not as an extra
-    // inline sibling of the title), so the title keeps its x position.
-    expect(statusSlot.querySelector('.dot-thinking')).toBeTruthy()
-    // The dot must be the slot's only child — anything rendered as a sibling
-    // of the title would shift the title right (the original bug).
-    expect(statusSlot.childElementCount).toBe(1)
-    // And the title still sits after exactly two fixed leading slots, so its
-    // x position is identical whether or not the row is thinking.
-    expect(leadingGutter(thinkingRow)).toEqual(leadingGutter(quietRow))
+    // The thinking dot must not sit BEFORE the name (there is no room between
+    // the row edge and the name now) — it trails the name instead, so the
+    // name's x is identical whether or not the row is thinking.
+    expect(thinkingRow.querySelector('.dot-thinking')).toBeTruthy()
+    expect(nameOf(thinkingRow).style.marginLeft).toBe(nameOf(quietRow).style.marginLeft)
+    // The dot comes after the name in document order.
+    const name = nameOf(thinkingRow)
+    const dot = thinkingRow.querySelector('.dot-thinking')!
+    expect(name.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 })
