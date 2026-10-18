@@ -6,7 +6,9 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (newTVarIO)
 import Data.Aeson qualified as A
 import Data.Aeson ((.=))
+import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -22,12 +24,14 @@ import Seal.Channels.Chat.Loop
   )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Signal
-  ( withSignalChatChannel
+  ( SignalChatTransport (..)
+  , withSignalChatChannel
   , mkMockSignalChatTransport
   , chunkMessage
   )
 import Seal.Channels.Chat.Types
-  ( defaultGatewayConfig, convKeyFromSource, newStreamingState
+  ( InboundMessage (..)
+  , defaultGatewayConfig, convKeyFromSource, newStreamingState
   , ChatMessageId (..), ReceivedMessage (..) )
 import Seal.Channels.Chat.WsClient (WsClient (..))
 import Seal.Gateway.Types.AllowList (AllowList (..))
@@ -66,6 +70,10 @@ dummyMsg = ReceivedMessage
 waitForSeed :: IO ()
 waitForSeed = threadDelay 50000  -- 50ms
 
+-- | Test backoff: 1ms — keeps the retry test sub-second.
+testBackoff :: Int
+testBackoff = 1000
+
 spec :: Spec
 spec = do
   describe "chunkMessage" $ do
@@ -84,12 +92,12 @@ spec = do
   describe "ChatChannel SignalChatChannel" $ do
     it "has label 'signal'" $ do
       (transport, _, _) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 1000 transport $ \ch -> do
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         ccLabel ch `shouldBe` "signal"
 
     it "sends messages via the transport" $ do
       (transport, getCaptured, _) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 1000 transport $ \ch -> do
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         ccSend ch "hello world"
         captured <- getCaptured
@@ -97,7 +105,7 @@ spec = do
 
     it "sends with id and returns a ChatMessageId" $ do
       (transport, _, _) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 1000 transport $ \ch -> do
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         mId <- ccSendWithId ch "test"
         case mId of
@@ -106,18 +114,67 @@ spec = do
 
     it "edits messages via the transport" $ do
       (transport, _, _) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 1000 transport $ \ch -> do
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         ok <- ccEditMessage ch (ChatMessageId "123") "new content"
         ok `shouldBe` True
 
     it "chunks long sends" $ do
       (transport, getCaptured, _) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 5 transport $ \ch -> do
+      withSignalChatChannel AllowAll 5 testBackoff transport $ \ch -> do
         waitForSeed
         ccSend ch "abcdefghij"
         captured <- getCaptured
         captured `shouldBe` ["abcde", "fghij"]
+
+  describe "reader loop retry" $ do
+    it "retries after a transient error and delivers subsequent messages" $ do
+      -- The reader loop must NOT die on a transient error (Left from
+      -- sctReceive).  It should log, back off, and retry — eventually
+      -- delivering messages that arrive after the error.
+      callCount <- newIORef (0 :: Int)
+      let transport = SignalChatTransport
+            { sctReceive = do
+                n <- readIORef callCount
+                modifyIORef' callCount (+1)
+                case n of
+                  0 -> pure (Left "transient network error")
+                  1 -> pure (Right dummyMsg)
+                  _ -> pure (Left "inbox empty")
+            , sctSend = \_c _b -> pure ()
+            , sctSendWithId = \_c _b -> pure (Just "1")
+            , sctEditMessage = \_c _ts _content -> pure True
+            , sctClose = pure ()
+            }
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
+        mMsg <- ccReceive ch
+        mMsg `shouldSatisfy` isJust
+        case mMsg of
+          Just (InboundMessage _ body _) -> body `shouldBe` "init"
+          Nothing -> fail "expected a message after retry"
+
+    it "does not die on repeated transient errors" $ do
+      -- Even after multiple consecutive errors, the reader should still
+      -- be alive and deliver a message once one becomes available.
+      callCount <- newIORef (0 :: Int)
+      let transport = SignalChatTransport
+            { sctReceive = do
+                n <- readIORef callCount
+                modifyIORef' callCount (+1)
+                if n < 3
+                  then pure (Left "transient error")
+                  else if n == 3 then pure (Right dummyMsg) else pure (Left "inbox empty")
+            , sctSend = \_c _b -> pure ()
+            , sctSendWithId = \_c _b -> pure (Just "1")
+            , sctEditMessage = \_c _ts _content -> pure True
+            , sctClose = pure ()
+            }
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
+        mMsg <- ccReceive ch
+        mMsg `shouldSatisfy` isJust
+        case mMsg of
+          Just (InboundMessage _ body _) -> body `shouldBe` "init"
+          Nothing -> fail "expected a message after repeated retries"
 
   describe "streaming edit cadence (issue #198, part 3: total-length bug)" $ do
     it "gates edits on NEW text since the last edit, not the total length" $ do
@@ -128,7 +185,7 @@ spec = do
       -- 'lots of small updates' on the wire). The client must gate on NEW
       -- text since the last edit, matching the server's semantics.
       (transport, getCaptured, getEdits) <- mkMockSignalChatTransport [dummyMsg]
-      withSignalChatChannel AllowAll 4000 transport $ \ch -> do
+      withSignalChatChannel AllowAll 4000 testBackoff transport $ \ch -> do
         waitForSeed
         -- Loop plumbing: conversation key + streaming state + a stub WS
         -- client (entry-updates never touch it — it is only used by the

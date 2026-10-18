@@ -218,7 +218,8 @@ data StreamEvent
   -- ^ The generation finished. Carries the final stop reason + usage. This
   -- is always the last event (unless the stream was aborted by the callback
   -- returning 'False' or a transport error).
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+instance ToJSON StreamEvent
 
 -- | The aggregated outcome of a completed stream: the final stop reason +
 -- usage. The loop uses this (alongside the accumulated 'ContentBlock's) to
@@ -226,7 +227,8 @@ data StreamEvent
 data StreamOutcome = StreamOutcome
   { soStop :: StopReason
   , soUsage :: Usage
-  } deriving stock (Eq, Show)
+  } deriving stock (Eq, Show, Generic)
+instance ToJSON StreamOutcome
 
 -- | Retry policy for transient provider failures during streaming (same as
 -- the non-streaming path: up to 2 retries, 50ms exponential backoff).

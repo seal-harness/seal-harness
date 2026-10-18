@@ -17,7 +17,7 @@ import Seal.Security.Policy (AutonomyLevel (..))
 data Command
   = CommandNoOp
   | CommandTui AutonomyLevel
-  | CommandServe AutonomyLevel
+  | CommandServe AutonomyLevel (Maybe FilePath)
   | CommandGenOpenApi
   deriving (Eq, Show)
 
@@ -25,7 +25,7 @@ pCommand :: Parser Command
 pCommand = hsubparser
   $  command "tui" (info (CommandTui <$> pAutonomy)
                          (progDesc "Start the interactive terminal UI (TUI)"))
-  <> command "serve" (info (CommandServe <$> pAutonomy)
+  <> command "serve" (info (CommandServe <$> pAutonomy <*> pStaticDir)
                             (progDesc "Run the web gateway server"))
   <> command "gen-openapi" (info (pure CommandGenOpenApi)
                                   (progDesc "Print the OpenAPI 3.1 spec (JSON) to stdout"))
@@ -37,3 +37,13 @@ pAutonomy = flag Supervised Full
   ( long "yolo"
   <> help "Bypass the approval gate so untrusted opcodes run without prompting (ACK audit still recorded)"
   )
+
+-- | @--static-dir DIR@ overrides the @[gateway] static_dir@ from TOML config,
+-- serving UI assets from DIR instead of the embedded bundle (dev mode).
+-- Absent = @Nothing@ (use TOML config or embedded default).
+pStaticDir :: Parser (Maybe FilePath)
+pStaticDir = optional (strOption
+  ( long "static-dir"
+  <> metavar "DIR"
+  <> help "Serve static UI assets from DIR instead of the embedded bundle (dev mode)"
+  ))

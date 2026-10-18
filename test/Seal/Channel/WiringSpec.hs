@@ -48,7 +48,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     (fc, caps) <- makeFakeCaps []
     ref <- newIORef
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let agentEnv = AgentEnv
           { aeProvider = SomeProvider (ScriptProvider ref)
@@ -67,6 +67,9 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeAutonomy = Full
           , aeApprovals = approvals
           , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
           , aeOnEntry = pure ()
           , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing

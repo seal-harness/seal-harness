@@ -174,13 +174,20 @@ export function useNewTabSpec(): NewTabSpec {
   }, [])
 
   // Default the provider to whatever Seal is configured to use (the entry
-  // marked isDefault by the backend), or — failing that — the first one.
+  // marked isDefault by the backend) — but only among the *configured*
+  // providers. Falling back to the first configured one, then the first
+  // overall (so an unconfigured provider is never auto-selected even when
+  // it is the only entry). `configured` is absent => configured (back-compat).
   useEffect(() => {
     if (!providersLoaded || configuredProviders.length === 0) return
     const names = configuredProviders.map((p) => p.name)
-    if (!provider || !names.includes(provider)) {
-      const def = configuredProviders.find((p) => p.isDefault)
-      setProvider((def ?? configuredProviders[0]!).name)
+    const isCfg = (n: string) =>
+      configuredProviders.find((p) => p.name === n)?.configured !== false
+    if (!provider || !names.includes(provider) || !isCfg(provider)) {
+      const cfg = configuredProviders.filter((p) => p.configured !== false)
+      const def = cfg.find((p) => p.isDefault)
+      const fallback = (def ?? cfg[0] ?? configuredProviders[0])!.name
+      setProvider(fallback)
     }
   }, [providersLoaded, configuredProviders, provider])
 
@@ -238,7 +245,7 @@ export function useNewTabSpec(): NewTabSpec {
   // Validation. Defaults are designed to keep this null.
   const validationError: string | null = (() => {
     if (kind === 'provider') {
-      if (providersLoaded && configuredProviders.length === 0) {
+      if (providersLoaded && !configuredProviders.some((p) => p.configured !== false)) {
         return 'No providers configured — set an API key or start Ollama'
       }
       if (modelsLoading) return 'Loading models…'

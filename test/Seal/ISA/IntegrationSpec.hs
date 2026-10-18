@@ -47,7 +47,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.Handles.Harness (HarnessError (..))
 import Seal.Harness.Id (harnessIdToText, newHarnessId)
 import Seal.Harness.Registry
@@ -154,7 +154,7 @@ dispatchOne reg = dispatchOneWith reg mkRemoteUntrustedIOStub
 dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
                -> App (Either DispatchError OpResult)
 dispatchOneWith reg uio name input = do
-  (h, _) <- liftIO fakeTwoFileTranscript
+  (h, _) <- liftIO fakeIndexedTranscript
   abortFlag <- liftIO newAbortFlag
   dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig abortFlag name input
 
@@ -243,14 +243,14 @@ spec = describe "Seal.ISA.Integration" $ do
               , CompletionResponse [CbText "the file says: hello world"] StopEnd (Usage 0 0)
               ]
         ref <- newIORef script
-        (h, _) <- fakeTwoFileTranscript
+        (h, _) <- fakeIndexedTranscript
         abortFlag <- newAbortFlag
         stopFanoutDoneRef <- newIORef False
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
                     (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) abortFlag defaultToolTimeoutConfig
-                    caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing stopFanoutDoneRef (\_ _ -> pure ()) Nothing False Nothing
+                    caps sid 8 "test" Nothing Full approvals Nothing Nothing 3 1000 (pure ()) Nothing Nothing stopFanoutDoneRef (\_ _ -> pure ()) Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

@@ -9,6 +9,7 @@ import { BottomBar } from './BottomBar'
 import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
+import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -632,7 +633,7 @@ function toolCallSummary(input: unknown): string {
   const obj = input as Record<string, unknown>
   // Show the most operationally relevant arg inline. Order is intentional:
   // shell-ish args first, then file/path, then query-style args.
-  const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url']
+  const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url', 'question']
   for (const k of preferredKeys) {
     const v = obj[k]
     if (typeof v === 'string' && v.length > 0) return v
@@ -873,10 +874,12 @@ function AskHumanForm({
   pendingQuestion,
   onAnswerText,
   onCancel,
+  onDismissed,
 }: {
   pendingQuestion: PendingQuestion
   onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
+  onDismissed?: (qid: string) => void
 }) {
   const [otherText, setOtherText] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -914,11 +917,12 @@ function AskHumanForm({
     if (result && typeof result.then === 'function') {
       void result.then((accepted) => {
         if (accepted) {
-          // Answer accepted — clear submitting immediately. The form
-          // unmounts when the WS ask_resolved event removes the pending
-          // question; until then, `answered` keeps it disabled.
+          // Answer accepted — dismiss immediately. The parent removes
+          // the form and its container from the DOM via onDismissed,
+          // so there is no lingering "Answered" state or timer.
           setSubmitting(false)
           setAnswered(true)
+          onDismissed?.(pendingQuestion.id)
         } else {
           setSubmitting(false)
           setError('Answer failed — try again')
@@ -928,6 +932,7 @@ function AskHumanForm({
       // void return (older callback) — assume success.
       setSubmitting(false)
       setAnswered(true)
+      onDismissed?.(pendingQuestion.id)
     }
   }
 
@@ -1041,14 +1046,12 @@ function ToolCallBlock({
   anchorId,
   pendingQuestion,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   tc: ToolCallInfo
   anchorId: string
   pendingQuestion?: PendingQuestion
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -1066,7 +1069,12 @@ function ToolCallBlock({
 
   useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman, isShowHuman])
 
-  const summary = toolCallSummary(tc.input)
+  const isPending = pendingQuestion !== undefined
+  // For pending ASK_HUMAN, suppress the summary — the question text is
+  // shown in the pinned AskHumanForm at the bottom of the transcript, so
+  // showing it here too would duplicate it. Answered ASK_HUMAN shows the
+  // question text as a transcript record.
+  const summary = (isAskHuman && isPending) ? '' : toolCallSummary(tc.input)
   const inputJson = (() => {
     try { return JSON.stringify(tc.input, null, 2) } catch { return String(tc.input) }
   })()
@@ -1077,7 +1085,6 @@ function ToolCallBlock({
   const failed = tc.exitCode !== undefined && tc.exitCode !== null
     ? tc.exitCode !== 0
     : tc.resultIsError ?? false
-  const isPending = pendingQuestion !== undefined
 
   const btnStyle = (color: string): React.CSSProperties => ({
     background: 'var(--bg-sunken)',
@@ -1175,16 +1182,6 @@ function ToolCallBlock({
           )}
         </div>
       )}
-      {/* The AskHumanForm renders OUTSIDE the collapsible section, attached
-          to the box but always visible — so the tool-call box can stay
-          collapsed for conciseness (AC13: opcode === 'ASK_HUMAN' &&
-          options.length > 0). Open-ended ASK_HUMAN (no options) renders the
-          same form with only the textarea. */}
-      {isPending && pendingQuestion && isAskHuman && onAnswerText && onCancel && (
-        <div className="px-3 pb-3">
-          <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
-        </div>
-      )}
     </div>
   )
 }
@@ -1267,19 +1264,27 @@ function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
   }
 }
 
+/** Distinguish ASK_HUMAN pending questions from confirmation-gate
+ *  questions. The confirmation gate uses the format
+ *  "Allow <NAME> <JSON>? [y/N] "; ASK_HUMAN questions are free-form text
+ *  from the model. Synthesized questions (id starts with "synth:") are
+ *  always ASK_HUMAN. */
+function isAskHumanQuestion(pq: PendingQuestion): boolean {
+  if (pq.id.startsWith('synth:')) return true
+  return !pq.question.match(/^Allow\s+\S+\s+\{.*\}\?/)
+}
+
 function MessageBlock({
   block,
   pendingQuestions,
   matchedQuestionIds,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   block: MessageContent
   pendingQuestions?: PendingQuestion[]
   matchedQuestionIds: Set<string>
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   if (block.toolCall) {
@@ -1301,7 +1306,6 @@ function MessageBlock({
         anchorId={block.id ?? `tc-${block.toolCall.id}`}
         pendingQuestion={pq}
         onAnswer={onAnswer}
-        onAnswerText={onAnswerText}
         onCancel={onCancel}
       />
     )
@@ -1368,7 +1372,6 @@ const ChatMessage = memo(function ChatMessage({
   sending,
   pendingQuestions,
   onAnswer,
-  onAnswerText,
   onCancel,
 }: {
   message: Message
@@ -1376,7 +1379,6 @@ const ChatMessage = memo(function ChatMessage({
   sending?: boolean
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
-  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const anchorId = `msg-${message.id}`
@@ -1485,7 +1487,6 @@ const ChatMessage = memo(function ChatMessage({
             pendingQuestions={pendingQuestions}
             matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
-            onAnswerText={onAnswerText}
             onCancel={onCancel}
           />
         ))}
@@ -2304,12 +2305,24 @@ export function ChatArea({
   onAnswerQuestionText,
   isSessionThinking,
   onCancelQuestion,
+  hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
+  isViewingLatest,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
   onSetDescription?: (id: string, description: string) => void
   messages: Message[]
   loading?: boolean
+  hasMore?: boolean
+  /** True when loaded entries include the latest (tail) entries. When
+   *  false, scrolling to the bottom triggers loadLatest to fetch the
+   *  newest entries from the server. Defaults to true for backward
+   *  compatibility (tests that don't pass this prop). */
+  isViewingLatest?: boolean
+  loadingMore?: boolean
+  loadOlder?: () => void
+  loadFromBeginning?: () => void
+  loadLatest?: () => void
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2400,6 +2413,12 @@ export function ChatArea({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+ // Guards against duplicate loadLatest calls when the user scrolls to
+ // the bottom while isViewingLatest is false. Set to true when
+ // loadLatest is triggered; reset when isViewingLatest becomes true.
+ const triggeredLoadLatest = useRef(false)
+ // Derived: treat missing prop as true (backward-compatible with tests).
+ const viewingLatest = isViewingLatest ?? true
 
   // Virtual windowing: only render visible messages + overscan buffer.
   // Only activated for large transcripts (> VIRTUALIZATION_THRESHOLD);
@@ -2408,6 +2427,15 @@ export function ChatArea({
     messages.length, scrollerRef, selectedId ?? null,
   )
   const useVirtualization = messages.length > 500
+
+  // ── Diagnostic: render state logging ──
+  detectLoop('ChatArea.render', 200, 20)
+  rateLimitedLog('ChatArea.render', 1000, () =>
+    `msgs=${messages.length} virtual=${useVirtualization} range=[${virtualWindow.startIndex},${virtualWindow.endIndex}) spacers=${virtualWindow.topSpacerHeight}+${virtualWindow.bottomSpacerHeight}`,
+  )
+  if (messages.length > 500) {
+    logMemoryNow(`ChatArea.render msgs=${messages.length}`)
+  }
 
   // Track ASK_HUMAN tool call IDs that had a real pending question which
   // was subsequently removed (answered/cancelled via WS ask_resolved).
@@ -2473,6 +2501,25 @@ export function ChatArea({
     return filtered
   }, [messages, pendingQuestions])
 
+  // Track ASK_HUMAN question IDs that have been dismissed (the user
+  // answered and the POST was accepted). Using state (not a ref) so
+  // that askHumanQuestions recomputes and the pinned container unmounts
+  // immediately — no timer needed. IDs are unique per session (AskIds
+  // from the store), so no cleanup is needed — the set is small and
+  // resets on session change (ChatArea re-mounts).
+  const [dismissedAskHumanIds, setDismissedAskHumanIds] = useState<Set<string>>(new Set())
+
+  // Extract ASK_HUMAN questions (exclude confirmation-gate questions) for
+  // the pinned bottom-of-transcript form. Guard with Array.isArray in case
+  // the memo returns a non-array during error recovery. Also filter out
+  // auto-dismissed questions so the container unmounts with the form.
+  const askHumanQuestions = useMemo(
+    () => (Array.isArray(effectivePendingQuestions)
+      ? effectivePendingQuestions.filter((pq) => isAskHumanQuestion(pq) && !dismissedAskHumanIds.has(pq.id))
+      : []),
+    [effectivePendingQuestions, dismissedAskHumanIds],
+  )
+
   // Whether the session is actively thinking — drives the stop button's
   // visibility. The parent (App.tsx) derives this from the live activity
  // visibility. The parent (App.tsx) derives `isSessionThinking` from the
@@ -2514,12 +2561,35 @@ export function ChatArea({
     if (!el) return
     const onScroll = () => {
       wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      // Load older entries when scrolled to top
+      if (el.scrollTop < 60 && hasMore && !loadingMore && loadOlder) {
+        loadOlder()
+        wasAtBottom.current = false
+      }
+      // When the user reaches the bottom but the loaded entries don't
+      // include the latest (e.g. after loadFromBeginning), trigger
+      // loadLatest to fetch the newest entries and enter auto-scroll
+      // mode. The triggeredLoadLatest guard prevents duplicate calls
+      // before isViewingLatest flips to true.
+      if (
+        wasAtBottom.current && !viewingLatest &&
+        !triggeredLoadLatest.current && loadLatest && !loadingMore
+      ) {
+        triggeredLoadLatest.current = true
+        pendingScrollToBottom.current = true
+        loadLatest()
+      }
     }
     onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
 
-  }, [hasFragment])
+  }, [hasFragment, hasMore, loadingMore, loadOlder, viewingLatest, loadLatest])
+  // Reset the loadLatest trigger when entries become the latest view
+  // (after loadLatest completes or on session switch).
+  useEffect(() => {
+    if (viewingLatest) triggeredLoadLatest.current = false
+  }, [viewingLatest])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2554,6 +2624,14 @@ export function ChatArea({
   // rather than on the loading view.
   const pendingScrollToBottom = useRef(false)
 
+  // Stays true from a "scroll to top" / loadFromBeginning click until the
+  // oldest entries arrive and we've scrolled to top: 0. Without this, the
+  // sticky-bottom effect (wasAtBottom still true from the initial load)
+  // would scroll to the BOTTOM of the newly-arrived oldest entries instead
+  // of the top — the user would see the last of the oldest chunk, not the
+  // first message (SETUP_REPO / System Prompt).
+  const pendingScrollToTop = useRef(false)
+
   // Session-switch scroll: useLayoutEffect fires after DOM commit but
   // BEFORE paint, so the user never sees a flash of the wrong position.
   // This is critical for tab clicks — the user expects to see the latest
@@ -2587,17 +2665,48 @@ export function ChatArea({
     if (pendingScrollToBottom.current && !loading && messages.length > 0) {
       const el = scrollerRef.current
       if (el) {
+        console.log(`[chat] SCROLL-BOTTOM useLayoutEffect: scrolling to scrollHeight=${el.scrollHeight} msgs=${messages.length} loading=${loading}`)
         el.scrollTo({ top: el.scrollHeight })
         // Follow-up scroll on the next frame to catch layout shifts from
-        // async content rendering (code blocks, images, markdown).
+        // async content rendering (code blocks, images, markdown). Use a
+        // very large value so the browser clamps to the true bottom even
+        // if scrollHeight changed after the initial scrollTo.
         requestAnimationFrame(() => {
           const el2 = scrollerRef.current
-          if (el2) el2.scrollTo({ top: el2.scrollHeight })
+          if (el2) {
+            console.log(`[chat] SCROLL-BOTTOM rAF follow-up: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
+          }
+          if (el2) el2.scrollTo({ top: 999999 })
+          if (el2) {
+            console.log(`[chat] SCROLL-BOTTOM rAF post-scroll: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
+          }
         })
         pendingScrollToBottom.current = false
       }
     } else if (pendingScrollToBottom.current && !loading && messages.length === 0) {
       pendingScrollToBottom.current = false
+    }
+
+    // Scroll to the top when a "scroll to top" / loadFromBeginning is
+    // pending and the new (oldest) entries have arrived. The pending flag
+    // survives the async gap between the button click (WS request) and
+    // the chunk arrival (setEntries → messages prop changes).
+    if (pendingScrollToTop.current && !loading && messages.length > 0) {
+      const el = scrollerRef.current
+      if (el) {
+        el.scrollTo({ top: 0 })
+        requestAnimationFrame(() => {
+          const el2 = scrollerRef.current
+          if (el2) el2.scrollTo({ top: 0 })
+        })
+      }
+      // Don't clear here — the sticky-bottom useEffect clears it after
+      // guarding against it. If we clear here, the scroll listener's
+      // onScroll() (which re-runs when hasMore changes) resets
+      // wasAtBottom before the sticky-bottom effect runs, causing an
+      // erroneous scroll-to-bottom.
+    } else if (pendingScrollToTop.current && !loading && messages.length === 0) {
+      pendingScrollToTop.current = false
     }
   }, [messages, hasFragment, selectedSession?.id, loading])
 
@@ -2609,8 +2718,23 @@ export function ChatArea({
   useEffect(() => {
     if (hasFragment) return
     if (pendingScrollToBottom.current) return
+    if (pendingScrollToTop.current) {
+      // Clear the flag here (not in useLayoutEffect) so the guard is
+      // still active when this effect runs — after the scroll listener's
+      // onScroll() may have reset wasAtBottom.
+      pendingScrollToTop.current = false
+      return
+    }
     if (wasAtBottom.current) {
-      messagesEndRef.current?.scrollIntoView({ block: 'end' })
+      // Use scrollTo with a large value instead of scrollIntoView on the
+      // sentinel — the sentinel sits above the container's bottom padding
+      // (py-6 = 24px), so scrollIntoView leaves a ~23px gap. A large
+      // value is clamped by the browser to the true bottom.
+      const el = scrollerRef.current
+      if (el) {
+        console.log(`[chat] SCROLL-BOTTOM sticky useEffect: scrollHeight=${el.scrollHeight} scrollTop=${el.scrollTop} clientHeight=${el.clientHeight} atBottom=${el.scrollHeight - el.scrollTop - el.clientHeight < 80}`)
+      }
+      if (el) el.scrollTo({ top: 999999 })
     }
   }, [messages, hasFragment, selectedSession?.id])
 
@@ -2697,31 +2821,85 @@ export function ChatArea({
             {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
-              title="Scroll to top of transcript"
+              title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
               aria-label="Scroll to top"
-              onClick={() => scrollerRef.current?.scrollTo({ top: 0 })}
+              disabled={loadingMore}
+              onClick={() => {
+                console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
+                if (hasMore && loadFromBeginning) {
+                  pendingScrollToTop.current = true
+                  wasAtBottom.current = false
+                  loadFromBeginning()
+                } else {
+                  scrollerRef.current?.scrollTo({ top: 0 })
+                }
+              }}
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
-                aria-hidden="true">
-                <path d="M3 10 L8 5 L13 10" />
-              </svg>
+              {loadingMore ? (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                  className="spin" aria-hidden="true">
+                  <path d="M8 3 a5 5 0 1 0 5 5" />
+                </svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden="true">
+                  <path d="M3 10 L8 5 L13 10" />
+                </svg>
+              )}
             </button>
             <button
               className="header-scroll-btn"
-              title="Scroll to bottom of transcript"
+              title={loadingMore ? "Loading…" : "Scroll to bottom of transcript"}
               aria-label="Scroll to bottom"
+              disabled={loadingMore}
               onClick={() => {
-                const el = scrollerRef.current
-                if (el) el.scrollTo({ top: el.scrollHeight })
-                wasAtBottom.current = true
+                console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
+                const elDebug = scrollerRef.current
+                console.log(`[chat] SCROLL-BOTTOM pre-scroll dims: scrollTop=${elDebug?.scrollTop} scrollHeight=${elDebug?.scrollHeight} clientHeight=${elDebug?.clientHeight}`)
+                if (loadLatest) {
+                  pendingScrollToBottom.current = true
+                  wasAtBottom.current = true
+                  loadLatest()
+                  // Diagnostic: check if loadLatest was a no-op (same
+                  // entries reference → no re-render → useLayoutEffect
+                  // never fires → pendingScrollToBottom never consumed).
+                  // We use a microtask + timeout to check after React
+                  // would have processed state updates.
+                  queueMicrotask(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM microtask check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight}`)
+                  })
+                  setTimeout(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM 200ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
+                  }, 200)
+                  setTimeout(() => {
+                    const el = scrollerRef.current
+                    console.log(`[chat] SCROLL-BOTTOM 500ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
+                  }, 500)
+                } else {
+                  const el = scrollerRef.current
+                  if (el) el.scrollTo({ top: el.scrollHeight })
+                  wasAtBottom.current = true
+                  console.log(`[chat] SCROLL-BOTTOM direct scroll to ${el?.scrollHeight}`)
+                }
               }}
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
-                aria-hidden="true">
-                <path d="M3 6 L8 11 L13 6" />
-              </svg>
+              {loadingMore ? (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                  className="spin" aria-hidden="true">
+                  <path d="M8 3 a5 5 0 1 0 5 5" />
+                </svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                  stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden="true">
+                  <path d="M3 6 L8 11 L13 6" />
+                </svg>
+              )}
             </button>
           </div>
         )}
@@ -2736,6 +2914,18 @@ export function ChatArea({
       {/* Messages or composer panel */}
       <div ref={scrollerRef} className="flex-1 overflow-y-auto chat-scroll px-5 py-6">
         <div className="flex flex-col gap-5">
+          {/* Load older entries UI */}
+          {hasMore && !loadingMore && loadOlder && (
+            <button
+              onClick={loadOlder}
+              className="self-center text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 py-1 px-3 rounded border border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 transition-colors"
+            >
+              Load older messages
+            </button>
+          )}
+          {loadingMore && (
+            <div className="self-center text-xs text-slate-400 py-1">Loading older messages…</div>
+          )}
           {composerControls ? (
             <>
               {prefixMessages && prefixMessages.length > 0 && (
@@ -2792,13 +2982,6 @@ export function ChatArea({
                           sending={sending}
                           pendingQuestions={effectivePendingQuestions}
                           onAnswer={onAnswerQuestion}
-                          onAnswerText={(qid, answer) => {
-                            if (qid.startsWith('synth:')) {
-                              onSend?.(answer)
-                              return Promise.resolve(true)
-                            }
-                            return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                          }}
                           onCancel={(qid) => {
                             if (qid.startsWith('synth:')) return
                             onCancelQuestion?.(qid)
@@ -2822,13 +3005,6 @@ export function ChatArea({
                       sending={sending}
                       pendingQuestions={effectivePendingQuestions}
                       onAnswer={onAnswerQuestion}
-                      onAnswerText={(qid, answer) => {
-                        if (qid.startsWith('synth:')) {
-                          onSend?.(answer)
-                          return Promise.resolve(true)
-                        }
-                        return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
-                      }}
                       onCancel={(qid) => {
                         if (qid.startsWith('synth:')) return
                         onCancelQuestion?.(qid)
@@ -2842,6 +3018,36 @@ export function ChatArea({
           <div ref={messagesEndRef} />
         </div>
       </div>
+
+      {/* Pinned ASK_HUMAN question — rendered at the bottom of the
+          transcript, above the input area, so it's always visible even
+          when background sub-agents add entries that would push an inline
+          form up. The tool call blocks processing, so the question UI
+          should be where the user's attention naturally is. The inline
+          tool-call block in the transcript shows a collapsed "needs input"
+          indicator; the interactive form lives here. */}
+      {askHumanQuestions.length > 0 && (
+        <div className="shrink-0 px-5 py-3" style={{ borderTop: '1px solid var(--accent-primary)' }}>
+          {askHumanQuestions.map((pq) => (
+            <AskHumanForm
+              key={pq.id}
+              pendingQuestion={pq}
+              onAnswerText={(qid, answer) => {
+                if (qid.startsWith('synth:')) {
+                  onSend?.(answer)
+                  return Promise.resolve(true)
+                }
+                return onAnswerQuestionText?.(qid, answer) ?? Promise.resolve(false)
+              }}
+              onCancel={(qid) => {
+                if (qid.startsWith('synth:')) return
+                onCancelQuestion?.(qid)
+              }}
+              onDismissed={(qid) => { setDismissedAskHumanIds((prev) => new Set(prev).add(qid)) }}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Input area. In compose mode we keep the textarea right where it
           always lives, just rewire its submit path. For raw_shell the

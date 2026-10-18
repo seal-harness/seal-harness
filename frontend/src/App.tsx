@@ -5,10 +5,12 @@ import { ChatArea, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
+import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
 import { PerfOverlay } from './components/PerfOverlay'
+import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
 import {
   useSendMessage,
@@ -60,6 +62,7 @@ function selectedIdFromPath(): string | null {
 function sectionFromPath(): TopSection {
   if (typeof window === 'undefined') return 'sessions'
   const path = window.location.pathname
+  if (path === '/providers' || path.startsWith('/providers/')) return 'providers'
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
@@ -287,6 +290,9 @@ export default function App() {
   // provider/model selection + persisted
   // last-options are consistent. Constructed unconditionally (the hook
   // loads providers/models on mount regardless of which composer opens).
+  // ── Diagnostic: start memory monitor on mount ──
+  useEffect(() => { startMemoryMonitor() }, [])
+
   const composerSpec = useNewTabSpec()
 
   // ── Preserve the focused session across tab-list mutations ──────────────
@@ -339,7 +345,7 @@ export default function App() {
   // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
   // fetch on every tab click). The `loading` flag and `refresh` action
   // are exposed by the stream hook.
-  const { entries: streamEntries, pendingQuestions, loading, refresh } = useTranscriptStream(currentSessionId)
+ const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
@@ -553,6 +559,10 @@ export default function App() {
   }, [syncPath])
 
   const transcriptMessages = useTranscriptMessages(entries, currentSessionId)
+  // ── Diagnostic: log transcript message count changes ──
+  rateLimitedLog('App.transcriptMessages', 2000, () =>
+    `count=${transcriptMessages.length} entries=${entries.length} sid=${currentSessionId ?? 'null'}`,
+  )
   // Keep the ref in sync so handleSendResult can read the current count
   // without depending on transcriptMessages in its callback deps.
   transcriptMsgCountRef.current = transcriptMessages.length
@@ -629,6 +639,8 @@ export default function App() {
   })()
 
   const messages = useMemo(() => {
+    // ── Diagnostic: log messages memo recomputation ──
+    detectLoop('App.messages useMemo', 200, 15)
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z'
     // Transient slash-command output rows. Each bubble carries the
     // transcript-messages count at the time the command response arrived
@@ -937,7 +949,9 @@ export default function App() {
   return (
     <>
       <TopBar section={section} onSectionChange={handleSectionChange} />
-      {section === 'agents' ? (
+      {section === 'providers' ? (
+        <ProvidersView />
+      ) : section === 'agents' ? (
         <AgentsView />
       ) : section === 'skills' ? (
         <SkillsView />
@@ -992,6 +1006,12 @@ export default function App() {
               onSetDescription={handleSetDescription}
               messages={messages}
               loading={loading}
+             hasMore={hasMore}
+             isViewingLatest={isViewingLatest}
+             loadingMore={loadingMore}
+             loadOlder={loadOlder}
+              loadFromBeginning={loadFromBeginning}
+              loadLatest={loadLatest}
               onSend={currentSessionId ? handleSend : undefined}
               sending={sending}
               onStop={sessionIsThinking ? handleStop : undefined}

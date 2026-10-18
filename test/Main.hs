@@ -11,6 +11,7 @@ import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.Gateway.ConfigSpec
+import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
@@ -24,6 +25,7 @@ import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
 import qualified Seal.Gateway.TranscriptSpec
+import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
@@ -101,6 +103,7 @@ import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
+import qualified Seal.Transcript.ConvIndexSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.AskReplySpec
@@ -162,6 +165,7 @@ import qualified Seal.Telegram.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
+import qualified Seal.Providers.OpenRouterSpec
 import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
@@ -202,6 +206,7 @@ specs = do
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
   Seal.Gateway.ConfigSpec.spec
+  Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
@@ -215,6 +220,7 @@ specs = do
   Seal.Gateway.StreamSpec.spec
   Seal.Gateway.TranscriptSpec.spec
   Seal.Gateway.OpenApiSpec.spec
+  Seal.Util.StrictIOSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec
@@ -292,6 +298,7 @@ specs = do
   Seal.Channels.Chat.TelegramAdapterSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
+  Seal.Transcript.ConvIndexSpec.spec
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.AskReplySpec.spec
@@ -355,6 +362,7 @@ specs = do
   Seal.Providers.ClassSpec.spec
   Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
+  Seal.Providers.OpenRouterSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
   Seal.Agent.ContextTruncationSpec.spec

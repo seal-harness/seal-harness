@@ -27,8 +27,8 @@ import Data.Default (def)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript
-  ( fakeTwoFileTranscript, withTwoFileTranscript, TwoFileWrite (..)
-  , tfwRecordAndAck )
+  ( fakeIndexedTranscript, withIndexedTranscript, IndexedTranscriptWrite (..)
+  , itwRecordAndAck )
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -199,7 +199,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -218,7 +218,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -234,7 +236,7 @@ spec = describe "Seal.Agent.Loop" $ do
     -- Streaming: the final text "all done" is sent as a delta (no prefix).
     readIORef sent `shouldReturn` ["all done"]
 
-  it "writes the conversation + entries to the two-file transcript" $ do
+  it "writes the conversation + entries to the indexed transcript" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     let caps = def
@@ -242,7 +244,7 @@ spec = describe "Seal.Agent.Loop" $ do
         script =
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
-    (h, readState) <- fakeTwoFileTranscript
+    (h, readState) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -261,7 +263,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -284,7 +288,7 @@ spec = describe "Seal.Agent.Loop" $ do
       _      -> expectationFailure "expected exactly one response entry"
 
   -- Regression: a second turn must load the prior conversation from disk so
-  -- the model sees the full history, and the two-file writer's diff-based
+  -- the model sees the full history, and the indexed transcript writer's diff-based
   -- appender never duplicates messages. Before the fix, runTurn started each
   -- turn with only the new user message, so (a) the model answered as if it
   -- was a fresh chat (ignoring all prior turns) and (b) the writer's diff
@@ -303,7 +307,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -322,7 +326,9 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Nothing
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -350,7 +356,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- Debug-transcript: when aeDebugRequestsPath is set, each LLM request is
   -- written in full (including the complete message history) to requests.jsonl,
   -- one line per request. This lets us verify the model actually received the
-  -- full conversation history (the bug hypothesis: the two-file storage format's
+  -- full conversation history (the bug hypothesis: the indexed transcript storage format's
   -- reconstruction was only surfacing the latest message, not the history).
   it "writes the full CompletionRequest to requests.jsonl when aeDebugRequestsPath is set" $
     withSystemTempDirectory "seal-loop-debug" $ \dir -> do
@@ -362,7 +368,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -381,7 +387,9 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -410,7 +418,7 @@ spec = describe "Seal.Agent.Loop" $ do
         (req1 : _) -> length (crMessages req1) `shouldBe` 1
         []         -> expectationFailure "expected at least one request line"
       -- Turn 2: the model sees the full history (prior 2 + new user message).
-      -- This is the key assertion — if the two-file format was not feeding
+      -- This is the key assertion — if the indexed transcript format was not feeding
       -- history, this would be 1 instead of 3.
       case drop 1 reqs of
         [req2] -> length (crMessages req2) `shouldBe` 3
@@ -419,7 +427,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- Verification: the reconstructed Request payloads (from conversation.jsonl
   -- + entries.jsonl) carry ONLY the new messages added at each turn (the
   -- delta), NOT the cumulative conversation history. This is the contract
-  -- of the two-file delta format: the on-disk conversation.jsonl already
+  -- of the indexed transcript delta format: the on-disk conversation.jsonl already
   -- stores each message exactly once, and re-embedding the full history into
   -- every request entry would be O(N²) in the conversation length. The
   -- separate debug requests.jsonl file (captured via the debug flag) still
@@ -437,7 +445,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
-      withTwoFileTranscript dir $ \h -> do
+      withIndexedTranscript dir $ \h -> do
         stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
@@ -456,7 +464,9 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeAutonomy = Full
                       , aeApprovals = approvals
                       , aeDebugRequestsPath = Just reqPath
-                      , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                      , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -469,7 +479,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
-      -- Read back the two-file format + the debug requests file.
+      -- Read back the indexed transcript format + the debug requests file.
       convBs <- BS8.readFile (dir </> "conversation.jsonl")
       entriesBs <- BS8.readFile (dir </> "entries.jsonl")
       reqBs <- BS8.readFile reqPath
@@ -548,7 +558,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -567,7 +577,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -594,7 +606,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -613,7 +625,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -640,7 +654,7 @@ spec = describe "Seal.Agent.Loop" $ do
           policy = SecurityPolicy AllowAll Full
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -659,7 +673,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -696,7 +712,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
             ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let reg = mkRegistry [stubOp]
           env = AgentEnv
@@ -716,7 +732,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -741,7 +759,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -761,7 +779,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -785,7 +805,7 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -805,7 +825,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -836,7 +858,7 @@ spec = describe "Seal.Agent.Loop" $ do
     sent <- newIORef ([] :: [Text])
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, readState) <- fakeTwoFileTranscript
+    (h, readState) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
@@ -855,7 +877,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -890,7 +914,7 @@ spec = describe "Seal.Agent.Loop" $ do
     sent <- newIORef ([] :: [Text])
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     -- Fail the first 2 calls (transport-style error), then succeed.
     ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
     stopFanoutDoneRef <- newIORef False
@@ -911,7 +935,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -937,7 +963,7 @@ spec = describe "Seal.Agent.Loop" $ do
     callCount <- newIORef (0 :: Int)
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     -- A provider that counts calls and always returns a 401 auth error.
     stopFanoutDoneRef <- newIORef False
     let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
@@ -958,7 +984,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -984,7 +1012,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1003,7 +1031,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1016,6 +1046,591 @@ spec = describe "Seal.Agent.Loop" $ do
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (logDir </> "seal.log") `shouldReturn` False
+
+
+  -- ── New WU-1 logging tests ─────────────────────────────────────────────
+
+  it "logs model response summary to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello world"] StopEnd (Usage 10 5) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[DEBUG]"
+      content `shouldContain` "model response:"
+      content `shouldContain` "stop=StopEnd"
+      content `shouldContain` "textLen=11"
+
+  it "logs stream result to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "stream result: success"
+
+  it "logs degenerate response warning to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 0
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[WARN]"
+      content `shouldContain` "degenerate response"
+
+
+  it "logs tool dispatch to seal.log when a tool call is executed" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                     (const (Right ())) False
+                     (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
+          script = [ CompletionResponse
+                       [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+                       StopToolUse (Usage 0 0)
+                   , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+                   ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry [stubOp]
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "tool dispatch:"
+      content `shouldContain` "PING"
+      content `shouldContain` "result=ok"
+
+
+  -- ── New WU-1 logging tests ─────────────────────────────────────────────
+
+  it "logs model response summary to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello world"] StopEnd (Usage 10 5) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[DEBUG]"
+      content `shouldContain` "model response:"
+      content `shouldContain` "stop=StopEnd"
+      content `shouldContain` "textLen=11"
+
+  it "logs stream result to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "stream result: success"
+
+  it "logs degenerate response warning to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[WARN]"
+      content `shouldContain` "degenerate response"
+
+
+  it "logs tool dispatch to seal.log when a tool call is executed" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                     (const (Right ())) False
+                     (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
+          script = [ CompletionResponse
+                       [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+                       StopToolUse (Usage 0 0)
+                   , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+                   ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry [stubOp]
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  }
+      runTestApp (runTurn env "hi")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "tool dispatch:"
+      content `shouldContain` "PING"
+      content `shouldContain` "result=ok"
+
+
+  -- ── WU-2: debug response logging tests ─────────────────────────────────
+
+  it "writes responses.jsonl when aeDebugResponsePath is set" $
+    withSystemTempDirectory "seal-debug-resp" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 5 3) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let respPath = Just (dir </> "responses.jsonl")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = respPath
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
+      runTestApp (runTurn env "hi")
+      doesFileExist (fromJust respPath) `shouldReturn` True
+      content <- readFile (fromJust respPath)
+      content `shouldContain` "streamEvents"
+      content `shouldContain` "aggregated"
+      content `shouldContain` "StopEnd"
+
+  it "does NOT write responses.jsonl when aeDebugResponsePath is Nothing" $
+    withSystemTempDirectory "seal-debug-resp" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
+      runTestApp (runTurn env "hi")
+      doesFileExist (dir </> "responses.jsonl") `shouldReturn` False
+
+
+  -- ── WU-3: retry logic tests ─────────────────────────────────────────────
+
+  it "retries degenerate response and succeeds on second attempt" $
+    withSystemTempDirectory "seal-retry" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          -- First response is degenerate, second is normal
+          script = [ CompletionResponse [] StopEnd (Usage 0 0)
+                   , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1)
+                   ]
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (dir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1
+                  }
+      runTestApp (runTurn env "hi")
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("recovered" `T.isInfixOf`)
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "retry attempt 1/3"
+      content `shouldContain` "degenerate response"
+
+  it "shows user-facing error after retry exhaustion" $
+    withSystemTempDirectory "seal-retry" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+          -- All responses are degenerate
+          script = replicate 5 (CompletionResponse [] StopEnd (Usage 0 0))
+      ref <- newIORef script
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let logPath = Just (dir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeDebugResponsePath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnStop = Nothing
+                  , aeStopFanoutDone = stopFanoutDoneRef
+                  , aeOnToolCall = \_ _ -> pure ()
+                  , aeOnTextDelta = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  , aeMaxModelRetries = 2
+                  , aeRetryBaseDelayMs = 1
+                  }
+      runTestApp (runTurn env "hi")
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("unusable response" `T.isInfixOf`)
+      sentMsgs `shouldSatisfy` any ("2 attempts" `T.isInfixOf`)
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "retry exhausted"
+      content `shouldContain` "retry attempt 1/2"
+      content `shouldContain` "retry attempt 2/2"
 
   it "logs the max-turns stop to seal.log" $
     withSystemTempDirectory "seal-log" $ \logDir -> do
@@ -1032,7 +1647,7 @@ spec = describe "Seal.Agent.Loop" $ do
                                    [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
                                    StopToolUse (Usage 0 0))
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1052,7 +1667,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1129,7 +1746,7 @@ spec = describe "Seal.Agent.Loop" $ do
           [ CompletionResponse [CbText "finished after human input"] StopEnd (Usage 0 0)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1148,7 +1765,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1182,7 +1801,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1201,7 +1820,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1232,7 +1853,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1251,7 +1872,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1278,7 +1901,7 @@ spec = describe "Seal.Agent.Loop" $ do
         -- up. 1 initial + 3 continuations = 4 scripted responses consumed.
         script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1297,7 +1920,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1325,7 +1950,7 @@ spec = describe "Seal.Agent.Loop" $ do
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         -- A provider that always truncates and counts calls.
         countingTrunc = SomeProvider (CountingTruncProvider calls)
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = countingTrunc
@@ -1344,7 +1969,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1382,7 +2009,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText "all done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1401,7 +2028,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1473,7 +2102,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, readBack) <- fakeTwoFileTranscript
+    (h, readBack) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1492,7 +2121,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1521,7 +2152,7 @@ spec = describe "Seal.Agent.Loop" $ do
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
           ]
     ref <- newIORef script
-    (h, readBack) <- fakeTwoFileTranscript
+    (h, readBack) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1540,7 +2171,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1573,7 +2206,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
             ]
       ref <- newIORef script
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -1593,7 +2226,9 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
-                  , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                  , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
                     , aeStopFanoutDone = stopFanoutDoneRef
@@ -1643,7 +2278,7 @@ spec = describe "Seal.Agent.Loop" $ do
                         (\_ _ -> do
                            liftIO (setAbort abortFlag)
                            pure (OpResult [TrpText "stopped"] False Null))
-    (h, _) <- fakeTwoFileTranscript
+    (h, _) <- fakeIndexedTranscript
     stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider countingScript
@@ -1662,7 +2297,9 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
-                , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing                , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
                 , aeStopFanoutDone = stopFanoutDoneRef
@@ -1699,7 +2336,7 @@ spec = describe "Seal.Agent.Loop" $ do
           -- (exceeds glm-5's 1M context window)
           priorMsgs = replicate 1000 bigMsg
           caps = def
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       -- Write prior messages to the transcript so runTurn reads them
       liftIO $ do
         now <- getCurrentTime
@@ -1716,7 +2353,7 @@ spec = describe "Seal.Agent.Loop" $ do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+        itwRecordAndAck h (IndexedTranscriptWrite priorMsgs entry)
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
             { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
@@ -1735,7 +2372,9 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeAutonomy = Full
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
-            , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
@@ -1773,7 +2412,7 @@ spec = describe "Seal.Agent.Loop" $ do
           bigMsg = textMsg User (T.replicate 5000 "x")
           priorMsgs = replicate 100 bigMsg
           caps = def
-      (h, _) <- fakeTwoFileTranscript
+      (h, _) <- fakeIndexedTranscript
       liftIO $ do
         now <- getCurrentTime
         let entry = EntryRecord
@@ -1789,7 +2428,7 @@ spec = describe "Seal.Agent.Loop" $ do
               , erCorrelation = Nothing
               , erMeta = Map.empty
               }
-        tfwRecordAndAck h (TwoFileWrite priorMsgs entry)
+        itwRecordAndAck h (IndexedTranscriptWrite priorMsgs entry)
       stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
             { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
@@ -1808,7 +2447,9 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeAutonomy = Full
             , aeApprovals = approvals
             , aeDebugRequestsPath = Nothing
-            , aeOnEntry = pure ()
+                  , aeDebugResponsePath = Nothing            , aeOnEntry = pure ()
+                  , aeMaxModelRetries = 3
+                  , aeRetryBaseDelayMs = 1000
             , aeOnUserMessage = Nothing
             , aeOnStop = Nothing
             , aeStopFanoutDone = stopFanoutDoneRef
@@ -1826,3 +2467,90 @@ spec = describe "Seal.Agent.Loop" $ do
       case reqs of
         (firstReq : _) -> length (crMessages firstReq) `shouldBe` 101
         [] -> expectationFailure "provider was not called"
+
+  -- ── Fallback XML tool call parser ────────────────────────────────
+  describe "parseXmlToolCalls (fallback for GLM XML tool calls)" $ do
+    it "extracts a tool call from a proper invoke block with name attribute" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          blocks = rsContent resp
+          -- Should contain a CbToolUse block with name=FILE_READ
+          toolUses = [b | b <- blocks, case b of CbToolUse{} -> True; _ -> False]
+      length toolUses `shouldBe` 1
+      case toolUses of
+        (CbToolUse _ (OpName n) _) : _ -> n `shouldBe` "FILE_READ"
+        _ -> expectationFailure "expected a CbToolUse block"
+
+    it "extracts path argument from invoke block params" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+      case [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False] of
+        (CbToolUse _ _ args) : _ -> do
+         case args of
+           A.Object o ->
+             case KeyMap.lookup (Key.fromText "path") o of
+               Just (A.String p) -> p `shouldBe` "some_file.hs"
+               other -> expectationFailure ("expected path=some_file.hs, got " <> show other)
+           _ -> expectationFailure "expected Object args"
+        _ -> expectationFailure "expected a CbToolUse block"
+
+    it "returns empty text after extracting a tool call from invoke block" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          texts = [t | CbText t <- rsContent resp]
+      -- The invoke block is fully stripped; text should be empty
+      texts `shouldBe` [""]
+
+    it "preserves prose before and after an invoke block" $ do
+      let xml = T.pack ("Reading file now. " ++ "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62" ++ " Done.")
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          texts = [t | CbText t <- rsContent resp]
+          tools = [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False]
+      length tools `shouldBe` 1
+      case texts of
+        [t] -> do
+          T.isPrefixOf "Reading file now." t `shouldBe` True
+          T.isSuffixOf "Done." t `shouldBe` True
+        _ -> expectationFailure ("expected one CbText block, got " <> show (length texts))
+
+
+    it "tag character codes produce correct strings" $ do
+      -- Verify that toEnum-based construction matches hex-escape strings
+      let akOpenCode = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+          akOpenLit = T.pack "\60arg_key\62"
+      akOpenCode `shouldBe` akOpenLit
+      let akCloseCode = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 107, toEnum 101, toEnum 121, toEnum 62]
+          akCloseLit = T.pack "\60/arg_key\62"
+      akCloseCode `shouldBe` akCloseLit
+      let avOpenCode = T.pack [toEnum 60, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+          avOpenLit = T.pack "\60arg_value\62"
+      avOpenCode `shouldBe` avOpenLit
+      let avCloseCode = T.pack [toEnum 60, toEnum 47, toEnum 97, toEnum 114, toEnum 103, toEnum 95, toEnum 118, toEnum 97, toEnum 108, toEnum 117, toEnum 101, toEnum 62]
+          avCloseLit = T.pack "\60/arg_value\62"
+      avCloseCode `shouldBe` avCloseLit
+
+    it "findAllInvokeCalls directly extracts tool call from invoke block" $ do
+      let xml = T.pack "\60invoke name=\"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62some_file.hs\60/arg_value\62\60/invoke\62"
+          calls = findAllInvokeCalls 0 xml
+      length calls `shouldBe` 1
+      case calls of
+        (CbToolUse _ (OpName n) args) : _ -> do
+          n `shouldBe` "FILE_READ"
+          case args of
+            A.Object o -> case KeyMap.lookup (Key.fromText "path") o of
+              Just (A.String p) -> p `shouldBe` "some_file.hs"
+              _ -> expectationFailure "path not found in args"
+            _ -> expectationFailure "args is not an Object"
+        _ -> expectationFailure "no calls found"
+
+    it "does NOT extract from invoke blocks without name attribute" $ do
+      -- <invoke "FILE_READ"> without name= should be stripped, not parsed
+      let xml = T.pack "\60invoke \"FILE_READ\"\62\60arg_key\62path\60/arg_key\62\60arg_value\62a.hs\60/arg_value\62\60/invoke\62"
+          evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+          resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+          tools = [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False]
+      tools `shouldBe` []

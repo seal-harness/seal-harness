@@ -23,6 +23,8 @@ vi.mock('../lib/streamClient', () => {
     onAgentDefsChanged: () => unsub,
     onSkillsChanged: () => unsub,
     onReposChanged: () => unsub,
+    requestEntries: () => {},
+    onEntriesChunk: () => unsub,
     lastError: () => null,
   }
   return { streamClient: () => client }
@@ -106,6 +108,8 @@ function defaultFetchDispatch(): void {
     let body: unknown = {}
     if (url === '/api/agents') body = []
     else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+   else if (url === '/api/providers/all') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514', baseUrl: null, authStatus: 'api-key' }, { name: 'ollama', isDefault: false, defaultModel: null, baseUrl: null, authStatus: 'none' }]
+   else if (url === '/api/providers/default') body = { provider: 'anthropic' }
     else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
     else if (url === '/api/sessions') body = []
     else if (url === '/api/sessions/archived') body = []
@@ -241,7 +245,7 @@ describe('App — send + branch', () => {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (url === '/api/sessions/sess-send/transcript' && method === 'GET') {
+      if (url.includes('/api/sessions/sess-send/transcript') && method === 'GET') {
         return new globalThis.Response(JSON.stringify([]), {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
@@ -277,7 +281,7 @@ describe('App — send + branch', () => {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (url === '/api/sessions/sess-b/transcript' && method === 'GET') {
+      if (url.includes('/api/sessions/sess-b/transcript') && method === 'GET') {
         return new globalThis.Response(JSON.stringify([makeEntry({ id: 'be1' })]), {
           status: 200, headers: { 'Content-Type': 'application/json' },
         })
@@ -719,7 +723,7 @@ describe('App — slash bubble inline ordering', () => {
       if (url === '/api/sessions/archived') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (url === '/api/tabs') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (url === '/api/harnesses' || url === '/api/harnesses/discover') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
-      if (url === '/api/sessions/sess-slash/transcript' && method === 'GET') {
+      if (url.includes('/api/sessions/sess-slash/transcript') && method === 'GET') {
         // Return the current transcript state (grows as sends produce entries).
         return new globalThis.Response(JSON.stringify(transcript), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }

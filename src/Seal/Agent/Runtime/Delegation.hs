@@ -7,7 +7,7 @@
 --
 -- Each child gets:
 --
---   * a fresh 'SessionId' and its own two-file transcript nested under
+--   * a fresh 'SessionId' and its own indexed transcript nested under
 --     @\<parent-session\>\/agents\/\<child-id\>@ (the worker-builder opens it);
 --   * a focused system prompt built from the def's @adSystem@ + the goal +
 --     optional context (the worker-builder assembles it);
@@ -99,6 +99,9 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime, UTCTime)
 import System.Random (randomRIO)
 import System.Timeout (timeout)
+
+import Katip (Severity (..), ls)
+import Seal.Logging.Global (globalLogIO)
 
 import Seal.Agent.Def.Types (AgentDef (..))
 import Seal.Core.Types (SessionId, sessionIdText)
@@ -725,9 +728,13 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
                 -- isn't in the registry yet). The ThreadId from myThreadId
                 -- inside the forked thread is the same as forkIO's return
                 -- value, so AGENT_STOP can still kill the correct thread.
+                globalLogIO DebugS (ls ("[idle-diag] about to fork child worker: subagent=" <> subagentIdText subagentId
+                  <> " childSid=" <> sessionIdText childSid))
                 void $ forkIO $ do
                   tid <- myThreadId
+                  globalLogIO DebugS (ls ("[idle-diag] forked thread started, calling spawnCallback: subagent=" <> subagentIdText subagentId))
                   spawnCallback subagentId def childSid tid
+                  globalLogIO DebugS (ls ("[idle-diag] spawnCallback completed, starting worker: subagent=" <> subagentIdText subagentId))
                   case mSem of
                     Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
                     Just sem -> bracketSem sem $

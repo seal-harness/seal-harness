@@ -59,7 +59,7 @@ import Seal.Util.StrictIO (decodeFileStrict)
 import Data.Aeson (Value, object)
 import Seal.ISA.Dispatch (DispatchError, dispatch)
 import Seal.ISA.Opcode (OpResult (..), localBackend)
-import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.Handles.Transcript (fakeIndexedTranscript)
 import Seal.ISA.Ops.Skills (skillListOp)
 import Seal.ISA.Registry qualified as Registry
 import Seal.Providers.Class (ToolResultPart (..))
@@ -885,7 +885,7 @@ runDispatch reg opName input = do
   env <- mkEnv logger defaultConfig
   runApp env $ do
     deps <- liftIO stubCloneDeps
-    (h, _) <- liftIO fakeTwoFileTranscript
+    (h, _) <- liftIO fakeIndexedTranscript
     abortFlag <- liftIO newAbortFlag
     dispatch reg h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub deps) defaultToolTimeoutConfig abortFlag opName input
 

@@ -5,15 +5,18 @@ import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import type { TabLineField } from '../lib/tabLineConfig'
 import { ActivityDot } from './StatusDot'
+import ollamaIcon from '../../assets/ollama-icon.svg'
+import openrouterIcon from '../../assets/openrouter-icon.svg'
 
 // ── Tab second-line field rendering ───────────────────────────────────
 // Each field type maps to a small render function that produces JSX (or
 // null when the field has no data). The parent TabRow iterates over the
 // configured field list and joins non-null results with "·" separators.
 
-/** The default field order: repo + channel (the most identifying per-tab
- *  signals). Provider/model are opt-in via the config popover. */
-const DEFAULT_FIELDS: TabLineField[] = ['repo', 'channel']
+/** The default field order: provider + repo + channel (the backend,
+ *  provenance, and origin signals). Model/agent are opt-in via the config
+ *  popover. */
+const DEFAULT_FIELDS: TabLineField[] = ['provider', 'repo', 'channel']
 
 export interface TabLineData {
   provider: string
@@ -87,16 +90,28 @@ export function renderConfigurableLine(fields: TabLineField[], data: TabLineData
 }
 
 // ── Provider badge ────────────────────────────────────────────────────
-// A small single-letter colored badge for the LLM provider. Providers are
-// a small enum (anthropic, ollama, ...) so a single glyph + color suffices
-// to communicate the provider without taking space for the full label.
+// A small provider icon shown next to a tab/session. Providers with a
+// bundled logo render that logo; the rest fall back to a single-letter
+// glyph on a colored chip.
 
-const PROVIDER_BADGE: Record<string, { char: string; color: string; title: string }> = {
-  anthropic: { char: 'A', color: '#d97757', title: 'Anthropic' },
-  ollama:    { char: 'O', color: '#6b8cff', title: 'Ollama' },
+interface ProviderBadgeSpec {
+  title: string
+  /** Bundled logo (imported SVG URL). Takes precedence over `char`. */
+  icon?: string
+  /** Glyph rendered when there is no `icon`. */
+  char?: string
+  /** Chip background. White for the black Ollama mark so it stays visible
+   *  on the dark theme; transparent for the lime OpenRouter mark. */
+  bg: string
 }
 
-const FALLBACK_PROVIDER = { char: '?', color: 'var(--text-faint)', title: 'Unknown provider' }
+const PROVIDER_BADGE: Record<string, ProviderBadgeSpec> = {
+  anthropic:  { char: 'A', bg: '#d97757', title: 'Anthropic' },
+  ollama:     { icon: ollamaIcon, bg: '#ffffff', title: 'Ollama' },
+  openrouter: { icon: openrouterIcon, bg: 'transparent', title: 'OpenRouter' },
+}
+
+const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)', title: 'Unknown provider' }
 
 function ProviderBadge({ provider }: { provider: string }) {
   const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
@@ -116,11 +131,19 @@ function ProviderBadge({ provider }: { provider: string }) {
         fontWeight: 700,
         lineHeight: 1,
         color: '#fff',
-        background: badge.color,
+        background: badge.bg,
+        overflow: 'hidden',
         flexShrink: 0,
       }}
     >
-      {badge.char}
+      {badge.icon
+        ? <img
+            src={badge.icon}
+            alt=""
+            aria-hidden="true"
+            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+          />
+        : badge.char}
     </span>
   )
 }
@@ -235,7 +258,7 @@ export function TabRow({
    *  "cli"), or null/empty when no channel was recorded. */
   channel?: string | null
   /** Ordered list of fields to render on the second line. When omitted,
-   *  defaults to repo → channel. */
+   *  defaults to provider → repo → channel. */
   fields?: TabLineField[]
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)

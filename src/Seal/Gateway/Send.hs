@@ -103,6 +103,9 @@ import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Util.StrictIO (decodeFileStrict)
 
+import Katip (Severity (..), ls)
+import Seal.Logging.Global (globalLogIO)
+
 -- | The dependencies the send handler needs (the agent-loop plumbing). Built
 -- once in 'Seal.Command.Serve.runServeMain' and shared across requests. The
 -- 'sdResolve' seam defaults to the real 'resolveSessionProvider' but tests
@@ -162,7 +165,7 @@ data SendDeps = SendDeps
     -- via the WS broker.
   , sdLocks :: SessionLocks
     -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
-    -- lock before 'withTwoFileTranscript' so a web send and a channel
+    -- lock before 'withIndexedTranscript' so a web send and a channel
     -- message on the same tab serialize rather than race.
   , sdAbortReg :: SessionAbortRegistry
     -- ^ Per-session abort registry (design Blocker Resolution #2). The web
@@ -324,17 +327,22 @@ releaseWake (SessionWakeMutex tv) sid = do
 wakeIdleSession :: SendDeps -> SessionId -> IO ()
 wakeIdleSession deps sid = do
   inFlight <- sessionTurnInFlight (sdLocks deps) sid
+  globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: sid=" <> sessionIdText sid
+    <> " inFlight=" <> (if inFlight then "true" else "false")))
   if inFlight
-    then pure ()  -- turn already running; sidecar will be read at its start
+    then globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: skipping (turn in flight) sid=" <> sessionIdText sid))
     else do
       acquired <- tryAcquireWake (sdWakeMutex deps) sid
+      globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: sid=" <> sessionIdText sid
+        <> " wakeMutexAcquired=" <> (if acquired then "true" else "false")))
       if not acquired
-        then pure ()  -- another wake-up is already in progress
+        then globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: skipping (wake mutex held) sid=" <> sessionIdText sid))
         else do
           mMeta <- loadSessionMeta (sdPaths deps) sid
           case mMeta of
             Nothing -> releaseWake (sdWakeMutex deps) sid
             Just meta -> do
+              globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: triggering synthetic turn for sid=" <> sessionIdText sid))
               caps <- webAskCaps (sdBroker deps) (sdAskReply deps) sid
               let td = mkWebTurnDeps deps
                   adapter = mkWebTurnAdapter deps td caps
@@ -342,6 +350,7 @@ wakeIdleSession deps sid = do
               -- content the LLM sees comes from the sidecar completions
               -- injected by runTurnBody.
               _ <- runSessionTurn td adapter meta Nothing "."
+              globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: synthetic turn completed for sid=" <> sessionIdText sid))
               releaseWake (sdWakeMutex deps) sid
 -- * @taPreTurn@ — fans out the user's message to subscribed chat channels
 --   (cross-channel mirroring, @"web"@ label). No 'replySubscribe' (the web

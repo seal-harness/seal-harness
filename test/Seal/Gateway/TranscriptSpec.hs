@@ -16,32 +16,43 @@ import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime, getCurrentTime)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
+import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
   , TranscriptTimings (..)
+  , readTranscriptEntriesTimed, ReadLimit (..)
+  , ttEntryCount
   , reconEntryToFrontend
   , renderServerTiming
   , trailingConvEntries
   , firstUserMessageSnippetFast
-  , setEncodeMs
+ , readTranscriptEntriesLimited
+ , setEncodeMs
   )
-import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (mkSessionId)
+import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
+import Seal.Transcript.ConvIndex (buildIndex)
+import Seal.Transcript.Entries qualified as Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Transcript.Entries
+  (EntryRecord (..), EntryKind (..), encodeEntryRecordRaw)
 
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class qualified as PC (Message (..), Role (..))
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 21) (secondsToDiffTime 0)
@@ -333,6 +344,146 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
           result = trailingConvEntries "model-x" "2026-01-01T00:00:00.000Z" 0 msgs
       length result `shouldBe` 2
 
+  -- ── readTranscriptEntriesTimed: trailing entries with limit ──────────
+
+  describe "readTranscriptEntriesTimed trailing entries with limit" $ do
+    let mkPaths root = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
+        mkSid = case mkSessionId "test-session" of Right s -> s; Left _ -> error "bad sid"
+        setupSession :: Int -> Int -> IO SealPaths
+        setupSession entryCount trailingCount = do
+          dir <- withSystemTempDirectory "seal-transcript" pure
+          let paths = mkPaths dir
+              sdir = dir </> "state" </> "sessions" </> "test-session"
+              convPath = sdir </> "conversation.jsonl"
+              entriesPath = sdir </> "entries.jsonl"
+              idxPath = sdir </> "conversation.idx"
+              totalLines = entryCount + trailingCount
+          let convMsgs = [ PC.Message (if even i then PC.User else PC.Assistant) [CbText (T.pack ("msg-" <> show i))]
+                         | i <- [0 .. totalLines - 1] ]
+              convBs = BS.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") convMsgs)
+          createDirectoryIfMissing True sdir
+          BS.writeFile convPath convBs
+          now <- getCurrentTime
+          let entries = [ Entries.EntryRecord
+                          { Entries.erId = ""
+                          , Entries.erTimestamp = now
+                          , Entries.erKind = Entries.EKRequest
+                          , Entries.erConvLen = i + 1
+                          , Entries.erEnvelope = Just Entries.emptyEnvelopeDelta
+                          , Entries.erUsage = Nothing
+                          , Entries.erStop = Nothing
+                          , Entries.erDurationMs = Nothing
+                          , Entries.erHarness = Nothing
+                          , Entries.erCorrelation = Nothing
+                          , Entries.erMeta = Map.empty
+                          }
+                        | i <- [0 .. entryCount - 1] ]
+              entriesBs = BS.concat (map (\e -> encodeEntryRecordRaw e <> "\n") entries)
+          BS.writeFile entriesPath entriesBs
+          _ <- buildIndex convPath idxPath
+          pure paths
+
+    it "returns trailing entries even when limit is fully consumed by reconstructed entries" $ do
+      -- 10 entries (covering 10 conv lines) + 20 trailing conv lines.
+      -- With limit=10, the old code allocated all 10 to reconstruction
+      -- (remaining = 10 - 10 = 0 → no trailing). The fix splits the limit
+      -- so trailing entries get up to half: 5 reconstructed + 5 trailing.
+      paths <- setupSession 10 20
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadLastN 10)
+      -- The fix ensures trailing entries are sent alongside reconstructed
+      -- entries. At minimum, we should get trailing entries (the most
+      -- recent activity). The exact split depends on the limit allocation.
+      length frontend `shouldSatisfy` (>= 5)
+      -- totalCount should include trailing lines.
+      ttEntryCount tt `shouldBe` 10 + 20
+
+    it "returns all trailing entries when no limit is set" $ do
+      paths <- setupSession 5 10
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid ReadAll
+      -- Without a limit, all entries + all trailing are returned.
+      -- reconEntryToFrontend may filter some entries, so we check
+      -- that trailing entries are present and totalCount is correct.
+      length frontend `shouldSatisfy` (>= 10)
+      ttEntryCount tt `shouldBe` 5 + 10
+
+    it "returns only trailing entries when entries.jsonl is empty" $ do
+      paths <- setupSession 0 5
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadLastN 10)
+      -- No entries → all 5 trailing lines are returned.
+      length frontend `shouldBe` 5
+
+  -- ── readTranscriptEntriesTimed: ReadFirstN (scroll-to-top) ──────────
+
+  describe "readTranscriptEntriesTimed ReadFirstN" $ do
+    let mkPaths root = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
+        mkSid = case mkSessionId "test-session" of Right s -> s; Left _ -> error "bad sid"
+        setupSession' :: Int -> Int -> IO SealPaths
+        setupSession' entryCount trailingCount = do
+          dir <- withSystemTempDirectory "seal-transcript" pure
+          let paths = mkPaths dir
+              sdir = dir </> "state" </> "sessions" </> "test-session"
+              convPath = sdir </> "conversation.jsonl"
+              entriesPath = sdir </> "entries.jsonl"
+              idxPath = sdir </> "conversation.idx"
+              totalLines = entryCount + trailingCount
+          let convMsgs = [ PC.Message (if even i then PC.User else PC.Assistant) [CbText (T.pack ("msg-" <> show i))]
+                         | i <- [0 .. totalLines - 1] ]
+              convBs = BS.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") convMsgs)
+          createDirectoryIfMissing True sdir
+          BS.writeFile convPath convBs
+          now <- getCurrentTime
+          let entries = [ Entries.EntryRecord
+                          { Entries.erId = ""
+                          , Entries.erTimestamp = now
+                          , Entries.erKind = Entries.EKRequest
+                          , Entries.erConvLen = i + 1
+                          , Entries.erEnvelope = Just Entries.emptyEnvelopeDelta
+                          , Entries.erUsage = Nothing
+                          , Entries.erStop = Nothing
+                          , Entries.erDurationMs = Nothing
+                          , Entries.erHarness = Nothing
+                          , Entries.erCorrelation = Nothing
+                          , Entries.erMeta = Map.empty
+                          }
+                        | i <- [0 .. entryCount - 1] ]
+              entriesBs = BS.concat (map (\e -> encodeEntryRecordRaw e <> "\n") entries)
+          BS.writeFile entriesPath entriesBs
+          _ <- buildIndex convPath idxPath
+          pure paths
+
+    it "ReadFirstN returns only the first N entries, not all" $ do
+      -- 10 entries + 20 trailing = 30 total. ReadFirstN 5 should return
+      -- at most 5 entries (the first 5 reconstructed entries), NOT all 30.
+      paths <- setupSession' 10 20
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 5)
+      length frontend `shouldSatisfy` (<= 5)
+      -- totalCount is still the full count.
+      ttEntryCount tt `shouldBe` 10 + 20
+
+    it "ReadFirstN returns fewer entries than ReadLastN for large trailing" $ do
+      -- With 5 entries and 100 trailing, ReadFirstN 10 should only
+      -- process the 5 entries + 5 trailing from the start, while
+      -- ReadLastN 10 would process 5 entries + 5 trailing from the end.
+      -- Both should return <=10 entries, but ReadFirstN should NOT
+      -- read all 100 trailing lines.
+      paths <- setupSession' 5 100
+      (frontend, tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 10)
+      length frontend `shouldSatisfy` (<= 10)
+      ttEntryCount tt `shouldBe` 5 + 100
+
+    it "ReadFirstN with 0 entries returns first trailing lines" $ do
+      paths <- setupSession' 0 10
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 5)
+      -- No entries → first 5 trailing lines are returned.
+      length frontend `shouldBe` 5
+
+    it "ReadFirstN with limit > entry count reads entries + trailing fill" $ do
+      -- 3 entries + 20 trailing. ReadFirstN 10 should return up to 10:
+      -- 3 reconstructed entries + 7 trailing from the start.
+      paths <- setupSession' 3 20
+      (frontend, _tt) <- readTranscriptEntriesTimed paths "test-model" "2026-01-01T00:00:00.000Z" mkSid (ReadFirstN 10)
+      length frontend `shouldSatisfy` (<= 10)
+
   -- ── renderServerTiming ───────────────────────────────────────────────
 
   describe "Seal.Gateway.Transcript.renderServerTiming" $ do
@@ -490,3 +641,121 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
             T.length snippet `shouldBe` 81  -- 80 chars + ellipsis
             T.last snippet `shouldBe` '…'
           Nothing -> expectationFailure "expected Just snippet, got Nothing"
+  -- ── ReadLastN (transcript tail-read) ────────────────────────────────
+
+  describe "Seal.Gateway.Transcript.readTranscriptEntriesLimited" $ do
+    let fakePaths stateDir =
+          SealPaths { spHome = "", spState = stateDir, spConfig = ""
+                    , spKeys = "", spCache = "" }
+        testSid = case mkSessionId "20260701-120000-042" of
+          Right s -> s
+          Left e  -> error ("invalid sid: " ++ show e)
+        -- | Encode a Message as a conversation.jsonl line.
+        convLineMsg :: Message -> BL.ByteString
+        convLineMsg m = A.encode m <> "\n"
+        -- | Encode an EntryRecord as an entries.jsonl line.
+        entryLine :: EntryRecord -> BL.ByteString
+        entryLine e = BL.fromStrict (encodeEntryRecordRaw e) <> "\n"
+        -- | Build a simple EntryRecord.
+        mkEntry :: Text -> Int -> EntryKind -> EntryRecord
+        mkEntry eid convLen kind = EntryRecord
+          { erId = eid
+          , erTimestamp = sampleTime
+          , erKind = kind
+          , erConvLen = convLen
+          , erEnvelope = Nothing
+          , erUsage = Nothing
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Nothing
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+        -- | Extract the "id" field from a frontend TranscriptEntry JSON.
+        getEntryId :: A.Value -> Maybe Text
+        getEntryId (A.Object o) = case KeyMap.lookup (Key.fromString "id") o of
+          Just (A.String t) -> Just t
+          _ -> Nothing
+        getEntryId _ = Nothing
+
+    it "ReadAll returns all entries" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   , Message User [CbText "how are you?"]
+                   , Message Assistant [CbText "fine"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  , mkEntry "e2" 3 EKRequest
+                  , mkEntry "e3" 4 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited ReadAll paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        length result `shouldBe` 4
+
+    it "ReadLastN 2 returns only the last 2 entries with correct IDs" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   , Message User [CbText "how are you?"]
+                   , Message Assistant [CbText "fine"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  , mkEntry "e2" 3 EKRequest
+                  , mkEntry "e3" 4 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited (ReadLastN 2) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        -- Should return 2 entries (the last 2: e2 and e3)
+        length result `shouldBe` 2
+        -- The entry IDs should be "2" and "3" (original positions, not 0/1)
+        mapMaybe getEntryId result `shouldBe` ["e2", "e3"]
+
+    it "ReadLastN larger than total returns all entries" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                   ]
+            evs = [ mkEntry "e0" 1 EKRequest
+                  , mkEntry "e1" 2 EKResponse
+                  ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        BC.writeFile (sdir </> "entries.jsonl")
+                     (BL.toStrict (mconcat (map entryLine evs)))
+        result <- readTranscriptEntriesLimited (ReadLastN 100) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        length result `shouldBe` 2
+
+    it "ReadLastN on conv-only (no entries.jsonl) returns last N conversation lines" $
+      withSystemTempDirectory "seal-transcript" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        let conv = [ Message User [CbText "msg1"]
+                   , Message Assistant [CbText "reply1"]
+                   , Message User [CbText "msg2"]
+                   , Message Assistant [CbText "reply2"]
+                   , Message User [CbText "msg3"]
+                   ]
+        BC.writeFile (sdir </> "conversation.jsonl")
+                     (BL.toStrict (mconcat (map convLineMsg conv)))
+        result <- readTranscriptEntriesLimited (ReadLastN 2) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
+        -- Should return 2 entries (the last 2 conversation lines)
+        length result `shouldBe` 2

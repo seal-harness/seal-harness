@@ -23,12 +23,15 @@ import type {
   ActivityEvent,
   AskPayload,
   ClientOp,
+  EntriesChunkPayload,
   ListsSnapshot,
   ServerEvent,
   StreamClient,
   StreamStatus,
 } from '../types/stream'
 import type { TranscriptEntry } from '../types'
+
+import { rateLimitedLog, detectLoop } from './diag'
 
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
@@ -64,6 +67,7 @@ class StreamClientImpl implements StreamClient {
   private agentDefsChangedListeners = new Set<() => void>()
   private skillsChangedListeners = new Set<() => void>()
   private reposChangedListeners = new Set<() => void>()
+  private entriesChunkListeners = new Set<(sessionId: string, chunk: EntriesChunkPayload) => void>()
 
   constructor(urlOrPromise: string | Promise<string>) {
     if (typeof urlOrPromise === 'string') {
@@ -163,6 +167,23 @@ class StreamClientImpl implements StreamClient {
     this.reposChangedListeners.add(cb)
     return () => {
       this.reposChangedListeners.delete(cb)
+    }
+  }
+
+  requestEntries(sessionId: string, before: string | null, limit: number): void {
+    if (this.ws === null || this.ws.readyState !== WebSocket.OPEN) return
+    const op: ClientOp = { op: 'request-entries', sessionId, before, limit }
+    try {
+      this.ws.send(JSON.stringify(op))
+    } catch (e) {
+      this._lastError = e instanceof Error ? e.message : 'send failed'
+    }
+  }
+
+  onEntriesChunk(cb: (sessionId: string, chunk: EntriesChunkPayload) => void): () => void {
+    this.entriesChunkListeners.add(cb)
+    return () => {
+      this.entriesChunkListeners.delete(cb)
     }
   }
 
@@ -269,6 +290,8 @@ class StreamClientImpl implements StreamClient {
     // First server frame after (re)connect is evidence the connection is healthy.
     this.reconnectAttempt = 0
     const event = parsed as ServerEvent
+    detectLoop('WS.msg', 200, 30)
+    rateLimitedLog('WS.msg', 1000, (c) => `type=${event.type}${c > 0 ? ` (+${c} suppressed)` : ""}`)
     switch (event.type) {
       case 'hello':
         this._lastServerStartedAt = event.serverStartedAt
@@ -324,6 +347,16 @@ class StreamClientImpl implements StreamClient {
       case 'repos-changed':
         for (const cb of this.reposChangedListeners) cb()
         break
+      case 'entries-chunk': {
+        const chunk: EntriesChunkPayload = {
+          entries: event.entries,
+          hasMore: event.hasMore,
+          totalCount: event.totalCount,
+          requestBefore: event.requestBefore,
+        }
+        for (const cb of this.entriesChunkListeners) cb(event.sessionId, chunk)
+        break
+      }
       case 'replay-end':
         if (
           this.focusState.kind === 'focused' &&

@@ -106,9 +106,18 @@ data RuntimeConfig = RuntimeConfig
     -- @conversation.jsonl@ / @entries.jsonl@. The contract: each line is
     -- the complete JSON-encoded 'CompletionRequest' exactly as passed to
     -- the provider, including the full @crMessages@ history. Used to
-    -- debug whether the two-file storage format is correctly feeding the
+    -- debug whether the indexed transcript storage format is correctly feeding the
     -- session history to the LLM. Absent (the default) means the file is
     -- not written.
+  , rcDebugModelResponses :: Maybe Bool
+  , rcMaxModelRetries :: Maybe Int
+  , rcRetryBaseDelayMs :: Maybe Int
+    -- ^ Optional @debug_model_responses@ flag. When @true@, the exact
+    -- raw 'StreamEvent' values received from the model at every turn
+    -- are written to a @responses.jsonl@ file alongside the session's
+    -- other debug files. Independent from @debug_session_transcript@
+    -- (which controls @requests.jsonl@). Absent (the default) means
+    -- the file is not written.
   , rcOnDemandSchemas :: Maybe Bool
     -- ^ Optional @on_demand_schemas@ flag. When @true@, the full
     -- @input_schema@ JSON for every opcode is replaced with a minimal
@@ -282,6 +291,9 @@ defaultRuntimeConfig = RuntimeConfig
   , rcTelegram        = Nothing
   , rcGateway         = Nothing
   , rcDebugSessionTranscript = Nothing
+  , rcDebugModelResponses = Nothing
+  , rcMaxModelRetries = Nothing
+  , rcRetryBaseDelayMs = Nothing
   , rcOnDemandSchemas = Nothing
   , rcDelegation      = Nothing
   , rcWeb             = Nothing
@@ -436,6 +448,9 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= rcTelegram
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= rcGateway
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
+  <*> Toml.dioptional (Toml.bool "debug_model_responses") .= rcDebugModelResponses
+  <*> Toml.dioptional (Toml.int "max_model_retries") .= rcMaxModelRetries
+  <*> Toml.dioptional (Toml.int "model_retry_base_delay_ms") .= rcRetryBaseDelayMs
   <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= rcOnDemandSchemas
   <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= rcDelegation
   <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb

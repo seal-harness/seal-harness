@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 
@@ -1401,12 +1401,11 @@ describe('AskHumanForm', () => {
     if (_resolve) _resolve(true)
   })
 
-  it('shows Answered (not Submitting) after POST resolves true, even without WS', async () => {
-    vi.useFakeTimers()
+  it('form dismisses immediately after POST resolves true, even without WS', async () => {
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
-    // Promise resolves true (accepted), but the pendingQuestions prop never
-    // changes (simulating WS ask_resolved never arriving).
+    // Promise resolves true (accepted). The form should dismiss immediately
+    // via onDismissed — no lingering "Answered" state, no timer.
     const onAnswerText = vi.fn(() => Promise.resolve(true))
     render(
       <ChatArea
@@ -1418,16 +1417,11 @@ describe('AskHumanForm', () => {
       />,
     )
     fireEvent.click(screen.getByText('main'))
-    // Flush the microtask so Promise.resolve(true) settles.
-    await vi.advanceTimersByTimeAsync(0)
-    // The indicator should show "Answered", not the spinner
-    expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
-    expect(screen.getByText('Answered')).toBeTruthy()
-    // Advance past the 15s grace period — no false error should appear
-    // (the timeout is gated on !answered).
-    await vi.advanceTimersByTimeAsync(16_000)
-    expect(screen.queryByText('No confirmation from server — try again')).toBeNull()
-    vi.useRealTimers()
+    // The form (and its container) should dismiss immediately after the
+    // POST resolves — no "Answered" state, no timer, no lingering border.
+    await waitFor(() => {
+      expect(screen.queryByTestId('ask-human-form')).toBeNull()
+    })
   })
 
   // Regression (session 20260921-192522-899): after the user answers an
@@ -1701,6 +1695,99 @@ describe('AskHumanForm', () => {
     const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
     fireEvent.keyDown(ta, { key: 'Escape' })
     expect(onCancel).toHaveBeenCalledWith('q1')
+  })
+
+  // ── Pinned-to-bottom behavior ──────────────────────────────────────
+  // The AskHumanForm should render at the bottom of the transcript (pinned
+  // between the scroll area and the input area), NOT inline inside the
+  // tool-call block. This ensures the question is always visible even when
+  // background sub-agents add entries that would push an inline form up.
+  // The inline tool-call block shows a collapsed "needs input" indicator
+  // without the question text (avoiding duplication).
+
+  it('AskHumanForm is NOT rendered inside the tool-call block (not inline)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The tool-call block should NOT contain the ask-human-form
+    const toolCallBlock = container.querySelector('.tool-call')
+    expect(toolCallBlock).toBeTruthy()
+    expect(toolCallBlock!.querySelector('[data-testid="ask-human-form"]')).toBeNull()
+  })
+
+  it('AskHumanForm is rendered outside the scroll area (pinned at bottom)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The ask-human-form should be a sibling of the scroll area, not inside it
+    const scrollArea = container.querySelector('.overflow-y-auto')
+    const form = screen.getByTestId('ask-human-form')
+    expect(scrollArea).toBeTruthy()
+    expect(scrollArea!.contains(form)).toBe(false)
+  })
+
+  it('question text is NOT shown in the tool-call header when pending (no duplication)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The question text should appear exactly once — in the pinned form at
+    // the bottom, not in the tool-call header summary.
+    const allQuestionTexts = screen.getAllByText('which branch?')
+    expect(allQuestionTexts.length).toBe(1)
+  })
+
+  it('question text IS shown in the tool-call header when answered (transcript record)', () => {
+    const messages: Message[] = [{
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question: 'which branch?', options: [{ label: 'main', description: 'd' }] },
+          result: 'main',
+        },
+      }],
+      rawJson: '{}',
+    }]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // The answered ASK_HUMAN shows the question text in the header as a
+    // transcript record.
+    expect(screen.getByText('which branch?')).toBeTruthy()
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
   })
 
   // ── Stop button tests ───────────────────────────────────────────────
@@ -2070,9 +2157,8 @@ describe('Scroll-to-bottom behavior', () => {
       expect(scrollToSpy).toHaveBeenCalled()
 
       // Now simulate a new streaming message arriving. Because the button
-      // pinned to bottom, the sticky-bottom effect should fire
-      // scrollIntoView.
-      scrollIntoViewSpy.mockClear()
+      // pinned to bottom, the sticky-bottom effect should fire scrollTo.
+      scrollToSpy.mockClear()
       const msgsWithNew = [...msgsA, {
         id: 'a-m3',
         entryId: 'a-e3',
@@ -2090,7 +2176,7 @@ describe('Scroll-to-bottom behavior', () => {
         />,
       )
       // sticky-bottom scroll should have been called.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
       Element.prototype.scrollTo = origScrollTo
@@ -2204,7 +2290,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Clear calls from session switch.
-      scrollIntoViewSpy.mockClear()
+      scrollToSpy.mockClear()
 
       // A new message arrives in s2 (streaming update — same first id, count+1).
       const msgsWithNew = [...msgsB, {
@@ -2227,7 +2313,7 @@ describe('Scroll-to-bottom behavior', () => {
       })
 
       // Sticky-bottom scroll should have fired for the new message.
-      expect(scrollIntoViewSpy).toHaveBeenCalled()
+      expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView
      Element.prototype.scrollTo = origScrollTo
@@ -2287,5 +2373,144 @@ describe('Scroll-to-bottom behavior', () => {
     } finally {
       Element.prototype.scrollTo = origScrollTo
     }
+  })
+})
+
+describe('Scroll-to-top behavior', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    cleanup()
+  })
+
+  it('"Scroll to top" with hasMore calls loadFromBeginning and scrolls to top when entries arrive', () => {
+    // When hasMore is true and the user clicks "Scroll to top", the
+    // component calls loadFromBeginning() to fetch the oldest entries.
+    // When those entries arrive (messages prop changes), the scroller
+    // must scroll to top: 0 — NOT to the bottom (which is the
+    // sticky-bottom default). This is the regression: the sticky-bottom
+    // effect was firing after loadFromBeginning because wasAtBottom was
+    // still true from the initial session load.
+    const msgsLatest = makeMessages('latest', 3)
+    const msgsOldest = makeMessages('oldest', 3)
+
+    const loadFromBeginning = vi.fn()
+    const scrollToSpy = vi.fn()
+    const scrollIntoViewSpy = vi.fn()
+
+    const origScrollTo = Element.prototype.scrollTo
+    const origScrollIntoView = Element.prototype.scrollIntoView
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+    Element.prototype.scrollIntoView = scrollIntoViewSpy as unknown as typeof Element.prototype.scrollIntoView
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsLatest}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+      // Clear calls from initial render effects.
+      scrollToSpy.mockClear()
+      scrollIntoViewSpy.mockClear()
+
+      // Click "Scroll to top" — should call loadFromBeginning.
+      fireEvent.click(screen.getByLabelText('Scroll to top'))
+      expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+
+      // Clear any calls from the click's re-render effects.
+      scrollToSpy.mockClear()
+      scrollIntoViewSpy.mockClear()
+
+      // Simulate the WS chunk arriving: entries replaced with oldest.
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsOldest}
+            hasMore={false}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // The scroller must have been scrolled to top: 0, not to the
+      // bottom. scrollTo({ top: 0 }) should have been called.
+      const topZeroCalls = scrollToSpy.mock.calls.filter(
+        (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+      )
+      expect(topZeroCalls.length).toBeGreaterThan(0)
+
+      // scrollIntoView (sticky-bottom) must NOT have fired after the
+      // entries arrived — that would scroll to the bottom of the new
+      // entries instead of the top.
+      expect(scrollIntoViewSpy).not.toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+      Element.prototype.scrollIntoView = origScrollIntoView
+    }
+  })
+
+  it('scrolling to bottom when isViewingLatest is false triggers loadLatest', () => {
+    // When the user has jumped to the beginning (loadFromBeginning) and
+    // then scrolls back to the bottom via mouse/keyboard, the transcript
+    // should call loadLatest to fetch the latest entries. We verify by
+    // passing isViewingLatest={false} and checking that loadLatest is
+    // called on mount (jsdom's scroll dimensions are all 0, so the
+    // listener detects "at bottom" immediately).
+    const msgsA = makeMessages('a', 3)
+    const loadLatest = vi.fn()
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          isViewingLatest={false}
+          loadLatest={loadLatest}
+        />,
+      )
+      // The scroll listener runs onScroll() on mount. In jsdom, all
+      // scroll dimensions are 0, so wasAtBottom is true. With
+      // isViewingLatest=false, loadLatest should be called.
+      expect(loadLatest).toHaveBeenCalledTimes(1)
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('scrolling to bottom when isViewingLatest is true does NOT trigger loadLatest', () => {
+    // When the user is already viewing the latest entries, scrolling to
+    // the bottom should NOT call loadLatest (no unnecessary fetch).
+    const msgsA = makeMessages('a', 3)
+    const loadLatest = vi.fn()
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgsA}
+        isViewingLatest={true}
+        loadLatest={loadLatest}
+      />,
+    )
+    expect(loadLatest).not.toHaveBeenCalled()
   })
 })

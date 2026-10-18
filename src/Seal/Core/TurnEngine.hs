@@ -31,17 +31,14 @@ module Seal.Core.TurnEngine
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Data.Aeson (Value)
-import Data.Aeson qualified as A
 import Data.Aeson.Types qualified as AT
-import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -57,11 +54,12 @@ import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
   (mkDelegateWorker, DelegationWorkerDeps (..))
+import Seal.Agent.Runtime.Registry (hasRunningChildren)
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
-  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript
+  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
@@ -69,15 +67,16 @@ import Seal.Config.File
   , WebConfig (..) )
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
+   sessionConversationIndexPath,
    sessionDir,
-   sessionLogPath, sessionRequestsPath, sessionWorkdir)
+   sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast
   (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, takeNewEntries)
@@ -85,8 +84,8 @@ import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
-  ( TwoFileHandle, withTwoFileTranscript, tfwSetSecretOps, tfwReadEntries
-  , tfwRecordAndAck, tfwRecordAsync, tfwReadConversation, TwoFileWrite (..)
+  ( IndexedTranscriptHandle, withIndexedTranscript, itwSetSecretOps, itwReadEntries
+  , itwRecordAndAck, itwRecordAsync, itwReadConversation, IndexedTranscriptWrite (..)
   , readAndClearCompletions )
 import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
@@ -122,6 +121,7 @@ import Seal.Providers.Class
   (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
+import Seal.Transcript.ConvIndex (convLineCount, ensureIndex, readConvLines)
 import Seal.Session.ExecCache
   ( SessionExecCache, cachedSessionExec, cachedWorkdirScan
   , invalidateWorkdirScan
@@ -160,7 +160,7 @@ import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
+import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
@@ -525,6 +525,7 @@ runSessionTurn td adapter meta mSrc t = do
       -- [engine] Broadcast "thinking" (before the lock, matches the existing
       -- web + channel paths).
       broadcastHarnessStatus (tdBroker td) sid "thinking"
+      globalLogIO K2.DebugS (K2.ls ("[idle-diag] turn start: broadcast thinking for sid=" <> sessionIdText sid))
       -- Whether the agent loop's stop branch already fanned out the final
       -- reply via 'aeOnStop' (see 'Seal.Agent.Loop.notifyStop'). The loop
       -- sets this ONLY in the final-answer stop branch (the normal
@@ -533,7 +534,8 @@ runSessionTurn td adapter meta mSrc t = do
       -- same last-assistant text again (double delivery to every
       -- subscribed chat channel — observed as a duplicate final message on
       -- Telegram after /tab focus mid-turn). The cleanup still fires the
-      -- @reply-delivered@ signal and the idle broadcast on every path.
+      -- @reply-delivered@ signal on every path; the idle broadcast is
+      -- skipped when background children are still running.
       stopFanoutDoneRef <- newIORef False
       mErr <- bracket
         (pure ())
@@ -541,10 +543,20 @@ runSessionTurn td adapter meta mSrc t = do
           -- [engine] Guaranteed cleanup: signal idle + fan out the last
           -- assistant reply to subscribed chat channels (so a turn that
           -- dies mid-way still releases the tab + delivers any partial
-          -- reply). Skipped when the loop's stop branch already delivered
+          -- reply). The idle broadcast is SKIPPED when the session has
+          -- running background children ('hasRunningChildren') — the
+          -- session must stay "thinking" until the last child completes,
+          -- at which point the synthetic turn's cleanup broadcasts idle.
+          -- Skipped when the loop's stop branch already delivered
           -- the final reply ('notifyStop') — the cleanup would re-send the
           -- identical text (duplicate delivery).
-          broadcastHarnessStatus (tdBroker td) sid "idle"
+          globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: checking hasRunningChildren for sid=" <> sessionIdText sid))
+          hasChildren <- hasRunningChildren (bRuntime (tdBaseBackends td)) sid
+          if hasChildren
+            then globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: SUPPRESSING idle (hasChildren=true) for sid=" <> sessionIdText sid))
+            else do
+              globalLogIO K2.DebugS (K2.ls ("[idle-diag] bracket cleanup: BROADCASTING IDLE (hasChildren=false) for sid=" <> sessionIdText sid))
+              broadcastHarnessStatus (tdBroker td) sid "idle"
           stopFanoutDone <- readIORef stopFanoutDoneRef
           if stopFanoutDone
             then broadcastReplyDelivered (tdBroker td) sid
@@ -552,7 +564,7 @@ runSessionTurn td adapter meta mSrc t = do
               fanoutLastReply (tdReplies td) (tdBroker td) paths sid
               broadcastReplyDelivered (tdBroker td) sid)
         (\_ -> withSessionLock (tdLocks td) sid $
-          withTwoFileTranscript sessionDirPath $ \tHandle ->
+          withIndexedTranscript sessionDirPath $ \tHandle ->
             runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
       -- [engine] Auto-tab the session (idempotent; no-op if a tab already
       -- binds sid). Gated on shouldAutoTab so /bg sessions stay headless.
@@ -607,7 +619,7 @@ metaCacheEnvFor td paths eSecCfg = do
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
   -> SessionId -> SealPaths
-  -> SomeProvider -> ModelId -> IORef Bool -> TwoFileHandle
+  -> SomeProvider -> ModelId -> IORef Bool -> IndexedTranscriptHandle
   -> IO (Maybe Text)
 runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle = do
   appEnv <- mkEnv (tdLogger td) defaultConfig
@@ -671,7 +683,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
-  tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+  itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
               { teCaps          = askAwareCaps
@@ -684,6 +696,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               , teTranscript    = tHandle
               , teUioEnv        = uioEnv
               , teDebugReqPath  = debugRequestsPath paths sid eCfg
+              , teDebugRespPath = debugResponsesPath paths sid eCfg
+              , teMaxModelRetries = modelRetriesFromConfig eCfg
+              , teRetryBaseDelayMs = retryBaseDelayFromConfig eCfg
               , teAutonomy      = tdAutonomy td
               , teApprovals     = tdApprovals td
               , teOnEntry       = onEntry
@@ -705,11 +720,11 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   -- Inject subagent completion messages from the sidecar file. These are
   -- user-role harness messages appended by forked child threads when
   -- subagents complete. We write them through the daemon (via
-  -- tfwRecordAsync) so tfsWritten is updated correctly, then runTurn reads
-  -- the updated conversation from tfwReadConversation.
+  -- itwRecordAsync) so itsWritten is updated correctly, then runTurn reads
+  -- the updated conversation from itwReadConversation.
   completions <- readAndClearCompletions paths sid
   unless (null completions) $ do
-    prior <- tfwReadConversation tHandle
+    prior <- itwReadConversation tHandle
     now <- getCurrentTime
     hid <- newHarnessId
     let fullMsgs = prior <> completions
@@ -717,7 +732,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           { erId = harnessIdToText hid
           , erTimestamp = now
           , erKind = EKHarness
-          , erConvLen = length fullMsgs
+          , erConvLen = length completions
           , erEnvelope = Nothing
           , erUsage = Nothing
           , erStop = Nothing
@@ -726,7 +741,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           , erCorrelation = Nothing
           , erMeta = Map.empty
           }
-    tfwRecordAsync tHandle (TwoFileWrite fullMsgs entry)
+    itwRecordAsync tHandle (IndexedTranscriptWrite fullMsgs entry)
   eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
   case eResult of
@@ -744,7 +759,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
 -- the frontend can render both rows from this single entry. The preamble is
 -- recorded ONCE per session (the caller checks for prior EKRequest entries).
 -- Broadcasts the entry so a live-connected frontend sees it immediately.
-recordPreamble :: TwoFileHandle -> ModelId -> Maybe Text -> ISA.Registry -> IO ()
+recordPreamble :: IndexedTranscriptHandle -> ModelId -> Maybe Text -> ISA.Registry -> IO ()
 recordPreamble tHandle model mSystem isaReg = do
   now <- getCurrentTime
   let env0 = EnvelopeDelta
@@ -767,7 +782,7 @@ recordPreamble tHandle model mSystem isaReg = do
         , erCorrelation = Nothing
         , erMeta = Map.empty
         }
-  tfwRecordAndAck tHandle (TwoFileWrite [] entry)
+  itwRecordAndAck tHandle (IndexedTranscriptWrite [] entry)
 
 -- | Build 'Clone.CloneDeps' from a 'TurnDeps' (the in-scope vault runtime +
 -- repo registry handle + paths). The ssh-agent is real (production:
@@ -833,13 +848,24 @@ broadcastNewEntries mBroker paths sid model createdAt =
 fanoutLastReply :: ReplyRegistry -> Maybe StreamBroker -> SealPaths -> SessionId -> IO ()
 fanoutLastReply replies mBroker paths sid = do
   let convPath = sessionConversationPath paths sid
+      idxPath  = sessionConversationIndexPath paths sid
   exists <- doesFileExist convPath
   if not exists
     then pure ()
     else do
-      raw <- readFileTextStrict convPath
-      let lines' = filter (not . T.null) (T.lines raw)
-          msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
+      -- Read the last few conversation lines via the index (avoid reading
+      -- the full conversation.jsonl into memory). Scan backward for the
+      -- last Assistant message.
+      _ <- ensureIndex convPath idxPath
+      totalLines <- convLineCount idxPath
+      -- Read the last min(totalLines, 50) lines — enough to find the last
+      -- assistant reply in a typical turn (user msg + assistant reply).
+      let readStart = max 0 (totalLines - 50)
+          readCount = totalLines - readStart
+      eMsgs <- if readCount > 0
+        then readConvLines convPath idxPath readStart totalLines
+        else pure (Right [])
+      let msgs = case eMsgs of Right ms -> ms; Left _ -> []
       for_ (lastAssistantText msgs) $ \reply -> do
         replyFanout replies sid reply
         count <- replySubscriberCount replies sid
@@ -868,6 +894,27 @@ debugRequestsPath paths sid eCfg =
     Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
+
+debugResponsesPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
+debugResponsesPath paths sid eCfg =
+  case eCfg of
+    Right cfg | Just True <- rcDebugModelResponses cfg ->
+      Just (sessionResponsesPath paths sid)
+    _ -> Nothing
+
+-- | Extract max_model_retries from config (default 3).
+modelRetriesFromConfig :: Either a RuntimeConfig -> Int
+modelRetriesFromConfig eCfg =
+  case eCfg of
+    Right cfg | Just n <- rcMaxModelRetries cfg -> n
+    _ -> 3
+
+-- | Extract model_retry_base_delay_ms from config (default 1000).
+retryBaseDelayFromConfig :: Either a RuntimeConfig -> Int
+retryBaseDelayFromConfig eCfg =
+  case eCfg of
+    Right cfg | Just n <- rcRetryBaseDelayMs cfg -> n
+    _ -> 1000
 
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or
@@ -921,7 +968,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
       sessionDirPath = sessionDir paths sid
   createDirectoryIfMissing True sessionDirPath
   mMeta <- loadSessionMeta paths sid
-  withTwoFileTranscript sessionDirPath $ \tHandle -> do
+  withIndexedTranscript sessionDirPath $ \tHandle -> do
     appEnv <- mkEnv (tdLogger td) defaultConfig
     eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
     eSecCfg <- loadSecurityConfig (securityFilePath paths)
@@ -947,7 +994,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
-    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
     res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
@@ -976,7 +1023,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
               -- the System Prompt + Tools rows appear in the frontend
               -- BEFORE the first user message, not after it. Only recorded
               -- when no prior EKRequest entry exists (first time only).
-              priorEntries <- tfwReadEntries tHandle
+              priorEntries <- itwReadEntries tHandle
               unless (any (\e -> erKind e == EKRequest) priorEntries) $ do
                 mMetaAfterBind <- loadSessionMeta paths sid
                 let meta' = fromMaybe metaFallback mMetaAfterBind
@@ -1086,7 +1133,7 @@ hexSuffix4 n = T.justifyRight 4 '0' (T.pack (go n))
 -- | The unified AGENT_START worker-builder (design §5.3 — replaces
 -- @webMkWorker@, @channelMkWorker@, @cliMkWorker@). Resolves the def's
 -- provider+model (falling back to the parent session meta when the def
--- fields are empty), opens a fresh two-file transcript under the parent
+-- fields are empty), opens a fresh indexed transcript under the parent
 -- session's agents dir, builds a narrowed child ISA registry (the unified
 -- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
 -- message.

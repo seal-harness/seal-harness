@@ -115,12 +115,14 @@ library
         Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
+        Seal.Providers.OpenRouter
         Seal.Util.AesonUtils
         Seal.Util.AtomicJson
         Seal.Util.StrictIO
         Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
+        Seal.Transcript.ConvIndex
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
@@ -220,6 +222,7 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.API
+         Seal.Gateway.Embedded
          Seal.Gateway.Route
          Seal.Gateway.Send
          Seal.Gateway.SessionJson
@@ -340,6 +343,7 @@ library
       , trasa-openapi-hs
       , openapi-hs
       , http-media
+      , openai >=2.5.4
       , seal-gateway-types
       , seal-chat-channels
       , cron
@@ -373,19 +377,20 @@ test-suite tests
       , containers
       , directory
       , filepath
-      , hspec
-     , hspec-core
-      , http-client
-      , http-client-tls
-      , katip
-      , optparse-applicative
-      , stm
-      , temporary
-      , text
-      , time
-      , process
-      , unix
-      , random
+       , hspec
+      , hspec-core
+       , http-client
+       , http-client-tls
+       , katip
+       , optparse-applicative
+       , stm
+       , temporary
+       , text
+       , time
+       , process
+       , unix
+       , random
+       , openai >=2.5.4
       , websockets
       , case-insensitive
       , wai
@@ -403,11 +408,13 @@ test-suite tests
     other-modules:
         Seal.Core.ChannelKindSpec
         Seal.Core.MessageSourceSpec
+        Seal.Util.StrictIOSpec
         Seal.RepoDiscoverySpec
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
+        Seal.Gateway.EmbeddedSpec
         Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiIntegrationSpec
@@ -436,6 +443,7 @@ test-suite tests
         Seal.Routing.RouteSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
+        Seal.Transcript.ConvIndexSpec
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
@@ -576,6 +584,7 @@ test-suite tests
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
         Seal.Providers.ContextWindowSpec
+        Seal.Providers.OpenRouterSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec

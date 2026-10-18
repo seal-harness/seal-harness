@@ -15,7 +15,7 @@ import Seal.Config.Paths
   , configFilePath, vaultFilePath
   , reposFilePath, repoCloneStateDir
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
-  , sessionConversationPath, sessionEntriesPath, sessionRequestsPath
+  , sessionConversationPath, sessionConversationIndexPath, sessionEntriesPath, sessionRequestsPath
   , sessionLogPath
   , agentSessionDir
   , workdirsRoot, sessionWorkdir
@@ -123,6 +123,7 @@ spec = describe "Seal.Config.Paths" $ do
       sessionMetaPath paths sid   `shouldBe` "/h/state/sessions/20260701-120000-042/session.json"
       sessionTranscriptPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/transcript.jsonl"
       sessionConversationPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/conversation.jsonl"
+      sessionConversationIndexPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/conversation.idx"
       sessionEntriesPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/entries.jsonl"
       sessionRequestsPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/requests.jsonl"
       sessionLogPath paths sid         `shouldBe` "/h/state/sessions/20260701-120000-042/seal.log"

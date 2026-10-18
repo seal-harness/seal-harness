@@ -1,34 +1,34 @@
 # Project Context (Maintained by Orchestrator)
 
 ## Tooling
-- Build: `nix develop --command cabal build all` (or `make build`)
-- Test: `nix develop --command cabal test` (or `make test`)
-- Lint: `nix develop --command hlint src/ test/` (or `make lint`)
-- Full gate: `make check` (build + test + lint)
-- GHC 9.12.4, GHC2021, -Wall -Werror
-- Test framework: hspec + QuickCheck
-- Frontend: React 18 + TS + Vite + Tailwind (frontend/dist must exist for build)
-
-## Coding Conventions
-- `Text` not `String`; `ByteString` for binary; `Vector` for indexed access
-- `foldl'` not `foldl`; `modify'` not `modify`; strict fields (`!`) by default
-- Whole-module imports; `import qualified Data.Text as T`
-- No partial functions; no orphan instances; no `error`/`undefined`
-- Records: named-field construction; field names `_<type>_<field>`
-- Errors: default to `Either Text`
-- `ReaderT AppEnv IO` + Handle pattern; no effect systems
+- Package manager / build: `nix develop` + `cabal` (via Makefile wrappers)
+- Build: `make build` (cabal build all, inside nix develop)
+- Test runner: `make test` (`cabal test`); frontend `vitest`
+- Linter: `make lint` (`hlint src/ test/`)
+- Full gate: `make check` = build + test + lint
+- Frontend: React 18 + TS + Vite + Tailwind
+- Frontend gate: `cd frontend && npm run build` (tsc + vite; must exist before
+  cabal build) + `npm run test`
 
 ## Completed Work Units
-| WU | Title | Key Files | Services Created |
-|----|-------|-----------|-----------------|
-| WU-1 | SubagentRunRecord — durable tracking foundation | src/Seal/Agent/Runtime/RunRecord.hs | RunRecordRegistry (STM-backed) |
-| WU-2 | Foreground (blocking) mode for AGENT_MANAGE start | src/Seal/ISA/Ops/Agent.hs | SpawnMode, handleStartForeground |
-| WU-3 | Anti-polling instructions + Phase 2/3 migration + adAllowSpawn | src/Seal/ISA/Ops/Agent.hs, src/Seal/Agent/PromptParts.hs, src/Seal/Core/TurnEngine.hs, src/Seal/Agent/Def/Types.hs, src/Seal/Agent/Def/Workdir.hs | childAutoAnnounceNote, gAllowSpawn gate, allowSpawnBlockedMsg |
+| WU | Title | Key Files | Status |
+|----|-------|-----------|--------|
 
 ## Established Patterns
-- STM-backed registries: `newtype Registry = Registry (TVar (Map Key Value))`
-- Sidecar completion: forked child threads append to JSONL, turn engine reads at turn start
-- Agent runtime: `AgentRuntime (TVar (Map SubagentId AgentInstance))`
-- Delegation: `runDelegate` (sync) / `runDelegateAsync` (async with forked threads)
-- Spawn gate: `AgentStartGate { gEffectiveRole, gOrchEnabled, gAllowSpawn }` — `gAllowSpawn` (per-def `adAllowSpawn`) overrides role-based default; `authorizeStart` consults it
-- Anti-polling: spawn response + completion message carry NO_REPLY instructions; child prompt gets `childAutoAnnounceNote` when it can spawn
+- CRUD views: left list pane (280px) + right editor pane, AgentsView/SecretsView/ReposView pattern
+- API handlers: `case (requestMethod, pathInfo req) of ...` manual dispatch in `apiApp`
+- Vault access: `readIORef (vrHandleRef (adVault deps))` → `Maybe VaultHandle`
+- Config access: `srConfigPath (adSessionRuntime deps)` + `updateRuntimeConfig`
+- SealRoute GADT in src-gateway-types/Seal/Gateway/Types/Route.hs + openApiMeta in OpenApi.hs
+- Route count assertion in test/Seal/Gateway/ApiRouteSpec.hs
+- Provider module shape (mirror `Seal.Providers.Anthropic`/`Seal.Providers.Ollama`):
+  pure `encodeRequest`/`decodeResponse` + `sendX` HTTP + `withApiKey` CPS for
+  the bearer header; `Manager` field on the provider record; `mkX :: Manager -> ... `
+  constructor; `httpErrorText` special-cases 429/401.
+- `withApiKey :: ApiKey -> (ByteString -> r) -> r` (Secrets.hs) — key bytes only
+  live inside the continuation.
+- Provider modules are FORBIDDEN to import `System.Process`/`System.Directory`/
+  `System.Posix`/`Servant.*`.
+
+## Active Services
+See `docs/plans/active-plan.md`.
