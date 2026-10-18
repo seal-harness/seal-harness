@@ -9,6 +9,7 @@ module Seal.Providers.Registry
   , knownProviders
   , configuredProviders
   , providerLabel
+  , anthropicOAuthKey
   , providerId
   , parseProvider
   , vaultKeyName

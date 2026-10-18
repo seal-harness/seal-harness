@@ -615,7 +615,7 @@ describe('Sidebar — tab status indicator', () => {
 // ── Tab second-line info density ───────────────────────────────────────
 
 describe('Sidebar — tab second-line info (repo · provider · model · agent)', () => {
-  it('shows repo name · channel by default — agent and model suppressed', () => {
+  it('shows provider badge · repo name · channel by default — agent and model suppressed', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -643,16 +643,18 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // Default config is repo · channel: the second line shows the repo name
-    // and the channel. The agent ("zoe") and model are NOT in the default.
+    // Default config is provider · repo · channel: the second line shows the
+    // provider badge, the repo name, and the channel. The agent ("zoe") and
+    // model are NOT in the default.
     const label = screen.getByTestId('tab-status-label-0')
+    expect(screen.getByTestId('provider-badge-anthropic')).toBeDefined()
     expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).toContain('web')
     expect(label.textContent).not.toContain('zoe')
     expect(label.textContent).not.toContain('sonnet-4')
   })
 
-  it('renders an empty second line when no default-config fields have data', () => {
+  it('renders an empty text second line when only an icon provider has data', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:ollama', session_id: 's1' })]
     const tabSessions = [makeSession({
       id: 's1',
@@ -678,8 +680,9 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
       />,
     )
     const label = screen.getByTestId('tab-status-label-0')
-    // Default config is repo · channel — no repo and no channel data, so
-    // the second line is empty (renderConfigurableLine returns null).
+    // Default config is provider · repo · channel — the Ollama badge is an
+    // icon (no text), and there is no repo or channel data, so the text
+    // content is empty (renderConfigurableLine has only the icon to show).
     expect(label.textContent).toBe('')
   })
 
@@ -710,9 +713,11 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
         onReleaseTab={() => {}}
       />,
     )
-    // Default config is repo · channel — agent and model are not in the
-    // default, and there is no repo/channel data, so the second line is empty.
+    // Default config is provider · repo · channel — agent and model are not
+    // in the default, and there is no repo/channel data, so only the provider
+    // badge shows.
     const label = screen.getByTestId('tab-status-label-0')
+    expect(screen.getByTestId('provider-badge-anthropic')).toBeDefined()
     expect(label.textContent).not.toContain('sonnet-4')
     expect(label.textContent).not.toContain('zoe')
   })
@@ -1001,8 +1006,10 @@ describe('Sidebar — session second-line configurable fields', () => {
         onReleaseTab={() => {}}
       />,
     )
-    // Default config: repo · channel. No channel recorded → just repo name.
+    // Default config: provider · repo · channel. No channel recorded → the
+    // provider badge plus the repo name.
     const label = screen.getByTestId('session-status-label-s1')
+    expect(screen.getByTestId('provider-badge-anthropic')).toBeDefined()
     expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).not.toContain('sonnet-4')
     expect(label.textContent).not.toContain('zoe')
@@ -1067,7 +1074,8 @@ describe('Sidebar — session second-line configurable fields', () => {
     )
     // Expand the archived section.
     fireEvent.click(screen.getByTestId('collapse-icon'))
-    // Default config: repo · channel. No channel → just repo name.
+    // Default config: provider · repo · channel. No channel → the provider
+    // badge plus the repo name.
     const label = screen.getByTestId('session-status-label-old1')
     expect(label.textContent).toContain('seal-harness')
     expect(label.textContent).not.toContain('llama3.2')
