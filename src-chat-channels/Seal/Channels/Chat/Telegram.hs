@@ -21,6 +21,8 @@ import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
 import Data.Text qualified as T
 
+import System.IO (hPutStrLn, stderr)
+
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Types
   (InboundMessage (..), ChatMessageId (..), ReceivedMessage (..))
@@ -252,13 +254,18 @@ buildKeyboard prefix opts =
 -- | Run the reader thread with cleanup. Spawns a background thread that
 -- loops 'tctReceive', allow-lists the sender, and pushes 'InboundMessage's
 -- to 'tccInbox'. On transport close or exception, the thread exits.
+-- The initial backoff (microseconds) is used for retry delays on
+-- transient errors; it doubles on each consecutive error (capped at 30s)
+-- and resets on a successful receive.
 withTelegramChatChannel
   :: AllowList UserId
   -> Int
+  -> Int
+  -- ^ Initial backoff in microseconds (for retry on transient errors)
   -> TelegramChatTransport
   -> (TelegramChatChannel -> IO a)
   -> IO a
-withTelegramChatChannel allow chunkLimit transport action =
+withTelegramChatChannel allow chunkLimit initialBackoff transport action =
   bracket before after (action . snd)
   where
     before = do
@@ -273,7 +280,7 @@ withTelegramChatChannel allow chunkLimit transport action =
             , tccLastChat = lastChat
             , tccReaderAlive = alive
             }
-      tid <- forkIO (readerLoop ch)
+      tid <- forkIO (readerLoop ch initialBackoff)
       pure (tid, ch)
     after (tid, _) = do
       killThread tid
@@ -282,14 +289,22 @@ withTelegramChatChannel allow chunkLimit transport action =
 -- | The background reader: loop 'tctReceive', construct a 'MessageSource'
 -- from the received conversation id + sender, update the last chat id,
 -- and push to the inbox. Exits when 'tctReceive' returns 'Left'.
-readerLoop :: TelegramChatChannel -> IO ()
-readerLoop ch = go
+-- Retries with exponential backoff on transient errors instead of dying.
+readerLoop :: TelegramChatChannel -> Int -> IO ()
+readerLoop ch initialBackoff = go initialBackoff
   where
-    go = do
+    maxBackoff = 30_000_000  -- 30 seconds
+    go backoff = do
       eVal <- try (tctReceive (tccTransport ch)) :: IO (Either SomeException (Either Text ReceivedMessage))
       case eVal of
-        Left _ -> writeIORef (tccReaderAlive ch) False
-        Right (Left _) -> writeIORef (tccReaderAlive ch) False
+        Left ex -> do
+          logErr ("reader exception: " <> T.pack (show ex))
+          threadDelay backoff
+          go (min (backoff * 2) maxBackoff)
+        Right (Left err) -> do
+          logErr ("receive error: " <> err)
+          threadDelay backoff
+          go (min (backoff * 2) maxBackoff)
         Right (Right (ReceivedMessage cid mSender replyTo body mCbData _mCbId _mCbMsgId))
           | not (T.null body) -> do
               case mkMessageSource cid Telegram (mkSender <$> mSender) mempty of
@@ -297,8 +312,9 @@ readerLoop ch = go
                   writeIORef (tccLastChat ch) (Just replyTo)
                   atomically (writeTQueue (tccInbox ch) (InboundMessage ms body mCbData))
                 Left _ -> pure ()
-              go
-          | otherwise -> go
+              go initialBackoff
+          | otherwise -> go initialBackoff
+    logErr msg = hPutStrLn stderr ("[telegram] " <> T.unpack msg)
 
 -- | Construct a 'UserId' from a sender text, best-effort.
 mkSender :: Text -> UserId

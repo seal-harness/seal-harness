@@ -32,7 +32,7 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import System.Exit (ExitCode (..))
-import System.IO (BufferMode (..), Handle, hClose, hFlush, hGetLine, hSetBuffering)
+import System.IO (BufferMode (..), Handle, hClose, hFlush, hGetLine, hPutStrLn, hSetBuffering, stderr)
 import System.Process
   ( CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess,
     waitForProcess, withCreateProcess)
@@ -448,18 +448,21 @@ sendRaw ch t = do
   case mSender of
     Nothing -> pure ()
     Just sender -> sctSend (sccTransport ch) sender t
-
 -- | Run the reader thread with cleanup. Spawns a background thread that
 -- loops 'sctReceive', creates a 'MessageSource', and pushes
 -- 'InboundMessage's to 'sccInbox'. On transport close or exception, the
--- thread exits.
+-- thread exits. The initial backoff (microseconds) is used for retry
+-- delays on transient errors; it doubles on each consecutive error
+-- (capped at 30s) and resets on a successful receive.
 withSignalChatChannel
   :: AllowList UserId
   -> Int
+  -> Int
+  -- ^ Initial backoff in microseconds (for retry on transient errors)
   -> SignalChatTransport
   -> (SignalChatChannel -> IO a)
   -> IO a
-withSignalChatChannel allow chunkLimit transport action =
+withSignalChatChannel allow chunkLimit initialBackoff transport action =
   bracket before after (action . snd)
   where
     before = do
@@ -474,7 +477,7 @@ withSignalChatChannel allow chunkLimit transport action =
             , sccLastSender = lastSender
             , sccReaderAlive = alive
             }
-      tid <- forkIO (readerLoop ch)
+      tid <- forkIO (readerLoop ch initialBackoff)
       pure (tid, ch)
     after (tid, _) = do
       killThread tid
@@ -483,23 +486,32 @@ withSignalChatChannel allow chunkLimit transport action =
 -- | The background reader: loop 'sctReceive', construct a 'MessageSource'
 -- from the received conversation id + sender, update the last sender, and
 -- push to the inbox. Exits when 'sctReceive' returns 'Left'.
-readerLoop :: SignalChatChannel -> IO ()
-readerLoop ch = go
+-- Retries with exponential backoff on transient errors instead of dying.
+readerLoop :: SignalChatChannel -> Int -> IO ()
+readerLoop ch initialBackoff = go initialBackoff
   where
-    go = do
+    maxBackoff = 30_000_000  -- 30 seconds
+    go backoff = do
       eVal <- try (sctReceive (sccTransport ch)) :: IO (Either SomeException (Either Text ReceivedMessage))
       case eVal of
-        Left _ -> writeIORef (sccReaderAlive ch) False
-        Right (Left _) -> writeIORef (sccReaderAlive ch) False
+        Left ex -> do
+          logErr ("reader exception: " <> T.pack (show ex))
+          threadDelay backoff
+          go (min (backoff * 2) maxBackoff)
+        Right (Left err) -> do
+          logErr ("receive error: " <> err)
+          threadDelay backoff
+          go (min (backoff * 2) maxBackoff)
         Right (Right (ReceivedMessage cid mSender replyTo body _ _ _))
-          | T.null body -> go
+          | T.null body -> go initialBackoff
           | otherwise -> do
               case mkMessageSource cid Signal (mkSender <$> mSender) mempty of
                 Right ms -> do
                   writeIORef (sccLastSender ch) (Just replyTo)
                   atomically (writeTQueue (sccInbox ch) (InboundMessage ms body Nothing))
                 Left _ -> pure ()
-              go
+              go initialBackoff
+    logErr msg = hPutStrLn stderr ("[signal] " <> T.unpack msg)
 
 -- | Construct a 'UserId' from a sender text, best-effort.
 mkSender :: Text -> UserId

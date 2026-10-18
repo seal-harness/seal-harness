@@ -489,6 +489,7 @@ forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
           void (forkIO (withSignalChatChannel
                           allow
                           chunkLimit
+                         1000000
                           transport
                           (\chan -> runChatChannel chanCfg chan watchState)))
 
@@ -524,5 +525,6 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit
+                     1000000
                       transport
                       (\chan -> runChatChannel chanCfg chan watchState)))
