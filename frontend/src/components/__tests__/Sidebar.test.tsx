@@ -1114,3 +1114,136 @@ describe('Sidebar — session second-line configurable fields', () => {
     expect(label.textContent).toContain('zoe')
   })
 })
+
+// ── Row indentation parity (Active Tabs ↔ Recent Sessions ↔ Archived) ──
+
+/** The leading gutter every sidebar row reserves before its title: a fixed
+ *  slot for the tab index badge, then a fixed slot for the liveness /
+ *  activity glyph. Session rows leave the index slot empty so their titles
+ *  line up with tab titles instead of starting flush against the row edge. */
+function leadingGutter(row: Element): { index: number; status: number } {
+  const indexSlot = row.querySelector('[data-testid="row-index-slot"]')
+  const statusSlot = row.querySelector('[data-testid="row-status-slot"]')
+  expect(indexSlot).toBeTruthy()
+  expect(statusSlot).toBeTruthy()
+  return {
+    index: parseFloat((indexSlot as HTMLElement).style.width),
+    status: parseFloat((statusSlot as HTMLElement).style.width),
+  }
+}
+
+function secondLineOf(row: Element): HTMLElement {
+  const el = row.querySelector('[data-testid^="tab-status-label"], [data-testid^="session-status-label"]')
+  expect(el).toBeTruthy()
+  return el as HTMLElement
+}
+
+describe('Sidebar — row indentation parity across sections', () => {
+  function renderSidebarWithAllThreeSections() {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 't1' })]
+    const tabSessions = [makeSession({ id: 't1', description: 'Tab row', channel: 'web' })]
+    const sessions = [makeSession({ id: 'r1', description: 'Recent row', channel: 'web' })]
+    const archivedSessions = [makeSession({ id: 'a1', description: 'Archived row', channel: 'web' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={sessions}
+        archivedSessions={archivedSessions}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The Archived section is collapsed by default — expand it so its row
+    // participates in the comparison.
+    fireEvent.click(screen.getByTestId('collapse-icon'))
+    return {
+      tabRow: screen.getByText('Tab row').closest('.agent-row') as HTMLElement,
+      recentRow: screen.getByText('Recent row').closest('.agent-row') as HTMLElement,
+      archivedRow: screen.getByText('Archived row').closest('.agent-row') as HTMLElement,
+    }
+  }
+
+  it('Recent Sessions rows reserve the same leading gutter as Active Tabs rows', () => {
+    const { tabRow, recentRow } = renderSidebarWithAllThreeSections()
+    expect(leadingGutter(recentRow)).toEqual(leadingGutter(tabRow))
+  })
+
+  it('Archived rows reserve the same leading gutter as Active Tabs rows', () => {
+    const { tabRow, archivedRow } = renderSidebarWithAllThreeSections()
+    expect(leadingGutter(archivedRow)).toEqual(leadingGutter(tabRow))
+  })
+
+  it('Recent Sessions and Archived second lines are indented like the Active Tabs second line', () => {
+    const { tabRow, recentRow, archivedRow } = renderSidebarWithAllThreeSections()
+    const tabIndent = secondLineOf(tabRow).style.marginLeft
+    // Guard against a vacuous pass: the tab second line must actually be
+    // indented, otherwise "all equal" would be satisfied by three zeros.
+    expect(parseFloat(tabIndent)).toBeGreaterThan(0)
+    expect(secondLineOf(recentRow).style.marginLeft).toBe(tabIndent)
+    expect(secondLineOf(archivedRow).style.marginLeft).toBe(tabIndent)
+  })
+
+  it('a thinking Recent Sessions row puts its dot in the status slot so the title does not shift', () => {
+    const sessions = [makeSession({ id: 'r1', description: 'Quiet row', channel: 'web' })]
+    const { rerender } = render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const quietRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
+    expect(quietRow.querySelector('[data-testid="row-status-slot"]')!.childElementCount).toBe(0)
+
+    rerender(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        sessionActivity={{
+          r1: { harness: 'thinking', unread: 0, lastEntryAt: null, seenAt: null, toolCall: null },
+        }}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const thinkingRow = screen.getByText('Quiet row').closest('.agent-row') as HTMLElement
+    const statusSlot = thinkingRow.querySelector('[data-testid="row-status-slot"]') as HTMLElement
+    // The dot lives INSIDE the fixed-width status slot (not as an extra
+    // inline sibling of the title), so the title keeps its x position.
+    expect(statusSlot.querySelector('.dot-thinking')).toBeTruthy()
+    // The dot must be the slot's only child — anything rendered as a sibling
+    // of the title would shift the title right (the original bug).
+    expect(statusSlot.childElementCount).toBe(1)
+    // And the title still sits after exactly two fixed leading slots, so its
+    // x position is identical whether or not the row is thinking.
+    expect(leadingGutter(thinkingRow)).toEqual(leadingGutter(quietRow))
+  })
+})

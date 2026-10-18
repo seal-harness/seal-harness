@@ -7,6 +7,7 @@ import { type TabLineField, loadTabLineFields, saveTabLineFields } from '../lib/
 import { ActiveTabs, renderConfigurableLine, deriveRepoName, type TabLineData } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { TabLineConfigBar } from './TabLineConfigBar'
+import { RowIndexSlot, RowStatusSlot, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import { ActivityDot } from './StatusDot'
 
 /** A "Recent Sessions" section header — plain label, no action button.
@@ -97,7 +98,12 @@ function SessionRow({
   return (
     <div className={rowClasses} onClick={onSelect}>
       <div className="flex items-center gap-2">
-        {isThinking && <ActivityDot activity="thinking" />}
+        {/* Session rows have no tab index, but they reserve the same index
+            slot as a tab row so titles align across sections. */}
+        <RowIndexSlot />
+        <RowStatusSlot>
+          {isThinking && <ActivityDot activity="thinking" />}
+        </RowStatusSlot>
         <span
           className="text-sm truncate mr-auto"
           style={{ color: 'var(--text-muted)', letterSpacing: 'var(--tracking-tight)' }}
@@ -135,8 +141,8 @@ function SessionRow({
         if (!line) return null
         return (
           <div
-            className="text-xs ml-0 mt-0.5 flex items-center gap-1"
-            style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
+            className="text-xs mt-0.5 flex items-center gap-1"
+            style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)', marginLeft: ROW_SECOND_LINE_INDENT_PX }}
             data-testid={`session-status-label-${session.id}`}
           >
             {line}
