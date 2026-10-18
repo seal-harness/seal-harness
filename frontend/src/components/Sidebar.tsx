@@ -7,6 +7,7 @@ import { type TabLineField, loadTabLineFields, saveTabLineFields } from '../lib/
 import { ActiveTabs, renderConfigurableLine, deriveRepoName, type TabLineData } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { TabLineConfigBar } from './TabLineConfigBar'
+import { ROW_SESSION_NAME_INDENT_PX, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import { ActivityDot } from './StatusDot'
 
 /** A "Recent Sessions" section header — plain label, no action button.
@@ -97,12 +98,24 @@ function SessionRow({
   return (
     <div className={rowClasses} onClick={onSelect}>
       <div className="flex items-center gap-2">
-        {isThinking && <ActivityDot activity="thinking" />}
-        <span
-          className="text-sm truncate mr-auto"
-          style={{ color: 'var(--text-muted)', letterSpacing: 'var(--tracking-tight)' }}
-        >
-          {displayName}
+        {/* No leading slots on a session row: the name itself is inset to
+            where a tab row's number starts (see RowLayout). The thinking dot
+            sits immediately after the name rather than before it — there is
+            no room before, since the name begins only 4px in from the row
+            edge. The two are grouped so the dot stays attached to the name
+            instead of being pushed to the row's trailing edge. */}
+        <span className="flex items-center gap-1 mr-auto min-w-0">
+          <span
+            className="text-sm truncate"
+            style={{
+              color: 'var(--text-muted)',
+              letterSpacing: 'var(--tracking-tight)',
+              marginLeft: ROW_SESSION_NAME_INDENT_PX,
+            }}
+          >
+            {displayName}
+          </span>
+          {isThinking && <ActivityDot activity="thinking" />}
         </span>
         {unread > 0 && (
           <span
@@ -135,8 +148,12 @@ function SessionRow({
         if (!line) return null
         return (
           <div
-            className="text-xs ml-0 mt-0.5 flex items-center gap-1"
-            style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
+            className="text-xs mt-0.5 flex items-center gap-1"
+            style={{
+              color: 'var(--text-muted)',
+              lineHeight: 'var(--leading-tight)',
+              marginLeft: ROW_SECOND_LINE_INDENT_PX,
+            }}
             data-testid={`session-status-label-${session.id}`}
           >
             {line}

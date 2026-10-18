@@ -5,6 +5,7 @@ import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import type { TabLineField } from '../lib/tabLineConfig'
 import { ActivityDot } from './StatusDot'
+import { RowIndexSlot, RowStatusSlot, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import ollamaIcon from '../../assets/ollama-icon.svg'
 import openrouterIcon from '../../assets/openrouter-icon.svg'
 
@@ -298,31 +299,27 @@ export function TabRow({
   return (
     <div className={rowClasses} onClick={onSelect}>
       <div className="flex items-center gap-2">
-        <span
-          className="text-xs"
-          data-testid={`tab-index-${tab.index}`}
-          style={{ color: 'var(--text-faint)', minWidth: 12, textAlign: 'right' }}
-        >
-          {tabIndexToChar(tab.index)}
-        </span>
-        {isThinking && !isDead ? (
-          <ActivityDot activity="thinking" />
-        ) : isDead ? (
-          <span
-            data-testid={`status-${tab.status}`}
-            style={{ color: icon.color, fontSize: 10, lineHeight: 1 }}
-          >
-            {icon.char}
-          </span>
-        ) : (
-          <span
-            data-testid={`tab-kind-${kind}`}
-            style={{ color: kindGlyph.color, fontSize: 10, lineHeight: 1 }}
-            aria-label={kindLabel[kind]}
-          >
-            {kindGlyph.char}
-          </span>
-        )}
+        <RowIndexSlot testId={`tab-index-${tab.index}`}>{tabIndexToChar(tab.index)}</RowIndexSlot>
+        <RowStatusSlot>
+          {isThinking && !isDead ? (
+            <ActivityDot activity="thinking" />
+          ) : isDead ? (
+            <span
+              data-testid={`status-${tab.status}`}
+              style={{ color: icon.color, fontSize: 10, lineHeight: 1 }}
+            >
+              {icon.char}
+            </span>
+          ) : (
+            <span
+              data-testid={`tab-kind-${kind}`}
+              style={{ color: kindGlyph.color, fontSize: 10, lineHeight: 1 }}
+              aria-label={kindLabel[kind]}
+            >
+              {kindGlyph.char}
+            </span>
+          )}
+        </RowStatusSlot>
         <span
           className="text-sm font-medium truncate mr-auto"
           style={{ color: 'var(--text-muted)', letterSpacing: 'var(--tracking-tight)' }}
@@ -446,8 +443,8 @@ export function TabRow({
         {ageText && <span className="pill token-count">{ageText}</span>}
       </div>
       <div
-        className="text-xs ml-6 mt-0.5 flex items-center gap-1"
-        style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
+        className="text-xs mt-0.5 flex items-center gap-1"
+        style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)', marginLeft: ROW_SECOND_LINE_INDENT_PX }}
         data-testid={`tab-status-label-${tab.index}`}
       >
         {isDead ? (
