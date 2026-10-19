@@ -5,7 +5,7 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: #273 WU-1 (config `pcType` + migration gate + `providerInstances`)
+- Active work unit: #273 WU-3 (CLI: add/list/test/remove/default/login by instance)
 - Current phase: IMPLEMENT (#273 design rev 5 / plan v3 approved for build)
 - Retry count: 0
 
@@ -29,9 +29,9 @@ Issue: #271 · PR: #272 (draft)
 | WU | Status | Phase | Commits |
 |----|--------|-------|---------|
 | WU-0 (Name module) | COMPLETE | COMMITTED | 37e9cc8 |
-| WU-1 (config + migration + instances) | IN-PROGRESS | IMPLEMENT | — |
-| WU-2 (registry instances) | TODO | — | — |
-| WU-3 (CLI) | TODO | — | — |
+| WU-1 (config + migration + instances) | COMPLETE | COMMITTED | 9118652 |
+| WU-2 (registry instances) | COMPLETE | COMMITTED | ee41c6e |
+| WU-3 (CLI) | IN-PROGRESS | IMPLEMENT | — |
 | WU-4a (gateway reads) | TODO | — | — |
 | WU-4b (gateway mutations) | TODO | — | — |
 | WU-5 (frontend) | TODO | — | — |
@@ -41,7 +41,16 @@ Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
 authoritative), plan round 1 (Scope PASS; Feasibility/Completeness blockers
 fixed by adopting the scope review's simplifications: no
 `/api/provider-types`, no instance cap, three delete behaviours,
-`adProviders` deleted). Build in progress.
+`adProviders` deleted). WU-0/1/2 are in and green (3259 examples, hlint clean).
+
+Notes for the next unit:
+- `providerInstances` + `instanceCredentials` + `resolveInstance` +
+  `configuredInstances` + `instanceAuthStatus` + `resolveDefaultModelFor` +
+  `instanceLabelList` are the instance API the CLI/gateway should move to.
+- The old `KnownProvider`-shaped API is still exported (strangler); WU-3 ports
+  `Command/Provider` + `Model` + `New`, WU-4 ports the gateway, WU-6 deletes.
+- Migration: rev-6 correction — pointer-only still synthesizes the section
+  (design §11.9).
 
 ## Checkpoints
 - after WU-1 (transport green) — delivered
