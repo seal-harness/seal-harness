@@ -1,5 +1,38 @@
 # Revision history for seal-harness
 
+## Unreleased — named provider instances
+
+**Providers are now named instances of a type.** One `openai-compat` endpoint
+is no longer the limit: every type (Anthropic, Ollama, and each
+OpenAI-compatible catalog row) gets instances, named by you (e.g. `work`,
+`local-vllm`). They are addressed by instance name across the CLI
+(`/provider add <type> [name]`, `/provider list|test|default|remove|login
+<name>`, `/model list|use|default <name> <model>`, `new -p <name>`), the REST
+API, sessions and agent defs.
+
+- **Nothing to do on upgrade.** Existing `[providers.anthropic]`,
+  `[providers.ollama]` and `[providers.openai-compat]` sections keep working: a
+  type named after its own id is an implicit instance that keeps the legacy
+  vault keys. A hand-written section with no `type` and a non-legacy name is
+  surfaced as a *problem row* (fix or delete it in `config.toml`); a typed
+  section whose name is another type's id is also a problem row.
+- **Model change:** an instance is identified by its name, not its type.
+  `config.toml` gains `type = "<type-id>"` in each `[providers.<name>]` section;
+  secrets for non-type-named instances live under `PROVIDER_APIKEY_<NAME>` /
+  `PROVIDER_OAUTH_<NAME>` (type-named instances keep `ANTHROPIC_API_KEY` etc.).
+- **`default_provider`** now holds an instance name (e.g. `anthropic-work`).
+- **Security delta** (guarantees unchanged, surface wider): the set of
+  credentials repointable via `PUT {base_url}` grows 2→N (operator-key
+  exfiltration to an attacker-chosen host, not merely "repointing"); instance
+  names are operator-authored and creation-validated but **not load-validated**,
+  and credential target names become enumerable on a surface that can already
+  write them; `GET /api/providers/all` does one vault read per instance (no
+  cap); a no-credential (broken) row's credentials can no longer be deleted
+  from the UI/CLI and orphan until `/vault delete`.
+- **Non-goal:** repointing an existing session's provider from the web UI is
+  out of scope (the CLI's `/model use <instance> <model>` covers it; there is
+  no REST endpoint for it, for any provider).
+
 ## Unreleased — generic OpenAI-compatible provider
 
 **Breaking: the `openrouter` provider is now `openai-compat`.** The provider

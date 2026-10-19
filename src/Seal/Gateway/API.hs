@@ -4,14 +4,6 @@
 module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
-  -- Pure provider helpers, exported so the editor contract (and a future
-  -- preset row) is testable without an HTTP round-trip.
-  , providerDetailValue
-  , baseUrlRequired
-  , baseUrlEditable
-  , defaultBaseUrlFor
-  , keyOptionalFor
-  , staticModelsFor
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), withObject)
@@ -108,15 +100,13 @@ import Seal.Providers.Name
   ( ProviderName, apiKeyNameFor, checkNameForType, mkProviderName
   , oauthKeyNameFor, providerNameExample, providerNameRule )
 import Seal.Providers.Registry
-  ( KnownProvider (..), OpenAICompatSpec (..), ProviderCredentials (..)
-  , ProviderInstance (..)
-  , ProviderType (..), anthropicOAuthKey, configuredInstances, defaultModelFor
+  ( OpenAICompatSpec (..), ProviderCredentials (..), ProviderInstance (..)
+  , ProviderType (..), anthropicOAuthKey, configuredInstances
   , findInstance, instanceAuthStatus, instanceCredentials, instanceLabelList
   , instanceTypeIdFor, isConfiguredInstance, legacyKeyFor
-  , providerBaseUrlFor, providerBaseUrlForInstance, providerInstances
+  , providerBaseUrlForInstance, providerInstances
   , providerTypeForId, providerTypeLabel, providerTypes
-  , resolveDefaultModelFor, toProviderType, typeId
-  , providerDisplayName, providerLabel )
+  , resolveDefaultModelFor, typeId )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -2231,60 +2221,6 @@ typeDefaultModel AnthropicType           = Just (ModelId "claude-opus-4-8")
 typeDefaultModel OllamaType              = Just (ModelId "llama3.2")
 typeDefaultModel (OpenAICompatType spec) = ocsDefaultModel spec
 
--- | The pure half of the provider-detail response: every field the editor
--- needs, derived from the provider (row) and the config. Kept pure so the
--- preset columns are testable without shipping a preset.
-providerDetailValue :: RuntimeConfig -> Text -> KnownProvider -> Value
-providerDetailValue cfg authStatus kp =
-  object
-    [ "name" .= providerLabel kp
-    , "displayName" .= providerDisplayName kp
-    , "isDefault" .= (rcDefaultProvider cfg == Just (providerLabel kp))
-    , "defaultModel" .= providerDefaultModel cfg (providerLabel kp)
-    , "baseUrl" .= shownBaseUrl
-    , "authStatus" .= authStatus
-    , "baseUrlRequired" .= baseUrlRequired kp
-    , "baseUrlEditable" .= baseUrlEditable kp
-    , "defaultBaseUrl" .= defaultBaseUrlFor kp
-    , "keyOptional" .= keyOptionalFor cfg kp
-    , "defaultModelRequired" .= isNothing (defaultModelFor kp)
-    ]
-  where
-    -- A preset's URL is authoritative: show the destination, not a stale
-    -- configured override.
-    shownBaseUrl = case kp of
-      OpenAICompatProvider spec ->
-        ocsBuiltinBaseUrl spec `orElse` providerBaseUrl cfg (providerLabel kp)
-      -- The anthropic endpoint is fixed: show it (the field is read-only).
-      AnthropicProvider ->
-        either (const Nothing) Just (providerBaseUrlFor cfg kp)
-      _ -> providerBaseUrl cfg (providerLabel kp)
-    orElse (Just u) _ = Just u
-    orElse Nothing  x = x
-
--- | Does this provider need a base URL the user must supply?
-baseUrlRequired :: KnownProvider -> Bool
-baseUrlRequired (OpenAICompatProvider spec) = isNothing (ocsBuiltinBaseUrl spec)
-baseUrlRequired _                           = False
-
--- | Can the base URL be edited in the UI? (A fixed endpoint is read-only.)
-baseUrlEditable :: KnownProvider -> Bool
-baseUrlEditable AnthropicProvider           = False
-baseUrlEditable OllamaProvider              = True
-baseUrlEditable (OpenAICompatProvider spec) = isNothing (ocsBuiltinBaseUrl spec)
-
--- | The URL used when the field is blank (shown as its placeholder/default).
-defaultBaseUrlFor :: KnownProvider -> Maybe Text
-defaultBaseUrlFor AnthropicProvider           = Nothing
-defaultBaseUrlFor OllamaProvider              = Just defaultOllamaBaseUrl
-defaultBaseUrlFor (OpenAICompatProvider spec) = ocsBuiltinBaseUrl spec
-
--- | Can the provider run with no stored credential at all?
-keyOptionalFor :: RuntimeConfig -> KnownProvider -> Bool
-keyOptionalFor _   AnthropicProvider = False
-keyOptionalFor cfg OllamaProvider =
-  not (ollamaNeedsKey (fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg "ollama")))
-keyOptionalFor _   (OpenAICompatProvider spec) = not (ocsKeyRequired spec)
 
 -- | Strict decode of an optional string field. 'Nothing' = absent/null;
 -- @Just ""@ = present but empty (an explicit clear).
@@ -2690,10 +2626,6 @@ staticModelsForType AnthropicType =
 staticModelsForType OllamaType = ["llama3.2", "llama3.1"]
 staticModelsForType (OpenAICompatType spec) = [t | ModelId t <- ocsModels spec]
 
--- | The static model id list for a legacy provider row (kept for the editor
--- contract tests; dies with the legacy API in WU-6).
-staticModelsFor :: KnownProvider -> [Text]
-staticModelsFor = staticModelsForType . toProviderType
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: Text -> Value

@@ -48,11 +48,11 @@ import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
-import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
+import Seal.Config.File (RuntimeConfig (..))
 import Seal.Config.Paths
   ( SealPaths, sessionArchivedMarkerPath, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
-import Seal.Providers.Registry (resolveDefaultModel)
+import Seal.Providers.Registry (resolveDefaultModelFor)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
@@ -223,7 +223,7 @@ defaultSessionSelection cfg =
   where
     provLabel = fromMaybe "anthropic" (rcDefaultProvider cfg)
     fallbackModel = maybe "" modelText
-      (resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel)
+      (resolveDefaultModelFor cfg provLabel)
 
 -- | Resolve the default agent for a new session. Returns 'Nothing' if
 -- @default_agent@ is unset, the id fails validation, or the def is not on

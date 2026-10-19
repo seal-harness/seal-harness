@@ -58,9 +58,8 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
-import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
 import Seal.Providers.Registry
-  ( KnownProvider (..), genericOpenAICompat, providerInstances )
+  ( providerInstances )
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -5041,18 +5040,6 @@ spec_main = describe "Seal.Gateway.API" $ do
 -- Generic OpenAI-compatible provider (issue #271): detail fields, validation
 -- ---------------------------------------------------------------------------
 
--- | A synthetic preset row, to prove the DTO/model columns for a future row.
-compatPresetSpec :: OpenAICompatSpec
-compatPresetSpec = OpenAICompatSpec
-  { ocsId = "acme", ocsDisplayName = "Acme", ocsVaultKey = "ACME_API_KEY"
-  , ocsBuiltinBaseUrl = Just "https://acme.example/v1"
-  , ocsDefaultModel = Just (ModelId "acme-large"), ocsKeyRequired = True
-  , ocsModels = [ModelId "acme-large", ModelId "acme-small"]
-  , ocsExtraHeaders = [] }
-
-genericP :: KnownProvider
-genericP = OpenAICompatProvider genericOpenAICompat
-
 decodeText :: BL.ByteString -> T.Text
 decodeText b = case A.decode b :: Maybe A.Value of
   Just (A.Object o) -> case lookupK "error" o of
@@ -5078,48 +5065,6 @@ lookupBool _ _ = Nothing
 
 providerCompatSpec :: Spec
 providerCompatSpec = describe "generic provider API" $ do
-
-  it "detail exposes the editor flags for every provider" $ do
-    let g = providerDetailValue defaultRuntimeConfig "none" genericP
-        a = providerDetailValue defaultRuntimeConfig "none" AnthropicProvider
-        o = providerDetailValue defaultRuntimeConfig "keyless" OllamaProvider
-    lookupBool "baseUrlRequired" g `shouldBe` Just True
-    lookupBool "baseUrlEditable" g `shouldBe` Just True
-    lookupBool "defaultModelRequired" g `shouldBe` Just True
-    lookupBool "keyOptional" g `shouldBe` Just True
-    case g of
-      A.Object go -> lookupK "defaultBaseUrl" go `shouldBe` Just A.Null
-      _           -> expectationFailure "expected object"
-    -- anthropic: fixed endpoint, credential required
-    lookupBool "baseUrlRequired" a `shouldBe` Just False
-    lookupBool "baseUrlEditable" a `shouldBe` Just False
-    lookupBool "keyOptional" a `shouldBe` Just False
-    case a of
-      A.Object ao -> lookupK "baseUrl" ao
-                       `shouldBe` Just (A.String "https://api.anthropic.com")
-      _ -> expectationFailure "expected object"
-    -- ollama: editable with a default, keyless locally
-    lookupBool "baseUrlEditable" o `shouldBe` Just True
-    lookupBool "keyOptional" o `shouldBe` Just True
-    defaultBaseUrlFor OllamaProvider `shouldBe` Just "http://localhost:11434"
-
-  it "a preset row reports a fixed URL, a catalogue and a required key" $ do
-    let p = providerDetailValue defaultRuntimeConfig "none"
-              (OpenAICompatProvider compatPresetSpec)
-    lookupBool "baseUrlRequired" p `shouldBe` Just False
-    lookupBool "baseUrlEditable" p `shouldBe` Just False
-    lookupBool "keyOptional" p `shouldBe` Just False
-    case p of
-      A.Object po -> do
-        lookupK "baseUrl" po `shouldBe` Just (A.String "https://acme.example/v1")
-        lookupK "defaultBaseUrl" po `shouldBe` Just (A.String "https://acme.example/v1")
-      _ -> expectationFailure "expected object"
-    staticModelsFor (OpenAICompatProvider compatPresetSpec)
-      `shouldBe` ["acme-large", "acme-small"]
-    staticModelsFor genericP `shouldBe` []
-    keyOptionalFor defaultRuntimeConfig AnthropicProvider `shouldBe` False
-    baseUrlRequired (OpenAICompatProvider compatPresetSpec) `shouldBe` False
-    baseUrlEditable (OpenAICompatProvider compatPresetSpec) `shouldBe` False
 
   it "GET /api/providers/all reports the generic row's required base URL and model" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
