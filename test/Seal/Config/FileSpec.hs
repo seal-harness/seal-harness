@@ -320,12 +320,60 @@ spec = describe "Seal.Config.File" $ do
       providerBaseUrl      c2 "ollama" `shouldBe` Just "http://h:1"
       providerDefaultModel c2 "ollama" `shouldBe` Just "m"
 
+    it "round-trips an instance's type ([providers.work] type = ...)" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = upsertProvider "work"
+                     (const ProviderConfig { pcBaseUrl = Just "https://groq.example/v1"
+                                           , pcDefaultModel = Just "llama-3.3-70b"
+                                           , pcType = Just "openai-compat" })
+                     defaultRuntimeConfig
+        saveRuntimeConfig path cfg
+        raw <- TIO.readFile path
+        raw `shouldSatisfy` ("type = \"openai-compat\"" `T.isInfixOf`)
+        Right back <- loadRuntimeConfig path
+        rcProviders back `shouldBe` rcProviders cfg
+
+    it "preserves a hand-edited foreign provider key through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[providers.\"we ird\"]"
+          , "type = \"anthropic\""
+          , "default_model = \"m\""
+          ]
+        Right once <- loadRuntimeConfig path
+        -- tomland keeps the quoting on a quoted key; the point is that the
+        -- section survives a save/load cycle verbatim (the Registry turns such
+        -- a name into a problem row, it is never silently dropped).
+        map fst (Map.toList (rcProviders once))
+          `shouldSatisfy` any (T.isInfixOf "we ird")
+        saveRuntimeConfig path once
+        Right twice <- loadRuntimeConfig path
+        rcProviders twice `shouldBe` rcProviders once
+
+    it "keeps unrelated provider sections through an unrelated write" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "default_provider = \"anthropic\""
+          , "[providers.work]"
+          , "type = \"openai-compat\""
+          , "base_url = \"https://groq.example/v1\""
+          ]
+        Right cfg0 <- loadRuntimeConfig path
+        _ <- updateRuntimeConfig path (\c -> c { rcDefaultModel = Just "m" })
+        Right cfg1 <- loadRuntimeConfig path
+        rcProviders cfg1 `shouldBe` rcProviders cfg0
+        providerBaseUrl cfg1 "work" `shouldBe` Just "https://groq.example/v1"
+
     it "round-trips a hyphenated provider id ([providers.openai-compat])" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
             cfg  = upsertProvider "openai-compat"
                      (\_ -> ProviderConfig (Just "qwen2.5-7b-instruct")
-                                          (Just "http://localhost:8000/v1"))
+                                          (Just "http://localhost:8000/v1")
+                                          (Just "openai-compat"))
                      defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
@@ -335,7 +383,7 @@ spec = describe "Seal.Config.File" $ do
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434"))) defaultRuntimeConfig
+            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434") Nothing)) defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg

@@ -68,11 +68,11 @@ from WU-1 onward is expected.
 6. An unresolvable section **survives an unrelated config write** (the codec is
    re-encoded on every save).
 7. >64 sections load with none dropped (the cap is enforced at creation, WU-3/4).
-8. Migration (§10.5): three states — no-op; typed `[providers.openrouter]` ⇒
-   **section and pointer untouched**; type-less section ⇒ merge into the
-   destination (destination wins per field, `pcType` preserved, warning logged on
-   a differing URL/model) and rewrite the pointer; pointer-only ⇒ rewrite the
-   pointer. Assert the message per state.
+8. Migration (§10.5 + §11.9): typed `[providers.openrouter]` ⇒ **section and
+   pointer untouched** (no-op); type-less section ⇒ merge into the destination
+   (destination wins per field, `pcType` preserved) and rewrite the pointer;
+   pointer-only ⇒ rewrite the pointer AND synthesize the section from the legacy
+   constants (as #271 did). Assert the message.
 9. A type-less, non-legacy section (`[providers.groq]`) is a **problem row**
    (`has no type and its name is not a provider type`) — the §9.3 silent-downgrade
    case.

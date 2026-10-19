@@ -1006,3 +1006,13 @@ for it today, for any provider). Recorded here and in the CHANGELOG.
   `rg -w 'KnownProvider|knownProviders|parseProviderIn|toProviderType|vaultKeyName|knownLabelList|configuredProvidersFor|providerAuthStatus|defaultModelFor|missingBaseUrlMsgFor|resolveProvider'`
   in `src/` and `test/`. (`resolveDefaultModel` is excluded: the retained
   `resolveDefaultModelFor` contains it.)
+
+### 11.9 Pointer-only migration still synthesizes (rev 6 correction)
+
+§10.5's third state (`DefaultOnly`) is withdrawn. A `default_provider =
+"openrouter"` with no section is migrated exactly as #271 did: the pointer is
+rewritten **and** `[providers.openai-compat]` is synthesized with the legacy URL
+and model, so a pointer-only config keeps working instead of landing on an
+unconfigured implicit row. The typed-source case (§10.5 state 2) still touches
+nothing. `RenamePlan` therefore has two outcomes: `Nothing` and
+`RenameMoveAndDefault`.

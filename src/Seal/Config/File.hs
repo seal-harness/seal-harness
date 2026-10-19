@@ -169,6 +169,11 @@ data RuntimeConfig = RuntimeConfig
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+  , pcType         :: Maybe Text
+    -- ^ The provider *type* this instance speaks (@openai-compat@, @anthropic@,
+    -- @ollama@, or a catalog preset id). Absent for a section written before
+    -- named instances existed; the Registry resolves those through a frozen
+    -- legacy set. Always written by current code.
     -- ^ The endpoint Seal talks to. SECURITY: this is the destination of the
     -- provider's bearer token, so it is operator-set only — no config-writing
     -- opcode may touch it (see AGENTS.md §Security). A provider whose catalog
@@ -253,7 +258,7 @@ data EmbeddingConfig = EmbeddingConfig
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
-emptyProviderConfig = ProviderConfig Nothing Nothing
+emptyProviderConfig = ProviderConfig Nothing Nothing Nothing
 
 -- | The @[web]@ section: web tool configuration. Every field is optional;
 -- a missing key decodes as 'Nothing' and the resolved default applies at
@@ -471,6 +476,7 @@ providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+  <*> Toml.dioptional (Toml.text "type")          .= pcType
 
 -- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
 -- field is optional at the TOML layer; a missing key decodes as 'Nothing'

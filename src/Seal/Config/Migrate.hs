@@ -14,10 +14,11 @@ module Seal.Config.Migrate
   , couldNotUpdateMsg
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (try, SomeException)
 import Data.Text (Text)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.IO (hPutStrLn, stderr)
@@ -163,43 +164,80 @@ providerRenameMigration paths = do
     Left _ -> pure Nothing               -- malformed config: leave it alone
     Right cfg -> case renamePlan cfg of
       Nothing -> pure Nothing            -- never had openrouter / already done
-      Just (url, model) -> do
+      Just plan -> do
         r <- try @SomeException (updateRuntimeConfig cfgPath applyRename)
         pure $ Just $ case r of
-          Left e          -> couldNotUpdateMsg url model (T.pack (show e))
-          Right (Left e)  -> couldNotUpdateMsg url model e
-          Right (Right ()) -> migratedMsg url model
+          Left e           -> couldNotUpdateMsg (planUrl plan) (planModel plan)
+                                              (T.pack (show e))
+          Right (Left e)   -> couldNotUpdateMsg (planUrl plan) (planModel plan) e
+          Right (Right ()) -> case plan of
+            RenameMoveAndDefault url model -> migratedMsg url model
 
--- | What the migration would produce, or 'Nothing' when there is nothing to do.
--- Returns the effective (URL, model) for the operator-facing message.
-renamePlan :: RuntimeConfig -> Maybe (Text, Text)
+-- | What the migration will do, or 'Nothing' when there is nothing to do.
+--
+-- Three states (design §10.5):
+--
+--   1. no @[providers.openrouter]@ and no @default_provider = "openrouter"@ ⇒
+--      no-op;
+--   2. @[providers.openrouter]@ carries an explicit @type@ ⇒ it is an ordinary
+--      named instance, so **neither the section nor the pointer is touched**
+--      (a type id must never be rewritten behind the operator's back);
+--   3. otherwise ⇒ move the (type-less, i.e. genuinely legacy) section into
+--      @[providers.openai-compat]@ and/or rewrite the pointer.
+data RenamePlan
+  = RenameMoveAndDefault !Text !Text   -- ^ effective (base URL, model) to report
+  deriving stock (Eq, Show)
+
+renamePlan :: RuntimeConfig -> Maybe RenamePlan
 renamePlan cfg
-  | not (legacyDefault || legacySection) = Nothing
-  | otherwise = Just (url, model)
+  -- A typed section is an ordinary named instance: never rewrite it.
+  | Just oldSec <- oldSection, isJust (pcType oldSec) = Nothing
+  -- A section, or a pointer, still referring to the old id: migrate. The
+  -- section is synthesized from the legacy constants when absent, exactly as
+  -- before (#271), so a pointer-only config keeps working.
+  | isJust oldSection || legacyDefault = Just (RenameMoveAndDefault url model)
+  | otherwise = Nothing
   where
     provs = rcProviders cfg
-    legacySection = Map.member "openrouter" provs
-    legacyDefault = rcDefaultProvider cfg == Just "openrouter"
+    oldSection = Map.lookup "openrouter" provs
     newSec = Map.lookup "openai-compat" provs
-    oldSec = Map.lookup "openrouter" provs
-    pick newF oldF fallback =
-      fromMaybe (fromMaybe fallback (oldSec >>= oldF)) (newSec >>= newF)
-    url = pick pcBaseUrl pcBaseUrl legacyOpenRouterBaseUrl
-    model = pick pcDefaultModel pcDefaultModel legacyOpenRouterModel
+    legacyDefault = rcDefaultProvider cfg == Just "openrouter"
+    pick newV oldV fallback = fromMaybe (fromMaybe fallback oldV) newV
+    url = pick (newSec >>= pcBaseUrl) (oldSection >>= pcBaseUrl) legacyOpenRouterBaseUrl
+    model = pick (newSec >>= pcDefaultModel) (oldSection >>= pcDefaultModel)
+                legacyOpenRouterModel
 
--- | Apply the rename to a 'RuntimeConfig'.
+planUrl :: RenamePlan -> Text
+planUrl (RenameMoveAndDefault url _) = url
+
+planModel :: RenamePlan -> Text
+planModel (RenameMoveAndDefault _ model) = model
+
+-- | Apply the rename. The move **merges** into the destination: an existing
+-- @[providers.openai-compat]@ wins per field and keeps its @type@ (and any
+-- future key); the destination is synthesized only when absent.
 applyRename :: RuntimeConfig -> RuntimeConfig
 applyRename cfg = case renamePlan cfg of
   Nothing -> cfg
-  Just (url, model) -> cfg
-    { rcProviders = Map.insert "openai-compat"
-                      (ProviderConfig { pcBaseUrl = Just url
-                                      , pcDefaultModel = Just model })
+  Just (RenameMoveAndDefault _ _) -> cfg
+    { rcProviders = Map.insert "openai-compat" merged
                       (Map.delete "openrouter" (rcProviders cfg))
     , rcDefaultProvider = if rcDefaultProvider cfg == Just "openrouter"
                             then Just "openai-compat"
                             else rcDefaultProvider cfg
     }
+  where
+    oldSec = Map.lookup "openrouter" (rcProviders cfg)
+    merged = case Map.lookup "openai-compat" (rcProviders cfg) of
+      -- A destination instance already exists: fill only what it lacks.
+      Just dest -> dest
+        { pcBaseUrl      = pcBaseUrl dest      <|> (oldSec >>= pcBaseUrl)
+        , pcDefaultModel = pcDefaultModel dest <|> (oldSec >>= pcDefaultModel) }
+      -- No destination: synthesize the legacy-shaped section.
+      Nothing -> ProviderConfig
+        { pcBaseUrl      = Just (fromMaybe legacyOpenRouterBaseUrl (oldSec >>= pcBaseUrl))
+        , pcDefaultModel = Just (fromMaybe legacyOpenRouterModel (oldSec >>= pcDefaultModel))
+        , pcType         = Nothing }
 
 migratedMsg :: Text -> Text -> Text
 migratedMsg url model =

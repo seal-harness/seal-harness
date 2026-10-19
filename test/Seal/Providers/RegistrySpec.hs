@@ -3,6 +3,7 @@ module Seal.Providers.RegistrySpec (spec) where
 
 import Control.Monad (when)
 import Data.Either (isLeft)
+import Data.Maybe (isJust)
 import Data.IORef (IORef, newIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
@@ -11,7 +12,8 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig)
+import Seal.Config.File
+  ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig )
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic.OAuth (OAuthTokens (..), serializeTokens)
 import Seal.Providers.Class
@@ -26,8 +28,14 @@ import Seal.Providers.Registry
   , configuredProviders
   , configuredProvidersFor
   , defaultModelFor
+  , ProviderInstance (..)
   , genericOpenAICompat
   , knownProviders
+  , legacyTypeIds
+  , providerInstances
+  , providerTypeForId
+  , providerTypes
+  , typeId
   , listSome
   , openAICompatSpecs
   , parseProvider
@@ -87,7 +95,8 @@ genericProvider = OpenAICompatProvider genericOpenAICompat
 cfgWithUrl :: T.Text -> T.Text -> RuntimeConfig
 cfgWithUrl label u = defaultRuntimeConfig
   { rcProviders = Map.fromList
-      [(label, ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })] }
+      [(label, ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u
+                              , pcType = Nothing })] }
 
 ollamaCfg :: Maybe T.Text -> RuntimeConfig
 ollamaCfg = maybe defaultRuntimeConfig (cfgWithUrl "ollama")
@@ -95,8 +104,8 @@ ollamaCfg = maybe defaultRuntimeConfig (cfgWithUrl "ollama")
 genericCfg :: Maybe T.Text -> RuntimeConfig
 genericCfg = maybe defaultRuntimeConfig (cfgWithUrl "openai-compat")
 
-spec :: Spec
-spec = describe "Seal.Providers.Registry" $ do
+specMain :: Spec
+specMain = describe "Seal.Providers.Registry" $ do
 
   describe "catalog" $ do
     it "lists the shipped providers in order" $
@@ -429,3 +438,119 @@ spec = describe "Seal.Providers.Registry" $ do
       resolveDefaultModel Nothing "who" `shouldBe` Just (ModelId "claude-opus-4-8")
     it "has no default for the generic row" $
       resolveDefaultModel Nothing "openai-compat" `shouldBe` Nothing
+
+-- ---------------------------------------------------------------------------
+-- Provider instances (#273 WU-1)
+-- ---------------------------------------------------------------------------
+
+-- | A section in the config map.
+sec :: Maybe T.Text -> Maybe T.Text -> Maybe T.Text -> ProviderConfig
+sec ty url model = ProviderConfig { pcType = ty, pcBaseUrl = url, pcDefaultModel = model }
+
+cfgWith :: [(T.Text, ProviderConfig)] -> RuntimeConfig
+cfgWith xs = defaultRuntimeConfig { rcProviders = Map.fromList xs }
+
+instanceSpec :: Spec
+instanceSpec = describe "providerInstances (#273)" $ do
+
+  it "synthesizes one row per type for an empty config" $ do
+    let rows = providerInstances defaultRuntimeConfig
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    map piHasSection rows `shouldBe` [False, False, False]
+    map piProblem rows `shouldBe` [Nothing, Nothing, Nothing]
+    map (fmap typeId . piType) rows
+      `shouldBe` [Just "anthropic", Just "ollama", Just "openai-compat"]
+    map piTypeId rows `shouldBe` [Nothing, Nothing, Nothing]
+    map (isJust . piNameValid) rows `shouldBe` [True, True, True]
+
+  it "keeps catalog order when a section claims a type name" $ do
+    let rows = providerInstances (cfgWith [("anthropic", sec Nothing Nothing Nothing)])
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    map piHasSection (take 1 rows) `shouldBe` [True]
+
+  it "appends explicit extra instances after the type rows, by name" $ do
+    let cfg = cfgWith
+          [ ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") (Just "m1"))
+          , ("aaa", sec (Just "openai-compat") (Just "http://localhost:8000/v1") Nothing)
+          ]
+        rows = providerInstances cfg
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat", "aaa", "groq"]
+    map (fmap typeId . piType) (drop 3 rows) `shouldBe` [Just "openai-compat", Just "openai-compat"]
+    -- each instance keeps its OWN section
+    map (pcBaseUrl . piConfig) (drop 3 rows)
+      `shouldBe` [Just "http://localhost:8000/v1", Just "https://groq.example/v1"]
+
+  it "resolves a typed section, case-insensitively, keeping the raw text for display" $ do
+    let rows = providerInstances (cfgWith [("work", sec (Just "OpenAI-Compat") Nothing Nothing)])
+        work = [ r | r <- rows, piName r == "work" ]
+    map (fmap typeId . piType) work `shouldBe` [Just "openai-compat"]
+    map piTypeId work `shouldBe` [Just "OpenAI-Compat"]
+    map piProblem work `shouldBe` [Nothing]
+
+  it "treats an empty type as absent (back-compat fallback)" $ do
+    let rows = providerInstances (cfgWith [("ollama", sec (Just "") (Just "https://ollama.com") Nothing)])
+        o = [ r | r <- rows, piName r == "ollama" ]
+    map (fmap typeId . piType) o `shouldBe` [Just "ollama"]
+    map piProblem o `shouldBe` [Nothing]
+
+  it "reports a present-but-unknown type instead of falling back" $ do
+    let rows = providerInstances (cfgWith [("anthropic", sec (Just "anthorpic") Nothing Nothing)])
+        a = [ r | r <- rows, piName r == "anthropic" ]
+    map piType a `shouldBe` [Nothing]
+    map piProblem a `shouldSatisfy` all (maybe False ("unknown provider type: anthorpic" `T.isInfixOf`))
+
+  it "reports a type-less section whose name is not a legacy type id" $ do
+    let rows = providerInstances (cfgWith [("groq", sec Nothing Nothing Nothing)])
+        g = [ r | r <- rows, piName r == "groq" ]
+    map piType g `shouldBe` [Nothing]
+    map piProblem g
+      `shouldSatisfy` all (maybe False ("has no type" `T.isInfixOf`))
+
+  it "resolves a type-less legacy section (no rewrite needed)" $ do
+    let rows = providerInstances (cfgWith [("openai-compat", sec Nothing Nothing Nothing)])
+        g = [ r | r <- rows, piName r == "openai-compat" ]
+    map (fmap typeId . piType) g `shouldBe` [Just "openai-compat"]
+    map piProblem g `shouldBe` [Nothing]
+
+  it "reports an invalid or reserved section name and never resolves it" $ do
+    let rows = providerInstances (cfgWith
+          [ ("we ird", sec (Just "anthropic") Nothing Nothing)
+          , ("default", sec (Just "anthropic") Nothing Nothing)
+          ])
+        weird = [ r | r <- rows, piName r == "we ird" ]
+        def = [ r | r <- rows, piName r == "default" ]
+    map piNameValid weird `shouldBe` [Nothing]
+    map piNameValid def `shouldBe` [Nothing]
+    map piProblem weird `shouldSatisfy` all (maybe False ("not a valid instance name" `T.isInfixOf`))
+    map piProblem def `shouldSatisfy` all (maybe False ("is reserved" `T.isInfixOf`))
+
+  it "reports a section naming a type id with a different type (one row per name)" $ do
+    let rows = providerInstances (cfgWith [("anthropic", sec (Just "ollama") Nothing Nothing)])
+        named = [ r | r <- rows, piName r == "anthropic" ]
+    length named `shouldBe` 1
+    map (fmap typeId . piType) named `shouldBe` [Just "ollama"]
+    map piProblem named
+      `shouldSatisfy` all (maybe False ("is not a ollama instance" `T.isInfixOf`))
+
+  it "exposes the type catalog and lookups" $ do
+    map typeId providerTypes `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    map (fmap typeId . providerTypeForId) ["anthropic", " Ollama ", "OPENAI-COMPAT"]
+      `shouldBe` [Just "anthropic", Just "ollama", Just "openai-compat"]
+    providerTypeForId "nope" `shouldBe` Nothing
+    legacyTypeIds `shouldBe` ["anthropic", "ollama", "openai-compat"]
+
+  it "keeps every instance's config distinct (two openai-compat rows)" $ do
+    let cfg = cfgWith
+          [ ("local", sec (Just "openai-compat") (Just "http://localhost:8000/v1") (Just "qwen"))
+          , ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") (Just "llama"))
+          ]
+        rows = [ r | r <- providerInstances cfg, piName r `elem` ["local", "groq"] ]
+    -- extras are ordered by name
+    map piName rows `shouldBe` ["groq", "local"]
+    map (pcBaseUrl . piConfig) rows
+      `shouldBe` [Just "https://groq.example/v1", Just "http://localhost:8000/v1"]
+    map (pcDefaultModel . piConfig) rows `shouldBe` [Just "llama", Just "qwen"]
+
+-- | The module's single exported spec.
+spec :: Spec
+spec = specMain >> instanceSpec

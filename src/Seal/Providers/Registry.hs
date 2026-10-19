@@ -12,6 +12,14 @@
 -- CLI, the gateway or the frontend.
 module Seal.Providers.Registry
   ( KnownProvider (..)
+  , ProviderType (..)
+  , providerTypes
+  , typeId
+  , providerTypeForId
+  , legacyTypeIds
+  , ProviderInstance (..)
+  , providerInstances
+  , toProviderType
   , OpenAICompatSpec (..)
   , knownProviders
   , openAICompatSpecs
@@ -41,14 +49,19 @@ module Seal.Providers.Registry
   , vaultErrText
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Monad (void, filterM)
 import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 
-import Seal.Config.File (RuntimeConfig, providerBaseUrl)
+import Seal.Config.File
+  ( ProviderConfig (..), RuntimeConfig (..), emptyProviderConfig
+  , providerBaseUrl )
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic
   ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
@@ -57,6 +70,7 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
+import Seal.Providers.Name (ProviderName, mkProviderName)
 import Seal.Providers.OpenAICompat
   ( OpenAICompatSpec (..), mkOpenAICompat, validateBaseUrl )
 import Seal.Security.Secrets (ApiKey, mkApiKey)
@@ -114,6 +128,128 @@ data KnownProvider
 knownProviders :: [KnownProvider]
 knownProviders = [AnthropicProvider, OllamaProvider]
               <> map OpenAICompatProvider openAICompatSpecs
+
+-- | A provider *type*: the transport, credential policy and built-in defaults
+-- of one kind of API. A closed set, extended by the catalog — a *type* is code,
+-- an *instance* (below) is user data.
+data ProviderType
+  = AnthropicType
+  | OllamaType
+  | OpenAICompatType !OpenAICompatSpec
+  deriving stock (Eq, Show)
+
+providerTypes :: [ProviderType]
+providerTypes = [AnthropicType, OllamaType] <> map OpenAICompatType openAICompatSpecs
+
+-- | The id used for a type: its config-name stem and the default instance name.
+typeId :: ProviderType -> Text
+typeId AnthropicType           = "anthropic"
+typeId OllamaType              = "ollama"
+typeId (OpenAICompatType spec) = ocsId spec
+
+-- | The ids that existed before named instances. A section with no @type@ whose
+-- name is one of these resolves to that type (so every pre-#273 config keeps
+-- working with no rewrite); a type-less section named anything else is a
+-- problem row rather than a silent guess.
+legacyTypeIds :: [Text]
+legacyTypeIds = ["anthropic", "ollama", "openai-compat"]
+
+-- | Look a type up by id (trimmed, case-folded).
+providerTypeForId :: Text -> Maybe ProviderType
+providerTypeForId raw =
+  lookup (T.toCaseFold (T.strip raw))
+         [(T.toCaseFold (typeId t), t) | t <- providerTypes]
+
+-- | A provider instance: a user-named use of a type. Persisted as
+-- @[providers.\<name\>]@ in @config.toml@ (with @type@), and the identity that
+-- sessions, agent defs, the CLI and the API use.
+data ProviderInstance = ProviderInstance
+  { piName       :: !Text
+    -- ^ The config table key / instance id (raw; see 'piNameValid').
+  , piNameValid  :: !(Maybe ProviderName)
+    -- ^ 'Nothing' for a hand-edited invalid or reserved name. Such a row is
+    -- surfaced with a problem and never touches the vault.
+  , piTypeId     :: !(Maybe Text)
+    -- ^ The raw @type@ value, for display (resolution uses 'piType').
+  , piType       :: !(Maybe ProviderType)
+    -- ^ 'Nothing' ⇒ unresolvable (unknown or missing type); see 'piProblem'.
+  , piConfig     :: !ProviderConfig
+    -- ^ That instance's own @base_url@ / @default_model@.
+  , piProblem    :: !(Maybe Text)
+    -- ^ Human-readable reason the row is unusable; surfaced, never fatal.
+  , piHasSection :: !Bool
+    -- ^ An explicit @[providers.\<name\>]@ section exists.
+  } deriving stock (Eq, Show)
+
+-- | Every provider instance: one row per type (implicit, unconfigured, unless a
+-- section claims that name) followed by the remaining sections by name. Never
+-- empty, so the UI and the CLI always have something to show and the
+-- pre-instances defaults (@\"anthropic\"@, @\"ollama\"@) keep resolving.
+providerInstances :: RuntimeConfig -> [ProviderInstance]
+providerInstances cfg = typeRows <> extraRows
+  where
+    provs = rcProviders cfg
+    typeRows = map rowForType providerTypes
+    claimedTypeIds = Set.fromList (map typeId providerTypes)
+    extraRows =
+      [ rowFromSection n sec
+      | (n, sec) <- Map.toAscList provs
+      , not (Set.member n claimedTypeIds)
+      ]
+    rowForType t =
+      let n = typeId t
+      in case Map.lookup n provs of
+           Just sec -> rowFromSection n sec
+           Nothing  -> ProviderInstance
+             { piName       = n
+             , piNameValid  = either (const Nothing) Just (mkProviderName n)
+             , piTypeId     = Nothing
+             , piType       = Just t
+             , piConfig     = emptyProviderConfig
+             , piProblem    = Nothing
+             , piHasSection = False
+             }
+
+    rowFromSection n sec =
+      let mRawType =
+            pcType sec >>= \v -> if T.null (T.strip v) then Nothing else Just (T.strip v)
+          (mType, typeProblem) = case mRawType of
+            Just raw -> case providerTypeForId raw of
+              Just t  -> (Just t, Nothing)
+              Nothing -> (Nothing, Just ("unknown provider type: " <> raw))
+            Nothing
+              | n `elem` legacyTypeIds -> (providerTypeForId n, Nothing)
+              | otherwise ->
+                  (Nothing, Just "has no type and its name is not a provider type")
+          nameProblem = case mkProviderName n of
+            Left "reserved" ->
+              Just ("section name \"" <> n <> "\" is reserved — rename the section")
+            Left _ ->
+              Just ("section name \"" <> n <> "\" is not a valid instance name"
+                      <> " (1–32 characters of a–z, 0–9 and “-”)")
+            Right _ -> Nothing
+          mismatchProblem = case (mType, providerTypeForId n) of
+            (Just t, Just nameType)
+              | typeId t /= typeId nameType ->
+                  Just ("section named \"" <> n <> "\" is not a "
+                          <> typeId t <> " instance")
+            _ -> Nothing
+      in ProviderInstance
+           { piName       = n
+           , piNameValid  = either (const Nothing) Just (mkProviderName n)
+           , piTypeId     = mRawType
+           , piType       = mType
+           , piConfig     = sec
+           , piProblem    = nameProblem <|> typeProblem <|> mismatchProblem
+           , piHasSection = True
+           }
+
+-- | Project an instance's type into the legacy view (the strangler bridge for
+-- code that still speaks 'KnownProvider').
+toProviderType :: KnownProvider -> ProviderType
+toProviderType AnthropicProvider           = AnthropicType
+toProviderType OllamaProvider              = OllamaType
+toProviderType (OpenAICompatProvider spec) = OpenAICompatType spec
 
 -- | Static problems with a catalog (blank or duplicate ids, blank labels/keys,
 -- unusable built-in URLs). Exported so the invariant is testable and so a

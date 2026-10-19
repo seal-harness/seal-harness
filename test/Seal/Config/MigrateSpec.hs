@@ -10,7 +10,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.File
-  ( RuntimeConfig (..), loadRuntimeConfig
+  ( ProviderConfig (..), RuntimeConfig (..), loadRuntimeConfig
   , providerBaseUrl, providerDefaultModel )
 import Seal.Config.Migrate (migrateSecurityConfig, providerRenameMigration)
 import Seal.Config.Paths (SealPaths (..), configFilePath, securityFilePath)
@@ -215,6 +215,46 @@ providerRenameSpec = describe "providerRenameMigration" $ do
       providerBaseUrl cfg "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
       providerDefaultModel cfg "openai-compat" `shouldBe` Just "mine"
       rcProviders cfg `shouldSatisfy` not . Map.member "openrouter"
+
+  it "leaves a typed [providers.openrouter] section (an ordinary instance) alone" $
+    withSystemTempDirectory "seal-rename" $ \tmp -> do
+      let paths = makePaths tmp
+      cfgPath <- writeCfg tmp
+      TIO.writeFile cfgPath $ T.unlines
+        [ "default_provider = \"openrouter\""
+        , "[providers.openrouter]"
+        , "type = \"openai-compat\""
+        , "base_url = \"https://my-proxy.example/v1\""
+        ]
+      bytesBefore <- TIO.readFile cfgPath
+      msg <- providerRenameMigration paths
+      msg `shouldBe` Nothing
+      bytesAfter <- TIO.readFile cfgPath
+      bytesAfter `shouldBe` bytesBefore
+      Right cfg <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg `shouldBe` Just "openrouter"
+      providerBaseUrl cfg "openrouter" `shouldBe` Just "https://my-proxy.example/v1"
+      providerBaseUrl cfg "openai-compat" `shouldBe` Nothing
+
+  it "merges into a typed destination, preserving its type and settings" $
+    withSystemTempDirectory "seal-rename" $ \tmp -> do
+      let paths = makePaths tmp
+      cfgPath <- writeCfg tmp
+      TIO.writeFile cfgPath $ T.unlines
+        [ "[providers.openai-compat]"
+        , "type = \"openai-compat\""
+        , "base_url = \"http://localhost:8000/v1\""
+        , "[providers.openrouter]"
+        , "default_model = \"old/model\""
+        ]
+      _ <- providerRenameMigration paths
+      Right cfg <- loadRuntimeConfig cfgPath
+      providerBaseUrl cfg "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
+      providerDefaultModel cfg "openai-compat" `shouldBe` Just "old/model"
+      rcProviders cfg `shouldSatisfy` not . Map.member "openrouter"
+      -- the destination keeps its explicit type
+      fmap pcType (Map.lookup "openai-compat" (rcProviders cfg))
+        `shouldBe` Just (Just "openai-compat")
 
   it "is idempotent" $
     withSystemTempDirectory "seal-rename" $ \tmp -> do
