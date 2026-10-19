@@ -40,9 +40,15 @@ const LABELS: Record<string, string> = {
 
 function makeProvider(overrides: Partial<ProviderDetail> = {}): ProviderDetail {
   const name = overrides.name ?? 'anthropic'
+  const authStatus = overrides.authStatus ?? 'none'
   return {
     name,
     displayName: LABELS[name] ?? name,
+    type: name,
+    typeDisplayName: LABELS[name] ?? name,
+    problem: null,
+    reconfiguring: false,
+    configured: authStatus !== 'none',
     isDefault: false,
     defaultModel: null,
     baseUrl: 'https://api.anthropic.com',
@@ -97,22 +103,22 @@ describe('ProvidersView', () => {
     expect(screen.getByText('No providers configured.')).toBeDefined()
   })
 
-  it('hides unconfigured providers from the list', () => {
+  it('lists every instance, including unconfigured ones', () => {
     providersState = [
       makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
       makeProvider({ name: 'ollama', authStatus: 'none' }),
     ]
     render(<ProvidersView />)
     expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
-    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
-    expect(screen.getByText('Providers (1)')).toBeDefined()
+    expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
+    expect(screen.getByText('Providers (2)')).toBeDefined()
   })
 
-  it('shows empty state when only unconfigured providers exist', () => {
+  it('shows the all-unconfigured banner when nothing is configured', () => {
     providersState = [makeProvider({ name: 'ollama', authStatus: 'none' })]
     render(<ProvidersView />)
-    expect(screen.getByText('No providers configured.')).toBeDefined()
-    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
+    expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
+    expect(screen.getByText('No provider is configured yet — add one from the type picker.')).toBeDefined()
   })
 
   it('still offers unconfigured providers in the new-provider dropdown', () => {
@@ -349,5 +355,128 @@ describe('ProvidersView — required fields', () => {
     expect(baseInput.getAttribute('aria-invalid')).toBe('true')
     // the generic error box is not used for a field-scoped error
     expect(screen.queryByTestId('provider-form-error')).toBeNull()
+  })
+})
+
+// ── Named provider instances (issue #273) ────────────────────────────────
+
+describe('ProvidersView — instances', () => {
+  it('prefills the name with the type id and validates it inline', () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'none' }),
+      makeProvider({ name: 'ollama', authStatus: 'none' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const typeSel = screen.getByTestId('provider-type-select') as HTMLSelectElement
+    expect(typeSel.value).toBe('anthropic')
+    const nameInput = () => screen.getByTestId('provider-name-input') as HTMLInputElement
+    expect(nameInput().value).toBe('anthropic')
+    // Choosing another type moves the prefilled name with it.
+    fireEvent.change(typeSel, { target: { value: 'ollama' } })
+    expect(nameInput().value).toBe('ollama')
+    // Invalid grammar -> aria-invalid + describedby + an inline message.
+    fireEvent.change(nameInput(), { target: { value: 'Bad_Name' } })
+    expect(nameInput().getAttribute('aria-invalid')).toBe('true')
+    expect(nameInput().getAttribute('aria-describedby')).toBe('provider-name-error')
+    expect(screen.getByTestId('provider-name-error')).toBeDefined()
+    // Reserved word.
+    fireEvent.change(nameInput(), { target: { value: 'default' } })
+    expect(screen.getByTestId('provider-name-error').textContent).toContain('reserved')
+    // Another type's id (own type is ollama).
+    fireEvent.change(nameInput(), { target: { value: 'anthropic' } })
+    expect(screen.getByTestId('provider-name-error').textContent).toContain('provider type id')
+  })
+
+  it('shows a problem row delete-only and renders its problem', () => {
+    providersState = [makeProvider({
+      name: 'groq', type: null, typeDisplayName: null, authStatus: 'none',
+      problem: 'has no type and its name is not a provider type',
+    })]
+    render(<ProvidersView />)
+    expect(screen.getByText('has no type and its name is not a provider type')).toBeDefined()
+    fireEvent.click(screen.getByTestId('provider-row-groq'))
+    expect(screen.getByTestId('provider-form-groq')).toBeDefined()
+    expect(screen.getByTestId('provider-problem')).toBeDefined()
+    expect(screen.queryByTestId('provider-save')).toBeNull()
+    expect(screen.queryByTestId('set-default-provider')).toBeNull()
+    expect(screen.getByTestId('provider-delete')).toBeDefined()
+  })
+
+  it('shows name and type read-only when editing an explicit instance', () => {
+    providersState = [makeProvider({
+      name: 'work', type: 'anthropic', typeDisplayName: 'Anthropic',
+      displayName: 'work', authStatus: 'api-key',
+    })]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-work'))
+    const nameRo = screen.getByTestId('provider-name-readonly') as HTMLInputElement
+    const typeRo = screen.getByTestId('provider-type-readonly') as HTMLInputElement
+    expect(nameRo.value).toBe('work')
+    expect(typeRo.value).toBe('Anthropic')
+    expect(nameRo.readOnly).toBe(true)
+    expect(typeRo.readOnly).toBe(true)
+  })
+
+  it('renders two instances of one type distinctly', () => {
+    providersState = [
+      makeProvider({ name: 'work', type: 'anthropic', typeDisplayName: 'Anthropic', displayName: 'work', authStatus: 'api-key' }),
+      makeProvider({ name: 'personal', type: 'anthropic', typeDisplayName: 'Anthropic', displayName: 'personal', authStatus: 'api-key' }),
+    ]
+    render(<ProvidersView />)
+    expect(screen.getByText('work — Anthropic')).toBeDefined()
+    expect(screen.getByText('personal — Anthropic')).toBeDefined()
+  })
+
+  it('names the vault key and the default clause in the delete confirmation', async () => {
+    providersState = [makeProvider({
+      name: 'work', type: 'anthropic', typeDisplayName: 'Anthropic',
+      displayName: 'work', authStatus: 'api-key',
+    })]
+    defaultProviderState = 'work'
+    render(<ProvidersView />)
+    await screen.findByText('default')
+    fireEvent.click(screen.getByTestId('provider-row-work'))
+    fireEvent.click(screen.getByTestId('provider-delete'))
+    const box = screen.getByTestId('provider-delete-confirm')
+    expect(box.textContent).toContain('PROVIDER_APIKEY_WORK')
+    expect(box.textContent).toContain('clears it as default')
+  })
+
+  it('labels the button Reconfigure (with a warning) for an existing instance', () => {
+    providersState = [
+      makeProvider({ name: 'work', type: 'anthropic', typeDisplayName: 'Anthropic', displayName: 'work', authStatus: 'api-key', reconfiguring: true }),
+      makeProvider({ name: 'anthropic', authStatus: 'none' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    fireEvent.change(screen.getByTestId('provider-name-input'), { target: { value: 'work' } })
+    expect(screen.getByTestId('provider-reconfigure-warning')).toBeDefined()
+    expect(screen.getByTestId('provider-save').textContent).toBe('Reconfigure')
+  })
+
+  it('posts {type,name} on create', async () => {
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'none' })]
+    createProvider.mockResolvedValue({ ok: true, provider: makeProvider({ name: 'anthropic', authStatus: 'api-key' }) })
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    fireEvent.click(screen.getByTestId('provider-save'))
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    const arg = createProvider.mock.calls[0]![0] as Record<string, unknown>
+    expect(arg.type).toBe('anthropic')
+    expect(arg.name).toBe('anthropic')
+  })
+
+  it('renders the three legacy type rows with no problem rows (upgrade payload)', () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
+      makeProvider({ name: 'ollama', authStatus: 'keyless' }),
+      makeProvider({ name: 'openai-compat', authStatus: 'keyless', baseUrl: 'http://localhost:8000/v1' }),
+    ]
+    render(<ProvidersView />)
+    expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
+    expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
+    expect(screen.getByTestId('provider-row-openai-compat')).toBeDefined()
+    expect(screen.queryByTestId('provider-problem')).toBeNull()
   })
 })
