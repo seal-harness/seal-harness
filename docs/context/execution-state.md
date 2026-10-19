@@ -5,8 +5,8 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: #273 WU-6 (remove the legacy `KnownProvider` API + docs)
-- Current phase: IMPLEMENT (#273 design rev 5 / plan v3 approved for build)
+- Active work unit: #273 COMPLETE (WU-0…WU-6) — final gate green
+- Current phase: DONE (#273 design rev 5 / plan v3)
 - Retry count: 0
 
 ## Work Unit Status
@@ -35,21 +35,17 @@ Issue: #271 · PR: #272 (draft)
 | WU-4a (gateway reads) | COMPLETE | COMMITTED | 32eb1fd |
 | WU-4b (gateway mutations) | COMPLETE | COMMITTED | 605a1e2 |
 | WU-5 (frontend) | COMPLETE | COMMITTED | 0aff4b4 + b8f1bd0 |
-| WU-6 (remove legacy API + docs) | TODO | — | — |
+| WU-6 (remove legacy API + docs) | COMPLETE | COMMITTED | b75194d |
 
 Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
 authoritative), plan round 1 (Scope PASS; Feasibility/Completeness blockers
 fixed by adopting the scope review's simplifications: no
 `/api/provider-types`, no instance cap, three delete behaviours,
-`adProviders` deleted). WU-0/1/2/3, WU-4a and WU-4b are in and green (3279
-examples, 0 failures, hlint clean): the CLI creates/lists/tests/logs in to and
-removes named instances, and `/model`/`/new` resolve them; the gateway read
-API and session `providerType` speak instances; and POST/PUT/DELETE plus the
-default endpoints mutate instances (validation table, immutable type, §11.1
-delete, session/tab provider checks), and the frontend now speaks instances
-throughout (labels, badges by `providerType`, type→name create flow, problem
-rows, per-class delete copy). Only WU-6 remains: delete the legacy
-`KnownProvider` API and update the CHANGELOG/docs.
+`adProviders` deleted). **All of #273 (WU-0…WU-6) is in and green: 3222 Haskell
+examples (0 failures), 635 frontend tests (0 failures), hlint clean.** The CLI,
+gateway (read + write), and frontend speak named provider instances end to end;
+the legacy `KnownProvider` API is deleted (CHANGELOG documents the model change,
+the upgrade no-op, the security delta and the non-goal).
 Note: `Seal.Agent.Runtime.Registry > agentStatus > records Crashed` is a
 pre-existing flake under full-suite load; re-run before believing a red gate.
 
@@ -66,10 +62,11 @@ Notes for the next unit:
   by `providerType`, and the `ProvidersView` type→name create flow (inline
   validation, Configure/Reconfigure, problem rows delete-only, read-only
   identity in edit, per-class delete copy).
-- **WU-6 (remaining):** delete the legacy `KnownProvider` API per the gate
-  grep in plan WU-6 (keep `legacyProviderHint`), and update `CHANGELOG.md` +
-  the design/plan/execution-state docs (upgrade note, model change, security
-  delta).
+- WU-6 deleted the legacy `KnownProvider` API (Registry, `Session.Store`'s
+  `resolveDefaultModel` call, and the gateway's `providerDetailValue`/flag
+  helpers); `legacyProviderHint` and `resolveDefaultModelFor` remain. The plan
+  WU-6 gate grep is clean (only unrelated `Web.Search.parseProvider` / local
+  `providerLabel` identifiers remain).
 - Migration: rev-6 correction — pointer-only still synthesizes the section
   (design §11.9).
 
