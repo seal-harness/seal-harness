@@ -345,6 +345,16 @@ legacySpec = describe "legacy provider id recovery" $ do
           e `shouldSatisfy` ("provider line" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
+  it "/provider default names the missing model for a model-less provider" $
+    withSystemTempDirectory "seal-provider-legacy" $ \root -> do
+      pr <- mkPR (root </> "config.toml") Nothing
+      (fc, caps) <- makeFakeCaps []
+      runProv pr ["default", "openai-compat"] caps
+      sent <- getSent fc
+      let out = T.unlines sent
+      out `shouldSatisfy` ("default provider set to openai-compat" `T.isInfixOf`)
+      out `shouldSatisfy` ("no default model" `T.isInfixOf`)
+
   it "an unknown (non-legacy) id lists the known providers" $
     withSystemTempDirectory "seal-provider-legacy" $ \root -> do
       pr <- mkPR (root </> "config.toml") Nothing

@@ -32,6 +32,7 @@ module Seal.Command.New
   , parseNewArgs
   , emptyNewArgs
   , resolveRepoUrl
+  , resolveNewModel
   ) where
 
 import Data.Maybe (fromMaybe, isNothing, listToMaybe)
@@ -48,11 +49,12 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig)
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
-import Seal.Providers.Registry (knownLabelList, legacyProviderHint, parseProvider)
+import Seal.Providers.Registry
+  ( defaultModelFor, knownLabelList, legacyProviderHint, parseProvider )
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
@@ -230,7 +232,10 @@ mintNewSessionWith args oldMeta deps =
   newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta)
   where
     provider = fromMaybe (smProvider oldMeta) (naProvider args)
-    model    = fromMaybe (smModel oldMeta) (naModel args)
+    -- An inherited empty model is repaired from the target provider's default
+    -- so a model-less session cannot leak "model: " into another provider's
+    -- requests (design §4.4).
+    model    = resolveNewModel provider (fromMaybe (smModel oldMeta) (naModel args))
 
 -- | Mint a fresh 'SessionMeta' from the config defaults (or the given
 -- overrides). Used when there is no "old session" to inherit from (e.g.
@@ -253,3 +258,16 @@ renderNewConfirmation meta oldSid =
     <> " (" <> smProvider meta <> "/" <> smModel meta <> ")"
     <> " — prior session " <> sessionIdText oldSid
     <> " kept in /session list"
+
+-- | Repair an inherited/selected model. An empty model is replaced by the
+-- target provider's built-in default; a provider with no default (the generic
+-- OpenAI-compatible row) keeps the empty value so the actionable "no model
+-- selected" error surfaces instead of a foreign model id being sent.
+resolveNewModel :: Text -> Text -> Text
+resolveNewModel provider m
+  | not (T.null m) = m
+  | otherwise = maybe "" modelText (parseProvider provider >>= defaultModelFor)
+
+-- | The text inside a 'ModelId'.
+modelText :: ModelId -> Text
+modelText (ModelId t) = t

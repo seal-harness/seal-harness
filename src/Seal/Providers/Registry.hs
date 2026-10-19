@@ -175,18 +175,21 @@ vaultKeyName AnthropicProvider           = "ANTHROPIC_API_KEY"
 vaultKeyName OllamaProvider              = "OLLAMA_API_KEY"
 vaultKeyName (OpenAICompatProvider spec) = ocsVaultKey spec
 
--- | The model used when the user has not chosen one.
-defaultModelFor :: KnownProvider -> ModelId
-defaultModelFor AnthropicProvider           = ModelId "claude-opus-4-8"
-defaultModelFor OllamaProvider              = ModelId "llama3.2"
-defaultModelFor (OpenAICompatProvider spec) =
-  fromMaybe (ModelId "") (ocsDefaultModel spec)
+-- | The model a provider starts with when the user has not chosen one.
+-- 'Nothing' means the provider has no sensible default (the generic
+-- OpenAI-compatible row): the user must pick one, and the transport refuses to
+-- send an empty model id.
+defaultModelFor :: KnownProvider -> Maybe ModelId
+defaultModelFor AnthropicProvider           = Just (ModelId "claude-opus-4-8")
+defaultModelFor OllamaProvider              = Just (ModelId "llama3.2")
+defaultModelFor (OpenAICompatProvider spec) = ocsDefaultModel spec
 
--- | A provider's default model: the configured value if given, else the
--- provider's default (Anthropic's for an unrecognized label).
-resolveDefaultModel :: Maybe Text -> Text -> ModelId
-resolveDefaultModel (Just m) _   = ModelId m
-resolveDefaultModel Nothing  lbl =
+-- | A provider's default model: the configured value if given (an empty string
+-- counts as unset), else the provider's own default (Anthropic's for an
+-- unrecognized label).
+resolveDefaultModel :: Maybe Text -> Text -> Maybe ModelId
+resolveDefaultModel (Just m) _ | not (T.null (T.strip m)) = Just (ModelId m)
+resolveDefaultModel _ lbl =
   maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider lbl)
 
 -- | Build a live provider. For Anthropic, stored OAuth tokens take precedence

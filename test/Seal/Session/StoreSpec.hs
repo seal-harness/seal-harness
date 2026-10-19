@@ -99,6 +99,10 @@ spec = describe "Seal.Session.Store" $ do
                   (defaultRuntimeConfig { rcDefaultProvider = Just "ollama" })
       defaultSessionSelection cfg `shouldBe` ("ollama", "glm-5.2:cloud")
 
+    it "returns an empty model for a provider with no default model" $ do
+      let cfg = defaultRuntimeConfig { rcDefaultProvider = Just "openai-compat" }
+      defaultSessionSelection cfg `shouldBe` ("openai-compat", "")
+
     it "still lets a global default_model win when present" $ do
       let cfg = (defaultRuntimeConfig { rcDefaultProvider = Just "ollama"
                                    , rcDefaultModel = Just "override" })

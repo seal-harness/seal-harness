@@ -15,7 +15,7 @@ module Seal.Command.Provider
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
 import Data.IORef (IORef, readIORef)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -160,7 +160,10 @@ seedProviderDefaults kp fc0 =
       lbl = providerLabel kp
   in if isJust (providerDefaultModel fc1 lbl)
        then fc1
-       else upsertProvider lbl (\p -> p { pcDefaultModel = Just (modelText (defaultModelFor kp)) }) fc1
+       else case defaultModelFor kp of
+              -- The generic row has no default model: never seed an empty one.
+              Nothing -> fc1
+              Just m  -> upsertProvider lbl (\p -> p { pcDefaultModel = Just (modelText m) }) fc1
 
 addCmd :: ProviderRuntime -> Text -> CommandAction
 addCmd pr lbl = commandAction $ \caps ->
@@ -218,11 +221,14 @@ defaultCmd pr lbl = commandAction $ \caps ->
       Left e   -> ccSend caps e
       Right () -> do
         eCfg <- loadRuntimeConfig (prConfigPath pr)
-        let ModelId m = resolveDefaultModel
-                          (either (const Nothing) (`providerDefaultModel` plabel) eCfg)
-                          plabel
+        let rModel = resolveDefaultModel
+                       (either (const Nothing) (`providerDefaultModel` plabel) eCfg)
+                       plabel
         ccSend caps
-          ("default provider set to " <> plabel <> " (model: " <> m <> ")")
+          ("default provider set to " <> plabel <> case rModel of
+             Just (ModelId m) -> " (model: " <> m <> ")"
+             Nothing -> " (no default model — set one with /model use "
+                          <> plabel <> " <model-id>)")
 
 listCmd :: ProviderRuntime -> CommandAction
 listCmd pr = commandAction $ \caps ->
@@ -297,7 +303,7 @@ testCmd pr lbl = commandAction $ \caps ->
       eCfg <- loadRuntimeConfig (prConfigPath pr)
       let cfg     = fromRight defaultRuntimeConfig eCfg
           canonLbl = providerLabel kp
-          model = case eCfg of
+          model = fromMaybe (ModelId "") $ case eCfg of
             Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
             Left _  -> defaultModelFor kp
       eProv <- resolveProvider (Just vh) (prManager pr) cfg kp model (prCallCounter pr)

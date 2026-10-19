@@ -29,6 +29,7 @@ module Seal.Command.Model
   ) where
 
 import Data.Either (fromRight)
+import Data.Maybe (fromMaybe)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -51,7 +52,8 @@ import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptW
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Providers.Registry
   ( KnownProvider, configuredProviders, defaultModelFor, knownProviders, listSome
-  , parseProvider, providerLabel, resolveDefaultModel, resolveProvider )
+  , parseProvider, providerDisplayName, providerLabel, resolveDefaultModel
+  , resolveProvider )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
@@ -209,9 +211,10 @@ reportProviderQuiet
   :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> KnownProvider -> IO ()
 reportProviderQuiet pr caps cfg kp = do
   let lbl   = providerLabel kp
-      ModelId dm = resolveDefaultModel (providerDefaultModel cfg lbl) lbl
+      dm = maybe "(none)" modelIdText
+             (resolveDefaultModel (providerDefaultModel cfg lbl) lbl)
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveProvider mh (prManager pr) cfg kp (fallbackModel kp) (prCallCounter pr)
   eModels <- case eProv of
     Left _    -> pure (Left "unresolved")
     Right sp -> listSome sp
@@ -230,7 +233,7 @@ reportProviderLoud
 reportProviderLoud pr caps cfg kp = do
   let lbl   = providerLabel kp
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveProvider mh (prManager pr) cfg kp (fallbackModel kp) (prCallCounter pr)
   case eProv of
     Left e   -> ccSend caps ("could not list " <> lbl <> " models: " <> e)
     Right sp -> do
@@ -254,25 +257,34 @@ useCmd pr resolveMeta save mWriter provLbl mModel = commandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
-      model <- case mModel of
-        Just m  -> pure m
+      mResolved <- case mModel of
+        Just m  -> pure (Just m)
         Nothing -> do
           eCfg <- loadRuntimeConfig (prConfigPath pr)
           let cfg = fromRight defaultRuntimeConfig eCfg
-              ModelId m = resolveDefaultModel (providerDefaultModel cfg (providerLabel kp)) (providerLabel kp)
-          pure m
-      mActive <- resolveMeta
-      case mActive of
-        Nothing -> ccSend caps "no active session to update"
-        Just m0 -> do
-          let lbl = providerLabel kp
-              m1 = m0 { smProvider = lbl, smModel = model }
-              confirm = "session model set to " <> lbl <> "/" <> model
-          save m1
-          case mWriter of
-            Just w  -> w (smId m1) confirm
-            Nothing -> pure ()
-          ccSend caps confirm
+          pure (fmap modelIdText
+                 (resolveDefaultModel (providerDefaultModel cfg (providerLabel kp))
+                                      (providerLabel kp)))
+      case mResolved of
+        -- A provider with no built-in default model needs an explicit one:
+        -- writing the session with an empty model would just move the failure
+        -- to the next turn.
+        Nothing -> ccSend caps
+          (providerDisplayName kp <> " has no default model — run /model use "
+             <> providerLabel kp <> " <model-id>")
+        Just model -> do
+          mActive <- resolveMeta
+          case mActive of
+            Nothing -> ccSend caps "no active session to update"
+            Just m0 -> do
+              let lbl = providerLabel kp
+                  m1 = m0 { smProvider = lbl, smModel = model }
+                  confirm = "session model set to " <> lbl <> "/" <> model
+              save m1
+              case mWriter of
+                Just w  -> w (smId m1) confirm
+                Nothing -> pure ()
+              ccSend caps confirm
 
 defaultCmd :: ProviderRuntime -> Text -> Text -> CommandAction
 defaultCmd pr provLbl model = commandAction $ \caps ->
@@ -289,3 +301,13 @@ unknownProviderMsg :: Text -> Text
 unknownProviderMsg lbl =
   "unknown provider: " <> lbl <> " (known: "
     <> T.intercalate ", " (map providerLabel knownProviders) <> ")"
+
+-- | The model to hand 'resolveProvider' for a list/probe call: the provider's
+-- built-in default when it has one, else the empty model ("no model yet",
+-- which 'complete' reports with an actionable message).
+fallbackModel :: KnownProvider -> ModelId
+fallbackModel kp = fromMaybe (ModelId "") (defaultModelFor kp)
+
+-- | The text inside a 'ModelId'.
+modelIdText :: ModelId -> Text
+modelIdText (ModelId t) = t

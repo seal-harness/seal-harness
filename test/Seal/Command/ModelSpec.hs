@@ -98,8 +98,8 @@ mkPRWithOllama cfgPath vh port = do
     , prCallCounter = cntRef
     }
 
-spec :: Spec
-spec = describe "Seal.Command.Model" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Command.Model" $ do
   it "list shows configured providers and the active selection" $
     withSystemTempDirectory "seal-model" $ \root -> do
       sr <- mkSR root
@@ -323,3 +323,43 @@ spec = describe "Seal.Command.Model" $ do
       runModelForSession pr paths (pure sid) Nothing ["use","ollama","qwen3.8"] caps
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("no active session" `T.isInfixOf`)
+
+-- ---------------------------------------------------------------------------
+-- Generic OpenAI-compatible provider (issue #271): no default model
+-- ---------------------------------------------------------------------------
+
+spec_model_less :: Spec
+spec_model_less = describe "/model with a model-less provider" $ do
+  it "use without a model argument reports the missing model and does not mutate" $
+    withSystemTempDirectory "seal-model-nomodel" $ \root -> do
+      sr <- mkSR root
+      pr <- mkPR (root </> "config.toml") Nothing
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["use", "openai-compat"] caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("has no default model" `T.isInfixOf`)
+      m <- readActive sr
+      smProvider m `shouldBe` "anthropic"
+      smModel m    `shouldBe` "claude-opus-4-8"
+
+  it "list <provider> says it has no models instead of a resolution error" $
+    withSystemTempDirectory "seal-model-nomodel" $ \root -> do
+      sr <- mkSR root
+      vh <- makeFakeVault []
+      pr <- mkPR (root </> "config.toml") (Just vh)
+      _ <- updateRuntimeConfig (root </> "config.toml")
+             (upsertProvider "openai-compat" (\p -> p { pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["list", "openai-compat"] caps
+      sent <- getSent fc
+      let out = T.unlines sent
+      out `shouldSatisfy` ("has no models" `T.isInfixOf`)
+      out `shouldNotSatisfy` ("could not list" `T.isInfixOf`)
+
+-- | The active session's meta.
+readActive :: SessionRuntime -> IO SessionMeta
+readActive sr = readIORef (srActive sr)
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> spec_model_less

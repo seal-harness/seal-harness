@@ -148,9 +148,12 @@ spec = describe "Seal.Providers.Registry" $ do
       providerDisplayName presetProvider    `shouldBe` "Acme"
 
     it "has default models where the provider knows one" $ do
-      defaultModelFor AnthropicProvider `shouldBe` ModelId "claude-opus-4-8"
-      defaultModelFor OllamaProvider    `shouldBe` ModelId "llama3.2"
-      defaultModelFor presetProvider    `shouldBe` ModelId "acme-large"
+      defaultModelFor AnthropicProvider `shouldBe` Just (ModelId "claude-opus-4-8")
+      defaultModelFor OllamaProvider    `shouldBe` Just (ModelId "llama3.2")
+      defaultModelFor presetProvider    `shouldBe` Just (ModelId "acme-large")
+
+    it "has no default model for the generic row" $
+      defaultModelFor genericProvider `shouldBe` Nothing
 
   describe "completeSome / listSome" $ do
     it "passes the request through to the wrapped provider" $ do
@@ -416,9 +419,13 @@ spec = describe "Seal.Providers.Registry" $ do
 
   describe "resolveDefaultModel" $ do
     it "uses the configured value when present" $
-      resolveDefaultModel (Just "glm-5.2:cloud") "ollama" `shouldBe` ModelId "glm-5.2:cloud"
+      resolveDefaultModel (Just "glm-5.2:cloud") "ollama" `shouldBe` Just (ModelId "glm-5.2:cloud")
+    it "treats an empty configured model as unset" $
+      resolveDefaultModel (Just "") "ollama" `shouldBe` Just (ModelId "llama3.2")
     it "falls back to the provider's default" $ do
-      resolveDefaultModel Nothing "ollama"    `shouldBe` ModelId "llama3.2"
-      resolveDefaultModel Nothing "anthropic" `shouldBe` ModelId "claude-opus-4-8"
+      resolveDefaultModel Nothing "ollama"    `shouldBe` Just (ModelId "llama3.2")
+      resolveDefaultModel Nothing "anthropic" `shouldBe` Just (ModelId "claude-opus-4-8")
     it "falls back to anthropic for an unknown label" $
-      resolveDefaultModel Nothing "who" `shouldBe` ModelId "claude-opus-4-8"
+      resolveDefaultModel Nothing "who" `shouldBe` Just (ModelId "claude-opus-4-8")
+    it "has no default for the generic row" $
+      resolveDefaultModel Nothing "openai-compat" `shouldBe` Nothing

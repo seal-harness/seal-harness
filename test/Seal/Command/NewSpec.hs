@@ -9,7 +9,7 @@ import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
-  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl )
+  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveNewModel, resolveRepoUrl )
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
 import Seal.Command.Spec (mkRegistry, runCommandAction)
 import Seal.Core.Types (SessionId, mkSessionId)
@@ -233,4 +233,13 @@ legacySpec = describe "new -p validation" $ do
 
 -- | Both suites behind the module's single exported @spec@.
 spec :: Spec
-spec = spec_main >> legacySpec
+spec = spec_main >> legacySpec >> resolveModelSpec
+
+resolveModelSpec :: Spec
+resolveModelSpec = describe "resolveNewModel" $ do
+  it "repairs an empty inherited model from the target provider's default" $
+    resolveNewModel "anthropic" "" `shouldBe` "claude-opus-4-8"
+  it "keeps an explicit model" $
+    resolveNewModel "anthropic" "claude-haiku-4-5" `shouldBe` "claude-haiku-4-5"
+  it "keeps the empty value when the provider has no default model" $
+    resolveNewModel "openai-compat" "" `shouldBe` ""

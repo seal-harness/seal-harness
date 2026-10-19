@@ -222,7 +222,8 @@ defaultSessionSelection cfg =
   , fromMaybe fallbackModel (rcDefaultModel cfg) )
   where
     provLabel = fromMaybe "anthropic" (rcDefaultProvider cfg)
-    ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
+    fallbackModel = maybe "" modelText
+      (resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel)
 
 -- | Resolve the default agent for a new session. Returns 'Nothing' if
 -- @default_agent@ is unset, the id fails validation, or the def is not on
@@ -477,3 +478,7 @@ autoBindRepoAgentWith defs paths sid =
     -- as "user already chose a repo agent" so we don't clobber it.
     alreadyRepoBound Nothing = False
     alreadyRepoBound (Just aid) = "--" `T.isInfixOf` agentDefIdText aid
+
+-- | The text inside a 'ModelId'.
+modelText :: ModelId -> Text
+modelText (ModelId t) = t

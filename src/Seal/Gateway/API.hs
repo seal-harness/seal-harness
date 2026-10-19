@@ -741,19 +741,18 @@ parseKind (A.Object o) = case KeyMap.lookup (Key.fromText "kind") o of
   _                 -> Nothing
 parseKind _ = Nothing
 
--- | Parse the @provider@ and @model@ fields from a POST /api/tabs/new body.
--- Defaults to @("ollama", "llama3.2")@ when either is missing — the frontend
--- always sends both (the NewTabComposer preselects them), so the fallback is
--- purely defensive.
+-- | Parse the optional @provider@ and @model@ fields from a POST
+-- /api/tabs/new body. An absent field is @""@ (not another provider's model
+-- id); the handler fills it from 'defaultSessionSelection'.
 parseProviderModel :: A.Value -> (Text, Text)
 parseProviderModel v = case v of
   A.Object o ->
     let lookupT k = case KeyMap.lookup (Key.fromText k) o of
           Just (A.String t) | not (T.null t) -> Just t
           _                                   -> Nothing
-    in ( fromMaybe "ollama" (lookupT "provider")
-       , fromMaybe "llama3.2" (lookupT "model") )
-  _ -> ("ollama", "llama3.2")
+    in ( fromMaybe "" (lookupT "provider")
+       , fromMaybe "" (lookupT "model") )
+  _ -> ("", "")
 
 -- | Parse the optional @agent@ field from a POST /api/tabs/new body into an
 -- 'AgentDefId'. Returns 'Nothing' when absent/empty/invalid.
@@ -781,8 +780,15 @@ handleTabNew deps v =
       -- on disk — otherwise the orphaned session would surface in Recent
       -- Sessions with no tab to back it. newSessionMeta mints the id
       -- without touching disk; saveSessionMeta writes the atomically.
-      let paths = srPaths (adSessionRuntime deps)
-          (provider, model) = parseProviderModel v
+      eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+      let cfgForNew = fromRight defaultRuntimeConfig eCfg
+          paths = srPaths (adSessionRuntime deps)
+          (pReq, mReq) = parseProviderModel v
+          -- Absent fields fall back to the configured session defaults, never
+          -- to another provider's model id.
+          (pDef, mDef) = defaultSessionSelection cfgForNew
+          provider = if T.null pReq then pDef else pReq
+          model    = if T.null mReq then mDef else mReq
           mAgent = parseAgentField v
       meta <- newSessionMeta paths provider model "web" mAgent
       let sid = smId meta
@@ -2165,9 +2171,13 @@ handleProviderCreate deps body =
                   seedCfg :: RuntimeConfig -> RuntimeConfig
                   seedCfg cfg0 =
                     let cfg1 = cfg0 { rcDefaultProvider = rcDefaultProvider cfg0 <|> Just lbl }
-                        cfg2 = upsertProvider lbl (\p -> if isJust (pcDefaultModel p)
-                                                            then p
-                                                            else p { pcDefaultModel = Just (let ModelId t = defaultModelFor kp in t) }) cfg1
+                        cfg2 = case defaultModelFor kp of
+                          -- The generic row has no default model: never seed one.
+                          Nothing -> upsertProvider lbl id cfg1
+                          Just (ModelId t) -> upsertProvider lbl
+                            (\p -> if isJust (pcDefaultModel p)
+                                      then p
+                                      else p { pcDefaultModel = Just t }) cfg1
                         cfg3 = case mBaseUrl of
                           Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg2
                           _ -> cfg2
