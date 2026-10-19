@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | WU-C — real tests for the OpenRouter provider. Exercises the pure
+-- | WU-C — real tests for the OpenAICompat provider. Exercises the pure
 -- request/response mapping + the no-key branch + the static listModels +
 -- the bearer header builder, WITHOUT a network round-trip. A live
 -- @\/api\/v1\/chat\/completions@ round-trip would need a real key + endpoint;
 -- that is out of scope here (guard with 'pendingWith' if added later).
-module Seal.Providers.OpenRouterSpec (spec) where
+module Seal.Providers.OpenAICompatSpec (spec) where
 
 import Data.Aeson
   ( Value (Array, Object, String), encode, eitherDecode, object, (.=) )
@@ -26,8 +26,8 @@ import Seal.Providers.Class
   ( CompletionRequest (..), CompletionResponse (..), ContentBlock (..)
   , Message (..), Provider (..), Role (..), StopReason (..), ToolChoice (..)
   , ToolResultPart (..), Usage (..), textMsg )
-import Seal.Providers.OpenRouter
-  ( bearerHeaders, decodeResponse, encodeRequest, mapFinishReason, mkOpenRouter
+import Seal.Providers.OpenAICompat
+  ( bearerHeaders, decodeResponse, encodeRequest, mapFinishReason, mkOpenAICompat
   , defaultOpenRouterBaseUrl )
 
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
@@ -71,7 +71,7 @@ roleOf _ = Nothing
 
 -- ── Response fixtures ──────────────────────────────────────────────────────
 
--- | The JSON 'Value' for a @ChatCompletionObject@ the way OpenRouter emits it.
+-- | The JSON 'Value' for a @ChatCompletionObject@ the way OpenAICompat emits it.
 -- @mContent@ drives the assistant message's @content@ (Nothing => null); @finishReason@
 -- drives the single choice's @finish_reason@; @mToolCalls@, when present, adds a
 -- @tool_calls@ array to the assistant message.
@@ -111,7 +111,7 @@ decodeFromJson v =
 -- ── Spec ────────────────────────────────────────────────────────────────────
 
 spec :: Spec
-spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
+spec = describe "Seal.Providers.OpenAICompat — WU-C" $ do
 
   describe "encodeRequest" $ do
     it "sets model + tool_choice and emits a user message" $ do
@@ -203,14 +203,14 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
   describe "complete (no key)" $ do
     it "returns Left when the API key is absent" $ do
       mgr <- newTlsManager
-      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
+      let prov = mkOpenAICompat mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- complete prov minimalReq
       r `shouldSatisfy` isLeft
 
   describe "listModels" $ do
     it "returns Right with the default model" $ do
       mgr <- newTlsManager
-      let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
+      let prov = mkOpenAICompat mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- listModels prov
       r `shouldBe` Right [ModelId "deepseek/deepseek-v4.1-flash-1017"]
 

@@ -115,7 +115,7 @@ library
         Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
-        Seal.Providers.OpenRouter
+        Seal.Providers.OpenAICompat
         Seal.Util.AesonUtils
         Seal.Util.AtomicJson
         Seal.Util.StrictIO
@@ -574,7 +574,7 @@ test-suite tests
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
         Seal.Providers.ContextWindowSpec
-        Seal.Providers.OpenRouterSpec
+        Seal.Providers.OpenAICompatSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec

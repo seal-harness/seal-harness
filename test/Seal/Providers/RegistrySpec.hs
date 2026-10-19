@@ -31,7 +31,7 @@ import Seal.Providers.Registry
   , vaultKeyName
   )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
-import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl)
+import Seal.Providers.OpenAICompat (defaultOpenRouterBaseUrl)
 import Seal.Security.Secrets (mkBearerToken, mkRefreshToken)
 import Seal.TestHelpers.FakeVault (makeFakeVault, makeLockedVault)
 
@@ -87,7 +87,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
   it "labels Ollama" $
     providerLabel OllamaProvider `shouldBe` "ollama"
 
-  it "labels OpenRouter" $
+  it "labels OpenAICompat" $
     providerLabel OpenRouterProvider `shouldBe` "openrouter"
 
   it "maps Anthropic to its ProviderId" $
@@ -259,8 +259,8 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       providerBaseUrlFor defaultRuntimeConfig OpenRouterProvider
         `shouldBe` defaultOpenRouterBaseUrl
 
-    it "OpenRouter does NOT inherit Ollama's configured base URL (regression)" $ do
-      -- The bug: an OpenRouter session POSTed to the Ollama base URL (the
+    it "OpenAICompat does NOT inherit Ollama's configured base URL (regression)" $ do
+      -- The bug: an OpenAICompat session POSTed to the Ollama base URL (the
       -- local daemon), yielding \"404 page not found\". Each provider must
       -- read its OWN [providers.<label>] section.
       providerBaseUrlFor (ollamaCfg (Just "http://localhost:9999")) OpenRouterProvider

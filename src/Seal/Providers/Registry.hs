@@ -38,7 +38,7 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
-import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl, mkOpenRouter)
+import Seal.Providers.OpenAICompat (defaultOpenRouterBaseUrl, mkOpenAICompat)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -139,7 +139,7 @@ resolveProvider mvh mgr cfg OllamaProvider model callCounter
   where
     baseUrl = providerBaseUrlFor cfg OllamaProvider
 resolveProvider mvh mgr cfg OpenRouterProvider model _ =
-  -- OpenRouter requires a vault-stored API key; no keyless mode.
+  -- OpenAICompat requires a vault-stored API key; no keyless mode.
   case mvh of
     Nothing ->
       pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
@@ -148,7 +148,7 @@ resolveProvider mvh mgr cfg OpenRouterProvider model _ =
       case eKey of
         Left e -> pure (Left (credErr OpenRouterProvider e))
         Right kb ->
-          pure (Right (SomeProvider (mkOpenRouter mgr (Just (mkApiKey kb)) baseUrl model)))
+          pure (Right (SomeProvider (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model)))
   where
     baseUrl = providerBaseUrlFor cfg OpenRouterProvider
 

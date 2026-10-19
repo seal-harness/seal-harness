@@ -1,6 +1,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
--- | OpenRouter provider using the @openai@ package's *types* (v2.5.4) with our
+-- | Generic OpenAI-compatible provider: uses the @openai@ package's *types*
+-- (v2.5.4) with our
 -- own HTTP round-trip (mirroring 'Seal.Providers.Anthropic' / 'Ollama'). We do
 -- NOT use 'OpenAI.V1.makeMethods' (the servant-client convenience wrapper) —
 -- that would unwrap the 'ApiKey' to 'Text' and surface 'servant-client'
@@ -11,19 +12,19 @@
 -- only on the @Authorization: Bearer@ header built inside the CPS 'withApiKey'
 -- accessor — never returned, never logged.
 --
--- Base URL: @https://openrouter.ai/api/v1/chat/completions@
--- Vault key: @OPENROUTER_API_KEY@
+-- The endpoint (@<base-url>/chat/completions@), display name, vault key and
+-- vendor-specific headers all come from the caller (the catalog row in
+-- 'Seal.Providers.Registry'); this module contains no provider-specific branch.
 --
 -- Security: capability-based — no opcode touches the agent-immutable home
 -- state dir; this module imports only the openai types, the HTTP client
 -- library, and the CPS secret accessor. It never spawns a process, never
 -- touches the filesystem directly, and never imports the web-client library
 -- whose types it borrows (see AGENTS.md §Security).
-module Seal.Providers.OpenRouter
-  ( OpenRouter (..)
-  , mkOpenRouter
+module Seal.Providers.OpenAICompat
+  ( OpenAICompat (..)
+  , mkOpenAICompat
   , defaultOpenRouterBaseUrl
-  , openRouterBaseUrl
   , encodeRequest
   , decodeResponse
   , mapFinishReason
@@ -77,26 +78,22 @@ import Seal.Security.Secrets (ApiKey, withApiKey)
 -- caller (mirrors 'Seal.Providers.Ollama.olManager' /
 -- 'Seal.Providers.Anthropic.anManager') so the TLS context isn't rebuilt per
 -- call.
-data OpenRouter = OpenRouter
-  { orApiKey       :: !(Maybe ApiKey)
-  , orBaseUrl      :: !Text
-  , orDefaultModel :: !ModelId
-  , orManager      :: !Manager
+data OpenAICompat = OpenAICompat
+  { oacApiKey       :: !(Maybe ApiKey)
+  , oacBaseUrl      :: !Text
+  , oacModel :: !ModelId
+  , oacManager      :: !Manager
   }
 
--- | Build an 'OpenRouter' with an externally-owned 'Manager' and an optional
+-- | Build an 'OpenAICompat' with an externally-owned 'Manager' and an optional
 -- API key ('Nothing' => 'complete' returns an actionable error without
 -- touching the network).
-mkOpenRouter :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenRouter
-mkOpenRouter mgr key base model = OpenRouter key base model mgr
+mkOpenAICompat :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenAICompat
+mkOpenAICompat mgr key base model = OpenAICompat key base model mgr
 
--- | Default base URL for OpenRouter (OpenAI-compatible endpoint).
+-- | Default base URL for OpenAICompat (OpenAI-compatible endpoint).
 defaultOpenRouterBaseUrl :: Text
 defaultOpenRouterBaseUrl = "https://openrouter.ai/api/v1"
-
--- | Access the configured base URL.
-openRouterBaseUrl :: OpenRouter -> Text
-openRouterBaseUrl = orBaseUrl
 
 -- Pure request mapping ------------------------------------------------------
 
@@ -179,7 +176,7 @@ msgOpenAi (Message role blocks) =
 
 -- Pure response mapping -----------------------------------------------------
 
--- | Map a finish-reason string to our 'StopReason'. OpenRouter follows the
+-- | Map a finish-reason string to our 'StopReason'. OpenAICompat follows the
 -- OpenAI convention (@stop@ / @length@ / @tool_calls@); an unrecognized value
 -- (including @content_filter@) maps to 'StopOther' rather than failing — the
 -- caller can still use the partial response.
@@ -195,12 +192,12 @@ mapFinishReason r
 -- 'CompletionResponse'. An empty @choices@ array is a graceful 'Left' (some
 -- upstream error conditions return no choices). The first choice is taken;
 -- its @message@ is an 'Chat.Assistant' carrying optional text + tool calls.
--- Tool-call ids are taken verbatim from OpenRouter (it returns ids); the
+-- Tool-call ids are taken verbatim from OpenAICompat (it returns ids); the
 -- JSON-encoded @arguments@ text is parsed back to a 'Value'.
 decodeResponse :: Chat.ChatCompletionObject -> Either Text CompletionResponse
 decodeResponse obj =
   case V.toList (Chat.choices obj) of
-    []     -> Left "OpenRouter returned no choices"
+    []     -> Left "OpenAICompat returned no choices"
     (c:_)  ->
       let stop  = mapFinishReason (Chat.finish_reason c)
           blkss = assistantBlocks (Chat.message c)
@@ -214,7 +211,7 @@ decodeResponse obj =
 -- | Extract our 'ContentBlock's from an OpenAI assistant message: the text
 -- body becomes 'CbText' and each tool call becomes a 'CbToolUse' with the
 -- upstream id + name, and the JSON-encoded @arguments@ parsed back to a
--- 'Value' (OpenRouter emits arguments as a JSON object encoded as a 'Text';
+-- 'Value' (OpenAICompat emits arguments as a JSON object encoded as a 'Text';
 -- if it ever fails to parse, we fall back to a placeholder 'Value' so the
 -- transcript still records the call).
 assistantBlocks :: Chat.Message Text -> [ContentBlock]
@@ -234,8 +231,8 @@ assistantBlocks msg = case msg of
 
 -- Headers --------------------------------------------------------------------
 
--- | The headers for an OpenRouter chat-completion POST. The API key bytes
--- (@bytes@) live only here, inside the 'withApiKey' continuation. OpenRouter
+-- | The headers for an OpenAICompat chat-completion POST. The API key bytes
+-- (@bytes@) live only here, inside the 'withApiKey' continuation. OpenAICompat
 -- recommends @HTTP-Referer@ / @X-Title@ for app attribution; neither carries a
 -- secret.
 bearerHeaders :: ByteString -> RequestHeaders
@@ -251,7 +248,7 @@ bearerHeaders bytes =
 -- | POST @<baseUrl>/chat/completions@ with the given headers + request body,
 -- then decode the response. Non-2xx -> 'httpErrorText'; a transport error
 -- (connection / TLS) -> a 'Left' string. The body carries no secret. The
--- @baseUrl@ is the configured one ('orBaseUrl'), so a custom/proxy endpoint
+-- @baseUrl@ is the configured one ('oacBaseUrl'), so a custom/proxy endpoint
 -- is honored.
 sendChatCompletion
   :: Manager -> Text -> RequestHeaders -> Chat.CreateChatCompletion
@@ -265,7 +262,7 @@ sendChatCompletion mgr baseUrl hdrs req = do
   result <- try (httpLbs httpReq mgr) :: IO (Either HttpException (Response BL.ByteString))
   case result of
     Left _e ->
-      pure (Left "OpenRouter HTTP request failed (connection or transport error)")
+      pure (Left "OpenAICompat HTTP request failed (connection or transport error)")
     Right resp ->
       let code = statusCode (responseStatus resp)
       in if code >= 200 && code <= 299
@@ -276,29 +273,29 @@ sendChatCompletion mgr baseUrl hdrs req = do
                              (TE.decodeUtf8With TEE.lenientDecode
                                (BL.toStrict (responseBody resp)))))
 
--- | Render a non-2xx OpenRouter response into a user-facing message. 429
+-- | Render a non-2xx OpenAICompat response into a user-facing message. 429
 -- (rate limit) and 401 (auth) get friendlier, actionable hints; other codes
 -- keep the full response body (the body carries no secret).
 httpErrorText :: Int -> Text -> Text
 httpErrorText 429 _ =
-  "OpenRouter rate limit (HTTP 429) — the account behind this credential is \
+  "OpenAICompat rate limit (HTTP 429) — the account behind this credential is \
   \being throttled. Wait a moment and retry, or switch models with /model use."
 httpErrorText 401 _ =
-  "OpenRouter rejected the API key (HTTP 401) — run /provider remove openrouter \
+  "OpenAICompat rejected the API key (HTTP 401) — run /provider remove openrouter \
   \then /provider add openrouter to re-enter the key."
 httpErrorText code body =
-  "OpenRouter API returned HTTP " <> T.pack (show code) <> ": " <> body
+  "OpenAICompat API returned HTTP " <> T.pack (show code) <> ": " <> body
 
 -- Provider instance ---------------------------------------------------------
 
-instance Provider OpenRouter where
-  listModels prov = pure (Right [orDefaultModel prov])
-  complete prov cr = case orApiKey prov of
+instance Provider OpenAICompat where
+  listModels prov = pure (Right [oacModel prov])
+  complete prov cr = case oacApiKey prov of
     Nothing ->
-      pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
+      pure (Left "OpenAICompat needs an API key \x2014 run /vault setup then /provider add openrouter")
     Just key ->
       withApiKey key $ \bytes ->
-        sendChatCompletion (orManager prov) (orBaseUrl prov) (bearerHeaders bytes) (encodeRequest cr)
+        sendChatCompletion (oacManager prov) (oacBaseUrl prov) (bearerHeaders bytes) (encodeRequest cr)
 
 -- Helpers --------------------------------------------------------------------
 
