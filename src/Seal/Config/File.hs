@@ -45,6 +45,7 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , deleteProviderSection
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -648,6 +649,11 @@ updateRuntimeConfig path f = withMVar configWriteLock $ \_ -> do
   case result of
     Left err  -> pure (Left err)
     Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
+
+-- | Drop a provider instance's whole @[providers.\<name\>]@ section.
+deleteProviderSection :: Text -> RuntimeConfig -> RuntimeConfig
+deleteProviderSection lbl cfg =
+  cfg { rcProviders = Map.delete lbl (rcProviders cfg) }
 
 -- | The configured default model for provider @lbl@, if any.
 providerDefaultModel :: RuntimeConfig -> Text -> Maybe Text

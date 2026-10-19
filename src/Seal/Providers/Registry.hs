@@ -26,6 +26,7 @@ module Seal.Providers.Registry
   , providerBaseUrlForInstance
   , instanceAuthStatus
   , configuredInstances
+  , isConfiguredInstance
   , resolveInstance
   , resolveDefaultModelFor
   , instanceLabelList
@@ -63,7 +64,7 @@ module Seal.Providers.Registry
 import Control.Applicative ((<|>))
 import Control.Monad (void, filterM)
 import Data.IORef (IORef, newIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -746,6 +747,15 @@ configuredInstances mvh cfg = filterM isConfigured (providerInstances cfg)
           Left _ -> pure False
           Right _ | not (ocsKeyRequired spec) -> pure True
                   | otherwise -> hasVaultKey mvh (pcApiKeyName creds)
+
+-- | "Has a section or a stored credential" — the configure-vs-reconfigure
+-- predicate (design §10.4/§9.8). Always 'False' for a problem row.
+isConfiguredInstance :: Maybe VaultHandle -> RuntimeConfig -> ProviderInstance -> IO Bool
+isConfiguredInstance mh cfg inst
+  | isJust (piProblem inst) = pure False
+  | otherwise = do
+      st <- instanceAuthStatus mh cfg inst
+      pure (piHasSection inst || st /= "none")
 
 -- | Build the OAuth session for an anthropic instance, reading **and writing**
 -- through that instance's own OAuth key (leaving the literal would make a

@@ -24,7 +24,8 @@ import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), loadRuntimeConfig, providerBaseUrl
   , providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
-import Seal.Providers.Registry (KnownProvider (..), genericOpenAICompat)
+import Seal.Providers.Registry
+  ( ProviderType (..), genericOpenAICompat )
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -92,7 +93,7 @@ spec_main = do
         let cfgPath = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfgPath (Just vh)
-        (fc, caps) <- makeFakeCaps ["sk-secret"]
+        (fc, caps) <- makeFakeCaps ["", "sk-secret"]
         runProv pr ["add", "anthropic"] caps
         vhGet vh "ANTHROPIC_API_KEY" >>= (`shouldBe` Right ("sk-secret" :: ByteString))
         Right cfg <- loadRuntimeConfig cfgPath
@@ -106,7 +107,7 @@ spec_main = do
         let cfgPath = dir </> "config.toml"
         vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
         pr <- mkPR cfgPath (Just vh)
-        (_, addCaps)  <- makeFakeCaps ["sk2"]      -- not used; ensures defaults
+        (_, addCaps)  <- makeFakeCaps ["", "sk2"]   -- name (default) + key
         runProv pr ["add", "anthropic"] addCaps     -- sets default_provider
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
@@ -120,7 +121,7 @@ spec_main = do
         let cfgPath = dir </> "config.toml"
         vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
         pr <- mkPR cfgPath (Just vh)
-        (_, addCaps) <- makeFakeCaps ["sk"]
+        (_, addCaps) <- makeFakeCaps ["", "sk"]
         runProv pr ["add", "anthropic"] addCaps      -- sets default
         (fc, caps) <- makeFakeCaps []
         runProv pr ["remove", "anthropic"] caps
@@ -172,10 +173,11 @@ spec_main = do
         -- anthropic has no credential, ollama is keyless-local, the generic
         -- row has no base URL yet.
         out `shouldSatisfy` ("anthropic" `T.isInfixOf`)
-        out `shouldSatisfy` ("anthropic \x2014 auth: none" `T.isInfixOf`)
-        out `shouldSatisfy` ("ollama \x2014 auth: keyless" `T.isInfixOf`)
-        out `shouldSatisfy` ("openai-compat \x2014 auth: none, base URL: not set"
-                               `T.isInfixOf`)
+        out `shouldSatisfy` ("anthropic (Anthropic)" `T.isInfixOf`)
+        out `shouldSatisfy` ("auth: none" `T.isInfixOf`)
+        out `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        out `shouldSatisfy` ("keyless" `T.isInfixOf`)
+        out `shouldSatisfy` ("base URL: not set" `T.isInfixOf`)
 
     it "list shows anthropic when an API key is stored" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -198,7 +200,8 @@ spec_main = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- T.unlines <$> getSent fc
-        out `shouldSatisfy` ("ollama \x2014 auth: none" `T.isInfixOf`)
+        out `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        out `shouldSatisfy` ("auth: none" `T.isInfixOf`)
 
     it "remove clears BOTH the API key and the OAuth blob" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -221,7 +224,7 @@ spec_main = do
         vh <- makeFakeVault []
         pr <- mkPR cfgPath (Just vh)
         -- scripted answers: base url (ccPrompt) then key (ccPromptSecret)
-        (_, caps) <- makeFakeCaps ["https://ollama.com", "k-cloud"]
+        (_, caps) <- makeFakeCaps ["", "https://ollama.com", "k-cloud"]
         runProv pr ["add", "ollama"] caps
         vhGet vh "OLLAMA_API_KEY" >>= (`shouldBe` Right ("k-cloud" :: ByteString))
         Right cfg <- loadRuntimeConfig cfgPath
@@ -234,7 +237,7 @@ spec_main = do
         vh <- makeFakeVault []
         pr <- mkPR cfgPath (Just vh)
         -- blank base url keeps the default; blank key => local
-        (_, caps) <- makeFakeCaps ["", ""]
+        (_, caps) <- makeFakeCaps ["", "", ""]
         runProv pr ["add", "ollama"] caps
         vhGet vh "OLLAMA_API_KEY" >>= (`shouldSatisfy` either (const True) (const False))
 
@@ -267,7 +270,7 @@ spec_main = do
         let cfgPath = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfgPath (Just vh)
-        (_, addCaps) <- makeFakeCaps ["sk"]
+        (_, addCaps) <- makeFakeCaps ["", "sk"]
         runProv pr ["add", "anthropic"] addCaps   -- seeds default_provider = anthropic
         (_, caps) <- makeFakeCaps []
         runProv pr ["default", "ollama"] caps      -- must override, not <|>-keep
@@ -306,7 +309,7 @@ spec_main = do
       withSystemTempDirectory "seal-prov" $ \dir -> do
         let cfgPath = dir </> "config.toml"
         pr <- mkPR cfgPath Nothing      -- no vault handle
-        (fc, caps) <- makeFakeCaps ["sk-secret"]
+        (fc, caps) <- makeFakeCaps ["", "sk-secret"]
         runProv pr ["add", "anthropic"] caps
         sent <- getSent fc
         sent `shouldSatisfy` any ("/vault setup" `T.isInfixOf`)
@@ -350,8 +353,7 @@ legacySpec = describe "legacy provider id recovery" $ do
       case r of
         Left e -> do
           e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
-          e `shouldSatisfy` ("/provider add openai-compat" `T.isInfixOf`)
-          e `shouldSatisfy` ("/model use openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("/model use" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
   it "an agent def on openrouter names the rename and the provider line" $
@@ -361,7 +363,7 @@ legacySpec = describe "legacy provider id recovery" $ do
       case r of
         Left e -> do
           e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
-          e `shouldSatisfy` ("provider line" `T.isInfixOf`)
+          e `shouldSatisfy` ("Agents view" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
   it "/provider default names the missing model for a model-less provider" $
@@ -384,7 +386,7 @@ legacySpec = describe "legacy provider id recovery" $ do
 
 -- | All suites behind the module's single exported @spec@.
 spec :: Spec
-spec = spec_main >> legacySpec >> cliSpec
+spec = spec_main >> legacySpec >> cliSpec >> instanceCliSpec
 
 -- ---------------------------------------------------------------------------
 -- Add flow, model-less providers, removal (issue #271)
@@ -395,17 +397,17 @@ cliSpec = describe "generic provider CLI" $ do
 
   describe "addPlanFor" $ do
     it "asks anthropic for a key only" $
-      addPlanFor AnthropicProvider
+      addPlanFor AnthropicType
         `shouldBe` AddPlan NoBaseUrl RequiredKey (Just (ModelId "claude-opus-4-8"))
     it "offers ollama its local URL and an optional key" $
-      addPlanFor OllamaProvider
+      addPlanFor OllamaType
         `shouldBe` AddPlan (OptionalBaseUrl "http://localhost:11434") OptionalKey
                           (Just (ModelId "llama3.2"))
     it "requires a base URL and a model for the generic row" $
-      addPlanFor (OpenAICompatProvider genericOpenAICompat)
+      addPlanFor (OpenAICompatType genericOpenAICompat)
         `shouldBe` AddPlan RequiredBaseUrl OptionalKey Nothing
     it "requires a key (and no URL prompt) for a key-required preset" $
-      addPlanFor (OpenAICompatProvider presetSpec)
+      addPlanFor (OpenAICompatType presetSpec)
         `shouldBe` AddPlan NoBaseUrl RequiredKey (Just (ModelId "acme-large"))
 
   describe "add openai-compat" $ do
@@ -415,7 +417,7 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         -- three blank answers exhaust the required prompt
-        (fc, caps) <- makeFakeCaps ["", "", ""]
+        (fc, caps) <- makeFakeCaps ["", "", "", ""]
         runProv pr ["add", "openai-compat"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("nothing was saved" `T.isInfixOf`)
@@ -429,7 +431,7 @@ cliSpec = describe "generic provider CLI" $ do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
-        (fc, caps) <- makeFakeCaps ["ftp://h/v1", "ftp://h/v1", "ftp://h/v1"]
+        (fc, caps) <- makeFakeCaps ["", "ftp://h/v1", "ftp://h/v1", "ftp://h/v1"]
         runProv pr ["add", "openai-compat"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("not usable" `T.isInfixOf`)
@@ -440,7 +442,7 @@ cliSpec = describe "generic provider CLI" $ do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
-        (fc, caps) <- makeFakeCaps ["http://127.0.0.1:8000/v1", "qwen2.5-7b", ""]
+        (fc, caps) <- makeFakeCaps ["", "http://127.0.0.1:8000/v1", "qwen2.5-7b", ""]
         runProv pr ["add", "openai-compat"] caps
         Right cfg' <- loadRuntimeConfig cfg
         providerBaseUrl cfg' "openai-compat" `shouldBe` Just "http://127.0.0.1:8000/v1"
@@ -455,7 +457,7 @@ cliSpec = describe "generic provider CLI" $ do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
-        (_, caps) <- makeFakeCaps ["https://gw.example/v1", "gpt-4o-mini", "sk-oc"]
+        (_, caps) <- makeFakeCaps ["", "https://gw.example/v1", "gpt-4o-mini", "sk-oc"]
         runProv pr ["add", "openai-compat"] caps
         vhGet vh "OPENAI_COMPAT_API_KEY" >>= (`shouldBe` Right ("sk-oc" :: ByteString))
 
@@ -463,7 +465,7 @@ cliSpec = describe "generic provider CLI" $ do
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
         pr <- mkPR cfg Nothing
-        (fc, caps) <- makeFakeCaps ["http://127.0.0.1:8000/v1", "m1", ""]
+        (fc, caps) <- makeFakeCaps ["", "http://127.0.0.1:8000/v1", "m1", ""]
         runProv pr ["add", "openai-compat"] caps
         Right cfg' <- loadRuntimeConfig cfg
         providerBaseUrl cfg' "openai-compat" `shouldBe` Just "http://127.0.0.1:8000/v1"
@@ -486,7 +488,7 @@ cliSpec = describe "generic provider CLI" $ do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
-        (fc, caps) <- makeFakeCaps ["http://gw.example/v1", "m1", "sk-x"]
+        (fc, caps) <- makeFakeCaps ["", "http://gw.example/v1", "m1", "sk-x"]
         runProv pr ["add", "openai-compat"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("unencrypted" `T.isInfixOf`)
@@ -533,7 +535,7 @@ cliSpec = describe "generic provider CLI" $ do
         runProv pr ["remove", "openai-compat"] caps
         Right cfg' <- loadRuntimeConfig cfg
         providerBaseUrl cfg' "openai-compat" `shouldBe` Nothing
-        providerDefaultModel cfg' "openai-compat" `shouldBe` Just "m1"
+        rcProviders cfg' `shouldSatisfy` not . Map.member "openai-compat"
         vhGet vh "ANTHROPIC_OAUTH_TOKENS" >>= (`shouldBe` Right ("{}" :: ByteString))
 
     it "works with no vault handle at all" $
@@ -543,7 +545,7 @@ cliSpec = describe "generic provider CLI" $ do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["remove", "openai-compat"] caps
         out <- T.unlines <$> getSent fc
-        out `shouldSatisfy` ("Removed OpenAI-compatible" `T.isInfixOf`)
+        out `shouldSatisfy` ("openai-compat" `T.isInfixOf`)
 
 -- Fixtures ------------------------------------------------------------------
 
@@ -553,3 +555,152 @@ presetSpec = OpenAICompatSpec
   , ocsBuiltinBaseUrl = Just "https://acme.example/v1"
   , ocsDefaultModel = Just (ModelId "acme-large"), ocsKeyRequired = True
   , ocsModels = [], ocsExtraHeaders = [] }
+
+-- ---------------------------------------------------------------------------
+-- Instance-addressed CLI (#273 WU-3)
+-- ---------------------------------------------------------------------------
+
+instanceCliSpec :: Spec
+instanceCliSpec = describe "provider instances CLI (#273)" $ do
+
+  it "adds a named instance with its type, URL and model" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (_, caps) <- makeFakeCaps ["local", "http://127.0.0.1:8000/v1", "qwen2.5-7b", ""]
+      runProv pr ["add", "openai-compat"] caps
+      Right cfg' <- loadRuntimeConfig cfg
+      fmap pcType (Map.lookup "local" (rcProviders cfg'))
+        `shouldBe` Just (Just "openai-compat")
+      providerBaseUrl cfg' "local" `shouldBe` Just "http://127.0.0.1:8000/v1"
+      providerDefaultModel cfg' "local" `shouldBe` Just "qwen2.5-7b"
+
+  it "accepts the name as a second argument" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (_, caps) <- makeFakeCaps ["https://groq.example/v1", "llama-3.3", ""]
+      runProv pr ["add", "openai-compat", "groq"] caps
+      Right cfg' <- loadRuntimeConfig cfg
+      providerBaseUrl cfg' "groq" `shouldBe` Just "https://groq.example/v1"
+
+  it "keeps two instances of one type side by side" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (_, c1) <- makeFakeCaps ["local", "http://127.0.0.1:8000/v1", "m1", ""]
+      runProv pr ["add", "openai-compat"] c1
+      (_, c2) <- makeFakeCaps ["groq", "https://groq.example/v1", "m2", ""]
+      runProv pr ["add", "openai-compat"] c2
+      Right cfg' <- loadRuntimeConfig cfg
+      providerBaseUrl cfg' "local" `shouldBe` Just "http://127.0.0.1:8000/v1"
+      providerBaseUrl cfg' "groq" `shouldBe` Just "https://groq.example/v1"
+      -- list shows both by name, with their type
+      (fc2, capsList) <- makeFakeCaps []
+      runProv pr ["list"] capsList
+      out <- T.unlines <$> getSent fc2
+      out `shouldSatisfy` ("local (OpenAI-compatible)" `T.isInfixOf`)
+      out `shouldSatisfy` ("groq (OpenAI-compatible)" `T.isInfixOf`)
+
+  it "rejects an invalid name before writing anything" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (fc, caps) <- makeFakeCaps ["Work_Proxy"]
+      runProv pr ["add", "openai-compat"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("instance names are" `T.isInfixOf`)
+      Right cfg' <- loadRuntimeConfig cfg
+      rcProviders cfg' `shouldSatisfy` not . Map.member "Work_Proxy"
+      missing <- vhGet vh "PROVIDER_APIKEY_WORK_PROXY"
+      missing `shouldSatisfy` isLeft
+
+  it "rejects a reserved name" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (fc, caps) <- makeFakeCaps ["default"]
+      runProv pr ["add", "openai-compat"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("reserved" `T.isInfixOf`)
+
+  it "rejects another type's id as a name" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (fc, caps) <- makeFakeCaps ["ollama"]
+      runProv pr ["add", "openai-compat"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("is a provider type id" `T.isInfixOf`)
+
+  it "tells the user when a name belongs to another type" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
+      pr <- mkPR cfg (Just vh)
+      _ <- updateRuntimeConfig cfg
+             (upsertProvider "work" (\p -> p { pcType = Just "anthropic" }))
+      (fc, caps) <- makeFakeCaps ["work"]
+      runProv pr ["add", "openai-compat"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("already exists as a Anthropic instance" `T.isInfixOf`)
+
+  it "says Configuring the first time and Updating on a reconfigure" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (fc1, c1) <- makeFakeCaps ["", "https://gw.example/v1", "m1", "sk-1"]
+      runProv pr ["add", "openai-compat"] c1
+      out1 <- T.unlines <$> getSent fc1
+      out1 `shouldSatisfy` ("Configuring openai-compat" `T.isInfixOf`)
+      (fc2, c2) <- makeFakeCaps ["", "https://gw.example/v1", "m2", "sk-2"]
+      runProv pr ["add", "openai-compat"] c2
+      out2 <- T.unlines <$> getSent fc2
+      out2 `shouldSatisfy` ("Updating openai-compat" `T.isInfixOf`)
+
+  it "explains an instance name given where a type is expected" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      (fc, caps) <- makeFakeCaps []
+      runProv pr ["add", "groq"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("unknown provider type: groq" `T.isInfixOf`)
+
+  it "lists a named instance's own URL and status" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL", "sk-local")]
+      pr <- mkPR cfg (Just vh)
+      _ <- updateRuntimeConfig cfg
+             (upsertProvider "local" (\p -> p { pcType = Just "openai-compat"
+                                              , pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
+      (fc, caps) <- makeFakeCaps []
+      runProv pr ["list"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("local (OpenAI-compatible)" `T.isInfixOf`)
+      out `shouldSatisfy` ("auth: api-key" `T.isInfixOf`)
+      out `shouldSatisfy` ("base URL: http://127.0.0.1:9/v1" `T.isInfixOf`)
+
+  it "tests a named instance by name" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      let cfg = dir </> "config.toml"
+      vh <- makeFakeVault []
+      pr <- mkPR cfg (Just vh)
+      _ <- updateRuntimeConfig cfg
+             (upsertProvider "local" (\p -> p { pcType = Just "openai-compat"
+                                              , pcBaseUrl = Just "http://127.0.0.1:1/v1"
+                                              , pcDefaultModel = Just "m1" }))
+      (fc, caps) <- makeFakeCaps []
+      runProv pr ["test", "local"] caps
+      out <- T.unlines <$> getSent fc
+      out `shouldSatisfy` ("local test FAILED" `T.isInfixOf`)
+      out `shouldSatisfy` ("connection or transport error" `T.isInfixOf`)

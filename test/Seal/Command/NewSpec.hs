@@ -12,6 +12,7 @@ import Seal.Command.New
   , NewArgs (..), parseNewArgs, emptyNewArgs, resolveNewModel, resolveRepoUrl )
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
 import Seal.Command.Spec (mkRegistry, runCommandAction)
+import Seal.Config.File (defaultRuntimeConfig)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.SourceControl.Repo
@@ -49,7 +50,7 @@ stubDeps :: NewDeps
 stubDeps =
   NewDeps
     { ndPaths = error "ndPaths: unused"
-    , ndCfg = error "ndCfg: unused"
+    , ndCfg = pure defaultRuntimeConfig
     , ndAgentDefs = error "ndAgentDefs: unused"
     , ndChannelLabel = "test"
     , ndOldMeta = error "ndOldMeta: unused by parse/render tests"
@@ -211,8 +212,7 @@ legacySpec :: Spec
 legacySpec = describe "new -p validation" $ do
   it "rejects a legacy id with the rename guidance and mints no session" $ do
     (fc, caps) <- makeFakeCaps []
-    let deps = stubDeps { ndPaths = error "ndPaths must not be touched",
-                          ndCfg = error "ndCfg must not be touched" }
+    let deps = stubDeps { ndPaths = error "ndPaths must not be touched" }
     case parseSlash (mkRegistry [newCommandSpec deps]) "/new -p openrouter" of
       ParsedAction act -> do
         _ <- runCommandAction act caps
@@ -237,9 +237,10 @@ spec = spec_main >> legacySpec >> resolveModelSpec
 
 resolveModelSpec :: Spec
 resolveModelSpec = describe "resolveNewModel" $ do
-  it "repairs an empty inherited model from the target provider's default" $
-    resolveNewModel "anthropic" "" `shouldBe` "claude-opus-4-8"
+  it "repairs an empty inherited model from the target instance's default" $
+    resolveNewModel defaultRuntimeConfig "anthropic" "" `shouldBe` "claude-opus-4-8"
   it "keeps an explicit model" $
-    resolveNewModel "anthropic" "claude-haiku-4-5" `shouldBe` "claude-haiku-4-5"
-  it "keeps the empty value when the provider has no default model" $
-    resolveNewModel "openai-compat" "" `shouldBe` ""
+    resolveNewModel defaultRuntimeConfig "anthropic" "claude-haiku-4-5"
+      `shouldBe` "claude-haiku-4-5"
+  it "keeps the empty value when the instance has no default model" $
+    resolveNewModel defaultRuntimeConfig "openai-compat" "" `shouldBe` ""
