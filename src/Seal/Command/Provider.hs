@@ -6,6 +6,10 @@
 module Seal.Command.Provider
   ( pingRequest
   , formatTestResult
+  , AddPlan (..)
+  , BaseUrlPrompt (..)
+  , KeyPrompt (..)
+  , addPlanFor
   , ProviderRuntime (..)
   , providerCommandSpec
   , resolveSessionProvider
@@ -15,7 +19,7 @@ module Seal.Command.Provider
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
 import Data.IORef (IORef, readIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -36,12 +40,13 @@ import Seal.Config.File
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), SomeProvider, ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
+import Seal.Providers.OpenAICompat (OpenAICompatSpec (..), validateBaseUrl)
 import Seal.Providers.Registry
-  ( KnownProvider, completeSome, configuredProviders, defaultModelFor
-  , knownLabelList, knownProviders, legacyProviderHint, parseProvider
-  , providerLabel, resolveDefaultModel, resolveProvider, vaultErrText
-  , vaultKeyName )
-import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
+  ( KnownProvider (..), completeSome, defaultModelFor, knownLabelList
+  , knownProviders, legacyProviderHint, parseProvider, providerAuthStatus
+  , providerBaseUrlFor, providerDisplayName, providerLabel, resolveDefaultModel
+  , resolveProvider, vaultErrText, vaultKeyName )
+import Seal.Security.Vault (VaultHandle, vhDelete, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -165,45 +170,184 @@ seedProviderDefaults kp fc0 =
               Nothing -> fc1
               Just m  -> upsertProvider lbl (\p -> p { pcDefaultModel = Just (modelText m) }) fc1
 
+-- | What the add flow asks for, derived from the provider (never from a
+-- hardcoded id). Exported for tests.
+data BaseUrlPrompt
+  = NoBaseUrl                 -- ^ the endpoint is fixed (anthropic, presets)
+  | OptionalBaseUrl Text      -- ^ a default is offered (ollama)
+  | RequiredBaseUrl           -- ^ the user must supply one (generic family)
+  deriving stock (Eq, Show)
+
+data KeyPrompt = NoKey | OptionalKey | RequiredKey
+  deriving stock (Eq, Show)
+
+data AddPlan = AddPlan
+  { apBaseUrl :: BaseUrlPrompt
+  , apKey     :: KeyPrompt
+  , apModel   :: Maybe ModelId   -- ^ 'Just' ⇒ built in, 'Nothing' ⇒ prompt
+  } deriving stock (Eq, Show)
+
+-- | The add-flow plan for a provider. Further OpenAI-compatible vendors need
+-- no change here: their row supplies the key policy and model.
+addPlanFor :: KnownProvider -> AddPlan
+addPlanFor AnthropicProvider =
+  AddPlan NoBaseUrl RequiredKey (defaultModelFor AnthropicProvider)
+addPlanFor OllamaProvider =
+  AddPlan (OptionalBaseUrl defaultOllamaBaseUrl) OptionalKey (defaultModelFor OllamaProvider)
+addPlanFor (OpenAICompatProvider spec) =
+  AddPlan (maybe RequiredBaseUrl (const NoBaseUrl) (ocsBuiltinBaseUrl spec))
+          (if ocsKeyRequired spec then RequiredKey else OptionalKey)
+          (ocsDefaultModel spec)
+
+-- | The web channel's cancel sentinel (a typed "cancel" button).
+cancelSentinel :: Text
+cancelSentinel = "rejected"
+
+-- | Prompt until a valid value arrives (max 3 tries), then 'Nothing'. A blank
+-- answer or the cancel sentinel never becomes a stored value.
+promptRequired
+  :: ChannelCaps -> Text -> (Text -> Either Text a) -> (Text -> Text) -> IO (Maybe a)
+promptRequired caps label parse onError = go (3 :: Int)
+  where
+    go 0 = pure Nothing
+    go n = do
+      raw <- ccPrompt caps (AskPrompt label [])
+      case T.strip raw of
+        s | s == cancelSentinel -> pure Nothing
+        "" -> go (n - 1)
+        v  -> case parse v of
+                Left reason -> ccSend caps (onError reason) >> go (n - 1)
+                Right x     -> pure (Just x)
+
+-- | Prompt for a required secret (max 3 tries). The value never echoes.
+promptRequiredSecret :: ChannelCaps -> Text -> IO (Maybe Text)
+promptRequiredSecret caps label = go (3 :: Int)
+  where
+    go 0 = pure Nothing
+    go n = do
+      raw <- ccPromptSecret caps label
+      let v = T.strip raw
+      if T.null v || v == cancelSentinel then go (n - 1) else pure (Just v)
+
+-- | Store-then-configure. The vault is only touched when a non-empty key is
+-- actually being stored, so a keyless local endpoint needs no vault at all.
 addCmd :: ProviderRuntime -> Text -> CommandAction
 addCmd pr lbl = commandAction $ \caps ->
-  withProvider caps lbl $ \kp ->
-    withVaultHandle pr caps $ \vh ->
-      if providerLabel kp == "ollama"
-        then addOllama pr caps vh kp
-        else do
-          val <- ccPromptSecret caps ("API key for " <> providerLabel kp <> ": ")
-          res <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 val)
-          case res of
-            Left e   -> ccSend caps (vaultErrText e)
-            Right () -> do
-              _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
-              ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
+  withProvider caps lbl $ \kp -> do
+    let plan = addPlanFor kp
+        nm   = providerDisplayName kp
+    mUrl <- case apBaseUrl plan of
+      NoBaseUrl -> pure (Just Nothing)
+      OptionalBaseUrl def -> do
+        raw <- ccPrompt caps
+                 (AskPrompt (nm <> " base URL [" <> def <> "] (blank = keep): ") [])
+        case T.strip raw of
+          s | s == cancelSentinel -> pure Nothing
+          "" -> pure (Just Nothing)          -- keep whatever is configured
+          v  -> case validateBaseUrl v of
+                  Left reason -> ccSend caps (invalidBaseUrlCliMsg kp reason) >> pure Nothing
+                  Right u     -> pure (Just (Just u))
+      RequiredBaseUrl -> do
+        r <- promptRequired caps
+               (nm <> " base URL (full URL including the API path, e.g. https://host/v1): ")
+               validateBaseUrl
+               (invalidBaseUrlCliMsg kp)
+        pure (fmap Just r)
+    case mUrl of
+      Nothing -> ccSend caps (abortedMsg kp)
+      Just mUrlVal -> do
+        mModel <- case apModel plan of
+          Just m  -> pure (Just m)
+          Nothing -> promptRequired caps
+            (nm <> " model id (e.g. qwen2.5-7b-instruct; for keyed endpoints see"
+               <> " your provider's docs): ")
+            (Right . ModelId)
+            id
+        case mModel of
+          Nothing -> ccSend caps (abortedMsg kp)
+          Just model -> do
+            mKey <- case apKey plan of
+              NoKey -> pure (Just "")
+              OptionalKey -> do
+                raw <- ccPromptSecret caps
+                         (nm <> " API key (blank for a keyless endpoint): ")
+                pure (if T.strip raw == cancelSentinel then Nothing else Just raw)
+              RequiredKey -> promptRequiredSecret caps (nm <> " API key: ")
+            case mKey of
+              Nothing -> ccSend caps (abortedMsg kp)
+              Just key -> completeAdd pr caps kp mUrlVal model key
 
--- | Ollama onboarding: prompt for the base URL (blank keeps the default),
--- persist it to config, then prompt for an optional API key (blank => local,
--- nothing stored). Seeds provider/model defaults like the generic path.
-addOllama :: ProviderRuntime -> ChannelCaps -> VaultHandle -> KnownProvider -> IO ()
-addOllama pr caps vh kp = do
-  urlIn <- ccPrompt caps
-             (AskPrompt ("Ollama base URL [" <> defaultOllamaBaseUrl <> "] (blank = default): ") [])
-  let mUrl = if T.null (T.strip urlIn) then Nothing else Just (T.strip urlIn)
-  keyIn <- ccPromptSecret caps "Ollama API key (blank for local): "
+-- | The tail of the add flow: optional cleartext warning, vault write, config
+-- write (vault first, so a locked vault aborts before anything is persisted),
+-- then the confirmation.
+completeAdd
+  :: ProviderRuntime -> ChannelCaps -> KnownProvider
+  -> Maybe Text -> ModelId -> Text -> IO ()
+completeAdd pr caps kp mUrl model key = do
+  let nm = providerDisplayName kp
+      keyTxt = T.strip key
+  case mUrl of
+    Just u | not (T.null keyTxt), not (secureOrLoopback u) ->
+      ccSend caps
+        (nm <> " base URL is http, not https — the API key will be sent"
+           <> " unencrypted (continuing)")
+    _ -> pure ()
   keyRes <-
-    if T.null keyIn
+    if T.null keyTxt
       then pure (Right ())
-      else vhPut vh (vaultKeyName kp) (TE.encodeUtf8 keyIn)
+      else do
+        mh <- readIORef (vrHandleRef (prVault pr))
+        case mh of
+          Nothing -> pure (Left (nm <> " needs an API key — run /vault setup"))
+          Just vh -> do
+            r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 keyTxt)
+            pure $ case r of
+              Left e   -> Left (vaultErrText e)
+              Right () -> Right ()
   case keyRes of
-    Left e   -> ccSend caps (vaultErrText e)
+    Left e -> ccSend caps e
     Right () -> do
-      _ <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
-      ccSend caps "Configured ollama."
-  where
-    seedAll mUrl fc =
-      let fc' = seedProviderDefaults kp fc
-      in case mUrl of
-           Nothing -> fc'
-           Just u  -> upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Just u }) fc'
+      _ <- updateRuntimeConfig (prConfigPath pr) (\fc ->
+             let fc1 = seedProviderDefaults kp fc
+                 fc2 = seedModel kp model fc1
+             in case mUrl of
+                  Just u  -> upsertProvider (providerLabel kp)
+                               (\p -> p { pcBaseUrl = Just u }) fc2
+                  Nothing -> fc2)
+      ccSend caps (configuredMsg kp mUrl model)
+
+-- | Seed the provider's @default_model@ (a user-supplied model always wins).
+seedModel :: KnownProvider -> ModelId -> RuntimeConfig -> RuntimeConfig
+seedModel kp model =
+  upsertProvider (providerLabel kp) (\p -> p { pcDefaultModel = Just (modelText model) })
+
+-- | Should a URL be treated as safe for a bearer token? https anywhere, or
+-- http on loopback / a private host.
+secureOrLoopback :: Text -> Bool
+secureOrLoopback u
+  | "https://" `T.isPrefixOf` u = True
+  | "http://" `T.isPrefixOf` u =
+      let host = T.takeWhile (\c -> c /= '/' && c /= ':') (T.drop 7 u)
+      in host == "localhost"
+           || "127." `T.isPrefixOf` host
+           || host == "[::1]"
+           || "192.168." `T.isPrefixOf` host
+           || "10." `T.isPrefixOf` host
+  | otherwise = False
+
+configuredMsg :: KnownProvider -> Maybe Text -> ModelId -> Text
+configuredMsg kp mUrl (ModelId model) =
+  "Configured " <> providerLabel kp
+    <> maybe "" (\u -> " (" <> u <> ", model " <> model <> ")") mUrl
+    <> ". Run /provider test " <> providerLabel kp <> " to verify."
+
+abortedMsg :: KnownProvider -> Text
+abortedMsg kp = "nothing was saved — run /provider add " <> providerLabel kp <> " again"
+
+invalidBaseUrlCliMsg :: KnownProvider -> Text -> Text
+invalidBaseUrlCliMsg kp reason =
+  providerDisplayName kp <> " base URL is not usable (" <> reason <> ") — it must"
+    <> " be an http(s) URL like https://host/v1"
 
 -- | Set the default provider for new sessions (writes @default_provider@).
 -- Only a valid provider label is accepted; no credential or vault is required,
@@ -230,37 +374,34 @@ defaultCmd pr lbl = commandAction $ \caps ->
              Nothing -> " (no default model — set one with /model use "
                           <> plabel <> " <model-id>)")
 
+-- | List every known provider with the shared status derivation (the same one
+-- the gateway uses) and the URL Seal will actually talk to.
 listCmd :: ProviderRuntime -> CommandAction
-listCmd pr = commandAction $ \caps ->
-  withVaultHandle pr caps $ \vh -> do
-    eCfg <- loadRuntimeConfig (prConfigPath pr)
-    let cfg = fromRight defaultRuntimeConfig eCfg
-        def = rcDefaultProvider cfg
-    configured <- configuredProviders (Just vh) cfg
-    if null configured
-      then ccSend caps "no providers configured — run /provider add <provider>"
-      else mapM_ (reportOne caps vh def) configured
+listCmd pr = commandAction $ \caps -> do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
+      def = rcDefaultProvider cfg
+  mh <- readIORef (vrHandleRef (prVault pr))
+  mapM_ (reportOne caps cfg def mh) knownProviders
   where
-    reportOne caps vh def kp = do
-      eKey <- vhGet vh (vaultKeyName kp)
-      auth <- authLabel vh kp eKey
-      let mark = if Just (providerLabel kp) == def then " (default)" else ""
-      ccSend caps (providerLabel kp <> mark <> " — " <> auth)
+    reportOne caps cfg def mh kp = do
+      st <- providerAuthStatus mh cfg kp
+      let url = case providerBaseUrlFor cfg kp of
+                  Right u -> u
+                  Left _  -> "not set"
+          mark = if Just (providerLabel kp) == def then " (default)" else ""
+      ccSend caps (providerLabel kp <> mark <> " — auth: " <> statusLabel st
+                     <> ", base URL: " <> url)
+    statusLabel = \case
+      "api-key"      -> "api-key"
+      "keyless"      -> "keyless"
+      "oauth"        -> "oauth"
+      "vault-locked" -> "vault locked"
+      _              -> "none"
 
-    authLabel vh kp eKey
-      | providerLabel kp == "ollama" =
-          pure $ case eKey of
-            Right _          -> "auth: api-key"
-            Left VaultLocked -> "auth: (vault locked)"
-            _                -> "auth: none (local)"
-      | otherwise = do
-          eOAuth <- vhGet vh anthropicOAuthKey
-          pure $ case (eOAuth, eKey) of
-            (Right _, _)          -> "auth: oauth"
-            (_, Right _)          -> "auth: api-key"
-            (Left VaultLocked, _) -> "auth: (vault locked)"
-            _                     -> "auth: none"
-
+-- | OAuth login flow. Anthropic-only for this milestone. Prints the authorize
+-- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges
+-- it for tokens, and stores them in the vault. Tokens are never echoed.
 -- | OAuth login flow. Anthropic-only for this milestone. Prints the authorize
 -- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges
 -- it for tokens, and stores them in the vault. Tokens are never echoed.
@@ -298,33 +439,42 @@ openBrowser url = do
 
 testCmd :: ProviderRuntime -> Text -> CommandAction
 testCmd pr lbl = commandAction $ \caps ->
-  withProvider caps lbl $ \kp ->
-    withVaultHandle pr caps $ \vh -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let cfg     = fromRight defaultRuntimeConfig eCfg
-          canonLbl = providerLabel kp
-          model = fromMaybe (ModelId "") $ case eCfg of
-            Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
-            Left _  -> defaultModelFor kp
-      eProv <- resolveProvider (Just vh) (prManager pr) cfg kp model (prCallCounter pr)
-      case eProv of
-        Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
-        Right sp -> do
-          r <- completeSome sp (pingRequest model) :: IO (Either Text CompletionResponse)
-          ccSend caps (formatTestResult (providerLabel kp) r)
+  withProvider caps lbl $ \kp -> do
+    eCfg <- loadRuntimeConfig (prConfigPath pr)
+    let cfg     = fromRight defaultRuntimeConfig eCfg
+        canonLbl = providerLabel kp
+        model = fromMaybe (ModelId "") $ case eCfg of
+          Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
+          Left _  -> defaultModelFor kp
+    mh <- readIORef (vrHandleRef (prVault pr))
+    eProv <- resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr)
+    case eProv of
+      Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
+      Right sp -> do
+        r <- completeSome sp (pingRequest model) :: IO (Either Text CompletionResponse)
+        ccSend caps (formatTestResult (providerLabel kp) r)
 
+-- | Remove a provider's credential(s) and deconfigure it: the vault key (when
+-- there is one), the Anthropic OAuth blob (anthropic only — never for another
+-- provider), a family row's base URL (so a keyless provider can actually be
+-- removed), and the default pointers when it was the default. Works with no
+-- vault configured.
 removeCmd :: ProviderRuntime -> Text -> CommandAction
 removeCmd pr lbl = commandAction $ \caps ->
-  withProvider caps lbl $ \kp ->
-    withVaultHandle pr caps $ \vh -> do
-      r1 <- deleteIfPresent vh (vaultKeyName kp)
-      r2 <- deleteIfPresent vh anthropicOAuthKey
-      case (r1, r2) of
-        (Left e, _) -> ccSend caps (vaultErrText e)
-        (_, Left e) -> ccSend caps (vaultErrText e)
-        _           -> do
-          _ <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
-          ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
+  withProvider caps lbl $ \kp -> do
+    mh <- readIORef (vrHandleRef (prVault pr))
+    keyRes <- case mh of
+      Nothing -> pure (Right ())
+      Just vh -> deleteIfPresent vh (vaultKeyName kp)
+    oauthRes <- case (mh, kp) of
+      (Just vh, AnthropicProvider) -> deleteIfPresent vh anthropicOAuthKey
+      _                            -> pure (Right ())
+    case (keyRes, oauthRes) of
+      (Left e, _) -> ccSend caps (vaultErrText e)
+      (_, Left e) -> ccSend caps (vaultErrText e)
+      _           -> do
+        _ <- updateRuntimeConfig (prConfigPath pr) (deconfigure kp)
+        ccSend caps ("Removed " <> providerDisplayName kp <> ".")
   where
     -- | Delete a key; a missing key is not an error.
     deleteIfPresent vh k = do
@@ -332,10 +482,15 @@ removeCmd pr lbl = commandAction $ \caps ->
       pure $ case res of
         Left (VaultKeyNotFound _) -> Right ()
         other                     -> other
-    clearDefault kp fc
-      | rcDefaultProvider fc == Just (providerLabel kp) =
-          fc { rcDefaultProvider = Nothing, rcDefaultModel = Nothing }
-      | otherwise = fc
+    deconfigure kp fc =
+      let fc1 = case kp of
+                  OpenAICompatProvider spec | isNothing (ocsBuiltinBaseUrl spec) ->
+                    upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Nothing }) fc
+                  _ -> fc
+          fc2 = if rcDefaultProvider fc1 == Just (providerLabel kp)
+                  then fc1 { rcDefaultProvider = Nothing, rcDefaultModel = Nothing }
+                  else fc1
+      in fc2
 
 modelText :: ModelId -> Text
 modelText (ModelId t) = t
