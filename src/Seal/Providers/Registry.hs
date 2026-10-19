@@ -19,6 +19,17 @@ module Seal.Providers.Registry
   , legacyTypeIds
   , ProviderInstance (..)
   , providerInstances
+  , findInstance
+  , ProviderCredentials (..)
+  , legacyKeyFor
+  , instanceCredentials
+  , providerBaseUrlForInstance
+  , instanceAuthStatus
+  , configuredInstances
+  , resolveInstance
+  , resolveDefaultModelFor
+  , instanceLabelList
+  , providerTypeLabel
   , toProviderType
   , OpenAICompatSpec (..)
   , knownProviders
@@ -61,7 +72,7 @@ import Network.HTTP.Client (Manager)
 
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), emptyProviderConfig
-  , providerBaseUrl )
+  , providerBaseUrl, providerDefaultModel )
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic
   ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
@@ -70,7 +81,8 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
-import Seal.Providers.Name (ProviderName, mkProviderName)
+import Seal.Providers.Name
+  ( ProviderName, apiKeyNameFor, mkProviderName, oauthKeyNameFor )
 import Seal.Providers.OpenAICompat
   ( OpenAICompatSpec (..), mkOpenAICompat, validateBaseUrl )
 import Seal.Security.Secrets (ApiKey, mkApiKey)
@@ -264,13 +276,23 @@ catalogProblems specs =
   where
     check s = concat
       [ [ "blank id" | T.null (T.strip (ocsId s)) ]
+      , [ "id " <> ocsId s <> " is not a valid instance name (1-32 of a-z 0-9 -)"
+        | Left _ <- [mkProviderName (ocsId s)] ]
+      , [ "id " <> ocsId s <> " collides with a built-in provider type"
+        | ocsId s `elem` ["anthropic", "ollama"] ]
       , [ "blank display name for " <> ocsId s | T.null (T.strip (ocsDisplayName s)) ]
       , [ "blank vault key for " <> ocsId s | T.null (T.strip (ocsVaultKey s)) ]
+      , [ "vault key for " <> ocsId s <> " must not use the PROVIDER_ prefix"
+        | "PROVIDER_" `T.isPrefixOf` ocsVaultKey s ]
+      , [ "vault key for " <> ocsId s <> " collides with a legacy provider key"
+        | ocsVaultKey s `elem` legacyReservedKeys ]
       , [ ocsId s <> " built-in base URL is not usable: " <> reason
         | Just u <- [ocsBuiltinBaseUrl s]
         , Left reason <- [validateBaseUrl u]
         ]
       ]
+    legacyReservedKeys =
+      [ "ANTHROPIC_API_KEY", "OLLAMA_API_KEY", "ANTHROPIC_OAUTH_TOKENS" ]
     duplicates = go [] []
       where
         go _ dups [] = dups
@@ -595,3 +617,259 @@ infixr 2 ||^
 a ||^ b = do
   x <- a
   if x then pure True else b
+
+-- ---------------------------------------------------------------------------
+-- Instances: credentials, resolution, status (#273 WU-2)
+-- ---------------------------------------------------------------------------
+
+-- | The vault names an instance's credentials live under. Only obtainable for a
+-- resolvable, valid instance — so \"cannot touch the vault\" is a type fact, not
+-- a convention: a row with an invalid name, an unknown type or a problem has no
+-- 'ProviderCredentials' at all.
+data ProviderCredentials = ProviderCredentials
+  { pcApiKeyName   :: !Text
+  , pcOauthKeyName :: !(Maybe Text)   -- ^ anthropic-typed instances only
+  } deriving stock (Eq, Show)
+
+-- | The legacy vault key for a type (the name an instance named after its own
+-- type keeps, so upgrading never moves a secret).
+legacyKeyFor :: ProviderType -> Maybe Text
+legacyKeyFor AnthropicType           = Just "ANTHROPIC_API_KEY"
+legacyKeyFor OllamaType              = Just "OLLAMA_API_KEY"
+legacyKeyFor (OpenAICompatType spec) = Just (ocsVaultKey spec)
+
+-- | The legacy OAuth vault key for a type.
+legacyOauthKeyFor :: ProviderType -> Maybe Text
+legacyOauthKeyFor AnthropicType = Just anthropicOAuthKey
+legacyOauthKeyFor _             = Nothing
+
+-- | Where this instance's credentials live, or 'Nothing' when the row must not
+-- touch the vault at all (invalid/reserved name, unknown type, or any problem).
+instanceCredentials :: ProviderInstance -> Maybe ProviderCredentials
+instanceCredentials inst = case (piNameValid inst, piType inst, piProblem inst) of
+  (Just n, Just t, Nothing) ->
+    Just ProviderCredentials
+      { pcApiKeyName   = apiKeyNameFor (legacyKeyFor t) n (typeId t)
+      , pcOauthKeyName = case t of
+          AnthropicType ->
+            Just (oauthKeyNameFor (legacyOauthKeyFor t) n (typeId t))
+          _ -> Nothing
+      }
+  _ -> Nothing
+
+-- | The instance with this exact name, if it exists (implicit rows included).
+findInstance :: RuntimeConfig -> Text -> Maybe ProviderInstance
+findInstance cfg name = case [ i | i <- providerInstances cfg, piName i == name ] of
+  (i : _) -> Just i
+  []      -> Nothing
+
+-- | The known instance names, for \"known: …\" error tails.
+instanceLabelList :: RuntimeConfig -> Text
+instanceLabelList cfg = T.intercalate ", " (map piName (providerInstances cfg))
+
+-- | Human label for a type (@Anthropic@, @Ollama@, @OpenAI-compatible@, …).
+providerTypeLabel :: ProviderType -> Text
+providerTypeLabel AnthropicType           = "Anthropic"
+providerTypeLabel OllamaType              = "Ollama"
+providerTypeLabel (OpenAICompatType spec) = ocsDisplayName spec
+
+-- | The effective base URL for an instance. Every lookup uses the instance's
+-- **own** section name (never a type id), so two instances of one type never
+-- share a URL. A catalog row's built-in URL stays authoritative.
+providerBaseUrlForInstance :: RuntimeConfig -> ProviderInstance -> Either Text Text
+providerBaseUrlForInstance cfg inst = case piType inst of
+  Nothing -> Left (misconfiguredMsg inst)
+  Just t  -> case t of
+    AnthropicType -> Right anthropicBaseUrl
+    OllamaType ->
+      Right (fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (piName inst)))
+    OpenAICompatType spec -> case ocsBuiltinBaseUrl spec of
+      Just u -> Right u
+      Nothing -> case providerBaseUrl cfg (piName inst) of
+        Nothing -> Left (instanceNeedsBaseUrlMsg inst t)
+        Just raw -> case validateBaseUrl raw of
+          Left reason -> Left (instanceInvalidBaseUrlMsg inst reason)
+          Right u -> Right u
+
+-- | What the UI shows for an instance. Mirrors 'configuredInstances' so the two
+-- cannot disagree; an unresolvable row is always @none@.
+instanceAuthStatus :: Maybe VaultHandle -> RuntimeConfig -> ProviderInstance -> IO Text
+instanceAuthStatus mh cfg inst = case instanceCredentials inst of
+  Nothing -> pure "none"
+  Just creds -> case piType inst of
+    Nothing -> pure "none"
+    Just AnthropicType -> case mh of
+      Nothing -> pure "none"
+      Just vh -> do
+        eOAuth <- vhGet vh (fromMaybe anthropicOAuthKey (pcOauthKeyName creds))
+        case eOAuth of
+          Right _          -> pure "oauth"
+          Left VaultLocked -> pure "vault-locked"
+          Left _           -> probeVault vh (pcApiKeyName creds)
+    Just OllamaType -> do
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (piName inst))
+      if not (ollamaNeedsKey baseUrl)
+        then pure "keyless"
+        else case mh of
+          Nothing -> pure "none"
+          Just vh -> probeVault vh (pcApiKeyName creds)
+    Just (OpenAICompatType spec) -> case providerBaseUrlForInstance cfg inst of
+      Left _ -> pure "none"
+      Right _ -> case mh of
+        Nothing -> pure (if ocsKeyRequired spec then "none" else "keyless")
+        Just vh -> do
+          r <- vhGet vh (pcApiKeyName creds)
+          pure $ case r of
+            Right _ -> "api-key"
+            Left VaultLocked
+              | ocsKeyRequired spec -> "vault-locked"
+              | otherwise           -> "keyless"
+            Left _ -> if ocsKeyRequired spec then "none" else "keyless"
+
+-- | The instances usable right now (same rules as #271, applied per instance).
+configuredInstances :: Maybe VaultHandle -> RuntimeConfig -> IO [ProviderInstance]
+configuredInstances mvh cfg = filterM isConfigured (providerInstances cfg)
+  where
+    isConfigured inst = case instanceCredentials inst of
+      Nothing -> pure False
+      Just creds -> case piType inst of
+        Nothing -> pure False
+        Just AnthropicType ->
+          hasVaultKey mvh (pcApiKeyName creds)
+            ||^ maybe (pure False) (hasVaultKey mvh) (pcOauthKeyName creds)
+        Just OllamaType -> do
+          let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (piName inst))
+          if not (ollamaNeedsKey baseUrl)
+            then pure True
+            else hasVaultKey mvh (pcApiKeyName creds)
+        Just (OpenAICompatType spec) -> case providerBaseUrlForInstance cfg inst of
+          Left _ -> pure False
+          Right _ | not (ocsKeyRequired spec) -> pure True
+                  | otherwise -> hasVaultKey mvh (pcApiKeyName creds)
+
+-- | Build the OAuth session for an anthropic instance, reading **and writing**
+-- through that instance's own OAuth key (leaving the literal would make a
+-- refresh for one instance overwrite another's tokens).
+buildOAuthSession :: ProviderInstance -> Manager -> VaultHandle -> Text
+                  -> IO (Either Text OAuthSession)
+buildOAuthSession _inst mgr vh oauthKey = do
+  eOAuth <- vhGet vh oauthKey
+  case eOAuth of
+    Right blob -> case deserializeTokens blob of
+      Left e -> pure (Left ("stored Anthropic OAuth tokens are unreadable ("
+                              <> e <> ") — run /provider login anthropic"))
+      Right toks -> do
+        ref <- newIORef toks
+        let sess = OAuthSession
+              { osTokens  = ref
+              , osRefresh = refreshTokens mgr
+              , osPersist = void . vhPut vh oauthKey . serializeTokens
+              }
+        _ <- ensureFresh sess
+        pure (Right sess)
+    Left e -> pure (Left (vaultErrText e))
+
+-- | Resolve an instance into a live provider. Credentials, base URL and model
+-- all come from the same 'ProviderInstance'.
+resolveInstance
+  :: Maybe VaultHandle -> Manager -> RuntimeConfig -> ProviderInstance -> ModelId
+  -> IORef Int -> IO (Either Text SomeProvider)
+resolveInstance mvh mgr cfg inst model callCounter =
+  case instanceCredentials inst of
+    Nothing -> pure (Left (misconfiguredMsg inst))
+    Just creds -> case piType inst of
+      Nothing -> pure (Left (misconfiguredMsg inst))
+      Just t -> do
+        case providerBaseUrlForInstance cfg inst of
+          Left e -> pure (Left e)
+          Right baseUrl -> case t of
+            AnthropicType -> resolveAnthropicInstance mvh mgr inst creds model
+            OllamaType -> resolveOllamaInstance mvh mgr baseUrl creds model callCounter
+            OpenAICompatType spec ->
+              resolveOpenAIInstance mvh mgr baseUrl creds model spec
+
+resolveAnthropicInstance
+  :: Maybe VaultHandle -> Manager -> ProviderInstance -> ProviderCredentials
+  -> ModelId -> IO (Either Text SomeProvider)
+resolveAnthropicInstance mvh mgr inst creds model = case mvh of
+  Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+  Just vh -> case pcOauthKeyName creds of
+    Just oauthKey -> do
+      eSess <- buildOAuthSession inst mgr vh oauthKey
+      case eSess of
+        Right sess -> pure (Right (SomeProvider (mkAnthropicOAuth mgr sess model)))
+        Left _ -> do
+          -- No usable OAuth blob: fall back to the instance's API key.
+          eKey <- vhGet vh (pcApiKeyName creds)
+          pure $ case eKey of
+            Left e         -> Left (vaultErrText e)
+            Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
+    Nothing -> pure (Left (misconfiguredMsg inst))
+
+resolveOllamaInstance
+  :: Maybe VaultHandle -> Manager -> Text -> ProviderCredentials -> ModelId
+  -> IORef Int -> IO (Either Text SomeProvider)
+resolveOllamaInstance mvh mgr baseUrl creds model callCounter
+  | not (ollamaNeedsKey baseUrl) =
+      Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model callCounter
+  | otherwise = case mvh of
+      Nothing -> pure (Left (instanceNeedsKeyMsg baseUrl creds))
+      Just vh -> do
+        eKey <- vhGet vh (pcApiKeyName creds)
+        case eKey of
+          Right kb         -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
+          Left VaultLocked -> pure (Left (vaultErrText VaultLocked))
+          Left e           -> pure (Left (vaultErrText e))
+
+resolveOpenAIInstance
+  :: Maybe VaultHandle -> Manager -> Text -> ProviderCredentials -> ModelId
+  -> OpenAICompatSpec -> IO (Either Text SomeProvider)
+resolveOpenAIInstance mvh mgr baseUrl creds model spec
+  | ocsKeyRequired spec = case mvh of
+      Nothing -> pure (Left (keyNoVaultMsg spec))
+      Just vh -> do
+        eKey <- vhGet vh (pcApiKeyName creds)
+        case eKey of
+          Right kb                  -> pure (Right (SomeProvider
+            (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model spec)))
+          Left VaultLocked          -> pure (Left (keyLockedMsg spec))
+          Left (VaultKeyNotFound _) -> pure (Left (keyMissingMsg spec))
+          Left e                    -> pure (Left (vaultErrText e))
+  | otherwise = do
+      mKey <- readKeyIfAny mvh (pcApiKeyName creds)
+      pure (Right (SomeProvider (mkOpenAICompat mgr mKey baseUrl model spec)))
+
+-- | A provider instance's default model: its own @default_model@ if set, else
+-- its type's built-in default. 'Nothing' when the instance or its type is
+-- unresolvable — never another type's model.
+resolveDefaultModelFor :: RuntimeConfig -> Text -> Maybe ModelId
+resolveDefaultModelFor cfg name = do
+  inst <- findInstance cfg name
+  t <- piType inst
+  case providerDefaultModel cfg name of
+    Just m | not (T.null (T.strip m)) -> Just (ModelId m)
+    _ -> case t of
+      AnthropicType           -> Just (ModelId "claude-opus-4-8")
+      OllamaType              -> Just (ModelId "llama3.2")
+      OpenAICompatType spec   -> ocsDefaultModel spec
+
+misconfiguredMsg :: ProviderInstance -> Text
+misconfiguredMsg inst =
+  "provider \"" <> piName inst <> "\" is misconfigured: "
+    <> fromMaybe "unusable configuration" (piProblem inst)
+    <> " — fix or delete the section in config.toml"
+
+instanceNeedsBaseUrlMsg :: ProviderInstance -> ProviderType -> Text
+instanceNeedsBaseUrlMsg inst t =
+  piName inst <> " needs a base URL — set it in the Providers view, or run"
+    <> " /provider add " <> typeId t <> " " <> piName inst
+
+instanceInvalidBaseUrlMsg :: ProviderInstance -> Text -> Text
+instanceInvalidBaseUrlMsg inst reason =
+  piName inst <> " base URL is not usable (" <> reason <> ") — it must be an"
+    <> " http(s) URL like https://host/v1"
+
+instanceNeedsKeyMsg :: Text -> ProviderCredentials -> Text
+instanceNeedsKeyMsg baseUrl creds =
+  "the Ollama host at " <> baseUrl <> " needs an API key (vault name "
+    <> pcApiKeyName creds <> ") — run /vault setup, then /provider add ollama"
