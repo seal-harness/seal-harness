@@ -113,6 +113,7 @@ library
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
         Seal.Providers.ContextWindow
+        Seal.Providers.Name
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Providers.OpenAICompat
@@ -572,6 +573,7 @@ test-suite tests
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
+        Seal.Providers.NameSpec
         Seal.Providers.OllamaSpec
         Seal.Providers.ContextWindowSpec
         Seal.Providers.OpenAICompatSpec
