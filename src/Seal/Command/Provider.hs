@@ -38,8 +38,9 @@ import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Ro
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider, completeSome, configuredProviders, defaultModelFor
-  , knownProviders, parseProvider, providerLabel, resolveDefaultModel
-  , resolveProvider, vaultErrText, vaultKeyName )
+  , knownLabelList, knownProviders, legacyProviderHint, parseProvider
+  , providerLabel, resolveDefaultModel, resolveProvider, vaultErrText
+  , vaultKeyName )
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -342,7 +343,7 @@ resolveSessionProvider
   :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
 resolveSessionProvider pr meta =
   case parseProvider (smProvider meta) of
-    Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
+    Nothing -> pure (Left (unknownSessionProviderMsg (smProvider meta)))
     Just kp -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
       let cfg   = fromRight defaultRuntimeConfig eCfg
@@ -356,9 +357,25 @@ resolveDefProvider
   :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
 resolveDefProvider pr providerLabel' model =
   case parseProvider providerLabel' of
-    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel'))
+    Nothing -> pure (Left (unknownAgentDefProviderMsg providerLabel'))
     Just kp -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
       let cfg = fromRight defaultRuntimeConfig eCfg
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr))
+
+-- | The "unknown provider in session" message, with rename guidance when the
+-- id is a legacy one.
+unknownSessionProviderMsg :: Text -> Text
+unknownSessionProviderMsg p = case legacyProviderHint p of
+  Just h  -> "unknown provider in session: " <> p <> " \x2014 " <> h
+               <> "; first run /provider add openai-compat, then /model use"
+               <> " openai-compat <model-id>"
+  Nothing -> "unknown provider in session: " <> p <> " (known: " <> knownLabelList <> ")"
+
+-- | The "unknown provider in agent def" message, with rename guidance.
+unknownAgentDefProviderMsg :: Text -> Text
+unknownAgentDefProviderMsg p = case legacyProviderHint p of
+  Just h  -> "unknown provider in agent def: " <> p <> " \x2014 " <> h
+               <> "; edit the def's provider line to openai-compat"
+  Nothing -> "unknown provider in agent def: " <> p <> " (known: " <> knownLabelList <> ")"

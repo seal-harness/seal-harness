@@ -26,6 +26,8 @@ module Seal.Providers.Registry
   , anthropicOAuthKey
   , providerId
   , parseProvider
+  , legacyProviderHint
+  , knownLabelList
   , vaultKeyName
   , defaultModelFor
   , resolveDefaultModel
@@ -153,6 +155,19 @@ parseProviderIn :: [KnownProvider] -> Text -> Maybe KnownProvider
 parseProviderIn kps t =
   let needle = T.toCaseFold (T.strip t)
   in lookup needle [(T.toCaseFold (providerLabel p), p) | p <- kps]
+
+-- | Guidance for a provider id that Seal used to ship under another name.
+-- 'Nothing' for ids that never existed. One place, three surfaces (session,
+-- agent def, @new -p@).
+legacyProviderHint :: Text -> Maybe Text
+legacyProviderHint raw
+  | T.toCaseFold (T.strip raw) == "openrouter" =
+      Just "openrouter was renamed to openai-compat"
+  | otherwise = Nothing
+
+-- | The known provider ids, comma-separated (for \"known: …\" error tails).
+knownLabelList :: Text
+knownLabelList = T.intercalate ", " (map providerLabel knownProviders)
 
 -- | The vault secret name under which this provider's API key is stored.
 vaultKeyName :: KnownProvider -> Text

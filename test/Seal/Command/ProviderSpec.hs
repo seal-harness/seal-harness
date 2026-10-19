@@ -3,7 +3,7 @@ module Seal.Command.ProviderSpec (spec) where
 
 import Control.Monad (void)
 import Data.ByteString (ByteString)
-import Data.Either (isLeft)
+import Data.Either (fromRight, isLeft)
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -14,11 +14,15 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
-import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
+import Seal.Command.Provider
+  ( ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec
+  , resolveDefProvider, resolveSessionProvider )
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig, providerBaseUrl, providerDefaultModel)
 import Seal.Config.Paths (SealPaths (..))
-import Seal.Core.Types (ModelId (..))
+import Seal.Session.Meta (SessionMeta (..))
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Providers.Class
   ( CompletionRequest (..), CompletionResponse (..)
   , StopReason (..), ToolChoice (..), Usage (..) )
@@ -51,8 +55,8 @@ runProv pr argv caps =
 -- Spec
 -- ---------------------------------------------------------------------------
 
-spec :: Spec
-spec = do
+spec_main :: Spec
+spec_main = do
   describe "Seal.Command.Provider helpers" $ do
     describe "pingRequest" $ do
       it "uses the given model, one message, no tools, a small token cap" $ do
@@ -302,3 +306,53 @@ spec = do
 
     it "live: /provider test anthropic round-trips against the real API"
       pending  -- requires ANTHROPIC_API_KEY + network; run manually
+
+-- ---------------------------------------------------------------------------
+-- Legacy provider-id recovery (issue #271: openrouter -> openai-compat)
+-- ---------------------------------------------------------------------------
+
+legacyMeta :: SessionMeta
+legacyMeta =
+  let t = posixSecondsToUTCTime 0
+      sid = fromRight (error "bad sid") (mkSessionId "legacy")
+  in SessionMeta
+       { smId = sid, smProvider = "openrouter", smModel = "deepseek/x"
+       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing
+       , smAgentName = Nothing, smDescription = Nothing, smRepoUrl = Nothing
+       , smCreatedAt = t, smLastActive = t
+       }
+
+legacySpec :: Spec
+legacySpec = describe "legacy provider id recovery" $ do
+  it "a session on openrouter names the rename and both repair commands" $
+    withSystemTempDirectory "seal-provider-legacy" $ \root -> do
+      pr <- mkPR (root </> "config.toml") Nothing
+      r <- resolveSessionProvider pr legacyMeta
+      case r of
+        Left e -> do
+          e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("/provider add openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("/model use openai-compat" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left"
+
+  it "an agent def on openrouter names the rename and the provider line" $
+    withSystemTempDirectory "seal-provider-legacy" $ \root -> do
+      pr <- mkPR (root </> "config.toml") Nothing
+      r <- resolveDefProvider pr "openrouter" (ModelId "m")
+      case r of
+        Left e -> do
+          e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("provider line" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left"
+
+  it "an unknown (non-legacy) id lists the known providers" $
+    withSystemTempDirectory "seal-provider-legacy" $ \root -> do
+      pr <- mkPR (root </> "config.toml") Nothing
+      r <- resolveDefProvider pr "nope" (ModelId "m")
+      case r of
+        Left e -> e `shouldSatisfy` ("(known: anthropic, ollama, openai-compat)" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left"
+
+-- | Both suites, so the module keeps its single exported @spec@.
+spec :: Spec
+spec = spec_main >> legacySpec

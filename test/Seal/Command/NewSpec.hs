@@ -4,13 +4,14 @@ module Seal.Command.NewSpec (spec) where
 import Data.Text (Text)
 import qualified Data.Text as T
 import Test.Hspec
+import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
   , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl )
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec (mkRegistry, runCommandAction)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.SourceControl.Repo
@@ -57,8 +58,8 @@ stubDeps =
     , ndRepoReg = Nothing
     }
 
-spec :: Spec
-spec = describe "Seal.Command.New" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Command.New" $ do
   describe "renderNewConfirmation" $ do
     let newMeta = SessionMeta
           { smId = mkSid "20260719-120000-001"
@@ -201,3 +202,35 @@ showPO (ParsedAction _)   = "ParsedAction"
 showPO (ParseHelp Nothing) = "ParseHelp nothing"
 showPO (ParseHelp (Just _)) = "ParseHelp just"
 showPO (ParseFailure _)   = "ParseFailure"
+
+-- ---------------------------------------------------------------------------
+-- Legacy / unknown provider ids (issue #271: openrouter -> openai-compat)
+-- ---------------------------------------------------------------------------
+
+legacySpec :: Spec
+legacySpec = describe "new -p validation" $ do
+  it "rejects a legacy id with the rename guidance and mints no session" $ do
+    (fc, caps) <- makeFakeCaps []
+    let deps = stubDeps { ndPaths = error "ndPaths must not be touched",
+                          ndCfg = error "ndCfg must not be touched" }
+    case parseSlash (mkRegistry [newCommandSpec deps]) "/new -p openrouter" of
+      ParsedAction act -> do
+        _ <- runCommandAction act caps
+        sent <- getSent fc
+        let out = T.unpack (T.unlines sent)
+        out `shouldContain` "renamed to openai-compat"
+        out `shouldContain` "known: anthropic, ollama, openai-compat"
+      other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+
+  it "rejects any unknown id" $ do
+    (fc, caps) <- makeFakeCaps []
+    case parseSlash (mkRegistry [newCommandSpec stubDeps]) "/new -p nope" of
+      ParsedAction act -> do
+        _ <- runCommandAction act caps
+        sent <- getSent fc
+        T.unpack (T.unlines sent) `shouldContain` "unknown provider: nope"
+      other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> legacySpec

@@ -34,7 +34,7 @@ module Seal.Command.New
   , resolveRepoUrl
   ) where
 
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -52,6 +52,7 @@ import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
+import Seal.Providers.Registry (knownLabelList, legacyProviderHint, parseProvider)
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
@@ -183,20 +184,33 @@ repoOpt = strOption
 -- the given args (or config defaults when not specified), insert a new
 -- tab, optionally clone a repo, and send the confirmation line.
 newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
-newCmd deps mProvider mModel mRepo = commandAction $ \caps -> do
-  oldMeta <- ndOldMeta deps
-  let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
-  meta <- mintNewSessionWith args oldMeta deps
-  oldSid <- ndInsertTab deps caps meta
-  case (naRepo args, ndSetupRepo deps) of
-    (Just repoVal, Just setupFn) -> do
-      repoUrl <- resolveRepoUrlMaybe deps repoVal
-      eRes <- setupFn (smId meta) repoUrl
-      case eRes of
-        Left err -> ccSend caps ("repo setup failed: " <> err)
-        Right _  -> pure ()
-    _ -> pure ()
-  ccSend caps (renderNewConfirmation meta oldSid)
+newCmd deps mProvider mModel mRepo = commandAction $ \caps ->
+  -- Reject an unknown -p before minting anything: a session created with a
+  -- provider Seal cannot build would fail on its first turn instead.
+  case mProvider of
+    Just p | isNothing (parseProvider p) ->
+      ccSend caps (unknownNewProviderMsg p)
+    _ -> do
+      oldMeta <- ndOldMeta deps
+      let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
+      meta <- mintNewSessionWith args oldMeta deps
+      oldSid <- ndInsertTab deps caps meta
+      case (naRepo args, ndSetupRepo deps) of
+        (Just repoVal, Just setupFn) -> do
+          repoUrl <- resolveRepoUrlMaybe deps repoVal
+          eRes <- setupFn (smId meta) repoUrl
+          case eRes of
+            Left err -> ccSend caps ("repo setup failed: " <> err)
+            Right _  -> pure ()
+        _ -> pure ()
+      ccSend caps (renderNewConfirmation meta oldSid)
+
+-- | The @new -p@ rejection message (with rename guidance for a legacy id).
+unknownNewProviderMsg :: Text -> Text
+unknownNewProviderMsg p = case legacyProviderHint p of
+  Just h  -> "unknown provider: " <> p <> " \x2014 " <> h
+               <> " (known: " <> knownLabelList <> ")"
+  Nothing -> "unknown provider: " <> p <> " (known: " <> knownLabelList <> ")"
 
 -- | Resolve the @-r@ value to a URL using the repo registry (if wired),
 -- falling back to the raw value.
