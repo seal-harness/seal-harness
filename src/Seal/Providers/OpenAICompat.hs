@@ -30,7 +30,6 @@ module Seal.Providers.OpenAICompat
   ( OpenAICompatSpec (..)
   , OpenAICompat (..)
   , mkOpenAICompat
-  , defaultOpenRouterBaseUrl
   , encodeRequest
   , decodeResponse
   , mapFinishReason
@@ -131,11 +130,6 @@ data OpenAICompat = OpenAICompat
 -- 'Seal.Providers.Registry'.
 mkOpenAICompat :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenAICompatSpec -> OpenAICompat
 mkOpenAICompat mgr key base model spec = OpenAICompat spec key base model mgr
-
--- | The OpenRouter endpoint, kept only for the config-migration unit (WU-2
--- moves provider defaults into the catalog and deletes this).
-defaultOpenRouterBaseUrl :: Text
-defaultOpenRouterBaseUrl = "https://openrouter.ai/api/v1"
 
 -- Base URL handling ---------------------------------------------------------
 

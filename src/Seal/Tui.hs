@@ -5,6 +5,7 @@ module Seal.Tui (runTui) where
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
+import System.IO (hPutStrLn, stderr)
 
 import Network.HTTP.Client.TLS (newTlsManager)
 
@@ -21,7 +22,7 @@ import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
-import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Migrate (migrateSecurityConfig, providerRenameMigration)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -83,6 +84,11 @@ runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
+  -- Must run AFTER the security migration: this rewrites config.toml
+  -- through the RuntimeConfig codec, which would drop the legacy security
+  -- fields the migration above reads.
+  mProviderRename <- providerRenameMigration paths
+  mapM_ (hPutStrLn stderr . T.unpack) mProviderRename
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

@@ -9,25 +9,34 @@
 -- next boot).
 module Seal.Config.Migrate
   ( migrateSecurityConfig
+  , providerRenameMigration
+  , migratedMsg
+  , couldNotUpdateMsg
   ) where
 
 import Control.Exception (try, SomeException)
 import Data.Text (Text)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist)
 import System.IO (hPutStrLn, stderr)
+import System.Directory (doesFileExist)
+
 
 import Toml qualified
 
 import Validation (Validation (..))
 
 import Seal.Config.File
-  ( loadRuntimeConfig, saveRuntimeConfig )
+  ( ProviderConfig (..), RuntimeConfig (..), loadRuntimeConfig, saveRuntimeConfig
+  , updateRuntimeConfig )
 import Seal.Config.Paths (SealPaths, configFilePath, securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig, securityConfigCodec
   , saveSecurityConfig )
+import Seal.Providers.Registry
+  ( legacyOpenRouterBaseUrl, legacyOpenRouterModel )
 
 -- | One-time, idempotent migration. Examines both @config.toml@ and
 -- @security.toml@ and moves any legacy security fields from @config.toml@ to
@@ -124,3 +133,82 @@ tryWriteSecurityConfig path cfg = do
   pure $ case result of
     Left err  -> Left (T.pack (show err))
     Right ()  -> Right ()
+-- ---------------------------------------------------------------------------
+-- Provider rename: openrouter -> openai-compat (issue #271)
+-- ---------------------------------------------------------------------------
+
+-- | One-time, idempotent migration of the provider id Seal used to ship as
+-- @openrouter@. Must run **after** 'migrateSecurityConfig': this function
+-- rewrites @config.toml@ through the 'RuntimeConfig' codec, which does not
+-- model the legacy security fields — running it first would make
+-- 'migrateSecurityConfig'\'s text scan find nothing and silently drop
+-- @vault_*@ / @[untrusted_execution]@ (downgrading @mode = remote@ to local).
+--
+-- Migrates:
+--
+--   * @default_provider = "openrouter"@ → @openai-compat@;
+--   * @[providers.openrouter]@ → @[providers.openai-compat]@, keeping
+--     @default_model@ and @base_url@; the OpenRouter endpoint and the old
+--     implicit model are filled in when absent; an existing
+--     @[providers.openai-compat]@ wins; the old section is removed.
+--
+-- The vault entry cannot be copied here (the migration runs before the vault is
+-- unlocked), so the stderr line names the one manual step.
+-- Returns the one-line message for the caller to log (never throws).
+providerRenameMigration :: SealPaths -> IO (Maybe Text)
+providerRenameMigration paths = do
+  let cfgPath = configFilePath paths
+  eCfg <- loadRuntimeConfig cfgPath
+  case eCfg of
+    Left _ -> pure Nothing               -- malformed config: leave it alone
+    Right cfg -> case renamePlan cfg of
+      Nothing -> pure Nothing            -- never had openrouter / already done
+      Just (url, model) -> do
+        r <- try @SomeException (updateRuntimeConfig cfgPath applyRename)
+        pure $ Just $ case r of
+          Left e          -> couldNotUpdateMsg url model (T.pack (show e))
+          Right (Left e)  -> couldNotUpdateMsg url model e
+          Right (Right ()) -> migratedMsg url model
+
+-- | What the migration would produce, or 'Nothing' when there is nothing to do.
+-- Returns the effective (URL, model) for the operator-facing message.
+renamePlan :: RuntimeConfig -> Maybe (Text, Text)
+renamePlan cfg
+  | not (legacyDefault || legacySection) = Nothing
+  | otherwise = Just (url, model)
+  where
+    provs = rcProviders cfg
+    legacySection = Map.member "openrouter" provs
+    legacyDefault = rcDefaultProvider cfg == Just "openrouter"
+    newSec = Map.lookup "openai-compat" provs
+    oldSec = Map.lookup "openrouter" provs
+    pick newF oldF fallback =
+      fromMaybe (fromMaybe fallback (oldSec >>= oldF)) (newSec >>= newF)
+    url = pick pcBaseUrl pcBaseUrl legacyOpenRouterBaseUrl
+    model = pick pcDefaultModel pcDefaultModel legacyOpenRouterModel
+
+-- | Apply the rename to a 'RuntimeConfig'.
+applyRename :: RuntimeConfig -> RuntimeConfig
+applyRename cfg = case renamePlan cfg of
+  Nothing -> cfg
+  Just (url, model) -> cfg
+    { rcProviders = Map.insert "openai-compat"
+                      (ProviderConfig { pcBaseUrl = Just url
+                                      , pcDefaultModel = Just model })
+                      (Map.delete "openrouter" (rcProviders cfg))
+    , rcDefaultProvider = if rcDefaultProvider cfg == Just "openrouter"
+                            then Just "openai-compat"
+                            else rcDefaultProvider cfg
+    }
+
+migratedMsg :: Text -> Text -> Text
+migratedMsg url model =
+  "openrouter was renamed to openai-compat; your config was updated (base URL "
+    <> url <> ", model " <> model
+    <> "). Run /provider add openai-compat to store the API key."
+
+couldNotUpdateMsg :: Text -> Text -> Text -> Text
+couldNotUpdateMsg url model err =
+  "openrouter was renamed to openai-compat, but Seal could not update your"
+    <> " config (" <> err <> "). Run /provider add openai-compat (base URL "
+    <> url <> ", model " <> model <> ")."

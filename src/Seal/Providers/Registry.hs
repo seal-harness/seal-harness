@@ -33,6 +33,8 @@ module Seal.Providers.Registry
   , resolveDefaultModel
   , resolveProvider
   , providerBaseUrlFor
+  , legacyOpenRouterBaseUrl
+  , legacyOpenRouterModel
   , completeSome
   , listSome
   , vaultErrText
@@ -85,6 +87,15 @@ genericOpenAICompat = OpenAICompatSpec
   , ocsModels         = []
   , ocsExtraHeaders   = []
   }
+
+-- | The endpoint and model Seal used to hardcode for OpenRouter. Kept here (not
+-- duplicated as literals) for the boot-time config migration; step 3's preset
+-- row reuses both.
+legacyOpenRouterBaseUrl :: Text
+legacyOpenRouterBaseUrl = "https://openrouter.ai/api/v1"
+
+legacyOpenRouterModel :: Text
+legacyOpenRouterModel = "deepseek/deepseek-v4.1-flash-1017"
 
 -- | The OpenAI-compatible provider catalog. Append a row to ship a preset; the
 -- row supplies the endpoint, key policy, model catalogue and static headers,
