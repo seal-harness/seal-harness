@@ -3714,6 +3714,7 @@ spec_main = describe "Seal.Gateway.API" $ do
       configuredOf beforeBody `shouldBe` [Just (A.Bool False)]
       req <- testPost ["api", "providers"]
         (A.encode (A.object [ "name" .= ("anthropic" :: T.Text)
+                            , "type" .= ("anthropic" :: T.Text)
                             , "api_key" .= ("sk-fresh" :: T.Text) ]))
       s <- runAppStatus app req
       s `shouldBe` 201
@@ -3814,6 +3815,7 @@ spec_main = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("anthropic" :: T.Text)
+          , "type" .= ("anthropic" :: T.Text)
           , "api_key" .= ("sk-test-123" :: T.Text)
           ]))
       (status, body) <- runAppBody app req
@@ -3831,14 +3833,57 @@ spec_main = describe "Seal.Gateway.API" $ do
         Right cfg -> rcDefaultProvider cfg `shouldBe` Just "anthropic"
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
 
-  it "POST /api/providers with unknown name returns 400" $ do
-    vault <- makeFakeVaultRuntime []
-    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
-    let app = apiApp deps
-    req <- testPost ["api", "providers"]
-      (A.encode (A.object [ "name" .= ("unknown" :: T.Text), "api_key" .= ("k" :: T.Text) ]))
-    status <- runAppStatus app req
-    status `shouldBe` 400
+  it "POST /api/providers rejects bad creates with 400 {field} and never writes the vault" $
+    withSystemTempDirectory "seal-prov-val" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"] (A.encode (A.object fields))
+          expectField fields field = do
+            req <- post fields
+            (s, b) <- runAppBody app req
+            s `shouldBe` 400
+            b `shouldSatisfy` \raw -> case A.decode raw :: Maybe A.Value of
+              Just (A.Object o) -> lookupK "field" o == Just (A.String field)
+              _                 -> False
+      -- malformed name
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("Bad_Name" :: T.Text) ] "name"
+      -- reserved name
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("default" :: T.Text) ] "name"
+      -- a name that is another type's id
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("ollama" :: T.Text) ] "name"
+      -- unknown type
+      expectField [ "type" .= ("anthorpic" :: T.Text), "name" .= ("x" :: T.Text) ] "type"
+      -- missing required base URL (generic row) — with a key so an errant write shows
+      expectField [ "type" .= ("openai-compat" :: T.Text)
+                  , "name" .= ("oc" :: T.Text), "default_model" .= ("m" :: T.Text)
+                  , "api_key" .= ("sk" :: T.Text) ] "base_url"
+      -- missing required model (generic row) — with a key so an errant write shows
+      expectField [ "type" .= ("openai-compat" :: T.Text)
+                  , "name" .= ("oc" :: T.Text), "base_url" .= ("https://h/v1" :: T.Text)
+                  , "api_key" .= ("sk" :: T.Text) ] "default_model"
+      -- no rejected request wrote a credential
+      forM_ ["PROVIDER_APIKEY_OC", "ANTHROPIC_API_KEY"] $ \k -> do
+        x <- vaultHas vault k
+        x `shouldBe` Nothing
+      -- a new instance is 201; reconfiguring the same type is 200 {reconfigured:true}
+      reqNew <- post [ "type" .= ("anthropic" :: T.Text), "name" .= ("work" :: T.Text)
+                     , "api_key" .= ("k1" :: T.Text) ]
+      (sNew, _) <- runAppBody app reqNew
+      sNew `shouldBe` 201
+      reqRe <- post [ "type" .= ("anthropic" :: T.Text), "name" .= ("work" :: T.Text)
+                    , "api_key" .= ("k2" :: T.Text) ]
+      (sRe, bRe) <- runAppBody app reqRe
+      sRe `shouldBe` 200
+      bRe `shouldSatisfy` \raw -> case A.decode raw :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "reconfigured" o == Just (A.Bool True)
+        _                 -> False
+      -- a different type on an existing name is a name conflict (400 field:"name")
+      expectField [ "type" .= ("ollama" :: T.Text), "name" .= ("work" :: T.Text)
+                  , "base_url" .= ("http://localhost:11434" :: T.Text) ] "name"
 
   it "POST /api/providers with ollama + base_url (no api_key) configures keyless" $
     withSystemTempDirectory "seal-prov" $ \tmp -> do
@@ -3850,7 +3895,8 @@ spec_main = describe "Seal.Gateway.API" $ do
       let app = apiApp deps
       req <- testPost ["api", "providers"]
         (A.encode (A.object
-          [ "name" .= ("ollama" :: T.Text)
+          [ "name" .= ("ollama-local" :: T.Text)
+          , "type" .= ("ollama" :: T.Text)
           , "base_url" .= ("http://localhost:11434" :: T.Text)
           ]))
       (status, body) <- runAppBody app req
@@ -3907,12 +3953,12 @@ spec_main = describe "Seal.Gateway.API" $ do
         Right cfg -> rcDefaultProvider cfg `shouldBe` Nothing
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
 
-  it "DELETE /api/providers/:name with unknown provider returns 400" $ do
+  it "DELETE /api/providers/:name with unknown provider returns 404" $ do
     vault <- makeFakeVaultRuntime []
     deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
     let app = apiApp deps
     status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
-    status `shouldBe` 400
+    status `shouldBe` 404
 
   -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
 
@@ -5108,7 +5154,9 @@ providerCompatSpec = describe "generic provider API" $ do
       deps <- mkProviderTestDeps tmp cfgRoot vault
       let app = apiApp deps
           post fields = testPost ["api", "providers"]
-            (A.encode (A.object (("name" .= ("openai-compat" :: T.Text)) : fields)))
+            (A.encode (A.object
+              (("name" .= ("openai-compat" :: T.Text))
+                 : ("type" .= ("openai-compat" :: T.Text)) : fields)))
       -- missing base_url
       req1 <- post [ "api_key" .= ("sk-oc" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
       (s1, b1) <- runAppBody app req1
@@ -5131,6 +5179,7 @@ providerCompatSpec = describe "generic provider API" $ do
       -- a non-string field is rejected, not silently ignored
       req4 <- testPost ["api", "providers"]
         (A.encode (A.object [ "name" .= ("openai-compat" :: T.Text)
+                            , "type" .= ("openai-compat" :: T.Text)
                             , "base_url" .= (5 :: Int) ]))
       s4 <- runAppStatus app req4
       s4 `shouldBe` 400
@@ -5150,6 +5199,7 @@ providerCompatSpec = describe "generic provider API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("openai-compat" :: T.Text)
+          , "type" .= ("openai-compat" :: T.Text)
           , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
           , "default_model" .= ("qwen2.5" :: T.Text)
           ]))
@@ -5172,6 +5222,143 @@ providerCompatSpec = describe "generic provider API" $ do
       providerBaseUrl cfg "openai-compat" `shouldBe` Nothing
       oauth <- vaultHas vault "ANTHROPIC_OAUTH_TOKENS"
       oauth `shouldBe` Just "{}"
+
+  it "PUT /api/providers/:name rejects a type change, 404s unknown and refuses a no-credential row" $
+    withSystemTempDirectory "seal-prov-put" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("work", emptyProviderConfig { pcType = Just "anthropic" })
+            , ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          fieldOf raw = case A.decode raw :: Maybe A.Value of
+            Just (A.Object o) -> lookupK "field" o
+            _                 -> Nothing
+      -- type immutable
+      req1 <- testPut ["api", "providers", "work"]
+        (A.encode (A.object [ "type" .= ("ollama" :: T.Text) ]))
+      (s1, b1) <- runAppBody app req1
+      s1 `shouldBe` 400
+      fieldOf b1 `shouldBe` Just (A.String "type")
+      -- unknown instance => 404
+      req2 <- testPut ["api", "providers", "ghost"]
+        (A.encode (A.object [ "default_model" .= ("x" :: T.Text) ]))
+      s2 <- runAppStatus app req2
+      s2 `shouldBe` 404
+      -- a problem row (no credentials) => 400 field:"type"
+      req3 <- testPut ["api", "providers", "groq"]
+        (A.encode (A.object [ "default_model" .= ("x" :: T.Text) ]))
+      (s3, b3) <- runAppBody app req3
+      s3 `shouldBe` 400
+      fieldOf b3 `shouldBe` Just (A.String "type")
+
+  it "DELETE of a type-named instance keeps the sibling and clears default only for the default" $
+    withSystemTempDirectory "seal-prov-del" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"] (A.encode (A.object fields))
+      _ <- runAppStatus app =<< post
+             [ "type" .= ("anthropic" :: T.Text), "name" .= ("work-a" :: T.Text)
+             , "api_key" .= ("ka" :: T.Text) ]
+      _ <- runAppStatus app =<< post
+             [ "type" .= ("anthropic" :: T.Text), "name" .= ("work-b" :: T.Text)
+             , "api_key" .= ("kb" :: T.Text) ]
+      reqDef <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("work-a" :: T.Text) ]))
+      _ <- runAppStatus app reqDef
+      -- delete the non-default sibling: work-a's key + the default pointer survive
+      sDel <- runAppStatus app (testRequest methodDelete ["api", "providers", "work-b"])
+      sDel `shouldBe` 204
+      ka <- vaultHas vault "PROVIDER_APIKEY_WORK_A"
+      kb <- vaultHas vault "PROVIDER_APIKEY_WORK_B"
+      ka `shouldBe` Just "ka"
+      kb `shouldBe` Nothing
+      Right cfg1 <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg1 `shouldBe` Just "work-a"
+      -- deleting the default clears the pointer
+      sDel2 <- runAppStatus app (testRequest methodDelete ["api", "providers", "work-a"])
+      sDel2 `shouldBe` 204
+      Right cfg2 <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg2 `shouldBe` Nothing
+
+  it "DELETE /api/providers/default removes a reserved-named section" $
+    withSystemTempDirectory "seal-prov-resdel" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("default", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "default"])
+      s `shouldBe` 204
+      Right cfg <- loadRuntimeConfig cfgPath
+      Map.member "default" (rcProviders cfg) `shouldBe` False
+
+  it "PUT /api/providers/default accepts an explicit instance name" $
+    withSystemTempDirectory "seal-prov-defname" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("anthropic-work", emptyProviderConfig { pcType = Just "anthropic" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("anthropic-work" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg `shouldBe` Just "anthropic-work"
+
+  it "POST /api/sessions and /api/tabs/new reject an unknown provider or a problem row" $
+    withSystemTempDirectory "seal-prov-sessval" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      r1 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("ghost" :: T.Text) ]))
+      s1 <- runAppStatus app r1
+      s1 `shouldBe` 400
+      r2 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("groq" :: T.Text) ]))
+      s2 <- runAppStatus app r2
+      s2 `shouldBe` 400
+      -- an implicit unconfigured row is still allowed
+      r3 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("anthropic" :: T.Text)
+                            , "model" .= ("claude-opus-4-8" :: T.Text) ]))
+      s3 <- runAppStatus app r3
+      s3 `shouldBe` 200
+      -- tabs/new rejects an unknown provider too
+      r4 <- testPost ["api", "tabs", "new"]
+        (A.encode (A.object [ "kind" .= ("provider" :: T.Text)
+                            , "provider" .= ("ghost" :: T.Text) ]))
+      s4 <- runAppStatus app r4
+      s4 `shouldBe` 400
 
   it "DELETE works with no vault configured" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
