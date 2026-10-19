@@ -5089,6 +5089,15 @@ providerCompatSpec = describe "generic provider API" $ do
       lookupK "authStatus" g `shouldBe` Just (A.String "none")
       lookupK "displayName" g `shouldBe` Just (A.String "openai")
       lookupK "typeDisplayName" g `shouldBe` Just (A.String "OpenAI API")
+      lookupK "family" g `shouldBe` Just (A.String "openai")
+      lookupK "familyDisplayName" g `shouldBe` Just (A.String "OpenAI API")
+      lookupK "apiKeyName" g `shouldBe` Just (A.String "OPENAI_API_KEY")
+      lookupK "oauthKeyName" g `shouldBe` Just A.Null
+      let r = findRow "openrouter"
+      lookupK "typeDisplayName" r `shouldBe` Just (A.String "OpenRouter")
+      lookupK "family" r `shouldBe` Just (A.String "openai")
+      lookupK "apiKeyName" r `shouldBe` Just (A.String "OPENROUTER_API_KEY")
+      lookupBool "baseUrlRequired" (A.Object r) `shouldBe` Just False
 
   it "POST /api/providers rejects a missing base URL, an unusable one and a missing model — without writing the vault" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
@@ -5167,6 +5176,64 @@ providerCompatSpec = describe "generic provider API" $ do
       providerBaseUrl cfg "openai" `shouldBe` Nothing
       oauth <- vaultHas vault "ANTHROPIC_OAUTH_TOKENS"
       oauth `shouldBe` Just "{}"
+
+  it "PUT on the implicit openai row persists its type" $
+    withSystemTempDirectory "seal-prov-put-type" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "openai"]
+        (A.encode (A.object [ "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+                            , "default_model" .= ("m1" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      fmap pcType (Map.lookup "openai" (rcProviders cfg)) `shouldBe` Just (Just "openai")
+
+  it "PUT on openrouter ignores a base_url (fixed endpoint)" $
+    withSystemTempDirectory "seal-prov-fixed" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "openrouter"]
+        (A.encode (A.object [ "base_url" .= ("https://proxy.example/v1" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      providerBaseUrl cfg "openrouter" `shouldBe` Nothing
+
+  it "DELETE on a keyed openai instance removes OPENAI_API_KEY" $
+    withSystemTempDirectory "seal-prov-del-key" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("openai" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
+          , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+          , "default_model" .= ("m1" :: T.Text)
+          , "api_key" .= ("sk-test" :: T.Text)
+          ]))
+      (s1, _) <- runAppBody app req
+      s1 `shouldBe` 201
+      has <- vaultHas vault "OPENAI_API_KEY"
+      has `shouldBe` Just "sk-test"
+      s2 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
+      s2 `shouldBe` 204
+      gone <- vaultHas vault "OPENAI_API_KEY"
+      gone `shouldBe` Nothing
 
   it "PUT /api/providers/:name rejects a type change, 404s unknown and refuses a no-credential row" $
     withSystemTempDirectory "seal-prov-put" $ \tmp -> do

@@ -55,7 +55,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, deleteProviderSection, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, deleteProviderSection, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, upsertProviderForType)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
@@ -101,7 +101,8 @@ import Seal.Providers.Name
   , oauthKeyNameFor, providerNameExample, providerNameRule )
 import Seal.Providers.Registry
   ( OpenAICompatSpec (..), ProviderCredentials (..), ProviderInstance (..)
-  , ProviderType (..), anthropicOAuthKey, configuredInstances
+  , ProviderType (..), familyKey, familyLabel, providerFamily
+  , anthropicOAuthKey, configuredInstances
   , findInstance, instanceAuthStatus, instanceCredentials, instanceLabelList
   , instanceTypeIdFor, isConfiguredInstance, legacyKeyFor
   , providerBaseUrlForInstance, providerInstances
@@ -2166,6 +2167,8 @@ providerInstanceDetailJson cfg mh configuredNames inst = do
     , "displayName" .= piName inst
     , "type" .= (typeId <$> piType inst)
     , "typeDisplayName" .= (providerTypeLabel <$> piType inst)
+    , "family" .= (familyKey . providerFamily <$> piType inst)
+    , "familyDisplayName" .= (familyLabel . providerFamily <$> piType inst)
     , "isDefault" .= (rcDefaultProvider cfg == Just (piName inst))
     , "configured" .= Set.member (piName inst) configuredNames
     , "reconfiguring" .= reconfiguring
@@ -2173,6 +2176,8 @@ providerInstanceDetailJson cfg mh configuredNames inst = do
     , "defaultModel" .= resolveDefaultModelFor cfg (piName inst)
     , "baseUrl" .= shownBaseUrlOf cfg inst
     , "authStatus" .= authStatus
+    , "apiKeyName" .= (pcApiKeyName <$> instanceCredentials inst)
+    , "oauthKeyName" .= (instanceCredentials inst >>= pcOauthKeyName)
     , "baseUrlRequired" .= (typeUrlRequired <$> piType inst)
     , "baseUrlEditable" .= (typeUrlEditable <$> piType inst)
     , "defaultBaseUrl" .= (piType inst >>= typeDefaultBaseUrl)
@@ -2510,8 +2515,9 @@ handleProviderUpdate deps name body = do
                         Left e -> pure (errJson status500 e)
                         Right () -> do
                           let writeCfg cfg1 =
-                                applyModelAction name modelAct
-                                  (applyBaseAction name baseAct cfg1)
+                                upsertProviderForType (typeId t') name id
+                                  (applyModelAction name modelAct
+                                     (applyBaseAction name baseAct cfg1))
                           eRes <- updateRuntimeConfig cfgPath writeCfg
                           case eRes of
                             Left e -> pure (errJson status500 e)
