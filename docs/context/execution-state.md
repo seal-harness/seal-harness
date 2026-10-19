@@ -5,7 +5,7 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: WU-5 (CLI: add/list/test/remove/default)
+- Active work unit: WU-7 (frontend)
 - Current phase: IMPLEMENT
 - Retry count: 0
 
@@ -18,18 +18,19 @@ Issue: #271 · PR: #272 (draft)
 | WU-2b (legacy copy, new -p) | COMPLETE | COMMITTED | 0 | 88b3625 |
 | WU-3 (model `Maybe`) | COMPLETE | COMMITTED | 0 | 0fc85bc |
 | WU-4 (config migration) | COMPLETE | COMMITTED | 0 | e510151 |
-| WU-5 (CLI) | IN-PROGRESS | IMPLEMENT | 0 | — |
+| WU-5 (CLI) | COMPLETE | COMMITTED | 0 | 3b5f6d4 |
+| WU-6 (gateway) | COMPLETE | COMMITTED | 0 | 5ba5066 |
 | WU-6 (gateway) | TODO | — | 0 | — |
-| WU-7 (frontend) | TODO | — | 0 | — |
+| WU-7 (frontend) | IN-PROGRESS | IMPLEMENT | 0 | — |
 | WU-8 (docs) | TODO | — | 0 | — |
 
 ## Checkpoints
 - after WU-1 (transport green) — delivered
 - after WU-2b (contract consumed by later units) — delivered (PR #272 reviewable)
-- after WU-6 (backend complete) — pending
+- after WU-6 (backend complete) — delivered (`make check`: 3207 examples, 0 failures, hlint clean)
 
 ## Notes
-- Gate status at WU-4: `make check` green — 3184 examples, 0 failures, hlint
+- Gate status at WU-6: `make check` green — 3207 examples, 0 failures, hlint
   clean.
 - `Seal.Agent.Runtime.Registry > agentStatus > records Crashed when the worker
   throws` is flaky under full-suite load (passes in isolation and on re-run);
