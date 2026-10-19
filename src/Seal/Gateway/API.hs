@@ -96,9 +96,9 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
-  ( KnownProvider (..), anthropicOAuthKey, defaultModelFor, knownProviders
-  , parseProvider, providerLabel, vaultKeyName )
-import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
+  ( KnownProvider (..), OpenAICompatSpec (..), anthropicOAuthKey
+  , defaultModelFor, knownProviders, parseProvider, providerAuthStatus
+  , providerLabel, vaultKeyName )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -108,8 +108,8 @@ import Seal.SourceControl.Repo
   , repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
-import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
-import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
+import Seal.Security.Vault (VaultHandle (vhDelete, vhList, vhPut))
+import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound))
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
@@ -2126,40 +2126,6 @@ providerDetailJson cfg mh kp = do
     , "authStatus" .= authStatus
     ]
 
--- | Determine the auth status for a provider by probing the vault. For
--- Ollama, a keyless local base URL returns "keyless" without touching the
--- vault. For Anthropic, OAuth tokens take precedence over an API key.
-providerAuthStatus :: Maybe VaultHandle -> RuntimeConfig -> KnownProvider -> IO Text
-providerAuthStatus mh cfg kp = case kp of
-  OllamaProvider -> do
-    let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg "ollama")
-    if not (ollamaNeedsKey baseUrl)
-      then pure "keyless"
-      else case mh of
-        Nothing   -> pure "none"
-        Just vh   -> probeVault vh (vaultKeyName OllamaProvider)
-  AnthropicProvider -> case mh of
-    Nothing   -> pure "none"
-    Just vh   -> do
-      eOAuth <- vhGet vh anthropicOAuthKey
-      case eOAuth of
-        Right _         -> pure "oauth"
-        Left VaultLocked -> pure "vault-locked"
-        Left _           -> probeVault vh (vaultKeyName AnthropicProvider)
-  OpenRouterProvider -> case mh of
-    Nothing   -> pure "none"
-    Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
-
--- | Probe the vault for a single key and return the auth status string.
-probeVault :: VaultHandle -> Text -> IO Text
-probeVault vh key = do
-  r <- vhGet vh key
-  pure $ case r of
-    Right _                   -> "api-key"
-    Left VaultLocked          -> "vault-locked"
-    Left (VaultKeyNotFound _) -> "none"
-    Left _                    -> "none"
-
 -- | Handle POST /api/providers — add or update a provider. Stores the API
 -- key in the vault (when present) and seeds config defaults
 -- (default_provider if unset, per-provider default_model if unset). If
@@ -2350,7 +2316,7 @@ staticModelsFor AnthropicProvider =
   , "claude-haiku-4-5"
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
-staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+staticModelsFor (OpenAICompatProvider spec) = [t | ModelId t <- ocsModels spec]
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value

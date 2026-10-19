@@ -320,6 +320,18 @@ spec = describe "Seal.Config.File" $ do
       providerBaseUrl      c2 "ollama" `shouldBe` Just "http://h:1"
       providerDefaultModel c2 "ollama" `shouldBe` Just "m"
 
+    it "round-trips a hyphenated provider id ([providers.openai-compat])" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = upsertProvider "openai-compat"
+                     (\_ -> ProviderConfig (Just "qwen2.5-7b-instruct")
+                                          (Just "http://localhost:8000/v1"))
+                     defaultRuntimeConfig
+        saveRuntimeConfig path cfg
+        Right back <- loadRuntimeConfig path
+        rcProviders back `shouldBe` rcProviders cfg
+        providerBaseUrl back "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
+
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"

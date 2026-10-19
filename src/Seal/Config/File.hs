@@ -169,6 +169,11 @@ data RuntimeConfig = RuntimeConfig
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+    -- ^ The endpoint Seal talks to. SECURITY: this is the destination of the
+    -- provider's bearer token, so it is operator-set only — no config-writing
+    -- opcode may touch it (see AGENTS.md §Security). A provider whose catalog
+    -- row carries a built-in base URL ignores this value; only the generic
+    -- OpenAI-compatible row (and Ollama) read it.
   } deriving stock (Eq, Show)
 
 -- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is

@@ -2,13 +2,27 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The code-level provider registry: the set of providers Seal knows how to
 -- build, and the mapping from each to its display label, vault credential key,
--- and default model. Credential resolution (reading the key from the vault and
--- constructing a live 'SomeProvider') is added on top of this vocabulary.
+-- default model and base URL. Credential resolution (reading the key from the
+-- vault and constructing a live 'SomeProvider') is added on top of this
+-- vocabulary.
+--
+-- OpenAI-compatible vendors are **data**: 'openAICompatSpecs' is the catalog,
+-- and every family provider is an 'OpenAICompatProvider' row. Adding a vendor
+-- with a known endpoint is one appended row — no change to the transport, the
+-- CLI, the gateway or the frontend.
 module Seal.Providers.Registry
   ( KnownProvider (..)
+  , OpenAICompatSpec (..)
   , knownProviders
+  , openAICompatSpecs
+  , genericOpenAICompat
+  , catalogProblems
+  , parseProviderIn
   , configuredProviders
+  , configuredProvidersFor
   , providerLabel
+  , providerDisplayName
+  , providerAuthStatus
   , anthropicOAuthKey
   , providerId
   , parseProvider
@@ -39,8 +53,8 @@ import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
 import Seal.Providers.OpenAICompat
-  ( OpenAICompatSpec (..), defaultOpenRouterBaseUrl, mkOpenAICompat )
-import Seal.Security.Secrets (mkApiKey)
+  ( OpenAICompatSpec (..), mkOpenAICompat, validateBaseUrl )
+import Seal.Security.Secrets (ApiKey, mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
 
@@ -49,10 +63,15 @@ import Seal.Security.Vault.Age (VaultError (..))
 -- circular import).
 anthropicOAuthKey :: Text
 anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
--- | The generic OpenAI-compatible provider row: the user supplies both the base
--- URL and the model, and no API key is required (local servers usually have
--- none). Further compatible vendors are appended to the catalog; the transport
--- itself is configured entirely from a row like this one.
+
+-- | The Anthropic API endpoint. Fixed inside the provider; surfaced here only
+-- so the editor can show what it talks to.
+anthropicBaseUrl :: Text
+anthropicBaseUrl = "https://api.anthropic.com"
+
+-- | The generic OpenAI-compatible row: the user supplies both the base URL and
+-- the model, and no API key is required (local servers usually have none).
+-- Further compatible vendors are appended to 'openAICompatSpecs'.
 genericOpenAICompat :: OpenAICompatSpec
 genericOpenAICompat = OpenAICompatSpec
   { ocsId             = "openai-compat"
@@ -65,45 +84,91 @@ genericOpenAICompat = OpenAICompatSpec
   , ocsExtraHeaders   = []
   }
 
+-- | The OpenAI-compatible provider catalog. Append a row to ship a preset; the
+-- row supplies the endpoint, key policy, model catalogue and static headers,
+-- and the shared transport does the rest.
+openAICompatSpecs :: [OpenAICompatSpec]
+openAICompatSpecs = [genericOpenAICompat]
 
--- | Every provider Seal can build. M1 ships Anthropic only; later milestones
--- extend this sum (the totality of the functions below forces each addition to
--- be handled everywhere).
-data KnownProvider = AnthropicProvider | OllamaProvider | OpenRouterProvider
-  deriving stock (Eq, Show, Enum, Bounded)
+-- | Every provider Seal can build.
+data KnownProvider
+  = AnthropicProvider
+  | OllamaProvider
+  | OpenAICompatProvider !OpenAICompatSpec
+  deriving stock (Eq, Show)
 
 knownProviders :: [KnownProvider]
-knownProviders = [minBound .. maxBound]
+knownProviders = [AnthropicProvider, OllamaProvider]
+              <> map OpenAICompatProvider openAICompatSpecs
 
--- | The user-facing id typed at the @/provider@ prompt.
+-- | Static problems with a catalog (blank or duplicate ids, blank labels/keys,
+-- unusable built-in URLs). Exported so the invariant is testable and so a
+-- future row cannot silently shadow another ('parseProviderIn' takes the first
+-- match).
+catalogProblems :: [OpenAICompatSpec] -> [Text]
+catalogProblems specs =
+  concatMap check specs
+    <> [ "duplicate id: " <> i
+       | i <- duplicates (map ocsId specs)
+       ]
+  where
+    check s = concat
+      [ [ "blank id" | T.null (T.strip (ocsId s)) ]
+      , [ "blank display name for " <> ocsId s | T.null (T.strip (ocsDisplayName s)) ]
+      , [ "blank vault key for " <> ocsId s | T.null (T.strip (ocsVaultKey s)) ]
+      , [ ocsId s <> " built-in base URL is not usable: " <> reason
+        | Just u <- [ocsBuiltinBaseUrl s]
+        , Left reason <- [validateBaseUrl u]
+        ]
+      ]
+    duplicates = go [] []
+      where
+        go _ dups [] = dups
+        go seen dups (x:xs)
+          | x `elem` seen = go seen (x : dups) xs
+          | otherwise     = go (x : seen) dups xs
+
+-- | The user-facing id typed at the @/provider@ prompt (and the TOML table key).
 providerLabel :: KnownProvider -> Text
-providerLabel AnthropicProvider = "anthropic"
-providerLabel OllamaProvider    = "ollama"
-providerLabel OpenRouterProvider = "openrouter"
+providerLabel AnthropicProvider              = "anthropic"
+providerLabel OllamaProvider                 = "ollama"
+providerLabel (OpenAICompatProvider spec)    = ocsId spec
+
+-- | Human label used in prompts, error copy and the API.
+providerDisplayName :: KnownProvider -> Text
+providerDisplayName AnthropicProvider           = "Anthropic"
+providerDisplayName OllamaProvider              = "Ollama"
+providerDisplayName (OpenAICompatProvider spec) = ocsDisplayName spec
 
 providerId :: KnownProvider -> ProviderId
 providerId = ProviderId . providerLabel
 
 -- | Parse a label (case-insensitive) back to a 'KnownProvider'.
 parseProvider :: Text -> Maybe KnownProvider
-parseProvider t =
+parseProvider = parseProviderIn knownProviders
+
+-- | 'parseProvider' over an explicit catalog (the seam that lets tests prove a
+-- new row is reachable without editing the shipped catalog).
+parseProviderIn :: [KnownProvider] -> Text -> Maybe KnownProvider
+parseProviderIn kps t =
   let needle = T.toCaseFold (T.strip t)
-  in lookup needle [(T.toCaseFold (providerLabel p), p) | p <- knownProviders]
+  in lookup needle [(T.toCaseFold (providerLabel p), p) | p <- kps]
 
 -- | The vault secret name under which this provider's API key is stored.
 vaultKeyName :: KnownProvider -> Text
-vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
-vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
-vaultKeyName OpenRouterProvider = "OPENROUTER_API_KEY"
+vaultKeyName AnthropicProvider           = "ANTHROPIC_API_KEY"
+vaultKeyName OllamaProvider              = "OLLAMA_API_KEY"
+vaultKeyName (OpenAICompatProvider spec) = ocsVaultKey spec
 
 -- | The model used when the user has not chosen one.
 defaultModelFor :: KnownProvider -> ModelId
-defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
-defaultModelFor OllamaProvider    = ModelId "llama3.2"
-defaultModelFor OpenRouterProvider = ModelId "deepseek/deepseek-v4.1-flash-1017"
+defaultModelFor AnthropicProvider           = ModelId "claude-opus-4-8"
+defaultModelFor OllamaProvider              = ModelId "llama3.2"
+defaultModelFor (OpenAICompatProvider spec) =
+  fromMaybe (ModelId "") (ocsDefaultModel spec)
 
 -- | A provider's default model: the configured value if given, else the
--- provider's hardcoded default (Anthropic's for an unrecognized label).
+-- provider's default (Anthropic's for an unrecognized label).
 resolveDefaultModel :: Maybe Text -> Text -> ModelId
 resolveDefaultModel (Just m) _   = ModelId m
 resolveDefaultModel Nothing  lbl =
@@ -152,36 +217,53 @@ resolveProvider mvh mgr cfg OllamaProvider model callCounter
         eKey <- vhGet vh (vaultKeyName OllamaProvider)
         case eKey of
           Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
+          Left VaultLocked -> pure (Left "Ollama Cloud needs an API key and the vault is locked — run /vault unlock")
           Left e   -> pure (Left (vaultErrText e))
   where
-    baseUrl = providerBaseUrlFor cfg OllamaProvider
-resolveProvider mvh mgr cfg OpenRouterProvider model _ =
-  -- OpenAICompat requires a vault-stored API key; no keyless mode.
-  case mvh of
-    Nothing ->
-      pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
-    Just vh -> do
-      eKey <- vhGet vh (vaultKeyName OpenRouterProvider)
-      case eKey of
-        Left e -> pure (Left (credErr OpenRouterProvider e))
-        Right kb ->
-          pure (Right (SomeProvider
-            (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model genericOpenAICompat)))
-  where
-    baseUrl = providerBaseUrlFor cfg OpenRouterProvider
+    baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (providerLabel OllamaProvider))
+resolveProvider mvh mgr cfg kp@(OpenAICompatProvider spec) model _ =
+  -- Base-URL errors precede credential errors: an unreachable endpoint is a
+  -- more useful first message than a missing key.
+  case providerBaseUrlFor cfg kp of
+    Left e -> pure (Left e)
+    Right baseUrl
+      | ocsKeyRequired spec -> case mvh of
+          Nothing -> pure (Left (keyNoVaultMsg spec))
+          Just vh -> do
+            eKey <- vhGet vh (vaultKeyName kp)
+            case eKey of
+              Right kb -> pure (Right (SomeProvider
+                (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model spec)))
+              Left VaultLocked -> pure (Left (keyLockedMsg spec))
+              Left (VaultKeyNotFound _) -> pure (Left (keyMissingMsg spec))
+              Left e -> pure (Left (vaultErrText e))
+      | otherwise -> do
+          -- Keyless: a stored key is used when one is there, but its absence
+          -- (or an unreadable vault) never blocks the request.
+          mKey <- readKeyIfAny mvh (vaultKeyName kp)
+          pure (Right (SomeProvider (mkOpenAICompat mgr mKey baseUrl model spec)))
 
--- | The effective base URL for a provider: the configured
--- @[providers.&lt;label&gt;] base_url@ when set, else that provider's own
--- built-in default. Each provider reads its OWN config section — Ollama's URL
--- is never used for another provider. Anthropic's endpoint is fixed inside the
--- provider, so its value here is only a placeholder.
-providerBaseUrlFor :: RuntimeConfig -> KnownProvider -> Text
-providerBaseUrlFor cfg kp =
-  fromMaybe (builtInBaseUrl kp) (providerBaseUrl cfg (providerLabel kp))
-  where
-    builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl
-    builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl
-    builtInBaseUrl AnthropicProvider  = "https://api.anthropic.com"
+-- | The effective base URL for a provider.
+--
+--   * A catalog row with a built-in URL is authoritative: a configured
+--     @[providers.<id>] base_url@ is ignored, so the URL the UI shows is always
+--     the URL Seal talks to.
+--   * The generic row reads its own @[providers.<id>] base_url@ and validates
+--     it; a missing or unusable value is an actionable 'Left'.
+--   * Ollama keeps its configured value or its local default, unvalidated.
+--   * Anthropic's endpoint is fixed.
+providerBaseUrlFor :: RuntimeConfig -> KnownProvider -> Either Text Text
+providerBaseUrlFor cfg kp = case kp of
+  AnthropicProvider -> Right anthropicBaseUrl
+  OllamaProvider ->
+    Right (fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (providerLabel kp)))
+  OpenAICompatProvider spec -> case ocsBuiltinBaseUrl spec of
+    Just u -> Right u
+    Nothing -> case providerBaseUrl cfg (ocsId spec) of
+      Nothing -> Left (missingBaseUrlMsg spec)
+      Just raw -> case validateBaseUrl raw of
+        Left reason -> Left (invalidBaseUrlMsg spec reason)
+        Right u -> Right u
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
@@ -190,6 +272,32 @@ completeSome (SomeProvider p) = complete p
 -- | List a provider's models through an existentially-wrapped provider.
 listSome :: SomeProvider -> IO (Either Text [ModelId])
 listSome (SomeProvider p) = listModels p
+
+-- -- User-facing copy (design §6) --------------------------------------------
+
+missingBaseUrlMsg :: OpenAICompatSpec -> Text
+missingBaseUrlMsg spec =
+  ocsDisplayName spec <> " needs a base URL — set it in the Providers view, or"
+    <> " run /provider add " <> ocsId spec
+
+invalidBaseUrlMsg :: OpenAICompatSpec -> Text -> Text
+invalidBaseUrlMsg spec reason =
+  ocsDisplayName spec <> " base URL is not usable (" <> reason <> ") — it must be"
+    <> " an http(s) URL like https://host/v1"
+
+keyNoVaultMsg :: OpenAICompatSpec -> Text
+keyNoVaultMsg spec =
+  ocsDisplayName spec <> " needs an API key — run /vault setup, then /provider add "
+    <> ocsId spec
+
+keyLockedMsg :: OpenAICompatSpec -> Text
+keyLockedMsg spec =
+  ocsDisplayName spec <> " needs an API key and the vault is locked — run /vault unlock"
+
+keyMissingMsg :: OpenAICompatSpec -> Text
+keyMissingMsg spec =
+  ocsDisplayName spec <> " needs an API key — run /provider add " <> ocsId spec
+    <> " (add to an existing entry; no need to remove it first)"
 
 -- | Provider-aware credential error: a missing key points the user at the
 -- exact @/provider add@ they need.
@@ -209,22 +317,77 @@ vaultErrText = \case
   VaultKeyNotFound k  -> "no such secret: " <> k
   VaultBackendError t -> "backend error: " <> t
 
--- | The set of providers that are *configured* (have a usable credential or
--- are usable keyless). A provider appears in @/provider list@ and in the
--- frontend's provider select only when this returns 'True'. The rules mirror
--- the auth labels in 'Seal.Command.Provider.listCmd':
+-- -- Status ------------------------------------------------------------------
+
+-- | What the UI shows for a provider. Kept next to 'configuredProviders' so the
+-- two cannot disagree:
 --
---   * __Ollama__ is configured when its base URL needs no key (local daemon)
---     OR an API key / OAuth blob is stored in the vault. A cloud URL
---     (@ollama.com@) without a key is NOT configured.
---   * __Anthropic__ is configured when either an OAuth blob or an API key is
---     stored in the vault.
+--   * anthropic: @oauth@ / @api-key@ / @none@ / @vault-locked@;
+--   * ollama: @keyless@ for a local URL, otherwise the vault probe;
+--   * family: no usable base URL ⇒ @none@; a readable key ⇒ @api-key@ (whether
+--     or not the key is required); otherwise @keyless@ when a key is optional,
+--     @none@ when it is required, and @vault-locked@ when the vault holding it
+--     is locked (visible-but-not-configured, matching anthropic).
+providerAuthStatus :: Maybe VaultHandle -> RuntimeConfig -> KnownProvider -> IO Text
+providerAuthStatus mh cfg kp = case kp of
+  AnthropicProvider -> case mh of
+    Nothing -> pure "none"
+    Just vh -> do
+      eOAuth <- vhGet vh anthropicOAuthKey
+      case eOAuth of
+        Right _          -> pure "oauth"
+        Left VaultLocked -> pure "vault-locked"
+        Left _           -> probeVault vh (vaultKeyName AnthropicProvider)
+  OllamaProvider -> do
+    let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (providerLabel kp))
+    if not (ollamaNeedsKey baseUrl)
+      then pure "keyless"
+      else case mh of
+        Nothing -> pure "none"
+        Just vh -> probeVault vh (vaultKeyName OllamaProvider)
+  OpenAICompatProvider spec -> case providerBaseUrlFor cfg kp of
+    Left _ -> pure "none"
+    Right _ -> case mh of
+      Nothing -> pure (if ocsKeyRequired spec then "none" else "keyless")
+      Just vh -> do
+        r <- vhGet vh (ocsVaultKey spec)
+        pure $ case r of
+          Right _ -> "api-key"
+          Left VaultLocked
+            | ocsKeyRequired spec -> "vault-locked"
+            | otherwise           -> "keyless"
+          Left _ -> if ocsKeyRequired spec then "none" else "keyless"
+
+-- | Probe the vault for a single key and map the outcome to a status string.
+probeVault :: VaultHandle -> Text -> IO Text
+probeVault vh key = do
+  r <- vhGet vh key
+  pure $ case r of
+    Right _                   -> "api-key"
+    Left VaultLocked          -> "vault-locked"
+    Left (VaultKeyNotFound _) -> "none"
+    Left _                    -> "none"
+
+-- -- Configuration -----------------------------------------------------------
+
+-- | The providers that are *configured* (usable right now).
 --
--- A missing vault ('Nothing') means no provider has credentials, so only a
--- keyless local Ollama would survive the filter (and only when its base URL
--- is the default local URL).
+--   * __Anthropic__: an API key or an OAuth blob is stored.
+--   * __Ollama__: a keyless local URL, or a key stored for a cloud URL.
+--   * __family__: the base URL resolves, and either a key is not required or a
+--     key is stored.
+--
+-- A missing vault ('Nothing') means no provider has credentials, so only
+-- keyless providers (local Ollama, a keyless family row with a base URL)
+-- survive the filter.
 configuredProviders :: Maybe VaultHandle -> RuntimeConfig -> IO [KnownProvider]
-configuredProviders mvh cfg = filterM isConfigured knownProviders
+configuredProviders = configuredProvidersFor knownProviders
+
+-- | 'configuredProviders' over an explicit catalog (the injection seam for
+-- tests: a synthetic preset row can be checked without shipping it).
+configuredProvidersFor
+  :: [KnownProvider] -> Maybe VaultHandle -> RuntimeConfig -> IO [KnownProvider]
+configuredProvidersFor kps mvh cfg = filterM isConfigured kps
   where
     isConfigured kp = case kp of
       OllamaProvider -> do
@@ -235,8 +398,10 @@ configuredProviders mvh cfg = filterM isConfigured knownProviders
       AnthropicProvider ->
         hasVaultKey mvh (vaultKeyName AnthropicProvider)
           ||^ hasVaultKey mvh anthropicOAuthKey
-      OpenRouterProvider ->
-        hasVaultKey mvh (vaultKeyName OpenRouterProvider)
+      OpenAICompatProvider spec -> case providerBaseUrlFor cfg kp of
+        Left _ -> pure False
+        Right _ | not (ocsKeyRequired spec) -> pure True
+                | otherwise -> hasVaultKey mvh (ocsVaultKey spec)
 
 -- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
 -- (locked / key missing) → 'False'; a present key → 'True'.
@@ -247,6 +412,15 @@ hasVaultKey (Just vh) k = do
   pure $ case r of
     Right _ -> True
     Left _  -> False
+
+-- | Read a key only if it is available; a locked/absent vault is not an error.
+readKeyIfAny :: Maybe VaultHandle -> Text -> IO (Maybe ApiKey)
+readKeyIfAny Nothing _ = pure Nothing
+readKeyIfAny (Just vh) k = do
+  r <- vhGet vh k
+  pure $ case r of
+    Right kb -> Just (mkApiKey kb)
+    Left _   -> Nothing
 
 -- | Short-circuit OR for two 'IO' booleans (so the second is only run when the
 -- first is 'False'). Avoids touching OAuth when an API key is already present.
