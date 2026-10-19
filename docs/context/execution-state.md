@@ -5,7 +5,7 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: #273 WU-5 (frontend) — part 1 (read surfaces) committed; part 2 (`ProvidersView` create/edit form) pending
+- Active work unit: #273 WU-6 (remove the legacy `KnownProvider` API + docs)
 - Current phase: IMPLEMENT (#273 design rev 5 / plan v3 approved for build)
 - Retry count: 0
 
@@ -34,7 +34,7 @@ Issue: #271 · PR: #272 (draft)
 | WU-3 (CLI) | COMPLETE | COMMITTED | 944e520 |
 | WU-4a (gateway reads) | COMPLETE | COMMITTED | 32eb1fd |
 | WU-4b (gateway mutations) | COMPLETE | COMMITTED | 605a1e2 |
-| WU-5 (frontend) | IN-PROGRESS | IMPLEMENT | 0aff4b4 |
+| WU-5 (frontend) | COMPLETE | COMMITTED | 0aff4b4 + b8f1bd0 |
 | WU-6 (remove legacy API + docs) | TODO | — | — |
 
 Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
@@ -46,11 +46,10 @@ examples, 0 failures, hlint clean): the CLI creates/lists/tests/logs in to and
 removes named instances, and `/model`/`/new` resolve them; the gateway read
 API and session `providerType` speak instances; and POST/PUT/DELETE plus the
 default endpoints mutate instances (validation table, immutable type, §11.1
-delete, session/tab provider checks). The frontend's read surfaces now consume
-the instance fields (`type`/`typeDisplayName`/`problem`/`reconfiguring`, session
-`providerType`) with backward-compatible fallbacks; only the `ProvidersView`
-create/edit form (type picker → name, problem rows, per-class delete copy) is
-still to port. WU-6 then deletes the legacy API.
+delete, session/tab provider checks), and the frontend now speaks instances
+throughout (labels, badges by `providerType`, type→name create flow, problem
+rows, per-class delete copy). Only WU-6 remains: delete the legacy
+`KnownProvider` API and update the CHANGELOG/docs.
 Note: `Seal.Agent.Runtime.Registry > agentStatus > records Crashed` is a
 pre-existing flake under full-suite load; re-run before believing a red gate.
 
@@ -61,20 +60,16 @@ Notes for the next unit:
   `sessionProviderError`. `/api/providers` and `/all` rows carry `type`,
   `typeDisplayName`, `configured`, `reconfiguring`, `problem`, `defaultModel`;
   session JSON carries `providerType`.
-- WU-5 part 1 (commit 0aff4b4) is done and green (tsc + `make frontend-test`,
-  627 tests): instance labels in both composers + AgentsView (problem rows
-  disabled), problem rows excluded from the default fallback, and the
-  ActiveTabs badge keyed by `providerType` with a `?`/`Unknown provider (<n>)`
-  fallback.
-- **WU-5 part 2 (remaining):** `components/ProvidersView.tsx` + its spec. The
-  create form must become type picker (the `name === type` rows of
-  `/api/providers/all` are the type catalog) → name field (prefilled with the
-  type id, inline regex validation with `aria-invalid`/`aria-describedby`) →
-  flag-driven fields; button reads Configure/Reconfigure (+ the "change the
-  name to add another <T> instance" warning). List must show implicit +
-  problem rows (Delete-only), edit shows read-only name/type, delete copy is
-  per §10.6 class naming the vault keys, and POST sends `{type,name,...}`.
-  Gate: `make check` + `make frontend-test`.
+- WU-5 is in and green (tsc + `make frontend-test`: 635 tests, 24 files):
+  instance labels in both composers + AgentsView (problem rows disabled),
+  problem rows excluded from the default fallback, the ActiveTabs badge keyed
+  by `providerType`, and the `ProvidersView` type→name create flow (inline
+  validation, Configure/Reconfigure, problem rows delete-only, read-only
+  identity in edit, per-class delete copy).
+- **WU-6 (remaining):** delete the legacy `KnownProvider` API per the gate
+  grep in plan WU-6 (keep `legacyProviderHint`), and update `CHANGELOG.md` +
+  the design/plan/execution-state docs (upgrade note, model change, security
+  delta).
 - Migration: rev-6 correction — pointer-only still synthesizes the section
   (design §11.9).
 
