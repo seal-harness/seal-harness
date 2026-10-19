@@ -67,7 +67,6 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
@@ -331,12 +330,6 @@ runServeMain autonomy mCliStaticDir logger = do
         , adAdoptConsent    = Just CcWeb
         , adAgentDefs       = bAgentDefs backends
         , adSkills          = bSkills backends
-        , adProviders       = do
-            -- The configured-provider list is computed on each request so
-            -- newly-added credentials are reflected without a restart. The
-            -- vault handle is read from the same ref the commands use.
-            mh <- readIORef (vrHandleRef rt)
-            configuredProviders mh cfg
         , adUiState         = uiState
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg

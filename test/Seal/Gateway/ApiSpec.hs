@@ -40,7 +40,8 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File
-  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig
+  ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig
+  , emptyProviderConfig, loadRuntimeConfig
   , providerBaseUrl, saveRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
@@ -59,7 +60,7 @@ import Seal.Providers.Class
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
 import Seal.Providers.Registry
-  ( KnownProvider (..), genericOpenAICompat, knownProviders )
+  ( KnownProvider (..), genericOpenAICompat, providerInstances )
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -281,7 +282,6 @@ mkDepsFor paths = do
     , adAdoptConsent    = Just CcWeb
     , adAgentDefs       = adb
     , adSkills          = skills
-    , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -322,7 +322,6 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adAdoptConsent    = Just CcWeb
     , adAgentDefs       = adb
     , adSkills          = skills
-    , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -1798,7 +1797,6 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                  , adDefaultAgent    = pure (Just "zoe")
@@ -1874,7 +1872,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
              , adDefaultAgent    = do
@@ -1942,7 +1939,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
@@ -2013,7 +2009,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2107,7 +2102,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2166,7 +2160,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2224,7 +2217,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2263,7 +2255,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2354,7 +2345,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2411,7 +2401,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2467,7 +2456,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2517,7 +2505,6 @@ spec_main = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2576,7 +2563,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -2837,7 +2823,6 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3026,7 +3011,6 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3100,7 +3084,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3144,7 +3127,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3328,7 +3310,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3638,62 +3619,36 @@ spec_main = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
-  it "GET /api/providers returns all known providers with a configured flag" $ do
-    -- adProviders yields the *configured* subset (here: ollama only). The
-    -- handler emits every 'knownProviders', flagging each as @configured@
-    -- by membership — so the frontend can show all supported providers and
-    -- mark which still need a credential.
-    let mkAppFiltered = do
-          tabsH <- newTabsHandle
-          reg   <- newHarnessRegistry
-          adb   <- noneBackend
-          skills <- Skill.noneBackend
-          activeRef <- newIORef fakeMeta
-          uiState <- newUiStateHandle mkPaths
-          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
-              deps = ApiDeps
-                { adSessionRuntime  = sr
-                , adTabsHandle      = tabsH
-                , adHarnessRegistry = reg
-                , adAdoptConsent    = Just CcWeb
-                , adAgentDefs       = adb
-                , adSkills          = skills
-                , adProviders       = pure [OllamaProvider]
-                , adUiState         = uiState
-                , adSend            = Nothing
-                , adDefaultAgent    = pure Nothing
-                , adBroker          = Nothing
-    , adTabCloseNotifier = noTabCloseNotifier
-        , adRepoRegistry     = fakeRepoRegistryHandle
-        , adAgentRegistry    = fakeAgentRegH
-    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
-    , adSecurityConfig = defaultSecurityConfig
-    , adMkSessionExec = Nothing
-                }
-          pure (apiApp deps)
-    app <- mkAppFiltered
+  it "GET /api/providers lists every instance with type, configured and reconfiguring" $ do
+    -- adProviders is gone: the handler loads the config and lists the implicit
+    -- instances themselves. The default (empty) config yields anthropic,
+    -- ollama and openai-compat; ollama's local default URL is keyless, so it
+    -- is the only configured one.
+    app <- mkApp
     (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openai-compat).
-    length arr `shouldBe` length knownProviders
-    -- Each entry has a name; build a name -> configured map.
-    let entries = [ (n, c) | e <- arr, A.Object o <- [e]
-                          , Just (A.String n) <- [lookupK "name" o]
-                          , Just c <- [case lookupK "configured" o of
-                                        Just (A.Bool b) -> Just b
-                                        _ -> Nothing]
-                          ]
-        byName = Map.fromList entries
-    -- Ollama is configured; the others are not.
-    byName `shouldBe` Map.fromList
-              [ ("anthropic", False)
-              , ("ollama", True)
-              , ("openai-compat", False)
-              ]
+        objects = [ o | A.Object o <- arr ]
+        byName = Map.fromList
+          [ (n, o) | o <- objects, Just (A.String n) <- [lookupK "name" o] ]
+        field n f = Map.lookup n byName >>= lookupK f
+    Map.keys byName `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    -- displayName is the instance name; the type hint is typeDisplayName.
+    forM_ objects $ \o -> do
+      lookupK "displayName" o `shouldBe` lookupK "name" o
+      lookupK "type" o `shouldSatisfy` isJust
+      lookupK "typeDisplayName" o `shouldSatisfy` isJust
+      lookupK "reconfiguring" o `shouldSatisfy` isJust
+      lookupK "problem" o `shouldBe` Just A.Null
+    field "anthropic" "type" `shouldBe` Just (A.String "anthropic")
+    field "openai-compat" "typeDisplayName"
+      `shouldBe` Just (A.String "OpenAI-compatible")
+    field "anthropic" "configured" `shouldBe` Just (A.Bool False)
+    field "ollama" "configured" `shouldBe` Just (A.Bool True)
+    field "openai-compat" "configured" `shouldBe` Just (A.Bool False)
+    field "anthropic" "defaultModel" `shouldBe` Just (A.String "claude-opus-4-8")
+    field "openai-compat" "defaultModel" `shouldBe` Just A.Null
 
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
@@ -3718,7 +3673,7 @@ spec_main = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers/all body: " ++ show body)
-    length arr `shouldBe` length knownProviders
+    length arr `shouldBe` length (providerInstances defaultRuntimeConfig)
     forM_ arr $ \case
       A.Object o -> do
         lookupK "name" o `shouldSatisfy` isJust
@@ -3741,6 +3696,108 @@ spec_main = describe "Seal.Gateway.API" $ do
           | n == "anthropic" -> lookupK "authStatus" o `shouldBe` Just (A.String "none")
         _ -> pure ()
       _ -> pure ()
+
+  it "GET /api/providers reflects a POST immediately (no boot-time snapshot)" $
+    withSystemTempDirectory "seal-prov-fresh" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          configuredOf b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ lookupK "configured" o
+                       | A.Object o <- xs
+                       , lookupK "name" o == Just (A.String "anthropic") ]
+            Nothing -> []
+      (_, beforeBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      configuredOf beforeBody `shouldBe` [Just (A.Bool False)]
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object [ "name" .= ("anthropic" :: T.Text)
+                            , "api_key" .= ("sk-fresh" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 201
+      (_, afterBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      configuredOf afterBody `shouldBe` [Just (A.Bool True)]
+
+  it "GET /api/providers/all surfaces an unresolvable row with null type/flags and a problem" $
+    withSystemTempDirectory "seal-prov-problem" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      -- A type-less, non-legacy section is a problem row (design §9.3).
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let rows = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          groqRows = [ o | A.Object o <- rows, lookupK "name" o == Just (A.String "groq") ]
+      length groqRows `shouldBe` 1
+      case groqRows of
+        (o:_) -> do
+          lookupK "type" o `shouldBe` Just A.Null
+          lookupK "typeDisplayName" o `shouldBe` Just A.Null
+          lookupK "baseUrlRequired" o `shouldBe` Just A.Null
+          lookupK "defaultModelRequired" o `shouldBe` Just A.Null
+          lookupK "problem" o `shouldSatisfy` \case
+            Just (A.String s) -> "has no type" `T.isInfixOf` s
+            _                 -> False
+        [] -> expectationFailure "expected a groq problem row"
+
+  it "GET /api/providers/:name/models resolves a non-type-named instance's type list" $
+    withSystemTempDirectory "seal-prov-models" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("work", emptyProviderConfig { pcType = Just "anthropic" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          modelNames b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ v | A.Object o <- xs, Just v <- [lookupK "name" o] ]
+            Nothing -> []
+      (s1, b1) <- runAppBody app (testRequest methodGet ["api", "providers", "work", "models"])
+      s1 `shouldBe` 200
+      modelNames b1 `shouldBe`
+        [ A.String "claude-sonnet-4-20250514"
+        , A.String "claude-opus-4-8"
+        , A.String "claude-haiku-4-5" ]
+      -- an unknown instance yields []
+      (_, b2) <- runAppBody app (testRequest methodGet ["api", "providers", "ghost", "models"])
+      modelNames b2 `shouldBe` []
+
+  it "GET /api/sessions carries each session's providerType (null when unresolvable)" $
+    withSystemTempDirectory "seal-prov-sess" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sidOf t = case mkSessionId t of Right s -> s; Left _ -> error "sid"
+          known = fakeMeta { smId = sidOf "knownsess", smProvider = "anthropic" }
+          ghost = fakeMeta { smId = sidOf "ghostsess", smProvider = "does-not-exist" }
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveSessionMeta paths known
+      saveSessionMeta paths ghost
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          ptOf n b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ lookupK "providerType" o
+                       | A.Object o <- xs, lookupK "id" o == Just (A.String n) ]
+            Nothing -> []
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      ptOf "knownsess" body `shouldBe` [Just (A.String "anthropic")]
+      ptOf "ghostsess" body `shouldBe` [Just A.Null]
 
 
   -- ── Provider CRUD (POST / PUT / DELETE) ───────────────────────────────
@@ -4116,7 +4173,7 @@ spec_main = describe "Seal.Gateway.API" $ do
                 { adSessionRuntime = sr, adTabsHandle = tabsH
                 , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
                 , adAgentDefs = userAdb, adSkills = skillsBackend
-                , adProviders = pure knownProviders, adUiState = uiState
+                , adUiState = uiState
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -4249,7 +4306,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             { adSessionRuntime = sr, adTabsHandle = tabsH
             , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
             , adAgentDefs = userAdb, adSkills = skillsBackend
-            , adProviders = pure knownProviders, adUiState = uiState
+            , adUiState = uiState
             , adSend = Nothing, adDefaultAgent = pure Nothing
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -4335,7 +4392,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4443,7 +4499,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4593,7 +4648,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4718,7 +4772,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4846,7 +4899,6 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5044,7 +5096,8 @@ providerCompatSpec = describe "generic provider API" $ do
       lookupBool "defaultModelRequired" (A.Object g) `shouldBe` Just True
       lookupBool "keyOptional" (A.Object g) `shouldBe` Just True
       lookupK "authStatus" g `shouldBe` Just (A.String "none")
-      lookupK "displayName" g `shouldBe` Just (A.String "OpenAI-compatible")
+      lookupK "displayName" g `shouldBe` Just (A.String "openai-compat")
+      lookupK "typeDisplayName" g `shouldBe` Just (A.String "OpenAI-compatible")
 
   it "POST /api/providers rejects a missing base URL, an unusable one and a missing model — without writing the vault" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do

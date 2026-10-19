@@ -106,9 +106,12 @@ import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
 import Seal.Providers.OpenAICompat (validateBaseUrl)
 import Seal.Providers.Registry
-  ( KnownProvider (..), OpenAICompatSpec (..), anthropicOAuthKey
-  , defaultModelFor, knownProviders, missingBaseUrlMsgFor, parseProvider
-  , providerBaseUrlFor
+  ( KnownProvider (..), OpenAICompatSpec (..), ProviderInstance (..)
+  , ProviderType (..), anthropicOAuthKey, configuredInstances, defaultModelFor
+  , findInstance, instanceAuthStatus, instanceCredentials, instanceTypeIdFor
+  , isConfiguredInstance, missingBaseUrlMsgFor, parseProvider
+  , providerBaseUrlFor, providerBaseUrlForInstance, providerInstances, providerTypeLabel
+  , resolveDefaultModelFor, toProviderType, typeId
   , providerAuthStatus, providerDisplayName, providerLabel, vaultKeyName )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
@@ -144,7 +147,6 @@ data ApiDeps = ApiDeps
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11) + /api/agents CRUD
   , adSkills          :: SkillBackend         -- ^ for /api/skills CRUD
-  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider subset (T11). The handler emits all 'knownProviders', flagging each as @configured@ by membership here.
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
@@ -198,14 +200,20 @@ apiApp deps req respond =
     -- filters those out, and 'listArchivedSessions' returns them via
     -- @/api/sessions/archived@.
     (m', ["api", "sessions"]) | m' == methodGet -> do
-      metas <- listSessions (srPaths (adSessionRuntime deps))
-      infos <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) metas
+      let paths = srPaths (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+      let providerTypeFor = instanceTypeIdFor (fromRight defaultRuntimeConfig eCfg)
+      metas <- listSessions paths
+      infos <- mapM (sessionInfoJsonWithSnippet paths providerTypeFor) metas
       respond (jsonLBS status200 (A.encode infos))
     -- GET /api/sessions/archived -> the archived sessions (those carrying an
     -- @archived@ marker file). Same shape as /api/sessions.
     (m', ["api", "sessions", "archived"]) | m' == methodGet -> do
-      metas <- listArchivedSessions (srPaths (adSessionRuntime deps))
-      infos <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) metas
+      let paths = srPaths (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+      let providerTypeFor = instanceTypeIdFor (fromRight defaultRuntimeConfig eCfg)
+      metas <- listArchivedSessions paths
+      infos <- mapM (sessionInfoJsonWithSnippet paths providerTypeFor) metas
       respond (jsonLBS status200 (A.encode infos))
     -- T11: GET /api/sessions/:id/transcript -> the parsed @entries.jsonl@
     -- lines, as a JSON array. Missing file -> @[]@; unparseable lines are
@@ -523,16 +531,20 @@ apiApp deps req respond =
     -- unconfigured/locked.
     (m', ["api", "secrets", sname]) | m' == methodDelete ->
       respond =<< handleSecretDelete deps sname
-    -- T11: GET /api/providers -> every provider Seal knows how to build, each
-    -- flagged with whether it is *configured* (has a usable credential or is
-    -- keyless). The frontend renders all supported providers in the "new tab"
-    -- form, marking the unconfigured ones so the user knows which still need
-    -- a key. @isDefault@ / @defaultModel@ are UI conveniences not threaded into
-    -- 'ApiDeps' for T11, so only @name@ + @configured@ are emitted.
+    -- GET /api/providers -> every provider *instance* (implicit rows included),
+    -- flagged @configured@ (usable now) and @reconfiguring@ (a section or
+    -- credential already exists), with its @type@/@typeDisplayName@, any
+    -- @problem@, @isDefault@ and @defaultModel@. The config is reloaded per
+    -- request, so a just-created instance appears without a restart.
     (m', ["api", "providers"]) | m' == methodGet -> do
-      configured <- adProviders deps
-      let cfgSet = Set.fromList (map providerLabel configured)
-      respond (jsonLBS status200 (A.encode (map (providerInfoJson cfgSet) knownProviders)))
+      let cfgPath = srConfigPath (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig cfgPath
+      let cfg = fromRight defaultRuntimeConfig eCfg
+      mh <- readIORef (vrHandleRef (adVault deps))
+      configured <- configuredInstances mh cfg
+      let cfgNames = Set.fromList (map piName configured)
+      infos <- mapM (providerInstanceInfoJson cfg mh cfgNames) (providerInstances cfg)
+      respond (jsonLBS status200 (A.encode infos))
     -- GET /api/providers/all -> ALL known providers with full status
     -- details (authStatus, isDefault, defaultModel, baseUrl) for the
     -- ProvidersView CRUD page. Literal "all" must precede :p/models.
@@ -565,8 +577,10 @@ apiApp deps req respond =
     -- provider (the real /v1/models upstream call needs vault credentials +
     -- a live HTTP request and is out of scope). Context windows come from
     -- 'Seal.Providers.ContextWindow'.
-    (m', ["api", "providers", p, "models"]) | m' == methodGet ->
-      respond (jsonLBS status200 (A.encode (providerModelsJson p)))
+    (m', ["api", "providers", p, "models"]) | m' == methodGet -> do
+      eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+      let cfg = fromRight defaultRuntimeConfig eCfg
+      respond (jsonLBS status200 (A.encode (providerModelsJsonFor cfg p)))
     -- T11: GET /api/providers/:p/models/:m/context -> the context-window +
     -- max-output-tokens for the model (from 'Seal.Providers.ContextWindow').
     (m', ["api", "providers", _p, "models", m, "context"]) | m' == methodGet ->
@@ -2102,29 +2116,106 @@ skillInfoJson s = A.object
 jsonCreated :: Value -> Response
 jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
 
--- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
--- emits @name@ + @configured@ (membership in the configured-provider set);
--- @isDefault@ / @defaultModel@ are UI conveniences not threaded into
--- 'ApiDeps' for T11.
-providerInfoJson :: Set.Set Text -> KnownProvider -> Value
-providerInfoJson cfgSet p =
-  object
-    [ "name" .= providerLabel p
-    , "displayName" .= providerDisplayName p
-    , "configured" .= Set.member (providerLabel p) cfgSet
-    ]
+-- | One instance row for GET /api/providers: identity, type, live usability,
+-- the configure-vs-reconfigure flag, any load-time problem, and the UI
+-- conveniences. @displayName@ is the instance name (§3.8); the type hint comes
+-- from @typeDisplayName@.
+providerInstanceInfoJson
+  :: RuntimeConfig -> Maybe VaultHandle -> Set.Set Text -> ProviderInstance -> IO Value
+providerInstanceInfoJson cfg mh configuredNames inst = do
+  reconfiguring <- isConfiguredInstance mh cfg inst
+  pure (object
+    [ "name" .= piName inst
+    , "displayName" .= piName inst
+    , "type" .= (typeId <$> piType inst)
+    , "typeDisplayName" .= (providerTypeLabel <$> piType inst)
+    , "configured" .= Set.member (piName inst) configuredNames
+    , "reconfiguring" .= reconfiguring
+    , "problem" .= piProblem inst
+    , "isDefault" .= (rcDefaultProvider cfg == Just (piName inst))
+    , "defaultModel" .= resolveDefaultModelFor cfg (piName inst)
+    ])
 
--- | Handle GET /api/providers/all — returns ALL known providers with full
--- status details for the ProvidersView CRUD page. Each provider object
--- includes name, isDefault, defaultModel, baseUrl, and authStatus.
+-- | Handle GET /api/providers/all — every instance with full status details for
+-- the ProvidersView CRUD page. Reloads the config per request (no boot-time
+-- snapshot), so a just-created instance appears immediately.
 handleProvidersAll :: ApiDeps -> IO Response
 handleProvidersAll deps = do
   let cfgPath = srConfigPath (adSessionRuntime deps)
   eCfg <- loadRuntimeConfig cfgPath
   let cfg = fromRight defaultRuntimeConfig eCfg
   mh <- readIORef (vrHandleRef (adVault deps))
-  details <- mapM (providerDetailJson cfg mh) knownProviders
+  configured <- configuredInstances mh cfg
+  let cfgNames = Set.fromList (map piName configured)
+  details <- mapM (providerInstanceDetailJson cfg mh cfgNames) (providerInstances cfg)
   pure (jsonLBS status200 (A.encode details))
+
+-- | The detailed JSON object for one instance. Type-derived columns are @null@
+-- when the type is unresolvable (a problem row); @problem@ carries the reason.
+providerInstanceDetailJson
+  :: RuntimeConfig -> Maybe VaultHandle -> Set.Set Text -> ProviderInstance -> IO Value
+providerInstanceDetailJson cfg mh configuredNames inst = do
+  authStatus <- instanceAuthStatus mh cfg inst
+  reconfiguring <- isConfiguredInstance mh cfg inst
+  pure (object
+    [ "name" .= piName inst
+    , "displayName" .= piName inst
+    , "type" .= (typeId <$> piType inst)
+    , "typeDisplayName" .= (providerTypeLabel <$> piType inst)
+    , "isDefault" .= (rcDefaultProvider cfg == Just (piName inst))
+    , "configured" .= Set.member (piName inst) configuredNames
+    , "reconfiguring" .= reconfiguring
+    , "problem" .= piProblem inst
+    , "defaultModel" .= resolveDefaultModelFor cfg (piName inst)
+    , "baseUrl" .= shownBaseUrlOf cfg inst
+    , "authStatus" .= authStatus
+    , "baseUrlRequired" .= (typeUrlRequired <$> piType inst)
+    , "baseUrlEditable" .= (typeUrlEditable <$> piType inst)
+    , "defaultBaseUrl" .= (piType inst >>= typeDefaultBaseUrl)
+    , "keyOptional" .= (typeKeyOptional cfg inst <$> piType inst)
+    , "defaultModelRequired" .= (isNothing . typeDefaultModel <$> piType inst)
+    ])
+
+-- | The base URL shown in the editor (a preset's URL wins over a stale
+-- configured override; Anthropic's endpoint is fixed).
+shownBaseUrlOf :: RuntimeConfig -> ProviderInstance -> Maybe Text
+shownBaseUrlOf cfg inst = case piType inst of
+  Just (OpenAICompatType spec) ->
+    ocsBuiltinBaseUrl spec `orElse` providerBaseUrl cfg (piName inst)
+  Just AnthropicType ->
+    either (const Nothing) Just (providerBaseUrlForInstance cfg inst)
+  _ -> providerBaseUrl cfg (piName inst)
+  where
+    orElse (Just u) _ = Just u
+    orElse Nothing  x = x
+
+-- | Type-derived editor columns (instance-independent).
+typeUrlRequired :: ProviderType -> Bool
+typeUrlRequired (OpenAICompatType spec) = isNothing (ocsBuiltinBaseUrl spec)
+typeUrlRequired _                       = False
+
+typeUrlEditable :: ProviderType -> Bool
+typeUrlEditable AnthropicType           = False
+typeUrlEditable OllamaType              = True
+typeUrlEditable (OpenAICompatType spec) = isNothing (ocsBuiltinBaseUrl spec)
+
+typeDefaultBaseUrl :: ProviderType -> Maybe Text
+typeDefaultBaseUrl AnthropicType           = Nothing
+typeDefaultBaseUrl OllamaType              = Just defaultOllamaBaseUrl
+typeDefaultBaseUrl (OpenAICompatType spec) = ocsBuiltinBaseUrl spec
+
+-- | Whether the key field is optional — Ollama depends on its configured URL,
+-- the catalog row on its key policy.
+typeKeyOptional :: RuntimeConfig -> ProviderInstance -> ProviderType -> Bool
+typeKeyOptional _   _    AnthropicType = False
+typeKeyOptional cfg inst OllamaType =
+  not (ollamaNeedsKey (fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg (piName inst))))
+typeKeyOptional _   _    (OpenAICompatType spec) = not (ocsKeyRequired spec)
+
+typeDefaultModel :: ProviderType -> Maybe ModelId
+typeDefaultModel AnthropicType           = Just (ModelId "claude-opus-4-8")
+typeDefaultModel OllamaType              = Just (ModelId "llama3.2")
+typeDefaultModel (OpenAICompatType spec) = ocsDefaultModel spec
 
 -- | Build the detailed JSON object for a single provider, including its
 -- auth status (derived from the vault + config), default-model, base-URL,
@@ -2457,29 +2548,38 @@ handleProviderDefaultPut deps body =
               Left e  -> pure (errJson status500 e)
               Right _ -> pure (jsonOk (object ["provider" .= validProv]))
 
--- | T11: the STATIC model list for a provider. The real @/v1/models@
--- upstream call needs vault credentials + a live HTTP request and is out of
--- scope. Unknown providers -> @[]@. Each model's @contextWindow@ comes from
+-- | The STATIC model list for an instance. The real @/v1/models@ upstream call
+-- needs vault credentials + a live HTTP request and is out of scope. An
+-- unknown instance, or a problem row (no credentials / unresolvable type),
+-- yields @[]@. Each model's @contextWindow@ comes from
 -- 'Seal.Providers.ContextWindow'.
-providerModelsJson :: Text -> [Value]
-providerModelsJson pTxt =
-  case parseProvider pTxt of
-    Nothing -> []
-    Just p  -> map (modelEntryJson p) (staticModelsFor p)
+providerModelsJsonFor :: RuntimeConfig -> Text -> [Value]
+providerModelsJsonFor cfg name =
+  case findInstance cfg name of
+    Just inst
+      | isJust (instanceCredentials inst) -> case piType inst of
+          Just t  -> map modelEntryJson (staticModelsForType t)
+          Nothing -> []
+    _ -> []
 
--- | The static model id list for a provider (T11 best-known table).
-staticModelsFor :: KnownProvider -> [Text]
-staticModelsFor AnthropicProvider =
+-- | The static model id list for a provider type (T11 best-known table).
+staticModelsForType :: ProviderType -> [Text]
+staticModelsForType AnthropicType =
   [ "claude-sonnet-4-20250514"
   , "claude-opus-4-8"
   , "claude-haiku-4-5"
   ]
-staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
-staticModelsFor (OpenAICompatProvider spec) = [t | ModelId t <- ocsModels spec]
+staticModelsForType OllamaType = ["llama3.2", "llama3.1"]
+staticModelsForType (OpenAICompatType spec) = [t | ModelId t <- ocsModels spec]
+
+-- | The static model id list for a legacy provider row (kept for the editor
+-- contract tests; dies with the legacy API in WU-6).
+staticModelsFor :: KnownProvider -> [Text]
+staticModelsFor = staticModelsForType . toProviderType
 
 -- | One model entry: @{name, contextWindow}@.
-modelEntryJson :: KnownProvider -> Text -> Value
-modelEntryJson _p mName = object
+modelEntryJson :: Text -> Value
+modelEntryJson mName = object
   [ "name" .= mName
   , "contextWindow" .= modelContextWindow mName
   ]

@@ -20,6 +20,7 @@ module Seal.Providers.Registry
   , ProviderInstance (..)
   , providerInstances
   , findInstance
+  , instanceTypeIdFor
   , ProviderCredentials (..)
   , legacyKeyFor
   , instanceCredentials
@@ -663,6 +664,12 @@ findInstance :: RuntimeConfig -> Text -> Maybe ProviderInstance
 findInstance cfg name = case [ i | i <- providerInstances cfg, piName i == name ] of
   (i : _) -> Just i
   []      -> Nothing
+
+-- | The canonical type id a provider name resolves to, or 'Nothing' when the
+-- instance is unknown or its type is unresolvable. Derived once per snapshot
+-- so a session row can carry @providerType@ without persisting it.
+instanceTypeIdFor :: RuntimeConfig -> Text -> Maybe Text
+instanceTypeIdFor cfg name = typeId <$> (findInstance cfg name >>= piType)
 
 -- | The known instance names, for \"known: …\" error tails.
 instanceLabelList :: RuntimeConfig -> Text

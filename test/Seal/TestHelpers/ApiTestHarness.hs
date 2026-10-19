@@ -99,7 +99,6 @@ import Seal.Ingest (emptyChain)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class
   ( CompletionResponse (..), SomeProvider (..) )
-import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, sessionTurnInFlight)
@@ -523,7 +522,6 @@ buildTestEnv tmp mode mRepo opts = do
         , adAdoptConsent = Just CcWeb
         , adAgentDefs = bAgentDefs backends
         , adSkills = bSkills backends
-        , adProviders = pure knownProviders
         , adUiState = uiState
         , adSend = Just sendDeps
         , adDefaultAgent = pure Nothing
