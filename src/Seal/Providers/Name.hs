@@ -49,8 +49,7 @@ providerNameText (ProviderName t) = t
 -- | Words the gateway routes and the CLI parse as commands. @all@ and
 -- @default@ are literal @/api/providers/…@ routes; a section named either
 -- would be unreachable by name. (@openrouter@ is deliberately **not** reserved:
--- it is a future provider type id, and the #271 config migration is gated on
--- the section carrying no @type@ instead.)
+-- it is a provider id, so a type-named @openrouter@ instance must be legal.)
 reservedProviderNames :: [Text]
 reservedProviderNames = ["all", "default"]
 

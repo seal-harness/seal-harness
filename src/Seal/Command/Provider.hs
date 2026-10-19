@@ -4,7 +4,7 @@
 -- provider **instances**.
 --
 -- A provider is a named instance of a type (issue #273): @/provider add
--- openai-compat local@ creates @[providers.local] type = "openai-compat"@.
+-- openai local@ creates @[providers.local] type = "openai"@.
 -- Every other subcommand addresses an instance by that name, so several
 -- instances of one type (two Anthropic keys, two Ollama servers, several
 -- OpenAI-compatible endpoints) coexist.

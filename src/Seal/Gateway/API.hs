@@ -2251,7 +2251,7 @@ fieldErr field msg =
 
 -- | The base-URL policy for a type: fixed (never stored: anthropic, presets),
 -- defaulted (optional, a built-in default applies: ollama), or required (the
--- operator must supply one: the generic openai-compat row).
+-- operator must supply one: the generic openai row).
 data BaseUrlPolicy = UrlFixed | UrlDefault | UrlRequired
 
 baseUrlPolicyFor :: ProviderType -> BaseUrlPolicy

@@ -1,6 +1,6 @@
-> **Superseded** by `docs/superpowers/specs/2026-10-19-openai-compat-provider-design.md`
-> and `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md` — the provider
-> is now the generic `openai-compat` (issue #271). Kept for history.
+> **Superseded** by `docs/superpowers/specs/2026-10-19-provider-families-design.md`
+> and `docs/superpowers/plans/2026-10-19-provider-families-plan.md` — the generic
+> provider is now `openai` and `openrouter` is a fixed-URL provider. Kept for history.
 
 # Design: OpenRouter Provider via openai Package (Non-Servant)
 

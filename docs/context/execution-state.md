@@ -1,88 +1,22 @@
 # Execution State
 <!-- updated: 2026-10-19 -->
 
-Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
-Issue: #271 · PR: #272 (draft)
-
 ## Current Position
-- Active work unit: #273 COMPLETE (WU-0…WU-6) — final gate green
-- Current phase: DONE (#273 design rev 5 / plan v3)
-- Retry count: 0
+- Active work unit: none — provider-families WU-1..WU-5 complete
+- Current phase: COMMITTED
 
 ## Work Unit Status
-| WU | Status | Phase | Retries | Commits |
-|----|--------|-------|---------|---------|
-| WU-1 (rename) | COMPLETE | COMMITTED | 0 | cba6e27 |
-| WU-1 (transport) | COMPLETE | COMMITTED | 0 | a402195 |
-| WU-2 (catalog/URL/status) | COMPLETE | COMMITTED | 0 | 87cf89a |
-| WU-2b (legacy copy, new -p) | COMPLETE | COMMITTED | 0 | 88b3625 |
-| WU-3 (model `Maybe`) | COMPLETE | COMMITTED | 0 | 0fc85bc |
-| WU-4 (config migration) | COMPLETE | COMMITTED | 0 | e510151 |
-| WU-5 (CLI) | COMPLETE | COMMITTED | 0 | 3b5f6d4 |
-| WU-6 (gateway) | COMPLETE | COMMITTED | 0 | 5ba5066 |
-| WU-6 (gateway) | TODO | — | 0 | — |
-| WU-7 (frontend) | COMPLETE | COMMITTED | 0 | 0199d9e |
-| WU-8 (#271 docs) | COMPLETE | COMMITTED | 0 | 6881dd6 |
+| WU | Status | Commit |
+|----|--------|--------|
+| WU-1 model/catalog/migration | COMPLETE | 0cfbf7a |
+| WU-2 CLI/Model | COMPLETE | cbf7cad |
+| WU-3 gateway | COMPLETE | 5ab9a71 |
+| WU-4 frontend | COMPLETE | 66c93ab |
+| WU-5 docs | COMPLETE | — |
 
-## #273 — named provider instances (same branch/PR)
+## Gates
+- `make check`: green (3228 examples, 0 failures, 41 pending; hlint No hints)
+- `make frontend-test`: green (24 files, 637 tests)
 
-| WU | Status | Phase | Commits |
-|----|--------|-------|---------|
-| WU-0 (Name module) | COMPLETE | COMMITTED | 37e9cc8 |
-| WU-1 (config + migration + instances) | COMPLETE | COMMITTED | 9118652 |
-| WU-2 (registry instances) | COMPLETE | COMMITTED | ee41c6e |
-| WU-3 (CLI) | COMPLETE | COMMITTED | 944e520 |
-| WU-4a (gateway reads) | COMPLETE | COMMITTED | 32eb1fd |
-| WU-4b (gateway mutations) | COMPLETE | COMMITTED | 605a1e2 |
-| WU-5 (frontend) | COMPLETE | COMMITTED | 0aff4b4 + b8f1bd0 |
-| WU-6 (remove legacy API + docs) | COMPLETE | COMMITTED | b75194d |
-
-Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
-authoritative), plan round 1 (Scope PASS; Feasibility/Completeness blockers
-fixed by adopting the scope review's simplifications: no
-`/api/provider-types`, no instance cap, three delete behaviours,
-`adProviders` deleted). **All of #273 (WU-0…WU-6) is in and green: 3222 Haskell
-examples (0 failures), 635 frontend tests (0 failures), hlint clean.** The CLI,
-gateway (read + write), and frontend speak named provider instances end to end;
-the legacy `KnownProvider` API is deleted (CHANGELOG documents the model change,
-the upgrade no-op, the security delta and the non-goal).
-Note: `Seal.Agent.Runtime.Registry > agentStatus > records Crashed` is a
-pre-existing flake under full-suite load; re-run before believing a red gate.
-
-Notes for the next unit:
-- The gateway now speaks instances on both read and write: rows come from
-  `providerInstances`; POST/PUT are validated by `validateInstanceWrite`
-  (`BaseUrlPolicy`), DELETE follows §11.1, and sessions/tabs are checked by
-  `sessionProviderError`. `/api/providers` and `/all` rows carry `type`,
-  `typeDisplayName`, `configured`, `reconfiguring`, `problem`, `defaultModel`;
-  session JSON carries `providerType`.
-- WU-5 is in and green (tsc + `make frontend-test`: 635 tests, 24 files):
-  instance labels in both composers + AgentsView (problem rows disabled),
-  problem rows excluded from the default fallback, the ActiveTabs badge keyed
-  by `providerType`, and the `ProvidersView` type→name create flow (inline
-  validation, Configure/Reconfigure, problem rows delete-only, read-only
-  identity in edit, per-class delete copy).
-- WU-6 deleted the legacy `KnownProvider` API (Registry, `Session.Store`'s
-  `resolveDefaultModel` call, and the gateway's `providerDetailValue`/flag
-  helpers); `legacyProviderHint` and `resolveDefaultModelFor` remain. The plan
-  WU-6 gate grep is clean (only unrelated `Web.Search.parseProvider` / local
-  `providerLabel` identifiers remain).
-- Migration: rev-6 correction — pointer-only still synthesizes the section
-  (design §11.9).
-
-## Checkpoints
-- after WU-1 (transport green) — delivered
-- after WU-2b (contract consumed by later units) — delivered (PR #272 reviewable)
-- after WU-6 (backend complete) — delivered
-- final gate — `make check`: 3207 examples, 0 failures, hlint clean;
-  `make frontend-test`: 627 tests, 24 files
-
-## Notes
-- Gate status at WU-6: `make check` green — 3207 examples, 0 failures, hlint
-  clean.
-- `Seal.Agent.Runtime.Registry > agentStatus > records Crashed when the worker
-  throws` is flaky under full-suite load (passes in isolation and on re-run);
-  pre-existing and unrelated.
-- `defaultOpenRouterBaseUrl` no longer exists: the endpoint/model constants live
-  in `Seal.Providers.Registry` (`legacyOpenRouterBaseUrl`,
-  `legacyOpenRouterModel`) and are shared with the migration.
+## Blocked / Escalated
+None.

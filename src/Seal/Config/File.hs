@@ -172,9 +172,9 @@ data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
   , pcType         :: Maybe Text
-    -- ^ The provider *type* this instance speaks (@openai-compat@, @anthropic@,
-    -- @ollama@, or a catalog preset id). Absent for a section written before
-    -- named instances existed; the Registry resolves those through a frozen
+    -- ^ The provider *type* this instance speaks (@openai@, @openrouter@,
+    -- @anthropic@ or @ollama@). Absent for a section written before named
+    -- instances existed; the Registry resolves those through a frozen
     -- legacy set. Always written by current code.
     -- ^ The endpoint Seal talks to. SECURITY: this is the destination of the
     -- provider's bearer token, so it is operator-set only — no config-writing

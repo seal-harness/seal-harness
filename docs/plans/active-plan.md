@@ -1,14 +1,13 @@
 # Active Plan
 <!-- approved: 2026-10-19 -->
-<!-- gate-iterations: 3 -->
+<!-- gate-iterations: 2 -->
 <!-- user-approved: true -->
 <!-- status: complete -->
 
-See `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md` for the
-full approved plan, and
-`docs/superpowers/specs/2026-10-19-openai-compat-provider-design.md` (rev 6,
-§14 = PR boundary) for the design.
+Provider families — see `docs/superpowers/plans/2026-10-19-provider-families-plan.md`
+and `docs/superpowers/specs/2026-10-19-provider-families-design.md` (rev 6).
 
-Issue: #271 — rename the OpenRouter provider to a generic `openai-compat`
-provider with a required base URL, and make further OpenAI-compatible
-providers a catalog row.
+Issue: #271, step 3 — a first-class `ProviderFamily` (Anthropic/Ollama/OpenAI),
+a generic `openai` provider (base URL required) and an `openrouter` provider
+(OpenAI API with the base URL fixed). Supersedes the #271
+`openrouter → openai-compat` rename (never released).

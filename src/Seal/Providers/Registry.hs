@@ -154,9 +154,11 @@ typeId OllamaType              = "ollama"
 typeId (OpenAICompatType spec) = ocsId spec
 
 -- | The ids that existed before named instances. A section with no @type@ whose
--- name is one of these resolves to that type (so every pre-#273 config keeps
--- working with no rewrite); a type-less section named anything else is a
--- problem row rather than a silent guess.
+-- name is one of these resolves to that type; a type-less section named anything
+-- else is a problem row rather than a silent guess. @openrouter@ is the
+-- pre-#271 released id (it is a provider again); @openai@ is deliberately
+-- absent, so a dormant hand-written type-less @[providers.openai]@ cannot
+-- silently activate as a repointable instance.
 legacyTypeIds :: [Text]
 legacyTypeIds = ["anthropic", "ollama", "openrouter"]
 
