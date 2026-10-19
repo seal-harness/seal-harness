@@ -38,7 +38,8 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
-import Seal.Providers.OpenAICompat (defaultOpenRouterBaseUrl, mkOpenAICompat)
+import Seal.Providers.OpenAICompat
+  ( OpenAICompatSpec (..), defaultOpenRouterBaseUrl, mkOpenAICompat )
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -48,6 +49,22 @@ import Seal.Security.Vault.Age (VaultError (..))
 -- circular import).
 anthropicOAuthKey :: Text
 anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
+-- | The generic OpenAI-compatible provider row: the user supplies both the base
+-- URL and the model, and no API key is required (local servers usually have
+-- none). Further compatible vendors are appended to the catalog; the transport
+-- itself is configured entirely from a row like this one.
+genericOpenAICompat :: OpenAICompatSpec
+genericOpenAICompat = OpenAICompatSpec
+  { ocsId             = "openai-compat"
+  , ocsDisplayName    = "OpenAI-compatible"
+  , ocsVaultKey       = "OPENAI_COMPAT_API_KEY"
+  , ocsBuiltinBaseUrl = Nothing
+  , ocsDefaultModel   = Nothing
+  , ocsKeyRequired    = False
+  , ocsModels         = []
+  , ocsExtraHeaders   = []
+  }
+
 
 -- | Every provider Seal can build. M1 ships Anthropic only; later milestones
 -- extend this sum (the totality of the functions below forces each addition to
@@ -148,7 +165,8 @@ resolveProvider mvh mgr cfg OpenRouterProvider model _ =
       case eKey of
         Left e -> pure (Left (credErr OpenRouterProvider e))
         Right kb ->
-          pure (Right (SomeProvider (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model)))
+          pure (Right (SomeProvider
+            (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model genericOpenAICompat)))
   where
     baseUrl = providerBaseUrlFor cfg OpenRouterProvider
 
