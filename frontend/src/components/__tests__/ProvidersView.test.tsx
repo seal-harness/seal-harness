@@ -35,7 +35,15 @@ vi.mock('../../hooks/useApi', () => ({
 const LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama',
-  'openai-compat': 'OpenAI-compatible',
+  openai: 'OpenAI API',
+  openrouter: 'OpenRouter',
+}
+
+const legacyKeyFor: Record<string, string> = {
+  anthropic: 'ANTHROPIC_API_KEY',
+  ollama: 'OLLAMA_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
 }
 
 function makeProvider(overrides: Partial<ProviderDetail> = {}): ProviderDetail {
@@ -58,6 +66,10 @@ function makeProvider(overrides: Partial<ProviderDetail> = {}): ProviderDetail {
     defaultBaseUrl: null,
     keyOptional: false,
     defaultModelRequired: false,
+    apiKeyName: name === (overrides.type ?? name) && legacyKeyFor[name]
+      ? legacyKeyFor[name]
+      : `PROVIDER_APIKEY_${name.toUpperCase().replace(/-/g, '_')}`,
+    oauthKeyName: null,
     ...overrides,
   }
 }
@@ -277,13 +289,13 @@ describe('ProvidersView', () => {
   })
 })
 
-// ── Generic OpenAI-compatible provider (issue #271) ──────────────────────
+// ── Generic OpenAI API provider (issue #271) ──────────────────────
 
 describe('ProvidersView — required fields', () => {
   const compat = () =>
     makeProvider({
-      name: 'openai-compat',
-      displayName: 'OpenAI-compatible',
+      name: 'openai',
+      displayName: 'OpenAI API',
       authStatus: 'keyless',
       baseUrl: null,
       baseUrlRequired: true,
@@ -297,7 +309,7 @@ describe('ProvidersView — required fields', () => {
   it('blocks Save until the required base URL and model are filled', () => {
     providersState = [compat()]
     render(<ProvidersView />)
-    fireEvent.click(screen.getByTestId('provider-row-openai-compat'))
+    fireEvent.click(screen.getByTestId('provider-row-openai'))
     const save = screen.getByTestId('provider-save') as HTMLButtonElement
     expect(save.disabled).toBe(true)
     // The label is marked required and the field advertises it.
@@ -334,7 +346,7 @@ describe('ProvidersView — required fields', () => {
   it('shows the model hint for a provider without a default model', () => {
     providersState = [compat()]
     render(<ProvidersView />)
-    fireEvent.click(screen.getByTestId('provider-row-openai-compat'))
+    fireEvent.click(screen.getByTestId('provider-row-openai'))
     expect(screen.getByText('Required — the model id your endpoint serves.')).toBeDefined()
   })
 
@@ -344,7 +356,7 @@ describe('ProvidersView — required fields', () => {
     render(<ProvidersView />)
     fireEvent.click(screen.getByTestId('provider-new-btn'))
     const select = screen.getByTestId('provider-form-new').querySelector('select')!
-    fireEvent.change(select, { target: { value: 'openai-compat' } })
+    fireEvent.change(select, { target: { value: 'openai' } })
     fireEvent.change(screen.getByTestId('provider-base-url-input'),
                      { target: { value: 'https://host/v1' } })
     fireEvent.change(screen.getByTestId('provider-default-model-input'),
@@ -443,6 +455,29 @@ describe('ProvidersView — instances', () => {
     expect(box.textContent).toContain('clears it as default')
   })
 
+  it('names the server key and the shared-key clause for the built-in openai row', async () => {
+    providersState = [
+      makeProvider({ name: 'openai', authStatus: 'api-key', baseUrl: 'https://api.openai.com/v1' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-openai'))
+    fireEvent.click(screen.getByTestId('provider-delete'))
+    const box = screen.getByTestId('provider-delete-confirm')
+    expect(box.textContent).toContain('OPENAI_API_KEY')
+    expect(box.textContent).toContain('may be shared with other tooling')
+  })
+
+  it('names both the API key and OAuth key for an anthropic instance', async () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'oauth', oauthKeyName: 'ANTHROPIC_OAUTH_TOKENS' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-anthropic'))
+    fireEvent.click(screen.getByTestId('provider-delete'))
+    const box = screen.getByTestId('provider-delete-confirm')
+    expect(box.textContent).toContain('ANTHROPIC_API_KEY and ANTHROPIC_OAUTH_TOKENS')
+  })
+
   it('labels the button Reconfigure (with a warning) for an existing instance', () => {
     providersState = [
       makeProvider({ name: 'work', type: 'anthropic', typeDisplayName: 'Anthropic', displayName: 'work', authStatus: 'api-key', reconfiguring: true }),
@@ -471,12 +506,12 @@ describe('ProvidersView — instances', () => {
     providersState = [
       makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
       makeProvider({ name: 'ollama', authStatus: 'keyless' }),
-      makeProvider({ name: 'openai-compat', authStatus: 'keyless', baseUrl: 'http://localhost:8000/v1' }),
+      makeProvider({ name: 'openai', authStatus: 'keyless', baseUrl: 'http://localhost:8000/v1' }),
     ]
     render(<ProvidersView />)
     expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
     expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
-    expect(screen.getByTestId('provider-row-openai-compat')).toBeDefined()
+    expect(screen.getByTestId('provider-row-openai')).toBeDefined()
     expect(screen.queryByTestId('provider-problem')).toBeNull()
   })
 })

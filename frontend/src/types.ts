@@ -42,7 +42,7 @@ export interface SessionInfo {
   runtime: string
   model: string
   /** The provider *type* id the session's provider resolves to (e.g.
-   *  "anthropic", "openai-compat"), or null when the instance is unknown or
+   *  "anthropic", "openai", "openrouter"), or null when the instance is unknown or
    *  unresolvable. Derived server-side per snapshot; not persisted. */
   providerType?: string | null
   /** The URL of the repo cloned into the session's workdir via SETUP_REPO,
@@ -285,6 +285,10 @@ export interface ProviderDetail {
   type?: string | null
   /** The type's human label ("OpenAI-compatible"), or null. */
   typeDisplayName?: string | null
+  /** The provider family / API slug ("openai"), or null when unresolvable. */
+  family?: string | null
+  /** The family's human label ("OpenAI API"), or null. */
+  familyDisplayName?: string | null
   /** A load-time problem that makes the row unusable, or null. */
   problem?: string | null
   /** True when a section or stored credential already exists (configure vs
@@ -296,6 +300,10 @@ export interface ProviderDetail {
   defaultModel: string | null
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** The vault key name(s) the server would delete for this instance; null
+   *  when the row has no credentials (a problem row). Names only, never values. */
+  apiKeyName?: string | null
+  oauthKeyName?: string | null
   /** The user must supply a base URL before the provider can work; null when
    *  the type is unresolvable (a problem row). */
   baseUrlRequired: boolean | null

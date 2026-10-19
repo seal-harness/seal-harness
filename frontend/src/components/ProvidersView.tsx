@@ -22,7 +22,8 @@ const AUTH_STATUS_LABELS: Record<ProviderAuthStatus, string> = {
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama',
-  'openai-compat': 'OpenAI-compatible',
+  openai: 'OpenAI API',
+  openrouter: 'OpenRouter',
 }
 
 const NAME_RULE =
@@ -54,16 +55,20 @@ function validateName(name: string, ownType: string, typeIds: string[]): string 
   return null
 }
 
-/** Derive the vault key an instance's API key lives under (best effort — the
- *  API does not expose key names). Type-named built-ins keep the legacy keys. */
-function apiKeyNameFor(p: ProviderDetail): string {
-  const legacy: Record<string, string> = {
-    anthropic: 'ANTHROPIC_API_KEY',
-    ollama: 'OLLAMA_API_KEY',
-    'openai-compat': 'OPENAI_COMPAT_API_KEY',
-  }
-  if (p.type && p.name === p.type && legacy[p.type]) return legacy[p.type]!
-  return `PROVIDER_APIKEY_${p.name.toUpperCase().replace(/-/g, '_')}`
+/** The vault key name(s) the delete dialog names. Server-supplied (so it cannot
+ *  drift); falls back to the derived name for older payloads/mocks. */
+function keyNamesOf(p: ProviderDetail): string {
+  const names = [p.apiKeyName, p.oauthKeyName].filter((k): k is string => !!k)
+  return names.length > 0
+    ? names.join(' and ')
+    : `PROVIDER_APIKEY_${p.name.toUpperCase().replace(/-/g, '_')}`
+}
+
+/** A note when the key name is vendor-conventional and may be shared. */
+function sharedKeyNote(p: ProviderDetail): string {
+  return p.apiKeyName === 'OPENAI_API_KEY' || p.apiKeyName === 'OPENROUTER_API_KEY'
+    ? ' (this name may be shared with other tooling)'
+    : ''
 }
 
 /** The delete-confirmation copy for a row's class (design §10.6). */
@@ -74,13 +79,13 @@ function deleteConfirmText(p: ProviderDetail, isDefault: boolean): string {
       + ` type is unknown, so any credential stored for it must be deleted`
       + ` manually (/vault delete ${p.name}).`
   }
-  const key = apiKeyNameFor(p)
+  const keys = keyNamesOf(p) + sharedKeyNote(p)
   if (p.name === p.type) {
-    return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${key} from the`
+    return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${keys} from the`
       + ` vault${defClause}. The ${typeLabelOf(p)} instance stays in the list,`
       + ` not configured.`
   }
-  return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${key} from the`
+  return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${keys} from the`
     + ` vault${defClause}, and sessions or agent defs using “${p.name}” will`
     + ` fail until you re-create it or point them elsewhere.`
 }

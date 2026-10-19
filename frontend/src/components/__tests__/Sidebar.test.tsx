@@ -531,12 +531,12 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.getByTestId('tab-kind-idle-read')).toBeTruthy()
   })
 
-  it('renders an OpenAI-compatible badge for an openai-compat tab', () => {
+  it('renders an OpenAI API badge for an openai tab', () => {
     localStorage.setItem('seal.tabLineFields', '["provider"]')
     const tabs = [
-      makeTab({ index: 0, kind: 'session:openai-compat', session_id: 'read' }),
+      makeTab({ index: 0, kind: 'session:openai', session_id: 'read' }),
     ]
-    const tabSessions = [makeSession({ id: 'read', description: 'oc tab', runtime: 'session:openai-compat' })]
+    const tabSessions = [makeSession({ id: 'read', description: 'oc tab', runtime: 'session:openai' })]
     const sessionActivity = {
       read: { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z', toolCall: null },
     }
@@ -559,7 +559,7 @@ describe('Sidebar — tab status indicator', () => {
         onReleaseTab={() => {}}
       />,
     )
-    // The badge is "O" (OpenAI-compatible), not the "?" unknown fallback.
+    // The badge is "O" (OpenAI API), not the "?" unknown fallback.
     expect(screen.getByTestId('tab-status-label-0').textContent).toBe('O')
   })
 

@@ -10,8 +10,8 @@ import { adoptWindow, createTab, setupRepo, type NewTabResponse } from '../hooks
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  'openai-compat': 'OpenAI-compatible',
+  openai: 'OpenAI API',
+  openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
 

@@ -8,8 +8,8 @@ import { createBareSession, setupRepo, type NewBareSessionResponse } from '../ho
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  'openai-compat': 'OpenAI-compatible',
+  openai: 'OpenAI API',
+  openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
 
