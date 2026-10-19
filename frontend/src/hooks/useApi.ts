@@ -724,7 +724,7 @@ export async function fetchAllProviders(): Promise<ProviderDetail[] | null> {
  *  carries the updated detail; on failure `error` carries the backend's
  *  error message. The API key is NEVER echoed back. */
 export type ProviderMutationResult =
-  | { ok: true; provider: ProviderDetail }
+  | { ok: true; provider: ProviderDetail; reconfigured?: boolean }
   | { ok: false; error: string; field?: string }
 
 /** Read the backend's @{"error": "...", "field": "..."}@ body for a provider
@@ -752,7 +752,8 @@ export async function createProvider(input: ProviderInput): Promise<ProviderMuta
       body: JSON.stringify(input),
     })
     if (!res.ok) return { ok: false, ...(await providerMutationError(res)) }
-    return { ok: true, provider: await res.json() as ProviderDetail }
+    const data = await res.json() as ProviderDetail & { reconfigured?: boolean }
+    return { ok: true, provider: data, reconfigured: data.reconfigured === true }
   } catch {
     return { ok: false, error: 'network error' }
   }

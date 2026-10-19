@@ -19,6 +19,15 @@ const PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama',
 }
 
+/** Dropdown label for a provider *instance* (see NewSessionComposer). */
+function providerOptionLabel(p: {
+  name: string; displayName?: string | null; type?: string | null; typeDisplayName?: string | null
+}): string {
+  const typeLabel = p.typeDisplayName || (p.type ? PROVIDER_LABELS[p.type] : undefined)
+  if (typeLabel && p.type && p.name !== p.type) return `${p.name} — ${typeLabel}`
+  return typeLabel || p.displayName || PROVIDER_LABELS[p.name] || p.name
+}
+
 const labelStyle: React.CSSProperties = {
   fontSize: 12,
   fontWeight: 500,
@@ -522,8 +531,8 @@ export function AgentsView() {
               >
                 <option value="">(none)</option>
                 {providersLoaded && providers.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.displayName || PROVIDER_LABELS[p.name] || p.name}
+                  <option key={p.name} value={p.name} disabled={!!p.problem}>
+                    {providerOptionLabel(p)}
                   </option>
                 ))}
                 {/* Allow providers not in the configured list too — the

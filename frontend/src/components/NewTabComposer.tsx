@@ -15,6 +15,15 @@ const PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama',
 }
 
+/** Dropdown label for a provider *instance* (see NewSessionComposer). */
+function providerOptionLabel(p: {
+  name: string; displayName?: string | null; type?: string | null; typeDisplayName?: string | null
+}): string {
+  const typeLabel = p.typeDisplayName || (p.type ? PROVIDER_LABELS[p.type] : undefined)
+  if (typeLabel && p.type && p.name !== p.type) return `${p.name} — ${typeLabel}`
+  return typeLabel || p.displayName || PROVIDER_LABELS[p.name] || p.name
+}
+
 // Human labels for each tab kind. 'harness' is the spawn-a-new-harness flow;
 // 'attach' is the adopt-a-running-harness flow.
 const KIND_LABELS: Record<NewTabKind, string> = {
@@ -189,8 +198,8 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
                 // `configured` absent => configured (back-compat).
                 const isCfg = p.configured !== false
                 return (
-                  <option key={p.name} value={p.name} disabled={!isCfg}>
-                    {p.displayName || PROVIDER_LABELS[p.name] || p.name}
+                  <option key={p.name} value={p.name} disabled={!isCfg || !!p.problem}>
+                    {providerOptionLabel(p)}
                     {p.isDefault ? ' (default)' : ''}
                     {isCfg ? '' : ' (not configured)'}
                   </option>

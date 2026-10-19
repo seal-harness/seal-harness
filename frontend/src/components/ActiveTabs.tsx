@@ -21,6 +21,9 @@ const DEFAULT_FIELDS: TabLineField[] = ['provider', 'repo', 'channel']
 
 export interface TabLineData {
   provider: string
+  /** The provider *type* id the session's provider resolves to, or null when
+   *  unresolvable. Drives the badge glyph; absent on pre-instance payloads. */
+  providerType?: string | null
   model: string
   repoName: string
   repoUrl: string | null
@@ -43,7 +46,7 @@ export function deriveRepoName(repoUrl: string | null, agent: string | null): st
 function renderTabLineField(field: TabLineField, data: TabLineData): ReactNode {
   switch (field) {
     case 'provider':
-      return data.provider ? <ProviderBadge provider={data.provider} /> : null
+      return data.provider ? <ProviderBadge provider={data.provider} providerType={data.providerType} /> : null
     case 'model':
       return data.model ? (
         <span style={{ color: 'var(--text-faint)' }}>{data.model}</span>
@@ -115,13 +118,20 @@ const PROVIDER_BADGE: Record<string, ProviderBadgeSpec> = {
 
 const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)', title: 'Unknown provider' }
 
-function ProviderBadge({ provider }: { provider: string }) {
-  const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
+function ProviderBadge({ provider, providerType }: { provider: string; providerType?: string | null }) {
+  const key = providerType || provider
+  const badge = PROVIDER_BADGE[key] ?? FALLBACK_PROVIDER
+  // `providerType` undefined => pre-instance payload, keep the legacy title.
+  const title = providerType === undefined
+    ? badge.title
+    : providerType
+      ? `${provider} — ${badge.title}`
+      : `Unknown provider (${provider})`
   return (
     <span
-      data-testid={`provider-badge-${provider || 'unknown'}`}
-      title={badge.title}
-      aria-label={badge.title}
+      data-testid={`provider-badge-${key || 'unknown'}`}
+      title={title}
+      aria-label={title}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

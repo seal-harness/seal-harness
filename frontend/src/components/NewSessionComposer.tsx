@@ -13,6 +13,17 @@ const PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama',
 }
 
+/** Dropdown label for a provider *instance*: "<name> — <type>" when the name
+ *  differs from its type id, else the type label. Falls back to the legacy
+ *  displayName / local map / name for pre-instance payloads. */
+function providerOptionLabel(p: {
+  name: string; displayName?: string | null; type?: string | null; typeDisplayName?: string | null
+}): string {
+  const typeLabel = p.typeDisplayName || (p.type ? PROVIDER_LABELS[p.type] : undefined)
+  if (typeLabel && p.type && p.name !== p.type) return `${p.name} — ${typeLabel}`
+  return typeLabel || p.displayName || PROVIDER_LABELS[p.name] || p.name
+}
+
 // ── Props ─────────────────────────────────────────────────────────────
 
 interface NewSessionComposerProps {
@@ -96,8 +107,8 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
               </option>
             )}
             {spec.configuredProviders.map((p) => (
-              <option key={p.name} value={p.name}>
-                {p.displayName || PROVIDER_LABELS[p.name] || p.name}{p.isDefault ? ' (default)' : ''}
+              <option key={p.name} value={p.name} disabled={!!p.problem}>
+                {providerOptionLabel(p)}{p.isDefault ? ' (default)' : ''}
               </option>
             ))}
           </select>
