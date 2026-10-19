@@ -5,8 +5,8 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: none — all units complete
-- Current phase: IMPLEMENT
+- Active work unit: #273 WU-1 (config `pcType` + migration gate + `providerInstances`)
+- Current phase: IMPLEMENT (#273 design rev 5 / plan v3 approved for build)
 - Retry count: 0
 
 ## Work Unit Status
@@ -22,7 +22,26 @@ Issue: #271 · PR: #272 (draft)
 | WU-6 (gateway) | COMPLETE | COMMITTED | 0 | 5ba5066 |
 | WU-6 (gateway) | TODO | — | 0 | — |
 | WU-7 (frontend) | COMPLETE | COMMITTED | 0 | 0199d9e |
-| WU-8 (docs) | COMPLETE | COMMITTED | 0 | (this commit) |
+| WU-8 (#271 docs) | COMPLETE | COMMITTED | 0 | 6881dd6 |
+
+## #273 — named provider instances (same branch/PR)
+
+| WU | Status | Phase | Commits |
+|----|--------|-------|---------|
+| WU-0 (Name module) | COMPLETE | COMMITTED | 37e9cc8 |
+| WU-1 (config + migration + instances) | IN-PROGRESS | IMPLEMENT | — |
+| WU-2 (registry instances) | TODO | — | — |
+| WU-3 (CLI) | TODO | — | — |
+| WU-4a (gateway reads) | TODO | — | — |
+| WU-4b (gateway mutations) | TODO | — | — |
+| WU-5 (frontend) | TODO | — | — |
+| WU-6 (remove legacy API + docs) | TODO | — | — |
+
+Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
+authoritative), plan round 1 (Scope PASS; Feasibility/Completeness blockers
+fixed by adopting the scope review's simplifications: no
+`/api/provider-types`, no instance cap, three delete behaviours,
+`adProviders` deleted). Build in progress.
 
 ## Checkpoints
 - after WU-1 (transport green) — delivered
