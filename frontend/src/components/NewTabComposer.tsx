@@ -11,7 +11,7 @@ import { adoptWindow, createTab, setupRepo, type NewTabResponse } from '../hooks
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
-  openrouter: 'OpenRouter',
+  'openai-compat': 'OpenAI-compatible',
   ollama: 'Ollama',
 }
 
@@ -190,7 +190,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
                 const isCfg = p.configured !== false
                 return (
                   <option key={p.name} value={p.name} disabled={!isCfg}>
-                    {PROVIDER_LABELS[p.name] ?? p.name}
+                    {p.displayName || PROVIDER_LABELS[p.name] || p.name}
                     {p.isDefault ? ' (default)' : ''}
                     {isCfg ? '' : ' (not configured)'}
                   </option>

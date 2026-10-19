@@ -15,7 +15,7 @@ import {
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
-  openrouter: 'OpenRouter',
+  'openai-compat': 'OpenAI-compatible',
   ollama: 'Ollama',
 }
 
@@ -523,7 +523,7 @@ export function AgentsView() {
                 <option value="">(none)</option>
                 {providersLoaded && providers.map((p) => (
                   <option key={p.name} value={p.name}>
-                    {PROVIDER_LABELS[p.name] ?? p.name}
+                    {p.displayName || PROVIDER_LABELS[p.name] || p.name}
                   </option>
                 ))}
                 {/* Allow providers not in the configured list too — the

@@ -110,6 +110,7 @@ const PROVIDER_BADGE: Record<string, ProviderBadgeSpec> = {
   anthropic:  { char: 'A', bg: '#d97757', title: 'Anthropic' },
   ollama:     { icon: ollamaIcon, bg: '#ffffff', title: 'Ollama' },
   openrouter: { icon: openrouterIcon, bg: 'transparent', title: 'OpenRouter' },
+  'openai-compat': { char: 'O', bg: 'var(--bg-elevated)', title: 'OpenAI-compatible' },
 }
 
 const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)', title: 'Unknown provider' }

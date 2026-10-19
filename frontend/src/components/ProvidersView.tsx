@@ -22,6 +22,12 @@ const AUTH_STATUS_LABELS: Record<ProviderAuthStatus, string> = {
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama',
+  'openai-compat': 'OpenAI-compatible',
+}
+
+/** Prefer the backend's display name; fall back to the local map, then the id. */
+function providerLabelOf(name: string, displayName?: string): string {
+  return displayName || PROVIDER_LABELS[name] || name
 }
 
 const labelStyle: React.CSSProperties = {
@@ -98,6 +104,7 @@ export function ProvidersView() {
   const [form, setForm] = useState<ProviderInput>(emptyInput())
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+  const [formErrorField, setFormErrorField] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
   const [settingDefault, setSettingDefault] = useState(false)
 
@@ -149,6 +156,7 @@ export function ProvidersView() {
   const handleSubmit = async () => {
     setSubmitting(true)
     setFormError(null)
+    setFormErrorField(null)
     const trimmedName = (form.name ?? '').trim()
     if (creating) {
       const payload: ProviderInput = {
@@ -165,6 +173,7 @@ export function ProvidersView() {
         setEditing(res.provider.name)
       } else {
         setFormError(res.error)
+        setFormErrorField(res.field ?? null)
       }
     } else if (editing) {
       const payload: ProviderInput = {
@@ -179,6 +188,7 @@ export function ProvidersView() {
         setEditing(res.provider.name)
       } else {
         setFormError(res.error)
+        setFormErrorField(res.field ?? null)
       }
     }
   }
@@ -210,9 +220,24 @@ export function ProvidersView() {
     setEditing(name)
   }
 
-  const isVaultLocked = selected?.authStatus === 'vault-locked'
-  const isKeyless = selected?.authStatus === 'keyless'
-  const isOllama = selected?.name === 'ollama' || (creating && form.name === 'ollama')
+  // In create mode there is no `selected` row yet: resolve the flags from the
+  // /api/providers/all entry matching the picked provider name.
+  const effective = useMemo(() => {
+    if (selected) return selected
+    if (creating && form.name) return providers.find((p) => p.name === form.name) ?? null
+    return null
+  }, [selected, creating, form.name, providers])
+
+  const isVaultLocked = effective?.authStatus === 'vault-locked'
+  const baseUrlRequired = effective?.baseUrlRequired ?? false
+  const baseUrlEditable = effective?.baseUrlEditable ?? true
+  const keyOptional = effective?.keyOptional ?? false
+  const defaultModelRequired = effective?.defaultModelRequired ?? false
+
+  // A required field with no value blocks Save (whitespace counts as empty).
+  const missingRequired =
+    (baseUrlRequired && !(form.base_url ?? '').trim()) ||
+    (defaultModelRequired && !(form.default_model ?? '').trim())
 
   // ── Render ──────────────────────────────────────────────────────────
   return (
@@ -278,7 +303,7 @@ export function ProvidersView() {
                     className="text-sm truncate mr-auto"
                     style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
                   >
-                    {PROVIDER_LABELS[p.name] ?? p.name}
+                    {providerLabelOf(p.name, p.displayName)}
                   </span>
                   {defaultProvider === p.name && (
                     <span
@@ -332,7 +357,7 @@ export function ProvidersView() {
           >
             <div className="flex items-center gap-2">
               <span className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
-                {creating ? 'New provider' : (PROVIDER_LABELS[selected?.name ?? ''] ?? selected?.name ?? 'Provider')}
+                {creating ? 'New provider' : providerLabelOf(selected?.name ?? '', selected?.displayName)}
               </span>
               {defaultProvider === selected?.name && (
                 <span
@@ -369,13 +394,13 @@ export function ProvidersView() {
                   <option value="">(select)</option>
                   {unconfigured.map((p) => (
                     <option key={p.name} value={p.name}>
-                      {PROVIDER_LABELS[p.name] ?? p.name}
+                      {providerLabelOf(p.name, p.displayName)}
                     </option>
                   ))}
                   {/* Allow already-configured providers too (upsert) */}
                   {configured.map((p) => (
                     <option key={p.name} value={p.name}>
-                      {PROVIDER_LABELS[p.name] ?? p.name} (reconfigure)
+                      {providerLabelOf(p.name, p.displayName)} (reconfigure)
                     </option>
                   ))}
                 </select>
@@ -386,9 +411,9 @@ export function ProvidersView() {
               label="API key"
               htmlFor="provider-api-key"
               hint={creating
-                ? 'Stored in the vault — never persisted in cleartext. Leave blank for keyless providers (e.g. local Ollama).'
-                : isKeyless
-                  ? 'This provider is keyless (local). No API key required.'
+                ? 'Stored in the vault — never persisted in cleartext. Leave blank for a keyless endpoint.'
+                : keyOptional
+                  ? 'Optional — leave blank for a keyless endpoint.'
                   : isVaultLocked
                     ? 'Vault is locked — unlock it to manage API keys.'
                     : 'Paste a new key to rotate (the stored key is never shown).'}
@@ -399,35 +424,54 @@ export function ProvidersView() {
                 value={form.api_key ?? ''}
                 onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))}
                 style={inputStyle}
-                placeholder={isKeyless ? '(keyless — not required)' : 'Enter API key'}
+                placeholder={keyOptional ? '(optional — keyless endpoint)' : 'Enter API key'}
                 autoComplete="off"
                 disabled={isVaultLocked}
+                aria-invalid={formErrorField === 'api_key'}
                 data-testid="provider-api-key-input"
               />
+              {formErrorField === 'api_key' && formError && (
+                <div style={{ fontSize: 12, color: 'var(--needs-input)', marginTop: 4 }}>
+                  {formError}
+                </div>
+              )}
             </Row>
 
             <Row
-              label="Base URL"
+              label={baseUrlRequired ? 'Base URL *' : 'Base URL'}
               htmlFor="provider-base-url"
-              hint={isOllama
-                ? 'Ollama server URL. Leave blank for default (http://localhost:11434).'
-                : 'Custom API endpoint URL (optional).'}
+              hint={baseUrlRequired
+                ? 'Required — the full URL including the API path, e.g. https://host/v1.'
+                : effective?.defaultBaseUrl
+                  ? `Fixed default: ${effective.defaultBaseUrl}`
+                  : 'Custom API endpoint URL (optional).'}
             >
               <input
                 id="provider-base-url"
                 type="text"
-                value={form.base_url ?? ''}
+                value={baseUrlEditable ? (form.base_url ?? '') : (effective?.baseUrl ?? effective?.defaultBaseUrl ?? '')}
                 onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))}
-                style={inputStyle}
-                placeholder={isOllama ? 'http://localhost:11434' : '(optional)'}
+                style={baseUrlEditable ? inputStyle : { ...inputStyle, opacity: 0.7 }}
+                placeholder={effective?.defaultBaseUrl ?? (baseUrlRequired ? 'https://host/v1' : '(optional)')}
                 autoComplete="off"
+                readOnly={!baseUrlEditable}
+                aria-required={baseUrlRequired}
+                aria-invalid={formErrorField === 'base_url'}
+                data-testid="provider-base-url-input"
               />
+              {formErrorField === 'base_url' && formError && (
+                <div style={{ fontSize: 12, color: 'var(--needs-input)', marginTop: 4 }}>
+                  {formError}
+                </div>
+              )}
             </Row>
 
             <Row
-              label="Default model"
+              label={defaultModelRequired ? 'Default model *' : 'Default model'}
               htmlFor="provider-default-model"
-              hint="Provider-specific model id. Leave blank to use the provider default."
+              hint={defaultModelRequired
+                ? 'Required — the model id your endpoint serves.'
+                : 'Provider-specific model id. Leave blank to use the provider default.'}
             >
               <input
                 id="provider-default-model"
@@ -435,12 +479,20 @@ export function ProvidersView() {
                 value={form.default_model ?? ''}
                 onChange={(e) => setForm((f) => ({ ...f, default_model: e.target.value }))}
                 style={inputStyle}
-                placeholder="e.g. claude-sonnet-4-20250514"
+                placeholder={defaultModelRequired ? 'e.g. qwen2.5-7b-instruct' : 'e.g. claude-sonnet-4-20250514'}
                 autoComplete="off"
+                aria-required={defaultModelRequired}
+                aria-invalid={formErrorField === 'default_model'}
+                data-testid="provider-default-model-input"
               />
+              {formErrorField === 'default_model' && formError && (
+                <div style={{ fontSize: 12, color: 'var(--needs-input)', marginTop: 4 }}>
+                  {formError}
+                </div>
+              )}
             </Row>
 
-            {formError && (
+            {formError && !formErrorField && (
               <div
                 data-testid="provider-form-error"
                 style={{ fontSize: 12, color: 'var(--needs-input)' }}
@@ -458,7 +510,7 @@ export function ProvidersView() {
                   type="button"
                   className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
                   onClick={handleSubmit}
-                  disabled={submitting || (creating && !(form.name ?? '').trim())}
+                  disabled={submitting || (creating && !(form.name ?? '').trim()) || missingRequired}
                   aria-label={creating ? 'Create provider' : 'Save provider'}
                   data-testid="provider-save"
                 >

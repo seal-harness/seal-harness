@@ -5,8 +5,8 @@ import type { ProviderDetail } from '../../types'
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
-const createProvider = vi.fn(async (_input: unknown): Promise<{ ok: true; provider: ProviderDetail } | { ok: false; error: string }> => ({ ok: false, error: 'fail' }))
-const updateProvider = vi.fn(async (_name: string, _input: unknown): Promise<{ ok: true; provider: ProviderDetail } | { ok: false; error: string }> => ({ ok: false, error: 'fail' }))
+const createProvider = vi.fn(async (_input: unknown): Promise<{ ok: true; provider: ProviderDetail } | { ok: false; error: string; field?: string }> => ({ ok: false, error: 'fail' }))
+const updateProvider = vi.fn(async (_name: string, _input: unknown): Promise<{ ok: true; provider: ProviderDetail } | { ok: false; error: string; field?: string }> => ({ ok: false, error: 'fail' }))
 const deleteProvider = vi.fn(async (_name: string): Promise<boolean> => false)
 const fetchDefaultProvider = vi.fn(async (): Promise<string | null> => null)
 const setDefaultProvider = vi.fn(async (_provider: string | null): Promise<boolean> => false)
@@ -32,13 +32,26 @@ vi.mock('../../hooks/useApi', () => ({
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+const LABELS: Record<string, string> = {
+  anthropic: 'Anthropic',
+  ollama: 'Ollama',
+  'openai-compat': 'OpenAI-compatible',
+}
+
 function makeProvider(overrides: Partial<ProviderDetail> = {}): ProviderDetail {
+  const name = overrides.name ?? 'anthropic'
   return {
-    name: 'anthropic',
+    name,
+    displayName: LABELS[name] ?? name,
     isDefault: false,
     defaultModel: null,
-    baseUrl: null,
+    baseUrl: 'https://api.anthropic.com',
     authStatus: 'none',
+    baseUrlRequired: false,
+    baseUrlEditable: false,
+    defaultBaseUrl: null,
+    keyOptional: false,
+    defaultModelRequired: false,
     ...overrides,
   }
 }
@@ -140,9 +153,12 @@ describe('ProvidersView', () => {
   it('creating a provider calls createProvider', async () => {
     providersState = [
       makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
-      makeProvider({ name: 'ollama', authStatus: 'none' }),
+      makeProvider({ name: 'ollama', authStatus: 'none', defaultBaseUrl: 'http://localhost:11434',
+                     baseUrlEditable: true }),
     ]
-    const created: ProviderDetail = makeProvider({ name: 'ollama', authStatus: 'keyless', baseUrl: 'http://localhost:11434' })
+    const created: ProviderDetail = makeProvider({ name: 'ollama', authStatus: 'keyless',
+                                                   baseUrl: 'http://localhost:11434',
+                                                   defaultBaseUrl: 'http://localhost:11434' })
     createProvider.mockResolvedValue({ ok: true, provider: created })
     render(<ProvidersView />)
     fireEvent.click(screen.getByTestId('provider-new-btn'))
@@ -217,11 +233,12 @@ describe('ProvidersView', () => {
     expect(apiKeyInput.disabled).toBe(true)
   })
 
-  it('shows keyless hint for keyless providers', () => {
-    providersState = [makeProvider({ name: 'ollama', authStatus: 'keyless', baseUrl: 'http://localhost:11434' })]
+  it('shows the optional-key hint for a keyless provider', () => {
+    providersState = [makeProvider({ name: 'ollama', authStatus: 'keyless', keyOptional: true,
+                                     baseUrl: 'http://localhost:11434', defaultBaseUrl: 'http://localhost:11434' })]
     render(<ProvidersView />)
     fireEvent.click(screen.getByTestId('provider-row-ollama'))
-    expect(screen.getByText('This provider is keyless (local). No API key required.')).toBeDefined()
+    expect(screen.getByText('Optional — leave blank for a keyless endpoint.')).toBeDefined()
   })
 
   it('set as default button calls setDefaultProvider', async () => {
@@ -251,5 +268,86 @@ describe('ProvidersView', () => {
     const errorEl = await screen.findByTestId('provider-form-error')
     expect(errorEl).toBeDefined()
     expect(screen.getByText('vault not configured')).toBeDefined()
+  })
+})
+
+// ── Generic OpenAI-compatible provider (issue #271) ──────────────────────
+
+describe('ProvidersView — required fields', () => {
+  const compat = () =>
+    makeProvider({
+      name: 'openai-compat',
+      displayName: 'OpenAI-compatible',
+      authStatus: 'keyless',
+      baseUrl: null,
+      baseUrlRequired: true,
+      baseUrlEditable: true,
+      defaultBaseUrl: null,
+      keyOptional: true,
+      defaultModelRequired: true,
+      defaultModel: null,
+    })
+
+  it('blocks Save until the required base URL and model are filled', () => {
+    providersState = [compat()]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-openai-compat'))
+    const save = screen.getByTestId('provider-save') as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    // The label is marked required and the field advertises it.
+    expect(screen.getByText('Base URL *')).toBeDefined()
+    expect(screen.getByText('Default model *')).toBeDefined()
+    const baseInput = screen.getByTestId('provider-base-url-input') as HTMLInputElement
+    expect(baseInput.getAttribute('aria-required')).toBe('true')
+    expect(baseInput.placeholder).toBe('https://host/v1')
+    fireEvent.change(baseInput, { target: { value: 'https://gw.example/v1' } })
+    // base URL alone is not enough: the model is also required
+    expect((screen.getByTestId('provider-save') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByTestId('provider-default-model-input'),
+                     { target: { value: 'qwen2.5-7b' } })
+    expect((screen.getByTestId('provider-save') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('does not block Save for a provider whose base URL is optional', () => {
+    providersState = [makeProvider({ name: 'ollama', authStatus: 'keyless', keyOptional: true,
+                                     baseUrl: 'http://localhost:11434' })]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-ollama'))
+    expect((screen.getByTestId('provider-save') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('renders a fixed endpoint read-only', () => {
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'api-key' })]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-anthropic'))
+    const baseInput = screen.getByTestId('provider-base-url-input') as HTMLInputElement
+    expect(baseInput.readOnly).toBe(true)
+    expect(baseInput.value).toBe('https://api.anthropic.com')
+  })
+
+  it('shows the model hint for a provider without a default model', () => {
+    providersState = [compat()]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-openai-compat'))
+    expect(screen.getByText('Required — the model id your endpoint serves.')).toBeDefined()
+  })
+
+  it('renders a server field error inline next to the field', async () => {
+    providersState = [compat()]
+    createProvider.mockResolvedValue({ ok: false, error: 'Base URL is not usable (host required)', field: 'base_url' })
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')!
+    fireEvent.change(select, { target: { value: 'openai-compat' } })
+    fireEvent.change(screen.getByTestId('provider-base-url-input'),
+                     { target: { value: 'https://host/v1' } })
+    fireEvent.change(screen.getByTestId('provider-default-model-input'),
+                     { target: { value: 'm1' } })
+    fireEvent.click(screen.getByTestId('provider-save'))
+    expect(await screen.findByText('Base URL is not usable (host required)')).toBeDefined()
+    const baseInput = screen.getByTestId('provider-base-url-input') as HTMLInputElement
+    expect(baseInput.getAttribute('aria-invalid')).toBe('true')
+    // the generic error box is not used for a field-scoped error
+    expect(screen.queryByTestId('provider-form-error')).toBeNull()
   })
 })

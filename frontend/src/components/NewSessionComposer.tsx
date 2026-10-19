@@ -9,7 +9,7 @@ import { createBareSession, setupRepo, type NewBareSessionResponse } from '../ho
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
-  openrouter: 'OpenRouter',
+  'openai-compat': 'OpenAI-compatible',
   ollama: 'Ollama',
 }
 
@@ -97,7 +97,7 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
             )}
             {spec.configuredProviders.map((p) => (
               <option key={p.name} value={p.name}>
-                {PROVIDER_LABELS[p.name] ?? p.name}{p.isDefault ? ' (default)' : ''}
+                {p.displayName || PROVIDER_LABELS[p.name] || p.name}{p.isDefault ? ' (default)' : ''}
               </option>
             ))}
           </select>

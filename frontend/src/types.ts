@@ -242,6 +242,8 @@ export interface AgentInfo {
 
 export interface ProviderInfo {
   name: string
+  /** Human label ("OpenAI-compatible"); falls back to the frontend map. */
+  displayName?: string
   /** True for the provider Seal is configured to use (from CLI flag or
    *  config file). At most one entry has it set to true. */
   isDefault?: boolean
@@ -264,10 +266,22 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** Human label ("OpenAI-compatible"); the editor prefers it over a local map. */
+  displayName: string
   isDefault: boolean
   defaultModel: string | null
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** The user must supply a base URL before the provider can work. */
+  baseUrlRequired: boolean
+  /** False for a fixed endpoint (anthropic, a catalog preset): read-only. */
+  baseUrlEditable: boolean
+  /** The URL used when the field is blank (shown as its placeholder). */
+  defaultBaseUrl: string | null
+  /** True when the provider works with no stored credential at all. */
+  keyOptional: boolean
+  /** True when the provider has no built-in default model. */
+  defaultModelRequired: boolean
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
