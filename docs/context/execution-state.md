@@ -5,7 +5,7 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: #273 WU-4a (gateway reads from instances; delete `adProviders`)
+- Active work unit: #273 WU-4b (gateway mutations + session validation)
 - Current phase: IMPLEMENT (#273 design rev 5 / plan v3 approved for build)
 - Retry count: 0
 
@@ -32,7 +32,7 @@ Issue: #271 · PR: #272 (draft)
 | WU-1 (config + migration + instances) | COMPLETE | COMMITTED | 9118652 |
 | WU-2 (registry instances) | COMPLETE | COMMITTED | ee41c6e |
 | WU-3 (CLI) | COMPLETE | COMMITTED | 944e520 |
-| WU-4a (gateway reads) | IN-PROGRESS | IMPLEMENT | — |
+| WU-4a (gateway reads) | COMPLETE | COMMITTED | 32eb1fd |
 | WU-4b (gateway mutations) | TODO | — | — |
 | WU-5 (frontend) | TODO | — | — |
 | WU-6 (remove legacy API + docs) | TODO | — | — |
@@ -41,20 +41,25 @@ Gate status for #273: design rounds 1–3 (5 agents each, rev 5 = §11
 authoritative), plan round 1 (Scope PASS; Feasibility/Completeness blockers
 fixed by adopting the scope review's simplifications: no
 `/api/provider-types`, no instance cap, three delete behaviours,
-`adProviders` deleted). WU-0/1/2/3 are in and green (3270 examples, hlint clean):
-the CLI now creates, lists, tests, logs in to and removes named instances, and
-`/model`/`/new` resolve them. The gateway and frontend still speak the legacy
-`KnownProvider` view (strangler), so the next units are the API (WU-4a reads,
-WU-4b mutations) and the UI (WU-5), then WU-6 deletes the legacy API.
+`adProviders` deleted). WU-0/1/2/3 and WU-4a are in and green (3274 examples,
+0 failures, hlint clean): the CLI now creates, lists, tests, logs in to and
+removes named instances, and `/model`/`/new` resolve them; the gateway read
+API (`/api/providers`, `/all`, `/:name/models`) and session `providerType` now
+speak instances, reloading config per request. The gateway *mutations* and the
+frontend still speak the legacy `KnownProvider` view (strangler), so the next
+units are WU-4b (mutations) and WU-5 (UI), then WU-6 deletes the legacy API.
 Note: `Seal.Agent.Runtime.Registry > agentStatus > records Crashed` is a
 pre-existing flake under full-suite load; re-run before believing a red gate.
 
 Notes for the next unit:
-- `providerInstances` + `instanceCredentials` + `resolveInstance` +
-  `configuredInstances` + `instanceAuthStatus` + `resolveDefaultModelFor` +
-  `instanceLabelList` are the instance API the CLI/gateway should move to.
-- The old `KnownProvider`-shaped API is still exported (strangler); WU-3 ports
-  `Command/Provider` + `Model` + `New`, WU-4 ports the gateway, WU-6 deletes.
+- WU-4a deleted `ApiDeps.adProviders`; the read handlers now build rows from
+  `providerInstances` and reload `config.toml` per request
+  (`providerInstanceInfoJson`, `providerInstanceDetailJson`,
+  `providerModelsJsonFor`, `instanceTypeIdFor` for session `providerType`).
+- WU-4b is the gateway *mutations*: `handleProviderCreate/-Update/-Delete`,
+  both default endpoints, `handleTabNew` and `handleSessionNew` still call
+  `parseProvider`/`knownProviders` and still return `providerDetailJson`
+  (legacy). Port them to instances per plan WU-4b / design §11.1/§11.6.
 - Migration: rev-6 correction — pointer-only still synthesizes the section
   (design §11.9).
 
