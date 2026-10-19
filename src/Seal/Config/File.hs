@@ -45,6 +45,7 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , upsertProviderForType
   , deleteProviderSection
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
@@ -744,3 +745,10 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | Like 'upsertProvider', but stamps the canonical provider id. Every
+-- section-creating path uses it, so a section created for a built-in row (for
+-- example the implicit @openai@ row) is never type-less.
+upsertProviderForType :: Text -> Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
+upsertProviderForType canonicalId lbl f =
+  upsertProvider lbl (\p -> (f p) { pcType = Just canonicalId })

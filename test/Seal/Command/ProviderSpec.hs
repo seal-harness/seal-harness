@@ -22,10 +22,10 @@ import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
 import Data.Map.Strict qualified as Map
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), loadRuntimeConfig, providerBaseUrl
-  , providerDefaultModel, updateRuntimeConfig, upsertProvider )
+  , providerDefaultModel, updateRuntimeConfig, upsertProvider, upsertProviderForType )
 import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
 import Seal.Providers.Registry
-  ( ProviderType (..), genericOpenAICompat )
+  ( ProviderType (..), genericOpenAI, openRouter, openRouterDefaultModel )
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -330,7 +330,7 @@ spec_main = do
       pending  -- requires ANTHROPIC_API_KEY + network; run manually
 
 -- ---------------------------------------------------------------------------
--- Legacy provider-id recovery (issue #271: openrouter -> openai-compat)
+-- Legacy provider-id recovery (issue #271: openrouter -> openai)
 -- ---------------------------------------------------------------------------
 
 legacyMeta :: SessionMeta
@@ -338,7 +338,7 @@ legacyMeta =
   let t = posixSecondsToUTCTime 0
       sid = fromRight (error "bad sid") (mkSessionId "legacy")
   in SessionMeta
-       { smId = sid, smProvider = "openrouter", smModel = "deepseek/x"
+       { smId = sid, smProvider = "openai-compat", smModel = "deepseek/x"
        , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing
        , smAgentName = Nothing, smDescription = Nothing, smRepoUrl = Nothing
        , smCreatedAt = t, smLastActive = t
@@ -346,34 +346,42 @@ legacyMeta =
 
 legacySpec :: Spec
 legacySpec = describe "legacy provider id recovery" $ do
-  it "a session on openrouter names the rename and both repair commands" $
+  it "a session on openai-compat names the rename and both repair commands" $
     withSystemTempDirectory "seal-provider-legacy" $ \root -> do
       pr <- mkPR (root </> "config.toml") Nothing
       r <- resolveSessionProvider pr legacyMeta
       case r of
         Left e -> do
-          e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("renamed to openai" `T.isInfixOf`)
           e `shouldSatisfy` ("/model use" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
-  it "an agent def on openrouter names the rename and the provider line" $
+  it "an agent def on openai-compat names the rename and the provider line" $
     withSystemTempDirectory "seal-provider-legacy" $ \root -> do
       pr <- mkPR (root </> "config.toml") Nothing
-      r <- resolveDefProvider pr "openrouter" (ModelId "m")
+      r <- resolveDefProvider pr "openai-compat" (ModelId "m")
       case r of
         Left e -> do
-          e `shouldSatisfy` ("renamed to openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("renamed to openai" `T.isInfixOf`)
           e `shouldSatisfy` ("Agents view" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
+
+  it "resolves a session on openrouter to the OpenRouter row (key required)" $
+    withSystemTempDirectory "seal-provider-legacy" $ \root -> do
+      pr <- mkPR (root </> "config.toml") Nothing
+      r <- resolveSessionProvider pr legacyMeta { smProvider = "openrouter" }
+      case r of
+        Left e -> e `shouldSatisfy` ("OpenRouter needs an API key" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left (no key)"
 
   it "/provider default names the missing model for a model-less provider" $
     withSystemTempDirectory "seal-provider-legacy" $ \root -> do
       pr <- mkPR (root </> "config.toml") Nothing
       (fc, caps) <- makeFakeCaps []
-      runProv pr ["default", "openai-compat"] caps
+      runProv pr ["default", "openai"] caps
       sent <- getSent fc
       let out = T.unlines sent
-      out `shouldSatisfy` ("default provider set to openai-compat" `T.isInfixOf`)
+      out `shouldSatisfy` ("default provider set to openai" `T.isInfixOf`)
       out `shouldSatisfy` ("no default model" `T.isInfixOf`)
 
   it "an unknown (non-legacy) id lists the known providers" $
@@ -381,7 +389,7 @@ legacySpec = describe "legacy provider id recovery" $ do
       pr <- mkPR (root </> "config.toml") Nothing
       r <- resolveDefProvider pr "nope" (ModelId "m")
       case r of
-        Left e -> e `shouldSatisfy` ("(known: anthropic, ollama, openai-compat)" `T.isInfixOf`)
+        Left e -> e `shouldSatisfy` ("(known: anthropic, ollama, openai, openrouter)" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
 -- | All suites behind the module's single exported @spec@.
@@ -403,14 +411,18 @@ cliSpec = describe "generic provider CLI" $ do
       addPlanFor OllamaType
         `shouldBe` AddPlan (OptionalBaseUrl "http://localhost:11434") OptionalKey
                           (Just (ModelId "llama3.2"))
-    it "requires a base URL and a model for the generic row" $
-      addPlanFor (OpenAICompatType genericOpenAICompat)
+    it "requires a base URL and a model for the generic OpenAI API row" $
+      addPlanFor (OpenAICompatType genericOpenAI)
         `shouldBe` AddPlan RequiredBaseUrl OptionalKey Nothing
+    it "fixes the URL and requires a key for OpenRouter" $
+      addPlanFor (OpenAICompatType openRouter)
+        `shouldBe` AddPlan NoBaseUrl RequiredKey
+                          (Just (ModelId openRouterDefaultModel))
     it "requires a key (and no URL prompt) for a key-required preset" $
       addPlanFor (OpenAICompatType presetSpec)
         `shouldBe` AddPlan NoBaseUrl RequiredKey (Just (ModelId "acme-large"))
 
-  describe "add openai-compat" $ do
+  describe "add openai" $ do
     it "aborts on a blank base URL without writing anything" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
@@ -418,12 +430,12 @@ cliSpec = describe "generic provider CLI" $ do
         pr <- mkPR cfg (Just vh)
         -- three blank answers exhaust the required prompt
         (fc, caps) <- makeFakeCaps ["", "", "", ""]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("nothing was saved" `T.isInfixOf`)
         Right cfg' <- loadRuntimeConfig cfg
-        rcProviders cfg' `shouldSatisfy` not . Map.member "openai-compat"
-        missing <- vhGet vh "OPENAI_COMPAT_API_KEY"
+        rcProviders cfg' `shouldSatisfy` not . Map.member "openai"
+        missing <- vhGet vh "OPENAI_API_KEY"
         missing `shouldSatisfy` isLeft
 
     it "rejects an unusable base URL with the reason" $
@@ -432,7 +444,7 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         (fc, caps) <- makeFakeCaps ["", "ftp://h/v1", "ftp://h/v1", "ftp://h/v1"]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("not usable" `T.isInfixOf`)
         out `shouldSatisfy` ("scheme must be http or https" `T.isInfixOf`)
@@ -443,14 +455,14 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         (fc, caps) <- makeFakeCaps ["", "http://127.0.0.1:8000/v1", "qwen2.5-7b", ""]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         Right cfg' <- loadRuntimeConfig cfg
-        providerBaseUrl cfg' "openai-compat" `shouldBe` Just "http://127.0.0.1:8000/v1"
-        providerDefaultModel cfg' "openai-compat" `shouldBe` Just "qwen2.5-7b"
-        missing <- vhGet vh "OPENAI_COMPAT_API_KEY"
+        providerBaseUrl cfg' "openai" `shouldBe` Just "http://127.0.0.1:8000/v1"
+        providerDefaultModel cfg' "openai" `shouldBe` Just "qwen2.5-7b"
+        missing <- vhGet vh "OPENAI_API_KEY"
         missing `shouldSatisfy` isLeft
         out <- T.unlines <$> getSent fc
-        out `shouldSatisfy` ("Configured openai-compat" `T.isInfixOf`)
+        out `shouldSatisfy` ("Configured openai" `T.isInfixOf`)
 
     it "stores a supplied key in the vault" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
@@ -458,30 +470,30 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         (_, caps) <- makeFakeCaps ["", "https://gw.example/v1", "gpt-4o-mini", "sk-oc"]
-        runProv pr ["add", "openai-compat"] caps
-        vhGet vh "OPENAI_COMPAT_API_KEY" >>= (`shouldBe` Right ("sk-oc" :: ByteString))
+        runProv pr ["add", "openai"] caps
+        vhGet vh "OPENAI_API_KEY" >>= (`shouldBe` Right ("sk-oc" :: ByteString))
 
     it "works keyless with no vault configured at all" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
         pr <- mkPR cfg Nothing
         (fc, caps) <- makeFakeCaps ["", "http://127.0.0.1:8000/v1", "m1", ""]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         Right cfg' <- loadRuntimeConfig cfg
-        providerBaseUrl cfg' "openai-compat" `shouldBe` Just "http://127.0.0.1:8000/v1"
+        providerBaseUrl cfg' "openai" `shouldBe` Just "http://127.0.0.1:8000/v1"
         out <- T.unlines <$> getSent fc
-        out `shouldSatisfy` ("Configured openai-compat" `T.isInfixOf`)
+        out `shouldSatisfy` ("Configured openai" `T.isInfixOf`)
 
     it "aborts on the web cancel sentinel" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
         pr <- mkPR cfg Nothing
         (fc, caps) <- makeFakeCaps ["rejected"]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("nothing was saved" `T.isInfixOf`)
         Right cfg' <- loadRuntimeConfig cfg
-        rcProviders cfg' `shouldSatisfy` not . Map.member "openai-compat"
+        rcProviders cfg' `shouldSatisfy` not . Map.member "openai"
 
     it "warns when a key would be sent over plain http to a remote host" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
@@ -489,22 +501,22 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         (fc, caps) <- makeFakeCaps ["", "http://gw.example/v1", "m1", "sk-x"]
-        runProv pr ["add", "openai-compat"] caps
+        runProv pr ["add", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("unencrypted" `T.isInfixOf`)
 
-  describe "test openai-compat" $ do
+  describe "test openai" $ do
     it "reports the transport failure verbatim against an unreachable endpoint" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         _ <- updateRuntimeConfig cfg
-               (upsertProvider "openai-compat"
+               (upsertProviderForType "openai" "openai"
                   (\p -> p { pcBaseUrl = Just "http://127.0.0.1:1/v1"
                            , pcDefaultModel = Just "m1" }))
         (fc, caps) <- makeFakeCaps []
-        runProv pr ["test", "openai-compat"] caps
+        runProv pr ["test", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("connection or transport error" `T.isInfixOf`)
 
@@ -514,28 +526,28 @@ cliSpec = describe "generic provider CLI" $ do
         vh <- makeFakeVault []
         pr <- mkPR cfg (Just vh)
         _ <- updateRuntimeConfig cfg
-               (upsertProvider "openai-compat"
+               (upsertProviderForType "openai" "openai"
                   (\p -> p { pcBaseUrl = Just "http://127.0.0.1:1/v1" }))
         (fc, caps) <- makeFakeCaps []
-        runProv pr ["test", "openai-compat"] caps
+        runProv pr ["test", "openai"] caps
         out <- T.unlines <$> getSent fc
         out `shouldSatisfy` ("has no model selected" `T.isInfixOf`)
 
-  describe "remove openai-compat" $ do
+  describe "remove openai" $ do
     it "deconfigures a keyless provider with no vault and keeps Anthropic's OAuth" $
       withSystemTempDirectory "seal-oc" $ \dir -> do
         let cfg = dir </> "config.toml"
         vh <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", "{}")]
         pr <- mkPR cfg (Just vh)
         _ <- updateRuntimeConfig cfg
-               (upsertProvider "openai-compat"
+               (upsertProviderForType "openai" "openai"
                   (\p -> p { pcBaseUrl = Just "http://127.0.0.1:8000/v1"
                            , pcDefaultModel = Just "m1" }))
         (_, caps) <- makeFakeCaps []
-        runProv pr ["remove", "openai-compat"] caps
+        runProv pr ["remove", "openai"] caps
         Right cfg' <- loadRuntimeConfig cfg
-        providerBaseUrl cfg' "openai-compat" `shouldBe` Nothing
-        rcProviders cfg' `shouldSatisfy` not . Map.member "openai-compat"
+        providerBaseUrl cfg' "openai" `shouldBe` Nothing
+        rcProviders cfg' `shouldSatisfy` not . Map.member "openai"
         vhGet vh "ANTHROPIC_OAUTH_TOKENS" >>= (`shouldBe` Right ("{}" :: ByteString))
 
     it "works with no vault handle at all" $
@@ -543,9 +555,9 @@ cliSpec = describe "generic provider CLI" $ do
         let cfg = dir </> "config.toml"
         pr <- mkPR cfg Nothing
         (fc, caps) <- makeFakeCaps []
-        runProv pr ["remove", "openai-compat"] caps
+        runProv pr ["remove", "openai"] caps
         out <- T.unlines <$> getSent fc
-        out `shouldSatisfy` ("openai-compat" `T.isInfixOf`)
+        out `shouldSatisfy` ("openai" `T.isInfixOf`)
 
 -- Fixtures ------------------------------------------------------------------
 
@@ -569,10 +581,10 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (_, caps) <- makeFakeCaps ["local", "http://127.0.0.1:8000/v1", "qwen2.5-7b", ""]
-      runProv pr ["add", "openai-compat"] caps
+      runProv pr ["add", "openai"] caps
       Right cfg' <- loadRuntimeConfig cfg
       fmap pcType (Map.lookup "local" (rcProviders cfg'))
-        `shouldBe` Just (Just "openai-compat")
+        `shouldBe` Just (Just "openai")
       providerBaseUrl cfg' "local" `shouldBe` Just "http://127.0.0.1:8000/v1"
       providerDefaultModel cfg' "local" `shouldBe` Just "qwen2.5-7b"
 
@@ -582,7 +594,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (_, caps) <- makeFakeCaps ["https://groq.example/v1", "llama-3.3", ""]
-      runProv pr ["add", "openai-compat", "groq"] caps
+      runProv pr ["add", "openai", "groq"] caps
       Right cfg' <- loadRuntimeConfig cfg
       providerBaseUrl cfg' "groq" `shouldBe` Just "https://groq.example/v1"
 
@@ -592,9 +604,9 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (_, c1) <- makeFakeCaps ["local", "http://127.0.0.1:8000/v1", "m1", ""]
-      runProv pr ["add", "openai-compat"] c1
+      runProv pr ["add", "openai"] c1
       (_, c2) <- makeFakeCaps ["groq", "https://groq.example/v1", "m2", ""]
-      runProv pr ["add", "openai-compat"] c2
+      runProv pr ["add", "openai"] c2
       Right cfg' <- loadRuntimeConfig cfg
       providerBaseUrl cfg' "local" `shouldBe` Just "http://127.0.0.1:8000/v1"
       providerBaseUrl cfg' "groq" `shouldBe` Just "https://groq.example/v1"
@@ -602,8 +614,8 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       (fc2, capsList) <- makeFakeCaps []
       runProv pr ["list"] capsList
       out <- T.unlines <$> getSent fc2
-      out `shouldSatisfy` ("local (OpenAI-compatible)" `T.isInfixOf`)
-      out `shouldSatisfy` ("groq (OpenAI-compatible)" `T.isInfixOf`)
+      out `shouldSatisfy` ("local (OpenAI API)" `T.isInfixOf`)
+      out `shouldSatisfy` ("groq (OpenAI API)" `T.isInfixOf`)
 
   it "rejects an invalid name before writing anything" $
     withSystemTempDirectory "seal-oc" $ \dir -> do
@@ -611,7 +623,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (fc, caps) <- makeFakeCaps ["Work_Proxy"]
-      runProv pr ["add", "openai-compat"] caps
+      runProv pr ["add", "openai"] caps
       out <- T.unlines <$> getSent fc
       out `shouldSatisfy` ("instance names are" `T.isInfixOf`)
       Right cfg' <- loadRuntimeConfig cfg
@@ -625,7 +637,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (fc, caps) <- makeFakeCaps ["default"]
-      runProv pr ["add", "openai-compat"] caps
+      runProv pr ["add", "openai"] caps
       out <- T.unlines <$> getSent fc
       out `shouldSatisfy` ("reserved" `T.isInfixOf`)
 
@@ -635,7 +647,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (fc, caps) <- makeFakeCaps ["ollama"]
-      runProv pr ["add", "openai-compat"] caps
+      runProv pr ["add", "openai"] caps
       out <- T.unlines <$> getSent fc
       out `shouldSatisfy` ("is a provider type id" `T.isInfixOf`)
 
@@ -647,7 +659,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       _ <- updateRuntimeConfig cfg
              (upsertProvider "work" (\p -> p { pcType = Just "anthropic" }))
       (fc, caps) <- makeFakeCaps ["work"]
-      runProv pr ["add", "openai-compat"] caps
+      runProv pr ["add", "openai"] caps
       out <- T.unlines <$> getSent fc
       out `shouldSatisfy` ("already exists as a Anthropic instance" `T.isInfixOf`)
 
@@ -657,13 +669,13 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       (fc1, c1) <- makeFakeCaps ["", "https://gw.example/v1", "m1", "sk-1"]
-      runProv pr ["add", "openai-compat"] c1
+      runProv pr ["add", "openai"] c1
       out1 <- T.unlines <$> getSent fc1
-      out1 `shouldSatisfy` ("Configuring openai-compat" `T.isInfixOf`)
+      out1 `shouldSatisfy` ("Configuring openai" `T.isInfixOf`)
       (fc2, c2) <- makeFakeCaps ["", "https://gw.example/v1", "m2", "sk-2"]
-      runProv pr ["add", "openai-compat"] c2
+      runProv pr ["add", "openai"] c2
       out2 <- T.unlines <$> getSent fc2
-      out2 `shouldSatisfy` ("Updating openai-compat" `T.isInfixOf`)
+      out2 `shouldSatisfy` ("Updating openai" `T.isInfixOf`)
 
   it "explains an instance name given where a type is expected" $
     withSystemTempDirectory "seal-oc" $ \dir -> do
@@ -681,12 +693,12 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL", "sk-local")]
       pr <- mkPR cfg (Just vh)
       _ <- updateRuntimeConfig cfg
-             (upsertProvider "local" (\p -> p { pcType = Just "openai-compat"
+             (upsertProvider "local" (\p -> p { pcType = Just "openai"
                                               , pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
       (fc, caps) <- makeFakeCaps []
       runProv pr ["list"] caps
       out <- T.unlines <$> getSent fc
-      out `shouldSatisfy` ("local (OpenAI-compatible)" `T.isInfixOf`)
+      out `shouldSatisfy` ("local (OpenAI API)" `T.isInfixOf`)
       out `shouldSatisfy` ("auth: api-key" `T.isInfixOf`)
       out `shouldSatisfy` ("base URL: http://127.0.0.1:9/v1" `T.isInfixOf`)
 
@@ -696,7 +708,7 @@ instanceCliSpec = describe "provider instances CLI (#273)" $ do
       vh <- makeFakeVault []
       pr <- mkPR cfg (Just vh)
       _ <- updateRuntimeConfig cfg
-             (upsertProvider "local" (\p -> p { pcType = Just "openai-compat"
+             (upsertProvider "local" (\p -> p { pcType = Just "openai"
                                               , pcBaseUrl = Just "http://127.0.0.1:1/v1"
                                               , pcDefaultModel = Just "m1" }))
       (fc, caps) <- makeFakeCaps []

@@ -13,7 +13,6 @@ import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
-import System.IO (hPutStrLn, stderr)
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
@@ -52,7 +51,7 @@ import Seal.Command.Spec (mkRegistry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
-import Seal.Config.Migrate (migrateSecurityConfig, providerRenameMigration)
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
@@ -110,11 +109,6 @@ runServeMain autonomy mCliStaticDir logger = do
   -- newest N entries, drop the rest. Best-effort — failures are ignored.
   gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN
   migrateSecurityConfig paths
-  -- Must run AFTER the security migration: this rewrites config.toml
-  -- through the RuntimeConfig codec, which would drop the legacy security
-  -- fields the migration above reads.
-  mProviderRename <- providerRenameMigration paths
-  mapM_ (hPutStrLn stderr . T.unpack) mProviderRename
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

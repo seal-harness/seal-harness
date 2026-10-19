@@ -205,7 +205,7 @@ showPO (ParseHelp (Just _)) = "ParseHelp just"
 showPO (ParseFailure _)   = "ParseFailure"
 
 -- ---------------------------------------------------------------------------
--- Legacy / unknown provider ids (issue #271: openrouter -> openai-compat)
+-- Legacy / unknown provider ids (issue #271: openrouter -> openai)
 -- ---------------------------------------------------------------------------
 
 legacySpec :: Spec
@@ -213,13 +213,13 @@ legacySpec = describe "new -p validation" $ do
   it "rejects a legacy id with the rename guidance and mints no session" $ do
     (fc, caps) <- makeFakeCaps []
     let deps = stubDeps { ndPaths = error "ndPaths must not be touched" }
-    case parseSlash (mkRegistry [newCommandSpec deps]) "/new -p openrouter" of
+    case parseSlash (mkRegistry [newCommandSpec deps]) "/new -p openai-compat" of
       ParsedAction act -> do
         _ <- runCommandAction act caps
         sent <- getSent fc
         let out = T.unpack (T.unlines sent)
-        out `shouldContain` "renamed to openai-compat"
-        out `shouldContain` "known: anthropic, ollama, openai-compat"
+        out `shouldContain` "renamed to openai"
+        out `shouldContain` "known: anthropic, ollama, openai, openrouter"
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
 
   it "rejects any unknown id" $ do
@@ -243,4 +243,7 @@ resolveModelSpec = describe "resolveNewModel" $ do
     resolveNewModel defaultRuntimeConfig "anthropic" "claude-haiku-4-5"
       `shouldBe` "claude-haiku-4-5"
   it "keeps the empty value when the instance has no default model" $
-    resolveNewModel defaultRuntimeConfig "openai-compat" "" `shouldBe` ""
+    resolveNewModel defaultRuntimeConfig "openai" "" `shouldBe` ""
+  it "resolves OpenRouter's default model" $
+    resolveNewModel defaultRuntimeConfig "openrouter" ""
+      `shouldBe` "deepseek/deepseek-v4.1-flash-1017"

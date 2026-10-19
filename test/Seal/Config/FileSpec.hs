@@ -17,7 +17,7 @@ import Seal.Config.File
   , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
-  , updateRuntimeConfig, upsertProvider
+  , updateRuntimeConfig, upsertProvider, upsertProviderForType, emptyProviderConfig
   , defaultAutoloadSkill, resolvedAutoloadSkill, resolvedAvailableSkills
   , resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
   , resolvedCredentialToolGuidance
@@ -326,11 +326,11 @@ spec = describe "Seal.Config.File" $ do
             cfg  = upsertProvider "work"
                      (const ProviderConfig { pcBaseUrl = Just "https://groq.example/v1"
                                            , pcDefaultModel = Just "llama-3.3-70b"
-                                           , pcType = Just "openai-compat" })
+                                           , pcType = Just "openai" })
                      defaultRuntimeConfig
         saveRuntimeConfig path cfg
         raw <- TIO.readFile path
-        raw `shouldSatisfy` ("type = \"openai-compat\"" `T.isInfixOf`)
+        raw `shouldSatisfy` ("type = \"openai\"" `T.isInfixOf`)
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg
 
@@ -358,7 +358,7 @@ spec = describe "Seal.Config.File" $ do
         TIO.writeFile path $ T.unlines
           [ "default_provider = \"anthropic\""
           , "[providers.work]"
-          , "type = \"openai-compat\""
+          , "type = \"openai\""
           , "base_url = \"https://groq.example/v1\""
           ]
         Right cfg0 <- loadRuntimeConfig path
@@ -367,18 +367,18 @@ spec = describe "Seal.Config.File" $ do
         rcProviders cfg1 `shouldBe` rcProviders cfg0
         providerBaseUrl cfg1 "work" `shouldBe` Just "https://groq.example/v1"
 
-    it "round-trips a hyphenated provider id ([providers.openai-compat])" $
+    it "round-trips a hyphenated provider id ([providers.openai])" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg  = upsertProvider "openai-compat"
+            cfg  = upsertProvider "openai"
                      (\_ -> ProviderConfig (Just "qwen2.5-7b-instruct")
                                           (Just "http://localhost:8000/v1")
-                                          (Just "openai-compat"))
+                                          (Just "openai"))
                      defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg
-        providerBaseUrl back "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
+        providerBaseUrl back "openai" `shouldBe` Just "http://localhost:8000/v1"
 
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
@@ -490,3 +490,14 @@ spec = describe "Seal.Config.File" $ do
 
     it "onDemandSchemas returns True when the key is set" $
       onDemandSchemas (defaultRuntimeConfig { rcOnDemandSchemas = Just True }) `shouldBe` True
+
+  describe "upsertProviderForType" $ do
+    it "stamps the canonical type on create" $ do
+      let cfg = upsertProviderForType "openai" "openai" id defaultRuntimeConfig
+      fmap pcType (Map.lookup "openai" (rcProviders cfg)) `shouldBe` Just (Just "openai")
+    it "overwrites a different existing type" $ do
+      let base = defaultRuntimeConfig
+                   { rcProviders = Map.singleton "openai"
+                       (emptyProviderConfig { pcType = Just "OPENAI" }) }
+          cfg = upsertProviderForType "openai" "openai" id base
+      fmap pcType (Map.lookup "openai" (rcProviders cfg)) `shouldBe` Just (Just "openai")

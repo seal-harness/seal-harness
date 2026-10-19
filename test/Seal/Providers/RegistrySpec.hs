@@ -20,6 +20,17 @@ import Seal.Providers.Registry
   ( catalogProblems
   , completeSome
   , ProviderCredentials (..)
+  , ProviderType (..)
+  , ProviderFamily (..)
+  , providerFamily
+  , familyKey
+  , familyLabel
+  , openAICompatSpecFor
+  , genericOpenAI
+  , openRouter
+  , openRouterBaseUrl
+  , openRouterDefaultModel
+  , openAICompatSpecs
   , ProviderInstance (..)
   , configuredInstances
   , findInstance
@@ -103,36 +114,35 @@ instanceSpec = describe "providerInstances (#273)" $ do
 
   it "synthesizes one row per type for an empty config" $ do
     let rows = providerInstances defaultRuntimeConfig
-    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat"]
-    map piHasSection rows `shouldBe` [False, False, False]
-    map piProblem rows `shouldBe` [Nothing, Nothing, Nothing]
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai", "openrouter"]
+    map piHasSection rows `shouldBe` [False, False, False, False]
+    map piProblem rows `shouldBe` [Nothing, Nothing, Nothing, Nothing]
     map (fmap typeId . piType) rows
-      `shouldBe` [Just "anthropic", Just "ollama", Just "openai-compat"]
-    map piTypeId rows `shouldBe` [Nothing, Nothing, Nothing]
-    map (isJust . piNameValid) rows `shouldBe` [True, True, True]
+      `shouldBe` [Just "anthropic", Just "ollama", Just "openai", Just "openrouter"]
+    map piTypeId rows `shouldBe` [Nothing, Nothing, Nothing, Nothing]
+    map (isJust . piNameValid) rows `shouldBe` [True, True, True, True]
 
   it "keeps catalog order when a section claims a type name" $ do
     let rows = providerInstances (cfgWith [("anthropic", sec Nothing Nothing Nothing)])
-    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai", "openrouter"]
     map piHasSection (take 1 rows) `shouldBe` [True]
 
   it "appends explicit extra instances after the type rows, by name" $ do
     let cfg = cfgWith
-          [ ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") (Just "m1"))
-          , ("aaa", sec (Just "openai-compat") (Just "http://localhost:8000/v1") Nothing)
+          [ ("groq", sec (Just "openai") (Just "https://groq.example/v1") (Just "m1"))
+          , ("aaa", sec (Just "openai") (Just "http://localhost:8000/v1") Nothing)
           ]
         rows = providerInstances cfg
-    map piName rows `shouldBe` ["anthropic", "ollama", "openai-compat", "aaa", "groq"]
-    map (fmap typeId . piType) (drop 3 rows) `shouldBe` [Just "openai-compat", Just "openai-compat"]
+    map piName rows `shouldBe` ["anthropic", "ollama", "openai", "openrouter", "aaa", "groq"]
+    map (fmap typeId . piType) (drop 4 rows) `shouldBe` [Just "openai", Just "openai"]
     -- each instance keeps its OWN section
-    map (pcBaseUrl . piConfig) (drop 3 rows)
+    map (pcBaseUrl . piConfig) (drop 4 rows)
       `shouldBe` [Just "http://localhost:8000/v1", Just "https://groq.example/v1"]
 
   it "resolves a typed section, case-insensitively, keeping the raw text for display" $ do
-    let rows = providerInstances (cfgWith [("work", sec (Just "OpenAI-Compat") Nothing Nothing)])
+    let rows = providerInstances (cfgWith [("work", sec (Just "OpenAI") Nothing Nothing)])
         work = [ r | r <- rows, piName r == "work" ]
-    map (fmap typeId . piType) work `shouldBe` [Just "openai-compat"]
-    map piTypeId work `shouldBe` [Just "OpenAI-Compat"]
+    map (fmap typeId . piType) work `shouldBe` [Just "openai"]
     map piProblem work `shouldBe` [Nothing]
 
   it "treats an empty type as absent (back-compat fallback)" $ do
@@ -155,10 +165,17 @@ instanceSpec = describe "providerInstances (#273)" $ do
       `shouldSatisfy` all (maybe False ("has no type" `T.isInfixOf`))
 
   it "resolves a type-less legacy section (no rewrite needed)" $ do
-    let rows = providerInstances (cfgWith [("openai-compat", sec Nothing Nothing Nothing)])
-        g = [ r | r <- rows, piName r == "openai-compat" ]
-    map (fmap typeId . piType) g `shouldBe` [Just "openai-compat"]
+    let rows = providerInstances (cfgWith [("openrouter", sec Nothing Nothing Nothing)])
+        g = [ r | r <- rows, piName r == "openrouter" ]
+    map (fmap typeId . piType) g `shouldBe` [Just "openrouter"]
     map piProblem g `shouldBe` [Nothing]
+
+  it "reports a type-less openai section (not a legacy id) as a problem row" $ do
+    let rows = providerInstances (cfgWith [("openai", sec Nothing Nothing Nothing)])
+        g = [ r | r <- rows, piName r == "openai" ]
+    map piType g `shouldBe` [Nothing]
+    map piProblem g
+      `shouldSatisfy` all (maybe False ("has no type" `T.isInfixOf`))
 
   it "reports an invalid or reserved section name and never resolves it" $ do
     let rows = providerInstances (cfgWith
@@ -181,16 +198,16 @@ instanceSpec = describe "providerInstances (#273)" $ do
       `shouldSatisfy` all (maybe False ("is not a ollama instance" `T.isInfixOf`))
 
   it "exposes the type catalog and lookups" $ do
-    map typeId providerTypes `shouldBe` ["anthropic", "ollama", "openai-compat"]
-    map (fmap typeId . providerTypeForId) ["anthropic", " Ollama ", "OPENAI-COMPAT"]
-      `shouldBe` [Just "anthropic", Just "ollama", Just "openai-compat"]
+    map typeId providerTypes `shouldBe` ["anthropic", "ollama", "openai", "openrouter"]
+    map (fmap typeId . providerTypeForId) ["anthropic", " Ollama ", "OPENAI"]
+      `shouldBe` [Just "anthropic", Just "ollama", Just "openai"]
     providerTypeForId "nope" `shouldBe` Nothing
-    legacyTypeIds `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    legacyTypeIds `shouldBe` ["anthropic", "ollama", "openrouter"]
 
-  it "keeps every instance's config distinct (two openai-compat rows)" $ do
+  it "keeps every instance's config distinct (two openai rows)" $ do
     let cfg = cfgWith
-          [ ("local", sec (Just "openai-compat") (Just "http://localhost:8000/v1") (Just "qwen"))
-          , ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") (Just "llama"))
+          [ ("local", sec (Just "openai") (Just "http://localhost:8000/v1") (Just "qwen"))
+          , ("groq", sec (Just "openai") (Just "https://groq.example/v1") (Just "llama"))
           ]
         rows = [ r | r <- providerInstances cfg, piName r `elem` ["local", "groq"] ]
     -- extras are ordered by name
@@ -201,7 +218,7 @@ instanceSpec = describe "providerInstances (#273)" $ do
 
 -- | The module's single exported spec.
 spec :: Spec
-spec = specMain >> instanceSpec >> instanceBehaviourSpec
+spec = specMain >> instanceSpec >> instanceBehaviourSpec >> familySpec
 
 -- ---------------------------------------------------------------------------
 -- Instances: credentials, resolution, status (#273 WU-2)
@@ -230,8 +247,8 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
       let i = instOf defaultRuntimeConfig "anthropic"
       fmap pcApiKeyName (instanceCredentials i) `shouldBe` Just "ANTHROPIC_API_KEY"
       fmap pcOauthKeyName (instanceCredentials i) `shouldBe` Just (Just "ANTHROPIC_OAUTH_TOKENS")
-      let g = instOf defaultRuntimeConfig "openai-compat"
-      fmap pcApiKeyName (instanceCredentials g) `shouldBe` Just "OPENAI_COMPAT_API_KEY"
+      let g = instOf defaultRuntimeConfig "openai"
+      fmap pcApiKeyName (instanceCredentials g) `shouldBe` Just "OPENAI_API_KEY"
     it "derives prefixed keys for a named instance" $ do
       let cfg = cfgWith [("work", sec (Just "anthropic") Nothing Nothing)]
       fmap pcApiKeyName (instanceCredentials (instOf cfg "work"))
@@ -239,7 +256,7 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
       fmap pcOauthKeyName (instanceCredentials (instOf cfg "work"))
         `shouldBe` Just (Just "PROVIDER_OAUTH_WORK")
     it "gives a non-anthropic instance no OAuth key" $ do
-      let cfg = cfgWith [("local", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)]
+      let cfg = cfgWith [("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)]
       fmap pcOauthKeyName (instanceCredentials (instOf cfg "local")) `shouldBe` Just Nothing
     it "refuses credentials for problem rows (invalid name, unknown type, mismatch)" $ do
       let cfg = cfgWith
@@ -253,19 +270,19 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
   describe "per-instance base URL" $ do
     it "keeps two instances of one type on their own URLs" $ do
       let cfg = cfgWith
-            [ ("local", sec (Just "openai-compat") (Just "http://127.0.0.1:8000/v1") Nothing)
-            , ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") Nothing)
+            [ ("local", sec (Just "openai") (Just "http://127.0.0.1:8000/v1") Nothing)
+            , ("groq", sec (Just "openai") (Just "https://groq.example/v1") Nothing)
             ]
       providerBaseUrlForInstance cfg (instOf cfg "local")
         `shouldBe` Right "http://127.0.0.1:8000/v1"
       providerBaseUrlForInstance cfg (instOf cfg "groq")
         `shouldBe` Right "https://groq.example/v1"
     it "requires a base URL for the generic row and names the instance" $ do
-      let cfg = cfgWith [("local", sec (Just "openai-compat") Nothing Nothing)]
+      let cfg = cfgWith [("local", sec (Just "openai") Nothing Nothing)]
       case providerBaseUrlForInstance cfg (instOf cfg "local") of
         Left e -> do
           e `shouldSatisfy` ("local needs a base URL" `T.isInfixOf`)
-          e `shouldSatisfy` ("/provider add openai-compat local" `T.isInfixOf`)
+          e `shouldSatisfy` ("/provider add openai local" `T.isInfixOf`)
         Right u -> expectationFailure ("expected Left, got " <> T.unpack u)
     it "reports a misconfigured row" $ do
       let cfg = cfgWith [("typo", sec (Just "anthorpic") Nothing Nothing)]
@@ -276,8 +293,8 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
   describe "instanceAuthStatus / configuredInstances" $ do
     it "walks none -> keyless -> api-key for one instance while another stays none" $ do
       let cfg = cfgWith
-            [ ("local", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)
-            , ("groq", sec (Just "openai-compat") (Just "https://groq.example/v1") Nothing)
+            [ ("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)
+            , ("groq", sec (Just "openai") (Just "https://groq.example/v1") Nothing)
             ]
       vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL", "sk-local")]
       local <- instanceAuthStatus (Just vh) cfg (instOf cfg "local")
@@ -320,11 +337,12 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
         _ <- configuredInstances (Just spy) cfg
         _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg n) (ModelId "m") counter
         pure ()) ["we ird", "typo", "anthropic"]
-      readIORef entries `shouldReturn` []
+      gets <- readIORef entries
+      gets `shouldSatisfy` all (T.isInfixOf "OPENROUTER_API_KEY")
 
   describe "resolveInstance" $ do
     it "resolves a keyless generic instance with no vault at all" $ do
-      let cfg = cfgWith [("local", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)]
+      let cfg = cfgWith [("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)]
       shouldResolve =<< resolveInstance Nothing mgrRef cfg (instOf cfg "local") (ModelId "m") counter
     it "refuses a problem row with its problem text" $ do
       let cfg = cfgWith [("typo", sec (Just "anthorpic") Nothing Nothing)]
@@ -334,8 +352,8 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
         Right _ -> expectationFailure "expected Left"
     it "reads each instance's own key (keyed generic row)" $ do
       let cfg = cfgWith
-            [ ("a", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)
-            , ("b", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)
+            [ ("a", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)
+            , ("b", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)
             ]
       entries <- newIORef []
       vh <- makeFakeVault [("PROVIDER_APIKEY_A", "sk-a")]
@@ -361,7 +379,7 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
     it "resolves section -> type -> built-in per instance" $ do
       let cfg = cfgWith
             [ ("work", sec (Just "anthropic") Nothing (Just "claude-haiku-4-5"))
-            , ("local", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)
+            , ("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)
             ]
       resolveDefaultModelFor cfg "work"  `shouldBe` Just (ModelId "claude-haiku-4-5")
       resolveDefaultModelFor cfg "local" `shouldBe` Nothing
@@ -373,10 +391,10 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
     it "lists instance names (both of a type)" $ do
       let cfg = cfgWith
             [ ("work", sec (Just "anthropic") Nothing Nothing)
-            , ("local", sec (Just "openai-compat") (Just "http://127.0.0.1:9/v1") Nothing)
+            , ("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)
             ]
       instanceLabelList cfg
-        `shouldBe` "anthropic, ollama, openai-compat, local, work"
+        `shouldBe` "anthropic, ollama, openai, openrouter, local, work"
 
   describe "catalogProblems (#273 additions)" $ do
     it "rejects a catalog id that is not a valid instance name or is a built-in id" $ do
@@ -394,3 +412,40 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
 mgrRef :: Manager
 mgrRef = unsafePerformIO (newManager defaultManagerSettings)
 {-# NOINLINE mgrRef #-}
+
+-- | Provider families, the two shipped rows, and the OpenRouter URL policy.
+familySpec :: Spec
+familySpec = describe "provider families and catalog" $ do
+  it "maps every provider to its family and exposes the wire slug/label" $ do
+    let ts = [ AnthropicType, OllamaType
+             , OpenAICompatType genericOpenAI, OpenAICompatType openRouter ]
+    map providerFamily ts
+      `shouldBe` [AnthropicFamily, OllamaFamily, OpenAIFamily, OpenAIFamily]
+    map (familyKey . providerFamily) ts
+      `shouldBe` ["anthropic", "ollama", "openai", "openai"]
+    map (familyLabel . providerFamily) ts
+      `shouldBe` ["Anthropic API", "Ollama API", "OpenAI API", "OpenAI API"]
+    openAICompatSpecFor (OpenAICompatType openRouter) `shouldBe` Just openRouter
+    openAICompatSpecFor AnthropicType `shouldBe` Nothing
+
+  it "ships the generic OpenAI API and OpenRouter rows" $ do
+    map ocsId openAICompatSpecs `shouldBe` ["openai", "openrouter"]
+    ocsDisplayName genericOpenAI `shouldBe` "OpenAI API"
+    ocsDisplayName openRouter `shouldBe` "OpenRouter"
+    ocsVaultKey genericOpenAI `shouldBe` "OPENAI_API_KEY"
+    ocsVaultKey openRouter `shouldBe` "OPENROUTER_API_KEY"
+    ocsBuiltinBaseUrl genericOpenAI `shouldBe` Nothing
+    ocsBuiltinBaseUrl openRouter `shouldBe` Just openRouterBaseUrl
+    ocsDefaultModel openRouter `shouldBe` Just (ModelId openRouterDefaultModel)
+    ocsKeyRequired openRouter `shouldBe` True
+    catalogProblems openAICompatSpecs `shouldBe` []
+
+  it "rejects a duplicate vault key across catalog rows" $
+    catalogProblems [genericOpenAI, openRouter { ocsVaultKey = "OPENAI_API_KEY" }]
+      `shouldSatisfy` any ("duplicate vault key" `T.isInfixOf`)
+
+  it "resolves OpenRouter to its fixed URL even with a stored base_url" $ do
+    let cfg = cfgWith
+          [("openrouter", sec (Just "openrouter") (Just "https://proxy.example/v1") (Just "m"))]
+    providerBaseUrlForInstance cfg (instOf cfg "openrouter")
+      `shouldBe` Right openRouterBaseUrl

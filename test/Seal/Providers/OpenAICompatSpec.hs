@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Tests for the generic OpenAI-compatible provider. Pure coverage for the
+-- | Tests for the generic OpenAI API provider. Pure coverage for the
 -- request/response mapping, base-URL validation and header construction, plus
 -- wire-level coverage against a loopback @warp@ mock (no DNS, no egress).
 --
@@ -50,9 +50,9 @@ import Seal.Security.Secrets (mkApiKey)
 -- | The shipped generic row (mirrors 'Seal.Providers.Registry.genericOpenAICompat').
 genericSpec :: OpenAICompatSpec
 genericSpec = OpenAICompatSpec
-  { ocsId             = "openai-compat"
-  , ocsDisplayName    = "OpenAI-compatible"
-  , ocsVaultKey       = "OPENAI_COMPAT_API_KEY"
+  { ocsId             = "openai"
+  , ocsDisplayName    = "OpenAI API"
+  , ocsVaultKey       = "OPENAI_API_KEY"
   , ocsBuiltinBaseUrl = Nothing
   , ocsDefaultModel   = Nothing
   , ocsKeyRequired    = False
@@ -113,7 +113,7 @@ roleOf (Object mo) = case KM.lookup (fromString "role") mo of
   _               -> Nothing
 roleOf _ = Nothing
 
--- | A @ChatCompletionObject@ the way an OpenAI-compatible endpoint emits it.
+-- | A @ChatCompletionObject@ the way an OpenAI API endpoint emits it.
 chatObj :: Maybe Text -> Text -> Maybe [Value] -> Value
 chatObj mContent finishReason mToolCalls = object
   [ "id" .= ("chatcmpl-1" :: Text)
@@ -383,7 +383,7 @@ pureSpec = describe "Seal.Providers.OpenAICompat" $ do
       case r of
         Left e -> do
           e `shouldSatisfy` ("has no model selected" `T.isInfixOf`)
-          e `shouldSatisfy` ("/model use openai-compat" `T.isInfixOf`)
+          e `shouldSatisfy` ("/model use openai" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
 
   describe "listModels" $ do

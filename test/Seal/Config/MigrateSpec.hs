@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Config.MigrateSpec (spec) where
 
-import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -10,9 +9,8 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.File
-  ( ProviderConfig (..), RuntimeConfig (..), loadRuntimeConfig
-  , providerBaseUrl, providerDefaultModel )
-import Seal.Config.Migrate (migrateSecurityConfig, providerRenameMigration)
+  ( RuntimeConfig (..), loadRuntimeConfig )
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig )
@@ -142,165 +140,7 @@ spec_main = describe "Seal.Config.Migrate" $ do
 -- | Helper: check if a Maybe UntrustedExecFileConfig is Just.
 isJustUexec :: Maybe UntrustedExecFileConfig -> Bool
 isJustUexec = \case Just _ -> True; Nothing -> False
--- ---------------------------------------------------------------------------
--- Provider rename migration (issue #271: openrouter -> openai-compat)
--- ---------------------------------------------------------------------------
 
-providerRenameSpec :: Spec
-providerRenameSpec = describe "providerRenameMigration" $ do
-
-  let makePaths tmp = SealPaths
-        { spHome = tmp, spConfig = tmp </> "config"
-        , spState = tmp </> "state", spKeys = tmp </> "keys"
-        , spCache = tmp </> "cache" }
-      writeCfg tmp = do
-        createDirectoryIfMissing True (tmp </> "config")
-        pure (configFilePath (makePaths tmp))
-
-  it "rewrites default_provider and copies the provider section" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath $ T.unlines
-        [ "default_provider = \"openrouter\""
-        , "[providers.openrouter]"
-        , "base_url = \"https://proxy.example/v1\""
-        , "default_model = \"some/model\""
-        ]
-      msg <- providerRenameMigration paths
-      msg `shouldSatisfy` maybe False (T.isInfixOf "renamed to openai-compat")
-      msg `shouldSatisfy` maybe False (T.isInfixOf "Run /provider add openai-compat")
-      Right cfg <- loadRuntimeConfig cfgPath
-      rcDefaultProvider cfg `shouldBe` Just "openai-compat"
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "https://proxy.example/v1"
-      providerDefaultModel cfg "openai-compat" `shouldBe` Just "some/model"
-      providerBaseUrl cfg "openrouter" `shouldBe` Nothing
-      rcProviders cfg `shouldSatisfy` not . Map.member "openrouter"
-
-  it "fills the OpenRouter URL and the old implicit model when absent" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath "[providers.openrouter]\ndefault_model = \"m1\"\n"
-      msg <- providerRenameMigration paths
-      msg `shouldSatisfy` maybe False (T.isInfixOf "openai-compat")
-      Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "https://openrouter.ai/api/v1"
-      providerDefaultModel cfg "openai-compat" `shouldBe` Just "m1"
-
-  it "synthesizes the section when only default_provider was set" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath "default_provider = \"openrouter\"\n"
-      _ <- providerRenameMigration paths
-      Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "https://openrouter.ai/api/v1"
-      providerDefaultModel cfg "openai-compat"
-        `shouldBe` Just "deepseek/deepseek-v4.1-flash-1017"
-
-  it "lets an existing [providers.openai-compat] win" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath $ T.unlines
-        [ "[providers.openai-compat]"
-        , "base_url = \"http://localhost:8000/v1\""
-        , "default_model = \"mine\""
-        , "[providers.openrouter]"
-        , "base_url = \"https://old.example/v1\""
-        ]
-      _ <- providerRenameMigration paths
-      Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
-      providerDefaultModel cfg "openai-compat" `shouldBe` Just "mine"
-      rcProviders cfg `shouldSatisfy` not . Map.member "openrouter"
-
-  it "leaves a typed [providers.openrouter] section (an ordinary instance) alone" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath $ T.unlines
-        [ "default_provider = \"openrouter\""
-        , "[providers.openrouter]"
-        , "type = \"openai-compat\""
-        , "base_url = \"https://my-proxy.example/v1\""
-        ]
-      bytesBefore <- TIO.readFile cfgPath
-      msg <- providerRenameMigration paths
-      msg `shouldBe` Nothing
-      bytesAfter <- TIO.readFile cfgPath
-      bytesAfter `shouldBe` bytesBefore
-      Right cfg <- loadRuntimeConfig cfgPath
-      rcDefaultProvider cfg `shouldBe` Just "openrouter"
-      providerBaseUrl cfg "openrouter" `shouldBe` Just "https://my-proxy.example/v1"
-      providerBaseUrl cfg "openai-compat" `shouldBe` Nothing
-
-  it "merges into a typed destination, preserving its type and settings" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath $ T.unlines
-        [ "[providers.openai-compat]"
-        , "type = \"openai-compat\""
-        , "base_url = \"http://localhost:8000/v1\""
-        , "[providers.openrouter]"
-        , "default_model = \"old/model\""
-        ]
-      _ <- providerRenameMigration paths
-      Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "http://localhost:8000/v1"
-      providerDefaultModel cfg "openai-compat" `shouldBe` Just "old/model"
-      rcProviders cfg `shouldSatisfy` not . Map.member "openrouter"
-      -- the destination keeps its explicit type
-      fmap pcType (Map.lookup "openai-compat" (rcProviders cfg))
-        `shouldBe` Just (Just "openai-compat")
-
-  it "is idempotent" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath "default_provider = \"openrouter\"\n"
-      _ <- providerRenameMigration paths
-      Right once <- loadRuntimeConfig cfgPath
-      again <- providerRenameMigration paths
-      again `shouldBe` Nothing
-      Right twice <- loadRuntimeConfig cfgPath
-      twice `shouldBe` once
-
-  it "leaves malformed TOML untouched and does not throw" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath "this is not toml [[["
-      _ <- providerRenameMigration paths
-      raw <- TIO.readFile cfgPath
-      raw `shouldBe` "this is not toml [[["
-
-  it "runs after the security migration, so remote-exec settings survive" $
-    withSystemTempDirectory "seal-rename" $ \tmp -> do
-      let paths = makePaths tmp
-          secPath = securityFilePath paths
-      cfgPath <- writeCfg tmp
-      TIO.writeFile cfgPath $ T.unlines
-        [ "vault_path = \"/tmp/vault.age\""
-        , "vault_recipient = \"age1abc\""
-        , "default_provider = \"openrouter\""
-        , "[providers.openrouter]"
-        , "base_url = \"https://proxy.example/v1\""
-        , "[untrusted_execution]"
-        , "mode = \"remote\""
-        ]
-      migrateSecurityConfig paths
-      _ <- providerRenameMigration paths
-      secExists <- doesFileExist secPath
-      secExists `shouldBe` True
-      Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Just "https://proxy.example/v1"
-      raw <- TIO.readFile cfgPath
-      raw `shouldSatisfy` not . T.isInfixOf "[untrusted_execution]"
-
--- | Both suites behind the module's single exported @spec@.
-
+-- | The module's single exported @spec@.
 spec :: Spec
-spec = spec_main >> providerRenameSpec
+spec = spec_main

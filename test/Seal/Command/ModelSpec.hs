@@ -22,7 +22,7 @@ import Seal.Command.Model (ModelTranscriptWriter, modelCommandSpec, modelCommand
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Config.File
-  (ProviderConfig (..), loadRuntimeConfig, providerDefaultModel, updateRuntimeConfig, upsertProvider)
+  (ProviderConfig (..), loadRuntimeConfig, providerDefaultModel, updateRuntimeConfig, upsertProvider, upsertProviderForType)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Core.Types (SessionId, mkSessionId)
@@ -325,7 +325,7 @@ spec_main = describe "Seal.Command.Model" $ do
       T.unlines sent `shouldSatisfy` ("no active session" `T.isInfixOf`)
 
 -- ---------------------------------------------------------------------------
--- Generic OpenAI-compatible provider (issue #271): no default model
+-- Generic OpenAI API provider (issue #271): no default model
 -- ---------------------------------------------------------------------------
 
 spec_model_less :: Spec
@@ -335,7 +335,7 @@ spec_model_less = describe "/model with a model-less provider" $ do
       sr <- mkSR root
       pr <- mkPR (root </> "config.toml") Nothing
       (fc, caps) <- makeFakeCaps []
-      runModel pr sr ["use", "openai-compat"] caps
+      runModel pr sr ["use", "openai"] caps
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("has no default model" `T.isInfixOf`)
       m <- readActive sr
@@ -348,9 +348,9 @@ spec_model_less = describe "/model with a model-less provider" $ do
       vh <- makeFakeVault []
       pr <- mkPR (root </> "config.toml") (Just vh)
       _ <- updateRuntimeConfig (root </> "config.toml")
-             (upsertProvider "openai-compat" (\p -> p { pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
+             (upsertProviderForType "openai" "openai" (\p -> p { pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
       (fc, caps) <- makeFakeCaps []
-      runModel pr sr ["list", "openai-compat"] caps
+      runModel pr sr ["list", "openai"] caps
       sent <- getSent fc
       let out = T.unlines sent
       out `shouldSatisfy` ("has no models" `T.isInfixOf`)

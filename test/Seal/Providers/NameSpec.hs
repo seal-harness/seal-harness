@@ -45,8 +45,8 @@ spec = describe "Seal.Providers.Name" $ do
   describe "mkProviderName" $ do
     it "accepts ordinary instance names" $
       map (fmap providerNameText . mkProviderName)
-          ["groq", "work-proxy", "a1", "anthropic", "openai-compat", "openrouter"]
-        `shouldBe` map Right ["groq", "work-proxy", "a1", "anthropic", "openai-compat", "openrouter"]
+          ["groq", "work-proxy", "a1", "anthropic", "openai", "openrouter"]
+        `shouldBe` map Right ["groq", "work-proxy", "a1", "anthropic", "openai", "openrouter"]
 
     it "rejects the empty string, uppercase, underscores, dots and non-ASCII" $
       map mkProviderName ["", "Work", "work_proxy", "work.proxy", T.pack "caf\233"]
@@ -65,7 +65,7 @@ spec = describe "Seal.Providers.Name" $ do
       map mkProviderName reservedProviderNames `shouldSatisfy` all isLeft'
 
   describe "checkNameForType" $ do
-    let known = ["anthropic", "ollama", "openai-compat"]
+    let known = ["anthropic", "ollama", "openai"]
     it "allows a type id as its own instance name" $
       runName "anthropic" (\n -> checkNameForType known n "anthropic") `shouldBe` Right ()
     it "rejects another type's id" $
@@ -81,8 +81,8 @@ spec = describe "Seal.Providers.Name" $ do
     it "keeps the legacy key for a type-named instance" $ do
       runName "anthropic" (\n -> apiKeyNameFor (Just "ANTHROPIC_API_KEY") n "anthropic")
         `shouldBe` "ANTHROPIC_API_KEY"
-      runName "openai-compat" (\n -> apiKeyNameFor (Just "OPENAI_COMPAT_API_KEY") n "openai-compat")
-        `shouldBe` "OPENAI_COMPAT_API_KEY"
+      runName "openai" (\n -> apiKeyNameFor (Just "OPENAI_API_KEY") n "openai")
+        `shouldBe` "OPENAI_API_KEY"
 
     it "derives a prefixed key for any other name" $ do
       runName "work" (\n -> apiKeyNameFor (Just "ANTHROPIC_API_KEY") n "anthropic")

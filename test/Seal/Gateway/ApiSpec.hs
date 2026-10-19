@@ -3621,7 +3621,7 @@ spec_main = describe "Seal.Gateway.API" $ do
   it "GET /api/providers lists every instance with type, configured and reconfiguring" $ do
     -- adProviders is gone: the handler loads the config and lists the implicit
     -- instances themselves. The default (empty) config yields anthropic,
-    -- ollama and openai-compat; ollama's local default URL is keyless, so it
+    -- ollama and openai; ollama's local default URL is keyless, so it
     -- is the only configured one.
     app <- mkApp
     (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
@@ -3632,7 +3632,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         byName = Map.fromList
           [ (n, o) | o <- objects, Just (A.String n) <- [lookupK "name" o] ]
         field n f = Map.lookup n byName >>= lookupK f
-    Map.keys byName `shouldBe` ["anthropic", "ollama", "openai-compat"]
+    Map.keys byName `shouldBe` ["anthropic", "ollama", "openai", "openrouter"]
     -- displayName is the instance name; the type hint is typeDisplayName.
     forM_ objects $ \o -> do
       lookupK "displayName" o `shouldBe` lookupK "name" o
@@ -3641,13 +3641,13 @@ spec_main = describe "Seal.Gateway.API" $ do
       lookupK "reconfiguring" o `shouldSatisfy` isJust
       lookupK "problem" o `shouldBe` Just A.Null
     field "anthropic" "type" `shouldBe` Just (A.String "anthropic")
-    field "openai-compat" "typeDisplayName"
-      `shouldBe` Just (A.String "OpenAI-compatible")
+    field "openai" "typeDisplayName"
+      `shouldBe` Just (A.String "OpenAI API")
     field "anthropic" "configured" `shouldBe` Just (A.Bool False)
     field "ollama" "configured" `shouldBe` Just (A.Bool True)
-    field "openai-compat" "configured" `shouldBe` Just (A.Bool False)
+    field "openai" "configured" `shouldBe` Just (A.Bool False)
     field "anthropic" "defaultModel" `shouldBe` Just (A.String "claude-opus-4-8")
-    field "openai-compat" "defaultModel" `shouldBe` Just A.Null
+    field "openai" "defaultModel" `shouldBe` Just A.Null
 
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
@@ -3857,11 +3857,11 @@ spec_main = describe "Seal.Gateway.API" $ do
       -- unknown type
       expectField [ "type" .= ("anthorpic" :: T.Text), "name" .= ("x" :: T.Text) ] "type"
       -- missing required base URL (generic row) — with a key so an errant write shows
-      expectField [ "type" .= ("openai-compat" :: T.Text)
+      expectField [ "type" .= ("openai" :: T.Text)
                   , "name" .= ("oc" :: T.Text), "default_model" .= ("m" :: T.Text)
                   , "api_key" .= ("sk" :: T.Text) ] "base_url"
       -- missing required model (generic row) — with a key so an errant write shows
-      expectField [ "type" .= ("openai-compat" :: T.Text)
+      expectField [ "type" .= ("openai" :: T.Text)
                   , "name" .= ("oc" :: T.Text), "base_url" .= ("https://h/v1" :: T.Text)
                   , "api_key" .= ("sk" :: T.Text) ] "default_model"
       -- no rejected request wrote a credential
@@ -5037,7 +5037,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         _ -> False
 
 -- ---------------------------------------------------------------------------
--- Generic OpenAI-compatible provider (issue #271): detail fields, validation
+-- Generic OpenAI API provider (issue #271): detail fields, validation
 -- ---------------------------------------------------------------------------
 
 decodeText :: BL.ByteString -> T.Text
@@ -5082,13 +5082,13 @@ providerCompatSpec = describe "generic provider API" $ do
           findRow n = case [o | A.Object o <- rows, lookupK "name" o == Just (A.String n)] of
             (o:_) -> o
             []    -> error ("no row for " ++ T.unpack n)
-      let g = findRow "openai-compat"
+      let g = findRow "openai"
       lookupBool "baseUrlRequired" (A.Object g) `shouldBe` Just True
       lookupBool "defaultModelRequired" (A.Object g) `shouldBe` Just True
       lookupBool "keyOptional" (A.Object g) `shouldBe` Just True
       lookupK "authStatus" g `shouldBe` Just (A.String "none")
-      lookupK "displayName" g `shouldBe` Just (A.String "openai-compat")
-      lookupK "typeDisplayName" g `shouldBe` Just (A.String "OpenAI-compatible")
+      lookupK "displayName" g `shouldBe` Just (A.String "openai")
+      lookupK "typeDisplayName" g `shouldBe` Just (A.String "OpenAI API")
 
   it "POST /api/providers rejects a missing base URL, an unusable one and a missing model — without writing the vault" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
@@ -5100,8 +5100,8 @@ providerCompatSpec = describe "generic provider API" $ do
       let app = apiApp deps
           post fields = testPost ["api", "providers"]
             (A.encode (A.object
-              (("name" .= ("openai-compat" :: T.Text))
-                 : ("type" .= ("openai-compat" :: T.Text)) : fields)))
+              (("name" .= ("openai" :: T.Text))
+                 : ("type" .= ("openai" :: T.Text)) : fields)))
       -- missing base_url
       req1 <- post [ "api_key" .= ("sk-oc" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
       (s1, b1) <- runAppBody app req1
@@ -5123,13 +5123,13 @@ providerCompatSpec = describe "generic provider API" $ do
         _                 -> False
       -- a non-string field is rejected, not silently ignored
       req4 <- testPost ["api", "providers"]
-        (A.encode (A.object [ "name" .= ("openai-compat" :: T.Text)
-                            , "type" .= ("openai-compat" :: T.Text)
+        (A.encode (A.object [ "name" .= ("openai" :: T.Text)
+                            , "type" .= ("openai" :: T.Text)
                             , "base_url" .= (5 :: Int) ]))
       s4 <- runAppStatus app req4
       s4 `shouldBe` 400
       -- the vault was never written by any rejected request
-      missing <- vaultHas vault "OPENAI_COMPAT_API_KEY"
+      missing <- vaultHas vault "OPENAI_API_KEY"
       missing `shouldBe` Nothing
 
   it "POST then PUT then DELETE round-trips a keyless generic provider" $
@@ -5143,28 +5143,28 @@ providerCompatSpec = describe "generic provider API" $ do
       let app = apiApp deps
       req <- testPost ["api", "providers"]
         (A.encode (A.object
-          [ "name" .= ("openai-compat" :: T.Text)
-          , "type" .= ("openai-compat" :: T.Text)
+          [ "name" .= ("openai" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
           , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
           , "default_model" .= ("qwen2.5" :: T.Text)
           ]))
       (s1, _) <- runAppBody app req
       s1 `shouldBe` 201
       -- a key-only PUT is a valid partial update
-      req2 <- testPut ["api", "providers", "openai-compat"]
+      req2 <- testPut ["api", "providers", "openai"]
         (A.encode (A.object [ "default_model" .= ("qwen3" :: T.Text) ]))
       s2 <- runAppStatus app req2
       s2 `shouldBe` 200
       -- explicitly clearing the required base URL is rejected
-      req3 <- testPut ["api", "providers", "openai-compat"]
+      req3 <- testPut ["api", "providers", "openai"]
         (A.encode (A.object [ "base_url" .= ("" :: T.Text) ]))
       s3 <- runAppStatus app req3
       s3 `shouldBe` 400
       -- DELETE deconfigures it and leaves Anthropic's OAuth blob alone
-      s4 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai-compat"])
+      s4 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
       s4 `shouldBe` 204
       Right cfg <- loadRuntimeConfig cfgPath
-      providerBaseUrl cfg "openai-compat" `shouldBe` Nothing
+      providerBaseUrl cfg "openai" `shouldBe` Nothing
       oauth <- vaultHas vault "ANTHROPIC_OAUTH_TOKENS"
       oauth `shouldBe` Just "{}"
 
@@ -5312,10 +5312,10 @@ providerCompatSpec = describe "generic provider API" $ do
       ensureConfigRepo cfgRoot
       deps <- mkProviderTestDeps tmp cfgRoot =<< makeLockedVaultRuntime
       let app = apiApp deps
-      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai-compat"])
+      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
       s `shouldBe` 204
 
-  it "GET /api/providers/openai-compat/models returns an empty list" $
+  it "GET /api/providers/openai/models returns an empty list" $
     withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
       let cfgRoot = tmp </> "config"
       createDirectoryIfMissing True cfgRoot
@@ -5324,7 +5324,7 @@ providerCompatSpec = describe "generic provider API" $ do
       deps <- mkProviderTestDeps tmp cfgRoot vault
       let app = apiApp deps
       (status, body) <- runAppBody app
-        (testRequest methodGet ["api", "providers", "openai-compat", "models"])
+        (testRequest methodGet ["api", "providers", "openai", "models"])
       status `shouldBe` 200
       body `shouldBe` "[]"
 

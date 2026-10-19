@@ -33,12 +33,18 @@ module Seal.Providers.Registry
   , providerTypeLabel
   , OpenAICompatSpec (..)
   , openAICompatSpecs
-  , genericOpenAICompat
+  , genericOpenAI
+  , openRouter
+  , openRouterBaseUrl
+  , openRouterDefaultModel
+  , ProviderFamily (..)
+  , providerFamily
+  , familyKey
+  , familyLabel
+  , openAICompatSpecFor
   , catalogProblems
   , anthropicOAuthKey
   , legacyProviderHint
-  , legacyOpenRouterBaseUrl
-  , legacyOpenRouterModel
   , completeSome
   , listSome
   , vaultErrText
@@ -84,14 +90,14 @@ anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 anthropicBaseUrl :: Text
 anthropicBaseUrl = "https://api.anthropic.com"
 
--- | The generic OpenAI-compatible row: the user supplies both the base URL and
--- the model, and no API key is required (local servers usually have none).
--- Further compatible vendors are appended to 'openAICompatSpecs'.
-genericOpenAICompat :: OpenAICompatSpec
-genericOpenAICompat = OpenAICompatSpec
-  { ocsId             = "openai-compat"
-  , ocsDisplayName    = "OpenAI-compatible"
-  , ocsVaultKey       = "OPENAI_COMPAT_API_KEY"
+-- | The generic OpenAI API row: the user supplies the base URL and the model;
+-- no API key is required (local servers usually have none). Further compatible
+-- vendors are appended to 'openAICompatSpecs'.
+genericOpenAI :: OpenAICompatSpec
+genericOpenAI = OpenAICompatSpec
+  { ocsId             = "openai"
+  , ocsDisplayName    = "OpenAI API"
+  , ocsVaultKey       = "OPENAI_API_KEY"
   , ocsBuiltinBaseUrl = Nothing
   , ocsDefaultModel   = Nothing
   , ocsKeyRequired    = False
@@ -99,20 +105,34 @@ genericOpenAICompat = OpenAICompatSpec
   , ocsExtraHeaders   = []
   }
 
--- | The endpoint and model Seal used to hardcode for OpenRouter. Kept here (not
--- duplicated as literals) for the boot-time config migration; step 3's preset
--- row reuses both.
-legacyOpenRouterBaseUrl :: Text
-legacyOpenRouterBaseUrl = "https://openrouter.ai/api/v1"
+-- | The OpenRouter provider: the OpenAI API with a fixed base URL, a required
+-- key, a default model and static attribution headers.
+openRouter :: OpenAICompatSpec
+openRouter = OpenAICompatSpec
+  { ocsId             = "openrouter"
+  , ocsDisplayName    = "OpenRouter"
+  , ocsVaultKey       = "OPENROUTER_API_KEY"
+  , ocsBuiltinBaseUrl = Just openRouterBaseUrl
+  , ocsDefaultModel   = Just (ModelId openRouterDefaultModel)
+  , ocsKeyRequired    = True
+  , ocsModels         = []
+  , ocsExtraHeaders   = [ ("HTTP-Referer", "https://github.com/seal-harness/seal-harness")
+                        , ("X-Title", "Seal") ]
+  }
 
-legacyOpenRouterModel :: Text
-legacyOpenRouterModel = "deepseek/deepseek-v4.1-flash-1017"
+-- | The OpenRouter endpoint (also the value the #271 migration used).
+openRouterBaseUrl :: Text
+openRouterBaseUrl = "https://openrouter.ai/api/v1"
+
+-- | The default model advertised for OpenRouter.
+openRouterDefaultModel :: Text
+openRouterDefaultModel = "deepseek/deepseek-v4.1-flash-1017"
 
 -- | The OpenAI-compatible provider catalog. Append a row to ship a preset; the
 -- row supplies the endpoint, key policy, model catalogue and static headers,
 -- and the shared transport does the rest.
 openAICompatSpecs :: [OpenAICompatSpec]
-openAICompatSpecs = [genericOpenAICompat]
+openAICompatSpecs = [genericOpenAI, openRouter]
 
 
 -- | A provider *type*: the transport, credential policy and built-in defaults
@@ -138,7 +158,42 @@ typeId (OpenAICompatType spec) = ocsId spec
 -- working with no rewrite); a type-less section named anything else is a
 -- problem row rather than a silent guess.
 legacyTypeIds :: [Text]
-legacyTypeIds = ["anthropic", "ollama", "openai-compat"]
+legacyTypeIds = ["anthropic", "ollama", "openrouter"]
+
+-- | A provider *family* (a.k.a. provider API): the wire protocol Seal speaks.
+-- A family never fixes a base URL — it is the transport, not an endpoint.
+data ProviderFamily
+  = AnthropicFamily | OllamaFamily | OpenAIFamily
+  deriving stock (Eq, Show)
+
+-- | The family a built-in provider belongs to.
+providerFamily :: ProviderType -> ProviderFamily
+providerFamily AnthropicType = AnthropicFamily
+providerFamily OllamaType = OllamaFamily
+providerFamily (OpenAICompatType _) = OpenAIFamily
+
+-- | Stable wire slug for a family (lowercase, not the constructor name).
+familyKey :: ProviderFamily -> Text
+familyKey AnthropicFamily = "anthropic"
+familyKey OllamaFamily = "ollama"
+familyKey OpenAIFamily = "openai"
+
+-- | Human label for a family.
+familyLabel :: ProviderFamily -> Text
+familyLabel AnthropicFamily = "Anthropic API"
+familyLabel OllamaFamily = "Ollama API"
+familyLabel OpenAIFamily = "OpenAI API"
+
+-- | The OpenAI transport spec of a provider, when it is an OpenAI-family row.
+openAICompatSpecFor :: ProviderType -> Maybe OpenAICompatSpec
+openAICompatSpecFor (OpenAICompatType spec) = Just spec
+openAICompatSpecFor _ = Nothing
+
+-- | The problem reported for a type-less section whose name is not a legacy id.
+missingTypeProblem :: Text -> Text
+missingTypeProblem n = case providerTypeForId n of
+  Just t  -> "has no type — add type = \"" <> typeId t <> "\" or delete the section"
+  Nothing -> "has no type — add a type line or delete the section"
 
 -- | Look a type up by id (trimmed, case-folded).
 providerTypeForId :: Text -> Maybe ProviderType
@@ -205,8 +260,7 @@ providerInstances cfg = typeRows <> extraRows
               Nothing -> (Nothing, Just ("unknown provider type: " <> raw))
             Nothing
               | n `elem` legacyTypeIds -> (providerTypeForId n, Nothing)
-              | otherwise ->
-                  (Nothing, Just "has no type and its name is not a provider type")
+              | otherwise -> (Nothing, Just (missingTypeProblem n))
           nameProblem = case mkProviderName n of
             Left "reserved" ->
               Just ("section name \"" <> n <> "\" is reserved — rename the section")
@@ -241,6 +295,9 @@ catalogProblems specs =
     <> [ "duplicate id: " <> i
        | i <- duplicates (map ocsId specs)
        ]
+    <> [ "duplicate vault key: " <> k
+       | k <- duplicates (map vaultKeyId specs)
+       ]
   where
     check s = concat
       [ [ "blank id" | T.null (T.strip (ocsId s)) ]
@@ -250,6 +307,8 @@ catalogProblems specs =
         | ocsId s `elem` ["anthropic", "ollama"] ]
       , [ "blank display name for " <> ocsId s | T.null (T.strip (ocsDisplayName s)) ]
       , [ "blank vault key for " <> ocsId s | T.null (T.strip (ocsVaultKey s)) ]
+      , [ "vault key for " <> ocsId s <> " has surrounding whitespace"
+        | ocsVaultKey s /= T.strip (ocsVaultKey s) ]
       , [ "vault key for " <> ocsId s <> " must not use the PROVIDER_ prefix"
         | "PROVIDER_" `T.isPrefixOf` ocsVaultKey s ]
       , [ "vault key for " <> ocsId s <> " collides with a legacy provider key"
@@ -261,6 +320,7 @@ catalogProblems specs =
       ]
     legacyReservedKeys =
       [ "ANTHROPIC_API_KEY", "OLLAMA_API_KEY", "ANTHROPIC_OAUTH_TOKENS" ]
+    vaultKeyId = T.toLower . T.strip . ocsVaultKey
     duplicates = go [] []
       where
         go _ dups [] = dups
@@ -274,8 +334,8 @@ catalogProblems specs =
 -- agent def, @new -p@).
 legacyProviderHint :: Text -> Maybe Text
 legacyProviderHint raw
-  | T.toCaseFold (T.strip raw) == "openrouter" =
-      Just "openrouter was renamed to openai-compat"
+  | T.toCaseFold (T.strip raw) == "openai-compat" =
+      Just "openai-compat was renamed to openai"
   | otherwise = Nothing
 
 
@@ -535,11 +595,12 @@ resolveInstance mvh mgr cfg inst model callCounter =
       Just t -> do
         case providerBaseUrlForInstance cfg inst of
           Left e -> pure (Left e)
-          Right baseUrl -> case t of
-            AnthropicType -> resolveAnthropicInstance mvh mgr inst creds model
-            OllamaType -> resolveOllamaInstance mvh mgr baseUrl creds model callCounter
-            OpenAICompatType spec ->
-              resolveOpenAIInstance mvh mgr baseUrl creds model spec
+          Right baseUrl -> case providerFamily t of
+            AnthropicFamily -> resolveAnthropicInstance mvh mgr inst creds model
+            OllamaFamily -> resolveOllamaInstance mvh mgr baseUrl creds model callCounter
+            OpenAIFamily -> case openAICompatSpecFor t of
+              Just spec -> resolveOpenAIInstance mvh mgr baseUrl creds model spec
+              Nothing   -> pure (Left (misconfiguredMsg inst))
 
 resolveAnthropicInstance
   :: Maybe VaultHandle -> Manager -> ProviderInstance -> ProviderCredentials
