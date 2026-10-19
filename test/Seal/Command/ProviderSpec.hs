@@ -7,7 +7,7 @@ import Data.Either (fromRight, isLeft)
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import Network.HTTP.Client (defaultManagerSettings, newManager)
-import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
+import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, renderFailure)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -402,6 +402,16 @@ spec = spec_main >> legacySpec >> cliSpec >> instanceCliSpec
 
 cliSpec :: Spec
 cliSpec = describe "generic provider CLI" $ do
+
+  it "lists all four provider ids in the add type help" $
+    withSystemTempDirectory "seal-oc" $ \dir -> do
+      pr <- mkPR (dir </> "config.toml") Nothing
+      case execParserPure defaultPrefs (csParserInfo (providerCommandSpec pr)) ["add", "-h"] of
+        Failure f -> do
+          let (msg, _) = renderFailure f "provider"
+          msg `shouldContain` "anthropic, ollama, openai"
+          msg `shouldContain` "openrouter"
+        _ -> expectationFailure "expected the add help to render"
 
   describe "addPlanFor" $ do
     it "asks anthropic for a key only" $

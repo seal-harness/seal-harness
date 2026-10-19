@@ -43,7 +43,7 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig
-  , updateRuntimeConfig, upsertProvider )
+  , updateRuntimeConfig, upsertProvider, upsertProviderForType )
 import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
@@ -54,7 +54,7 @@ import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
 import Seal.Providers.Registry
   ( ProviderInstance (..), ProviderType (..)
   , configuredInstances, findInstance, instanceLabelList, legacyProviderHint
-  , listSome, resolveDefaultModelFor, resolveInstance )
+  , listSome, resolveDefaultModelFor, resolveInstance, typeId )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
@@ -290,7 +290,11 @@ defaultCmd pr name model = commandAction $ \caps -> do
     Nothing -> ccSend caps (unknownProviderMsg cfg raw)
     Just inst -> do
       res <- updateRuntimeConfig (prConfigPath pr)
-               (upsertProvider (piName inst) (\p -> p { pcDefaultModel = Just model }))
+               (case piType inst of
+                  Just t  -> upsertProviderForType (typeId t) (piName inst)
+                               (\p -> p { pcDefaultModel = Just model })
+                  Nothing -> upsertProvider (piName inst)
+                               (\p -> p { pcDefaultModel = Just model }))
       case res of
         Left e   -> ccSend caps e
         Right () -> ccSend caps (piName inst <> " default model set to " <> model)

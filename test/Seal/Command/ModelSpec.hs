@@ -28,6 +28,7 @@ import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Security.Vault (VaultHandle)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Registry (ProviderInstance (..), findInstance, typeId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
@@ -168,6 +169,16 @@ spec_main = describe "Seal.Command.Model" $ do
       providerDefaultModel cfg "ollama" `shouldBe` Just "glm-5.2:cloud"
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("glm-5.2:cloud" `T.isInfixOf`)
+
+  it "default stamps the canonical type on the implicit openai row" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      (_, caps) <- makeFakeCaps []
+      runModel pr sr ["default", "openai", "gpt-x"] caps
+      Right cfg <- loadRuntimeConfig (srConfigPath sr)
+      providerDefaultModel cfg "openai" `shouldBe` Just "gpt-x"
+      fmap (fmap typeId . piType) (findInstance cfg "openai")
+        `shouldBe` Just (Just "openai")
 
   it "use without a model uses the provider's default" $
     withSystemTempDirectory "seal-model" $ \root -> do

@@ -318,7 +318,7 @@ addCmd pr typeRaw mName = commandAction $ \caps ->
                               Right u -> pure (Just (Just u))
                   RequiredBaseUrl -> fmap (fmap Just) (promptRequired caps
                     (nameRaw <> " base URL (full URL including the API path,"
-                       <> " e.g. https://host/v1): ")
+                       <> " e.g. https://api.openai.com/v1 or http://localhost:8000/v1): ")
                     validateBaseUrl
                     (invalidBaseUrlCliMsg nameRaw))
                 case mUrl of
