@@ -38,7 +38,7 @@
 - #19 iMessage support `(area:channels)`
 - #18 WhatsApp support `(area:channels)`
 - #17 Google Gemini support `(area:providers)`
-- #16 OpenRouter support `(area:providers)`
+- #16 OpenRouter support `(area:providers)` — now `openai-compat`; presets tracked in #271
 - #6 Add OSS health files: CODE_OF_CONDUCT, SECURITY, issue/PR templates `(documentation)`
 - #7 CI: add hlint as a required gate `(good first issue, area:ci)`
 

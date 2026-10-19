@@ -1,3 +1,7 @@
+> **Superseded** by `docs/superpowers/specs/2026-10-19-openai-compat-provider-design.md`
+> and `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md` — the provider
+> is now the generic `openai-compat` (issue #271). Kept for history.
+
 # Implementation Plan: OpenRouter Provider — Finish `complete`
 
 > Supersedes the WU-001..WU-003 skeleton plan. WU-001 (skeleton) and WU-002

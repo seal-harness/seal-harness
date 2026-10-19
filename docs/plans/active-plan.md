@@ -2,7 +2,7 @@
 <!-- approved: 2026-10-19 -->
 <!-- gate-iterations: 3 -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: complete -->
 
 See `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md` for the
 full approved plan, and

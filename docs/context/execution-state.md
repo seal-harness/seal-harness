@@ -5,7 +5,7 @@ Plan: `docs/superpowers/plans/2026-10-19-openai-compat-provider-plan.md`
 Issue: #271 · PR: #272 (draft)
 
 ## Current Position
-- Active work unit: WU-7 (frontend)
+- Active work unit: none — all units complete
 - Current phase: IMPLEMENT
 - Retry count: 0
 
@@ -21,13 +21,15 @@ Issue: #271 · PR: #272 (draft)
 | WU-5 (CLI) | COMPLETE | COMMITTED | 0 | 3b5f6d4 |
 | WU-6 (gateway) | COMPLETE | COMMITTED | 0 | 5ba5066 |
 | WU-6 (gateway) | TODO | — | 0 | — |
-| WU-7 (frontend) | IN-PROGRESS | IMPLEMENT | 0 | — |
-| WU-8 (docs) | TODO | — | 0 | — |
+| WU-7 (frontend) | COMPLETE | COMMITTED | 0 | 0199d9e |
+| WU-8 (docs) | COMPLETE | COMMITTED | 0 | (this commit) |
 
 ## Checkpoints
 - after WU-1 (transport green) — delivered
 - after WU-2b (contract consumed by later units) — delivered (PR #272 reviewable)
-- after WU-6 (backend complete) — delivered (`make check`: 3207 examples, 0 failures, hlint clean)
+- after WU-6 (backend complete) — delivered
+- final gate — `make check`: 3207 examples, 0 failures, hlint clean;
+  `make frontend-test`: 627 tests, 24 files
 
 ## Notes
 - Gate status at WU-6: `make check` green — 3207 examples, 0 failures, hlint
