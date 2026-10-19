@@ -4,6 +4,14 @@
 module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
+  -- Pure provider helpers, exported so the editor contract (and a future
+  -- preset row) is testable without an HTTP round-trip.
+  , providerDetailValue
+  , baseUrlRequired
+  , baseUrlEditable
+  , defaultBaseUrlFor
+  , keyOptionalFor
+  , staticModelsFor
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), withObject)
@@ -95,10 +103,13 @@ import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
+import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
+import Seal.Providers.OpenAICompat (validateBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider (..), OpenAICompatSpec (..), anthropicOAuthKey
-  , defaultModelFor, knownProviders, parseProvider, providerAuthStatus
-  , providerLabel, vaultKeyName )
+  , defaultModelFor, knownProviders, missingBaseUrlMsgFor, parseProvider
+  , providerBaseUrlFor
+  , providerAuthStatus, providerDisplayName, providerLabel, vaultKeyName )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -2099,6 +2110,7 @@ providerInfoJson :: Set.Set Text -> KnownProvider -> Value
 providerInfoJson cfgSet p =
   object
     [ "name" .= providerLabel p
+    , "displayName" .= providerDisplayName p
     , "configured" .= Set.member (providerLabel p) cfgSet
     ]
 
@@ -2120,17 +2132,82 @@ handleProvidersAll deps = do
 providerDetailJson :: RuntimeConfig -> Maybe VaultHandle -> KnownProvider -> IO Value
 providerDetailJson cfg mh kp = do
   authStatus <- providerAuthStatus mh cfg kp
-  let lbl = providerLabel kp
-      isDef = rcDefaultProvider cfg == Just lbl
-      dModel = providerDefaultModel cfg lbl
-      bUrl = providerBaseUrl cfg lbl
-  pure $ object
-    [ "name" .= lbl
-    , "isDefault" .= isDef
-    , "defaultModel" .= dModel
-    , "baseUrl" .= bUrl
+  pure (providerDetailValue cfg authStatus kp)
+
+-- | The pure half of the provider-detail response: every field the editor
+-- needs, derived from the provider (row) and the config. Kept pure so the
+-- preset columns are testable without shipping a preset.
+providerDetailValue :: RuntimeConfig -> Text -> KnownProvider -> Value
+providerDetailValue cfg authStatus kp =
+  object
+    [ "name" .= providerLabel kp
+    , "displayName" .= providerDisplayName kp
+    , "isDefault" .= (rcDefaultProvider cfg == Just (providerLabel kp))
+    , "defaultModel" .= providerDefaultModel cfg (providerLabel kp)
+    , "baseUrl" .= shownBaseUrl
     , "authStatus" .= authStatus
+    , "baseUrlRequired" .= baseUrlRequired kp
+    , "baseUrlEditable" .= baseUrlEditable kp
+    , "defaultBaseUrl" .= defaultBaseUrlFor kp
+    , "keyOptional" .= keyOptionalFor cfg kp
+    , "defaultModelRequired" .= isNothing (defaultModelFor kp)
     ]
+  where
+    -- A preset's URL is authoritative: show the destination, not a stale
+    -- configured override.
+    shownBaseUrl = case kp of
+      OpenAICompatProvider spec ->
+        ocsBuiltinBaseUrl spec `orElse` providerBaseUrl cfg (providerLabel kp)
+      -- The anthropic endpoint is fixed: show it (the field is read-only).
+      AnthropicProvider ->
+        either (const Nothing) Just (providerBaseUrlFor cfg kp)
+      _ -> providerBaseUrl cfg (providerLabel kp)
+    orElse (Just u) _ = Just u
+    orElse Nothing  x = x
+
+-- | Does this provider need a base URL the user must supply?
+baseUrlRequired :: KnownProvider -> Bool
+baseUrlRequired (OpenAICompatProvider spec) = isNothing (ocsBuiltinBaseUrl spec)
+baseUrlRequired _                           = False
+
+-- | Can the base URL be edited in the UI? (A fixed endpoint is read-only.)
+baseUrlEditable :: KnownProvider -> Bool
+baseUrlEditable AnthropicProvider           = False
+baseUrlEditable OllamaProvider              = True
+baseUrlEditable (OpenAICompatProvider spec) = isNothing (ocsBuiltinBaseUrl spec)
+
+-- | The URL used when the field is blank (shown as its placeholder/default).
+defaultBaseUrlFor :: KnownProvider -> Maybe Text
+defaultBaseUrlFor AnthropicProvider           = Nothing
+defaultBaseUrlFor OllamaProvider              = Just defaultOllamaBaseUrl
+defaultBaseUrlFor (OpenAICompatProvider spec) = ocsBuiltinBaseUrl spec
+
+-- | Can the provider run with no stored credential at all?
+keyOptionalFor :: RuntimeConfig -> KnownProvider -> Bool
+keyOptionalFor _   AnthropicProvider = False
+keyOptionalFor cfg OllamaProvider =
+  not (ollamaNeedsKey (fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg "ollama")))
+keyOptionalFor _   (OpenAICompatProvider spec) = not (ocsKeyRequired spec)
+
+-- | Strict decode of an optional string field. 'Nothing' = absent/null;
+-- @Just ""@ = present but empty (an explicit clear).
+decodeOptText :: Text -> A.Value -> Either (Text, Text) (Maybe Text)
+decodeOptText field v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText field) o of
+    Nothing    -> Right Nothing
+    Just A.Null -> Right Nothing
+    Just (A.String s) -> Right (Just (T.strip s))
+    Just _ -> Left (field, field <> " must be a string")
+  _ -> Left (field, "invalid JSON body")
+
+-- | A 400 whose body names the offending field, so the editor can render the
+-- message inline (design §4.9).
+fieldErr :: Text -> Text -> Response
+fieldErr field msg =
+  responseLBS status400 (corsHeaders <> [jsonHeader])
+    (A.encode (object ["error" .= msg, "field" .= field]))
+
+
 
 -- | Handle POST /api/providers — add or update a provider. Stores the API
 -- key in the vault (when present) and seeds config defaults
@@ -2148,128 +2225,200 @@ handleProviderCreate deps body =
                 | otherwise -> case parseProvider name of
         Nothing -> pure (errJson status400 ("unknown provider: " <> name))
         Just kp -> do
-          let mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
-              mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
-              mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
-              cfgPath = srConfigPath (adSessionRuntime deps)
-          -- Store API key in vault (when present and non-empty)
-          vaultResult <- case mApiKey of
-            Just key | not (T.null key) -> do
-              mh <- readIORef (vrHandleRef (adVault deps))
-              case mh of
-                Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-                Just vh -> do
-                  r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
-                  pure $ case r of
-                    Left e  -> Left (T.pack (show e))
-                    Right _ -> Right ()
-            _ -> pure (Right ())
-          case vaultResult of
-            Left e -> pure (errJson status500 e)
-            Right () -> do
-              let lbl = providerLabel kp
-                  seedCfg :: RuntimeConfig -> RuntimeConfig
-                  seedCfg cfg0 =
-                    let cfg1 = cfg0 { rcDefaultProvider = rcDefaultProvider cfg0 <|> Just lbl }
-                        cfg2 = case defaultModelFor kp of
-                          -- The generic row has no default model: never seed one.
-                          Nothing -> upsertProvider lbl id cfg1
-                          Just (ModelId t) -> upsertProvider lbl
-                            (\p -> if isJust (pcDefaultModel p)
-                                      then p
-                                      else p { pcDefaultModel = Just t }) cfg1
-                        cfg3 = case mBaseUrl of
-                          Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg2
-                          _ -> cfg2
-                        cfg4 = case mDefaultModel of
-                          Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg3
-                          _ -> cfg3
-                    in cfg4
-              eRes <- updateRuntimeConfig cfgPath seedCfg
-              case eRes of
-                Left e -> pure (errJson status500 e)
-                Right _ -> do
-                  eCfg <- loadRuntimeConfig cfgPath
-                  let cfg = fromRight defaultRuntimeConfig eCfg
-                  mh <- readIORef (vrHandleRef (adVault deps))
-                  detail <- providerDetailJson cfg mh kp
-                  pure (jsonLBS status201 (A.encode detail))
+          -- 1. Strict decode.
+          case (decodeOptText "api_key" v, decodeOptText "base_url" v
+               , decodeOptText "default_model" v) of
+            (Left (f, e), _, _) -> pure (fieldErr f e)
+            (_, Left (f, e), _) -> pure (fieldErr f e)
+            (_, _, Left (f, e)) -> pure (fieldErr f e)
+            (Right mApiKey, Right mBaseUrl, Right mDefaultModel) -> do
+              -- 2. Validate before mutating: the vault must not be written for
+              --    a request we are going to reject.
+              case validateProviderWrite kp Nothing mBaseUrl mDefaultModel of
+                Left (f, e) -> pure (fieldErr f e)
+                Right mBaseToStore -> do
+                  let cfgPath = srConfigPath (adSessionRuntime deps)
+                  -- 3. Vault, then config.
+                  vaultResult <- case mApiKey of
+                    Just key | not (T.null key) -> do
+                      mh <- readIORef (vrHandleRef (adVault deps))
+                      case mh of
+                        Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                        Just vh -> do
+                          r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
+                          pure $ case r of
+                            Left e  -> Left (T.pack (show e))
+                            Right _ -> Right ()
+                    _ -> pure (Right ())
+                  case vaultResult of
+                    Left e -> pure (errJson status500 e)
+                    Right () -> do
+                      let lbl = providerLabel kp
+                          seedCfg :: RuntimeConfig -> RuntimeConfig
+                          seedCfg cfg0 =
+                            let cfg1 = cfg0 { rcDefaultProvider = rcDefaultProvider cfg0 <|> Just lbl }
+                                cfg2 = case defaultModelFor kp of
+                                  -- The generic row has no default model: never seed one.
+                                  Nothing -> upsertProvider lbl id cfg1
+                                  Just (ModelId t) -> upsertProvider lbl
+                                    (\p -> if isJust (pcDefaultModel p)
+                                              then p
+                                              else p { pcDefaultModel = Just t }) cfg1
+                                cfg3 = case mBaseToStore of
+                                  Just u  -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg2
+                                  Nothing -> cfg2
+                                cfg4 = case mDefaultModel of
+                                  Just dm | not (T.null dm) ->
+                                    upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg3
+                                  _ -> cfg3
+                            in cfg4
+                      eRes <- updateRuntimeConfig cfgPath seedCfg
+                      case eRes of
+                        Left e -> pure (errJson status500 e)
+                        Right () -> do
+                          eCfg <- loadRuntimeConfig cfgPath
+                          let cfg = fromRight defaultRuntimeConfig eCfg
+                          mh <- readIORef (vrHandleRef (adVault deps))
+                          detail <- providerDetailJson cfg mh kp
+                          pure (jsonLBS status201 (A.encode detail))
 
--- | Handle PUT /api/providers/:name — update a provider's config. If
--- @api_key@ is present and non-empty, rotates the vault key. If
--- @base_url@ or @default_model@ are present, updates the config. Does NOT
--- change @default_provider@. Returns 200 + the provider detail, 400 on
--- unknown provider.
+-- | Validate a create/update request against the provider's requirements
+-- *after* merging with the stored config (@mCurrent@ is the stored value of
+-- the field being written). Returns the base URL to store (or 'Nothing').
+validateProviderWrite
+  :: KnownProvider -> Maybe Text -> Maybe Text -> Maybe Text
+  -> Either (Text, Text) (Maybe Text)
+validateProviderWrite kp storedBase mBase mModel = do
+  base <- case kp of
+    -- A preset's URL is authoritative; a body value is ignored, never stored.
+    OpenAICompatProvider spec | isJust (ocsBuiltinBaseUrl spec) -> Right Nothing
+    _ | baseUrlRequired kp -> case mBase of
+          -- An explicit empty value clears a required field: reject it rather
+          -- than silently keeping the stored URL.
+          Just "" -> Left ("base_url", missingBaseUrlMsgFor kp)
+          Just u  -> checkBase u
+          Nothing -> case nonEmpty storedBase of
+            Just u  -> checkBase u
+            Nothing -> Left ("base_url", missingBaseUrlMsgFor kp)
+      | otherwise -> case nonEmpty mBase of
+          Just u  -> checkBase u >> pure (Just u)
+          Nothing -> Right Nothing
+  case nonEmpty mModel of
+    Just _ -> Right base
+    Nothing
+      | isNothing (defaultModelFor kp) && isNothing storedBaseModel ->
+          Left ("default_model", providerDisplayName kp
+                 <> " needs a model id — the model your endpoint serves")
+      | otherwise -> Right base
+  where
+    checkBase u = case validateBaseUrl u of
+      Left reason -> Left ("base_url", providerDisplayName kp
+                             <> " base URL is not usable (" <> reason
+                             <> ") — it must be an http(s) URL like https://host/v1")
+      Right _ -> Right (Just u)
+    nonEmpty (Just t) | not (T.null (T.strip t)) = Just (T.strip t)
+    nonEmpty _ = Nothing
+    -- A model supplied on create is the stored model; on update the caller
+    -- passes the effective value, so 'storedBaseModel' only matters for create.
+    storedBaseModel = Nothing
+
+-- | Handle PUT /api/providers/:name — partial update. Validates the effective
+-- value after merging (so @{api_key}@ alone never 400s), rotates the vault key
+-- when supplied, and never writes the vault for a rejected request.
 handleProviderUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
 handleProviderUpdate deps name body =
   case parseProvider name of
     Nothing -> pure (errJson status400 ("unknown provider: " <> name))
     Just kp -> case A.decode body :: Maybe A.Value of
       Nothing -> pure (errJson status400 "invalid JSON body")
-      Just v  -> do
-        let mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
-            mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
-            mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
-            cfgPath = srConfigPath (adSessionRuntime deps)
-            lbl = providerLabel kp
-        vaultResult <- case mApiKey of
-          Just key | not (T.null key) -> do
-            mh <- readIORef (vrHandleRef (adVault deps))
-            case mh of
-              Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-              Just vh -> do
-                r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
-                pure $ case r of
-                  Left e  -> Left (T.pack (show e))
-                  Right _ -> Right ()
-          _ -> pure (Right ())
-        case vaultResult of
-          Left e -> pure (errJson status500 e)
-          Right () -> do
-            let updateCfg :: RuntimeConfig -> RuntimeConfig
-                updateCfg cfg0 =
-                  let cfg1 = case mBaseUrl of
-                        Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg0
-                        _ -> cfg0
-                      cfg2 = case mDefaultModel of
-                        Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg1
-                        _ -> cfg1
-                  in cfg2
-            eRes <- updateRuntimeConfig cfgPath updateCfg
-            case eRes of
-              Left e -> pure (errJson status500 e)
-              Right _ -> do
-                eCfg <- loadRuntimeConfig cfgPath
-                let cfg = fromRight defaultRuntimeConfig eCfg
-                mh <- readIORef (vrHandleRef (adVault deps))
-                detail <- providerDetailJson cfg mh kp
-                pure (jsonOk detail)
+      Just v  -> case (decodeOptText "api_key" v, decodeOptText "base_url" v
+                      , decodeOptText "default_model" v) of
+        (Left (f, e), _, _) -> pure (fieldErr f e)
+        (_, Left (f, e), _) -> pure (fieldErr f e)
+        (_, _, Left (f, e)) -> pure (fieldErr f e)
+        (Right mApiKey, Right mBaseUrl, Right mDefaultModel) -> do
+          let cfgPath = srConfigPath (adSessionRuntime deps)
+          eCfg0 <- loadRuntimeConfig cfgPath
+          let cfg0 = fromRight defaultRuntimeConfig eCfg0
+              lbl = providerLabel kp
+              _ = lbl
+              storedModel = providerDefaultModel cfg0 lbl
+              -- Effective model after the merge: the body value, else the
+              -- stored one, else the row's built-in default.
+              effModel = case mDefaultModel of
+                Just dm -> Just dm
+                Nothing -> case storedModel of
+                  Just m  -> Just m
+                  Nothing -> modelTextOf <$> defaultModelFor kp
+          case validateProviderWrite kp (providerBaseUrl cfg0 lbl) mBaseUrl effModel of
+            Left (f, e) -> pure (fieldErr f e)
+            Right mBaseToStore -> do
+              vaultResult <- case mApiKey of
+                Just key | not (T.null key) -> do
+                  mh <- readIORef (vrHandleRef (adVault deps))
+                  case mh of
+                    Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                    Just vh -> do
+                      r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
+                      pure $ case r of
+                        Left e  -> Left (T.pack (show e))
+                        Right _ -> Right ()
+                _ -> pure (Right ())
+              case vaultResult of
+                Left e -> pure (errJson status500 e)
+                Right () -> do
+                  let updateCfg :: RuntimeConfig -> RuntimeConfig
+                      updateCfg cfg1 =
+                        let cfg2 = case mBaseToStore of
+                              Just u  -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg1
+                              Nothing -> cfg1
+                            cfg3 = case mDefaultModel of
+                              Just dm | not (T.null dm) ->
+                                upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg2
+                              _ -> cfg2
+                        in cfg3
+                  eRes <- updateRuntimeConfig cfgPath updateCfg
+                  case eRes of
+                    Left e -> pure (errJson status500 e)
+                    Right () -> do
+                      eCfg <- loadRuntimeConfig cfgPath
+                      let cfg = fromRight defaultRuntimeConfig eCfg
+                      mh <- readIORef (vrHandleRef (adVault deps))
+                      detail <- providerDetailJson cfg mh kp
+                      pure (jsonOk detail)
+  where
+    modelTextOf (ModelId t) = t
 
--- | Handle DELETE /api/providers/:name — remove all vault credentials for
--- the provider (both the API key and the OAuth token) and clear
--- @default_provider@ / @default_model@ if set to this provider. Returns 204
--- (idempotent — missing keys are not an error). 500 when the vault is not
--- configured or locked.
+-- | Handle DELETE /api/providers/:name — remove the provider's credentials and
+-- deconfigure it: the vault key (when there is one), the Anthropic OAuth blob
+-- (anthropic only), a family row's base URL, and the default pointers when it
+-- was the default. Works with no vault. Idempotent (204).
 handleProviderDelete :: ApiDeps -> Text -> IO Response
 handleProviderDelete deps name =
   case parseProvider name of
     Nothing -> pure (errJson status400 ("unknown provider: " <> name))
     Just kp -> do
       let cfgPath = srConfigPath (adSessionRuntime deps)
-          lbl = providerLabel kp
       mh <- readIORef (vrHandleRef (adVault deps))
       case mh of
-        Nothing -> pure (errJson status500 "vault not configured \x2014 run /vault setup")
+        Nothing -> pure ()
         Just vh -> do
           _ <- vhDelete vh (vaultKeyName kp)
-          _ <- vhDelete vh anthropicOAuthKey
-          eCfg <- loadRuntimeConfig cfgPath
-          let cfg = fromRight defaultRuntimeConfig eCfg
-          if rcDefaultProvider cfg == Just lbl
-            then do
-              _ <- updateRuntimeConfig cfgPath (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
-              pure noContent
-            else pure noContent
+          case kp of
+            AnthropicProvider -> void (vhDelete vh anthropicOAuthKey)
+            _                 -> pure ()
+      _ <- updateRuntimeConfig cfgPath (deconfigure kp)
+      pure noContent
+  where
+    deconfigure kp fc =
+      let fc1 = case kp of
+                  OpenAICompatProvider spec | isNothing (ocsBuiltinBaseUrl spec) ->
+                    upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Nothing }) fc
+                  _ -> fc
+          fc2 = if rcDefaultProvider fc1 == Just (providerLabel kp)
+                  then fc1 { rcDefaultProvider = Nothing, rcDefaultModel = Nothing }
+                  else fc1
+      in fc2
 
 -- | Handle GET /api/providers/default — returns the configured
 -- @default_provider@ from config.toml as @{"provider": "anthropic"}@ or

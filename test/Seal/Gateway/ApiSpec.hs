@@ -39,7 +39,9 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
+import Seal.Config.File
+  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig
+  , providerBaseUrl, saveRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
@@ -55,7 +57,9 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
-import Seal.Providers.Registry (KnownProvider (..), knownProviders)
+import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
+import Seal.Providers.Registry
+  ( KnownProvider (..), genericOpenAICompat, knownProviders )
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -371,8 +375,8 @@ waitForPoll totalWaitUs readAction predicate = go totalWaitUs
               threadDelay stepUs
               go (remaining - stepUs)
 
-spec :: Spec
-spec = describe "Seal.Gateway.API" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Gateway.API" $ do
   -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
   -- kind=provider calls newSession, which writes session.json under
   -- spState/sessions/. With spState="" that resolves to ./sessions/ in the
@@ -4934,3 +4938,211 @@ spec = describe "Seal.Gateway.API" $ do
                 _ -> False
             _ -> False
         _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Generic OpenAI-compatible provider (issue #271): detail fields, validation
+-- ---------------------------------------------------------------------------
+
+-- | A synthetic preset row, to prove the DTO/model columns for a future row.
+compatPresetSpec :: OpenAICompatSpec
+compatPresetSpec = OpenAICompatSpec
+  { ocsId = "acme", ocsDisplayName = "Acme", ocsVaultKey = "ACME_API_KEY"
+  , ocsBuiltinBaseUrl = Just "https://acme.example/v1"
+  , ocsDefaultModel = Just (ModelId "acme-large"), ocsKeyRequired = True
+  , ocsModels = [ModelId "acme-large", ModelId "acme-small"]
+  , ocsExtraHeaders = [] }
+
+genericP :: KnownProvider
+genericP = OpenAICompatProvider genericOpenAICompat
+
+decodeText :: BL.ByteString -> T.Text
+decodeText b = case A.decode b :: Maybe A.Value of
+  Just (A.Object o) -> case lookupK "error" o of
+    Just (A.String s) -> s
+    _                 -> ""
+  _ -> ""
+
+-- | Look a key up in the fake vault backing a 'VaultRuntime'.
+vaultHas :: VaultRuntime -> T.Text -> IO (Maybe T.Text)
+vaultHas vr k = do
+  mh <- readIORef (vrHandleRef vr)
+  case mh of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- vhGet vh k
+      pure (either (const Nothing) (Just . TE.decodeUtf8) r)
+
+lookupBool :: T.Text -> A.Value -> Maybe Bool
+lookupBool k (A.Object o) = case lookupK k o of
+  Just (A.Bool b) -> Just b
+  _               -> Nothing
+lookupBool _ _ = Nothing
+
+providerCompatSpec :: Spec
+providerCompatSpec = describe "generic provider API" $ do
+
+  it "detail exposes the editor flags for every provider" $ do
+    let g = providerDetailValue defaultRuntimeConfig "none" genericP
+        a = providerDetailValue defaultRuntimeConfig "none" AnthropicProvider
+        o = providerDetailValue defaultRuntimeConfig "keyless" OllamaProvider
+    lookupBool "baseUrlRequired" g `shouldBe` Just True
+    lookupBool "baseUrlEditable" g `shouldBe` Just True
+    lookupBool "defaultModelRequired" g `shouldBe` Just True
+    lookupBool "keyOptional" g `shouldBe` Just True
+    case g of
+      A.Object go -> lookupK "defaultBaseUrl" go `shouldBe` Just A.Null
+      _           -> expectationFailure "expected object"
+    -- anthropic: fixed endpoint, credential required
+    lookupBool "baseUrlRequired" a `shouldBe` Just False
+    lookupBool "baseUrlEditable" a `shouldBe` Just False
+    lookupBool "keyOptional" a `shouldBe` Just False
+    case a of
+      A.Object ao -> lookupK "baseUrl" ao
+                       `shouldBe` Just (A.String "https://api.anthropic.com")
+      _ -> expectationFailure "expected object"
+    -- ollama: editable with a default, keyless locally
+    lookupBool "baseUrlEditable" o `shouldBe` Just True
+    lookupBool "keyOptional" o `shouldBe` Just True
+    defaultBaseUrlFor OllamaProvider `shouldBe` Just "http://localhost:11434"
+
+  it "a preset row reports a fixed URL, a catalogue and a required key" $ do
+    let p = providerDetailValue defaultRuntimeConfig "none"
+              (OpenAICompatProvider compatPresetSpec)
+    lookupBool "baseUrlRequired" p `shouldBe` Just False
+    lookupBool "baseUrlEditable" p `shouldBe` Just False
+    lookupBool "keyOptional" p `shouldBe` Just False
+    case p of
+      A.Object po -> do
+        lookupK "baseUrl" po `shouldBe` Just (A.String "https://acme.example/v1")
+        lookupK "defaultBaseUrl" po `shouldBe` Just (A.String "https://acme.example/v1")
+      _ -> expectationFailure "expected object"
+    staticModelsFor (OpenAICompatProvider compatPresetSpec)
+      `shouldBe` ["acme-large", "acme-small"]
+    staticModelsFor genericP `shouldBe` []
+    keyOptionalFor defaultRuntimeConfig AnthropicProvider `shouldBe` False
+    baseUrlRequired (OpenAICompatProvider compatPresetSpec) `shouldBe` False
+    baseUrlEditable (OpenAICompatProvider compatPresetSpec) `shouldBe` False
+
+  it "GET /api/providers/all reports the generic row's required base URL and model" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let rows = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          findRow n = case [o | A.Object o <- rows, lookupK "name" o == Just (A.String n)] of
+            (o:_) -> o
+            []    -> error ("no row for " ++ T.unpack n)
+      let g = findRow "openai-compat"
+      lookupBool "baseUrlRequired" (A.Object g) `shouldBe` Just True
+      lookupBool "defaultModelRequired" (A.Object g) `shouldBe` Just True
+      lookupBool "keyOptional" (A.Object g) `shouldBe` Just True
+      lookupK "authStatus" g `shouldBe` Just (A.String "none")
+      lookupK "displayName" g `shouldBe` Just (A.String "OpenAI-compatible")
+
+  it "POST /api/providers rejects a missing base URL, an unusable one and a missing model — without writing the vault" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"]
+            (A.encode (A.object (("name" .= ("openai-compat" :: T.Text)) : fields)))
+      -- missing base_url
+      req1 <- post [ "api_key" .= ("sk-oc" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
+      (s1, b1) <- runAppBody app req1
+      s1 `shouldBe` 400
+      b1 `shouldSatisfy` \b -> case A.decode b :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "field" o == Just (A.String "base_url")
+        _                 -> False
+      -- unusable base_url (no CLI tail in the body)
+      req2 <- post [ "base_url" .= ("ftp://h/v1" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
+      (s2, b2) <- runAppBody app req2
+      s2 `shouldBe` 400
+      b2 `shouldSatisfy` \b -> not ("/provider add" `T.isInfixOf` decodeText b)
+      -- missing model
+      req3 <- post [ "base_url" .= ("https://gw.example/v1" :: T.Text) ]
+      (s3, b3) <- runAppBody app req3
+      s3 `shouldBe` 400
+      b3 `shouldSatisfy` \b -> case A.decode b :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "field" o == Just (A.String "default_model")
+        _                 -> False
+      -- a non-string field is rejected, not silently ignored
+      req4 <- testPost ["api", "providers"]
+        (A.encode (A.object [ "name" .= ("openai-compat" :: T.Text)
+                            , "base_url" .= (5 :: Int) ]))
+      s4 <- runAppStatus app req4
+      s4 `shouldBe` 400
+      -- the vault was never written by any rejected request
+      missing <- vaultHas vault "OPENAI_COMPAT_API_KEY"
+      missing `shouldBe` Nothing
+
+  it "POST then PUT then DELETE round-trips a keyless generic provider" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime [("ANTHROPIC_OAUTH_TOKENS", "{}")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("openai-compat" :: T.Text)
+          , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+          , "default_model" .= ("qwen2.5" :: T.Text)
+          ]))
+      (s1, _) <- runAppBody app req
+      s1 `shouldBe` 201
+      -- a key-only PUT is a valid partial update
+      req2 <- testPut ["api", "providers", "openai-compat"]
+        (A.encode (A.object [ "default_model" .= ("qwen3" :: T.Text) ]))
+      s2 <- runAppStatus app req2
+      s2 `shouldBe` 200
+      -- explicitly clearing the required base URL is rejected
+      req3 <- testPut ["api", "providers", "openai-compat"]
+        (A.encode (A.object [ "base_url" .= ("" :: T.Text) ]))
+      s3 <- runAppStatus app req3
+      s3 `shouldBe` 400
+      -- DELETE deconfigures it and leaves Anthropic's OAuth blob alone
+      s4 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai-compat"])
+      s4 `shouldBe` 204
+      Right cfg <- loadRuntimeConfig cfgPath
+      providerBaseUrl cfg "openai-compat" `shouldBe` Nothing
+      oauth <- vaultHas vault "ANTHROPIC_OAUTH_TOKENS"
+      oauth `shouldBe` Just "{}"
+
+  it "DELETE works with no vault configured" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      deps <- mkProviderTestDeps tmp cfgRoot =<< makeLockedVaultRuntime
+      let app = apiApp deps
+      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai-compat"])
+      s `shouldBe` 204
+
+  it "GET /api/providers/openai-compat/models returns an empty list" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "providers", "openai-compat", "models"])
+      status `shouldBe` 200
+      body `shouldBe` "[]"
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> providerCompatSpec

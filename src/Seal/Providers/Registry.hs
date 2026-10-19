@@ -33,6 +33,7 @@ module Seal.Providers.Registry
   , resolveDefaultModel
   , resolveProvider
   , providerBaseUrlFor
+  , missingBaseUrlMsgFor
   , legacyOpenRouterBaseUrl
   , legacyOpenRouterModel
   , completeSome
@@ -289,7 +290,7 @@ providerBaseUrlFor cfg kp = case kp of
   OpenAICompatProvider spec -> case ocsBuiltinBaseUrl spec of
     Just u -> Right u
     Nothing -> case providerBaseUrl cfg (ocsId spec) of
-      Nothing -> Left (missingBaseUrlMsg spec)
+      Nothing -> Left (missingBaseUrlMsgFor kp)
       Just raw -> case validateBaseUrl raw of
         Left reason -> Left (invalidBaseUrlMsg spec reason)
         Right u -> Right u
@@ -304,10 +305,10 @@ listSome (SomeProvider p) = listModels p
 
 -- -- User-facing copy (design §6) --------------------------------------------
 
-missingBaseUrlMsg :: OpenAICompatSpec -> Text
-missingBaseUrlMsg spec =
-  ocsDisplayName spec <> " needs a base URL — set it in the Providers view, or"
-    <> " run /provider add " <> ocsId spec
+missingBaseUrlMsgFor :: KnownProvider -> Text
+missingBaseUrlMsgFor kp =
+  providerDisplayName kp <> " needs a base URL — set it in the Providers view, or"
+    <> " run /provider add " <> providerLabel kp
 
 invalidBaseUrlMsg :: OpenAICompatSpec -> Text -> Text
 invalidBaseUrlMsg spec reason =
