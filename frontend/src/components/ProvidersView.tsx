@@ -37,6 +37,23 @@ function typeLabelOf(p: ProviderDetail): string {
   return p.typeDisplayName || (p.type ? PROVIDER_LABELS[p.type] : undefined) || p.displayName || p.name
 }
 
+/** Should this instance be listed in the left pane?
+ *
+ *  Hidden: an instance that is not configured — no credential and no usable
+ *  endpoint. It only clutters the list, and it stays reachable through the
+ *  type picker, so the user can still (re-)configure it.
+ *
+ *  Kept: a configured instance, an instance whose vault is locked (its
+ *  credential may well exist — we just cannot read it right now, and the row
+ *  must stay reachable so the key can be rotated), and a problem row (the
+ *  only way to fix or delete a broken config section). */
+function isListedInList(p: ProviderDetail): boolean {
+  if (p.problem) return true
+  // `configured` is absent on older payloads — treat it as configured.
+  if (p.configured !== false) return true
+  return p.authStatus !== 'none'
+}
+
 /** "<name> — <type>" for explicit instances, else just the type label. */
 function instanceLabel(p: ProviderDetail): string {
   return p.type && p.name !== p.type ? `${p.name} — ${typeLabelOf(p)}` : typeLabelOf(p)
@@ -81,9 +98,18 @@ function deleteConfirmText(p: ProviderDetail, isDefault: boolean): string {
   }
   const keys = keyNamesOf(p) + sharedKeyNote(p)
   if (p.name === p.type) {
+    // A type-named instance keeps its (implicit) row after the delete, but
+    // whether it still works depends on whether it needed a credential at
+    // all: a keyless endpoint (local Ollama) keeps working, one that needs a
+    // key does not — it drops out of the list until it is re-configured.
+    if (p.keyOptional) {
+      return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${keys} from the`
+        + ` vault${defClause}. The ${typeLabelOf(p)} instance needs no API key,`
+        + ` so it keeps working.`
+    }
     return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${keys} from the`
-      + ` vault${defClause}. The ${typeLabelOf(p)} instance stays in the list,`
-      + ` not configured.`
+      + ` vault${defClause}. The ${typeLabelOf(p)} instance is no longer`
+      + ` configured — re-configure it from the type picker if you need it.`
   }
   return `Delete ${p.name} (${typeLabelOf(p)})? This removes ${keys} from the`
     + ` vault${defClause}, and sessions or agent defs using “${p.name}” will`
@@ -162,6 +188,15 @@ const emptyForm = (type: string, name: string): FormState =>
  *  pre-filled. The stored key is never retrieved or displayed. */
 export function ProvidersView() {
   const { providers, loaded, error, refresh } = useAllProviders()
+
+  // The left pane lists only the instances worth showing: the configured
+  // ones, plus the ones the user must still be able to act on (a locked
+  // vault, a broken section). Unconfigured instances are configured from the
+  // type picker instead.
+  const listedProviders = useMemo(
+    () => providers.filter(isListedInList),
+    [providers],
+  )
 
   const [defaultProvider, setDefaultProv] = useState<string | null>(null)
   const refreshDefault = useCallback(async () => {
@@ -331,7 +366,7 @@ export function ProvidersView() {
             className="text-xs font-semibold uppercase"
             style={{ color: 'var(--text-muted)', letterSpacing: '0.08em' }}
           >
-            Providers ({providers.length})
+            Providers ({listedProviders.length})
           </span>
           <button
             type="button"
@@ -354,18 +389,14 @@ export function ProvidersView() {
               Failed to load — the backend may be unreachable.
             </div>
           )}
-          {loaded && !error && providers.length === 0 && (
+          {loaded && !error && listedProviders.length === 0 && (
             <div className="px-3 py-2 text-xs" style={{ color: 'var(--text-faint)' }}>
-              No providers configured.
+              {providers.length === 0
+                ? 'No providers configured.'
+                : 'No provider is configured yet — add one from the type picker.'}
             </div>
           )}
-          {loaded && !error && providers.length > 0
-            && providers.every((p) => p.configured === false && !p.problem) && (
-            <div className="px-3 py-2 text-xs" style={{ color: 'var(--text-faint)' }}>
-              No provider is configured yet — add one from the type picker.
-            </div>
-          )}
-          {providers.map((p) => {
+          {listedProviders.map((p) => {
             const isActive = mode === 'edit' && editName === p.name && confirmingDelete !== p.name
             return (
               <div
@@ -440,7 +471,7 @@ export function ProvidersView() {
               </select>
             </Row>
 
-            <Row label="Name" htmlFor="provider-name" hint={NAME_RULE}>
+            <Row label="Unique Name" htmlFor="provider-name" hint={NAME_RULE}>
               <input
                 id="provider-name"
                 data-testid="provider-name-input"
@@ -502,7 +533,7 @@ export function ProvidersView() {
               </div>
             ) : (
               <>
-                <Row label="Name" htmlFor="provider-name-ro" hint="A provider's name can't be changed — delete and re-create to rename.">
+                <Row label="Unique Name" htmlFor="provider-name-ro" hint="A provider's name can't be changed — delete and re-create to rename.">
                   <input id="provider-name-ro" data-testid="provider-name-readonly" type="text" value={selected.name} readOnly style={{ ...inputStyle, opacity: 0.7 }} />
                 </Row>
                 <Row label="Type" htmlFor="provider-type-ro" hint="A provider's type can't change — delete and re-create to change it.">

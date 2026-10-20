@@ -41,6 +41,15 @@ vault key (`ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`, `OPENAI_API_KEY`,
 - `/provider list` lists every instance with its status and the URL Seal will
   talk to. `new -p openrouter` now works (it is a valid provider); a persisted
   `provider = "openai-compat"` fails closed with a rename hint.
+- **The Providers view lists only the providers you can actually use.** An
+  instance with no credential and no usable endpoint no longer appears in the
+  left-hand list — it is configured from the type picker instead (the picker
+  still offers every type, configured or not). Two kinds of row stay visible
+  on purpose: a **locked vault** (the credential may well exist, we just
+  cannot read it, and the row must stay reachable so the key can be
+  rotated) and a **problem row** (the only way to fix or delete a broken
+  `config.toml` section). The name field in the new-provider form is labelled
+  **"Unique Name"** to make clear that the name identifies one instance.
 
 ## 0.1.0.0 — unreleased
 

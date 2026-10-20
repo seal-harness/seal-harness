@@ -115,22 +115,75 @@ describe('ProvidersView', () => {
     expect(screen.getByText('No providers configured.')).toBeDefined()
   })
 
-  it('lists every instance, including unconfigured ones', () => {
+  it('hides providers that are not configured', () => {
     providersState = [
       makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
       makeProvider({ name: 'ollama', authStatus: 'none' }),
     ]
     render(<ProvidersView />)
     expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
-    expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
-    expect(screen.getByText('Providers (2)')).toBeDefined()
+    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
+    expect(screen.getByText('Providers (1)')).toBeDefined()
   })
 
   it('shows the all-unconfigured banner when nothing is configured', () => {
     providersState = [makeProvider({ name: 'ollama', authStatus: 'none' })]
     render(<ProvidersView />)
-    expect(screen.getByTestId('provider-row-ollama')).toBeDefined()
+    expect(screen.queryByTestId('provider-row-ollama')).toBeNull()
     expect(screen.getByText('No provider is configured yet — add one from the type picker.')).toBeDefined()
+  })
+
+  it('keeps a vault-locked provider in the list', () => {
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'vault-locked' })]
+    render(<ProvidersView />)
+    // The credential may well exist — we just cannot read it right now, so the
+    // row must stay reachable (e.g. to rotate the key).
+    expect(screen.getByTestId('provider-row-anthropic')).toBeDefined()
+    expect(screen.getByText('Vault Locked')).toBeDefined()
+  })
+
+  it('keeps a problem row in the list', () => {
+    providersState = [makeProvider({
+      name: 'groq', type: null, typeDisplayName: null, authStatus: 'none',
+      problem: 'has no type and its name is not a provider type',
+    })]
+    render(<ProvidersView />)
+    // The only way to fix or delete a broken config section.
+    expect(screen.getByTestId('provider-row-groq')).toBeDefined()
+  })
+
+  it('still offers unconfigured providers in the type picker', () => {
+    providersState = [
+      makeProvider({ name: 'anthropic', authStatus: 'api-key' }),
+      makeProvider({ name: 'ollama', authStatus: 'none' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')!
+    const options = Array.from(select.querySelectorAll('option')).map((o) => o.textContent)
+    // A hidden provider is still configurable.
+    expect(options).toContain('Ollama')
+  })
+
+  it('labels the name field "Unique Name" in the new-provider form', () => {
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'api-key' })]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    expect(screen.getByText('Unique Name')).toBeDefined()
+    expect(screen.queryByText('Name')).toBeNull()
+  })
+
+  it('tells the user a keyless provider keeps working after a delete', () => {
+    providersState = [makeProvider({
+      name: 'ollama', type: 'ollama', typeDisplayName: 'Ollama', displayName: 'ollama',
+      authStatus: 'keyless', keyOptional: true, baseUrl: 'http://localhost:11434',
+    })]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-ollama'))
+    fireEvent.click(screen.getByTestId('provider-delete'))
+    const box = screen.getByTestId('provider-delete-confirm')
+    // No credential is removed, so the instance keeps working.
+    expect(box.textContent).toContain('needs no API key')
   })
 
   it('still offers unconfigured providers in the new-provider dropdown', () => {
