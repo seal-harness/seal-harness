@@ -1202,6 +1202,81 @@ describe('SessionSetup Agent dropdown', () => {
   })
 })
 
+describe('SessionSetup "Add Seal Harness front matter" toggle', () => {
+  // The toggle lives on the empty-session form: it decides whether the
+  // harness appends its own front matter (static guidance, the seal-usage
+  // skill, the codegraph skill, the skills/agents catalogs) to the selected
+  // agent's prompt.
+  function renderToggle(
+    overrides: {
+      sealFrontMatter?: boolean
+      onSealFrontMatterChange?: (enabled: boolean) => void
+    } = {},
+  ) {
+    const onSealFrontMatterChange = overrides.onSealFrontMatterChange ?? (() => {})
+    return render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={[{ name: 'zoe', isDefault: true }]}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+        sealFrontMatter={overrides.sealFrontMatter ?? true}
+        onSealFrontMatterChange={onSealFrontMatterChange}
+      />,
+    )
+  }
+
+  it('renders the toggle labelled "Add Seal Harness front matter"', () => {
+    renderToggle()
+    expect(screen.getByLabelText('Add Seal Harness front matter')).toBeTruthy()
+  })
+
+  it('defaults to ON (checked) when the prop is true', () => {
+    renderToggle({ sealFrontMatter: true })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(true)
+  })
+
+  it('defaults to ON (checked) when the prop is omitted', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={[{ name: 'zoe', isDefault: true }]}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+      />,
+    )
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(true)
+  })
+
+  it('is unchecked when the front matter is off', () => {
+    renderToggle({ sealFrontMatter: false })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(false)
+  })
+
+  it('reports turning the toggle off to the parent', () => {
+    const onChange = vi.fn()
+    renderToggle({ sealFrontMatter: true, onSealFrontMatterChange: onChange })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    fireEvent.click(box)
+    expect(onChange).toHaveBeenCalledWith(false)
+  })
+
+  it('reports turning the toggle on to the parent', () => {
+    const onChange = vi.fn()
+    renderToggle({ sealFrontMatter: false, onSealFrontMatterChange: onChange })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    fireEvent.click(box)
+    expect(onChange).toHaveBeenCalledWith(true)
+  })
+})
+
 // ── SHOW_HUMAN rendering ──────────────────────────────────────────────────
 
 describe('ShowHumanMessage', () => {

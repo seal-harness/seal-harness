@@ -482,6 +482,28 @@ export async function setSessionAgent(sessionId: string, agent: string | null): 
   }
 }
 
+/** Set whether the harness injects its own front matter (the static
+ *  guidance blocks, the auto-loaded `seal-usage` skill, the codegraph
+ *  skill, and the available-skills / available-agents catalogs) into the
+ *  session's system prompt. When disabled, the system prompt is the
+ *  selected agent's prompt and nothing else. Returns true when the
+ *  backend accepted the change. */
+export async function setSessionSealFrontMatter(
+  sessionId: string,
+  enabled: boolean,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/seal-front-matter`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 // ── Pending questions (human-confirmation gate / ASK_HUMAN) ────────────
 
 /** One discrete choice offered alongside an ASK_HUMAN question. The label

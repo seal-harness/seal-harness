@@ -185,9 +185,13 @@ unwrapOptMaybe = maybe Nothing
 -- 1. If @smSystemOverride@ is set (non-empty), use it as the base.
 -- 2. Otherwise, read the bound agent's @adSystem@ from the workdir-aware
 --    agent-def backend.
--- 3. Inject static guidance (parallel / tool-use / task-completion).
--- 4. Inject the autoload skill body.
--- 5. Inject the available-skills catalog (if enabled).
+-- 3. If @smSealFrontMatter@ is 'False' (the session-setup form's "Add
+--    Seal Harness front matter" toggle is off), STOP: the base is the
+--    system prompt, verbatim. No harness front matter is added.
+-- 4. Otherwise, inject the harness front matter: static guidance
+--    (parallel / tool-use / task-completion / credential-tools), the
+--    autoload skill body, the codegraph skill body, the available-skills
+--    catalog (if enabled), and the available-agents catalog (if enabled).
 --
 -- The flags ('autoloadId', 'injectCatalog', 'parallel', 'toolUse',
 -- 'taskCompletion') are passed as explicit args — the caller computes
@@ -227,17 +231,25 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
     _ -> case smAgent meta of
            Nothing  -> pure Nothing
            Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
-  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool base
-  withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
-  let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload
-  withSkills <- if injectCatalog
-                  then injectAvailableSkills skillBackend withCodegraph
-                  else pure withCodegraph
-  -- The agents catalog is appended AFTER the skills catalog (W3: skills
-  -- keep their established tail position; agents follow).
-  pure (if injectAgents
-          then injectAvailableAgents agentDefs withSkills
-          else withSkills)
+  -- The "Add Seal Harness front matter" toggle (the session-setup form's
+  -- checkbox). When OFF, the system prompt is the selected agent's prompt
+  -- and NOTHING else: no static guidance blocks, no auto-loaded skill, no
+  -- codegraph skill, no available-skills catalog, no available-agents
+  -- catalog. The base is returned verbatim.
+  if not (smSealFrontMatter meta)
+    then pure base
+    else do
+      let withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool base
+      withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
+      let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload
+      withSkills <- if injectCatalog
+                      then injectAvailableSkills skillBackend withCodegraph
+                      else pure withCodegraph
+      -- The agents catalog is appended AFTER the skills catalog (W3: skills
+      -- keep their established tail position; agents follow).
+      pure (if injectAgents
+              then injectAvailableAgents agentDefs withSkills
+              else withSkills)
 
 -- | Build the ISA registry for a session turn. This is the **single**
 -- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
@@ -1172,13 +1184,21 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
-        in childSystemPrompt td eCfg (bAgentDefs sessionBackends) orch
+        in \agentDef task -> do
+             fm <- parentSealFrontMatter
+             childSystemPrompt td eCfg (bAgentDefs sessionBackends) orch fm agentDef task
     , dwdOnEntry = pure ()
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
     }
   where
+    -- The parent session's front-matter toggle, read from its session.json
+    -- (a missing/unreadable meta falls back to the default: front matter
+    -- ON, matching every other session).
+    parentSealFrontMatter = do
+      mParentMeta <- loadSessionMeta (tdPaths td) parentSid
+      pure (maybe True smSealFrontMatter mParentMeta)
     resolveChild agentDef = do
       mParentMeta <- loadSessionMeta (tdPaths td) parentSid
       now <- getCurrentTime
@@ -1192,6 +1212,7 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smDescription = Nothing
+      , smSealFrontMatter = True
       , smRepoUrl = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
@@ -1334,10 +1355,18 @@ applyDefAllowList def ops = case adTools def of
 -- appended) + the static guidance + autoload skill + available-skills
 -- catalog. Uses 'tdBaseBackends' (the child registry doesn't get
 -- workdir-aware skills — matching the original implementations).
+--
+-- The parent session's "Add Seal Harness front matter" toggle is inherited:
+-- when the parent opted OUT, the child's prompt is the def's prompt (plus
+-- the task context) and nothing else — so a child doesn't silently
+-- reintroduce the harness front matter the parent turned off.
 childSystemPrompt
   :: TurnDeps -> Either a RuntimeConfig -> Def.AgentDefBackend -> Bool
+  -> Bool
+  -- ^ Whether the harness front matter is injected (the parent session's
+  -- 'smSealFrontMatter' setting).
   -> AgentDef -> ChildTask -> IO (Maybe Text)
-childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
+childSystemPrompt td eCfg unionDefBackend orchEnabled sealFrontMatter agentDef task = do
   let base = adSystem agentDef
       ctx  = ctContext task
       basePrompt = case (base, ctx) of
@@ -1364,21 +1393,26 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
       roleCanSpawn = effRole == Just "orchestrator" && orchEnabled
       canSpawn = fromMaybe roleCanSpawn (adAllowSpawn agentDef)
       withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool basePrompt
-  withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
-  withSkills <- if injectCatalog
-    then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload
-    else pure withAutoload
-  if not injectAgents
-    then pure withSkills
-    else if canSpawn
-      then do
-        agentDefs <- Def.adbList unionDefBackend
-        -- A spawning child gets the catalog PLUS the auto-announce note
-        -- (it must not busy-poll for its own status — the harness pushes
-        -- its results upward automatically).
-        pure (fmap (\p -> p <> "\n\n" <> childAutoAnnounceNote)
-                   (injectAvailableAgents agentDefs withSkills))
-      else pure (Just (maybe leafAgentNote (\p -> p <> "\n\n" <> leafAgentNote) withSkills))
+  -- The parent opted out of the harness front matter: the child's prompt is
+  -- the def's prompt (plus the task context) and nothing else.
+  if not sealFrontMatter
+    then pure basePrompt
+    else do
+      withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
+      withSkills <- if injectCatalog
+        then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload
+        else pure withAutoload
+      if not injectAgents
+        then pure withSkills
+        else if canSpawn
+          then do
+            agentDefs <- Def.adbList unionDefBackend
+            -- A spawning child gets the catalog PLUS the auto-announce note
+            -- (it must not busy-poll for its own status — the harness pushes
+            -- its results upward automatically).
+            pure (fmap (\p -> p <> "\n\n" <> childAutoAnnounceNote)
+                       (injectAvailableAgents agentDefs withSkills))
+          else pure (Just (maybe leafAgentNote (\p -> p <> "\n\n" <> leafAgentNote) withSkills))
 
 -- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.
 -- If so, look up the codegraph skill body from the skill backend and return

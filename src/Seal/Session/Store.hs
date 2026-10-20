@@ -21,6 +21,7 @@ module Seal.Session.Store
   , updateSessionSystemOverride
   , updateSessionDescription
   , updateSessionRepoUrl
+  , updateSessionSealFrontMatter
   , autoBindRepoAgent
   , autoBindRepoAgentWith
   , SessionRuntime (..)
@@ -90,6 +91,7 @@ newSessionMeta _paths provider model channel mAgent = do
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
     , smDescription = Nothing
+    , smSealFrontMatter = True
     , smRepoUrl = Nothing
     , smCreatedAt = now, smLastActive = now }
 
@@ -411,6 +413,29 @@ updateSessionRepoUrl paths sid mUrl = do
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing
       Nothing                      -> Nothing
+
+-- | Set (or clear) whether the harness injects its own front matter into
+-- the session's system prompt. 'True' injects the static guidance blocks,
+-- the auto-loaded @seal-usage@ skill, the codegraph skill, and the
+-- available-skills / available-agents catalogs; 'False' leaves the system
+-- prompt as the selected agent's prompt and nothing else. Returns 'False'
+-- when the session's @session.json@ can't be found or parsed; 'True' on a
+-- successful write. Only touches 'smSealFrontMatter' — all other fields
+-- (agent binding, override, description) are preserved.
+updateSessionSealFrontMatter :: SealPaths -> SessionId -> Bool -> IO Bool
+updateSessionSealFrontMatter paths sid enabled = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smSealFrontMatter = enabled }
+          saveSessionMeta paths next
+          pure True
 
 -- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
 -- Returns 'Nothing' when the file has no frontmatter or no @id@ key.

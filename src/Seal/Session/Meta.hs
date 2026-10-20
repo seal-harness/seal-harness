@@ -44,6 +44,14 @@ data SessionMeta = SessionMeta
     -- @session.json@ so it survives restarts and propagates to the
     -- sidebar (which reads the live session list, not a client-side
     -- override).
+  , smSealFrontMatter :: Bool
+    -- ^ Whether the harness injects its own front matter into the session's
+    -- system prompt (the static behavioral guidance blocks, the auto-loaded
+    -- @seal-usage@ skill, the codegraph skill, and the available-skills /
+    -- available-agents catalogs). 'True' (the default) injects it;
+    -- 'False' means the system prompt is the selected agent's prompt and
+    -- nothing else. Set by the session-setup form's "Add Seal Harness
+    -- front matter" toggle.
   , smRepoUrl :: Maybe Text
     -- ^ The URL of the repository cloned into the session's workdir via
     -- @SETUP_REPO@ (either agent-invoked or the web setup-repo endpoint).
@@ -63,6 +71,7 @@ instance ToJSON SessionMeta where
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
     , "description" .= smDescription m
+    , "seal_front_matter" .= smSealFrontMatter m
     , "repo_url"    .= smRepoUrl m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
@@ -78,6 +87,7 @@ instance FromJSON SessionMeta where
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
     <*> o .:? "description"
+    <*> o .:? "seal_front_matter" .!= True
     <*> o .:? "repo_url"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

@@ -1508,12 +1508,22 @@ function SessionSetup({
   onAgentChange,
   customPromptFile,
   onCustomPromptFile,
+  sealFrontMatter,
+  onSealFrontMatterChange,
 }: {
   agents: AgentInfo[]
   currentAgent: string | null
   onAgentChange: (agent: string) => void
   customPromptFile: { name: string; content: string } | null
   onCustomPromptFile: (file: { name: string; content: string } | null) => void
+  /** Whether the harness injects its own front matter into the session's
+   *  system prompt (the static guidance blocks, the auto-loaded
+   *  `seal-usage` skill, the codegraph skill, and the available-skills /
+   *  available-agents catalogs). True (the default) injects it; false
+   *  means the system prompt is the selected agent's prompt and nothing
+   *  else. */
+  sealFrontMatter: boolean
+  onSealFrontMatterChange: (enabled: boolean) => void
 }) {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1580,6 +1590,35 @@ function SessionSetup({
           </select>
         </div>
       )}
+
+      {/* The "Add Seal Harness front matter" toggle. On (the default), the
+          harness appends its own front matter — the static behavioral
+          guidance, the auto-loaded `seal-usage` skill, the codegraph skill,
+          and the available-skills / available-agents catalogs — to the
+          selected agent's prompt. Off, the system prompt is the agent's
+          prompt and nothing else. */}
+      <label
+        className="w-full flex items-start gap-2 cursor-pointer"
+        data-testid="session-setup-seal-front-matter"
+      >
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          aria-label="Add Seal Harness front matter"
+          checked={sealFrontMatter}
+          onChange={(e) => onSealFrontMatterChange(e.target.checked)}
+        />
+        <span>
+          <span className="text-xs font-medium block" style={{ color: 'var(--text-primary)' }}>
+            Add Seal Harness front matter
+          </span>
+          <span className="text-xs block" style={{ color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            {sealFrontMatter
+              ? "Seal's guidance and skills are added to the agent's prompt."
+              : "The agent's prompt is used on its own, with nothing added."}
+          </span>
+        </span>
+      </label>
 
       <div className="flex items-center gap-3 w-full" style={{ color: 'var(--text-faint)' }}>
         <div className="flex-1" style={{ borderTop: '1px solid var(--border)' }} />
@@ -2290,6 +2329,8 @@ export function ChatArea({
   onAgentChange,
   customPromptFile,
   onCustomPromptFile,
+  sealFrontMatter,
+  onSealFrontMatterChange,
   composerControls,
   newTabFocusTick,
   selectedId,
@@ -2333,6 +2374,11 @@ export function ChatArea({
   onAgentChange?: (agent: string) => void
   customPromptFile?: { name: string; content: string } | null
   onCustomPromptFile?: (file: { name: string; content: string } | null) => void
+  /** Whether the harness injects its own front matter into the session's
+   *  system prompt. True (the default) injects it; false means the system
+   *  prompt is the selected agent's prompt and nothing else. */
+  sealFrontMatter?: boolean
+  onSealFrontMatterChange?: (enabled: boolean) => void
   /** When set, ChatArea is in "new tab compose" mode. The messages region
    *  renders `panel` instead of the transcript, and the bottom input
    *  drives the new-tab create-and-send flow via `onSubmit`. The input
@@ -2961,6 +3007,8 @@ export function ChatArea({
               onAgentChange={onAgentChange}
               customPromptFile={customPromptFile ?? null}
               onCustomPromptFile={onCustomPromptFile}
+              sealFrontMatter={sealFrontMatter ?? true}
+              onSealFrontMatterChange={onSealFrontMatterChange ?? (() => {})}
             />
           ) : messages.length === 0 ? (
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>

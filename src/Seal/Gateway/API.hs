@@ -116,7 +116,8 @@ import Seal.Session.Store
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
   , saveSessionMeta, updateSessionAgent
   , updateSessionArchived, updateSessionSystemOverride
-  , updateSessionDescription )
+  , updateSessionDescription
+  , updateSessionSealFrontMatter )
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
@@ -326,6 +327,20 @@ apiApp deps req respond =
       case mkSessionId sid of
         Left e  -> respond (errJson status400 ("invalid session id: " <> e))
         Right sId -> respond =<< handleSessionAgent deps sId body
+    -- PUT /api/sessions/:id/seal-front-matter — set whether the harness
+    -- injects its own front matter (the static guidance blocks, the
+    -- auto-loaded seal-usage skill, the codegraph skill, and the
+    -- available-skills / available-agents catalogs) into this session's
+    -- system prompt. Body: {"enabled": true|false}. When false, the
+    -- system prompt is the selected agent's prompt and nothing else.
+    -- Persists to session.json so subsequent /send turns pick it up.
+    -- Returns 200 {ok:true} on success, 404 when the session doesn't
+    -- exist, 400 on an invalid body or a missing/non-boolean 'enabled'.
+    (m', ["api", "sessions", sid, "seal-front-matter"]) | m' == methodPut -> do
+      body <- collectBody req
+      case mkSessionId sid of
+        Left e  -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> respond =<< handleSessionSealFrontMatter deps sId body
     -- GET /api/sessions/:id/questions -> the session's pending ASK_HUMAN
     -- questions (oldest-first). The frontend renders these as dismissible
     -- prompts; the operator answers via POST .../questions/:qid/answer or
@@ -1057,6 +1072,35 @@ handleSessionAgent deps sid body =
         pure (if ok then jsonOk (object ["ok" .= True])
                     else errJson status404 "session not found")
       AgentInvalid e -> pure (errJson status400 ("invalid agent id: " <> e))
+
+-- | Handle PUT /api/sessions/:id/seal-front-matter. Parses the @enabled@
+-- boolean field from the body and persists it via
+-- 'updateSessionSealFrontMatter'. When 'True' (the default), the harness
+-- injects its front matter into the session's system prompt; when
+-- 'False', the system prompt is the selected agent's prompt and nothing
+-- else. Returns 200 {ok:true} on success, 404 when the session has no
+-- @session.json@ on disk, 400 on invalid JSON or a missing/non-boolean
+-- @enabled@ field.
+handleSessionSealFrontMatter :: ApiDeps -> SessionId -> BL.ByteString -> IO Response
+handleSessionSealFrontMatter deps sid body =
+  case parseEnabledFlag body of
+    Nothing -> pure (errJson status400 "missing or invalid 'enabled' field")
+    Just enabled -> do
+      ok <- updateSessionSealFrontMatter (srPaths (adSessionRuntime deps)) sid enabled
+      pure (if ok then jsonOk (object ["ok" .= True])
+                  else errJson status404 "session not found")
+
+-- | Parse the @enabled@ boolean field from a PUT
+-- /api/sessions/:id/seal-front-matter body. Returns 'Nothing' when the
+-- body is invalid JSON or the field is missing/non-boolean. Mirrors
+-- 'parseArchivedFlag'.
+parseEnabledFlag :: BL.ByteString -> Maybe Bool
+parseEnabledFlag body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "enabled") o of
+      Just (A.Bool b) -> Just b
+      _               -> Nothing
+    _ -> Nothing
 
 -- | Parse the @agent@ field for PUT /api/sessions/:id/agent. Distinguishes
 -- "absent/empty" (clear the binding) from "present but malformed" (400).

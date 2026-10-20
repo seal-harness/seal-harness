@@ -60,6 +60,14 @@ export interface SessionInfo {
    *  or no user message. Used by the sidebar to sort the Active Tabs list
    *  (newest last-user-message first within each status bucket). */
   lastUserMessageAt: string | null
+  /** Whether the harness injects its own front matter (static guidance
+   *  blocks, the auto-loaded `seal-usage` skill, the codegraph skill, and
+   *  the available-skills / available-agents catalogs) into the session's
+   *  system prompt. True (the default) injects it; false means the system
+   *  prompt is the selected agent's prompt and nothing else. Optional so
+   *  the SPA still works against an older server that omits the field;
+   *  `undefined` is read as the default (front matter ON). */
+  sealFrontMatter?: boolean
 }
 
 /** Cascade used to pick the display title for a session.

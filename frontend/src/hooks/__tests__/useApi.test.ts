@@ -48,6 +48,7 @@ import {
   setSessionDescription,
   setSessionArchived,
   setSessionPrompt,
+  setSessionSealFrontMatter,
   createTab,
   closeTab,
   dismissTab,
@@ -430,6 +431,15 @@ describe('session mutators', () => {
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/prompt')!
     expect(call.init!.method).toBe('PUT')
     expect(JSON.parse(call.init!.body as string)).toEqual({ prompt: 'be concise' })
+  })
+
+  it('setSessionSealFrontMatter PUTs /api/sessions/:id/seal-front-matter with {enabled}', async () => {
+    setNextResponse('{}')
+    const ok = await setSessionSealFrontMatter('s1', false)
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/seal-front-matter')!
+    expect(call.init!.method).toBe('PUT')
+    expect(JSON.parse(call.init!.body as string)).toEqual({ enabled: false })
   })
 })
 

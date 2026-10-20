@@ -181,7 +181,7 @@ mkSendDepsWith paths resolveStub = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -235,7 +235,7 @@ seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 spec :: Spec
@@ -701,8 +701,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web"
-                      (Just zoe) Nothing (Just "zoe") Nothing Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -758,6 +757,90 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           Just sys -> do
             sys `shouldSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
             sys `shouldNotSatisfy` T.isInfixOf "REPO_PROJECT_MARKER"
+
+  -- The "Add Seal Harness front matter" toggle, end to end: with the front
+  -- matter OFF, the system prompt the model actually receives is the
+  -- selected agent's prompt and NOTHING else — no static guidance blocks,
+  -- no auto-loaded skill, no skills/agents catalogs. This exercises the
+  -- same handleSend → plainTurn → resolveSystemPrompt path the web
+  -- frontend drives, so a regression in the wiring (not just in the
+  -- resolver) is caught here.
+  describe "seal front matter toggle (gateway integration)" $ do
+    let seedZoeAgent paths = do
+          let agentsDir = spConfig paths </> "agents"
+          createDirectoryIfMissing True agentsDir
+          writeFile (agentsDir </> "zoe.md")
+            "---\nid: zoe\nname: zoe\nprovider: ollama\nmodel: llama3\ntools: all\ncreated_at: 2026-07-01T00:00:00Z\nupdated_at: 2026-07-01T00:00:00Z\nsession: s1\n---\nZOE_SYSTEM_PROMPT_MARKER\n"
+
+    it "the model receives ONLY the agent's prompt when the front matter is off" $ do
+      withSystemTempDirectory "front-matter-off" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoeAgent paths
+        capRef <- newIORef (Nothing :: Maybe T.Text)
+        let resolveStub _ = pure (Right
+              ( SomeProvider (CapturingProvider capRef)
+              , ModelId "llama3.2" ))
+        baseDeps <- mkSendDepsWith paths resolveStub
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20260817-151158-290"
+            sdir = sessionDir paths sid
+            zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
+            -- The front matter is OFF for this session.
+            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
+        createDirectoryIfMissing True sdir
+        saveSessionMeta paths meta
+        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome `shouldBe` SendAssistant
+        sysSeen <- waitFor 5000000 (readIORef capRef) isJust
+        sysSeen `shouldBe` True
+        mSys <- readIORef capRef
+        case mSys of
+          Nothing -> expectationFailure "provider was never called — turn did not reach the LLM"
+          Just sys -> do
+            -- The agent's prompt is present...
+            sys `shouldSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+            -- ...and nothing else was added.
+            sys `shouldSatisfy` (not . T.isInfixOf "Parallel tool calls")
+            sys `shouldSatisfy` (not . T.isInfixOf "Tool use")
+            sys `shouldSatisfy` (not . T.isInfixOf "Task completion")
+            sys `shouldSatisfy` (not . T.isInfixOf "Credential-bearing tools")
+            sys `shouldSatisfy` (not . T.isInfixOf "<available_skills>")
+            sys `shouldSatisfy` (not . T.isInfixOf "<available_agents>")
+            sys `shouldSatisfy` (not . T.isInfixOf "Auto-loaded skill")
+
+    it "the model receives the harness front matter when the toggle is on" $ do
+      withSystemTempDirectory "front-matter-on" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoeAgent paths
+        capRef <- newIORef (Nothing :: Maybe T.Text)
+        let resolveStub _ = pure (Right
+              ( SomeProvider (CapturingProvider capRef)
+              , ModelId "llama3.2" ))
+        baseDeps <- mkSendDepsWith paths resolveStub
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20260817-151158-291"
+            sdir = sessionDir paths sid
+            zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
+            -- The front matter is ON (the default).
+            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+        createDirectoryIfMissing True sdir
+        saveSessionMeta paths meta
+        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome `shouldBe` SendAssistant
+        sysSeen <- waitFor 5000000 (readIORef capRef) isJust
+        sysSeen `shouldBe` True
+        mSys <- readIORef capRef
+        case mSys of
+          Nothing -> expectationFailure "provider was never called"
+          Just sys -> do
+            sys `shouldSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+            sys `shouldSatisfy` T.isInfixOf "Parallel tool calls"
 
   -- The /stop slash command must target the request's session (the sid
   -- from the URL), NOT the process-global srActive ref. The web is
