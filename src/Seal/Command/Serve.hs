@@ -7,6 +7,8 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (finally)
 import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
@@ -15,6 +17,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
+import System.Timeout (timeout)
 import System.Directory (doesFileExist)
 
 import Katip (Severity (..), ls)
@@ -58,7 +61,9 @@ import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureS
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
-import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+import Seal.Gateway.Stream
+  ( StreamGuard (..), StreamHealth (..), runStreamServerWithHealth
+  , streamHealthMessage, streamHealthStatus )
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -318,7 +323,14 @@ runServeMain autonomy mCliStaticDir logger = do
       gwCfg  = case mCliStaticDir of
         Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
         Nothing  -> gwCfg0
-      deps = ApiDeps
+  -- The WS stream server's liveness, published through /api/health. The
+  -- ref is created BEFORE the ApiDeps that reads it and is filled in by
+  -- the WS server thread once it has attempted its bind. Reporting the
+  -- CONFIGURED port unconditionally was the bug: a WS that failed to bind
+  -- (port already in use) still advertised the dead port, so the frontend
+  -- connected to a non-WebSocket port and its transcript froze.
+  wsHealthRef <- newIORef (StreamHealth "starting" (gcWsPort gwCfg))
+  let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
         , adHarnessRegistry = reg
@@ -341,7 +353,7 @@ runServeMain autonomy mCliStaticDir logger = do
         , adConfigRepo       = repo
         , adVault            = rt
         , adPaths            = paths
-        , adWsPort           = gcWsPort gwCfg
+        , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
@@ -362,7 +374,24 @@ runServeMain autonomy mCliStaticDir logger = do
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
   logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
-  _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
+  -- Start the WS stream server and WAIT for its bind to settle, so the
+  -- startup banner can tell the operator the truth. Previously the bind
+  -- happened inside the forked thread with no error handling: a port
+  -- collision killed that thread silently and the gateway carried on
+  -- serving HTTP while the live transcript was permanently dead.
+  wsStarted <- newEmptyMVar
+  _ <- forkIO
+    (runStreamServerWithHealth (gcHost gwCfg) (gcWsPort gwCfg) guard broker wsHealthRef
+      `finally` putMVar wsStarted ())
+  -- Bound the wait: a healthy bind settles in milliseconds.
+  _ <- timeout 5_000_000 (takeMVar wsStarted)
+  wsHealth <- readIORef wsHealthRef
+  case streamHealthStatus wsHealth of
+    "up" -> pure ()
+    _    -> logIO logger ErrorS
+      ("WebSocket stream server UNAVAILABLE: " <> ls (streamHealthMessage wsHealth)
+       <> " — the web UI's live transcript updates will NOT work."
+       <> " Fix the port conflict (or set a different [gateway] ws_port) and restart.")
   -- Periodically clear stale "thinking" sessions (safety net for sessions
   -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
   -- every 5 minutes; clears sessions thinking longer than 30 minutes.

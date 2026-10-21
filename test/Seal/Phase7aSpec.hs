@@ -28,7 +28,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Logging.Logger (SealLogger, testSealLogger)
-import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -106,7 +106,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
@@ -165,7 +166,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg

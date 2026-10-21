@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The WebSocket stream endpoint. Runs on a separate port from the REST +
--- static WARP server (the @wai-app-websockets@ bridge isn't available; a
--- separate port is the clean 7a path). Every connection is gated by the
+-- static WARP server. Every connection is gated by the
 -- Origin allowlist + the broker's global cap. The wire protocol: on
 -- connect, a one-shot @hello@ (carrying @protocolVersion@ +
 -- @serverStartedAt@ so the client can detect server restarts); then a
@@ -15,7 +14,11 @@
 -- while the WS was disconnected are no longer permanently lost.
 module Seal.Gateway.Stream
   ( runStreamServer
+  , runStreamServerWithHealth
   , StreamGuard (..)
+  , StreamHealth (..)
+  , streamHealthStatus
+  , streamHealthMessage
   , FocusOp (..)
   , handleRequestEntries
   , RequestEntriesOp (..)
@@ -27,8 +30,10 @@ module Seal.Gateway.Stream
   , sendErrorFrame
   ) where
 
-import Control.Exception (SomeException, catch)
-import Control.Monad (forever, forM_)
+import Control.Concurrent (forkIO)
+import Control.Exception (SomeException, bracket, catch, try)
+import Control.Monad (forever, forM_, void)
+import Data.IORef (IORef, newIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
@@ -39,9 +44,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
+import Network.Socket (Socket)
+import Network.Socket qualified as Sock
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
-  , withPingThread, sendClose, Connection )
+  , withPingThread, sendClose, Connection
+  , defaultConnectionOptions, makeListenSocket, makePendingConnection )
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
@@ -58,6 +66,39 @@ import Seal.Tabs (TabsHandle)
 
 import Seal.Gateway.Types.Stream (FocusOp (..), RequestEntriesOp (..), ClientMessage (..))
 
+-- | The liveness of the WebSocket stream server, as reported by
+-- @\/api\/health@. The health endpoint used to report the CONFIGURED
+-- @ws_port@ unconditionally, so a server whose WS had failed to bind
+-- (port already in use) still advertised the dead port and the frontend
+-- connected to a non-WebSocket port and froze. The status is now derived
+-- from what actually happened at bind time.
+data StreamHealth = StreamHealth
+  { shStatus :: Text
+    -- ^ @\"starting\"@ (bind not yet attempted), @\"up\"@ (bound and
+    -- accepting), @\"failed\"@ (the bind failed).
+  , shPort  :: Int
+    -- ^ The port the server was asked to bind.
+  } deriving stock (Eq, Show)
+
+-- | The status string of a 'StreamHealth', as surfaced in @\/api\/health@.
+streamHealthStatus :: StreamHealth -> Text
+streamHealthStatus = shStatus
+
+-- | A human-readable, actionable description of a 'StreamHealth'. For a
+-- failed bind this names the port so the operator can see WHICH port
+-- collided — the whole point of reporting the failure.
+streamHealthMessage :: StreamHealth -> Text
+streamHealthMessage h =
+  case shStatus h of
+    "up"      -> "WebSocket stream server listening on port " <> tshow (shPort h)
+    "failed"  -> "WebSocket stream server FAILED to bind port " <> tshow (shPort h)
+                  <> " (port already in use?) — live transcript updates are unavailable"
+    "down"    -> "WebSocket stream server is not running"
+    _         -> "WebSocket stream server is starting on port " <> tshow (shPort h)
+  where
+    tshow :: Int -> Text
+    tshow = T.pack . show
+
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
 -- initial @lists@ snapshot on connect (the frontend's @wsListsReceived@
@@ -71,9 +112,71 @@ data StreamGuard = StreamGuard
 
 -- | Run the WebSocket stream server on the given port. Blocks (run in a
 -- forked thread from @seal serve@).
+--
+-- This wrapper does not report liveness; 'runStreamServerWithHealth' is
+-- what production uses. A bind failure is still LOGGED either way.
 runStreamServer :: Text -> Int -> StreamGuard -> StreamBroker -> IO ()
-runStreamServer host port guard broker =
-  WS.runServer (T.unpack host) port (streamApp guard broker)
+runStreamServer host port guard broker = do
+  healthRef <- newIORef (StreamHealth "starting" port)
+  runStreamServerWithHealth host port guard broker healthRef
+
+-- | Run the WebSocket stream server, reporting its liveness into the given
+-- 'IORef'.
+--
+-- The bind is performed HERE (via 'makeListenSocket') rather than inside
+-- 'WS.runServer', so that a bind failure is caught and REPORTED instead of
+-- killing the calling thread. The historical implementation used
+-- @WS.runServer@ directly, so a port collision (e.g. another process
+-- already holding the port) raised an exception that unwound the forked
+-- thread and was silently discarded: the HTTP gateway kept running and
+-- @\/api\/health@ went on advertising the dead port, so the web frontend
+-- connected to a non-WebSocket port and its transcript froze permanently.
+--
+-- On a successful bind the health state becomes @\"up\"@; on failure it
+-- becomes @\"failed\"@ and the error is logged at 'ErrorS' severity.
+runStreamServerWithHealth
+  :: Text
+  -> Int
+  -> StreamGuard
+  -> StreamBroker
+  -> IORef StreamHealth
+  -> IO ()
+runStreamServerWithHealth host port guard broker healthRef = do
+  writeIORef healthRef (StreamHealth "starting" port)
+  bindResult <- try (makeListenSocket (T.unpack host) port)
+  case bindResult of
+    Left (e :: SomeException) -> do
+      writeIORef healthRef (StreamHealth "failed" port)
+      globalLogIO ErrorS
+        ("[ws] FAILED to bind port " <> ls (T.pack (show port)) <> ": " <> ls (T.pack (show e))
+         <> " — live transcript updates are UNAVAILABLE (the port may already be in use)")
+    Right sock -> do
+      writeIORef healthRef (StreamHealth "up" port)
+      globalLogIO InfoS ("[ws] stream server listening on " <> ls (T.unpack host) <> ":" <> ls (T.pack (show port)))
+      -- The accept loop runs against the socket we already bound, so the
+      -- "we know the bind succeeded" property is preserved.
+      acceptLoop sock guard broker
+
+-- | Accept loop over an already-bound listening socket. Mirrors
+-- 'WS.runServer' but takes the socket, so the caller controls the bind.
+--
+-- Mirrors the upstream 'Network.WebSockets.Server' accept loop: accept a
+-- connection socket, turn it into a 'PendingConnection', then run the
+-- per-connection app. Each connection is handled in its own thread so a
+-- slow client cannot stall the accept loop.
+acceptLoop :: Socket -> StreamGuard -> StreamBroker -> IO ()
+acceptLoop sock guard broker = forever $ do
+  (conn, _addr) <- Sock.accept sock
+  void (forkIO (handleConnection conn guard broker))
+
+-- | Run the per-connection app for an accepted socket. The
+-- 'PendingConnection' and its socket are closed when the app returns.
+handleConnection :: Sock.Socket -> StreamGuard -> StreamBroker -> IO ()
+handleConnection conn guard broker =
+  bracket
+    (makePendingConnection conn defaultConnectionOptions)
+    (\_pending -> Sock.close conn)
+    (streamApp guard broker)
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.
