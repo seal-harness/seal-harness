@@ -77,12 +77,13 @@ sessionWire (BoundHarness _)   = Nothing
 -- agent is effective — either a bound 'smAgent' or a one-off uploaded
 -- file's frontmatter id), falling back to 'smAgent'\'s id for
 -- backwards-compat with old session.json files that predate smAgentName.
-sessionInfoJson :: Maybe Text -> Maybe Text -> SessionMeta -> Value
-sessionInfoJson mSnippet mLastUserMessageAt m = object
+sessionInfoJson :: Maybe Text -> Maybe Text -> Maybe Text -> SessionMeta -> Value
+sessionInfoJson mSnippet mLastUserMessageAt mProviderType m = object
   [ "id" .= sessionIdText (smId m)
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
   , "model" .= smModel m
+  , "providerType" .= mProviderType
   , "repoUrl" .= smRepoUrl m
   , "lastActive" .= smLastActive m
   , "createdAt" .= smCreatedAt m
@@ -98,8 +99,8 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
 -- message snippet and the last user-message timestamp from the transcript
 -- so the session has a default title before the user sets an explicit
 -- description and the sidebar can sort tabs by last-user-message time.
-sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
-sessionInfoJsonWithSnippet paths m = do
+sessionInfoJsonWithSnippet :: SealPaths -> (Text -> Maybe Text) -> SessionMeta -> IO Value
+sessionInfoJsonWithSnippet paths providerTypeFor m = do
   mSnippet <- firstUserMessageSnippetFast paths (smId m)
   mLastUserMessageAt <- lastUserMessageAtFast paths (smId m)
-  pure (sessionInfoJson mSnippet mLastUserMessageAt m)
+  pure (sessionInfoJson mSnippet mLastUserMessageAt (providerTypeFor (smProvider m)) m)

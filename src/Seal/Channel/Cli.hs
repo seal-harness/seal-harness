@@ -119,7 +119,7 @@ handlePlain agentEnv env t = do
     Right _     -> pure ()
 
 -- | Resolve the active session's provider from the vault, or explain why not.
--- Key bytes never surface: 'resolveProvider' returns an opaque 'SomeProvider'.
+-- Key bytes never surface: 'resolveInstance' returns an opaque 'SomeProvider'.
 --
 -- 'resolveSessionProvider' and 'resolveDefProvider' are defined in
 -- 'Seal.Command.Provider' and re-exported here for backwards compatibility.

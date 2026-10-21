@@ -186,7 +186,8 @@ export function useNewTabSpec(): NewTabSpec {
     if (!provider || !names.includes(provider) || !isCfg(provider)) {
       const cfg = configuredProviders.filter((p) => p.configured !== false)
       const def = cfg.find((p) => p.isDefault)
-      const fallback = (def ?? cfg[0] ?? configuredProviders[0])!.name
+      const usable = configuredProviders.filter((p) => !p.problem)
+      const fallback = (def ?? cfg[0] ?? usable[0] ?? configuredProviders[0])!.name
       setProvider(fallback)
     }
   }, [providersLoaded, configuredProviders, provider])

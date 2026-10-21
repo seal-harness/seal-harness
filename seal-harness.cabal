@@ -113,9 +113,10 @@ library
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
         Seal.Providers.ContextWindow
+        Seal.Providers.Name
         Seal.Providers.Ollama
         Seal.Providers.Registry
-        Seal.Providers.OpenRouter
+        Seal.Providers.OpenAICompat
         Seal.Util.AesonUtils
         Seal.Util.AtomicJson
         Seal.Util.StrictIO
@@ -572,9 +573,10 @@ test-suite tests
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
+        Seal.Providers.NameSpec
         Seal.Providers.OllamaSpec
         Seal.Providers.ContextWindowSpec
-        Seal.Providers.OpenRouterSpec
+        Seal.Providers.OpenAICompatSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec

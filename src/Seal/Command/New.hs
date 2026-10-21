@@ -32,9 +32,10 @@ module Seal.Command.New
   , parseNewArgs
   , emptyNewArgs
   , resolveRepoUrl
+  , resolveNewModel
   ) where
 
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -48,10 +49,13 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig)
 import Seal.Config.Paths (SealPaths)
-import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
+import Seal.Providers.Registry
+  ( findInstance, instanceLabelList, legacyProviderHint
+  , resolveDefaultModelFor )
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
@@ -184,19 +188,32 @@ repoOpt = strOption
 -- tab, optionally clone a repo, and send the confirmation line.
 newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
 newCmd deps mProvider mModel mRepo = commandAction $ \caps -> do
-  oldMeta <- ndOldMeta deps
-  let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
-  meta <- mintNewSessionWith args oldMeta deps
-  oldSid <- ndInsertTab deps caps meta
-  case (naRepo args, ndSetupRepo deps) of
-    (Just repoVal, Just setupFn) -> do
-      repoUrl <- resolveRepoUrlMaybe deps repoVal
-      eRes <- setupFn (smId meta) repoUrl
-      case eRes of
-        Left err -> ccSend caps ("repo setup failed: " <> err)
-        Right _  -> pure ()
-    _ -> pure ()
-  ccSend caps (renderNewConfirmation meta oldSid)
+  -- Reject an unknown -p before minting anything: a session created with a
+  -- provider Seal cannot build would fail on its first turn instead.
+  cfg <- ndCfg deps
+  case mProvider of
+    Just p | isNothing (findInstance cfg (T.strip p)) ->
+      ccSend caps (unknownNewProviderMsg cfg p)
+    _ -> do
+      oldMeta <- ndOldMeta deps
+      let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
+      meta <- mintNewSessionWith args oldMeta deps
+      oldSid <- ndInsertTab deps caps meta
+      case (naRepo args, ndSetupRepo deps) of
+        (Just repoVal, Just setupFn) -> do
+          repoUrl <- resolveRepoUrlMaybe deps repoVal
+          eRes <- setupFn (smId meta) repoUrl
+          case eRes of
+            Left err -> ccSend caps ("repo setup failed: " <> err)
+            Right _  -> pure ()
+        _ -> pure ()
+      ccSend caps (renderNewConfirmation meta oldSid)
+
+-- | The @new -p@ rejection message (with rename guidance for a legacy id).
+unknownNewProviderMsg :: RuntimeConfig -> Text -> Text
+unknownNewProviderMsg cfg p =
+  "unknown provider: " <> p <> " (known: " <> instanceLabelList cfg <> ")"
+    <> maybe "" (" — " <>) (legacyProviderHint p)
 
 -- | Resolve the @-r@ value to a URL using the repo registry (if wired),
 -- falling back to the raw value.
@@ -212,11 +229,14 @@ resolveRepoUrlMaybe deps raw =
 -- defaults. Persisted to disk via 'newSession' so @/session list@ picks it
 -- up. Shared by the registry path (CLI/web) and the loop-level inbox path.
 mintNewSessionWith :: NewArgs -> SessionMeta -> NewDeps -> IO SessionMeta
-mintNewSessionWith args oldMeta deps =
+mintNewSessionWith args oldMeta deps = do
+  cfg <- ndCfg deps
+  let provider = fromMaybe (smProvider oldMeta) (naProvider args)
+      -- An inherited empty model is repaired from the target instance's default
+      -- so a model-less session cannot leak "model: " into another provider's
+      -- requests.
+      model    = resolveNewModel cfg provider (fromMaybe (smModel oldMeta) (naModel args))
   newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta)
-  where
-    provider = fromMaybe (smProvider oldMeta) (naProvider args)
-    model    = fromMaybe (smModel oldMeta) (naModel args)
 
 -- | Mint a fresh 'SessionMeta' from the config defaults (or the given
 -- overrides). Used when there is no "old session" to inherit from (e.g.
@@ -239,3 +259,16 @@ renderNewConfirmation meta oldSid =
     <> " (" <> smProvider meta <> "/" <> smModel meta <> ")"
     <> " — prior session " <> sessionIdText oldSid
     <> " kept in /session list"
+
+-- | Repair an inherited/selected model. An empty model is replaced by the
+-- target provider's built-in default; a provider with no default (the generic
+-- OpenAI-compatible row) keeps the empty value so the actionable "no model
+-- selected" error surfaces instead of a foreign model id being sent.
+resolveNewModel :: RuntimeConfig -> Text -> Text -> Text
+resolveNewModel cfg provider m
+  | not (T.null m) = m
+  | otherwise = maybe "" modelText (resolveDefaultModelFor cfg (T.strip provider))
+
+-- | The text inside a 'ModelId'.
+modelText :: ModelId -> Text
+modelText (ModelId t) = t

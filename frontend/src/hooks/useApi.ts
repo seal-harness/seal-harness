@@ -724,15 +724,20 @@ export async function fetchAllProviders(): Promise<ProviderDetail[] | null> {
  *  carries the updated detail; on failure `error` carries the backend's
  *  error message. The API key is NEVER echoed back. */
 export type ProviderMutationResult =
-  | { ok: true; provider: ProviderDetail }
-  | { ok: false; error: string }
+  | { ok: true; provider: ProviderDetail; reconfigured?: boolean }
+  | { ok: false; error: string; field?: string }
 
-/** Read the backend's @{"error": "..."}@ body for a provider mutation,
-  *  falling back to the HTTP status. */
-async function providerMutationError(res: Response): Promise<string> {
+/** Read the backend's @{"error": "...", "field": "..."}@ body for a provider
+ *  mutation, falling back to the HTTP status. `field` lets the editor render
+ *  the message inline next to the offending input. */
+async function providerMutationError(res: Response): Promise<{ error: string; field?: string }> {
   const body = await res.json().catch(() => null)
-  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
-  return `HTTP ${res.status}`
+  if (body && typeof body.error === 'string' && body.error.length > 0) {
+    return typeof body.field === 'string' && body.field.length > 0
+      ? { error: body.error, field: body.field }
+      : { error: body.error }
+  }
+  return { error: `HTTP ${res.status}` }
 }
 
 /** Create a new provider (or update an existing one — upsert semantics).
@@ -746,8 +751,9 @@ export async function createProvider(input: ProviderInput): Promise<ProviderMuta
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     })
-    if (!res.ok) return { ok: false, error: await providerMutationError(res) }
-    return { ok: true, provider: await res.json() as ProviderDetail }
+    if (!res.ok) return { ok: false, ...(await providerMutationError(res)) }
+    const data = await res.json() as ProviderDetail & { reconfigured?: boolean }
+    return { ok: true, provider: data, reconfigured: data.reconfigured === true }
   } catch {
     return { ok: false, error: 'network error' }
   }
@@ -763,7 +769,7 @@ export async function updateProvider(name: string, input: ProviderInput): Promis
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     })
-    if (!res.ok) return { ok: false, error: await providerMutationError(res) }
+    if (!res.ok) return { ok: false, ...(await providerMutationError(res)) }
     return { ok: true, provider: await res.json() as ProviderDetail }
   } catch {
     return { ok: false, error: 'network error' }

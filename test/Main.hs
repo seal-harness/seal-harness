@@ -161,7 +161,8 @@ import qualified Seal.Telegram.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
-import qualified Seal.Providers.OpenRouterSpec
+import qualified Seal.Providers.OpenAICompatSpec
+import qualified Seal.Providers.NameSpec
 import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
@@ -353,8 +354,9 @@ specs = do
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
   Seal.Providers.ContextWindowSpec.spec
+  Seal.Providers.NameSpec.spec
   Seal.Providers.OllamaSpec.spec
-  Seal.Providers.OpenRouterSpec.spec
+  Seal.Providers.OpenAICompatSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
   Seal.Agent.ContextTruncationSpec.spec

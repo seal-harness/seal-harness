@@ -38,7 +38,7 @@
 - #19 iMessage support `(area:channels)`
 - #18 WhatsApp support `(area:channels)`
 - #17 Google Gemini support `(area:providers)`
-- #16 OpenRouter support `(area:providers)`
+- #16 OpenRouter support `(area:providers)` — shipped as the `openai` (generic) + `openrouter` (fixed URL) providers (#271/#273)
 - #6 Add OSS health files: CODE_OF_CONDUCT, SECURITY, issue/PR templates `(documentation)`
 - #7 CI: add hlint as a required gate `(good first issue, area:ci)`
 
@@ -47,6 +47,8 @@
 - #50 Per-session workdir + optional chroot isolation for untrusted opcodes
 - #40 On-demand opcode schema loading (config flag + OPCODE_DESCRIBE)
 - #5 Refine CONTRIBUTING.md as Phase 2 lands
+- [ ] Provider base-URL repoint guard — a keyed instance's `PUT {base_url}` keeps its stored key; add a rotate-key / explicit-confirmation guard
+- [ ] Derive `catalogProblems`' built-in id list and `legacyReservedKeys` from `providerTypes`
 
 ## Done
 

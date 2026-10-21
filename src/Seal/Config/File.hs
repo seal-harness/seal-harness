@@ -45,6 +45,8 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , upsertProviderForType
+  , deleteProviderSection
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -169,6 +171,16 @@ data RuntimeConfig = RuntimeConfig
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+  , pcType         :: Maybe Text
+    -- ^ The provider *type* this instance speaks (@openai@, @openrouter@,
+    -- @anthropic@ or @ollama@). Absent for a section written before named
+    -- instances existed; the Registry resolves those through a frozen
+    -- legacy set. Always written by current code.
+    -- ^ The endpoint Seal talks to. SECURITY: this is the destination of the
+    -- provider's bearer token, so it is operator-set only — no config-writing
+    -- opcode may touch it (see AGENTS.md §Security). A provider whose catalog
+    -- row carries a built-in base URL ignores this value; only the generic
+    -- OpenAI-compatible row (and Ollama) read it.
   } deriving stock (Eq, Show)
 
 -- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is
@@ -248,7 +260,7 @@ data EmbeddingConfig = EmbeddingConfig
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
-emptyProviderConfig = ProviderConfig Nothing Nothing
+emptyProviderConfig = ProviderConfig Nothing Nothing Nothing
 
 -- | The @[web]@ section: web tool configuration. Every field is optional;
 -- a missing key decodes as 'Nothing' and the resolved default applies at
@@ -466,6 +478,7 @@ providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+  <*> Toml.dioptional (Toml.text "type")          .= pcType
 
 -- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
 -- field is optional at the TOML layer; a missing key decodes as 'Nothing'
@@ -638,6 +651,11 @@ updateRuntimeConfig path f = withMVar configWriteLock $ \_ -> do
     Left err  -> pure (Left err)
     Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
 
+-- | Drop a provider instance's whole @[providers.\<name\>]@ section.
+deleteProviderSection :: Text -> RuntimeConfig -> RuntimeConfig
+deleteProviderSection lbl cfg =
+  cfg { rcProviders = Map.delete lbl (rcProviders cfg) }
+
 -- | The configured default model for provider @lbl@, if any.
 providerDefaultModel :: RuntimeConfig -> Text -> Maybe Text
 providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (rcProviders cfg)
@@ -727,3 +745,10 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | Like 'upsertProvider', but stamps the canonical provider id. Every
+-- section-creating path uses it, so a section created for a built-in row (for
+-- example the implicit @openai@ row) is never type-less.
+upsertProviderForType :: Text -> Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
+upsertProviderForType canonicalId lbl f =
+  upsertProvider lbl (\p -> (f p) { pcType = Just canonicalId })

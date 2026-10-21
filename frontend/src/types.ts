@@ -41,6 +41,10 @@ export interface SessionInfo {
   /** `"session:<provider>"` — the runtime kind + provider label. */
   runtime: string
   model: string
+  /** The provider *type* id the session's provider resolves to (e.g.
+   *  "anthropic", "openai", "openrouter"), or null when the instance is unknown or
+   *  unresolvable. Derived server-side per snapshot; not persisted. */
+  providerType?: string | null
   /** The URL of the repo cloned into the session's workdir via SETUP_REPO,
    *  or null when no repo has been cloned. */
   repoUrl: string | null
@@ -242,6 +246,17 @@ export interface AgentInfo {
 
 export interface ProviderInfo {
   name: string
+  /** Human label ("OpenAI-compatible"); falls back to the frontend map. */
+  displayName?: string
+  /** The instance's provider *type* id, or null for an unresolvable row. */
+  type?: string | null
+  /** The type's human label ("OpenAI-compatible"), or null. */
+  typeDisplayName?: string | null
+  /** A load-time problem that makes the row unusable, or null. */
+  problem?: string | null
+  /** True when configuring this name would reconfigure an existing instance
+   *  (a section or a stored credential already exists). */
+  reconfiguring?: boolean
   /** True for the provider Seal is configured to use (from CLI flag or
    *  config file). At most one entry has it set to true. */
   isDefault?: boolean
@@ -264,16 +279,50 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** Human label ("OpenAI-compatible"); the editor prefers it over a local map. */
+  displayName: string
+  /** The instance's provider *type* id, or null when unresolvable. */
+  type?: string | null
+  /** The type's human label ("OpenAI-compatible"), or null. */
+  typeDisplayName?: string | null
+  /** The provider family / API slug ("openai"), or null when unresolvable. */
+  family?: string | null
+  /** The family's human label ("OpenAI API"), or null. */
+  familyDisplayName?: string | null
+  /** A load-time problem that makes the row unusable, or null. */
+  problem?: string | null
+  /** True when a section or stored credential already exists (configure vs
+   *  reconfigure predicate). Always false for a problem row. */
+  reconfiguring?: boolean
+  /** True when the instance is usable right now. */
+  configured?: boolean
   isDefault: boolean
   defaultModel: string | null
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** The vault key name(s) the server would delete for this instance; null
+   *  when the row has no credentials (a problem row). Names only, never values. */
+  apiKeyName?: string | null
+  oauthKeyName?: string | null
+  /** The user must supply a base URL before the provider can work; null when
+   *  the type is unresolvable (a problem row). */
+  baseUrlRequired: boolean | null
+  /** False for a fixed endpoint (anthropic, a catalog preset): read-only. */
+  baseUrlEditable: boolean | null
+  /** The URL used when the field is blank (shown as its placeholder). */
+  defaultBaseUrl: string | null
+  /** True when the provider works with no stored credential at all. */
+  keyOptional: boolean | null
+  /** True when the provider has no built-in default model. */
+  defaultModelRequired: boolean | null
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
  *  api_key is write-only — never returned by the API. */
 export interface ProviderInput {
   name?: string
+  /** The provider type id (POST only; the type is immutable on PUT). */
+  type?: string
   api_key?: string
   base_url?: string
   default_model?: string

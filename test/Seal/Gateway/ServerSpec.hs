@@ -25,7 +25,6 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
 import Seal.Gateway.Embedded (embeddedAssetCount)
 import Seal.Harness.Registry (newHarnessRegistry)
-import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -99,7 +98,6 @@ mkDeps = do
     , adAdoptConsent = Just CcWeb
     , adAgentDefs = adb
     , adSkills = skills
-    , adProviders = pure knownProviders
     , adUiState = uiState
     , adSend = Nothing
     , adDefaultAgent = pure Nothing

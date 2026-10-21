@@ -29,6 +29,7 @@ module Seal.Command.Model
   ) where
 
 import Data.Either (fromRight)
+import Data.Maybe (fromMaybe)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -42,16 +43,18 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig
-  , providerDefaultModel, updateRuntimeConfig, upsertProvider )
+  , updateRuntimeConfig, upsertProvider, upsertProviderForType )
 import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
 import Seal.Providers.Registry
-  ( KnownProvider, configuredProviders, defaultModelFor, knownProviders, listSome
-  , parseProvider, providerLabel, resolveDefaultModel, resolveProvider )
+  ( ProviderInstance (..), ProviderType (..)
+  , configuredInstances, findInstance, instanceLabelList, legacyProviderHint
+  , listSome, resolveDefaultModelFor, resolveInstance, typeId )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
@@ -182,22 +185,21 @@ listCmd pr resolveMeta Nothing = commandAction $ \caps -> do
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   let cfg = fromRight defaultRuntimeConfig eCfg
   mh <- readIORef (vrHandleRef (prVault pr))
-  configured <- configuredProviders mh cfg
+  configured <- configuredInstances mh cfg
   if null configured
-    then ccSend caps "no providers configured — run /provider add <provider>"
+    then ccSend caps "no provider is configured yet — add one in the Providers view"
     else mapM_ (reportProviderQuiet pr caps cfg) configured
   mActive <- resolveMeta
   let activeLine = case mActive of
         Just a  -> "active: " <> smProvider a <> "/" <> smModel a
         Nothing -> "active: (no session)"
   ccSend caps activeLine
-listCmd pr _ (Just provLbl) = commandAction $ \caps ->
-  case parseProvider provLbl of
-    Nothing -> ccSend caps (unknownProviderMsg provLbl)
-    Just kp -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let cfg = fromRight defaultRuntimeConfig eCfg
-      reportProviderLoud pr caps cfg kp
+listCmd pr _ (Just name) = commandAction $ \caps -> do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
+  case findInstance cfg (T.strip name) of
+    Nothing   -> ccSend caps (unknownProviderMsg cfg (T.strip name))
+    Just inst -> reportProviderLoud pr caps cfg inst
 
 -- | Render one provider for the bare @/model list@: its label followed by
 -- either the live models reachable through a resolved provider, or — if
@@ -206,12 +208,12 @@ listCmd pr _ (Just provLbl) = commandAction $ \caps ->
 -- providers are filtered out before this runs, so a failure here means the
 -- daemon is down, not that the provider is unconfigured.
 reportProviderQuiet
-  :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> KnownProvider -> IO ()
-reportProviderQuiet pr caps cfg kp = do
-  let lbl   = providerLabel kp
-      ModelId dm = resolveDefaultModel (providerDefaultModel cfg lbl) lbl
+  :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> ProviderInstance -> IO ()
+reportProviderQuiet pr caps cfg inst = do
+  let lbl   = piName inst
+      dm = maybe "(none)" modelIdText (resolveDefaultModelFor cfg lbl)
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr)
   eModels <- case eProv of
     Left _    -> pure (Left "unresolved")
     Right sp -> listSome sp
@@ -226,11 +228,11 @@ reportProviderQuiet pr caps cfg kp = do
 -- resolution and listing failures as actionable error lines (the user asked
 -- for this specific provider, so a silent fallback would hide the problem).
 reportProviderLoud
-  :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> KnownProvider -> IO ()
-reportProviderLoud pr caps cfg kp = do
-  let lbl   = providerLabel kp
+  :: ProviderRuntime -> ChannelCaps -> RuntimeConfig -> ProviderInstance -> IO ()
+reportProviderLoud pr caps cfg inst = do
+  let lbl = piName inst
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveProvider mh (prManager pr) cfg kp (defaultModelFor kp) (prCallCounter pr)
+  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr)
   case eProv of
     Left e   -> ccSend caps ("could not list " <> lbl <> " models: " <> e)
     Right sp -> do
@@ -250,42 +252,70 @@ useCmd
   -> Text
   -> Maybe Text
   -> CommandAction
-useCmd pr resolveMeta save mWriter provLbl mModel = commandAction $ \caps ->
-  case parseProvider provLbl of
-    Nothing -> ccSend caps (unknownProviderMsg provLbl)
-    Just kp -> do
-      model <- case mModel of
-        Just m  -> pure m
-        Nothing -> do
-          eCfg <- loadRuntimeConfig (prConfigPath pr)
-          let cfg = fromRight defaultRuntimeConfig eCfg
-              ModelId m = resolveDefaultModel (providerDefaultModel cfg (providerLabel kp)) (providerLabel kp)
-          pure m
-      mActive <- resolveMeta
-      case mActive of
-        Nothing -> ccSend caps "no active session to update"
-        Just m0 -> do
-          let lbl = providerLabel kp
-              m1 = m0 { smProvider = lbl, smModel = model }
-              confirm = "session model set to " <> lbl <> "/" <> model
-          save m1
-          case mWriter of
-            Just w  -> w (smId m1) confirm
-            Nothing -> pure ()
-          ccSend caps confirm
+useCmd pr resolveMeta save mWriter name mModel = commandAction $ \caps -> do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
+      raw = T.strip name
+  case findInstance cfg raw of
+    Nothing -> ccSend caps (unknownProviderMsg cfg raw)
+    Just inst -> do
+      mResolved <- case mModel of
+        Just m  -> pure (Just m)
+        Nothing -> pure (fmap modelIdText (resolveDefaultModelFor cfg raw))
+      case mResolved of
+        -- An instance with no built-in default model needs an explicit one:
+        -- writing the session with an empty model would just move the failure
+        -- to the next turn.
+        Nothing -> ccSend caps
+          (raw <> " has no default model — run /model use " <> raw <> " <model-id>")
+        Just model -> do
+          mActive <- resolveMeta
+          case mActive of
+            Nothing -> ccSend caps "no active session to update"
+            Just m0 -> do
+              let m1 = m0 { smProvider = piName inst, smModel = model }
+                  confirm = "session model set to " <> piName inst <> "/" <> model
+              save m1
+              case mWriter of
+                Just w  -> w (smId m1) confirm
+                Nothing -> pure ()
+              ccSend caps confirm
 
 defaultCmd :: ProviderRuntime -> Text -> Text -> CommandAction
-defaultCmd pr provLbl model = commandAction $ \caps ->
-  case parseProvider provLbl of
-    Nothing -> ccSend caps (unknownProviderMsg provLbl)
-    Just kp -> do
+defaultCmd pr name model = commandAction $ \caps -> do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
+      raw = T.strip name
+  case findInstance cfg raw of
+    Nothing -> ccSend caps (unknownProviderMsg cfg raw)
+    Just inst -> do
       res <- updateRuntimeConfig (prConfigPath pr)
-               (upsertProvider (providerLabel kp) (\p -> p { pcDefaultModel = Just model }))
+               (case piType inst of
+                  Just t  -> upsertProviderForType (typeId t) (piName inst)
+                               (\p -> p { pcDefaultModel = Just model })
+                  Nothing -> upsertProvider (piName inst)
+                               (\p -> p { pcDefaultModel = Just model }))
       case res of
         Left e   -> ccSend caps e
-        Right () -> ccSend caps (providerLabel kp <> " default model set to " <> model)
+        Right () -> ccSend caps (piName inst <> " default model set to " <> model)
 
-unknownProviderMsg :: Text -> Text
-unknownProviderMsg lbl =
-  "unknown provider: " <> lbl <> " (known: "
-    <> T.intercalate ", " (map providerLabel knownProviders) <> ")"
+unknownProviderMsg :: RuntimeConfig -> Text -> Text
+unknownProviderMsg cfg lbl =
+  "unknown provider: " <> lbl <> " (known: " <> instanceLabelList cfg <> ")"
+    <> maybe "" (" — " <>) (legacyProviderHint lbl)
+
+-- | The model to hand 'resolveInstance' for a list/probe call: the instance's
+-- default when it has one, else the empty model ("no model yet", which
+-- 'complete' reports with an actionable message).
+fallbackModelFor :: ProviderInstance -> ModelId
+fallbackModelFor inst = fromMaybe (ModelId "") (piType inst >>= defaultModelForType)
+
+defaultModelForType :: ProviderType -> Maybe ModelId
+defaultModelForType AnthropicType = Just (ModelId "claude-opus-4-8")
+defaultModelForType OllamaType = Just (ModelId "llama3.2")
+defaultModelForType (OpenAICompatType spec) =
+  ocsDefaultModel spec
+
+-- | The text inside a 'ModelId'.
+modelIdText :: ModelId -> Text
+modelIdText (ModelId t) = t
