@@ -10,6 +10,7 @@ import qualified Seal.Core.MessageSourceSpec
 import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
+import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
@@ -205,6 +206,7 @@ specs = do
   Seal.Core.AllowListSpec.spec
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
+  Seal.Core.SystemPromptSpec.spec
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec

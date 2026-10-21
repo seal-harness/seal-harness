@@ -34,6 +34,7 @@ mkMeta s =
     , smSystemOverride = Nothing
     , smAgentName = Nothing
     , smDescription = Nothing
+    , smSealFrontMatter = True
     , smRepoUrl = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime

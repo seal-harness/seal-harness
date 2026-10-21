@@ -92,6 +92,7 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "channel" .= smChannel m
   , "channelUserId" .= (Nothing :: Maybe Text)
   , "lastUserMessageAt" .= mLastUserMessageAt
+  , "sealFrontMatter" .= smSealFrontMatter m
   ]
 
 -- | Build the 'SessionInfo' JSON for a session, reading the first user

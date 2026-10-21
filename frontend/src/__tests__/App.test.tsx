@@ -177,6 +177,55 @@ describe('App — sidebar selection', () => {
     expect(screen.getAllByText('Session A').length).toBeGreaterThanOrEqual(1)
   })
 
+  it('the empty-session form shows the "Add Seal Harness front matter" toggle, on by default', async () => {
+    defaultFetchDispatch()
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      let body: unknown = []
+      if (url === '/api/sessions') body = [makeSession({ id: 'sess-A', description: 'Session A' })]
+      else if (url === '/api/agents') body = [{ name: 'zoe', isDefault: true }]
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true }]
+      else if (url === '/api/sessions/sess-A/agents') body = [{ name: 'zoe', isDefault: true }]
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    const rows = await screen.findAllByText('Session A', {}, { timeout: 4000 })
+    fireEvent.click(rows[0]!)
+    const box = await screen.findByLabelText('Add Seal Harness front matter', {}, { timeout: 4000 })
+    expect((box as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('toggling the front matter off PUTs to the session and unchecks the box', async () => {
+    defaultFetchDispatch()
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      let body: unknown = []
+      if (url === '/api/sessions') body = [makeSession({ id: 'sess-A', description: 'Session A' })]
+      else if (url === '/api/agents') body = [{ name: 'zoe', isDefault: true }]
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true }]
+      else if (url === '/api/sessions/sess-A/agents') body = [{ name: 'zoe', isDefault: true }]
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    const rows = await screen.findAllByText('Session A', {}, { timeout: 4000 })
+    fireEvent.click(rows[0]!)
+    const box = await screen.findByLabelText('Add Seal Harness front matter', {}, { timeout: 4000 })
+    fireEvent.click(box)
+    await waitFor(() => {
+      const call = fetchCalls.find((c) => c.url === '/api/sessions/sess-A/seal-front-matter')
+      expect(call).toBeTruthy()
+      expect(call!.init!.method).toBe('PUT')
+      expect(JSON.parse(call!.init!.body as string)).toEqual({ enabled: false })
+    })
+    expect((box as HTMLInputElement).checked).toBe(false)
+  })
+
   it('clicking the New Tab button opens the composer', async () => {
     defaultFetchDispatch()
     render(<App />)

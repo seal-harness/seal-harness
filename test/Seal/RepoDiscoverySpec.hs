@@ -720,6 +720,7 @@ spec = do
                 , smChannel = "web", smAgent = Just zoe
                 , smSystemOverride = Nothing, smAgentName = Just "zoe"
                 , smDescription = Nothing
+                , smSealFrontMatter = True
                 , smRepoUrl = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
@@ -764,6 +765,7 @@ spec = do
             , smChannel = "web", smAgent = pickedId
             , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
             , smDescription = Nothing
+            , smSealFrontMatter = True
             , smRepoUrl = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta

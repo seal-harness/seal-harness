@@ -20,10 +20,11 @@ import Seal.Config.File
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.Types (isValidSessionId, sessionIdText)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, initSession, listSessions
-  , newSession, saveSessionMeta )
+  , newSession, saveSessionMeta, updateSessionSealFrontMatter )
 
 mkPaths :: FilePath -> SealPaths
 mkPaths root = SealPaths
@@ -68,6 +69,7 @@ spec = describe "Seal.Session.Store" $ do
                 { smId = sid, smProvider = "anthropic", smModel = "m"
                 , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
                 , smDescription = Nothing
+                , smSealFrontMatter = True
                 , smRepoUrl = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
@@ -142,3 +144,31 @@ spec = describe "Seal.Session.Store" $ do
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
+
+  describe "updateSessionSealFrontMatter" $ do
+    it "persists the front-matter flag to session.json" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        -- The default is ON (front matter injected).
+        smSealFrontMatter m `shouldBe` True
+        ok <- updateSessionSealFrontMatter paths (smId m) False
+        ok `shouldBe` True
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smSealFrontMatter mAfter `shouldBe` Just False
+
+    it "can turn the front matter back on" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        _ <- updateSessionSealFrontMatter paths (smId m) False
+        ok <- updateSessionSealFrontMatter paths (smId m) True
+        ok `shouldBe` True
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smSealFrontMatter mAfter `shouldBe` Just True
+
+    it "returns False for a session that does not exist" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+            sid = fromRight (error "bad sid") (Seal.Core.Types.mkSessionId "20260701-120000-042")
+        updateSessionSealFrontMatter paths sid False `shouldReturn` False

@@ -413,6 +413,7 @@ test-suite tests
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
+        Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
         Seal.Gateway.ApiRouteSpec
