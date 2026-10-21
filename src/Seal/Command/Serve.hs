@@ -7,8 +7,6 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (finally)
 import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
@@ -17,7 +15,6 @@ import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.Timeout (timeout)
 import System.Directory (doesFileExist)
 
 import Katip (Severity (..), ls)
@@ -61,9 +58,7 @@ import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureS
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
-import Seal.Gateway.Stream
-  ( StreamGuard (..), StreamHealth (..), runStreamServerWithHealth
-  , streamHealthMessage, streamHealthStatus )
+import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -329,7 +324,7 @@ runServeMain autonomy mCliStaticDir logger = do
   -- CONFIGURED port unconditionally was the bug: a WS that failed to bind
   -- (port already in use) still advertised the dead port, so the frontend
   -- connected to a non-WebSocket port and its transcript froze.
-  wsHealthRef <- newIORef (StreamHealth "starting" (gcWsPort gwCfg))
+  wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -358,7 +353,9 @@ runServeMain autonomy mCliStaticDir logger = do
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
         }
-  -- Start the WS stream server on the WS port.
+  -- The WS stream server is MOUNTED in the HTTP application (same port),
+  -- so there is no second listener and no second port to collide with.
+  --
   -- The Origin allowlist is the configured list PLUS origins derived from
   -- the HTTP server's host + port. A wildcard host (0.0.0.0) means "bind all
   -- interfaces" — the browser may reach the server via any of them, so we
@@ -373,25 +370,12 @@ runServeMain autonomy mCliStaticDir logger = do
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
-  logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
-  -- Start the WS stream server and WAIT for its bind to settle, so the
-  -- startup banner can tell the operator the truth. Previously the bind
-  -- happened inside the forked thread with no error handling: a port
-  -- collision killed that thread silently and the gateway carried on
-  -- serving HTTP while the live transcript was permanently dead.
-  wsStarted <- newEmptyMVar
-  _ <- forkIO
-    (runStreamServerWithHealth (gcHost gwCfg) (gcWsPort gwCfg) guard broker wsHealthRef
-      `finally` putMVar wsStarted ())
-  -- Bound the wait: a healthy bind settles in milliseconds.
-  _ <- timeout 5_000_000 (takeMVar wsStarted)
-  wsHealth <- readIORef wsHealthRef
-  case streamHealthStatus wsHealth of
-    "up" -> pure ()
-    _    -> logIO logger ErrorS
-      ("WebSocket stream server UNAVAILABLE: " <> ls (streamHealthMessage wsHealth)
-       <> " — the web UI's live transcript updates will NOT work."
-       <> " Fix the port conflict (or set a different [gateway] ws_port) and restart.")
+  -- The WS server shares the HTTP listener, so it is up as soon as the
+  -- HTTP server is. Record that in the health state the /api/health
+  -- endpoint publishes.
+  writeIORef wsHealthRef (StreamHealth "up" (gcPort gwCfg))
+  logIO logger InfoS ("WS stream server mounted on the same port ("
+    <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))) <> ")")
   -- Periodically clear stale "thinking" sessions (safety net for sessions
   -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
   -- every 5 minutes; clears sessions thinking longer than 30 minutes.
@@ -410,7 +394,7 @@ runServeMain autonomy mCliStaticDir logger = do
   let isRemote = case scUntrustedExec secCfg of
         Just uefc -> uefcMode uefc == "remote"
         Nothing   -> False
-  runGateway logger gwCfg isRemote deps
+  runGateway logger gwCfg isRemote deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -506,11 +490,12 @@ forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
       let chatGwCfg = ChatTypes.GatewayConfig
             { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            -- The WS stream is served on the SAME port as the HTTP API.
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
             , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           accountText = Seal.Signal.Config.signalAccountText account
@@ -545,11 +530,12 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
       let chatGwCfg = ChatTypes.GatewayConfig
             { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            -- The WS stream is served on the SAME port as the HTTP API.
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
             , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           tokenText = Seal.Telegram.Config.telegramTokenText token

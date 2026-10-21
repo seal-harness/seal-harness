@@ -333,6 +333,7 @@ library
       , wai
       , warp
       , websockets
+      , wai-websockets
       , case-insensitive
       , trasa
       , trasa-server

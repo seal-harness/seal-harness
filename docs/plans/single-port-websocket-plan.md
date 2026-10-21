@@ -1,7 +1,9 @@
-# Single-Port WebSocket — Implementation Plan
+# Single-Port WebSocket — Implementation Notes
 
 Branch: `fix/single-port-websocket`
 Approved: 2026-10-20 (user: "Let's do item 1 first, and then do item 2 on the same branch")
+
+Status: both parts implemented on this branch.
 
 ## Problem
 
@@ -24,9 +26,14 @@ exactly the `wai-3.2.4` / `websockets-0.13.0.0` this repo already uses.
 
 ## Scope
 
-### Part 1 — Make WS failure visible and truthful (backend only)
+## Part 1 — Make WS failure visible and truthful (backend only)
 
 User decision: "Backend + health, no frontend" for Part 1.
+
+Implemented as: `runStreamServerWithHealth` binds the socket itself and
+reports the outcome into a `StreamHealth` value; `/api/health` publishes
+`wsStatus` / `wsMessage` / the port from that single source of truth; the
+startup path waits for the bind to settle and logs an actionable Error.
 
 - **P1.1** `runStreamServer` must not die silently. Catch the bind
   exception, log at Error, and surface it. (Red test: bind a port that is
@@ -37,35 +44,19 @@ User decision: "Backend + health, no frontend" for Part 1.
 - **P1.3** `seal serve` startup must not pretend success: if the WS server
   cannot bind, log a loud, actionable error naming the port and the cause.
 
-### Part 2 — Single port (WS served by the same Warp app)
+## Part 2 — Single port (WS served by the same Warp app)
 
-- **P2.1** Add `wai-websockets` to the library `build-depends` + the flake
-  so it resolves in the dev shell.
-- **P2.2** Convert `Seal.Gateway.Stream` from `runStreamServer` (own
-  listener) to a `ServerApp` that `websocketsOr` can mount inside
-  `gatewayApp`. The Origin allowlist moves from `PendingConnection` to the
-  WAI `Request` (or keeps using `getRequestHead`).
-- **P2.3** `Seal.Gateway.Server.gatewayApp` mounts the WS app at the WS
-  path; `runGateway` serves it on the single HTTP port.
-- **P2.4** `Seal.Gateway.Config`: `ws_port` becomes optional; when absent
-  the WS shares the HTTP port. Keep the field so existing configs keep
-  working (a configured `ws_port` may still request the legacy split for a
-  transition period, or be ignored with a warning — decide at
-  implementation time; prefer **same port always**, with `ws_port` honored
-  only if explicitly set AND the user opts in).
-- **P2.5** `/api/health`: `wsPort` becomes the HTTP port (same origin);
-  frontend no longer needs port discovery.
-- **P2.6** `frontend/src/lib/streamClient.ts`: connect to the same origin
-  (`ws://host:port/`), keeping the `/api/health` discovery as a fallback
-  for older servers.
-- **P2.7** The in-process chat channels (`forkNewSignalChatChannel`,
-  `forkNewTelegramChatChannel` in `Seal.Command.Serve`) build
-  `ChatTypes.gcWsUrl` from `gcWsPort` — they must use the same port now.
-  (These are **threads in the same process**, not separate processes.)
-- **P2.8** Update tests: `test/Seal/Gateway/ConfigSpec.hs` (8080/8081
-  split assertions), `test/Seal/Gateway/StreamSpec.hs` (the WS test
-  server), `test/Seal/Gateway/ServerSpec.hs`, `test/Seal/Gateway/ApiSpec.hs`
-  (health payload).
+Implemented as: `wai-websockets` added to the cabal + flake
+(`prebuilt-depends`); `Seal.Gateway.Stream.streamMiddleware` wraps the
+per-connection app with `websocketsOr`; `Seal.Gateway.Server.gatewayAppWithStream`
+mounts it over the ordinary app; `runGateway` serves the combined app on
+the single HTTP port with a 120s Warp timeout (the default 30s would tear
+down an idle WS); the chat channels' `gcWsUrl` now points at the HTTP port;
+`/api/health` reports the shared port; the frontend connects to the page's
+own origin, keeping `/api/health` discovery as a fallback.
+
+`ws_port` is retained in the config codec so existing config files still
+parse, but it no longer selects a separate listener.
 
 ## Files in scope
 

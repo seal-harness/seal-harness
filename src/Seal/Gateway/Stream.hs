@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The WebSocket stream endpoint. Runs on a separate port from the REST +
--- static WARP server. Every connection is gated by the
+-- | The WebSocket stream endpoint. Mounted INSIDE the REST + static WARP
+-- server, so the stream shares the gateway's port. Every connection is
+-- gated by the
 -- Origin allowlist + the broker's global cap. The wire protocol: on
 -- connect, a one-shot @hello@ (carrying @protocolVersion@ +
 -- @serverStartedAt@ so the client can detect server restarts); then a
@@ -13,8 +14,7 @@
 -- from @replaying@ back to @live@. This closes the gap: entries broadcast
 -- while the WS was disconnected are no longer permanently lost.
 module Seal.Gateway.Stream
-  ( runStreamServer
-  , runStreamServerWithHealth
+  ( streamMiddleware
   , StreamGuard (..)
   , StreamHealth (..)
   , streamHealthStatus
@@ -30,10 +30,8 @@ module Seal.Gateway.Stream
   , sendErrorFrame
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Exception (SomeException, bracket, catch, try)
-import Control.Monad (forever, forM_, void)
-import Data.IORef (IORef, newIORef, writeIORef)
+import Control.Exception (SomeException, catch)
+import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
@@ -44,12 +42,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
-import Network.Socket (Socket)
-import Network.Socket qualified as Sock
+import Network.Wai
+  ( Application )
+import Network.Wai.Handler.WebSockets (websocketsOr)
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
-  , withPingThread, sendClose, Connection
-  , defaultConnectionOptions, makeListenSocket, makePendingConnection )
+  , withPingThread, sendClose, Connection, defaultConnectionOptions )
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
@@ -110,73 +108,25 @@ data StreamGuard = StreamGuard
   , sgPaths :: SealPaths
   }
 
--- | Run the WebSocket stream server on the given port. Blocks (run in a
--- forked thread from @seal serve@).
+-- | The WebSocket stream endpoint, as a WAI middleware.
 --
--- This wrapper does not report liveness; 'runStreamServerWithHealth' is
--- what production uses. A bind failure is still LOGGED either way.
-runStreamServer :: Text -> Int -> StreamGuard -> StreamBroker -> IO ()
-runStreamServer host port guard broker = do
-  healthRef <- newIORef (StreamHealth "starting" port)
-  runStreamServerWithHealth host port guard broker healthRef
-
--- | Run the WebSocket stream server, reporting its liveness into the given
--- 'IORef'.
+-- The WS server is mounted INSIDE the HTTP server, so the stream shares
+-- the gateway's port. This removes the second listener entirely: the old
+-- two-port split existed only because @wai-app-websockets@ (now
+-- @wai-websockets@) was missing from the nix snapshot when the split was
+-- chosen in 2026-07. With the bridge available, one port means one bind,
+-- one thing to go wrong -- and no chance of the WS silently dying while
+-- HTTP kept serving.
 --
--- The bind is performed HERE (via 'makeListenSocket') rather than inside
--- 'WS.runServer', so that a bind failure is caught and REPORTED instead of
--- killing the calling thread. The historical implementation used
--- @WS.runServer@ directly, so a port collision (e.g. another process
--- already holding the port) raised an exception that unwound the forked
--- thread and was silently discarded: the HTTP gateway kept running and
--- @\/api\/health@ went on advertising the dead port, so the web frontend
--- connected to a non-WebSocket port and its transcript froze permanently.
---
--- On a successful bind the health state becomes @\"up\"@; on failure it
--- becomes @\"failed\"@ and the error is logged at 'ErrorS' severity.
-runStreamServerWithHealth
-  :: Text
-  -> Int
-  -> StreamGuard
+-- Non-WebSocket requests fall through to the supplied backup application,
+-- so this can wrap the whole gateway app.
+streamMiddleware
+  :: StreamGuard
   -> StreamBroker
-  -> IORef StreamHealth
-  -> IO ()
-runStreamServerWithHealth host port guard broker healthRef = do
-  writeIORef healthRef (StreamHealth "starting" port)
-  bindResult <- try (makeListenSocket (T.unpack host) port)
-  case bindResult of
-    Left (e :: SomeException) -> do
-      writeIORef healthRef (StreamHealth "failed" port)
-      globalLogIO ErrorS
-        ("[ws] FAILED to bind port " <> ls (T.pack (show port)) <> ": " <> ls (T.pack (show e))
-         <> " — live transcript updates are UNAVAILABLE (the port may already be in use)")
-    Right sock -> do
-      writeIORef healthRef (StreamHealth "up" port)
-      globalLogIO InfoS ("[ws] stream server listening on " <> ls (T.unpack host) <> ":" <> ls (T.pack (show port)))
-      -- The accept loop runs against the socket we already bound, so the
-      -- "we know the bind succeeded" property is preserved.
-      acceptLoop sock guard broker
-
--- | Accept loop over an already-bound listening socket. Mirrors
--- 'WS.runServer' but takes the socket, so the caller controls the bind.
---
--- Mirrors the upstream 'Network.WebSockets.Server' accept loop: accept a
--- connection socket, turn it into a 'PendingConnection', then run the
--- per-connection app. Each connection is handled in its own thread so a
--- slow client cannot stall the accept loop.
-acceptLoop :: Socket -> StreamGuard -> StreamBroker -> IO ()
-acceptLoop sock guard broker = forever $ do
-  (conn, _addr) <- Sock.accept sock
-  void (forkIO (handleConnection conn guard broker))
-
--- | Run the per-connection app for an accepted socket. The
--- 'PendingConnection' and its socket are closed when the app returns.
-handleConnection :: Sock.Socket -> StreamGuard -> StreamBroker -> IO ()
-handleConnection conn guard broker =
-  bracket
-    (makePendingConnection conn defaultConnectionOptions)
-    (\_pending -> Sock.close conn)
-    (streamApp guard broker)
+  -> Application
+  -> Application
+streamMiddleware guard broker =
+  websocketsOr defaultConnectionOptions (streamApp guard broker)
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.
