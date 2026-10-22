@@ -71,6 +71,7 @@ import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText, parseApprovalScope )
+import Seal.Handles.Transcript (pendingCompletionCount)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
@@ -351,6 +352,19 @@ wakeIdleSession deps sid = do
               -- injected by runTurnBody.
               _ <- runSessionTurn td adapter meta Nothing "."
               globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: synthetic turn completed for sid=" <> sessionIdText sid))
+              -- [completion-diag] Completions that landed while the
+              -- synthetic turn was running are still in the sidecar: the
+              -- wake-up that would have delivered them was skipped (a turn
+              -- was in flight) and no other wake-up is scheduled. The
+              -- session looks dead even though the sub-agents have
+              -- finished.
+              pending <- pendingCompletionCount (sdPaths deps) sid
+              when (pending > 0) $ do
+                globalLogIO WarningS
+                  (ls ("[completion-diag] " <> T.pack (show pending)
+                    <> " sub-agent completion(s) still pending after the wake-up turn for sid="
+                    <> sessionIdText sid
+                    <> " — no wake-up is scheduled for them"))
               releaseWake (sdWakeMutex deps) sid
 -- * @taPreTurn@ — fans out the user's message to subscribed chat channels
 --   (cross-channel mirroring, @"web"@ label). No 'replySubscribe' (the web

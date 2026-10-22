@@ -86,7 +86,8 @@ import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
   ( IndexedTranscriptHandle, withIndexedTranscript, itwSetSecretOps, itwReadEntries
   , itwRecordAndAck, itwRecordAsync, itwReadConversation, IndexedTranscriptWrite (..)
-  , readAndClearCompletions )
+  , completionHarnessTag, pendingCompletionCount, readAndClearCompletions )
+import Seal.Session.Log (appendSessionLog)
 import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
@@ -735,6 +736,14 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   completions <- readAndClearCompletions paths sid
   unless (null completions) $ do
     prior <- itwReadConversation tHandle
+    globalLogIO K2.DebugS
+      (K2.ls ("[completion-diag] injecting " <> T.pack (show (length completions))
+        <> " sub-agent completion(s) into sid=" <> sessionIdText sid
+        <> " conversationLen=" <> T.pack (show (length prior))))
+    appendSessionLog (Just (sessionLogPath paths sid)) "INFO"
+      ("[completion-diag] injecting " <> T.pack (show (length completions))
+        <> " sub-agent completion(s); conversation length before injection = "
+        <> T.pack (show (length prior)))
     now <- getCurrentTime
     hid <- newHarnessId
     let fullMsgs = prior <> completions
@@ -747,13 +756,30 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           , erUsage = Nothing
           , erStop = Nothing
           , erDurationMs = Nothing
-          , erHarness = Just "subagent-completion"
+          , erHarness = Just completionHarnessTag
           , erCorrelation = Nothing
           , erMeta = Map.empty
           }
     itwRecordAsync tHandle (IndexedTranscriptWrite fullMsgs entry)
   eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
+  -- [completion-diag] A completion still sitting in the sidecar when the
+  -- turn ends may have no delivery scheduled: the idle wake-up was skipped
+  -- because a turn was in flight, and nothing may pick the message up until
+  -- a human sends the next message. The session then looks dead even though
+  -- the sub-agent has finished. Checked on every exit path (including a
+  -- failed turn) so a stranded completion is always visible.
+  pending <- pendingCompletionCount paths sid
+  when (pending > 0) $ do
+    globalLogIO K2.WarningS
+      (K2.ls ("[completion-diag] " <> T.pack (show pending)
+        <> " sub-agent completion(s) still pending when the turn ended for sid="
+        <> sessionIdText sid
+        <> " — check that a wake-up picks them up"))
+    appendSessionLog (Just (sessionLogPath paths sid)) "WARN"
+      ("[completion-diag] " <> T.pack (show pending)
+        <> " sub-agent completion(s) still pending when the turn ended; "
+        <> "check that a wake-up picks them up")
   case eResult of
     Left errMsg -> pure (Just errMsg)
     Right _     -> do
