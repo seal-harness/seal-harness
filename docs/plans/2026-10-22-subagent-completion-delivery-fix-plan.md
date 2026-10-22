@@ -397,7 +397,8 @@ failure messages name the defect rather than dumping the conversation:
   second provider request; it stayed in the sidecar.
 
 The suite reports **3158 examples, 3 failures** — exactly R1, R2 and R3,
-nothing else newly failing. All three fail on **10 consecutive runs**.
+nothing else newly failing. All three fail on **20 consecutive runs**
+(measured in two batches of 10).
 The fixture is a production-sized conversation (300 messages x 5KB),
 which is the size at which the reader reliably loses the race (§2). R4
 passes, as specified.
