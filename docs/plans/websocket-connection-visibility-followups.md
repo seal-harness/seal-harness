@@ -10,10 +10,9 @@
 PR #276 fixed the *cause* of the reported bug — a WS port conflict that
 silently killed the stream while HTTP kept serving — by serving the
 WebSocket stream from the same Warp listener as the HTTP API. One port,
-one bind, no second listener to collide with.
-
-It also made the backend honest: a bind failure is now logged at `Error`
-and published in `/api/health` as `wsStatus` / `wsMessage`.
+one bind, no second listener to collide with. It also made the backend
+honest: a bind failure is now logged at `Error` and published in
+`/api/health` as `wsStatus` / `wsMessage`.
 
 **What it did not do is make the failure visible to the person using the
 web UI.** The `/api/health` fields are correct but nothing consumes them.
@@ -21,15 +20,14 @@ The user-facing symptom is still "the transcript silently stops updating
 and a hard refresh fixes it" — the same confusing experience that prompted
 the original investigation.
 
-This document describes the four remaining gaps, in the order they should
-be closed.
+This document describes the remaining work, in the order it should be
+closed.
 
 ## The core problem
 
-Three of the four gaps share one root cause: **the web UI has exactly one
-path for transcript data, and it is the WebSocket.** The sidebar already
-knows how to degrade (it polls `/api/lists` over HTTP every 3s when the
-WS `lists` frame never arrives) but the transcript does not.
+**The transcript's only data path is the WebSocket.** The sidebar already
+knows how to degrade — it polls `/api/lists` over HTTP every 3s when the
+WS `lists` frame never arrives — but the transcript has no such path.
 
 That asymmetry is what made the original bug read as *intermittent*: the
 tab list stayed live while the transcript was frozen, so it looked like a
@@ -65,6 +63,42 @@ nothing, with `reconnectAttempt = 0` after 25s.
 `wsStatus` is one of `up` | `failed` | `down` | `starting`. No frontend
 code reads it — the WS client only discovers the *port*, via
 `discoverStreamUrl()` in `frontend/src/lib/streamClient.ts`.
+
+---
+
+## Decision: no HTTP polling fallback for the transcript (yet)
+
+**HTTP polling for the transcript is explicitly deferred.** It is a
+reasonable future hardening — see [Deferred work](#deferred-work) — but it
+is not needed to make the transcript correct, because **the `since`-based
+replay already recovers everything missed while disconnected.**
+
+Verified against a live gateway: with the socket closed, a message sent
+while disconnected, then reconnected with `since=<last entry id>`, the
+server replayed **every** entry produced during the outage:
+
+```
+--- closing WS, then sending msg2 while disconnected ---
+on-disk ids now: ["0","1","3","4","6","7","9","10","12","13","14"]
+
+--- reconnecting with since=0 ---
+  <- entry id=1 … id=14
+  <- replay-end last="14"
+
+ids missed while disconnected: ["1","3","4","6","7","9","10","12","13","14"]
+of those, RECOVERED by reconnect: ["1","3","4","6","7","9","10","12","13","14"]
+```
+
+**100% recovered.** So the correct fix is to make the reconnect actually
+happen (Task 1) — after which the transcript is correct again, with no
+polling and no lost content. Polling would only paper over a reconnect
+that never fires.
+
+This also means the transcript is **stale but not wrong** during an
+outage: entries that arrive while disconnected are missing from the view
+until the reconnect, at which point they are replayed in full. The UI must
+therefore say *"these updates are not arriving yet"* rather than implying
+the transcript is up to date.
 
 ---
 
@@ -109,6 +143,9 @@ the fix is to make sure it always *runs*.
 - A socket that stays `CONNECTING` past the deadline is closed and
   retried.
 - Backoff still grows as expected (no thundering herd on a dead server).
+- **Recovery**: after a reconnect, entries produced during the outage are
+  delivered via the `since` replay (this is the property verified above;
+  it deserves a regression test).
 
 ---
 
@@ -139,6 +176,8 @@ Add a visible connection indicator to the chat area:
   still works), because the user may be reading history while the live
   tail is down.
 
+Task 3 escalates this to a modal once retries are exhausted.
+
 ### Test cases
 
 - The banner appears when the stream status leaves `live`.
@@ -148,49 +187,69 @@ Add a visible connection indicator to the chat area:
 
 ---
 
-## Task 3 — Give the transcript an HTTP polling fallback
+## Task 3 — Modal alert when the WebSocket cannot reconnect
 
-**Priority**: P1 — this is the difference between "degraded" and
-"broken".
-**Size**: Medium.
-**Depends on**: Task 1 (polling is a fallback for a WS that cannot be
-re-established, not a substitute for fixing reconnects).
+**Priority**: P1 — the terminal state of the same failure, and the one
+that must not be silent.
+**Size**: Small–medium (one component + the WS client).
+**Depends on**: Task 1 (there must be retries to exhaust).
 
 ### Problem
 
-The sidebar degrades gracefully; the transcript does not. `useListsPoll`
-polls `/api/lists` every 3s when the WS `lists` frame never arrives.
-`useTranscriptStream` has **no** polling path at all — `grep -c
-'setInterval\|POLL' frontend/src/hooks/useTranscriptStream.ts` returns
-`0`.
+Task 2's banner is deliberately non-modal, because most disconnects are
+brief and self-healing. But a *persistent* failure — the gateway is down,
+or the port is wrong — leaves the transcript permanently frozen with only a
+small dismissible banner. A user who does not notice the banner may
+believe the agent has stopped working, and may sit waiting for a reply
+that is already on disk.
 
-So when the WS is down, the transcript is frozen at whatever the last
-HTTP seed returned.
+The reconnect ladder backs off to a 5s cap and never gives up
+(`RECONNECT_MAX_MS = 5000`, no attempt cap). So "the connection is not
+coming back" is a real, reachable state that currently has no
+representation in the UI at all.
 
 ### Change
 
-Mirror the sidebar's pattern:
+Escalate to a **modal** once the client has failed to reconnect a set
+number of times.
 
-- When the stream is not `live`, poll
-  `GET /api/sessions/:id/transcript?limit=50` on an interval and merge
-  the result with `reconcileEntries` (the merge helper already exists and
-  is idempotent by entry id).
-- Stop polling as soon as the stream returns to `live` — the WS tail
-  takes over.
-- Poll only for the focused session, and only when the transcript view is
-  actually mounted.
-
-Reuse the existing `reconcileEntries` merge (it is already used for the
-HTTP seed) and the existing `TranscriptDataCache`, so the fallback does
-not introduce a second source of truth.
+- **Trigger**: after N consecutive failed connection attempts. The
+  existing `reconnectAttempt` counter already tracks this and is reset to
+  0 on any successful message (line ~291) — reuse it rather than adding
+  a second counter. Suggested N: **10** attempts. With the current
+  backoff (250ms → 5s), 10 attempts is roughly 30–40s of trying: long
+  enough to ride out a brief restart, short enough that a user waiting on
+  a reply is not left staring at a spinner for minutes.
+- **Content**: state plainly that live updates are unavailable and that
+  the transcript shown may be stale. Include `lastError` when set.
+  Something like: *"Live updates unavailable. The transcript may be out
+  of date. Check that the gateway is running, then reconnect."*
+- **Actions**:
+  - **Reconnect now** — force an immediate reconnection attempt rather
+    than waiting out the current backoff.
+  - **Dismiss** — close the modal but keep the background retry ladder
+    running. The transcript stays visible and stale; if a reconnect later
+    succeeds, the missed entries are replayed and the transcript catches
+    up automatically.
+- **Behaviour**: the modal must not block the transcript from being read
+  or the composer from being used. The agent keeps running server-side
+  regardless of the WS state, and a user can still send messages.
+- **Recovery**: when a reconnect succeeds, the modal closes automatically
+  and the banner returns to its non-modal state. Because the reconnect
+  sends `since`, the entries missed during the outage are replayed — the
+  user sees the transcript catch up rather than silently jumping.
 
 ### Test cases
 
-- With the WS down, the transcript gains new entries via polling.
-- Polling stops when the stream returns to `live`.
-- The HTTP-poll and WS-tail paths do not duplicate entries (dedup by id
-  is already handled by `reconcileEntries`).
-- Polling does not run for a session that is not focused.
+- The modal does not appear before N failed attempts.
+- The modal appears at attempt N, showing `lastError` when set.
+- "Reconnect now" triggers an immediate connection attempt.
+- "Dismiss" closes the modal and the background retry ladder continues.
+- The modal closes automatically when a reconnect succeeds.
+- The transcript remains readable and the composer usable while the modal
+  is open.
+- **Recovery**: after a successful reconnect, entries produced during the
+  outage appear in the transcript (via the `since` replay).
 
 ---
 
@@ -219,10 +278,6 @@ POST /send returned after 3ms
 The re-seed therefore **always** races the turn and sees an empty
 transcript. It is a wasted request that contributes nothing.
 
-Today this is masked: the WS tail delivers the entry anyway. It stops
-being masked the moment Task 3 introduces HTTP polling — the poll would
-be doing the work the re-seed was supposed to do, one second too early.
-
 ### Change
 
 Re-seed **after** the turn completes, not when the POST returns. Options:
@@ -237,13 +292,16 @@ Re-seed **after** the turn completes, not when the POST returns. Options:
 Do not simply delay the re-seed by a fixed interval — that trades a
 deterministic bug for a timing-dependent one.
 
+Note this is *not* the same as the deferred HTTP polling fallback: this
+is a one-shot re-seed triggered by turn completion, not a recurring poll.
+
 ### Test cases
 
 - A send that produces entries does not trigger an immediate empty
   re-seed.
 - The transcript still shows the sent message and the reply.
-- With the WS down (Task 3's fallback active), the transcript still
-  converges.
+- With the WS down, the transcript still converges once the connection is
+  restored (via the `since` replay).
 
 ---
 
@@ -253,35 +311,45 @@ deterministic bug for a timing-dependent one.
 |---|------|----------|------------|------|
 | 1 | Reconnect on socket death | P1 | — | Small |
 | 2 | Connection state in the UI | P1 | — | Small–medium |
-| 3 | Transcript HTTP polling fallback | P1 | 1 | Medium |
+| 3 | Modal alert when reconnects are exhausted | P1 | 1 | Small–medium |
 | 4 | Fix the POST /send re-seed race | P2 | — | Small |
 
-Tasks 1 and 2 are independent of each other and can be done in either
-order. Task 3 should follow Task 1 so that the polling fallback is a
-safety net for a genuinely dead WS rather than the primary mechanism.
-Task 4 should land with or shortly after Task 3, since Task 3 makes the
-re-seed's timing bug user-visible.
+Tasks 1 and 2 are independent and can be done in either order. Task 3
+needs Task 1 (there must be retries to exhaust) and benefits from Task 2
+(the banner is the transient state, the modal the terminal one). Task 4
+is independent of all three.
 
-## Out of scope
+**Task 1 is the load-bearing one.** It is what makes the transcript
+correct again after an outage; tasks 2 and 3 are what make the outage
+visible while it happens.
 
+## Deferred work
+
+- **HTTP polling fallback for the transcript.** Explicitly not doing this
+  now. The `since` replay recovers 100% of the entries missed during an
+  outage (verified above), so polling would be redundant once reconnects
+  work. Worth revisiting if a future change breaks the replay path, or if
+  the UX requirement becomes "the transcript must be current even while
+  the WS is down" — in which case the sidebar's `useListsPoll` pattern
+  (3s interval) is the precedent to mirror.
 - **Server-side WS metrics or a live-connection count.** The backend
-  already reports its own liveness accurately via `/api/health`; a
-  richer endpoint is not needed for these fixes.
+  already reports its own liveness accurately via `/api/health`; a richer
+  endpoint is not needed for these fixes.
 - **Changing the WS wire protocol.** The current protocol works; the
   gaps are all in the client's handling of a dead socket and in the
-  absence of a fallback.
-- **Retrying the HTTP transcript fetch aggressively.** The fallback poll
-  should be gentle (the sidebar's 3s interval is a reasonable precedent).
+  absence of user-visible state.
 
 ## References
 
 - `frontend/src/lib/streamClient.ts` — the WS client; `sock.onerror`
-  (line ~233), `handleClose`, `scheduleReconnect`, `discoverStreamUrl`
+  (line ~233), `handleClose` (~383), `scheduleReconnect` (~404),
+  `discoverStreamUrl` (~467), the backoff constants (~36)
 - `frontend/src/hooks/useTranscriptStream.ts` — the transcript hook;
-  `reconcileEntries` merge, the HTTP seed effect
-- `frontend/src/hooks/useApi.ts` — `useListsPoll` (the sidebar's polling
-  fallback, the pattern to mirror), `useSendMessage`'s `onComplete`
-- `src/Seal/Gateway/API.hs` — the `/api/health` handler that publishes
-  `wsStatus` / `wsMessage`
-- `src/Seal/Gateway/Stream.hs` — the WS middleware and `StreamHealth`
+  `reconcileEntries` merge (~161), the HTTP seed effect
+- `frontend/src/hooks/useApi.ts` — `useSendMessage`'s `onComplete` (~371),
+  `useListsPoll` (~231), `POLL_INTERVAL` (~26)
+- `src/Seal/Gateway/API.hs` — the `/api/health` handler (~176) that
+  publishes `wsStatus` / `wsMessage`
+- `src/Seal/Gateway/Stream.hs` — the WS middleware, `StreamHealth`, and
+  the `since` replay that makes recovery complete
 - `docs/plans/single-port-websocket-plan.md` — the merged single-port work
