@@ -112,6 +112,7 @@ import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp, sessionManageOp)
 import Seal.ISA.Ops.Skills
+import Seal.ISA.Ops.Cron (cronManageOp)
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLogging)
@@ -288,6 +289,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , memoryArchiveOp (bMemory backends) (bEmbedding backends)
       , skillWriteOp (bSkills backends) sid
      , skillManageOp (bSkills backends) sid
+      , cronManageOp (bCronFire backends) (bCronStore backends) sid
       , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
