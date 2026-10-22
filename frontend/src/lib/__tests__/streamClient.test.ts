@@ -266,6 +266,56 @@ describe('streamClient', () => {
     expect(ref.instances).toHaveLength(1)
   })
 
+  // ── reconnect attempt count + manual reconnect ──────────────────────────
+  //
+  // The UI needs to know when a disconnect has become terminal (so it can
+  // escalate from a banner to a modal) and needs a way to retry NOW rather
+  // than waiting out the backoff.
+
+  it('reports zero reconnect attempts before any failure', () => {
+    expect(client.reconnectAttempts()).toBe(0)
+  })
+
+  it('counts consecutive failed reconnect attempts', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateClose(1006, '', false)
+    expect(client.reconnectAttempts()).toBe(1)
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    // The second socket also fails.
+    ref.socket!.simulateClose(1006, '', false)
+    expect(client.reconnectAttempts()).toBe(2)
+  })
+
+  it('resets the reconnect attempt count after a successful message', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateClose(1006, '', false)
+    expect(client.reconnectAttempts()).toBe(1)
+    vi.advanceTimersByTime(300)
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateMessage({ type: 'hello', protocolVersion: 'v1', serverStartedAt: '2026-01-01T00:00:00Z' })
+    expect(client.reconnectAttempts()).toBe(0)
+  })
+
+  it('reconnectNow() attempts a connection immediately', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateClose(1006, '', false)
+    // A reconnect is already pending after the backoff.
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    // Force an immediate attempt rather than waiting out the next backoff.
+    client.reconnectNow()
+    expect(ref.instances).toHaveLength(3)
+  })
+
+  it('reconnectNow() does nothing when the user has closed the client', () => {
+    ref.socket!.simulateOpen()
+    cleanup()
+    client.reconnectNow()
+    vi.advanceTimersByTime(10000)
+    expect(ref.instances).toHaveLength(1)
+  })
+
   it('recovers missed entries via the since replay after a reconnect', () => {
     // The recovery property that makes an HTTP polling fallback
     // unnecessary: on reconnect the client re-focuses with `since`, and

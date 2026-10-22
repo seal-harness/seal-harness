@@ -30,6 +30,8 @@ function fakeClient(): StreamClient & {
   const requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[] = []
   const entriesChunkCbs = new Set<(sessionId: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void>()
   let lastError: string | null = null
+  let reconnectAttempts = 0
+  let reconnectNowCalls = 0
   return {
     status: 'live' as StreamClient['status'],
     focus: () => {},
@@ -43,6 +45,8 @@ function fakeClient(): StreamClient & {
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
+    reconnectAttempts: () => reconnectAttempts,
+    reconnectNow: () => { reconnectNowCalls += 1 },
     requestEntries: (sessionId: string, before: string | null, limit: number) => { requestEntriesCalls.push({ sessionId, before, limit }) },
     onEntriesChunk: (cb) => { entriesChunkCbs.add(cb); return () => { entriesChunkCbs.delete(cb) } },
     // test drivers:
@@ -53,6 +57,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid, ask) => { for (const cb of askResolvedCbs) cb(sid, ask) },
     setStatus: (s) => { for (const cb of statusCbs) cb(s); },
     setError: (e) => { lastError = e },
+    setReconnectAttempts: (n) => { reconnectAttempts = n; for (const cb of statusCbs) cb('reconnecting') },
+    getReconnectNowCalls: () => reconnectNowCalls,
     pushEntriesChunk: (sid, chunk) => { for (const cb of entriesChunkCbs) cb(sid, chunk) },
     requestEntriesCalls,
   } as StreamClient & {
@@ -63,6 +69,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid: string, ask: { id: string; resolution: string }) => void
     setStatus: (s: StreamClient['status']) => void
     setError: (e: string | null) => void
+    setReconnectAttempts: (n: number) => void
+    getReconnectNowCalls: () => number
     pushEntriesChunk: (sid: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void
     requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[]
   }

@@ -222,6 +222,9 @@ export function useTranscriptStream(
   const [entries, setEntries] = useState<TranscriptEntry[]>([])
   const [status, setStatus] = useState<StreamStatus>(sc.status)
   const [lastError, setLastError] = useState<string | null>(sc.lastError())
+  // Consecutive failed connection attempts. Drives the escalation from the
+  // connection banner to the "live updates unavailable" modal.
+  const [reconnectAttempts, setReconnectAttempts] = useState<number>(sc.reconnectAttempts())
   const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([])
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
@@ -540,6 +543,7 @@ export function useTranscriptStream(
     const unsub = sc.onStatusChange((s) => {
       setStatus(s)
       setLastError(sc.lastError())
+      setReconnectAttempts(sc.reconnectAttempts())
       // Reset loadingMore on disconnect (in-flight chunk request is lost).
       if (s === 'reconnecting' || s === 'closed') {
         setLoadingMore(false)
@@ -556,5 +560,7 @@ export function useTranscriptStream(
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
     hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest,
+    reconnectAttempts,
+    reconnectNow: () => sc.reconnectNow(),
   }
 }

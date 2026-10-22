@@ -26,6 +26,8 @@ vi.mock('../lib/streamClient', () => {
     requestEntries: () => {},
     onEntriesChunk: () => unsub,
     lastError: () => null,
+    reconnectAttempts: () => 0,
+    reconnectNow: () => {},
   }
   return { streamClient: () => client }
 })

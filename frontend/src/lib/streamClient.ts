@@ -195,6 +195,31 @@ class StreamClientImpl implements StreamClient {
     }
   }
 
+  /** The number of consecutive failed connection attempts since the last
+   *  successful message. The UI uses this to decide when a disconnect has
+   *  become terminal (and should escalate from a banner to a modal). */
+  reconnectAttempts(): number {
+    return this.reconnectAttempt
+  }
+
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. Used by the "Reconnect now" action in the connection modal.
+   *  A no-op after an explicit 'close()'. */
+  reconnectNow(): void {
+    if (this.closedByUser) return
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    // Drop the current socket so the new attempt is not confused with it.
+    if (this.ws !== null) {
+      try { this.ws.close(4000, 'manual reconnect') } catch { /* ignore */ }
+      this.ws = null
+    }
+    this.clearConnectTimer()
+    this.connect()
+  }
+
   /** Closes the connection permanently. No further reconnect attempts. */
   close(): void {
     this.closedByUser = true
