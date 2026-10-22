@@ -1,7 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.SessionSpec (spec) where
 
+import Control.Concurrent (threadDelay)
 import Data.Aeson (encode, object, (.=))
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -12,8 +14,9 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.Paths
-  ( SealPaths (..), agentSessionDir, sessionConversationPath, sessionDir )
-import Seal.Core.Types (SessionId, mkSessionId, sessionIdText)
+  ( SealPaths (..), agentSessionDir, sessionConversationPath
+  , sessionConversationIndexPath, sessionDir )
+import Seal.Core.Types (SessionId, ToolCallId (..), mkSessionId, sessionIdText)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Session
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
@@ -21,6 +24,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (newSession, saveSessionMeta)
 import Seal.Session.Search (inMemorySessionSearchBackend)
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
+import Seal.Transcript.ConvIndex (buildIndex)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -58,6 +62,11 @@ userMsg t = TE.decodeUtf8 (encodeConvLine (ConvLine (Message User [CbText t])))
 -- | An assistant message JSON line (proper encoding via encodeConvLine).
 assistantMsg :: Text -> Text
 assistantMsg t = TE.decodeUtf8 (encodeConvLine (ConvLine (Message Assistant [CbText t])))
+
+-- | A tool-result message JSON line (proper encoding via encodeConvLine).
+toolResultMsg :: Text -> Text
+toolResultMsg t = TE.decodeUtf8
+  (encodeConvLine (ConvLine (Message User [CbToolResult (ToolCallId "call-1") [TrpText t] False])))
 
 -- | Mint a fixed, valid SessionId from a literal text (for tests that need
 -- deterministic child ids without going through 'newSession').
@@ -679,6 +688,11 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
         currentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        -- Session ids are millisecond-resolution timestamps; two
+        -- back-to-back newSession calls can mint the same id (a
+        -- pre-existing flake). Sleep past the boundary so the ids
+        -- are guaranteed distinct.
+        threadDelay 2000
         otherMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         seedConversation paths (smId currentMeta)
           [ userMsg "database connection pool question" ]
@@ -797,3 +811,245 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             T.isInfixOf (sessionIdText childSid) t `shouldBe` False
             T.isInfixOf (sessionIdText (smId parentMeta)) t `shouldBe` True
           _ -> expectationFailure "expected a single text part"
+
+  -- -----------------------------------------------------------------------
+  -- Byte budget + conversation.idx windowed reads
+  -- -----------------------------------------------------------------------
+  describe "byte budget and conversation.idx reads" $ do
+    it "reads the same window via conversation.idx as via the whole-file path" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "msg0"
+          , assistantMsg "msg1"
+          , userMsg "msg2"
+          , assistantMsg "msg3"
+          , userMsg "msg4"
+          , assistantMsg "msg5"
+          ]
+        let op = sessionGetOp paths callerSessionId
+            readVia args = runTestApp (opRun op localBackend
+              (object ([ "session_id" .= sessionIdText (smId meta) ] <> args)))
+            argsAsc = [ "order" .= ("front-to-back" :: Text)
+                      , "offset" .= (4 :: Int), "limit" .= (2 :: Int) ]
+            argsDesc = [ "order" .= ("back-to-front" :: Text)
+                       , "offset" .= (2 :: Int), "limit" .= (2 :: Int) ]
+            argsPast = [ "order" .= ("front-to-back" :: Text)
+                       , "offset" .= (50 :: Int), "limit" .= (2 :: Int) ]
+        asc1 <- readVia argsAsc
+        desc1 <- readVia argsDesc
+        past1 <- readVia argsPast
+        _ <- buildIndex (sessionConversationPath paths (smId meta))
+                        (sessionConversationIndexPath paths (smId meta))
+        asc2 <- readVia argsAsc
+        desc2 <- readVia argsDesc
+        past2 <- readVia argsPast
+        (asc2, desc2, past2) `shouldBe` (asc1, desc1, past1)
+        orIsError asc2 `shouldBe` False
+        case orParts asc2 of
+          [TrpText t] -> do
+            T.isInfixOf "msg4" t `shouldBe` True
+            T.isInfixOf "msg5" t `shouldBe` True
+            T.isInfixOf "msg0" t `shouldBe` False
+            -- Small transcripts are never cut: no markers, no notice.
+            T.isInfixOf "[content truncated]" t `shouldBe` False
+            T.isInfixOf "output truncated at" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded asc2)))
+        T.isInfixOf "\"truncated\":false" recorded `shouldBe` True
+        case orParts desc2 of
+          [TrpText t] -> do
+            T.isInfixOf "msg2" t `shouldBe` True
+            T.isInfixOf "msg3" t `shouldBe` True
+            T.isInfixOf "msg4" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "uses the idx line count as total when the index is present" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "ok alpha"
+          , "{not a json message line"
+          , userMsg "ok beta"
+          ]
+        let op = sessionGetOp paths callerSessionId
+            args = object ["session_id" .= sessionIdText (smId meta)]
+        beforeIdx <- runTestApp (opRun op localBackend args)
+        _ <- buildIndex (sessionConversationPath paths (smId meta))
+                        (sessionConversationIndexPath paths (smId meta))
+        afterIdx <- runTestApp (opRun op localBackend args)
+        orIsError afterIdx `shouldBe` False
+        case orParts afterIdx of
+          [TrpText t] -> do
+            T.isInfixOf "ok alpha" t `shouldBe` True
+            T.isInfixOf "ok beta" t `shouldBe` True
+            T.isInfixOf "of 3" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recordedBefore = TE.decodeUtf8 (BL.toStrict (encode (orRecorded beforeIdx)))
+            recordedAfter = TE.decodeUtf8 (BL.toStrict (encode (orRecorded afterIdx)))
+        T.isInfixOf "\"total_messages\":2" recordedBefore `shouldBe` True
+        T.isInfixOf "\"total_messages\":3" recordedAfter `shouldBe` True
+
+    it "bounds the rendered page to the byte budget on a large transcript (idx path)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let bigMsgs =
+              [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
+                  <> T.replicate 1200 "x")
+              | i <- [0 .. 199 :: Int] ]
+        seedConversation paths (smId meta) bigMsgs
+        _ <- buildIndex (sessionConversationPath paths (smId meta))
+                        (sessionConversationIndexPath paths (smId meta))
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object [ "session_id" .= sessionIdText (smId meta)
+                  , "limit" .= (200 :: Int) ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- getRenderBudgetBytes is 98304: the whole rendered page fits.
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
+            T.isInfixOf "output truncated at" t `shouldBe` True
+            T.isInfixOf "narrow the window (limit / offset)" t `shouldBe` True
+            T.isInfixOf "[content truncated]" t `shouldBe` False
+            T.isInfixOf "messages 1-200 of 200" t `shouldBe` True
+            T.isInfixOf "budget payload 0 " t `shouldBe` True
+            T.isInfixOf "budget payload 199 " t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":true" recorded `shouldBe` True
+        T.isInfixOf "payload" recorded `shouldBe` False
+
+    it "bounds the rendered page to the byte budget without an index (fallback)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let bigMsgs =
+              [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
+                  <> T.replicate 1200 "x")
+              | i <- [0 .. 199 :: Int] ]
+        seedConversation paths (smId meta) bigMsgs
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object [ "session_id" .= sessionIdText (smId meta)
+                  , "limit" .= (200 :: Int) ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
+            T.isInfixOf "output truncated at" t `shouldBe` True
+            T.isInfixOf "budget payload 0 " t `shouldBe` True
+            T.isInfixOf "budget payload 199 " t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":true" recorded `shouldBe` True
+
+    it "truncates a single huge message to the per-message cap with a visible marker" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let bigText = "permsg-head-marker "
+                      <> T.replicate 10000 "0123456789"
+                      <> " permsg-tail-marker-xyzzy"
+        seedConversation paths (smId meta) [ userMsg bigText ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object [ "session_id" .= sessionIdText (smId meta)
+                  , "limit" .= (1 :: Int) ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "[content truncated]" t `shouldBe` True
+            T.isInfixOf "permsg-head-marker" t `shouldBe` True
+            T.isInfixOf "permsg-tail-marker-xyzzy" t `shouldBe` False
+            T.isInfixOf "output truncated at" t `shouldBe` False
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (< 20000)
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":true" recorded `shouldBe` True
+        T.isInfixOf "permsg" recorded `shouldBe` False
+
+    it "reads a child session window identically via conversation.idx" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-007"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ userMsg "child alpha"
+          , assistantMsg "child beta"
+          , userMsg "child gamma"
+          ]
+        let op = sessionGetOp paths callerSessionId
+            args = object
+              [ "session_id" .= sessionIdText childSid
+              , "limit" .= (2 :: Int)
+              ]
+        beforeIdx <- runTestApp (opRun op localBackend args)
+        let childDir = agentSessionDir paths (smId parentMeta) childSid
+        _ <- buildIndex (childDir </> "conversation.jsonl") (childDir </> "conversation.idx")
+        afterIdx <- runTestApp (opRun op localBackend args)
+        orIsError afterIdx `shouldBe` False
+        afterIdx `shouldBe` beforeIdx
+        case orParts afterIdx of
+          [TrpText t] -> do
+            T.isInfixOf "child beta" t `shouldBe` True
+            T.isInfixOf "child gamma" t `shouldBe` True
+            T.isInfixOf "child alpha" t `shouldBe` False
+            T.isInfixOf "child session of" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "caps an oversized session-meta header to the header byte budget" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths
+          (meta { smDescription = Just (T.replicate 65536 "d") })
+        seedConversation paths (smId meta)
+          [ userMsg "tiny body alpha", assistantMsg "tiny body beta" ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText (smId meta)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- getRenderHeaderBytes is 2048: the header line (which embeds
+            -- the session description verbatim) is cut at the cap even
+            -- though the description alone is 64 KiB.
+            let headerLine = T.takeWhile (/= '\n') t
+            BS.length (TE.encodeUtf8 headerLine) `shouldSatisfy` (<= 2048)
+            T.isInfixOf "[content truncated]" t `shouldBe` True
+            -- The transcript itself is tiny: the body survives whole and
+            -- the page budget (not the header cap) did no further cutting.
+            T.isInfixOf "tiny body alpha" t `shouldBe` True
+            T.isInfixOf "tiny body beta" t `shouldBe` True
+            T.isInfixOf "output truncated at" t `shouldBe` False
+            -- getRenderBudgetBytes is 98304: the whole rendered page fits.
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":true" recorded `shouldBe` True
+        T.isInfixOf "dddd" recorded `shouldBe` False
+
+    it "leaves a short session description header whole (no marker, not truncated)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths
+          (meta { smDescription = Just "short description" })
+        seedConversation paths (smId meta) [ userMsg "tiny body alpha" ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText (smId meta)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "short description" t `shouldBe` True
+            T.isInfixOf "[content truncated]" t `shouldBe` False
+            T.isInfixOf "output truncated at" t `shouldBe` False
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":false" recorded `shouldBe` True

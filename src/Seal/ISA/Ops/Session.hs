@@ -27,12 +27,14 @@ import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson qualified as A
 import Data.Aeson.Key (fromText)
-import Data.Aeson.Types (parseMaybe)
+import Data.Aeson.Types (Pair, parseMaybe)
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Time (formatTime, defaultTimeLocale)
 import Seal.Types.App (App)
 import System.Directory (doesFileExist)
@@ -53,6 +55,7 @@ import Seal.Session.Search (SessionSearchBackend (..))
 import Seal.Session.Store
   ( listChildSessions, listSessions, listArchivedSessions, newSession
   , saveSessionMeta )
+import Seal.Transcript.ConvIndex (convLineCount, readConvLines)
 import Seal.Util.StrictIO (readFileTextStrict, decodeFileStrict)
 
 -- ---------------------------------------------------------------------------
@@ -113,6 +116,121 @@ renderOrderJson OrderDesc = "back-to-front"
 -- 50-message default with a 200-message hard ceiling.
 sessionPageParams :: PageParams
 sessionPageParams = PageParams { ppFloor = 50, ppCeiling = 200, ppCoeff = 0.0 }
+
+-- ---------------------------------------------------------------------------
+-- Get render budget
+-- ---------------------------------------------------------------------------
+
+-- | Total rendered-output budget for a single @get@ page: the rendered
+-- text (header, message body, footer) never exceeds this many UTF-8
+-- bytes, so no foreign-session read can flood the caller's context.
+-- Oversized windows are cut with a truncation notice instead.
+-- 96 KiB (98304 bytes).
+getRenderBudgetBytes :: Int
+getRenderBudgetBytes = 98304
+
+-- | Per-message render cap: a single message whose rendered text exceeds
+-- this many bytes is cut at the cap and marked @[content truncated]@, so
+-- one huge tool result cannot consume the whole page budget. 8 KiB
+-- (8192 bytes).
+getRenderMessageBytes :: Int
+getRenderMessageBytes = 8192
+
+-- | Rendered-header cap: the rendered session-meta header line is capped
+-- to this many UTF-8 bytes. The header embeds the session description
+-- verbatim, and a description is unbounded agent-controlled input —
+-- without this cap a single oversized description would blow the page
+-- budget ('getRenderBudgetBytes') on its own. 2 KiB (2048 bytes).
+getRenderHeaderBytes :: Int
+getRenderHeaderBytes = 2048
+
+-- | Byte headroom for the page footer (paging info plus the truncation
+-- notice) so a fully-budgeted page still fits within 'getRenderBudgetBytes'
+-- once header and footer are appended.
+getRenderFooterReserveBytes :: Int
+getRenderFooterReserveBytes = 512
+
+-- | Marker line appended to a message whose rendered text was cut at
+-- 'getRenderMessageBytes'.
+contentTruncatedMarker :: Text
+contentTruncatedMarker = "\n[content truncated]"
+
+-- ---------------------------------------------------------------------------
+-- Windowed transcript reads
+-- ---------------------------------------------------------------------------
+
+-- | A count-selected transcript window plus the pagination metadata the
+-- page footer and recorded fields need.
+data WindowedRead = WindowedRead
+  { wrMessages :: [Message]  -- ^ the window's messages, in transcript order
+  , wrWindowCount :: !Int   -- ^ count-based window size (line count on the idx path)
+  , wrTotal :: !Int         -- ^ total messages (line count on the idx path)
+  , wrOffset :: !Int        -- ^ 0-based start index of the window
+  , wrHasMore :: !Bool      -- ^ more messages outside the window
+  }
+
+-- | Resolve the transcript directory a @get@ read should use: the
+-- session's own dir when it has a conversation file, otherwise the
+-- child (sub-agent) dir when one exists (mirrors the whole-file read's
+-- directory choice).
+sessionReadDir :: SealPaths -> SessionId -> IO FilePath
+sessionReadDir paths sid = do
+  let convPath = sessionConversationPath paths sid
+  exists <- doesFileExist convPath
+  if exists
+    then pure (sessionDir paths sid)
+    else do
+      mChild <- resolveChildSessionPath paths sid
+      pure (maybe (sessionDir paths sid) snd mChild)
+
+-- | Read the count-selected message window from a transcript directory.
+-- Window selection is count-based ('paginateBy') on both paths; when
+-- @conversation.idx@ exists only the window's byte range is read
+-- ('readConvLines'), otherwise the whole file is read and sliced. On
+-- the idx path the counts are the index's line counts — equal to the
+-- decoded-message counts for well-formed files, diverging only on
+-- malformed lines (accepted: guard behavior is identical, only the
+-- count-based totals can differ). Any index read failure (missing
+-- conversation file, corrupt index) falls back to the whole-file read.
+readTranscriptWindow :: ReadOrder -> PageParams -> Int -> Maybe Int -> FilePath -> IO WindowedRead
+readTranscriptWindow order params offset mLimit dir = do
+  let convPath = dir </> "conversation.jsonl"
+      idxPath = dir </> "conversation.idx"
+  idxExists <- doesFileExist idxPath
+  if not idxExists
+    then viaWholeFile
+    else do
+      lineTotal <- convLineCount idxPath
+      if lineTotal <= 0
+        then viaWholeFile
+        else do
+          -- Window selection is pure count math; the unit list reuses
+          -- 'paginateBy' itself so the idx path cannot drift from the
+          -- whole-file path's windowing.
+          let page = paginateBy order params offset mLimit (replicate lineTotal ())
+              start = pgOffset page
+              count = length (pgItems page)
+          eMsgs <- readConvLines convPath idxPath start (start + count)
+          case eMsgs of
+            Right msgs -> pure WindowedRead
+              { wrMessages = msgs
+              , wrWindowCount = count
+              , wrTotal = lineTotal
+              , wrOffset = start
+              , wrHasMore = pgHasMore page
+              }
+            Left _ -> viaWholeFile
+  where
+    viaWholeFile = do
+      msgs <- readMessagesFromDir dir
+      let page = paginateBy order params offset mLimit msgs
+      pure WindowedRead
+        { wrMessages = pgItems page
+        , wrWindowCount = length (pgItems page)
+        , wrTotal = pgTotal page
+        , wrOffset = pgOffset page
+        , wrHasMore = pgHasMore page
+        }
 
 -- ---------------------------------------------------------------------------
 -- Handlers (shared between SESSION_MANAGE and legacy shims)
@@ -230,26 +348,13 @@ handleGet paths session v = do
                  else liftIO (decodeFileStrict (sessionMetaPath paths sid))
       case mMeta of
         Just meta -> do
-          msgs <- liftIO (readSessionMessages paths sid)
-          let total = length msgs
-              page = paginateBy order sessionPageParams offset mLimit msgs
-              windowMsgs = pgItems page
-              header = renderSessionMeta meta
-              body = T.intercalate "\n\n"
-                (zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)
-              footer = renderPageFooter order (pgOffset page) offset (length windowMsgs) total (pgHasMore page)
-              rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
-              recorded = object
-                [ "session_id" .= sessionIdText sid
-                , "provider" .= smProvider meta
-                , "model" .= smModel meta
-                , "order" .= renderOrderJson order
-                , "offset" .= pgOffset page
-                , "limit" .= length windowMsgs
-                , "total_messages" .= total
-                , "has_more" .= pgHasMore page
-                ]
-          pure (OpResult [TrpText rendered] False recorded)
+          dir <- liftIO (sessionReadDir paths sid)
+          wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit dir)
+          pure (renderGetPage (renderSessionMeta meta) order offset
+            [ "session_id" .= sessionIdText sid
+            , "provider" .= smProvider meta
+            , "model" .= smModel meta
+            ] wr)
         Nothing -> do
           mChild <- liftIO (resolveChildSessionPath paths sid)
           case mChild of
@@ -257,25 +362,48 @@ handleGet paths session v = do
               [TrpText ("session not found: " <> sessionIdText sid)] True
               (object ["session_id" .= sessionIdText sid]))
             Just (parentSid, childDir) -> do
-              msgs <- liftIO (readMessagesFromDir childDir)
-              let total = length msgs
-                  page = paginateBy order sessionPageParams offset mLimit msgs
-                  windowMsgs = pgItems page
-                  header = "[child session of " <> sessionIdText parentSid <> "] " <> sessionIdText sid
-                  body = T.intercalate "\n\n"
-                    (zipWith (renderMessage (pgOffset page)) [0..] windowMsgs)
-                  footer = renderPageFooter order (pgOffset page) offset (length windowMsgs) total (pgHasMore page)
-                  rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
-                  recorded = object
-                    [ "session_id" .= sessionIdText sid
-                    , "child_of" .= sessionIdText parentSid
-                    , "order" .= renderOrderJson order
-                    , "offset" .= pgOffset page
-                    , "limit" .= length windowMsgs
-                    , "total_messages" .= total
-                    , "has_more" .= pgHasMore page
-                    ]
-              pure (OpResult [TrpText rendered] False recorded)
+              wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit childDir)
+              pure (renderGetPage
+                ("[child session of " <> sessionIdText parentSid <> "] " <> sessionIdText sid)
+                order offset
+                [ "session_id" .= sessionIdText sid
+                , "child_of" .= sessionIdText parentSid
+                ] wr)
+
+-- | Assemble the @get@ page from a windowed read: header line (capped at
+-- 'getRenderHeaderBytes' UTF-8 bytes), byte-budgeted message body, and
+-- footer (the count-based paging footer plus a truncation notice when the
+-- byte budget cut the body). The @userOffset@ is the caller-supplied
+-- offset, used for the footer's paging guidance. The recorded metadata
+-- stays content-free; @truncated@ is true when any output was cut — the
+-- header, a single message, or the page budget.
+renderGetPage :: Text -> ReadOrder -> Int -> [Pair] -> WindowedRead -> OpResult
+renderGetPage rawHeader order userOffset extraRecorded wr =
+  let (header, headerTruncated) = capHeader getRenderHeaderBytes rawHeader
+      bodyBudget = max minBodyBudget
+        (getRenderBudgetBytes - utf8Bytes header - getRenderFooterReserveBytes)
+      minBodyBudget = getRenderMessageBytes + utf8Bytes contentTruncatedMarker + 2
+      br = renderBudgetedWindow bodyBudget getRenderMessageBytes (wrOffset wr) (wrMessages wr)
+      pageTruncated = headerTruncated || brAnyTruncated br || brBudgetHit br
+      body = T.intercalate "\n\n" (brParts br)
+      countFooter = renderPageFooter order (wrOffset wr) userOffset
+        (wrWindowCount wr) (wrTotal wr) (wrHasMore wr)
+      footer
+        | brBudgetHit br =
+            countFooter <> "\n[output truncated at " <> T.pack (show (brRenderedBytes br))
+              <> " bytes — narrow the window (limit / offset) for the part you need]"
+        | otherwise = countFooter
+      rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
+      recorded = object
+        ( extraRecorded <>
+          [ "order" .= renderOrderJson order
+          , "offset" .= wrOffset wr
+          , "limit" .= wrWindowCount wr
+          , "total_messages" .= wrTotal wr
+          , "has_more" .= wrHasMore wr
+          , "truncated" .= pageTruncated
+          ] )
+  in OpResult [TrpText rendered] False recorded
 
 -- ---------------------------------------------------------------------------
 -- Authorize gate helpers
@@ -602,21 +730,78 @@ truncateSnippet n t
   | T.length t <= n = t
   | otherwise       = T.take n t <> "…"
 
--- | Read all messages from a session's @conversation.jsonl@. Returns @[]@
--- when the session has no conversation file. Falls back to the child
--- (sub-agent) transcript path when the top-level conversation file does not
--- exist.
-readSessionMessages :: SealPaths -> SessionId -> IO [Message]
-readSessionMessages paths sid = do
-  let convPath = sessionConversationPath paths sid
-  exists <- doesFileExist convPath
-  if exists
-    then readMessagesFromDir (sessionDir paths sid)
-    else do
-      mChild <- resolveChildSessionPath paths sid
-      case mChild of
-        Just (_, childDir) -> readMessagesFromDir childDir
-        Nothing            -> pure []
+-- | The outcome of rendering a message window under the byte budget.
+data BudgetedRender = BudgetedRender
+  { brParts :: [Text]        -- ^ rendered messages, in window order
+  , brAnyTruncated :: !Bool  -- ^ any content was cut (per message or budget)
+  , brBudgetHit :: !Bool     -- ^ the budget stopped further messages
+  , brRenderedBytes :: !Int  -- ^ UTF-8 bytes of the rendered body
+  }
+
+-- | Render window messages in order under the byte budget: each message
+-- is capped at @perMsgCap@ bytes (marked 'contentTruncatedMarker' when
+-- cut), and rendering stops before the first message that would push the
+-- accumulated body past @bodyBudget@. Callers floor the budget so at
+-- least one (capped) message always renders.
+renderBudgetedWindow :: Int -> Int -> Int -> [Message] -> BudgetedRender
+renderBudgetedWindow bodyBudget perMsgCap displayOffset = go 0 0 False []
+  where
+    go _ acc anyTrunc out [] =
+      BudgetedRender (reverse out) anyTrunc False acc
+    go relIdx acc anyTrunc out (m : rest) =
+      let rendered = renderMessage displayOffset relIdx m
+          (capped, msgTrunc) = capMessage perMsgCap rendered
+          separator = if null out then 0 else 2
+          acc' = acc + separator + utf8Bytes capped
+      in if acc' > bodyBudget
+           then BudgetedRender (reverse out) anyTrunc True acc
+           else go (relIdx + 1) acc' (anyTrunc || msgTrunc) (capped : out) rest
+
+-- | Cap a single rendered message at @perMsgCap@ UTF-8 bytes, appending
+-- the truncation marker when the text was cut.
+capMessage :: Int -> Text -> (Text, Bool)
+capMessage perMsgCap rendered
+  | utf8Bytes rendered > perMsgCap =
+      (truncateToBytes perMsgCap rendered <> contentTruncatedMarker, True)
+  | otherwise = (rendered, False)
+
+-- | Cap the rendered header at @cap@ UTF-8 bytes, marker included: an
+-- oversized header is cut to @cap@ minus the marker's bytes and
+-- 'contentTruncatedMarker' is appended, so the capped header never
+-- exceeds @cap@ even with the marker (same technique as 'capMessage').
+capHeader :: Int -> Text -> (Text, Bool)
+capHeader cap raw
+  | utf8Bytes raw > cap =
+      ( truncateToBytes (cap - utf8Bytes contentTruncatedMarker) raw
+          <> contentTruncatedMarker
+      , True )
+  | otherwise = (raw, False)
+
+-- | Truncate text to at most @cap@ UTF-8 bytes without splitting a code
+-- point (the cut walks back over continuation bytes).
+truncateToBytes :: Int -> Text -> Text
+truncateToBytes cap t =
+  let bs = TE.encodeUtf8 t
+  in if BS.length bs <= cap
+       then t
+       else TE.decodeUtf8With lenientDecode (BS.take (cutBoundary cap bs) bs)
+
+-- | The largest cut point @<= cap@ that does not split a UTF-8 code
+-- point: walks back from @cap@ while the byte at the cut is a
+-- continuation byte (@0b10xxxxxx@).
+cutBoundary :: Int -> BS.ByteString -> Int
+cutBoundary cap bs = go (min cap (BS.length bs))
+  where
+    go p
+      | p <= 0 = 0
+      | p >= BS.length bs = p
+      | isContinuation (BS.index bs p) = go (p - 1)
+      | otherwise = p
+    isContinuation w = w >= 0x80 && w <= 0xBF
+
+-- | UTF-8 encoded byte length of a text.
+utf8Bytes :: Text -> Int
+utf8Bytes = BS.length . TE.encodeUtf8
 
 -- | Read all messages from a @conversation.jsonl@ in the given directory.
 -- Returns @[]@ when the file is absent.
