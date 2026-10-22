@@ -527,7 +527,8 @@ as a tracking item in WU-5.
 |---|---|
 | `itwRecordAndAck` blocks up to 30 s if the writer daemon is stuck | the handoff path catches `TranscriptError` and logs; the turn continues |
 | the end-of-turn hook adds a turn where there was none | it fires only when the sidecar is non-empty; a test asserts no turn starts with an empty sidecar |
-| the wake chain loops | the chain re-checks the sidecar after each synthetic turn and stops when it is empty; a test asserts termination |
+| the new trigger ignores the existing kill switch | it is wired behind `sdEnableIdleWake`, the same switch that gates the completion wake-up |
+| the wake chain loops | the chain re-checks the sidecar after each synthetic turn and stops when it is empty; it is also bounded by a maximum number of consecutive wake turns, and the hook does not fire on the provider-resolution early return (which never drains the sidecar) |
 | the hook fires while the session lock is still held | the hook is called after the bracket; a test asserts the wake is not skipped as "turn in flight" |
 | the hook fires on a provider-resolution failure | the call site is after the early return as well as after the bracket; a test asserts it |
 
