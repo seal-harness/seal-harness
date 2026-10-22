@@ -28,7 +28,7 @@ module Seal.Core.TurnEngine
   , loadSessionMeta
   ) where
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, catch)
 import Control.Monad (unless, when)
 import Data.Aeson (Value)
 import Data.Aeson.Types qualified as AT
@@ -85,8 +85,9 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
   ( IndexedTranscriptHandle, withIndexedTranscript, itwSetSecretOps, itwReadEntries
-  , itwRecordAndAck, itwRecordAsync, itwReadConversation, IndexedTranscriptWrite (..)
-  , completionHarnessTag, pendingCompletionCount, readAndClearCompletions )
+  , itwRecordAndAck, itwReadConversation, IndexedTranscriptWrite (..)
+  , TranscriptError (..), completionHarnessTag, pendingCompletionCount
+  , readAndClearCompletions )
 import Seal.Session.Log (appendSessionLog)
 import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
@@ -730,9 +731,17 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
             { aeMessageSource = mSrc }
   -- Inject subagent completion messages from the sidecar file. These are
   -- user-role harness messages appended by forked child threads when
-  -- subagents complete. We write them through the daemon (via
-  -- itwRecordAsync) so itsWritten is updated correctly, then runTurn reads
-  -- the updated conversation from itwReadConversation.
+  -- subagents complete.
+  --
+  -- The write is DURABLE, and it must be: the conversation the model is
+  -- given is read straight off disk (Seal.Agent.Loop reads the file), so
+  -- an enqueued-but-not-yet-flushed injection is invisible to the model.
+  -- The parent is then told a finished sub-agent is still running, while
+  -- its verdict sits in the transcript (see
+  -- docs/plans/2026-10-22-subagent-completion-delivery-diagnosis.md).
+  -- Recording it durably also keeps the writer's conversation the same
+  -- length as the caller's, so the writer's positional diff stays aligned
+  -- and the parent's own messages are not dropped from the transcript.
   completions <- readAndClearCompletions paths sid
   unless (null completions) $ do
     prior <- itwReadConversation tHandle
@@ -760,7 +769,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           , erCorrelation = Nothing
           , erMeta = Map.empty
           }
-    itwRecordAsync tHandle (IndexedTranscriptWrite fullMsgs entry)
+    recordHandoff tHandle (IndexedTranscriptWrite fullMsgs entry)
   eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
   -- [completion-diag] A completion still sitting in the sidecar when the
@@ -787,6 +796,28 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- sequence; the per-entry live broadcast already fired via aeOnEntry).
       broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       pure Nothing
+
+-- | Record a completed sub-agent's message as a durable handoff.
+--
+-- Durable matters: the conversation the model is given is read straight
+-- off disk by 'Seal.Agent.Loop', so a handoff that is merely enqueued can
+-- be missing from the model's context even though it lands in the
+-- transcript. 'itwRecordAndAck' blocks until the write is fsync'd, which
+-- is what closes that race.
+--
+-- If the writer daemon is dead or stuck, 'itwRecordAndAck' raises
+-- 'TranscriptError'. That must not take the turn down with it: the
+-- completion is lost, but the session survives and the failure is
+-- visible.
+recordHandoff :: IndexedTranscriptHandle -> IndexedTranscriptWrite -> IO ()
+recordHandoff tHandle write =
+  itwRecordAndAck tHandle write `catch` \(e :: TranscriptError) -> do
+    globalLogIO K2.ErrorS
+      (K2.ls ("[completion-diag] FAILED to record a sub-agent completion handoff: "
+        <> T.pack (show e)))
+    appendSessionLog Nothing "ERROR"
+      ("[completion-diag] failed to record a sub-agent completion handoff: "
+        <> T.pack (show e))
 
 -- | Record a synthetic 'EKRequest' preamble entry (convLen=0, full envelope,
 -- no messages) before the first user message so the frontend's System Prompt

@@ -585,6 +585,15 @@ withIndexedTranscript dir action = do
                     msgs = itwMessages w
                 when (n > 0 && n <= length msgs) $
                   atomically (writeTVar pendingInjectedTv (take n (reverse msgs)))
+        -- Close the handle: mark the writer dead so a further durable
+        -- write raises 'TranscriptError' instead of hanging. The daemon
+        -- thread itself is stopped by the bracket's shutdown (enqueuing a
+        -- second 'ITShutdown' here would deadlock that shutdown, which
+        -- waits on the daemon's ack). The writer has no other way to be
+        -- stopped — it is a bare `forkIO` with no exposed 'ThreadId' — so
+        -- without this the "the writer died" path is unreachable from a
+        -- test. Never called in production.
+        let closeHandle = atomically (writeTVar aliveRef False)
         let enqueue w = do
               notePendingInjection w
               atomically (writeTQueue q (ITWrite w Nothing))
@@ -622,7 +631,7 @@ withIndexedTranscript dir action = do
               pure msgs
           , itwReadEntries     = readEntries entriesPath
           , itwSetSecretOps    = writeIORef secretOpsRef
-          , itwCloseTranscript = pure ()
+          , itwCloseTranscript = closeHandle
           , itwIsAlive = readTVarIO aliveRef
           , itwDiagnostics = readTVarIO diagTv
           , itwRecordedLength = readTVarIO writtenLenTv

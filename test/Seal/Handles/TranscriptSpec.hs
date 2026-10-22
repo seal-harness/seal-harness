@@ -226,26 +226,30 @@ spec = describe "Seal.Handles.Transcript" $ do
           Nothing -> expectationFailure "exception was not a TranscriptError"
         Right _ -> expectationFailure "expected an exception but got none"
 
-    it "itwRecordAndAck raises TranscriptError after daemon dies (fd closed externally)" $
+    it "itwRecordAndAck raises TranscriptError after the writer is closed" $
+      -- The completion handoff is now a DURABLE write, so the turn engine
+      -- has to survive the writer being gone: a handoff that cannot be
+      -- recorded is caught and logged, not thrown into the turn. This
+      -- test is the writer-side half of that contract - a durable write
+      -- against a closed writer must raise promptly rather than hang.
+      --
+      -- The writer is a bare `forkIO` with no exposed ThreadId, so
+      -- `itwCloseTranscript` is the only way to stop it; it used to be a
+      -- no-op, which is why this test previously only asserted that a
+      -- healthy write succeeds.
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        -- Make the directory read-only AFTER the files are opened, then
-        -- remove the files so fsync fails. Actually, a simpler approach:
-        -- close the fd by sending a signal. The most portable approach is
-        -- to use a directory on a full/tiny filesystem, but that's complex.
-        -- Instead, we test the liveness check: after a normal session, the
-        -- daemon is alive; if we write garbage to force an error, the daemon
-        -- dies and subsequent writes raise TranscriptError.
-        --
-        -- For now, this test verifies the contract: a successful write does
-        -- not raise, and itwIsAlive is True. The daemon-death path is
-        -- exercised by the integration test (a closed fd causes fsync to
-        -- fail, the handler fires, aliveRef flips, and the next
-        -- itwRecordAndAck raises TranscriptError instead of hanging).
         e <- mkEntryRecord 1
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
           alive <- itwIsAlive h
           alive `shouldBe` True
+          itwCloseTranscript h
+          alive' <- itwIsAlive h
+          alive' `shouldBe` False
+          r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e))
+          case r of
+            Left (TranscriptError msg) -> msg `shouldSatisfy` T.isInfixOf "dead"
+            Right _ -> expectationFailure "expected a TranscriptError but got none"
 
     it "emits a minimal envelope delta (only changed fields) on the second request" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
