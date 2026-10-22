@@ -381,6 +381,23 @@ handoff away and the test would pass for the wrong reason.
 **Verification:** `make test` — three named failures with the expected
 messages.
 
+**Result (2026-10-22, commit `6ae74b5`):** all three fail, and the
+failure messages name the defect rather than dumping the conversation:
+
+- R1: `expected: True but got: False` — the model's request did not
+  contain the verdict.
+- R2: `expected: [] but got: ["hello","ok"]` — the parent's own user
+  message and reply are missing from the transcript, while both verdicts
+  are present. That is the desync, named exactly.
+- R3: `expected: True but got: False` — the verdict never reached a
+  second provider request; it stayed in the sidecar.
+
+The suite reports **3158 examples, 3 failures** — exactly R1, R2 and R3,
+nothing else newly failing. All three fail on **10 consecutive runs**.
+The fixture is a production-sized conversation (300 messages x 5KB),
+which is the size at which the reader reliably loses the race (§2). R4
+passes, as specified.
+
 ### WU-2 — Record the completion handoff durably
 
 **Files:**
