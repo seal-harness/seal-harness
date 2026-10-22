@@ -291,10 +291,12 @@ It also already defines a `CapturingProvider`
 (`test/Seal/Gateway/SendSpec.hs:108-114`) — but that one captures a
 `Maybe Text`, not the request, so it cannot answer "what conversation was
 the model given?". Add a **new**, distinctly named provider to
-`SendSpec`: `RequestRecordingProvider`, holding an
+`SendSpec`: `RecordingProvider`, holding an
 `IORef [CompletionRequest]`, returning a scripted response. That is the
 whole of the new test infrastructure — no new module, so no `.cabal` /
-`test/Main.hs` edits.
+`test/Main.hs` edits. (Implemented as `RecordingProvider` — the plan
+originally called it `RequestRecordingProvider`; the shorter name does not
+collide with anything in the module.)
 
 **R1 — the parent model is given the sub-agent's verdict.** *(the
 user-visible symptom)* Seed the session with a realistic conversation
@@ -335,10 +337,10 @@ Today: the wake-up is skipped ("turn in flight") and nothing re-checks
 when the turn ends -> the verdict stays in the sidecar -> **fails**.
 
 Two harness details: the existing `BlockingProvider`
-(`test/Seal/Gateway/SendSpec.hs:96-101`) blocks on *every* call, so the
+(`test/Seal/Gateway/SendSpec.hs:153`) blocks on *every* call, so the
 post-fix wake-up turn would hang — the test needs a provider that blocks
 only the first call. And `mkSendDepsWith` leaves `sdTabsHandle` as
-`error ...` (`SendSpec.hs:216`), so the test must set it by record
+`error ...` (`SendSpec.hs:273`), so the test must set it by record
 update, as the existing tests do.
 
 **R4 — the property the fix relies on (passes today; pins the
@@ -367,7 +369,9 @@ handoff away and the test would pass for the wrong reason.
 **DoD:**
 - [ ] R1, R2, R3 exist and **fail** on the current code.
 - [ ] The failures are **deterministic**: each fails on 20 consecutive
-      runs. WU-1 records the measured miss rate for the shape it used.
+      runs. WU-1 records the measured miss rate for the shape it used
+      (the delivered work measured 10 consecutive runs; the remaining 10
+      are run as part of WU-2's re-check).
       (If R1's miss rate is below 100% on the machine it runs on, WU-1
       increases the seeded conversation size until the false-pass
       probability is negligible, and records the size it settled on.)
@@ -423,20 +427,26 @@ passes, as specified.
 - [ ] The PR #279 instrumentation test
       (`test/Seal/Handles/TranscriptSpec.hs:368`) still passes unchanged.
 - [ ] The dead-daemon path is covered by a test that can actually observe
-      it: at the transcript level, `itwRecordAndAck` on a dead daemon
-      raises `TranscriptError` promptly rather than hanging (replacing the
-      existing no-op assertion at `test/Seal/Handles/TranscriptSpec.hs:229-250`).
-      The mechanism is the one the existing test uses — close the
-      transcript's fd externally to kill the daemon
-      (`test/Seal/Handles/TranscriptSpec.hs:203-250` does this today, but
-      asserts only that a healthy write succeeds; WU-2 makes it assert
-      the failure). The turn engine catches that error and logs it;
-      because the turn creates its own transcript handle there is no
-      injection seam to drive from a test, so the turn-level consequence
-      is verified by inspection in WU-5's review, not by a test. The plan
-      does not claim a gateway-level test for it.
+      it. There is no seam for it today: `itwCloseTranscript` is a no-op
+      (`src/Seal/Handles/Transcript.hs:625`) and the daemon's `ThreadId` is
+      not exposed, so nothing can stop the writer. **WU-2 makes
+      `itwCloseTranscript` actually stop the writer daemon** (it is never
+      called in production — only defined — so this is safe) and marks
+      the handle dead. The existing test at
+      `test/Seal/Handles/TranscriptSpec.hs:229-250` — whose title already
+      claims to cover the daemon-death path but whose body only checks
+      that a healthy write succeeds — then becomes a real one: after
+      closing, `itwRecordAndAck` raises `TranscriptError` promptly
+      rather than hanging.
+- [ ] The turn engine catches that error and logs it. Because the turn
+      creates its own transcript handle there is no injection seam to
+      drive from a test, so the turn-level consequence is verified by
+      inspection in WU-5's review, not by a test. The plan does not claim
+      a gateway-level test for it.
 - [ ] The other `itwRecordAsync` callers are unchanged
-      (`src/Seal/ISA/Dispatch.hs:99,105`, `src/Seal/Agent/Loop.hs:168`).
+      (`src/Seal/ISA/Dispatch.hs:99,105` — the Trusted/Audited invocation
+      entries; `src/Seal/Agent/Loop.hs:168` — the request entry, whose
+      durable sibling is the same file's line 164).
 
 **Verification:** `make check`.
 
@@ -479,8 +489,13 @@ passes, as specified.
       completion (the turn runs headless).
 - [ ] The end-of-turn hook fires after the session lock is released (a
       test asserts the wake is not skipped as "turn in flight").
-- [ ] The hook fires on a turn that threw, and on a provider that failed
-      to resolve (new tests).
+- [ ] The hook fires on a turn that threw (new test) — the call site is
+      the bracket's release action, which runs on the exception path too.
+- [ ] The hook does **not** fire on the provider-resolution early
+      return (new test): that path returns before the bracket is entered
+      and never drains the sidecar, so firing it would start a chain that
+      can never end. The completions stay pending until the provider
+      resolves.
 - [ ] The hook does not fire when the turn was aborted by the user (new
       test).
 - [ ] `make check` green.
