@@ -318,9 +318,9 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
       , sessionListOp paths
-      , sessionSearchOp paths (bSessionSearch backends)
-      , sessionGetOp paths
-      , sessionManageOp paths (bSessionSearch backends)
+      , sessionSearchOp paths (bSessionSearch backends) sid
+      , sessionGetOp paths sid
+      , sessionManageOp paths (bSessionSearch backends) sid
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.hideOpcodes legacyHidden
@@ -1265,8 +1265,8 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)
-       , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td))
-       , sessionGetOp (tdPaths td)
+        , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td)) childSid
+        , sessionGetOp (tdPaths td) childSid
         , nestedAgentStartOp
         ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
