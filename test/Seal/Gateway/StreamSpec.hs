@@ -11,6 +11,9 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Text qualified as T
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Network.HTTP.Types (status404)
+import Network.Wai (Application, responseLBS)
+import Network.Wai.Handler.Warp (run)
 import Network.WebSockets (ClientApp, runClient, receiveData, ConnectionException)
 import Test.Hspec
 
@@ -41,16 +44,26 @@ withTimeout act =
 -- the client against it. Tolerates a bind failure (e.g. a transient
 -- port-take race) by skipping with 'pendingWith' instead of crashing the
 -- suite.
+--
+-- The server is the gateway app WITH the WS stream mounted (the
+-- single-port arrangement), so these tests exercise the same path
+-- production uses: an HTTP listener that also serves the WS upgrade.
 withStreamServer :: StreamGuard -> StreamBroker -> (Int -> ClientApp ()) -> IO ()
 withStreamServer guard broker clientApp =
   withFreePort $ \port -> do
-    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
+    _ <- forkIO (run port (streamAppWithFallback guard broker))
     threadDelay 200000  -- wait for the server to bind
     withTimeout (runClient "127.0.0.1" port "/" (clientApp port))
       `catch` \(e :: IOException) ->
         pendingWith ("server bind/client failed (port " <> show port <> "): " <> show e)
       `catch` \(_ :: ConnectionException) ->
         pendingWith "client connection closed unexpectedly"
+
+-- | The WS middleware mounted on an HTTP application — the production
+-- arrangement (one port serving both).
+streamAppWithFallback :: StreamGuard -> StreamBroker -> Application
+streamAppWithFallback guard broker =
+  streamMiddleware guard broker (\_req respond -> respond (responseLBS status404 [] "not found"))
 
 -- | Extract a field from a JSON object (for assertions).
 jsonField :: T.Text -> A.Value -> Maybe A.Value

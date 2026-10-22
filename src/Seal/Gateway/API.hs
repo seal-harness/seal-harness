@@ -87,6 +87,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
+import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
@@ -145,7 +146,17 @@ data ApiDeps = ApiDeps
   , adConfigRepo       :: ConfigRepo            -- ^ for the best-effort @gitCommitAll@ audit-commit of repos.toml after a mutation (W4)
   , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
-  , adWsPort           :: Int                   -- ^ the WS stream server port (returned in /api/health so the frontend can discover it at runtime)
+  , adWsHealth         :: IO StreamHealth
+    -- ^ The CURRENT liveness of the WS stream server, read fresh on every
+    -- @\/api\/health@ call. The health endpoint used to report the
+    -- CONFIGURED @ws_port@ unconditionally, so a server whose WS had
+    -- failed to bind (the port was already taken by another process)
+    -- still advertised the dead port — the web frontend then connected to
+    -- a non-WebSocket port and its transcript froze permanently. The
+    -- status is now the truth: @up@, @down@ or @failed@.
+    -- The port lives in this record too, so @\/api\/health@ reports the
+    -- port the WS server actually attempted to bind — one source of truth
+    -- for both the port and its status, so they can never disagree.
   , adSecurityConfig   :: SecurityConfig        -- ^ the security config (for mkSessionExec in handleSessionAgents — remote-mode repo-agent discovery)
   , adMkSessionExec    :: Maybe (SessionId -> IO SessionExec)
     -- ^ Test injection seam for 'handleSessionAgents': when 'Just', the
@@ -163,10 +174,19 @@ apiApp :: ApiDeps -> Application
 apiApp deps req respond =
   case (requestMethod req, pathInfo req) of
     (m', ["api", "health"]) | m' == methodGet ->
-      respond (jsonOk (object
-        [ "status" .= ("ok" :: Text)
-        , "wsPort" .= adWsPort deps
-        ]))
+      do
+        wsHealth <- adWsHealth deps
+        respond (jsonOk (object
+          [ "status" .= ("ok" :: Text)
+          -- The port comes from the WS health state, not from the
+          -- configured value: the health state is the authority on what
+          -- the WS server actually did (which port it attempted to bind).
+          -- In production the two agree; deriving it from one source
+          -- keeps @wsPort@ and @wsMessage@ from ever disagreeing.
+          , "wsPort" .= shPort wsHealth
+          , "wsStatus" .= streamHealthStatus wsHealth
+          , "wsMessage" .= streamHealthMessage wsHealth
+          ]))
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)

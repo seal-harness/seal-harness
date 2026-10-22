@@ -451,21 +451,27 @@ export function createStreamClient(url: string): StreamClient & { close(): void 
 }
 
 /**
- * Build the default WS URL from the current page. The WS port is discovered
- * at runtime from `/api/health` (the backend's `wsPort` field), falling back
- * to `VITE_WS_PORT` and then `8081`. Uses `wss:` on https pages and `ws:` on
- * http pages.
+ * Build the default WS URL from the current page.
+ *
+ * The gateway serves the WebSocket stream on the SAME port as the HTTP
+ * API, so the normal case is simply the page's own origin — no port
+ * discovery, no second listener, nothing to collide with.
+ *
+ * `/api/health` still reports `wsPort`, and it is used as a fallback: a
+ * server that still runs the WS on a separate port (or a build served from
+ * a different host than the API) is honoured. `VITE_WS_PORT` remains the
+ * last-resort fallback for dev servers with no health endpoint.
+ *
+ * Uses `wss:` on https pages and `ws:` on http pages.
  */
 async function discoverStreamUrl(): Promise<string> {
   const fallbackPort = import.meta.env.VITE_WS_PORT ?? '8081'
   if (typeof window === 'undefined') return `ws://localhost:${fallbackPort}/`
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const host = window.location.hostname
-  // Discover the WS port from the backend at runtime so the frontend never
-  // needs a build-time VITE_WS_PORT that matches the server's config. The
-  // build-time env var is only a fallback for dev servers without the
-  // health endpoint.
-  let wsPort = fallbackPort
+  // Default to the page's own port — that is where the gateway serves the
+  // WS stream.
+  let wsPort = window.location.port
   try {
     const res = await fetch('/api/health')
     if (res.ok) {
@@ -475,8 +481,9 @@ async function discoverStreamUrl(): Promise<string> {
       }
     }
   } catch {
-    // Health endpoint unreachable — fall back to the env var / default.
+    // Health endpoint unreachable — keep the page's own port.
   }
+  if (!wsPort) wsPort = fallbackPort
   return `${proto}//${host}:${wsPort}/`
 }
 
