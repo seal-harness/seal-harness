@@ -215,3 +215,92 @@ was sliced against the wrong offset and three messages were dropped from
 
 With the fix (§6, option C) the third and fourth lines do not appear.
 
+## 9. Live reproduction (2026-10-22, with the §7 instrumentation)
+
+Two sessions on a gateway running the instrumentation. Both hit it, both
+in the same way, and the measurements are direct rather than inferred.
+
+### 9.1 The race (I1) — the model saw none of the completions
+
+```
+[transcript-diag] COMPLETION NOT VISIBLE TO READER. injected=3  missingFromReader=3  readerLen=195
+[transcript-diag] COMPLETION NOT VISIBLE TO READER. injected=18 missingFromReader=18 readerLen=269
+```
+
+`missingFromReader` equals `injected` in both cases: the reader that built
+the model's context was missing **every** completion, not some of them.
+
+### 9.2 The transcript corruption (I2) — measured on the transcripts
+
+The completions were written into @conversation.jsonl@ at the positions
+where the model's own messages belonged, and the model's own messages were
+never written at all.
+
+| session | tool calls | tool results | dangling calls | orphan results |
+|---|---|---|---|---|
+| @20261022-161622-011@ (3 completions) | 169 | 167 | 2 | 0 |
+| @20261022-161101-300@ (18 completions) | 199 | 198 | 2 | 1 |
+
+The dangling calls include the @AGENT_MANAGE@ call that spawned the
+reviewers: the transcript shows the model spawning them and then — with no
+@spawned, running in background@ result — the verdicts themselves.
+
+In the 18-completion session, file indices 269–286 are the completions and
+the model's own 18 messages are absent from the file. The @DESYNC@ cascade
+shows the offset shrinking one message per model round as the caller's
+list catches up (dropped 17 → 0), after which the two conversations
+disagree permanently at the boundary (@tailMismatch=true@).
+
+### 9.3 The stranding — 19 skipped wake-ups, 6 completions never delivered
+
+```
+[idle-diag] wakeIdleSession: sid=20261022-161101-300 inFlight=true
+[idle-diag] wakeIdleSession: skipping (turn in flight) sid=20261022-161101-300
+```
+
+19 times. Six completions are still sitting in the session's
+@agent-completions.jsonl@, never delivered.
+
+### 9.4 Why the turn was in flight: the model was polling
+
+With no notifications arriving, the model worked it out and started
+polling the sidecar file itself:
+
+```
+sleep 120; wc -c ~/.seal/state/sessions/20261022-161101-300/agent-completions.jsonl
+sleep 240; wc -c ~/.seal/state/sessions/20261022-161101-300/agent-completions.jsonl
+```
+
+19 such calls. And it named the bug correctly (its own reasoning, message
+298):
+
+> "no agents running" — but the transcripts suggest they were still
+> working. The harness may have stopped them, or they completed and the
+> notifications [never arrived].
+
+Each poll held the turn for two to five minutes, which is exactly why
+more completions arrived "turn in flight". The failure feeds itself:
+broken notifications → polling → long turns → skipped wake-ups → more
+stranded completions.
+
+### 9.5 How the session died
+
+The gateway restarted at 18:04:12 (PID 93440 → 27443) while a turn was in
+flight (a @sleep 300@). The turn was lost with the process. The session
+has been dead since, with six completions pending in its sidecar.
+
+### 9.6 A gap in the §7 instrumentation
+
+The @completion(s) still pending when the turn ended@ warning **never
+fired** — the turn never ended. The check sits at turn end; it needs to
+also fire at the moment the wake-up is skipped, which is where the
+stranding actually starts.
+
+### 9.7 Incidental
+
+Five of the 18 completions were @status=CsError error: agent def not found:
+dr3-pm@ (and @dr3-architect@, @dr3-designer@, @dr3-security@,
+@dr3-cto@). The parent spawned agent defs that do not exist — and because
+those completions were invisible too, the model never learned that five of
+its eighteen sub-agents had failed to start.
+
