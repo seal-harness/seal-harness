@@ -371,8 +371,15 @@ class TranscriptRenderer {
     // The session preamble (the "System Prompt" + "Tools" rows) is
     // rendered by the first LLM request in the view — and by no other
     // entry. See `findPreambleId`.
+    //
+    // The anchor can only MOVE when the view's first entry changes (the
+    // anchor is the first LLM request, so anything before it is an opcode
+    // entry at the start of the view). It can also APPEAR while the view
+    // grows: a view that starts with opcode entries only (a session that
+    // has not sent anything yet) gets its first LLM request later. So the
+    // anchor is recomputed while there is none.
     const firstEntryId = entries[0]?.id
-    if (firstEntryId !== this.firstEntryId) {
+    if (firstEntryId !== this.firstEntryId || this.preambleId === undefined) {
       this.firstEntryId = firstEntryId
       this.preambleId = findPreambleId(entries)
     }

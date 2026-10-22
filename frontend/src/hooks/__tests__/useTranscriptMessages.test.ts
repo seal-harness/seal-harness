@@ -429,6 +429,40 @@ describe('useTranscriptMessages', () => {
     expect(result.current.some((m) => m.agentName.startsWith('You'))).toBe(true)
   })
 
+  it('anchors the preamble when the first LLM request arrives after the opcode entries', () => {
+    // A session that has not sent anything yet shows only the opcode
+    // entries (SETUP_REPO). The first LLM request arrives later, appended
+    // to the view — the preamble must anchor on it.
+    const setup: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+    ]
+    const { result, rerender } = renderHook(
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
+      { initialProps: { entries: setup } },
+    )
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(0)
+
+    const first: TranscriptEntry = makeEntry({
+      id: 'llm1',
+      direction: 'request',
+      payload: JSON.stringify({
+        model: 'm',
+        system: 'sys',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      }),
+    })
+    rerender({ entries: [...setup, first] })
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+  })
+
   it('handles empty entries', () => {
     const { result } = renderHook(() => useTranscriptMessages([], 's1'))
     expect(result.current).toEqual([])
