@@ -64,7 +64,13 @@ the model's context is built.
 A throwaway probe measured how often the reader loses the race. The rate
 depends on the size of the conversation, because the daemon's work
 (redact the whole list, write, fsync) and the reader's work (read the
-file, parse the JSON) both scale with it:
+file, parse the JSON) both scale with it. **The absolute numbers are
+machine-dependent** — a second probe on a different machine measured the
+one-message case at 10/10 rather than 3/30, and a durable handoff at
+0/5 misses in every shape. The *shape* of the result is what matters:
+the miss rate rises with the conversation size, and it is 100% at
+production size. WU-1 therefore re-measures in the shape it uses rather
+than trusting these numbers:
 
 | shape | reader missed the handoff |
 |---|---|
@@ -263,6 +269,16 @@ deterministic before anything is fixed.
 **Files (test only):**
 - `test/Seal/Gateway/SendSpec.hs` — R1, R2, R3
 - `test/Seal/Handles/TranscriptSpec.hs` — R4
+
+**The wake internals are not exported.** `wakeIdleSession`,
+`tryAcquireWake` and `releaseWake` are not in `Seal.Gateway.Send`'s
+export list (only `SessionWakeMutex` and `newSessionWakeMutex` are), so
+WU-3's tests cannot call them directly. They drive the wake through the
+public path — the completion callback and the new end-of-turn hook — and
+observe it through the number of provider calls the recording provider
+receives. WU-4's mutex test likewise observes the leak by its
+consequence (a later completion can still wake the session), not by
+inspecting the mutex.
 
 **Test infrastructure needed (test only).** `SendSpec` already defines a
 local `ScriptProvider`; it pops canned responses but *discards* the
