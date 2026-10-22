@@ -1885,18 +1885,53 @@ export function extractToolDefs(tools: unknown[]): { names: string[]; descriptio
   return { names, descriptions }
 }
 
+/** The id of the entry that renders the session preamble (the "System
+ *  Prompt" and "Tools" rows) — the first LLM request in the view.
+ *
+ *  The preamble is the session's CONFIGURATION: it belongs at the top of
+ *  the transcript, not in the middle of the conversation. The backend
+ *  ships the system prompt and the tool definitions on every request
+ *  entry where they CHANGED (the transcript's envelope-delta encoding),
+ *  so a mid-session change — e.g. the agent catalog growing, or the
+ *  project's instructions being edited — produced a second preamble group
+ *  half-way down the session. Rendering that group inline made a
+ *  "System Prompt" section pop up at the bottom of a long session the
+ *  moment the user hit enter.
+ *
+ *  Opcode-invocation entries (SETUP_REPO, /skill load, approvals) are
+ *  request-direction too, but they are not LLM requests — their payload
+ *  carries the `op`/`harness` keys, which an LLM request payload never
+ *  does. */
+export function findPreambleId(entries: TranscriptEntry[]): string | undefined {
+  for (const e of entries) {
+    if (e.direction !== 'request') continue
+    // Harness-internal entries (the synthetic continuation prompt) are
+    // skipped by the renderer — they must not anchor the preamble.
+    if (e.internal === true) continue
+    const parsed = tryParsePayload(e.payload)
+    if (parsed && !('op' in parsed) && !('harness' in parsed)) return e.id
+  }
+  return undefined
+}
+
 /** Convert transcript entries to the Message format ChatArea expects.
  *  Parses each entry's payload JSON to extract text, code blocks, tool calls,
  *  and matches tool calls to their results by tool_use_id. Groups the system
- *  prompt into a collapsed System row (first occurrence only). The verbatim
- *  on-disk transcript line (`raw`) is carried through to the "View raw JSON
- *  (message)" modal so Seal always makes EVERYTHING visible to the user. */
+ *  prompt into a collapsed System row (the session preamble — rendered by the
+ *  first LLM request in the view, see `findPreambleId`). The verbatim on-disk
+ *  transcript line (`raw`) is carried through to the "View raw JSON (message)"
+ *  modal so Seal always makes EVERYTHING visible to the user. */
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
   const toolResults = buildToolResultIndex(entries)
-  const seenSystem = new Set<string>()
-  const seenTools = new Set<string>()
+  // The session preamble (the "System Prompt" + "Tools" rows) is rendered
+  // by the first LLM request in the view — and by no other entry. The
+  // backend ships the system prompt and the tools on every request entry
+  // where they CHANGED, so a mid-session change used to render a second
+  // preamble group half-way down the session. See the sibling hook
+  // `useTranscriptMessages` for the full rationale.
+  const preambleId = findPreambleId(entries)
 
   for (const e of entries) {
     const ts = formatTimestamp(e.timestamp)
@@ -2005,48 +2040,43 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // System Prompt and Tools rows: deduplicate by content. The
+        // The session preamble (System Prompt + Tools rows) is rendered by
+        // the first LLM request in the view — and by no other entry. The
         // backend's delta encoding only includes `system` and `tools` when
-        // they CHANGE from the prior request. The frontend deduplicates by
-        // content: the first occurrence of each unique system prompt /
-        // tools array renders a row; subsequent identical values are
-        // skipped. This keeps System Prompt and Tools rows at their
-        // first-occurrence positions (typically the top of the
-        // transcript) and prevents them from shifting when new entries
-        // arrive. Changed values DO render a new row at their change
-        // position, so the user can see when the system prompt or tools
-        // changed mid-conversation.
-        const sysPrompt = parsed.system as string | undefined
-        const tools = parsed.tools
-        const hasTools = Array.isArray(tools) && tools.length > 0
-        const toolsKey = hasTools ? JSON.stringify(tools) : ''
-        const toolDefsBlock = hasTools
-          ? (() => {
-              const { names, descriptions } = extractToolDefs(tools)
-              return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
-            })()
-          : undefined
-        if (sysPrompt && !seenSystem.has(sysPrompt)) {
-          seenSystem.add(sysPrompt)
-          messages.push({
-            id: e.id + '-sys',
-            agentName: 'System Prompt',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
-            rawJson,
-          })
-        }
-        if (toolDefsBlock && !seenTools.has(toolsKey)) {
-          seenTools.add(toolsKey)
-          messages.push({
-            id: e.id + '-tools',
-            agentName: 'Tools',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
-            rawJson,
-          })
+        // they CHANGE from the prior request, so a mid-session change used
+        // to render a second preamble group half-way down the session (a
+        // "System Prompt" section popping up at the bottom of a long
+        // session the moment the user hit enter).
+        if (preambleId === e.id) {
+          const sysPrompt = parsed.system as string | undefined
+          const tools = parsed.tools
+          const hasTools = Array.isArray(tools) && tools.length > 0
+          const toolDefsBlock = hasTools
+            ? (() => {
+                const { names, descriptions } = extractToolDefs(tools)
+                return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
+              })()
+            : undefined
+          if (sysPrompt) {
+            messages.push({
+              id: e.id + '-sys',
+              agentName: 'System Prompt',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+              rawJson,
+            })
+          }
+          if (toolDefsBlock) {
+            messages.push({
+              id: e.id + '-tools',
+              agentName: 'Tools',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+              rawJson,
+            })
+          }
         }
         // Extract only the LAST message from the request — it's the new
         // one being sent. Earlier messages in the array are conversation
