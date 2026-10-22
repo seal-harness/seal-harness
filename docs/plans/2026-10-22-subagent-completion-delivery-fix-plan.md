@@ -304,15 +304,22 @@ Today: the turn engine's injection is the first write on the turn's fresh
 transcript handle, so the read that builds the model's context beats the
 writer. The request does not contain the verdict -> **fails**.
 
-**R2 — the transcript keeps both the verdict and the parent's own
-message.** After R1's turn, read `conversation.jsonl` and assert it
-contains the verdict *and* the parent's reply, in that order, with
-nothing lost.
+**R2 — the transcript keeps the verdicts *and* everything the parent
+wrote.** *(R2 seeds its own session with **two** completions in the
+sidecar — R1's single completion is not enough to lose the reply.)*
+After the turn, read `conversation.jsonl` and assert it contains the
+prior conversation, **both** verdicts, the user's message and the
+parent's reply, in that order, with nothing lost.
 
 Today: the writer is ahead of the caller's list by the number of
-injected messages, so the parent's own reply is dropped from the file
-(the verdict is appended at the position the reply would have taken) ->
-**fails**.
+injected messages, so the caller's next writes are sliced against the
+wrong offset. With one injected completion the *user's* message is
+dropped (the reply survives); with two, the reply is dropped as well
+-> **fails**.
+
+After the fix the file reads `prior ++ [verdict1, verdict2] ++
+[userMessage] ++ [reply]` — the verdicts land before the user's message
+because the handoff is injected at the start of the turn.
 
 **R3 — a verdict that arrives while the parent is mid-turn is delivered
 when the turn ends.** Run a turn whose provider blocks (so a turn is in
@@ -398,11 +405,15 @@ messages.
       it: at the transcript level, `itwRecordAndAck` on a dead daemon
       raises `TranscriptError` promptly rather than hanging (replacing the
       existing no-op assertion at `test/Seal/Handles/TranscriptSpec.hs:229-250`).
-      The turn engine catches that error and logs it; because the turn
-      creates its own transcript handle there is no injection seam to
-      drive from a test, so the turn-level consequence is verified by
-      inspection in WU-5's review, not by a test. The plan does not claim
-      a gateway-level test for it.
+      The mechanism is the one the existing test uses — close the
+      transcript's fd externally to kill the daemon
+      (`test/Seal/Handles/TranscriptSpec.hs:203-250` does this today, but
+      asserts only that a healthy write succeeds; WU-2 makes it assert
+      the failure). The turn engine catches that error and logs it;
+      because the turn creates its own transcript handle there is no
+      injection seam to drive from a test, so the turn-level consequence
+      is verified by inspection in WU-5's review, not by a test. The plan
+      does not claim a gateway-level test for it.
 - [ ] The other `itwRecordAsync` callers are unchanged
       (`src/Seal/ISA/Dispatch.hs:99,105`, `src/Seal/Agent/Loop.hs:168`).
 
@@ -419,10 +430,16 @@ messages.
 **Work:**
 - Add `tdOnTurnEnd :: Maybe (SessionId -> IO ())` to `TurnDeps`; wire it
   in the gateway, `Nothing` in the CLI.
-- `runSessionTurn` calls the hook after the turn's bracket — and also
-  after the provider-resolution early return, so a provider that fails to
-  resolve does not strand completions. The hook does not fire when the
-  turn was aborted by the user.
+- `runSessionTurn` calls the hook from the turn bracket's release
+  action, after the idle broadcast. That placement is deliberate: the
+  session lock is inside the bracket's body, so it is already released
+  when the release action runs, and the release action runs on both the
+  normal and the exception path — so a turn that threw still delivers
+  the completions, which a call placed *after* the bracket would skip.
+  The hook does **not** fire on the provider-resolution early return,
+  which returns before the bracket is entered and never drains the
+  sidecar: firing it there would start a chain that can never end. It
+  does not fire when the turn was aborted by the user either.
 - `wakeIdleSession` becomes the loop in §3 D2, so a completion that
   arrives during a wake-up turn is delivered by a follow-up wake-up turn.
 
@@ -435,6 +452,8 @@ messages.
 - [ ] The chain is bounded: a provider that cannot be resolved does not
       produce an unbounded sequence of wake turns (asserted by a turn
       counter), and the completions stay pending.
+- [ ] The "no session meta" branch of the loop releases the wake mutex
+      and starts no turn (asserted by a turn counter).
 - [ ] A wake for a session whose tab was closed still delivers the
       completion (the turn runs headless).
 - [ ] The end-of-turn hook fires after the session lock is released (a
@@ -534,7 +553,12 @@ as a tracking item in WU-5.
   the same switch, so setting it to `False` disables both the
   completion wake-up and the end-of-turn trigger (as the scripted-provider
   tests do: `test/Seal/TestHelpers/ApiTestHarness.hs:513`,
-  `test/Seal/Gateway/ApiSpec.hs:4443`). If the handoff's fsync shows up in a latency
+  `test/Seal/Gateway/ApiSpec.hs:4443`). Note this is a *construction-time*
+  flag on `SendDeps` — set `True` by the gateway
+  (`src/Seal/Command/Serve.hs:312`), `False` by the scripted-provider test
+  harnesses — not an operator-facing setting. There is no runtime switch
+  to flip if the wake-up misbehaves in production; reverting the change
+  is the lever. If the handoff's fsync shows up in a latency
   budget, the fix reverts to option C (diagnosis §6) without a flag.
 
 ## 7. Risks
@@ -545,8 +569,8 @@ as a tracking item in WU-5.
 | the end-of-turn hook adds a turn where there was none | it fires only when the sidecar is non-empty; a test asserts no turn starts with an empty sidecar |
 | the new trigger ignores the existing kill switch | it is wired behind `sdEnableIdleWake`, the same switch that gates the completion wake-up |
 | the wake chain loops | the chain re-checks the sidecar after each synthetic turn and stops when it is empty; it is also bounded by a maximum number of consecutive wake turns, and the hook does not fire on the provider-resolution early return (which never drains the sidecar) |
-| the hook fires while the session lock is still held | the hook is called after the bracket; a test asserts the wake is not skipped as "turn in flight" |
-| the hook fires on a provider-resolution failure | the call site is after the early return as well as after the bracket; a test asserts it |
+| the hook fires while the session lock is still held | the hook is called from the bracket's release action, after the lock (which is in the bracket's body) has been released; a test asserts the wake is not skipped as "turn in flight" |
+| the hook fires on a provider-resolution failure | it does not: that path returns before the bracket is entered and never drains the sidecar; a test asserts the completions stay pending instead |
 
 ## 8. Definition of done for the whole change
 
