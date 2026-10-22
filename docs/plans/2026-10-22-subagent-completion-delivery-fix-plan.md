@@ -189,11 +189,15 @@ gateway checks for pending completions then.**
 - The gateway's wiring is gated on the existing `sdEnableIdleWake` kill
   switch (`src/Seal/Gateway/Send.hs:229-232`), which already gates the
   completion wake-up hook. Setting it to `False` disables both — see §6.
-- `TurnEngine.runSessionTurn` calls it **after** the turn's bracket, so
-  the session lock is released and the idle broadcast has already fired.
-  A wake started from it is therefore not blocked by the turn that is
-  ending, and the frontend sees idle → thinking rather than thinking →
-  idle.
+- `TurnEngine.runSessionTurn` calls it **from the turn bracket's release
+  action**, after the idle broadcast. That placement is deliberate: the
+  session lock is inside the bracket's *body*, so it is already released
+  when the release action runs; and the release action runs on both the
+  normal and the exception path, so a turn that threw still delivers its
+  completions — a call placed *after* the bracket would be skipped by an
+  exception propagating out of it. A wake started from it is therefore
+  not blocked by the turn that is ending, and the frontend sees idle →
+  thinking rather than thinking → idle.
 - `Gateway/Send.hs` implements it: if `pendingCompletionCount` is
   non-zero, call `wakeIdleSession`.
 
