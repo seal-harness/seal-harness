@@ -180,6 +180,9 @@ gateway checks for pending completions then.**
   construction sites are `src/Seal/Gateway/Send.hs:254` (the gateway
   wires it) and `src/Seal/Channel/Cli.hs:216,272,303` (they pass
   `Nothing`).
+- The gateway's wiring is gated on the existing `sdEnableIdleWake` kill
+  switch (`src/Seal/Gateway/Send.hs:229-232`), which already gates the
+  completion wake-up hook. Setting it to `False` disables both — see §6.
 - `TurnEngine.runSessionTurn` calls it **after** the turn's bracket, so
   the session lock is released and the idle broadcast has already fired.
   A wake started from it is therefore not blocked by the turn that is
@@ -214,11 +217,14 @@ wakeIdleSession deps sid = loop
               -- nested wake could not start (the mutex was held), so
               -- this frame picks it up.
               pending <- pendingCompletionCount (sdPaths deps) sid
-              when (pending > 0) $ loop
+              when (pending > 0 && wakeTurns < maxWakeTurns) $ loop
 ```
 
 The chain terminates because the sidecar is empty when no sub-agent is
-outstanding.
+outstanding, and because it is **bounded**: it stops after
+`maxWakeTurns` consecutive wake turns and logs at Warning level if it
+stops with completions still pending. The bound is what makes the
+provider-failure case below safe even if the hook were to fire there.
 
 **Which turn exits fire the hook:**
 
@@ -226,8 +232,15 @@ outstanding.
 |---|---|---|
 | normal completion | yes | a completion may have arrived during the turn |
 | the turn threw | yes | same — and the failure must not strand completions |
-| the provider failed to resolve | yes | `runSessionTurn` returns *before* the bracket (`TurnEngine.hs:520-527`); the hook is called after that early return too, so the hook's call site must not be inside the bracket |
+| the provider failed to resolve | **no** | `runSessionTurn` returns *before* the bracket (`TurnEngine.hs:520-527`) and never reaches `readAndClearCompletions` (`TurnEngine.hs:736`), so the sidecar is never drained. Firing the hook here would make the chain re-enter `runSessionTurn` for a sidecar that can never be emptied — an infinite loop. The completions stay pending until the provider works again |
 | the user aborted (`/stop`) | no | an explicit "not now" — the completions stay pending until the next user message |
+
+**Closed tabs.** A wake for a session whose tab was closed runs the turn
+headless, exactly as today's completion wake-up does — `runSessionTurn`
+re-inserts a tab via `ensureTabForSession` (`TurnEngine.hs:582-583`).
+That is pre-existing behaviour of the wake path, not something this plan
+introduces; WU-3 adds a test that the turn still runs and the completion
+is still delivered, so the tab side effect cannot silently change it.
 
 ### D3 — the wake mutex must not leak
 
@@ -254,10 +267,14 @@ deterministic before anything is fixed.
 **Test infrastructure needed (test only).** `SendSpec` already defines a
 local `ScriptProvider`; it pops canned responses but *discards* the
 `CompletionRequest`, so a test cannot assert what the model was given.
-Add a local `CapturingProvider` to `SendSpec` that records every
-`CompletionRequest` it receives (an `IORef [CompletionRequest]`) and
-returns a scripted response. That is the whole of the new test
-infrastructure — no new module, so no `.cabal` / `test/Main.hs` edits.
+It also already defines a `CapturingProvider`
+(`test/Seal/Gateway/SendSpec.hs:108-114`) — but that one captures a
+`Maybe Text`, not the request, so it cannot answer "what conversation was
+the model given?". Add a **new**, distinctly named provider to
+`SendSpec`: `RequestRecordingProvider`, holding an
+`IORef [CompletionRequest]`, returning a scripted response. That is the
+whole of the new test infrastructure — no new module, so no `.cabal` /
+`test/Main.hs` edits.
 
 **R1 — the parent model is given the sub-agent's verdict.** *(the
 user-visible symptom)* Seed the session with a realistic conversation
@@ -361,8 +378,15 @@ messages.
       "No hints".
 - [ ] The PR #279 instrumentation test
       (`test/Seal/Handles/TranscriptSpec.hs:368`) still passes unchanged.
-- [ ] A new test covers the dead-daemon path: the turn's caller sees the
-      error logged, not an exception.
+- [ ] The dead-daemon path is covered by a test that can actually observe
+      it: at the transcript level, `itwRecordAndAck` on a dead daemon
+      raises `TranscriptError` promptly rather than hanging (replacing the
+      existing no-op assertion at `test/Seal/Handles/TranscriptSpec.hs:229-250`).
+      The turn engine catches that error and logs it; because the turn
+      creates its own transcript handle there is no injection seam to
+      drive from a test, so the turn-level consequence is verified by
+      inspection in WU-5's review, not by a test. The plan does not claim
+      a gateway-level test for it.
 - [ ] The other `itwRecordAsync` callers are unchanged
       (`src/Seal/ISA/Dispatch.hs:99,105`, `src/Seal/Agent/Loop.hs:168`).
 
@@ -392,6 +416,11 @@ messages.
       follow-up wake-up turn (new test).
 - [ ] The chain terminates: with an empty sidecar, no further turn
       starts (asserted by a turn counter in the test).
+- [ ] The chain is bounded: a provider that cannot be resolved does not
+      produce an unbounded sequence of wake turns (asserted by a turn
+      counter), and the completions stay pending.
+- [ ] A wake for a session whose tab was closed still delivers the
+      completion (the turn runs headless).
 - [ ] The end-of-turn hook fires after the session lock is released (a
       test asserts the wake is not skipped as "turn in flight").
 - [ ] The hook fires on a turn that threw, and on a provider that failed
@@ -483,7 +512,13 @@ as a tracking item in WU-5.
   `conversation.jsonl`. The I2 detector will keep reporting the
   divergence for them. The fix prevents new corruption; it does not
   repair old transcripts.
-- **Kill switch:** none. If the handoff's fsync shows up in a latency
+- **Kill switch:** the existing `sdEnableIdleWake`
+  (`src/Seal/Gateway/Send.hs:229-232`), which already gates the
+  completion wake-up hook. The new end-of-turn trigger is wired behind
+  the same switch, so setting it to `False` disables both the
+  completion wake-up and the end-of-turn trigger (as the scripted-provider
+  tests do: `test/Seal/TestHelpers/ApiTestHarness.hs:513`,
+  `test/Seal/Gateway/ApiSpec.hs:4443`). If the handoff's fsync shows up in a latency
   budget, the fix reverts to option C (diagnosis §6) without a flag.
 
 ## 7. Risks
