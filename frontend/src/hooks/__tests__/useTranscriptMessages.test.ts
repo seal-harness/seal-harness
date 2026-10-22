@@ -273,6 +273,162 @@ describe('useTranscriptMessages', () => {
     expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
   })
 
+  it('renders the System Prompt row once — a mid-session change adds no second row', () => {
+    // Regression: the backend ships the system prompt on every request
+    // entry where it CHANGED (the transcript's envelope-delta encoding).
+    // The frontend rendered a "System Prompt" row for every distinct
+    // value, so a mid-session change — the agent catalog growing, the
+    // project's instructions being edited — made a second preamble group
+    // pop up half-way down the session. At the bottom of a long session
+    // that is exactly where the user had just typed their message: the
+    // transcript showed a "System Prompt" section instead of the new
+    // message and the response.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'p1',
+        direction: 'request',
+        payload: JSON.stringify({
+          model: 'm',
+          system: 'sys-A',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }],
+        }),
+      }),
+      makeEntry({
+        id: 'p2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+      }),
+      // The second request carries a CHANGED system prompt.
+      makeEntry({
+        id: 'p3',
+        direction: 'request',
+        payload: JSON.stringify({
+          model: 'm',
+          system: 'sys-B',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }],
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const sysRows = result.current.filter((m) => m.agentName === 'System Prompt')
+    // One row, carrying the FIRST request's system prompt.
+    expect(sysRows).toHaveLength(1)
+    expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
+  })
+
+  it('anchors the preamble on the first LLM request, not on a preceding opcode entry', () => {
+    // A session starts with a SETUP_REPO opcode entry — request-direction,
+    // but not an LLM request. The preamble belongs to the first LLM
+    // request that follows it.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+      makeEntry({
+        id: 'llm1',
+        direction: 'request',
+        payload: JSON.stringify({
+          model: 'm',
+          system: 'sys',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+  })
+
+  it('moves the preamble rows when older entries are prepended', () => {
+    // The view grows upwards (the user scrolls to the top of the session):
+    // the preamble anchor moves to the session's first LLM request, and
+    // the entry that was the anchor before stops rendering the rows.
+    const first: TranscriptEntry[] = [
+      makeEntry({
+        id: 'llm1',
+        direction: 'request',
+        payload: JSON.stringify({
+          model: 'm',
+          system: 'sys',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+      }),
+    ]
+    const { result, rerender } = renderHook(
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
+      { initialProps: { entries: first } },
+    )
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+
+    // A newer entry arrives that does NOT carry the system prompt: the
+    // anchor stays on the first LLM request, so the row does not move.
+    const second: TranscriptEntry = makeEntry({
+      id: 'llm2',
+      direction: 'request',
+      payload: JSON.stringify({
+        model: 'm',
+        system: 'sys-CHANGED',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'again' }] }],
+      }),
+    })
+    rerender({ entries: [...first, second] })
+    const sysRows = result.current.filter((m) => m.agentName === 'System Prompt')
+    expect(sysRows).toHaveLength(1)
+    expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys')
+  })
+
+  it('does not render a System Prompt row when a live entry carries a changed prompt', () => {
+    // The reported symptom: the user is at the bottom of a long session
+    // (the view holds the last N entries — no session start in sight) and
+    // hits enter. The backend ships the new request entry with the
+    // CHANGED system prompt, and the transcript used to render a
+    // "System Prompt" section right where the user's message and the
+    // response should have been.
+    const view: TranscriptEntry[] = [
+      makeEntry({
+        id: 'w1',
+        direction: 'request',
+        payload: JSON.stringify({
+          model: 'm',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'older' }] }],
+        }),
+      }),
+      makeEntry({
+        id: 'w2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+      }),
+    ]
+    const { result, rerender } = renderHook(
+      ({ entries }) => useTranscriptMessages(entries, 's1'),
+      { initialProps: { entries: view } },
+    )
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(0)
+
+    // The new turn's request entry carries the changed system prompt.
+    const live: TranscriptEntry = makeEntry({
+      id: 'w3',
+      direction: 'request',
+      payload: JSON.stringify({
+        model: 'm',
+        system: 'sys-CHANGED',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'the new message' }] }],
+      }),
+    })
+    rerender({ entries: [...view, live] })
+    // No "System Prompt" section pops up at the bottom of the session,
+    // and the user's message still renders.
+    expect(result.current.filter((m) => m.agentName === 'System Prompt')).toHaveLength(0)
+    expect(result.current.some((m) => m.agentName.startsWith('You'))).toBe(true)
+  })
+
   it('handles empty entries', () => {
     const { result } = renderHook(() => useTranscriptMessages([], 's1'))
     expect(result.current).toEqual([])
