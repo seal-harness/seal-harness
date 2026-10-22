@@ -46,6 +46,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -287,10 +288,24 @@ mkDepsFor paths = do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
+
+-- | The same deps, but with the WS health state overridden. Used to
+-- assert that @\/api\/health@ reports the ACTUAL WS liveness rather than
+-- the configured port.
+mkDepsWithHealth :: SealPaths -> StreamHealth -> IO ApiDeps
+mkDepsWithHealth paths health = do
+  deps <- mkDepsFor paths
+  pure deps { adWsHealth = pure health }
+
+-- | Read a field from a decoded JSON object.
+healthField :: T.Text -> Maybe A.Value -> Maybe A.Value
+healthField key mv = case mv of
+  Just (A.Object o) -> KeyMap.lookup (Key.fromText key) o
+  _ -> Nothing
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
 -- registry and whose @rrhMutate@ always succeeds (no disk I/O). Used by
@@ -329,7 +344,8 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault            = vr
     , adPaths            = fakePaths
-    , adWsPort           = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
@@ -386,11 +402,33 @@ spec = describe "Seal.Gateway.API" $ do
 
   let mkPaths = fakePaths { spState = sharedStateDir }
       mkApp = apiApp <$> mkDepsFor mkPaths
+      mkAppWithHealth health = apiApp <$> mkDepsWithHealth mkPaths health
 
   it "GET /api/health returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "health"])
     status `shouldBe` 200
+
+  it "GET /api/health reports the WS status as up when the WS is healthy" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "health"])
+    status `shouldBe` 200
+    healthField "wsStatus" (A.decode body) `shouldBe` Just (A.String "up")
+
+  it "GET /api/health reports the WS status as failed when the WS could not bind" $ do
+    -- The regression: the health endpoint used to report the CONFIGURED
+    -- ws_port unconditionally, so a WS that failed to bind (port already
+    -- in use) still advertised the dead port and the frontend connected
+    -- to a non-WebSocket port.
+    app <- mkAppWithHealth (StreamHealth "failed" 9092)
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "health"])
+    status `shouldBe` 200
+    let decoded = A.decode body
+    healthField "wsStatus" decoded `shouldBe` Just (A.String "failed")
+    healthField "wsPort" decoded `shouldBe` Just (A.Number 9092)
+    case healthField "wsMessage" decoded of
+      Just (A.String msg) -> msg `shouldSatisfy` T.isInfixOf "9092"
+      other -> expectationFailure ("expected a wsMessage string, got " <> show other)
 
   it "GET /api/tabs returns 200" $ do
     app <- mkApp
@@ -1879,7 +1917,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -1957,7 +1995,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2025,7 +2063,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2094,7 +2132,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2188,7 +2226,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2247,7 +2285,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2305,7 +2343,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2344,7 +2382,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2435,7 +2473,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2492,7 +2530,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2548,7 +2586,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2598,7 +2636,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2657,7 +2695,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2919,7 +2957,8 @@ spec = describe "Seal.Gateway.API" $ do
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
-                , adWsPort           = 8081
+                
+                , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
@@ -3108,7 +3147,8 @@ spec = describe "Seal.Gateway.API" $ do
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
-                , adWsPort           = 8081
+                
+                , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
@@ -3181,7 +3221,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3226,7 +3266,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = vr
             , adPaths            = fakePaths
-            , adWsPort           = 8081
+            
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
@@ -3410,7 +3451,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = vr
             , adPaths            = paths
-            , adWsPort           = 8081
+            
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
@@ -3739,7 +3781,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -4192,7 +4234,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -4325,7 +4367,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
+            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
@@ -4416,7 +4459,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4524,7 +4567,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4673,7 +4716,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = fakeRepoRegistryHandle
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = fakeLockedVaultRuntime
-            , adPaths            = paths, adWsPort = 8081, adAbortReg = testAbortReg
+            , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -4799,7 +4842,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4927,7 +4970,7 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

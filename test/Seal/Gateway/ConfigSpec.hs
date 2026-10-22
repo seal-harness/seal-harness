@@ -12,9 +12,11 @@ import Seal.Gateway.Config
 spec :: Spec
 spec = describe "Seal.Gateway.Config" $ do
   describe "defaultGatewayConfig" $ do
-    it "has port 8080, ws_port 8081, host 127.0.0.1" $ do
+    it "has port 8080, host 127.0.0.1" $ do
       gcPort defaultGatewayConfig `shouldBe` 8080
-      gcWsPort defaultGatewayConfig `shouldBe` 8081
+      -- The WS stream shares the HTTP port (single-port gateway), so the
+      -- deprecated ws_port defaults to the same value.
+      gcWsPort defaultGatewayConfig `shouldBe` 8080
       gcHost defaultGatewayConfig `shouldBe` "127.0.0.1"
       gcStaticDir defaultGatewayConfig `shouldBe` Nothing
       gcAllowedOrigins defaultGatewayConfig `shouldBe` ["http://localhost:8080"]
@@ -24,7 +26,7 @@ spec = describe "Seal.Gateway.Config" $ do
       let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [] }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
-      gcWsPort full `shouldBe` 8081   -- default
+      gcWsPort full `shouldBe` 8080   -- default (same as the HTTP port)
       gcHost full `shouldBe` "0.0.0.0"
       gcStaticDir full `shouldBe` Nothing
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
@@ -76,7 +78,7 @@ spec = describe "Seal.Gateway.Config" $ do
             rcGateway loaded `shouldBe` Just partial
             -- The merge fills in ws_port + allowed_origins from defaults.
             let full = maybe defaultGatewayConfig withGatewayDefaults (rcGateway loaded)
-            gcWsPort full `shouldBe` 8081
+            gcWsPort full `shouldBe` 8080   -- default: the WS shares the HTTP port
             gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]
 
     it "absent section decodes as Nothing" $

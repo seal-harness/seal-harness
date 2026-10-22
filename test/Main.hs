@@ -25,6 +25,7 @@ import qualified Seal.Gateway.SendSpec
 import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
+import qualified Seal.Gateway.StreamHealthSpec
 import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
@@ -220,6 +221,7 @@ specs = do
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
+  Seal.Gateway.StreamHealthSpec.spec
   Seal.Gateway.TranscriptSpec.spec
   Seal.Gateway.OpenApiSpec.spec
   Seal.Util.StrictIOSpec.spec

@@ -9,6 +9,7 @@
 - [~] Memory distillation + codegraph — [plan](docs/superpowers/plans/2026-08-03-memory-distillation-codegraph-skills-hierarchy.md) (branch `feat/memory-distillation-codegraph`)
 - [ ] Remote enforcement hardening — [plan](docs/superpowers/plans/2026-07-22-remote-enforcement-hardening-plan.md)
 - [ ] Session partition invariants — [plan](docs/superpowers/plans/2026-07-25-session-partition-invariants.md)
+- [ ] Surface WebSocket connection issues in the web UI — [plan](docs/plans/websocket-connection-visibility-followups.md)
 
 ## Known Issues
 
@@ -64,4 +65,4 @@
 - [x] Haskell coder + reviewer skills wired (#84)
 - [x] Human-authorship rule added to CONTRIBUTING.md (#85)
 
-<!-- Last updated: 2026-08-17 by Seal session agent -->
+<!-- Last updated: 2026-10-21 by Seal session agent -->

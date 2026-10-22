@@ -337,6 +337,7 @@ library
       , wai
       , warp
       , websockets
+      , wai-websockets
       , case-insensitive
       , trasa
       , trasa-server
@@ -382,6 +383,7 @@ test-suite tests
        , http-client
        , http-client-tls
        , katip
+      , network
        , optparse-applicative
        , stm
        , temporary
@@ -427,6 +429,7 @@ test-suite tests
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
+        Seal.Gateway.StreamHealthSpec
         Seal.Gateway.TranscriptSpec
         Seal.Gateway.OpenApiSpec
         Seal.Harness.IdSpec

@@ -49,6 +49,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
@@ -269,7 +270,8 @@ mkVaultDeps vr tmp = do
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
         , adVault            = vr
         , adPaths            = paths
-        , adWsPort           = 8081
+        
+        , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg         = testAbortReg
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing

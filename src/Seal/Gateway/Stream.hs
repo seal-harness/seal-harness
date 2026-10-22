@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The WebSocket stream endpoint. Runs on a separate port from the REST +
--- static WARP server (the @wai-app-websockets@ bridge isn't available; a
--- separate port is the clean 7a path). Every connection is gated by the
+-- | The WebSocket stream endpoint. Mounted INSIDE the REST + static WARP
+-- server, so the stream shares the gateway's port. Every connection is
+-- gated by the
 -- Origin allowlist + the broker's global cap. The wire protocol: on
 -- connect, a one-shot @hello@ (carrying @protocolVersion@ +
 -- @serverStartedAt@ so the client can detect server restarts); then a
@@ -14,8 +14,11 @@
 -- from @replaying@ back to @live@. This closes the gap: entries broadcast
 -- while the WS was disconnected are no longer permanently lost.
 module Seal.Gateway.Stream
-  ( runStreamServer
+  ( streamMiddleware
   , StreamGuard (..)
+  , StreamHealth (..)
+  , streamHealthStatus
+  , streamHealthMessage
   , FocusOp (..)
   , handleRequestEntries
   , RequestEntriesOp (..)
@@ -28,7 +31,7 @@ module Seal.Gateway.Stream
   ) where
 
 import Control.Exception (SomeException, catch)
-import Control.Monad (forever, forM_)
+import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
@@ -39,9 +42,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
+import Network.Wai
+  ( Application )
+import Network.Wai.Handler.WebSockets (websocketsOr)
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
-  , withPingThread, sendClose, Connection )
+  , withPingThread, sendClose, Connection, defaultConnectionOptions )
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
@@ -58,6 +64,39 @@ import Seal.Tabs (TabsHandle)
 
 import Seal.Gateway.Types.Stream (FocusOp (..), RequestEntriesOp (..), ClientMessage (..))
 
+-- | The liveness of the WebSocket stream server, as reported by
+-- @\/api\/health@. The health endpoint used to report the CONFIGURED
+-- @ws_port@ unconditionally, so a server whose WS had failed to bind
+-- (port already in use) still advertised the dead port and the frontend
+-- connected to a non-WebSocket port and froze. The status is now derived
+-- from what actually happened at bind time.
+data StreamHealth = StreamHealth
+  { shStatus :: Text
+    -- ^ @\"starting\"@ (bind not yet attempted), @\"up\"@ (bound and
+    -- accepting), @\"failed\"@ (the bind failed).
+  , shPort  :: Int
+    -- ^ The port the server was asked to bind.
+  } deriving stock (Eq, Show)
+
+-- | The status string of a 'StreamHealth', as surfaced in @\/api\/health@.
+streamHealthStatus :: StreamHealth -> Text
+streamHealthStatus = shStatus
+
+-- | A human-readable, actionable description of a 'StreamHealth'. For a
+-- failed bind this names the port so the operator can see WHICH port
+-- collided — the whole point of reporting the failure.
+streamHealthMessage :: StreamHealth -> Text
+streamHealthMessage h =
+  case shStatus h of
+    "up"      -> "WebSocket stream server listening on port " <> tshow (shPort h)
+    "failed"  -> "WebSocket stream server FAILED to bind port " <> tshow (shPort h)
+                  <> " (port already in use?) — live transcript updates are unavailable"
+    "down"    -> "WebSocket stream server is not running"
+    _         -> "WebSocket stream server is starting on port " <> tshow (shPort h)
+  where
+    tshow :: Int -> Text
+    tshow = T.pack . show
+
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
 -- initial @lists@ snapshot on connect (the frontend's @wsListsReceived@
@@ -69,11 +108,25 @@ data StreamGuard = StreamGuard
   , sgPaths :: SealPaths
   }
 
--- | Run the WebSocket stream server on the given port. Blocks (run in a
--- forked thread from @seal serve@).
-runStreamServer :: Text -> Int -> StreamGuard -> StreamBroker -> IO ()
-runStreamServer host port guard broker =
-  WS.runServer (T.unpack host) port (streamApp guard broker)
+-- | The WebSocket stream endpoint, as a WAI middleware.
+--
+-- The WS server is mounted INSIDE the HTTP server, so the stream shares
+-- the gateway's port. This removes the second listener entirely: the old
+-- two-port split existed only because @wai-app-websockets@ (now
+-- @wai-websockets@) was missing from the nix snapshot when the split was
+-- chosen in 2026-07. With the bridge available, one port means one bind,
+-- one thing to go wrong -- and no chance of the WS silently dying while
+-- HTTP kept serving.
+--
+-- Non-WebSocket requests fall through to the supplied backup application,
+-- so this can wrap the whole gateway app.
+streamMiddleware
+  :: StreamGuard
+  -> StreamBroker
+  -> Application
+  -> Application
+streamMiddleware guard broker =
+  websocketsOr defaultConnectionOptions (streamApp guard broker)
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.

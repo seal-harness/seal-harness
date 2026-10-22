@@ -13,10 +13,12 @@ import Data.IORef (newIORef)
 import System.IO.Unsafe (unsafePerformIO)
 
 import Data.Time (UTCTime(..), fromGregorian)
-import Network.HTTP.Types (methodGet, statusCode)
+import Network.HTTP.Types (methodGet, status404, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus )
+  ( Application, Request, defaultRequest, pathInfo, requestMethod
+  , responseLBS, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
+import Network.Wai.Handler.Warp (run)
 import Network.WebSockets (ClientApp, runClient, receiveData)
 import Test.Hspec
 
@@ -28,7 +30,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Logging.Logger (SealLogger, testSealLogger)
-import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddleware)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -77,6 +79,10 @@ fakeRepoRegistryHandle = RepoRegistryHandle
   , rrhMutate = \_ -> pure (Right ())
   }
 
+-- | A trivial non-WebSocket handler for the WS middleware to fall through to.
+fallbackApp :: Application
+fallbackApp _req respond = respond (responseLBS status404 [] "not found")
+
 spec :: Spec
 spec = describe "Seal.Phase7aSpec" $ do
   it "the assembled gateway serves /api/health (200)" $ do
@@ -106,7 +112,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
@@ -120,7 +127,8 @@ spec = describe "Seal.Phase7aSpec" $ do
     tabsH <- newTabsHandle
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
         port = 18095
-    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
+    -- The WS stream is mounted in the HTTP app (single-port gateway).
+    _ <- forkIO (run port (streamMiddleware guard broker fallbackApp))
     threadDelay 200000
     let client :: ClientApp ()
         client conn = do
@@ -165,7 +173,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
