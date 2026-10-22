@@ -7,12 +7,13 @@ import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (for_, void, when)
+import Control.Monad (void, when)
 import Data.Aeson qualified as A
 import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
 import Data.Either (isLeft)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, mapMaybe)
