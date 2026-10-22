@@ -480,6 +480,48 @@ spec = describe "Seal.Handles.Transcript" $ do
           recorded <- itwRecordedLength h
           recorded `shouldBe` 3
 
+    it "does not count a desync for a write that carries no conversation messages" $
+      -- The ACK-before-execute entries and the session preamble hand the
+      -- writer an EMPTY message list: they append a line to entries.jsonl
+      -- and nothing to conversation.jsonl. Such a write cannot desync the
+      -- conversation, however long the writer's conversation already is.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        withIndexedTranscript dir $ \h -> do
+          let conv1 = [Message User [CbText "q1"]]
+              conv2 = conv1 <> [Message Assistant [CbText "a1"]]
+          e1 <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          e2 <- mkEntryRecordAtAt EKResponse 2
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+          -- An entries-only write: no messages, convLen 0.
+          e3 <- mkEntryRecordAtAt EKRequest 0
+          itwRecordAndAck h (IndexedTranscriptWrite [] e3)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldBe` 0
+          tdDesyncDroppedMessages diag `shouldBe` 0
+
+    it "does not count a desync for a write of a different conversation" $
+      -- The /model and /stop commands append a notice to a session whose
+      -- conversation they never read: they hand the writer a one-message
+      -- list that is not the session's conversation. That is not a desync
+      -- (it cannot corrupt anything), and flagging it would bury the real
+      -- signal under noise on every /model and /stop.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        withIndexedTranscript dir $ \h -> do
+          let conv1 = [Message User [CbText "q1"]]
+              conv2 = conv1 <> [Message Assistant [CbText "a1"]]
+              notice = [Message Assistant [CbText "Model set to x"]]
+          e1 <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          e2 <- mkEntryRecordAtAt EKResponse 2
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+          -- A one-message write that is not the session's conversation.
+          e3 <- mkEntryRecordAtAt EKResponse 1
+          itwRecordAndAck h (IndexedTranscriptWrite notice e3)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldBe` 0
+          tdDesyncDroppedMessages diag `shouldBe` 0
+
 -- | An entry record with a fixed conversation length and no envelope.
 mkEntryRecordAtAt :: EntryKind -> Int -> IO EntryRecord
 mkEntryRecordAtAt kind convLen = do

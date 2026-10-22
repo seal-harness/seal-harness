@@ -419,12 +419,32 @@ withIndexedTranscript dir action = do
       checkAlignment st redactedMsgs entry = do
         let writtenLen = length (itsWritten st)
             isHarness = erKind entry == EKHarness
+            -- A write that carries no conversation messages (the
+            -- ACK-before-execute entries, the session preamble) appends
+            -- nothing to @conversation.jsonl@ and cannot desync it.
+            carriesMessages = not (null redactedMsgs)
+            -- Two conversations are "the same conversation" when they
+            -- start with the same message. A caller that writes a
+            -- DIFFERENT conversation (the @\/model@ and @\/stop@
+            -- notices, which append one message to a session whose
+            -- conversation they did not read) is not desyncing anything
+            -- — its write is a no-op against the writer's state, which is
+            -- a separate (pre-existing) issue.
+            sameConversation =
+              carriesMessages
+              && not (null (itsWritten st))
+              && elementAt 0 redactedMsgs == elementAt 0 (itsWritten st)
             -- The caller's conversation length: its own claim, capped by
             -- the number of messages it actually handed over.
             callerLen = min (erConvLen entry) (length redactedMsgs)
-            tooShort = not isHarness && callerLen < writtenLen
+            tooShort =
+              not isHarness
+              && carriesMessages
+              && sameConversation
+              && callerLen < writtenLen
             tailMismatch =
               not isHarness
+              && carriesMessages
               && writtenLen > 0
               && case (lastOf (itsWritten st), elementAt (writtenLen - 1) redactedMsgs) of
                    (Just a, Just b) -> a /= b
