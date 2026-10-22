@@ -1905,6 +1905,9 @@ export function extractToolDefs(tools: unknown[]): { names: string[]; descriptio
 export function findPreambleId(entries: TranscriptEntry[]): string | undefined {
   for (const e of entries) {
     if (e.direction !== 'request') continue
+    // Harness-internal entries (the synthetic continuation prompt) are
+    // skipped by the renderer — they must not anchor the preamble.
+    if (e.internal === true) continue
     const parsed = tryParsePayload(e.payload)
     if (parsed && !('op' in parsed) && !('harness' in parsed)) return e.id
   }
