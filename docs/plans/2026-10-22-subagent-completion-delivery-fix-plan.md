@@ -135,6 +135,14 @@ caller's behaviour — and the PR #279 test that pins it — untouched.
   caller's next write is a prefix-extension and the positional diff never
   slices the wrong range. The model's own messages are no longer dropped.
 
+*Durability semantics (verified, not just argued).* A probe of the exact
+production sequence — a prior conversation, a durable handoff, the
+model-context read, then the model's reply written the way
+`Seal.Agent.Loop` writes it — gives: the model's context **contains** the
+handoff, and the file ends up as `prior + handoff + reply`, in order,
+with nothing lost. Both the visibility fault and the transcript
+corruption are repaired by the same one-line change.
+
 *Rejected alternative (from the diagnosis doc §6, option C):* pass the
 completions into `runTurn` and prepend them to the in-memory
 conversation, so the loop writes them as part of its normal request
