@@ -1,9 +1,17 @@
 # Sub-agent completion delivery — implementation plan
 
-<!-- status: draft — awaiting plan-review gate -->
+<!-- status: draft — plan-review gate iteration 2 -->
+<!-- gate iteration 1: Completeness FAIL, Scope&Alignment FAIL, Feasibility FAIL.
+     All three blocking issues addressed: D1 is now the call-site change
+     (iteration-1 D1's writer-side mode is withdrawn); the §2 measurement is
+     corrected against a re-run probe; the process-death and deferred-delivery
+     cases are scoped out with tracking items; the wake chain, the abort path
+     and the provider-resolution early return are specified. -->
 <!-- date: 2026-10-22 -->
 <!-- diagnosis: docs/plans/2026-10-22-subagent-completion-delivery-diagnosis.md -->
 <!-- branch: fix/subagent-completion-delivery-diagnostics (PR #279, draft) -->
+<!-- gate: iteration 1 — Completeness FAIL, Scope & Alignment FAIL; both blocking
+     issues are addressed in §3 D1 (the call-site change) and §4 WU-1/WU-3 -->
 
 ## 1. Problem
 
@@ -44,66 +52,113 @@ sliced against the wrong offset, so the model's own messages are dropped
 from `conversation.jsonl` and the file permanently disagrees with the
 model's context.
 
-## 2. What we measured (this is why WU-1's test is deterministic)
+## 2. What we measured (this is why WU-1's tests are deterministic)
 
-A throwaway probe (200+ runs) measured how often the reader loses the
-race, as a function of the write's position in the writer's queue:
+The writer daemon is forked when the transcript handle is opened, and the
+handle is opened **per turn** (`withIndexedTranscript` in
+`runSessionTurn`, `src/Seal/Core/TurnEngine.hs:578`). The completion
+injection is therefore *always* the first write on a fresh handle — the
+daemon has only just been forked and has not reached its queue read when
+the model's context is built.
 
-| shape | reader missed the injection |
+A throwaway probe measured how often the reader loses the race. The rate
+depends on the size of the conversation, because the daemon's work
+(redact the whole list, write, fsync) and the reader's work (read the
+file, parse the JSON) both scale with it:
+
+| shape | reader missed the handoff |
 |---|---|
-| injection is the **first** write on a fresh handle | **50 / 50 (100%)** |
-| injection follows an earlier write (warm daemon) | 0 / 50 (0%) |
+| cold daemon, prior = 1 small message | 3 / 30 (10%) |
+| cold daemon, prior = 50 messages x 5KB (250KB) | 25 / 30 (83%) |
+| cold daemon, prior = 300 messages x 5KB (1.5MB) | **30 / 30 (100%)** |
+| busy daemon, a bulk write queued ahead of the handoff | **50 / 50 (100%)** |
 
-The transcript handle is opened **per turn** (`withIndexedTranscript` in
-`runSessionTurn`), so in production the completion injection is *always*
-the first write on a fresh handle — the daemon has only just been forked
-and has not reached its queue read when the model's context is built.
+The live evidence agrees with the top of the table's tail: the incident
+sessions ran 269- and 505-message conversations, and **21 of 21**
+completions were missed (`missingFromReader == injected`).
 
-⇒ The bug is not a rare interleaving. It is the normal path, and it is
-reproducible in a unit test with no timing luck involved.
+Two consequences for WU-1:
+
+1. **A production-sized conversation makes the reproduction
+   deterministic.** The gateway-level test therefore seeds a realistic
+   conversation (>= 1.5MB, i.e. the size a real session reaches), which
+   is where the miss rate reaches 100%.
+2. **A busy writer also makes it deterministic, and cheaply.** A bulk
+   write queued ahead of the handoff keeps the daemon working while the
+   reader runs (the last row). The handoff must be *positioned* so the
+   writer will write it once it gets there — the list handed over is the
+   writer's state followed by the handoff — otherwise the writer's
+   positional diff slices the handoff away and the test would pass for
+   the wrong reason.
+
+=> The bug is not a rare interleaving. It is the normal path for any
+session with a real conversation, and it is reproducible in a test with
+no timing luck involved.
 
 ## 3. Design decisions
 
 ### D1 — the handoff must be durable before the model's context is built
 
-The writer exposes one durable primitive (`itwRecordAndAck`) and one
-fire-and-forget primitive (`itwRecordAsync`). The completion injection
-uses the fire-and-forget one, and the read that builds the model's
-context is a direct file read that does not go through the writer's queue.
+The writer exposes two primitives: `itwRecordAndAck` (blocks until the
+write is fsync'd) and `itwRecordAsync` (fire-and-forget). The completion
+injection uses the fire-and-forget one, and the read that builds the
+model's context is a direct file read that does not go through the
+writer's queue.
 
-**Decision: make the completion handoff durable at the point it is
-requested.** The `EntryRecord` already carries `erHarness = Just
-"subagent-completion"`, so the writer can recognise a handoff without any
-new plumbing. `itwRecordAsync` waits for the handoff to be fsync'd before
-returning; every other write stays fire-and-forget.
+**Decision: record the handoff durably, at the call site.**
+`TurnEngine.runTurnBody` records the completion injection with
+`itwRecordAndAck` instead of `itwRecordAsync`.
 
-*Why here rather than at the call site in `TurnEngine`:* the regression
-test in WU-1 must exercise the *same* call the production path makes, or
-it does not stay a regression test. Making the behaviour a property of
-the handoff (rather than of one call site) keeps the production path and
-the test on one code path.
+This is the codebase's own convention for "this write must be on disk
+before the next step": see the ACK-before-execute invariant in
+`src/Seal/ISA/Dispatch.hs:3-7` and its uses (`Dispatch.hs:75`,
+`Agent/Loop.hs:228`, `Command/Model.hs:100`, `Command/Stop.hs:92`). The
+handoff is the same kind of invariant — the model must be able to see it.
 
-*Rejected alternative:* change `TurnEngine` to call `itwRecordAndAck` and
-have the regression test call `itwRecordAndAck` too. Rejected because the
-test would then assert the behaviour of the *fixed* call rather than of
-the code that was broken — it would not have failed before the fix.
+*Why the call site and not a mode inside the writer:* `itwRecordAsync`
+is a shared API with four other callers (`src/Seal/ISA/Dispatch.hs:99`
+and `:105` — the Trusted/Audited invocation entries; `src/Seal/Agent/
+Loop.hs:168` — the turn's request entry; and the test in
+`test/Seal/Handles/TranscriptSpec.hs:386,389`). A tag-keyed second
+behaviour inside it would affect a shared contract for the sake of one
+call site, and would leave a permanent misnomer on the method. The
+call-site change touches exactly one line and leaves every other
+caller's behaviour — and the PR #279 test that pins it — untouched.
 
-*Consequence:* the name `itwRecordAsync` becomes a slight misnomer for
-handoffs. The doc comment will say so explicitly. (Alternative considered:
-rename the method — rejected as churn across call sites for no
-behavioural gain.)
+*What the change buys:*
 
-*Durability semantics:* after the handoff is durable, the file contains
-the completions, so the next read — the one that builds the model's
-context — necessarily contains them. The writer's recorded conversation
-and the caller's list are then the same length, so the positional diff
-stays aligned and no messages are dropped.
+- **Visibility.** The ack returns only after the handoff is fsync'd, so
+  the file contains the completions before `Agent/Loop.hs:118` reads it.
+  The read that builds the model's context therefore cannot miss them.
+- **Transcript alignment.** The writer's recorded conversation
+  (`itsWritten`) is then the same list the caller's is built from, so the
+  caller's next write is a prefix-extension and the positional diff never
+  slices the wrong range. The model's own messages are no longer dropped.
+
+*Rejected alternative (from the diagnosis doc §6, option C):* pass the
+completions into `runTurn` and prepend them to the in-memory
+conversation, so the loop writes them as part of its normal request
+entry. It avoids the extra fsync and has no second source of truth, but
+it needs the completions plumbed into the agent loop (a new `AgentEnv`
+field or a `runTurn` parameter) and the harness entry re-ordered so it
+does not write the completions behind the caller's back. Deferred: the
+fsync happens once per completion batch, and the simpler change is one
+line. Revisit if the fsync shows up in a latency budget.
 
 *Error handling:* `itwRecordAndAck` raises `TranscriptError` if the
 writer daemon is dead or stuck. A handoff that cannot be recorded must
 not kill the turn: the error is caught, logged at Error level, and the
 turn continues without the injection (the completion is lost, but the
 session survives and the failure is visible).
+
+*Interaction with the PR #279 instrumentation:* unchanged. The I1
+detector (`COMPLETION NOT VISIBLE TO READER`) still fires if a handoff is
+ever enqueued without becoming durable, and the existing test
+`test/Seal/Handles/TranscriptSpec.hs:368` ("counts a read that misses a
+completion injection the writer was asked to record") keeps passing
+because it exercises the async path, which this change does not touch.
+The I2 detector (`DESYNC`) likewise keeps firing if the caller's
+conversation ever diverges from the writer's.
 
 ### D2 — a completion that arrives during a turn is delivered when the turn ends
 
@@ -113,24 +168,58 @@ nothing is scheduled to pick the completion up.
 **Decision: the turn engine announces the end of every turn, and the
 gateway checks for pending completions then.**
 
-- `TurnDeps` gains `tdOnTurnEnd :: Maybe (SessionId -> IO ())` (the CLI
-  paths pass `Nothing`; the gateway wires it).
-- `TurnEngine.runSessionTurn` calls it *after* the turn's bracket — i.e.
-  after the session lock is released and the idle broadcast has fired —
-  so a wake started from it is not blocked by the turn that is ending.
+- `TurnDeps` gains `tdOnTurnEnd :: Maybe (SessionId -> IO ())`. The four
+  construction sites are `src/Seal/Gateway/Send.hs:254` (the gateway
+  wires it) and `src/Seal/Channel/Cli.hs:216,272,303` (they pass
+  `Nothing`).
+- `TurnEngine.runSessionTurn` calls it **after** the turn's bracket, so
+  the session lock is released and the idle broadcast has already fired.
+  A wake started from it is therefore not blocked by the turn that is
+  ending, and the frontend sees idle → thinking rather than thinking →
+  idle.
 - `Gateway/Send.hs` implements it: if `pendingCompletionCount` is
   non-zero, call `wakeIdleSession`.
 
-*Re-entrancy:* when the ending turn is itself a wake-up turn, the
-per-session wake mutex is still held, so the nested `wakeIdleSession`
-skips — which is correct, because the outer `wakeIdleSession` re-checks
-for pending completions after its turn finishes and starts another
-synthetic turn if any arrived meanwhile. The chain terminates when the
-sidecar is empty.
+**The wake chain (new behaviour).** Today the outer `wakeIdleSession`
+only logs a warning after its turn finishes
+(`src/Seal/Gateway/Send.hs:361-367`); it does not re-check. When the
+ending turn is itself a wake-up turn, the per-session wake mutex is still
+held (`releaseWake` happens at `src/Seal/Gateway/Send.hs:368`, after
+`runSessionTurn` returns), so a nested `wakeIdleSession` would correctly
+skip. The outer frame therefore re-checks after its turn finishes:
 
-*Ordering wart:* the idle broadcast fires before the new turn's thinking
-broadcast, so the frontend sees idle → thinking. Accepted (the current
-code has the same wart in the opposite direction).
+```haskell
+wakeIdleSession deps sid = loop
+  where
+    loop = do
+      inFlight <- sessionTurnInFlight (sdLocks deps) sid
+      unless inFlight $ do
+        acquired <- tryAcquireWake (sdWakeMutex deps) sid
+        when acquired $ do
+          mMeta <- loadSessionMeta (sdPaths deps) sid
+          case mMeta of
+            Nothing -> releaseWake (sdWakeMutex deps) sid
+            Just meta -> do
+              _ <- runSessionTurn td adapter meta Nothing "."
+              releaseWake (sdWakeMutex deps) sid
+              -- A completion may have arrived during the turn; the
+              -- nested wake could not start (the mutex was held), so
+              -- this frame picks it up.
+              pending <- pendingCompletionCount (sdPaths deps) sid
+              when (pending > 0) $ loop
+```
+
+The chain terminates because the sidecar is empty when no sub-agent is
+outstanding.
+
+**Which turn exits fire the hook:**
+
+| exit | hook fires? | why |
+|---|---|---|
+| normal completion | yes | a completion may have arrived during the turn |
+| the turn threw | yes | same — and the failure must not strand completions |
+| the provider failed to resolve | yes | `runSessionTurn` returns *before* the bracket (`TurnEngine.hs:520-527`); the hook is called after that early return too, so the hook's call site must not be inside the bracket |
+| the user aborted (`/stop`) | no | an explicit "not now" — the completions stay pending until the next user message |
 
 ### D3 — the wake mutex must not leak
 
@@ -152,7 +241,7 @@ deterministic before anything is fixed.
 
 **Files (test only):**
 - `test/Seal/Gateway/SendSpec.hs` — R1, R2, R3
-- `test/Seal/Handles/TranscriptSpec.hs` — R4 (the mechanism)
+- `test/Seal/Handles/TranscriptSpec.hs` — R4
 
 **Test infrastructure needed (test only).** `SendSpec` already defines a
 local `ScriptProvider`; it pops canned responses but *discards* the
@@ -163,15 +252,16 @@ returns a scripted response. That is the whole of the new test
 infrastructure — no new module, so no `.cabal` / `test/Main.hs` edits.
 
 **R1 — the parent model is given the sub-agent's verdict.** *(the
-user-visible symptom)* Seed the session's sidecar with a completed
-sub-agent's message (`appendCompletionToSidecar`), run one turn through
-`handleSend`, and assert the `CompletionRequest` the provider received
+user-visible symptom)* Seed the session with a realistic conversation
+(>= 1.5MB — the size a real session reaches, which is what makes the
+miss rate 100%, §2) and a sidecar holding one completed sub-agent's
+message (`appendCompletionToSidecar`). Run one turn through
+`handleSend` and assert the `CompletionRequest` the provider received
 contains the verdict.
 
-Today: the turn engine's injection is the first write on the turn's
-fresh transcript handle, so the read that builds the model's context
-beats the writer (measured: 50/50 misses — §2). The request does not
-contain the verdict -> **fails**.
+Today: the turn engine's injection is the first write on the turn's fresh
+transcript handle, so the read that builds the model's context beats the
+writer. The request does not contain the verdict -> **fails**.
 
 **R2 — the transcript keeps both the verdict and the parent's own
 message.** After R1's turn, read `conversation.jsonl` and assert it
@@ -180,7 +270,8 @@ nothing lost.
 
 Today: the writer is ahead of the caller's list by the number of
 injected messages, so the parent's own reply is dropped from the file
-and replaced by the verdict -> **fails**.
+(the verdict is appended at the position the reply would have taken) ->
+**fails**.
 
 **R3 — a verdict that arrives while the parent is mid-turn is delivered
 when the turn ends.** Run a turn whose provider blocks (so a turn is in
@@ -191,59 +282,81 @@ subsequent provider request contains it.
 Today: the wake-up is skipped ("turn in flight") and nothing re-checks
 when the turn ends -> the verdict stays in the sidecar -> **fails**.
 
-**R4 — the mechanism, in isolation.** *(the transcript handle, in the
-same shape the turn engine uses)* With a fresh handle, enqueue a
-completion handoff and then read the conversation the way the turn
-engine does:
+Two harness details: the existing `BlockingProvider`
+(`test/Seal/Gateway/SendSpec.hs:96-101`) blocks on *every* call, so the
+post-fix wake-up turn would hang — the test needs a provider that blocks
+only the first call. And `mkSendDepsWith` leaves `sdTabsHandle` as
+`error ...` (`SendSpec.hs:216`), so the test must set it by record
+update, as the existing tests do.
+
+**R4 — the property the fix relies on (passes today; pins the
+mechanism).** At the transcript handle, with the writer kept busy by a
+bulk write queued ahead of the handoff:
 
 ```haskell
 withIndexedTranscript dir $ \h -> do
-  itwRecordAsync h (IndexedTranscriptWrite (prior <> completion) handoffEntry)
+  -- a bulk write, queued first: the daemon is busy with it
+  itwRecordAsync h (IndexedTranscriptWrite bulk bulkEntry)
+  -- the handoff, positioned so the writer WILL write it once it gets
+  -- there (the list is the writer's state followed by the handoff)
+  itwRecordAndAck h (IndexedTranscriptWrite (bulk <> handoff) handoffEntry)
   modelContext <- itwReadConversation h
-  completion `shouldSatisfy` (`elem` modelContext)
+  handoff `shouldSatisfy` (`elem` modelContext)
 ```
 
-Today: the handoff is the first write on a fresh handle, so the reader
-beats the writer -> **fails** (measured 50/50, §2).
+This is the invariant WU-2 makes the production path rely on: a handoff
+that has been recorded durably is visible to the next reader, even when
+the writer had a backlog. It passes today; WU-1 adds it so that a
+future change to the writer cannot break the fix's premise unnoticed.
+The handoff must be *positioned* as above — if the list handed over does
+not continue the writer's state, the writer's positional diff slices the
+handoff away and the test would pass for the wrong reason.
 
 **DoD:**
-- [ ] R1, R2, R3, R4 exist and **fail** on the current code.
+- [ ] R1, R2, R3 exist and **fail** on the current code.
 - [ ] The failures are **deterministic**: each fails on 20 consecutive
-      runs (the measured miss rate is 100% for this shape — see §2).
+      runs. WU-1 records the measured miss rate for the shape it used.
+      (If R1's miss rate is below 100% on the machine it runs on, WU-1
+      increases the seeded conversation size until the false-pass
+      probability is negligible, and records the size it settled on.)
+- [ ] R4 passes.
 - [ ] Each failure message names the defect and points at the diagnosis
       doc.
 - [ ] No production file is touched by this work unit.
-- [ ] `make test` reports exactly these four as failing (and nothing
+- [ ] `make test` reports exactly R1, R2, R3 as failing (and nothing
       else newly failing).
 
-**Verification:** `make test` — four named failures with the expected
+**Verification:** `make test` — three named failures with the expected
 messages.
 
-### WU-2 — Make the completion handoff durable
+### WU-2 — Record the completion handoff durably
 
 **Files:**
-- `src/Seal/Handles/Transcript.hs`
+- `src/Seal/Core/TurnEngine.hs` (the injection call)
 - `test/Seal/Gateway/SendSpec.hs` (R1, R2 go green)
-- `test/Seal/Handles/TranscriptSpec.hs` (R4 goes green; new cases for the
-  dead-daemon path)
+- `test/Seal/Handles/TranscriptSpec.hs` (R4 stays green; a new case for
+  the dead-daemon path)
 
 **Work:**
-- `itwRecordAsync` waits for durability when the entry is a completion
-  handoff (`erHarness == Just completionHarnessTag`); every other write
-  stays fire-and-forget.
-- The dead/stuck-daemon path is caught and logged, not thrown into the
-  turn.
-- The doc comments on `itwRecordAsync` and on `completionHarnessTag` state
-  the durability rule.
+- `TurnEngine.runTurnBody` records the completion injection with
+  `itwRecordAndAck` instead of `itwRecordAsync` (D1).
+- The `TranscriptError` from a dead or stuck writer daemon is caught and
+  logged at Error level; the turn continues without the injection.
+- The doc comment on the injection site states the invariant: the handoff
+  must be durable before the model's context is read.
 
 **DoD:**
 - [ ] R1, R2 and R4 pass.
-- [ ] R1/R2/R4 pass on 20 consecutive runs (no flakiness introduced).
-- [ ] The full suite is green; `hlint src/ test/` reports "No hints".
+- [ ] R1/R2 pass on 20 consecutive runs (no flakiness introduced).
+- [ ] The suite is green except R3, which is fixed in WU-3 (it asserts the
+      stranding behaviour that WU-3 changes); `hlint src/ test/` reports
+      "No hints".
+- [ ] The PR #279 instrumentation test
+      (`test/Seal/Handles/TranscriptSpec.hs:368`) still passes unchanged.
 - [ ] A new test covers the dead-daemon path: the turn's caller sees the
       error logged, not an exception.
-- [ ] `itwRecordAsync` for a non-handoff write is still fire-and-forget
-      (asserted by a test that does not block).
+- [ ] The other `itwRecordAsync` callers are unchanged
+      (`src/Seal/ISA/Dispatch.hs:99,105`, `src/Seal/Agent/Loop.hs:168`).
 
 **Verification:** `make check`.
 
@@ -252,10 +365,18 @@ messages.
 **Files:**
 - `src/Seal/Core/TurnEngine.hs` (`TurnDeps`, `runSessionTurn`)
 - `src/Seal/Gateway/Send.hs` (the end-of-turn hook, the wake chain)
-- `src/Seal/Channel/Cli.hs` (`tdOnTurnEnd = Nothing`)
-- `test/Seal/Gateway/SendSpec.hs` (R3 goes green; a new test for the
-  chain: a completion arriving *during* the wake turn is delivered by a
-  second wake turn)
+- `src/Seal/Channel/Cli.hs` (`tdOnTurnEnd = Nothing` at the three sites)
+- `test/Seal/Gateway/SendSpec.hs` (R3 goes green; the chain tests)
+
+**Work:**
+- Add `tdOnTurnEnd :: Maybe (SessionId -> IO ())` to `TurnDeps`; wire it
+  in the gateway, `Nothing` in the CLI.
+- `runSessionTurn` calls the hook after the turn's bracket — and also
+  after the provider-resolution early return, so a provider that fails to
+  resolve does not strand completions. The hook does not fire when the
+  turn was aborted by the user.
+- `wakeIdleSession` becomes the loop in §3 D2, so a completion that
+  arrives during a wake-up turn is delivered by a follow-up wake-up turn.
 
 **DoD:**
 - [ ] R3 passes.
@@ -265,6 +386,10 @@ messages.
       starts (asserted by a turn counter in the test).
 - [ ] The end-of-turn hook fires after the session lock is released (a
       test asserts the wake is not skipped as "turn in flight").
+- [ ] The hook fires on a turn that threw, and on a provider that failed
+      to resolve (new tests).
+- [ ] The hook does not fire when the turn was aborted by the user (new
+      test).
 - [ ] `make check` green.
 
 **Verification:** `make check`.
@@ -292,8 +417,10 @@ messages.
 
 **Verification:** `make check`.
 
-### WU-5 — Final review, knowledge capture, PR
+### WU-5 — Final review, tracking items, knowledge capture, PR
 
+- [ ] The out-of-scope defects in §5 are filed as tracking items (the
+      repo's `TODO.md` / issue tracker), not just named here.
 - [ ] The full diff is reviewed against the diagnosis doc §9 (the live
       evidence): every number quoted there is re-checked against the
       fixed behaviour.
@@ -304,38 +431,70 @@ messages.
 
 ## 5. Out of scope
 
-- **The `agent def not found` errors.** Five of the eighteen completions
-  in the live session were `status=CsError error: agent def not found:
-  dr3-pm`. That is a separate defect (the parent spawned agent defs that
-  do not exist) and it is tracked separately.
+Each of these is a real defect found while diagnosing, and each is filed
+as a tracking item in WU-5.
+
+- **The gateway restarting mid-turn.** The incident session died this
+  way: the gateway restarted at 18:04:12 while a turn was in flight, and
+  the six pending completions were never delivered (diagnosis §9.5). D2's
+  end-of-turn hook cannot fire for a turn lost with the process, so
+  those completions wait for the next human message. Delivering them
+  automatically needs a startup sweep over every session's sidecar — a
+  different mechanism from the one this plan changes, and it is a
+  gateway-lifecycle feature rather than a completion-delivery fix.
+- **`agent def not found`.** Five of the eighteen completions in the
+  live session were `status=CsError error: agent def not found: dr3-pm`
+  (and `dr3-architect`, `dr3-designer`, `dr3-security`, `dr3-cto`). The
+  parent spawned agent defs that do not exist.
+- **The deferred-delivery path.** `src/Seal/ISA/Ops/Agent.hs:817` skips
+  the sidecar append entirely when a child has pending descendants
+  (`shouldDeferDelivery`); the settle flag is recorded
+  (`src/Seal/Agent/Runtime/RunRecord.hs:240,266,289`) but nothing acts
+  on it, so such a completion is never delivered at all.
 - **The torn-read hazard.** `readConversation` is `mapMaybe decode`, so a
   partially written trailing line is silently dropped from a reader's
   snapshot. Not reachable once handoffs are durable (the write is
-  fsync'd before the read), but it is a latent hazard worth its own
-  issue.
+  fsync'd before the read), but it is a latent hazard.
 - **The `/model` and `/stop` notices never reaching
   `conversation.jsonl`.** `Command/Model.hs` and `Command/Stop.hs` append
   a one-message list to a session whose conversation they never read, so
   the writer's positional diff drops it. A pre-existing bug, unrelated to
-  completion delivery, but it was found by the new alignment detector and
-  deserves its own issue.
+  completion delivery, but it was found by the new alignment detector.
 
-## 6. Risks
+## 6. Rollback and compatibility
+
+- **On-disk format: unchanged.** `conversation.jsonl`, `entries.jsonl` and
+  the sidecar encoding are untouched by this plan. The only new artefact
+  is the `tdOnTurnEnd` field on an internal record.
+- **Rollback:** the change is three behaviour switches in three files, each
+  independently revertable. Reverting WU-2 restores the race; reverting
+  WU-3 restores the stranding; reverting WU-4 restores the mutex leak.
+  No data migration is involved, so a revert is a plain `git revert`.
+- **Already-corrupted sessions:** sessions whose transcript already
+  diverged (the live incident session) keep their corrupted
+  `conversation.jsonl`. The I2 detector will keep reporting the
+  divergence for them. The fix prevents new corruption; it does not
+  repair old transcripts.
+- **Kill switch:** none. If the handoff's fsync shows up in a latency
+  budget, the fix reverts to option C (diagnosis §6) without a flag.
+
+## 7. Risks
 
 | risk | mitigation |
 |---|---|
 | `itwRecordAndAck` blocks up to 30 s if the writer daemon is stuck | the handoff path catches `TranscriptError` and logs; the turn continues |
-| making one `itwRecordAsync` call durable surprises a caller that expects fire-and-forget | the behaviour is keyed on the entry's harness tag and documented on the method; the turn engine's only handoff call is the completion injection |
 | the end-of-turn hook adds a turn where there was none | it fires only when the sidecar is non-empty; a test asserts no turn starts with an empty sidecar |
 | the wake chain loops | the chain re-checks the sidecar after each synthetic turn and stops when it is empty; a test asserts termination |
+| the hook fires while the session lock is still held | the hook is called after the bracket; a test asserts the wake is not skipped as "turn in flight" |
+| the hook fires on a provider-resolution failure | the call site is after the early return as well as after the bracket; a test asserts it |
 
-## 7. Definition of done for the whole change
+## 8. Definition of done for the whole change
 
-- [ ] WU-1's three tests exist and are green.
+- [ ] WU-1's three failing tests exist and are green.
 - [ ] A live gateway run with the fix shows no
       `COMPLETION NOT VISIBLE TO READER` and no `DESYNC` line for a
       completion delivery (the instrumentation from PR #279 stays in
-      place as the regression net).
+      place as the regression net — see §3 D1).
 - [ ] A live gateway run shows a completion that arrives during a turn
       being delivered when the turn ends.
 - [ ] `make check` green; hlint clean.
