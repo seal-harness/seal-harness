@@ -7,6 +7,10 @@ import type { StreamClient } from '../../types/stream'
  *   - control over open/close/error timing
  *   - capture of messages the client sends
  *   - the ability to inject messages from the "server"
+ *
+ * `simulateError()` models the failure mode that wedged the client: a
+ * socket that errors but NEVER closes (readyState stays CONNECTING). Real
+ * browsers do exactly this when the peer is not a WebSocket server.
  */
 type MockSocketRef = { socket: MockSocket | null; instances: MockSocket[] }
 
@@ -54,6 +58,11 @@ class MockSocket {
     this.readyState = MockSocket.CLOSED
     const ev = { code, reason, wasClean } as CloseEvent
     this.onclose?.(ev)
+  }
+  // Models a socket that errors WITHOUT ever closing — the failure mode
+  // that wedged the client (readyState stays CONNECTING forever).
+  simulateError(): void {
+    this.onerror?.(new Event('error'))
   }
 }
 
@@ -184,6 +193,103 @@ describe('streamClient', () => {
     expect(ref.instances).toHaveLength(2)
     // The new socket starts CONNECTING; it goes live on open.
     ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+  })
+
+  // ── reconnect on socket death ───────────────────────────────────────────
+  //
+  // The historical failure: `sock.onerror` was a no-op that assumed
+  // `onclose` always follows. Against a peer that is not a WebSocket
+  // server, `onerror` fires but `onclose` never does — so `handleClose`
+  // never ran, `scheduleReconnect()` never ran, and the client sat in
+  // `connecting` forever with no retry and no error surfaced.
+
+  it('reconnects when the socket errors WITHOUT a close event', () => {
+    ref.socket!.simulateOpen()
+    expect(ref.instances).toHaveLength(1)
+    // The socket errors and never closes (readyState stays CONNECTING).
+    ref.socket!.simulateError()
+    expect(client.status).toBe('reconnecting')
+    // A reconnect is attempted after the backoff.
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+  })
+
+  it('records an error message when the socket errors without closing', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateError()
+    expect(client.lastError()).not.toBeNull()
+  })
+
+  it('does NOT schedule two reconnects when error is followed by close', () => {
+    ref.socket!.simulateOpen()
+    ref.socket!.simulateError()
+    ref.socket!.simulateClose(1006, '', false)
+    vi.advanceTimersByTime(1000)
+    // Exactly one new socket — the error and the close must not both
+    // schedule a reconnect.
+    expect(ref.instances).toHaveLength(2)
+  })
+
+  it('does NOT reconnect after an explicit close() even if an error arrives', () => {
+    ref.socket!.simulateOpen()
+    cleanup()
+    expect(client.status).toBe('closed')
+    ref.socket!.simulateError()
+    vi.advanceTimersByTime(10000)
+    expect(ref.instances).toHaveLength(1)
+  })
+
+  it('force-closes and reconnects when the socket never opens (connect deadline)', async () => {
+    // The socket is created but never reaches OPEN. Without a connect
+    // deadline the client waits forever — no error, no retry.
+    expect(client.status).toBe('connecting')
+    vi.advanceTimersByTime(90_001)
+    await Promise.resolve()
+    expect(client.status).toBe('reconnecting')
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+  })
+
+  it('does not fire the connect deadline once the socket is open', async () => {
+    ref.socket!.simulateOpen()
+    // Advance past the connect deadline (30s) but NOT past the heartbeat
+    // timeout (90s) — the heartbeat is a separate, already-correct
+    // watchdog for an established-but-silent connection.
+    vi.advanceTimersByTime(30_001)
+    await Promise.resolve()
+    expect(client.status).toBe('live')
+    expect(ref.instances).toHaveLength(1)
+  })
+
+  it('recovers missed entries via the since replay after a reconnect', () => {
+    // The recovery property that makes an HTTP polling fallback
+    // unnecessary: on reconnect the client re-focuses with `since`, and
+    // the server replays every entry produced while disconnected.
+    ref.socket!.simulateOpen()
+    client.focus('sess-1')
+    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', channel: null, internal: null, raw: '{}' }
+    ref.socket!.simulateMessage({ type: 'entry', sessionId: 'sess-1', entry })
+    const received: Array<{ id: string }> = []
+    client.onEntry((e) => received.push(e))
+
+    // Connection drops, and entries are produced while disconnected.
+    ref.socket!.simulateClose(1006, '', false)
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    ref.socket!.simulateOpen()
+    // The reconnect re-focuses with the last entry id it saw.
+    const focusOp = JSON.parse(ref.socket!.sent[ref.socket!.sent.length - 1]!)
+    expect(focusOp).toEqual({ op: 'focus', sessionId: 'sess-1', since: 'e1' })
+    // The server replays the entries produced during the outage.
+    const missed = { ...entry, id: 'e2' }
+    ref.socket!.simulateMessage({ type: 'entry', sessionId: 'sess-1', entry: missed })
+    ref.socket!.simulateMessage({ type: 'replay-end', sessionId: 'sess-1', lastReplayedEntryId: 'e2' })
+    expect(received.map((e) => e.id)).toEqual(['e2'])
     expect(client.status).toBe('live')
   })
 

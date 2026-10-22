@@ -36,6 +36,11 @@ import { rateLimitedLog, detectLoop } from './diag'
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
 const HEARTBEAT_TIMEOUT_MS = 90_000
+// How long a socket may take to reach OPEN before it is treated as
+// dead. The server's 30s ping keeps an established connection alive,
+// but a connection that never opens is a failure (e.g. the peer is not
+// a WebSocket server) and must not hang forever.
+const CONNECT_TIMEOUT_MS = 30_000
 // Exponent ceiling for the backoff calc. Past this the delay is already
 // pinned at RECONNECT_MAX_MS, and it keeps `reconnectAttempt` from feeding
 // an unbounded value into Math.pow during a very long outage.
@@ -56,6 +61,9 @@ class StreamClientImpl implements StreamClient {
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  // Deadline for the current socket to reach OPEN. Cleared on open,
+  // on close, and on error.
+  private connectTimer: ReturnType<typeof setTimeout> | null = null
   private closedByUser = false
   private _lastError: string | null = null
   private statusListeners = new Set<(s: StreamStatus) => void>()
@@ -198,6 +206,7 @@ class StreamClientImpl implements StreamClient {
       clearTimeout(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
+    this.clearConnectTimer()
     if (this.ws !== null) {
       try {
         this.ws.close(1000, 'client closed')
@@ -230,12 +239,25 @@ class StreamClientImpl implements StreamClient {
     sock.onopen = () => this.handleOpen()
     sock.onmessage = (ev: MessageEvent) => this.handleMessage(ev)
     sock.onclose = (ev: CloseEvent) => this.handleClose(ev)
-    sock.onerror = () => {
-      // onerror always precedes onclose; we let close handle the bookkeeping.
-    }
+    sock.onerror = () => this.handleError(sock)
+    // A socket that never reaches OPEN is dead (e.g. the peer is not a
+    // WebSocket server, or the TCP connection is black-holed). Without a
+    // deadline the client waits forever: no error, no retry, no way out.
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null
+      if (this.ws !== sock) return
+      if (sock.readyState === WebSocket.OPEN) return
+      this._lastError = 'connection timed out — the server did not accept the WebSocket'
+      try {
+        sock.close(4000, 'connect timeout')
+      } catch {
+        /* ignore */
+      }
+    }, CONNECT_TIMEOUT_MS)
   }
 
   private handleOpen(): void {
+    this.clearConnectTimer()
     this.setStatus('live')
     this.resetHeartbeat()
     if (this.focusState.kind === 'focused') {
@@ -385,6 +407,7 @@ class StreamClientImpl implements StreamClient {
       clearTimeout(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
+    this.clearConnectTimer()
     if (this.closedByUser) {
       this.setStatus('closed')
       return
@@ -402,6 +425,14 @@ class StreamClientImpl implements StreamClient {
   }
 
   private scheduleReconnect(): void {
+    // Idempotent: a socket error is often followed by a close event, and
+    // both paths schedule a reconnect. Clearing the pending timer keeps
+    // a single live timer (and therefore a single retry).
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.closedByUser) return
     const attempt = this.reconnectAttempt
     this.reconnectAttempt += 1
     const expo = Math.min(
@@ -417,10 +448,46 @@ class StreamClientImpl implements StreamClient {
     }, delay)
   }
 
+  /** Handle a socket error. The browser fires `onerror` for a failed
+   *  connection, and `onclose` usually follows — but NOT always: against
+   *  a peer that is not a WebSocket server, `onerror` fires and
+   *  `onclose` never does, leaving `readyState` at CONNECTING forever.
+   *
+   *  The historical implementation treated `onerror` as a no-op on the
+   *  assumption that "onerror always precedes onclose; we let close
+   *  handle the bookkeeping". When that assumption broke, the client
+   *  never retried and never reported the failure — the transcript just
+   *  silently stopped updating.
+   *
+   *  So: schedule the reconnect HERE rather than waiting for a close
+   *  that may never come. `scheduleReconnect` is idempotent, so a
+   *  subsequent `onclose` does not double-schedule. */
+  private handleError(sock: WebSocket): void {
+    if (this.closedByUser) return
+    // A stale socket (superseded by a newer connection) must not
+    // disturb the current one.
+    if (this.ws !== sock) return
+    if (this._lastError === null) {
+      this._lastError = 'connection error — the server may not be reachable'
+    }
+    this.clearConnectTimer()
+    this.ws = null
+    this.setStatus('reconnecting')
+    this.scheduleReconnect()
+  }
+
   private setStatus(s: StreamStatus): void {
     if (this._status === s) return
     this._status = s
     for (const cb of this.statusListeners) cb(s)
+  }
+
+  /** Clear the connect-deadline timer, if one is pending. */
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
   }
 
   /** Reset the heartbeat watchdog. Called on every received message (data
