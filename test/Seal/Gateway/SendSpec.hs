@@ -1,13 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec) where
 
-import Control.Monad (when)
 import Control.Exception (catch, SomeException, throwIO)
 import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (void)
+import Control.Monad (for_, void, when)
 import Data.Aeson qualified as A
 import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -106,10 +106,8 @@ data RecordingProvider = RecordingProvider
 instance Provider RecordingProvider where
   complete rp req = do
     modifyIORef' (rpRequests rp) (++ [req])
-    isFirst <- atomicModifyIORef' (rpFirst rp) (\b -> (False, b))
-    when isFirst $ case rpGate rp of
-      Just mv -> takeMVar mv
-      Nothing -> pure ()
+    isFirst <- atomicModifyIORef' (rpFirst rp) (False,)
+    when isFirst $ for_ (rpGate rp) takeMVar
     pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
 
