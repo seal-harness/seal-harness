@@ -33,6 +33,7 @@ module Seal.Handles.Transcript
   , appendConversationMessage
   , appendCompletionToSidecar
   , readAndClearCompletions
+  , redactMessages
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)

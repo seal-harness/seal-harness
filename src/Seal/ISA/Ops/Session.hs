@@ -47,7 +47,9 @@ import Seal.Core.Paging
   ( Page (..), PageParams (..), paginate, paginateDesc )
 import Seal.Core.Types
   ( OpName (..), SessionId, TrustLevel (..), mkSessionId, sessionIdText )
+import Seal.Handles.Transcript (redactMessages)
 import Seal.ISA.Opcode
+import Seal.ISA.Registry (secretOpcodes)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..) )
 import Seal.Session.Meta (SessionMeta (..))
@@ -163,11 +165,23 @@ contentTruncatedMarker = "\n[content truncated]"
 -- page footer and recorded fields need.
 data WindowedRead = WindowedRead
   { wrMessages :: [Message]  -- ^ the window's messages, in transcript order
+  , wrMargin :: [Message]    -- ^ the messages just before the window start
+                             -- (up to 'redactionScanMargin'), not rendered;
+                             -- widens the secret-opcode scan of
+                             -- 'redactWindowedRead'
   , wrWindowCount :: !Int   -- ^ count-based window size (line count on the idx path)
   , wrTotal :: !Int         -- ^ total messages (line count on the idx path)
   , wrOffset :: !Int        -- ^ 0-based start index of the window
   , wrHasMore :: !Bool      -- ^ more messages outside the window
   }
+
+-- | Number of messages before the window start that the read also loads
+-- ('wrMargin') for the secret-opcode scan: a tool-use block typically
+-- precedes its tool-result block in the same or the immediately previous
+-- message, so a 2-message margin is enough to associate a window-edge
+-- tool result with the tool-use that produced it.
+redactionScanMargin :: Int
+redactionScanMargin = 2
 
 -- | Resolve the transcript directory a @get@ read should use: the
 -- session's own dir when it has a conversation file, otherwise the
@@ -192,6 +206,8 @@ sessionReadDir paths sid = do
 -- malformed lines (accepted: guard behavior is identical, only the
 -- count-based totals can differ). Any index read failure (missing
 -- conversation file, corrupt index) falls back to the whole-file read.
+-- Both paths also load a 'redactionScanMargin'-sized margin of messages
+-- before the window start ('wrMargin').
 readTranscriptWindow :: ReadOrder -> PageParams -> Int -> Maybe Int -> FilePath -> IO WindowedRead
 readTranscriptWindow order params offset mLimit dir = do
   let convPath = dir </> "conversation.jsonl"
@@ -210,27 +226,48 @@ readTranscriptWindow order params offset mLimit dir = do
           let page = paginateBy order params offset mLimit (replicate lineTotal ())
               start = pgOffset page
               count = length (pgItems page)
-          eMsgs <- readConvLines convPath idxPath start (start + count)
+              marginStart = max 0 (start - redactionScanMargin)
+          eMsgs <- readConvLines convPath idxPath marginStart (start + count)
           case eMsgs of
-            Right msgs -> pure WindowedRead
-              { wrMessages = msgs
-              , wrWindowCount = count
-              , wrTotal = lineTotal
-              , wrOffset = start
-              , wrHasMore = pgHasMore page
-              }
+            Right msgs ->
+              let margin = take (start - marginStart) msgs
+                  window = drop (start - marginStart) msgs
+              in pure WindowedRead
+                { wrMessages = window
+                , wrMargin = margin
+                , wrWindowCount = count
+                , wrTotal = lineTotal
+                , wrOffset = start
+                , wrHasMore = pgHasMore page
+                }
             Left _ -> viaWholeFile
   where
     viaWholeFile = do
       msgs <- readMessagesFromDir dir
       let page = paginateBy order params offset mLimit msgs
+          start = pgOffset page
+          marginStart = max 0 (start - redactionScanMargin)
       pure WindowedRead
         { wrMessages = pgItems page
+        , wrMargin = take (start - marginStart) (drop marginStart msgs)
         , wrWindowCount = length (pgItems page)
         , wrTotal = pgTotal page
-        , wrOffset = pgOffset page
+        , wrOffset = start
         , wrHasMore = pgHasMore page
         }
+
+-- | Redact secret-opcode tool results from a windowed read's messages
+-- before rendering: 'redactMessages' scans the window plus its pre-window
+-- margin ('wrMargin') for 'CbToolUse' blocks of secret opcodes and
+-- replaces the matching 'CbToolResult' parts inside the window with the
+-- transcript placeholder. Foreign transcripts written before their
+-- handle had secret ops configured would otherwise leak raw secret-op
+-- results to any reader. The margin is only scanned, never rendered.
+redactWindowedRead :: WindowedRead -> WindowedRead
+redactWindowedRead wr = wr
+  { wrMessages =
+      redactMessages secretOpcodes (wrMargin wr <> wrMessages wr) (wrMessages wr)
+  }
 
 -- ---------------------------------------------------------------------------
 -- Handlers (shared between SESSION_MANAGE and legacy shims)
@@ -354,7 +391,7 @@ handleGet paths session v = do
             [ "session_id" .= sessionIdText sid
             , "provider" .= smProvider meta
             , "model" .= smModel meta
-            ] wr)
+            ] (redactWindowedRead wr))
         Nothing -> do
           mChild <- liftIO (resolveChildSessionPath paths sid)
           case mChild of
@@ -368,7 +405,7 @@ handleGet paths session v = do
                 order offset
                 [ "session_id" .= sessionIdText sid
                 , "child_of" .= sessionIdText parentSid
-                ] wr)
+                ] (redactWindowedRead wr))
 
 -- | Assemble the @get@ page from a windowed read: header line (capped at
 -- 'getRenderHeaderBytes' UTF-8 bytes), byte-budgeted message body, and

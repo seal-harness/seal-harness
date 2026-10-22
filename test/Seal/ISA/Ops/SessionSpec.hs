@@ -16,7 +16,8 @@ import Test.Hspec
 import Seal.Config.Paths
   ( SealPaths (..), agentSessionDir, sessionConversationPath
   , sessionConversationIndexPath, sessionDir )
-import Seal.Core.Types (SessionId, ToolCallId (..), mkSessionId, sessionIdText)
+import Seal.Core.Types
+  ( OpName (..), SessionId, ToolCallId (..), mkSessionId, sessionIdText )
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Session
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
@@ -65,8 +66,19 @@ assistantMsg t = TE.decodeUtf8 (encodeConvLine (ConvLine (Message Assistant [CbT
 
 -- | A tool-result message JSON line (proper encoding via encodeConvLine).
 toolResultMsg :: Text -> Text
-toolResultMsg t = TE.decodeUtf8
-  (encodeConvLine (ConvLine (Message User [CbToolResult (ToolCallId "call-1") [TrpText t] False])))
+toolResultMsg = toolResultMsgFor (ToolCallId "call-1")
+
+-- | A tool-result message JSON line for a specific tool-call id.
+toolResultMsgFor :: ToolCallId -> Text -> Text
+toolResultMsgFor tcid t = TE.decodeUtf8
+  (encodeConvLine (ConvLine (Message User [CbToolResult tcid [TrpText t] False])))
+
+-- | An assistant tool-use message JSON line for the given tool-call id and
+-- opcode name (empty input object).
+toolUseMsg :: ToolCallId -> Text -> Text
+toolUseMsg tcid name = TE.decodeUtf8
+  (encodeConvLine
+    (ConvLine (Message Assistant [CbToolUse tcid (OpName name) (object [])])))
 
 -- | Mint a fixed, valid SessionId from a literal text (for tests that need
 -- deterministic child ids without going through 'newSession').
@@ -1053,3 +1065,133 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           _ -> expectationFailure "expected a single text part"
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
         T.isInfixOf "\"truncated\":false" recorded `shouldBe` True
+
+  -- -----------------------------------------------------------------------
+  -- Read-path secret redaction (foreign-session get)
+  -- -----------------------------------------------------------------------
+  describe "read-path secret redaction" $ do
+    it "redacts SECRET_MANAGE tool results in a foreign session (SESSION_MANAGE get)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "before the secret"
+          , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
+          , toolResultMsg "super-secret-value"
+          , userMsg "after the secret"
+          ]
+        let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "action" .= ("get" :: Text)
+            , "session_id" .= sessionIdText (smId meta)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "<redacted:secret>" t `shouldBe` True
+            T.isInfixOf "super-secret-value" t `shouldBe` False
+            T.isInfixOf "after the secret" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "super-secret-value" recorded `shouldBe` False
+
+    it "renders non-secret op tool results verbatim" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ toolUseMsg (ToolCallId "call-b") "BIN_EXEC"
+          , toolResultMsgFor (ToolCallId "call-b") "harmless tool output"
+          ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText (smId meta)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "harmless tool output" t `shouldBe` True
+            T.isInfixOf "<redacted:secret>" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "redacts a result whose tool-use message is outside the window (pre-window margin)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "margin0"
+          , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
+          , toolResultMsg "super-secret-value"
+          , userMsg "window-end"
+          ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "order" .= ("front-to-back" :: Text)
+            , "offset" .= (2 :: Int)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- The window is [tool result, window-end]; the tool-use
+            -- message at index 1 is only in the scan margin.
+            T.isInfixOf "<redacted:secret>" t `shouldBe` True
+            T.isInfixOf "super-secret-value" t `shouldBe` False
+            -- The margin supplies the scan only; it is not rendered.
+            T.isInfixOf "margin0" t `shouldBe` False
+            T.isInfixOf "window-end" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "super-secret-value" recorded `shouldBe` False
+
+    it "redacts a margin-supplied secret via the conversation.idx ranged path" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "margin0"
+          , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
+          , toolResultMsg "super-secret-value"
+          , userMsg "window-end"
+          ]
+        _ <- buildIndex (sessionConversationPath paths (smId meta))
+                        (sessionConversationIndexPath paths (smId meta))
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "order" .= ("front-to-back" :: Text)
+            , "offset" .= (2 :: Int)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "<redacted:secret>" t `shouldBe` True
+            T.isInfixOf "super-secret-value" t `shouldBe` False
+            T.isInfixOf "window-end" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "redacts secret results on the child-resolution branch" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-011"
+        seedChildConversation paths (smId parentMeta) childSid
+          [ toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
+          , toolResultMsg "super-secret-value"
+          ]
+        let op = sessionGetOp paths callerSessionId
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText childSid]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "<redacted:secret>" t `shouldBe` True
+            T.isInfixOf "super-secret-value" t `shouldBe` False
+            T.isInfixOf "child session of" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "super-secret-value" recorded `shouldBe` False
