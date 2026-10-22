@@ -18,6 +18,7 @@ import System.Directory (createDirectoryIfMissing)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
@@ -110,7 +111,8 @@ mkDeps = do
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg

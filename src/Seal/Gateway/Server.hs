@@ -1,9 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The assembled Warp application: the REST API routes + static file
--- serving with SPA fallback + the non-loopback bind warning. The WS stream
--- server runs separately (on @gcWsPort@) via 'Seal.Gateway.Stream'.
+-- serving with SPA fallback + the non-loopback bind warning. The WS
+-- stream server is MOUNTED in the same application (via
+-- 'Seal.Gateway.Stream.streamMiddleware'), so the gateway serves HTTP and
+-- WebSocket traffic on a single port.
 module Seal.Gateway.Server
   ( gatewayApp
+  , gatewayAppWithStream
   , requestTimingMiddleware
   , requestTimingMiddlewareWith
   , runGateway
@@ -23,13 +26,15 @@ import Network.HTTP.Types.Header (ResponseHeaders)
 import Network.Wai
   ( Application, pathInfo, requestMethod, responseFile
   , responseLBS, responseStatus, Response )
-import Network.Wai.Handler.Warp (run)
+import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeout, Settings)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeExtension)
 
 import Seal.Gateway.API (apiApp, ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..))
 import Seal.Gateway.Embedded (embeddedAssets)
+import Seal.Gateway.Stream (StreamGuard, streamMiddleware)
+import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Security.Path
   ( PathError (..)
@@ -51,6 +56,23 @@ gatewayApp logger deps mStaticDir =
       _ -> case mStaticDir of
         Just staticDir -> serveStatic staticDir req respond
         Nothing        -> serveEmbedded req respond
+
+-- | The assembled application WITH the WebSocket stream endpoint mounted
+-- on the same port.
+--
+-- The WS upgrade is handled by 'streamMiddleware'; every non-WebSocket
+-- request falls through to the ordinary gateway app. This is what makes
+-- the gateway single-port: one listener, one bind, no second port to
+-- collide with.
+gatewayAppWithStream
+  :: SealLogger
+  -> ApiDeps
+  -> Maybe FilePath
+  -> StreamGuard
+  -> StreamBroker
+  -> Application
+gatewayAppWithStream logger deps mStaticDir guard broker =
+  streamMiddleware guard broker (gatewayApp logger deps mStaticDir)
 
 -- | WAI middleware that logs each request's HTTP method, path, response
 -- status, and total duration (in milliseconds) via the Katip 'SealLogger'.
@@ -223,12 +245,25 @@ contentTypeFor ext = case ext of
 -- Katip 'SealLogger'. When the host is non-loopback:
 --   - If @failClosedOnNonLoopback@ is True (mode=remote), REFUSES to start.
 --   - Otherwise, warns (the full slash-command surface is reachable).
-runGateway :: SealLogger -> GatewayConfig -> Bool -> ApiDeps -> IO ()
-runGateway logger cfg failClosedOnNonLoopback deps = do
+--
+-- The WebSocket stream endpoint is served by the SAME listener (mounted
+-- via 'gatewayAppWithStream'), so there is exactly one port and one bind.
+-- A bind failure now aborts the whole server with a clear message, rather
+-- than leaving a half-running gateway whose live transcript was dead.
+runGateway
+  :: SealLogger
+  -> GatewayConfig
+  -> Bool
+  -> ApiDeps
+  -> StreamGuard
+  -> StreamBroker
+  -> IO ()
+runGateway logger cfg failClosedOnNonLoopback deps guard broker = do
   let host = gcHost cfg
       port = gcPort cfg
   logIO logger InfoS "Seal Harness gateway"
   logIO logger InfoS ("  URL:      http://" <> ls host <> ":" <> ls (show port))
+  logIO logger InfoS ("  Stream:   ws://" <> ls host <> ":" <> ls (show port) <> "/ (same port)")
   if host /= "127.0.0.1" && host /= "::1" && host /= "localhost"
     then
       if failClosedOnNonLoopback
@@ -240,9 +275,20 @@ runGateway logger cfg failClosedOnNonLoopback deps = do
           logIO logger WarningS ("binding to " <> ls host
                                  <> " — the full slash-command surface is reachable by anything that can reach this address")
           let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-              app = gatewayApp logger deps mStaticDir
-          run port app
+              app = gatewayAppWithStream logger deps mStaticDir guard broker
+          runSettings (setPort port settings) app
     else do
       let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-          app = gatewayApp logger deps mStaticDir
-      run port app
+          app = gatewayAppWithStream logger deps mStaticDir guard broker
+      runSettings (setPort port settings) app
+
+-- | Warp settings for the gateway.
+--
+-- Warp's default request timeout is 30s, which would tear down an idle
+-- WebSocket connection (the stream is idle between transcript events).
+-- The WS server sends a ping every 30s (see 'withPingThread'), so the
+-- timeout is raised well above that: a connection silent for two minutes
+-- is genuinely dead. HTTP requests are unaffected in practice (the
+-- gateway answers in milliseconds).
+settings :: Settings
+settings = setTimeout 120_000 defaultSettings

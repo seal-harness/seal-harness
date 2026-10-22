@@ -91,6 +91,7 @@ import Seal.Config.Security
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -533,7 +534,8 @@ buildTestEnv tmp mode mRepo opts = do
         , adConfigRepo = configRepo
         , adVault = rt
         , adPaths = paths
-        , adWsPort = 8081
+        
+        , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg = testAbortReg
         , adSecurityConfig = secCfg
         , adMkSessionExec = Nothing
