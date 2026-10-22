@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Gateway.SendSpec (spec) where
 
+import Control.Monad (when)
 import Control.Exception (catch, SomeException, throwIO)
 import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Concurrent (forkIO, threadDelay)
@@ -12,7 +13,8 @@ import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
 import Data.Either (isLeft)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, mapMaybe)
 import Data.Text.Encoding qualified as TE
 import Data.Text (Text)
@@ -58,6 +60,10 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted)
 import Seal.Transcript.Conv (readConversation)
+import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+import Seal.Handles.Transcript
+  ( IndexedTranscriptWrite (..), appendCompletionToSidecar, itwRecordAndAck
+  , withIndexedTranscript )
 import Data.ByteString qualified as BS
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
@@ -85,6 +91,55 @@ instance Provider ScriptProvider where
       (r : rest) -> writeIORef ref rest >> pure (Right r)
       []         -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
+
+-- | A fake provider that records every 'CompletionRequest' it receives,
+-- so a test can assert what conversation the model was actually given.
+-- It can also be gated: the FIRST call blocks until the gate is opened,
+-- every later call answers immediately (a post-wake turn must not block
+-- again).
+data RecordingProvider = RecordingProvider
+  { rpRequests :: IORef [CompletionRequest]
+  , rpFirst    :: IORef Bool
+  , rpGate     :: Maybe (MVar ())
+  }
+
+instance Provider RecordingProvider where
+  complete rp req = do
+    modifyIORef' (rpRequests rp) (++ [req])
+    isFirst <- atomicModifyIORef' (rpFirst rp) (\b -> (False, b))
+    when isFirst $ case rpGate rp of
+      Just mv -> takeMVar mv
+      Nothing -> pure ()
+    pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
+  listModels _ = pure (Right [ModelId "llama3.2"])
+
+-- | The text blocks of a completion request's messages.
+requestTexts :: CompletionRequest -> [T.Text]
+requestTexts req = [t | Message _ bs <- crMessages req, CbText t <- bs]
+
+-- | Seed a session's on-disk conversation with @n@ messages of @size@
+-- characters each. A realistic size matters: the reader that builds the
+-- model's context loses the race to the writer only when the
+-- conversation is big enough for the two to be close (see the diagnosis
+-- doc §2).
+seedConversation :: SealPaths -> SessionId -> Int -> Int -> IO ()
+seedConversation paths sid n size =
+  withIndexedTranscript (sessionDir paths sid) $ \h -> do
+    let msgs = [Message User [CbText (T.replicate size "x")] | _ <- [1 .. n]]
+        entry = EntryRecord
+          { erId = ""
+          , erTimestamp = sampleTime
+          , erKind = EKRequest
+          , erConvLen = length msgs
+          , erEnvelope = Nothing
+          , erUsage = Nothing
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Nothing
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+    itwRecordAndAck h (IndexedTranscriptWrite msgs entry)
 
 -- | A fake provider that always throws a synchronous exception. Used to
 -- test that the bracket-based idle broadcast fires even when the turn dies.
@@ -933,6 +988,122 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           out `shouldSatisfy` ("-h,--help" `T.isInfixOf`)
           out `shouldNotSatisfy` ("Invalid option" `T.isInfixOf`)
         other -> expectationFailure ("expected Failure (help), got: " <> show (isSuccess other))
+
+  describe "sub-agent completion delivery" $ do
+    -- The three tests below are the reproduction for the bug analysed in
+    -- docs/plans/2026-10-22-subagent-completion-delivery-diagnosis.md:
+    -- a completed sub-agent's message is delivered to the parent
+    -- session's model, and the parent's own messages are not lost from
+    -- the transcript on the way.
+
+    it "R1: the parent model is given the sub-agent's verdict" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261022-200000-r1"
+            verdict = "[subagent vtag--architect-agent-abc123 completed] verdict NEEDS_REVISION"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef Nothing), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        -- A production-sized conversation: the reader that builds the
+        -- model's context only loses the race to the writer when the
+        -- conversation is big enough for the two to be close (diagnosis 2).
+        seedConversation paths sid 300 5000
+        -- The harness delivered a completed sub-agent's message.
+        appendCompletionToSidecar paths sid verdict
+        outcome <- handleSend sendDeps sid "hello"
+        case outcome of
+          SendAssistant -> pure ()
+          other         -> expectationFailure ("expected SendAssistant, got " <> show other)
+        -- Wait for the turn to have reached the provider.
+        seen <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen `shouldBe` True
+        -- The model must have been given the verdict. Today the turn
+        -- engine injects the completion asynchronously and the reader
+        -- that builds the model's context beats the writer, so the
+        -- verdict is missing (diagnosis 9.1: 21 of 21 completions were
+        -- missed on a live gateway).
+        reqs <- readIORef recorded
+        let allTexts = concatMap requestTexts reqs
+            sawVerdict = any (T.isInfixOf verdict) allTexts
+        sawVerdict `shouldBe` True
+
+    it "R2: the transcript keeps the verdicts and everything the parent wrote" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261022-200000-r2"
+            verdictA = "[subagent vtag--architect-agent-aaa111 completed] verdict A"
+            verdictB = "[subagent vtag--architect-agent-bbb222 completed] verdict B"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef Nothing), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        seedConversation paths sid 300 5000
+        appendCompletionToSidecar paths sid verdictA
+        appendCompletionToSidecar paths sid verdictB
+        outcome <- handleSend sendDeps sid "hello"
+        case outcome of
+          SendAssistant -> pure ()
+          other         -> expectationFailure ("expected SendAssistant, got " <> show other)
+        seen <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen `shouldBe` True
+        -- The transcript must hold the two verdicts AND the parent's own
+        -- user message AND the parent's reply. Today the writer is ahead
+        -- of the caller's conversation by the number of injected
+        -- completions, so the caller's writes are sliced against the
+        -- wrong offset and the parent's messages are dropped from the
+        -- file (diagnosis 9.2).
+        raw <- BS.readFile (sessionDir paths sid </> "conversation.jsonl")
+        let msgs = readConversation raw
+            texts = [t | Message _ bs <- msgs, CbText t <- bs]
+            has needle = any (T.isInfixOf needle) texts
+        -- Report which part is missing, not the whole conversation.
+        let missing = [n | n <- [verdictA, verdictB, "hello", "ok"], not (has n)]
+        missing `shouldBe` []
+
+    it "R3: a verdict that arrives while the parent is mid-turn is delivered when the turn ends" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261022-200000-r3"
+            verdict = "[subagent vtag--cto-agent-ccc333 completed] verdict C"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        gate <- newEmptyMVar
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef (Just gate)), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        case outcome of
+          SendAssistant -> pure ()
+          other         -> expectationFailure ("expected SendAssistant, got " <> show other)
+        -- Wait for the turn to be in flight (the provider is blocked).
+        inFlight <- waitFor 5000000 (readIORef recorded) (not . null)
+        inFlight `shouldBe` True
+        -- The sub-agent finishes while the parent is still working.
+        appendCompletionToSidecar paths sid verdict
+        -- Let the turn end.
+        putMVar gate ()
+        -- The verdict must be delivered: a later turn must see it.
+        delivered <- waitFor 5000000 (readIORef recorded) ((> 1) . length)
+        delivered `shouldBe` True
+        reqs <- readIORef recorded
+        let allTexts = concatMap requestTexts reqs
+            sawVerdict = any (T.isInfixOf verdict) allTexts
+        sawVerdict `shouldBe` True
 
 -- | Discriminate a ParserResult Success for informative failure messages.
 isSuccess :: ParserResult a -> Bool

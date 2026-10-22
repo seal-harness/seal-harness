@@ -480,6 +480,28 @@ spec = describe "Seal.Handles.Transcript" $ do
           recorded <- itwRecordedLength h
           recorded `shouldBe` 3
 
+    it "R4: a durable handoff is visible to the next reader, even when the writer is busy" $
+      -- The property the fix relies on: a handoff that has been recorded
+      -- durably is in the conversation the next reader sees, even when
+      -- the writer still has a backlog to get through. This is what the
+      -- turn engine needs from the transcript once it records the
+      -- completion handoff durably.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 1
+        let injected = [Message User [CbText "[subagent x completed]"]]
+            bulk = [bulkMessage 4000 | _ <- [1 .. (400 :: Int)]]
+        withIndexedTranscript dir $ \h -> do
+          -- A bulk write first: the daemon is busy redacting, writing and
+          -- fsyncing ~1.6MB while the handoff is queued behind it.
+          bulkEntry <- mkEntryRecordAtAt EKHarness (length bulk)
+          itwRecordAsync h (IndexedTranscriptWrite bulk bulkEntry)
+          -- The handoff, recorded DURABLY, and positioned so the writer
+          -- will write it once it gets past the bulk write (the list
+          -- continues the writer's state).
+          itwRecordAndAck h (IndexedTranscriptWrite (bulk <> injected) completionEntry)
+          modelContext <- itwReadConversation h
+          any (`elem` injected) modelContext `shouldBe` True
+
     it "does not count a desync for a write that carries no conversation messages" $
       -- The ACK-before-execute entries and the session preamble hand the
       -- writer an EMPTY message list: they append a line to entries.jsonl
