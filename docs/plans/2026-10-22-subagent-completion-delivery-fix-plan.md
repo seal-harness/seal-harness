@@ -243,7 +243,7 @@ provider-failure case below safe even if the hook were to fire there.
 | normal completion | yes | a completion may have arrived during the turn |
 | the turn threw | yes | same — and the failure must not strand completions |
 | the provider failed to resolve | **no** | `runSessionTurn` returns *before* the bracket (`TurnEngine.hs:520-527`) and never reaches `readAndClearCompletions` (`TurnEngine.hs:736`), so the sidecar is never drained. Firing the hook here would make the chain re-enter `runSessionTurn` for a sidecar that can never be emptied — an infinite loop. The completions stay pending until the provider works again |
-| the user aborted (`/stop`) | no | an explicit "not now" — the completions stay pending until the next user message |
+| the user aborted (`/stop`) | no | an explicit "not now" — the completions stay pending until the next user message. **The release action runs on the abort path too**, so the hook must check the session's abort flag (`isAborted` over `tdAbortReg`) and skip the wake when the turn was aborted |
 
 **Closed tabs.** A wake for a session whose tab was closed runs the turn
 headless, exactly as today's completion wake-up does — `runSessionTurn`
@@ -288,7 +288,7 @@ inspecting the mutex.
 local `ScriptProvider`; it pops canned responses but *discards* the
 `CompletionRequest`, so a test cannot assert what the model was given.
 It also already defines a `CapturingProvider`
-(`test/Seal/Gateway/SendSpec.hs:108-114`) — but that one captures a
+(`test/Seal/Gateway/SendSpec.hs:162-167`) — but that one captures a
 `Maybe Text`, not the request, so it cannot answer "what conversation was
 the model given?". Add a **new**, distinctly named provider to
 `SendSpec`: `RecordingProvider`, holding an
@@ -407,6 +407,10 @@ passes, as specified.
 
 **Files:**
 - `src/Seal/Core/TurnEngine.hs` (the injection call)
+- `src/Seal/Handles/Transcript.hs` (`itwCloseTranscript` marks the writer
+  dead, so the dead-daemon path is reachable from a test — it must NOT
+  enqueue a second `ITShutdown`, which would hang the enclosing
+  `withIndexedTranscript` cleanup at `Transcript.hs:490-495,518-525`)
 - `test/Seal/Gateway/SendSpec.hs` (R1, R2 go green)
 - `test/Seal/Handles/TranscriptSpec.hs` (R4 stays green; a new case for
   the dead-daemon path)
