@@ -2,6 +2,8 @@ import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } fr
 import { createPortal } from 'react-dom'
 import { Profiler, memo } from 'react'
 import type { Agent, AgentInfo, Message, MessageContent, CodeSpan, ToolCallInfo, ToolDefsBlock, SessionInfo, TranscriptEntry } from '../types'
+import { WS_RECONNECT_ALERT_THRESHOLD } from '../types/stream'
+import type { StreamStatus } from '../types/stream'
 import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
@@ -10,6 +12,134 @@ import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
+
+/** The connection-state banner shown above the transcript when the
+ *  WebSocket stream is not live.
+ *
+ *  The transcript's only data path is the WebSocket, so when the socket
+ *  dies the transcript silently stops updating — the user cannot tell
+ *  whether the agent is still thinking or the connection is broken. This
+ *  banner makes the state visible.
+ *
+ *  Deliberately non-modal: the transcript stays fully readable (the HTTP
+ *  seed still works), because the user may be reading history while the
+ *  live tail is down. */
+function StreamConnectionBanner({
+  status,
+  error,
+}: {
+  status: StreamStatus | undefined
+  error: string | null | undefined
+}) {
+  // 'live' is the healthy state. 'closed' is the terminal state after an
+  // explicit client.close() — warning about it would be noise. 'replaying'
+  // is a normal transient state (the client is catching up), so it does
+  // not warrant a banner.
+  if (status === undefined || status === 'live' || status === 'closed' || status === 'replaying') {
+    return null
+  }
+  const label = status === 'connecting'
+    ? 'Connecting to the live stream\u2026'
+    : 'Live updates disconnected \u2014 reconnecting.'
+  return (
+    <div
+      data-testid="ws-connection-banner"
+      role="status"
+      className="flex items-center gap-2 text-xs px-3 py-2 mb-4 rounded-md"
+      style={{
+        background: 'var(--bg-elevated)',
+        border: '1px solid var(--border)',
+        color: 'var(--text-muted)',
+      }}
+    >
+      <span
+        aria-hidden="true"
+        className="inline-block w-2 h-2 rounded-full shrink-0"
+        style={{ background: 'var(--needs-input)' }}
+      />
+      <span>{label}</span>
+      {error && <span style={{ color: 'var(--text-muted)' }}>\u2014 {error}</span>}
+    </div>
+  )
+}
+
+/** The terminal-disconnect modal.
+ *
+ *  Shown once the reconnect ladder has been exhausted (see
+ *  'WS_RECONNECT_ALERT_THRESHOLD'). A brief disconnect is self-healing and
+ *  gets only the banner; a PERSISTENT one leaves the transcript frozen
+ *  with no explanation, and the user may sit waiting for a reply that is
+ *  already on disk.
+ *
+ *  Deliberately NOT a blocking overlay: the transcript stays readable and
+ *  the composer stays usable, because the agent keeps running server-side
+ *  regardless of the WebSocket state. */
+function StreamConnectionModal({
+  status,
+  error,
+  attempts,
+  onReconnect,
+}: {
+  status: StreamStatus | undefined
+  error: string | null | undefined
+  attempts: number
+  onReconnect?: () => void
+}) {
+  const [dismissed, setDismissed] = useState(false)
+  // The modal is terminal-state only: a live (or closed) stream has nothing
+  // to report.
+  const terminal =
+    status !== undefined && status !== 'live' && status !== 'closed' && status !== 'replaying'
+  // A successful connection clears the dismissal, so a LATER outage is
+  // reported again rather than staying silently dismissed.
+  useEffect(() => {
+    if (status === 'live') setDismissed(false)
+  }, [status])
+  if (!terminal || dismissed || attempts < WS_RECONNECT_ALERT_THRESHOLD) return null
+  return (
+    <div
+      className="ws-connection-modal-backdrop"
+      data-testid="ws-connection-modal-backdrop"
+      onClick={() => setDismissed(true)}
+    >
+      <div
+        className="ws-connection-modal"
+        data-testid="ws-connection-modal"
+        role="dialog"
+        aria-modal="false"
+        aria-labelledby="ws-connection-modal-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <span id="ws-connection-modal-title" className="ws-connection-modal-title">
+          Live updates unavailable
+        </span>
+        <p className="ws-connection-modal-body">
+          The connection to the gateway could not be re-established after {attempts} attempts.
+          The transcript shown may be out of date — the agent may still be working.
+        </p>
+        {error && <p className="ws-connection-modal-error">{error}</p>}
+        <div className="ws-connection-modal-actions">
+          {onReconnect && (
+            <button
+              data-testid="ws-connection-reconnect"
+              className="btn btn-primary"
+              onClick={() => onReconnect()}
+            >
+              Reconnect now
+            </button>
+          )}
+          <button
+            data-testid="ws-connection-dismiss"
+            className="btn btn-ghost"
+            onClick={() => setDismissed(true)}
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -2378,6 +2508,10 @@ export function ChatArea({
   onCancelQuestion,
   hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
   isViewingLatest,
+  streamStatus,
+  streamError,
+  streamReconnectAttempts,
+  onStreamReconnect,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2447,6 +2581,17 @@ export function ChatArea({
   /** When set, an inline error banner is shown inside the composer region
    *  (e.g. a failed branch create). Cleared by the caller. */
   composeError?: string | null
+  /** The live-stream connection status. When it is not 'live', a
+   *  connection banner is shown above the transcript so a dead WebSocket
+   *  is visible rather than silent. */
+  streamStatus?: StreamStatus
+  /** The last live-stream error, shown in the connection banner. */
+  streamError?: string | null
+  /** Consecutive failed connection attempts. At or above
+   *  'WS_RECONNECT_ALERT_THRESHOLD' a modal is shown. */
+  streamReconnectAttempts?: number
+  /** Invoked by the modal's "Reconnect now" action. */
+  onStreamReconnect?: () => void
   /** The model the next /send should use for an existing session. Default
    *  is the most-recent transcript `_te_model`; the user can override via
    *  the input-row dropdown. Frontend-only state (never persisted). */
@@ -2862,6 +3007,12 @@ export function ChatArea({
   }
   return (
     <div className="flex-1 flex flex-col min-w-0" style={{ background: 'var(--bg-base)' }}>
+      <StreamConnectionModal
+        status={streamStatus}
+        error={streamError}
+        attempts={streamReconnectAttempts ?? 0}
+        onReconnect={onStreamReconnect}
+      />
       {/* Chat header */}
       <div
         className="px-5 py-3 flex items-center gap-2.5 shrink-0"
@@ -2990,6 +3141,10 @@ export function ChatArea({
       {/* Messages or composer panel */}
       <div ref={scrollerRef} className="flex-1 overflow-y-auto chat-scroll px-5 py-6">
         <div className="flex flex-col gap-5">
+          {/* Live-stream connection state. Non-modal: the transcript below
+              stays readable (the HTTP seed still works) while the live
+              tail is down. */}
+          <StreamConnectionBanner status={streamStatus} error={streamError} />
           {/* Load older entries UI */}
           {hasMore && !loadingMore && loadOlder && (
             <button

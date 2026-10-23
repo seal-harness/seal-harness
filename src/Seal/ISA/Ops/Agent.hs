@@ -832,7 +832,9 @@ handleStartBackground wiring _v di = do
                 -- daemon's diff to desynchronize, corrupting the transcript.
                 appendCompletionToSidecar paths parentSid (completionMessage result)
                 globalLogIO DebugS (ls ("[idle-diag] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
-                  <> " parentSid=" <> sessionIdText parentSid))
+                  <> " parentSid=" <> sessionIdText parentSid
+                  <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
+                  <> " messageChars=" <> T.pack (show (T.length (completionMessage result)))))
                 -- Wake-up hook: if the parent session is idle (no turn in
                 -- flight), trigger a synthetic turn so the sidecar
                 -- completions are read and processed. Without this, the

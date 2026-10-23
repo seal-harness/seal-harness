@@ -183,6 +183,13 @@ export type ClientOp =
 
 // ── Stream client + hook contracts ──────────────────────────────────────
 
+/** The number of consecutive failed connection attempts after which the UI
+ *  escalates from the non-modal connection banner to the "live updates
+ *  unavailable" modal. At the current backoff (250ms -> 5s) this is roughly
+ *  30-40s of trying: long enough to ride out a brief gateway restart, short
+ *  enough that a user waiting on a reply is not left staring at a spinner. */
+export const WS_RECONNECT_ALERT_THRESHOLD = 10
+
 export type StreamStatus =
   | 'connecting'
   | 'live'
@@ -223,6 +230,13 @@ export interface StreamClient {
   onReposChanged(cb: () => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
+  /** The number of consecutive failed connection attempts since the last
+   *  successful message. Used to decide when a disconnect has become
+   *  terminal and should escalate from a banner to a modal. */
+  reconnectAttempts(): number
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. A no-op after an explicit 'close()'. */
+  reconnectNow(): void
   /** Request a chunk of transcript entries from the server. */
   requestEntries(sessionId: string, before: string | null, limit: number): void
   /** Subscribe to entries-chunk events. */
@@ -254,6 +268,13 @@ export interface UseTranscriptStream {
   entries: TranscriptEntry[]
   status: StreamStatus
   lastError: string | null
+  /** Consecutive failed connection attempts since the last successful
+   *  message. At or above 'WS_RECONNECT_ALERT_THRESHOLD' the UI escalates
+   *  from the connection banner to the "live updates unavailable" modal. */
+  reconnectAttempts: number
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. Wired to the modal's "Reconnect now" action. */
+  reconnectNow: () => void
   /** Pending human-confirmation questions (Untrusted opcode gate or ASK_HUMAN). */
   pendingQuestions: import('../hooks/useApi').PendingQuestion[]
   /** True until the first HTTP seed fetch completes. The WS stream hook is
@@ -262,9 +283,8 @@ export interface UseTranscriptStream {
    *  click), so `loading` is derived from the seed-fetch state. */
   loading: boolean
   /** Force a re-seed. Bumps the internal `refreshCount` which re-runs the
-   *  HTTP seed fetch. Used as `useSendMessage`'s `onComplete` callback —
-   *  the WS stream usually delivers new entries live, but the re-seed
-   *  acts as a consistency check. */
+   *  HTTP seed fetch. The WS stream delivers new entries live, so a
+   *  re-seed is a consistency check rather than the live path. */
   refresh: () => void
   /** Older entries exist on disk; initialized false. */
   hasMore: boolean

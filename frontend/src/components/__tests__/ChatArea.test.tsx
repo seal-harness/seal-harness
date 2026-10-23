@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
+import { WS_RECONNECT_ALERT_THRESHOLD } from '../../types/stream'
+import type { StreamStatus } from '../../types/stream'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -2589,5 +2591,172 @@ describe('Scroll-to-top behavior', () => {
       />,
     )
     expect(loadLatest).not.toHaveBeenCalled()
+  })
+})
+
+// ── WebSocket connection state banner ─────────────────────────────────────
+//
+// The transcript's only data path is the WebSocket. When the socket dies,
+// the transcript silently stops updating — the user has no idea whether
+// the agent is thinking or the connection is broken. These tests pin the
+// banner that makes the state visible.
+
+describe('ChatArea connection state banner', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        {...props}
+      />,
+    )
+
+  it('shows no banner while the stream is live', () => {
+    renderWith({ streamStatus: 'live' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('shows a reconnecting banner when the stream is reconnecting', () => {
+    renderWith({ streamStatus: 'reconnecting' satisfies StreamStatus })
+    const banner = screen.getByTestId('ws-connection-banner')
+    expect(banner.textContent).toMatch(/reconnect/i)
+  })
+
+  it('shows a banner when the stream is still connecting', () => {
+    renderWith({ streamStatus: 'connecting' satisfies StreamStatus })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('shows the last error text in the banner when present', () => {
+    renderWith({
+      streamStatus: 'reconnecting' satisfies StreamStatus,
+      streamError: 'connection closed (code 1006)',
+    })
+    expect(screen.getByTestId('ws-connection-banner').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('does not show a banner when the stream is closed by the user', () => {
+    // 'closed' is the terminal state after an explicit client.close();
+    // warning about it would be noise.
+    renderWith({ streamStatus: 'closed' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('does not show a banner for the replaying state (a normal, transient state)', () => {
+    renderWith({ streamStatus: 'replaying' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('keeps the transcript readable while the banner is shown', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages, streamStatus: 'reconnecting' })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
+  })
+})
+
+// ── WebSocket connection modal (terminal disconnect) ──────────────────────
+//
+// A brief disconnect is self-healing and deserves only a banner. A
+// PERSISTENT one (the gateway is down, or the port is wrong) leaves the
+// transcript frozen with no way for the user to know why. Once the
+// reconnect ladder has been exhausted, the UI escalates to a modal.
+
+describe('ChatArea connection modal', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+        {...props}
+      />,
+    )
+
+  it('shows no modal before the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD - 1 })
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('shows the modal once the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+  })
+
+  it('states that live updates are unavailable and the transcript may be stale', () => {
+    renderWith({})
+    const modal = screen.getByTestId('ws-connection-modal')
+    expect(modal.textContent).toMatch(/unavailable/i)
+    expect(modal.textContent).toMatch(/out of date|stale/i)
+  })
+
+  it('shows the last error when present', () => {
+    renderWith({ streamError: 'connection closed (code 1006)' })
+    expect(screen.getByTestId('ws-connection-modal').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('the "Reconnect now" action calls the reconnect callback', () => {
+    const onStreamReconnect = vi.fn()
+    renderWith({ onStreamReconnect })
+    fireEvent.click(screen.getByTestId('ws-connection-reconnect'))
+    expect(onStreamReconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('"Dismiss" closes the modal but the banner remains', () => {
+    renderWith({})
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('ws-connection-dismiss'))
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+    // The non-modal banner is still shown — the connection is still down.
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('closes automatically when the stream comes back', () => {
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+      />,
+    )
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'live'}
+        streamReconnectAttempts={0}
+      />,
+    )
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('does not block the transcript from being read', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
   })
 })

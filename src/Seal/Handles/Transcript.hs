@@ -29,6 +29,10 @@ module Seal.Handles.Transcript
   , IndexedTranscriptHandle (..)
   , IndexedTranscriptWrite (..)
   , TranscriptError (..)
+  , TranscriptDiagnostics (..)
+  , emptyTranscriptDiagnostics
+  , completionHarnessTag
+  , pendingCompletionCount
   , defaultAckTimeoutUs
   , appendConversationMessage
   , appendCompletionToSidecar
@@ -40,10 +44,10 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
   ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
-  , orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry, takeTMVar
-  , tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
+  , modifyTVar', orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry
+  , takeTMVar, tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
 import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
-import Control.Monad (void, foldM, when)
+import Control.Monad (void, foldM, unless, when)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
@@ -71,6 +75,7 @@ import Seal.Core.Types (OpName, ToolCallId, ModelId (..), SessionId)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), ToolChoice (..) )
+import Seal.Session.Log (appendSessionLog)
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
 import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
 import Seal.Transcript.Entries
@@ -78,6 +83,13 @@ import Seal.Transcript.Entries
   , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
+
+-- | The @erHarness@ tag the turn engine stamps on the entry that injects a
+-- completed sub-agent's message into the conversation. The writer uses it to
+-- recognise a completion injection and to assert that the injected messages
+-- actually reach the reader that builds the model's context.
+completionHarnessTag :: Text
+completionHarnessTag = "subagent-completion"
 
 -- | Exception raised by 'itwRecordAndAck' when the single-writer daemon has
 -- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
@@ -226,6 +238,47 @@ data IndexedTranscriptHandle = IndexedTranscriptHandle
   -- ^ Is the single-writer daemon still running? Returns 'False' after a
   -- write error killed it. Callers that depend on durability (the dispatch
   -- ACK-before-execute gate) should check this before trusting a prior write.
+  , itwDiagnostics :: IO TranscriptDiagnostics
+  -- ^ Counters for the writer's internal invariants. Both counters are
+  -- expected to stay at zero: a non-zero value means the transcript and
+  -- the conversation handed to the model have diverged (see
+  -- @docs\/plans\/2026-10-22-subagent-completion-delivery-diagnosis.md@).
+  , itwRecordedLength :: IO Int
+  -- ^ How many conversation messages the writer has recorded so far. The
+  -- writer's own view of the conversation — compare against
+  -- @length <$> itwReadConversation@ to spot a reader that is behind the
+  -- writer (a completion injection the model never saw).
+  }
+
+-- | Invariant counters for the indexed transcript writer.
+--
+-- Both counters describe ways the transcript can drift away from the
+-- conversation the model is actually given:
+--
+-- * 'tdInjectedTailMisses' — a read that did not contain a completion
+--   injection the writer had already been asked to record. The model is
+--   then told that a sub-agent is still running while its verdict sits in
+--   the transcript.
+-- * 'tdDesyncEvents' — a write whose incoming conversation was not a
+--   prefix-extension of the conversation the writer had recorded. The
+--   writer's positional diff then slices the wrong range and silently
+--   drops messages from @conversation.jsonl@.
+data TranscriptDiagnostics = TranscriptDiagnostics
+  { tdInjectedTailMisses :: Int
+  -- ^ Reads that missed a pending completion injection.
+  , tdDesyncEvents :: Int
+  -- ^ Writes whose incoming conversation diverged from the writer's.
+  , tdDesyncDroppedMessages :: Int
+  -- ^ Total messages the writer had to drop because of a desync.
+  }
+  deriving stock (Eq, Show)
+
+-- | A diagnostics record with every counter at zero.
+emptyTranscriptDiagnostics :: TranscriptDiagnostics
+emptyTranscriptDiagnostics = TranscriptDiagnostics
+  { tdInjectedTailMisses = 0
+  , tdDesyncEvents = 0
+  , tdDesyncDroppedMessages = 0
   }
 
 -- | Default ACK timeout (30 seconds). If the daemon does not acknowledge a
@@ -279,6 +332,10 @@ withIndexedTranscript :: FilePath -> (IndexedTranscriptHandle -> IO a) -> IO a
 withIndexedTranscript dir action = do
   q <- newTQueueIO
   aliveRef <- newTVarIO True
+  diagTv <- newTVarIO emptyTranscriptDiagnostics
+  writtenLenTv <- newTVarIO 0
+  pendingInjectedTv <- newTVarIO []
+  let sessionLog = dir </> "seal.log"
   let convPath     = dir </> "conversation.jsonl"
       entriesPath  = dir </> "entries.jsonl"
       idxPath      = dir </> "conversation.idx"
@@ -304,6 +361,7 @@ withIndexedTranscript dir action = do
               EKHarness -> erConvLen entry
               _ -> max 0 (erConvLen entry - writtenLen)
             new = take newLen (drop writtenLen redactedMsgs)
+        checkAlignment st redactedMsgs entry
         -- 1. Append new conversation lines + index entries, fsync both.
         convOffset <- fromIntegral <$> fdSeek (itsConvFd st) SeekFromEnd 0
         newOffset <- foldM (\off m -> do
@@ -336,7 +394,79 @@ withIndexedTranscript dir action = do
         -- 3. Append the entry line, fsync.
         writeFd (itsEntriesFd st) (encodeEntryRecordRaw entry' <> "\n")
         fileSynchronise (itsEntriesFd st)
-        pure st { itsWritten = itsWritten st <> new, itsPriorEnv = mNextEnv }
+        let st' = st { itsWritten = itsWritten st <> new, itsPriorEnv = mNextEnv }
+        atomically (writeTVar writtenLenTv (length (itsWritten st')))
+        -- The injection is on disk now: a later read that still misses it is
+        -- a torn read, not a race with the writer.
+        when (erHarness entry == Just completionHarnessTag) $
+          atomically (writeTVar pendingInjectedTv [])
+        pure st'
+      -- | Assert that the caller's conversation is a prefix-extension of
+      -- the conversation the writer has recorded. When it is not, the
+      -- positional diff below slices the wrong range and silently drops
+      -- messages from @conversation.jsonl@ — the transcript then no longer
+      -- matches the conversation the model was given.
+      --
+      -- Two cheap checks, no full prefix scan:
+      --
+      -- * a non-harness entry whose @erConvLen@ is below the writer's
+      --   length means the caller's list is SHORTER than what the writer
+      --   has recorded, so the writer will drop @writtenLen - erConvLen@
+      --   messages;
+      -- * a non-harness entry whose last already-written message differs
+      --   from the caller's message at the same position means the two
+      --   conversations have drifted apart (same length, different
+      --   content) — the file and the model's context disagree.
+      checkAlignment st redactedMsgs entry = do
+        let writtenLen = length (itsWritten st)
+            isHarness = erKind entry == EKHarness
+            -- A write that carries no conversation messages (the
+            -- ACK-before-execute entries, the session preamble) appends
+            -- nothing to @conversation.jsonl@ and cannot desync it.
+            carriesMessages = not (null redactedMsgs)
+            -- Two conversations are "the same conversation" when they
+            -- start with the same message. A caller that writes a
+            -- DIFFERENT conversation (the @\/model@ and @\/stop@
+            -- notices, which append one message to a session whose
+            -- conversation they did not read) is not desyncing anything
+            -- — its write is a no-op against the writer's state, which is
+            -- a separate (pre-existing) issue.
+            sameConversation =
+              carriesMessages
+              && not (null (itsWritten st))
+              && elementAt 0 redactedMsgs == elementAt 0 (itsWritten st)
+            -- The caller's conversation length: its own claim, capped by
+            -- the number of messages it actually handed over.
+            callerLen = min (erConvLen entry) (length redactedMsgs)
+            tooShort =
+              not isHarness
+              && carriesMessages
+              && sameConversation
+              && callerLen < writtenLen
+            tailMismatch =
+              not isHarness
+              && carriesMessages
+              && writtenLen > 0
+              && case (lastOf (itsWritten st), elementAt (writtenLen - 1) redactedMsgs) of
+                   (Just a, Just b) -> a /= b
+                   _                -> False
+        when (tooShort || tailMismatch) $ do
+          let dropped = max 0 (writtenLen - callerLen)
+          atomically (modifyTVar' diagTv $ \d -> d
+            { tdDesyncEvents = tdDesyncEvents d + 1
+            , tdDesyncDroppedMessages = tdDesyncDroppedMessages d + dropped
+            })
+          globalLogIO ErrorS
+            (ls ("[transcript-diag] DESYNC: the caller's conversation is not a "
+              <> "prefix-extension of the writer's. writerLen=" <> T.pack (show writtenLen)
+              <> " callerLen=" <> T.pack (show callerLen)
+              <> " dropped=" <> T.pack (show dropped)
+              <> " tailMismatch=" <> (if tailMismatch then "true" else "false")))
+          appendSessionLog (Just sessionLog) "ERROR"
+            ("[transcript-diag] DESYNC: caller conversation is not a "
+              <> "prefix-extension of the writer's conversation. writerLen="
+              <> T.pack (show writtenLen) <> " callerLen=" <> T.pack (show callerLen)
+              <> " droppedMessages=" <> T.pack (show dropped))
       drain st = do
         next <- atomically (tryReadTQueue q)
         case next of
@@ -419,9 +549,57 @@ withIndexedTranscript dir action = do
                           atomically (putTMVar done ())
                 drainRemaining
                 pure st
+            -- | Assert that a reader about to build the model's context can
+            -- see the completion injection the writer has been asked to
+            -- record. The expectation is dropped as soon as the writer has
+            -- actually written the injection, so a read that misses it is a
+            -- genuine race — the model is about to be told that a finished
+            -- sub-agent is still running.
+            checkVisibility msgs = do
+              pending <- readTVarIO pendingInjectedTv
+              unless (null pending) $ do
+                let missing = [ m | m <- pending, m `notElem` msgs ]
+                unless (null missing) $ do
+                  atomically (modifyTVar' diagTv $ \d -> d
+                    { tdInjectedTailMisses = tdInjectedTailMisses d + 1 })
+                  writerLen <- readTVarIO writtenLenTv
+                  let detail =
+                        "injected=" <> T.pack (show (length pending))
+                        <> " missingFromReader=" <> T.pack (show (length missing))
+                        <> " readerLen=" <> T.pack (show (length msgs))
+                        <> " writerLen=" <> T.pack (show writerLen)
+                  globalLogIO ErrorS
+                    (ls ("[transcript-diag] COMPLETION NOT VISIBLE TO READER: the "
+                      <> "writer has been asked to record a sub-agent completion but the "
+                      <> "conversation the model is given does not contain it. " <> detail))
+                  appendSessionLog (Just sessionLog) "ERROR"
+                    ("[transcript-diag] COMPLETION NOT VISIBLE TO READER. " <> detail)
         void $ forkIO (void (safeDaemon st0))
-        let enqueue w = atomically (writeTQueue q (ITWrite w Nothing))
+        -- | Remember a completion injection the writer has been asked to
+        -- record but has not written yet. A read that happens before the
+        -- write lands hands the model a conversation without the
+        -- completion — the model then reports the sub-agent as still
+        -- running while its verdict is on its way to disk.
+        let notePendingInjection w =
+              when (erHarness (itwEntry w) == Just completionHarnessTag) $ do
+                let n = erConvLen (itwEntry w)
+                    msgs = itwMessages w
+                when (n > 0 && n <= length msgs) $
+                  atomically (writeTVar pendingInjectedTv (take n (reverse msgs)))
+        -- Close the handle: mark the writer dead so a further durable
+        -- write raises 'TranscriptError' instead of hanging. The daemon
+        -- thread itself is stopped by the bracket's shutdown (enqueuing a
+        -- second 'ITShutdown' here would deadlock that shutdown, which
+        -- waits on the daemon's ack). The writer has no other way to be
+        -- stopped — it is a bare `forkIO` with no exposed 'ThreadId' — so
+        -- without this the "the writer died" path is unreachable from a
+        -- test. Never called in production.
+        let closeHandle = atomically (writeTVar aliveRef False)
+        let enqueue w = do
+              notePendingInjection w
+              atomically (writeTQueue q (ITWrite w Nothing))
             ackWrite w = do
+              notePendingInjection w
               alive <- readTVarIO aliveRef
               if not alive
                 then throwIO (TranscriptError "transcript writer daemon is dead")
@@ -448,11 +626,16 @@ withIndexedTranscript dir action = do
         action IndexedTranscriptHandle
           { itwRecordAndAck = ackWrite
           , itwRecordAsync  = enqueue
-          , itwReadConversation = readConversation <$> BS.readFile convPath
+          , itwReadConversation = do
+              msgs <- readConversation <$> BS.readFile convPath
+              checkVisibility msgs
+              pure msgs
           , itwReadEntries     = readEntries entriesPath
           , itwSetSecretOps    = writeIORef secretOpsRef
-          , itwCloseTranscript = pure ()
+          , itwCloseTranscript = closeHandle
           , itwIsAlive = readTVarIO aliveRef
+          , itwDiagnostics = readTVarIO diagTv
+          , itwRecordedLength = readTVarIO writtenLenTv
           }
 
 -- | Read back the entries file, skipping malformed lines.
@@ -494,10 +677,33 @@ fakeIndexedTranscript = do
         , itwSetSecretOps    = writeIORef secretOpsRef
         , itwCloseTranscript = pure ()
         , itwIsAlive = pure True
+        , itwDiagnostics = pure emptyTranscriptDiagnostics
+        , itwRecordedLength = length <$> readMVar convRef
         }
     , do cs <- readMVar convRef
          es <- readMVar entriesRef
          pure (cs, es)
+    )
+
+-- | How many completion messages are waiting in the sidecar file, without
+-- consuming them. A non-zero count when a turn ends means a finished
+-- sub-agent has no delivery scheduled: the wake-up was skipped because a
+-- turn was in flight, and nothing will pick the message up until a human
+-- sends the next message.
+pendingCompletionCount :: SealPaths -> SessionId -> IO Int
+pendingCompletionCount paths sid =
+  catch @IOException
+    ( do
+        let sidecarPath = completionSidecarPath paths sid
+        exists <- doesFileExist sidecarPath
+        if not exists
+          then pure 0
+          else length . readConversation <$> BS.readFile sidecarPath
+    )
+    ( \e -> do
+        globalLogIO ErrorS
+          (ls ("pendingCompletionCount failed: " <> T.pack (show e)))
+        pure 0
     )
 
 -- | Redact tool-result parts that may carry secret values. Only results from
@@ -662,3 +868,17 @@ readAndClearCompletions paths sid =
           (ls ("readAndClearCompletions failed: " <> T.pack (show e)))
         pure []
     )
+
+-- | The last element of a list, if it has one. Total: no partial
+-- functions, so the invariant check can run on every write.
+lastOf :: [a] -> Maybe a
+lastOf [] = Nothing
+lastOf [x] = Just x
+lastOf (_ : xs) = lastOf xs
+
+-- | The element at a 0-based index, if the list is long enough. Total.
+elementAt :: Int -> [a] -> Maybe a
+elementAt n _ | n < 0 = Nothing
+elementAt 0 (x : _) = Just x
+elementAt n (_ : xs) = elementAt (n - 1) xs
+elementAt _ [] = Nothing
