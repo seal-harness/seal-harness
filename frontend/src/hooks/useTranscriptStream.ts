@@ -222,6 +222,9 @@ export function useTranscriptStream(
   const [entries, setEntries] = useState<TranscriptEntry[]>([])
   const [status, setStatus] = useState<StreamStatus>(sc.status)
   const [lastError, setLastError] = useState<string | null>(sc.lastError())
+  // Consecutive failed connection attempts. Drives the escalation from the
+  // connection banner to the "live updates unavailable" modal.
+  const [reconnectAttempts, setReconnectAttempts] = useState<number>(sc.reconnectAttempts())
   const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([])
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
@@ -233,6 +236,29 @@ export function useTranscriptStream(
   const currentSessionRef = useRef<string | null>(null)
 
   const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  // Re-seed when the focused session's turn COMPLETES.
+  //
+  // The backend forks the turn and returns from POST /send immediately, so
+  // a re-seed fired on the POST response always raced the turn and saw a
+  // pre-turn transcript (measured: re-seed at t+4ms saw 0 entries; the
+  // first entry landed at t+1033ms). The turn's completion is signalled by
+  // the WS 'harness-status: idle' activity frame, so re-seeding on that
+  // transition catches the turn's entries.
+  //
+  // This is a CONSISTENCY CHECK, not the live path: the WS tail already
+  // delivers new entries as they are broadcast. The re-seed covers the
+  // case where the WS missed an entry (e.g. it was briefly down while
+  // the turn ran) — the `since` replay recovers those on reconnect, and
+  // this re-seed covers the window before that replay lands.
+  useEffect(() => {
+    const unsub = sc.onActivity((sid, event) => {
+      if (sid !== currentSessionRef.current) return
+      if (event.kind !== 'harness-status' || event.status !== 'idle') return
+      refresh()
+    })
+    return unsub
+  }, [sc, refresh])
 
   // Session load effect: seed the transcript via HTTP GET, or serve from
   // the transcript data cache on session switch for instant display.
@@ -540,6 +566,7 @@ export function useTranscriptStream(
     const unsub = sc.onStatusChange((s) => {
       setStatus(s)
       setLastError(sc.lastError())
+      setReconnectAttempts(sc.reconnectAttempts())
       // Reset loadingMore on disconnect (in-flight chunk request is lost).
       if (s === 'reconnecting' || s === 'closed') {
         setLoadingMore(false)
@@ -556,5 +583,7 @@ export function useTranscriptStream(
   return {
     entries, status, lastError, pendingQuestions, loading, refresh,
     hasMore, totalCount, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest,
+    reconnectAttempts,
+    reconnectNow: () => sc.reconnectNow(),
   }
 }

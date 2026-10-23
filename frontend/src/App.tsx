@@ -355,11 +355,11 @@ export default function App() {
   // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
   // fetch on every tab click). The `loading` flag and `refresh` action
   // are exposed by the stream hook.
- const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest } = useTranscriptStream(currentSessionId)
+ const { entries: streamEntries, pendingQuestions, loading, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest, status: streamStatus, lastError: streamError, reconnectAttempts: streamReconnectAttempts, reconnectNow: streamReconnectNow } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
-  const { send, sending, resetSending } = useSendMessage(currentSessionId, refresh)
+  const { send, sending, resetSending } = useSendMessage(currentSessionId)
 
   // ── Pending optimistic message + slash bubbles ────────────────────────
   const [pendingMessage, setPendingMessage] = useState<string | null>(null)
@@ -1060,6 +1060,10 @@ export default function App() {
             <ChatArea
               selectedAgent={displayAgent ?? DEFAULT_AGENT}
               selectedSession={selectedSession}
+              streamStatus={streamStatus}
+              streamError={streamError}
+              streamReconnectAttempts={streamReconnectAttempts}
+              onStreamReconnect={streamReconnectNow}
               onSetDescription={handleSetDescription}
               messages={messages}
               loading={loading}

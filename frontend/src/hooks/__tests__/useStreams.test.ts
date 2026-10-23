@@ -30,6 +30,8 @@ function fakeClient(): StreamClient & {
   const requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[] = []
   const entriesChunkCbs = new Set<(sessionId: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void>()
   let lastError: string | null = null
+  let reconnectAttempts = 0
+  let reconnectNowCalls = 0
   return {
     status: 'live' as StreamClient['status'],
     focus: () => {},
@@ -43,6 +45,8 @@ function fakeClient(): StreamClient & {
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
+    reconnectAttempts: () => reconnectAttempts,
+    reconnectNow: () => { reconnectNowCalls += 1 },
     requestEntries: (sessionId: string, before: string | null, limit: number) => { requestEntriesCalls.push({ sessionId, before, limit }) },
     onEntriesChunk: (cb) => { entriesChunkCbs.add(cb); return () => { entriesChunkCbs.delete(cb) } },
     // test drivers:
@@ -53,6 +57,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid, ask) => { for (const cb of askResolvedCbs) cb(sid, ask) },
     setStatus: (s) => { for (const cb of statusCbs) cb(s); },
     setError: (e) => { lastError = e },
+    setReconnectAttempts: (n) => { reconnectAttempts = n; for (const cb of statusCbs) cb('reconnecting') },
+    getReconnectNowCalls: () => reconnectNowCalls,
     pushEntriesChunk: (sid, chunk) => { for (const cb of entriesChunkCbs) cb(sid, chunk) },
     requestEntriesCalls,
   } as StreamClient & {
@@ -63,6 +69,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid: string, ask: { id: string; resolution: string }) => void
     setStatus: (s: StreamClient['status']) => void
     setError: (e: string | null) => void
+    setReconnectAttempts: (n: number) => void
+    getReconnectNowCalls: () => number
     pushEntriesChunk: (sid: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void
     requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[]
   }
@@ -152,6 +160,100 @@ describe('reconcileEntries', () => {
     expect(result).toHaveLength(2)
     expect(result[1]!.streaming).toBe(true)
     expect(result[1]!.payload).toBe('growing text')
+  })
+})
+
+describe('useTranscriptStream turn-completion re-seed', () => {
+  // The re-seed after a send used to fire when POST /send RETURNED — but
+  // the backend forks the turn and returns immediately, so the re-seed
+  // always saw a pre-turn transcript (measured: re-seed at t+4ms saw 0
+  // entries; the first entry landed at t+1033ms). The re-seed now fires
+  // when the turn actually COMPLETES, signalled by the WS
+  // 'harness-status: idle' activity for the focused session.
+  const stubFetch = (body: string = '[]') =>
+    vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+  const seedFetches = (m: ReturnType<typeof vi.fn>) =>
+    m.mock.calls.filter((c) => String(c[0]).includes('/transcript')).length
+
+  it(`re-seeds when the focused session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    // The turn ends -> the harness goes idle -> re-seed.
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(2)
+    expect(result.current.entries).toEqual([])
+    vi.unstubAllGlobals()
+  })
+
+  it(`does NOT re-seed when a DIFFERENT session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    await act(async () => {
+      c.pushActivity('s2', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('does NOT re-seed on the initial load (no turn has completed)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('re-seeds merge new entries rather than replacing what is shown', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    let call = 0
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      call += 1
+      const body = call === 1
+        ? JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z')])
+        : JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z'), makeEntry('e2', '2026-01-01T00:00:01Z')])
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(1)
+
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[1]!.id).toBe('e2')
+    vi.unstubAllGlobals()
   })
 })
 

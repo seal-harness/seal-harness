@@ -310,11 +310,11 @@ export function useTranscript(sessionId: string | null) {
   const [refreshCount, setRefreshCount] = useState(0)
   // Track whether we've already loaded entries for the current session.
   // Only show "Loading transcript..." on the FIRST load for a session —
-  // NOT on refresh-after-send (which fires `refresh` via `useSendMessage`'s
-  // `onComplete`). At refresh time the WS stream has already delivered the
-  // new entries live, so the HTTP re-seed is a consistency check; setting
-  // `loading=true` would flash "Loading transcript..." and clear the
-  // visible entries for the round-trip duration.
+  // NOT on a re-seed. A re-seed happens when a turn completes (the WS
+  // 'harness-status: idle' activity), by which point the WS has already
+  // delivered the new entries live; the re-seed is a consistency check.
+  // Setting `loading=true` would flash "Loading transcript..." and clear
+  // the visible entries for the round-trip duration.
   const loadedSessionRef = useRef<string | null>(null)
 
   const refresh = useCallback(() => {
@@ -368,7 +368,7 @@ export interface SendResult {
   session_id?: string | null
 }
 
-export function useSendMessage(sessionId: string | null, onComplete: () => void) {
+export function useSendMessage(sessionId: string | null) {
   const [sending, setSending] = useState(false)
 
   // The optimistic `sending` flag is per-session: reset it when the focused
@@ -404,9 +404,8 @@ export function useSendMessage(sessionId: string | null, onComplete: () => void)
       return null
     } finally {
       setSending(false)
-      onComplete()
     }
-  }, [sessionId, sending, onComplete])
+  }, [sessionId, sending])
 
   /** Reset the optimistic `sending` flag without waiting for the POST
    *  /send round-trip to complete. Called when the user clicks the stop
