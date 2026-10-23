@@ -18,7 +18,7 @@ sampleMeta =
   let sid = fromRight (error "bad id") (mkSessionId "20260701-120000-042")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+       , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
        , smDescription = Nothing
        , smSealFrontMatter = True
        , smRepoUrl = Nothing
@@ -122,3 +122,19 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smSealFrontMatter (decode (encode j)) `shouldBe` Just True
+
+  it "defaults smParent to Nothing when absent (backwards-compat)" $ do
+    -- A session.json written before the parent link existed has no
+    -- 'parent' key — it must load as a top-level session.
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smParent (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smParent = Just sid" $ do
+    let sid = fromRight (error "bad id") (mkSessionId "20260601-120000-009")
+        m = sampleMeta { smParent = Just sid }
+    fmap smParent (decode (encode m)) `shouldBe` Just (Just sid)

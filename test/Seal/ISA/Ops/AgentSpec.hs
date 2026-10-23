@@ -346,6 +346,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -384,6 +385,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -418,6 +420,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -452,6 +455,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -477,6 +481,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -507,6 +512,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -546,6 +552,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -575,6 +582,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -606,6 +614,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -637,6 +646,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswGate = gateOpen
             , aswPaths = samplePaths
             , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
@@ -936,6 +946,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           , aswGate = gate
           , aswPaths = samplePaths
           , aswParentSession = sampleSession
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
           }

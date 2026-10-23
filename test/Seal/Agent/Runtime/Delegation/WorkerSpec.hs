@@ -11,6 +11,8 @@ import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (getCurrentTime)
+import System.Directory (doesFileExist)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.QuickCheck
@@ -24,13 +26,15 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Delegation.Worker
 import Seal.Channel.Caps (ChannelCaps)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), agentSessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.ISA.Registry (mkRegistry)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveSessionMeta)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.TestHelpers.Arbitrary ()
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
@@ -40,6 +44,7 @@ import Seal.Tools.Exec.UIO.Internal
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Util.StrictIO (decodeFileStrict)
 import System.FilePath ((</>))
 
 agentStart :: OpName
@@ -130,7 +135,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
     it "calls dwdMkUIOEnv with Just parentWorkdir when ctIsolateWorkdir=False" $ do
       withSystemTempDirectory "seal-worker-anchor" $ \tmp -> do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
-        deps <- mkAnchorDepsIO tmp anchorRef
+        deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
             task = ChildTask "a1" "do the thing" Nothing Nothing False
             childSid = mkSystemSessionId "child"
@@ -147,7 +152,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
     it "calls dwdMkUIOEnv with Nothing when ctIsolateWorkdir=True" $ do
       withSystemTempDirectory "seal-worker-anchor" $ \tmp -> do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
-        deps <- mkAnchorDepsIO tmp anchorRef
+        deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
             task = ChildTask "a1" "do the thing" Nothing Nothing True
             childSid = mkSystemSessionId "child"
@@ -157,6 +162,58 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         captured <- readIORef anchorRef
         captured `shouldSatisfy` isJust
         captured `shouldBe` Just Nothing
+
+  describe "mkDelegateWorker child meta persistence (WU3)" $ do
+    it "writes session.json with smParent = parent into the child dir" $ do
+      withSystemTempDirectory "seal-worker-meta" $ \tmp -> do
+        let paths = samplePaths tmp
+        -- Seed a parent session.json so the child meta inherits its
+        -- provider/model.
+        now <- getCurrentTime
+        let parentMeta = SessionMeta
+              { smId = sampleSession, smProvider = "anthropic"
+              , smModel = "claude-opus-4", smChannel = "web"
+              , smParent = Nothing
+              , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+              , smDescription = Nothing
+              , smSealFrontMatter = True
+              , smRepoUrl = Nothing
+              , smCreatedAt = now, smLastActive = now }
+        saveSessionMeta paths parentMeta
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        let childMetaPath = agentSessionDir paths sampleSession childSid </> "session.json"
+        exists <- doesFileExist childMetaPath
+        exists `shouldBe` True
+        mMeta <- decodeFileStrict childMetaPath
+        fmap smParent mMeta `shouldBe` Just (Just sampleSession)
+        fmap smId mMeta `shouldBe` Just childSid
+        fmap smChannel mMeta `shouldBe` Just "agent"
+        fmap smProvider mMeta `shouldBe` Just "anthropic"
+        fmap smModel mMeta `shouldBe` Just "claude-opus-4"
+
+  describe "mkDelegateWorker lineage threading (WU3)" $ do
+    it "passes childSid : dwdParentLineage to the child-registry seam" $ do
+      withSystemTempDirectory "seal-worker-lineage" $ \tmp -> do
+        lineageRef <- newIORef (Nothing :: Maybe [SessionId])
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        deps <- mkWorkerDepsIO tmp anchorRef lineageRef
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        captured <- readIORef lineageRef
+        -- The seam must receive the CHILD's full lineage: the child's own
+        -- id prepended to the parent's baked chain (self first).
+        captured `shouldBe` Just [childSid, sampleSession, grandparentSid]
 
   where
     roleText :: Text -> Text
@@ -171,11 +228,16 @@ baseSet = Set.fromList
   [ agentStart, OpName "FILE_READ", OpName "FILE_WRITE", OpName "MEMORY_READ" ]
 
 -- ---------------------------------------------------------------------------
--- WU-4 workdir anchoring test helpers
+-- WU-4 workdir anchoring + WU3 lineage test helpers
 -- ---------------------------------------------------------------------------
 
 sampleSession :: SessionId
 sampleSession = mkSystemSessionId "parent"
+
+-- | A fixed ancestor of 'sampleSession' so the lineage chain in the
+-- worker-deps tests is more than one entry long.
+grandparentSid :: SessionId
+grandparentSid = mkSystemSessionId "grandparent"
 
 sampleAgentDef :: AgentDef
 sampleAgentDef = AgentDef
@@ -194,19 +256,23 @@ sampleAgentDef = AgentDef
   , adSession = sampleSession
   }
 
--- | Build the 'DelegationWorkerDeps' for the anchoring test. The
--- 'dwdMkUIOEnv' records the anchor arg to the IORef and returns a stub
--- 'UIOEnv'. The provider resolver returns a 'ScriptProvider' that
--- immediately yields @\"done\"@ so runTurn completes (or at least reaches
--- the dwdMkUIOEnv call before any failure).
-mkAnchorDepsIO :: FilePath -> IORef (Maybe (Maybe FilePath)) -> IO DelegationWorkerDeps
-mkAnchorDepsIO tmp anchorRef = do
+-- | Build the 'DelegationWorkerDeps' for the anchoring + lineage tests.
+-- The 'dwdMkUIOEnv' records the anchor arg and the 'dwdChildRegistry'
+-- records its lineage argument (both to their IORefs) and return stubs.
+-- The provider resolver returns a 'ScriptProvider' that immediately
+-- yields @\"done\"@ so runTurn completes (or at least reaches the
+-- dwdMkUIOEnv call before any failure).
+mkWorkerDepsIO
+  :: FilePath -> IORef (Maybe (Maybe FilePath)) -> IORef (Maybe [SessionId])
+  -> IO DelegationWorkerDeps
+mkWorkerDepsIO tmp anchorRef lineageRef = do
   logger <- testSealLogger
   appEnv <- mkEnv logger defaultConfig
   approvals <- newApprovalCache
   pure DelegationWorkerDeps
     { dwdPaths = samplePaths tmp
     , dwdParentSid = sampleSession
+    , dwdParentLineage = [sampleSession, grandparentSid]
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \anchor _childSid -> do
         writeIORef anchorRef (Just anchor)
@@ -221,7 +287,9 @@ mkAnchorDepsIO tmp anchorRef = do
         pure (Right (SomeProvider (ScriptProvider ref), ModelId "llama3"))
     , dwdResolveProviderOverride = Nothing
     , dwdUnionDefBackend = error "dwdUnionDefBackend: unused (no nested AGENT_START in this test)"
-    , dwdChildRegistry = \_def _depth _role _sid (_caps :: ChannelCaps) -> pure (mkRegistry [])
+    , dwdChildRegistry = \lineage _def _depth _role _sid (_caps :: ChannelCaps) -> do
+        writeIORef lineageRef (Just lineage)
+        pure (mkRegistry [])
     , dwdChildSystemPrompt = \_ _ -> pure Nothing
     , dwdOnEntry = pure ()
     , dwdChannel = "test"

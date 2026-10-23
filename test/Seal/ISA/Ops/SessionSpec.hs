@@ -2,12 +2,14 @@
 module Seal.ISA.Ops.SessionSpec (spec) where
 
 import Control.Concurrent (threadDelay)
+import Control.Monad (forM_)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Time (UTCTime, getCurrentTime)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -90,6 +92,36 @@ fixedSessionId t = fromRight (error "invalid fixed session id") (mkSessionId t)
 callerSessionId :: SessionId
 callerSessionId = fixedSessionId "20260101-120000-900"
 
+-- | Fixed lineage ids for the ancestor-guard tests: a child, its parent,
+-- and the session root. The lineage is ordered self (child) first.
+lineageChildSid, lineageParentSid, lineageRootSid :: SessionId
+lineageChildSid = fixedSessionId "20260101-130000-101"
+lineageParentSid = fixedSessionId "20260101-130000-102"
+lineageRootSid = fixedSessionId "20260101-130000-103"
+
+-- | The baked lineage a child session's ops would carry: [child, parent,
+-- root], self first.
+testLineage :: [SessionId]
+testLineage = [lineageChildSid, lineageParentSid, lineageRootSid]
+
+-- | A minimal 'SessionMeta' for seeding search fixtures without minting
+-- (deterministic ids, no millisecond-collision risk).
+seedMeta :: SessionId -> UTCTime -> Maybe Text -> SessionMeta
+seedMeta sid t mDesc = SessionMeta
+  { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4"
+  , smChannel = "cli", smParent = Nothing, smAgent = Nothing
+  , smSystemOverride = Nothing, smAgentName = Nothing
+  , smDescription = mDesc
+  , smSealFrontMatter = True
+  , smRepoUrl = Nothing
+  , smCreatedAt = t, smLastActive = t }
+
+-- | The snippet content of every rendered @  snippet: @ line in a search
+-- result.
+snippetContents :: Text -> [Text]
+snippetContents t =
+  [ T.drop (T.length "  snippet: ") l | l <- T.lines t, "  snippet: " `T.isPrefixOf` l ]
+
 -- | Write a conversation.jsonl into a child (sub-agent) transcript dir
 -- nested under a parent session: @sessions\/\<parent\>\/agents\/\<child\>@.
 seedChildConversation :: SealPaths -> SessionId -> SessionId -> [Text] -> IO ()
@@ -157,7 +189,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "returns no matches for an empty session store" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+            op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("anything" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -167,14 +199,14 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "errors on missing query" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+            op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object []))
         orIsError r `shouldBe` True
 
     it "errors on empty query" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+            op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("" :: Text)]))
         orIsError r `shouldBe` True
 
@@ -183,7 +215,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let paths = mkPaths tmp
         meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-        let op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("auth" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -198,7 +230,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
           ]
-        let op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("database" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -210,7 +242,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let paths = mkPaths tmp
         meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-        let op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("kubernetes" :: Text)]))
         orIsError r `shouldBe` False
         case orParts r of
@@ -221,14 +253,14 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "errors on missing session id" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionGetOp paths callerSessionId
+            op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend (object []))
         orIsError r `shouldBe` True
 
     it "errors on non-existent session" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-            op = sessionGetOp paths callerSessionId
+            op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["session_id" .= ("20260101-120000-000" :: Text)]))
         orIsError r `shouldBe` True
 
@@ -240,7 +272,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` False
@@ -264,7 +296,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , userMsg "msg4"
           , assistantMsg "msg5"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "order" .= ("front-to-back" :: Text)
@@ -292,7 +324,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , userMsg "msg4"
           , assistantMsg "msg5"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "session_id" .= sessionIdText (smId meta)
@@ -320,7 +352,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , userMsg "msg4"
           , assistantMsg "msg5"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "session_id" .= sessionIdText (smId meta)
@@ -348,7 +380,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , assistantMsg "beta"
           , userMsg "gamma"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "session_id" .= sessionIdText (smId meta)
@@ -371,7 +403,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
         saveSessionMeta paths (meta { smDescription = Just "my test session" })
         seedConversation paths (smId meta) [ userMsg "hi" ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` False
@@ -387,7 +419,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedConversation paths (smId meta)
           [ userMsg "secret-value-123"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
@@ -401,7 +433,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "creates a new session and returns its id + metadata" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+              op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("new" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -411,7 +443,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "accepts optional provider/model/description" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+              op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend
             (object
               [ "action" .= ("new" :: Text)
@@ -428,7 +460,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "returns an empty message when no sessions exist" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+              op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -439,7 +471,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
           _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
-          let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+          let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
           orIsError r `shouldBe` False
           case orParts r of
@@ -454,7 +486,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           let paths = mkPaths tmp
           meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
           saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
-          let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+          let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend
             (object ["action" .= ("search" :: Text), "query" .= ("auth" :: Text)]))
           orIsError r `shouldBe` False
@@ -465,7 +497,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "errors on missing query" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+              op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("search" :: Text)]))
           orIsError r `shouldBe` True
 
@@ -478,7 +510,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             [ userMsg "Hello world"
             , assistantMsg "Hi there"
             ]
-          let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+          let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend
             (object
               [ "action" .= ("get" :: Text)
@@ -503,7 +535,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             , userMsg "msg4"
             , assistantMsg "msg5"
             ]
-          let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+          let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend
             (object
               [ "action" .= ("get" :: Text)
@@ -522,33 +554,33 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "errors on missing session_id" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-              op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+              op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("get" :: Text)]))
           orIsError r `shouldBe` True
 
     describe "authorize gate" $ do
       it "accepts new with no extra fields" $
-        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend callerSessionId)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend [callerSessionId])
           (object ["action" .= ("new" :: Text)])
           `shouldBe` Right ()
 
       it "accepts list with no extra fields" $
-        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend callerSessionId)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend [callerSessionId])
           (object ["action" .= ("list" :: Text)])
           `shouldBe` Right ()
 
       it "rejects search without query" $
-        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend callerSessionId)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend [callerSessionId])
           (object ["action" .= ("search" :: Text)])
           `shouldBe` Left "search requires {query:string}"
 
       it "rejects get without session_id" $
-        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend callerSessionId)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend [callerSessionId])
           (object ["action" .= ("get" :: Text)])
           `shouldBe` Left "get requires {session_id:string}"
 
       it "rejects unknown action" $
-        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend callerSessionId)
+        opAuthorize (sessionManageOp undefined inMemorySessionSearchBackend [callerSessionId])
           (object ["action" .= ("frobnicate" :: Text)])
           `shouldBe` Left "unknown session action: frobnicate"
 
@@ -564,7 +596,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
           ]
-        let op = sessionManageOp paths inMemorySessionSearchBackend (smId meta)
+        let op = sessionManageOp paths inMemorySessionSearchBackend [smId meta]
         r <- runTestApp (opRun op localBackend
           (object
             [ "action" .= ("get" :: Text)
@@ -586,7 +618,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
           ]
-        let op = sessionGetOp paths (smId meta)
+        let op = sessionGetOp paths [smId meta]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` True
@@ -606,7 +638,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , assistantMsg "child response"
           ]
         -- The child's own registry is built with the child's session id.
-        let op = sessionGetOp paths childSid
+        let op = sessionGetOp paths [childSid]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText childSid]))
         orIsError r `shouldBe` True
@@ -624,7 +656,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
           ]
-        let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "action" .= ("get" :: Text)
@@ -642,7 +674,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedConversation paths (smId meta)
           [ userMsg "secret-value-123"
           ]
-        let op = sessionGetOp paths (smId meta)
+        let op = sessionGetOp paths [smId meta]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` True
@@ -650,6 +682,198 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         T.isInfixOf (sessionIdText (smId meta)) recorded `shouldBe` True
         T.isInfixOf "\"self_read\":true" recorded `shouldBe` True
         T.isInfixOf "secret-value-123" recorded `shouldBe` False
+
+  -- -----------------------------------------------------------------------
+  -- Lineage guard (a session cannot read its ancestors' transcripts)
+  -- -----------------------------------------------------------------------
+  describe "lineage guard" $ do
+    it "SESSION_MANAGE get on an ancestor (parent) is refused" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        -- Re-save the parent meta under the fixed parent sid so the
+        -- guard target has a readable session.
+        saveSessionMeta paths (meta { smId = lineageParentSid })
+        seedConversation paths lineageParentSid
+          [ userMsg "parent secret work"
+          , assistantMsg "parent answer"
+          ]
+        let op = sessionManageOp paths inMemorySessionSearchBackend testLineage
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "action" .= ("get" :: Text)
+            , "session_id" .= sessionIdText lineageParentSid
+            ]))
+        orIsError r `shouldBe` True
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "ancestor" t `shouldBe` True
+            T.isInfixOf (sessionIdText lineageParentSid) t `shouldBe` True
+            T.isInfixOf "parent secret work" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "SESSION_GET (legacy) on an ancestor (root) is refused" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths (meta { smId = lineageRootSid })
+        seedConversation paths lineageRootSid
+          [ userMsg "root secret work"
+          ]
+        let op = sessionGetOp paths testLineage
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText lineageRootSid]))
+        orIsError r `shouldBe` True
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "ancestor" t `shouldBe` True
+            T.isInfixOf "root secret work" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+    it "an op with a lineage still reads unrelated sessions" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "unrelated hello world"
+          ]
+        let op = sessionGetOp paths testLineage
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText (smId meta)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> T.isInfixOf "unrelated hello world" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "records ancestor-read refusals in orRecorded without transcript content" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths (meta { smId = lineageParentSid })
+        seedConversation paths lineageParentSid
+          [ userMsg "ancestor-secret-value-123"
+          ]
+        let op = sessionGetOp paths testLineage
+        r <- runTestApp (opRun op localBackend
+          (object ["session_id" .= sessionIdText lineageParentSid]))
+        orIsError r `shouldBe` True
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf (sessionIdText lineageParentSid) recorded `shouldBe` True
+        T.isInfixOf "\"ancestor_read\":true" recorded `shouldBe` True
+        T.isInfixOf "self_read" recorded `shouldBe` False
+        T.isInfixOf "ancestor-secret-value-123" recorded `shouldBe` False
+
+    it "search excludes every lineage session while finding unrelated sessions" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        -- The parent and the root as top-level sessions matching the
+        -- query by description.
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths
+          (parentMeta { smId = lineageParentSid
+                      , smDescription = Just "needle parent session" })
+        threadDelay 2000
+        rootMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths
+          (rootMeta { smId = lineageRootSid
+                    , smDescription = Just "needle root session" })
+        threadDelay 2000
+        unrelatedMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths
+          (unrelatedMeta { smDescription = Just "needle unrelated session" })
+        -- A child transcript nested under the parent, matching the query
+        -- by its first user message (the childMatched path).
+        seedChildConversation paths lineageParentSid lineageChildSid
+          [ userMsg "needle child work" ]
+        let op = sessionSearchOp paths inMemorySessionSearchBackend testLineage
+        r <- runTestApp (opRun op localBackend
+          (object ["query" .= ("needle" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf (sessionIdText (smId unrelatedMeta)) t `shouldBe` True
+            T.isInfixOf (sessionIdText lineageParentSid) t `shouldBe` False
+            T.isInfixOf (sessionIdText lineageRootSid) t `shouldBe` False
+            T.isInfixOf (sessionIdText lineageChildSid) t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf (sessionIdText lineageParentSid) recorded `shouldBe` False
+        T.isInfixOf (sessionIdText (smId unrelatedMeta)) recorded `shouldBe` True
+
+  -- -----------------------------------------------------------------------
+  -- Search result cap + snippet clamp
+  -- -----------------------------------------------------------------------
+  describe "search result cap" $ do
+    it "renders at most 20 rows with a footer when matches exceed the cap" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        now <- getCurrentTime
+        forM_ [0 .. 29 :: Int] $ \i ->
+          saveSessionMeta paths
+            (seedMeta (fixedSessionId (T.pack ("20260301-140000-" <> show (100 + i)))) now
+              (Just (T.pack ("needle session " <> show i))))
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
+        r <- runTestApp (opRun op localBackend (object ["query" .= ("needle" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.count "  snippet: " t `shouldBe` 20
+            T.isInfixOf "(showing 20 of 30 matches — refine your query)" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"match_count\":20" recorded `shouldBe` True
+        T.isInfixOf "\"match_total\":30" recorded `shouldBe` True
+
+    it "renders all rows with no footer when matches are within the cap" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        now <- getCurrentTime
+        forM_ [0 .. 2 :: Int] $ \i ->
+          saveSessionMeta paths
+            (seedMeta (fixedSessionId (T.pack ("20260302-140000-" <> show (200 + i)))) now
+              (Just (T.pack ("needle session " <> show i))))
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
+        r <- runTestApp (opRun op localBackend (object ["query" .= ("needle" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.count "  snippet: " t `shouldBe` 3
+            T.isInfixOf "refine your query" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+
+  describe "search snippet clamp" $ do
+    it "clamps every rendered snippet to 120 chars of content" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        now <- getCurrentTime
+        let longText = "longneedle start " <> T.replicate 40 "0123456789"
+        -- A backend-matched top-level session: the in-memory backend's
+        -- snippet for this would be ~200 chars before the render clamp.
+        let longConvSid = fixedSessionId "20260303-140000-300"
+        saveSessionMeta paths (seedMeta longConvSid now Nothing)
+        seedConversation paths longConvSid [ userMsg longText ]
+        -- A description-matched session: the description is the snippet
+        -- fallback, unbounded before the render clamp.
+        let longDescSid = fixedSessionId "20260303-140000-301"
+        saveSessionMeta paths (seedMeta longDescSid now (Just longText))
+        -- A child-matched session: the first user message is the snippet.
+        let parentSid = fixedSessionId "20260303-140000-302"
+            childSid = fixedSessionId "20260303-140000-303"
+        seedChildConversation paths parentSid childSid [ userMsg longText ]
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
+        r <- runTestApp (opRun op localBackend (object ["query" .= ("longneedle" :: Text)]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            T.length longText `shouldSatisfy` (> 200)
+            let snips = snippetContents t
+            length snips `shouldBe` 3
+            forM_ snips $ \s ->
+              -- At most 120 chars of snippet content; the ellipsis
+              -- marker may push the rendered length to 121.
+              (T.length s <= 120 || (T.length s == 121 && "…" `T.isSuffixOf` s))
+                `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
 
   -- -----------------------------------------------------------------------
   -- Search self-exclusion (a session never sees itself in search results)
@@ -663,7 +887,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
           ]
-        let op = sessionManageOp paths inMemorySessionSearchBackend (smId meta)
+        let op = sessionManageOp paths inMemorySessionSearchBackend [smId meta]
         r <- runTestApp (opRun op localBackend
           (object
             [ "action" .= ("search" :: Text)
@@ -686,7 +910,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
           ]
-        let op = sessionSearchOp paths inMemorySessionSearchBackend (smId meta)
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [smId meta]
         r <- runTestApp (opRun op localBackend
           (object ["query" .= ("database" :: Text)]))
         orIsError r `shouldBe` False
@@ -710,7 +934,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "database connection pool question" ]
         seedConversation paths (smId otherMeta)
           [ userMsg "database connection pool answer" ]
-        let op = sessionManageOp paths inMemorySessionSearchBackend (smId currentMeta)
+        let op = sessionManageOp paths inMemorySessionSearchBackend [smId currentMeta]
         r <- runTestApp (opRun op localBackend
           (object
             [ "action" .= ("search" :: Text)
@@ -734,7 +958,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "debug the subagent database pool"
           ]
-        let op = sessionSearchOp paths inMemorySessionSearchBackend childSid
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [childSid]
         r <- runTestApp (opRun op localBackend
           (object ["query" .= ("database" :: Text)]))
         orIsError r `shouldBe` False
@@ -757,7 +981,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ userMsg "child hello world"
           , assistantMsg "child response"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText childSid]))
         orIsError r `shouldBe` False
@@ -777,7 +1001,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "debug the subagent grpc pool"
           ]
-        let op = sessionSearchOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["query" .= ("grpc" :: Text)]))
         orIsError r `shouldBe` False
@@ -840,7 +1064,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , userMsg "msg4"
           , assistantMsg "msg5"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
             readVia args = runTestApp (opRun op localBackend
               (object ([ "session_id" .= sessionIdText (smId meta) ] <> args)))
             argsAsc = [ "order" .= ("front-to-back" :: Text)
@@ -886,7 +1110,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , "{not a json message line"
           , userMsg "ok beta"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
             args = object ["session_id" .= sessionIdText (smId meta)]
         beforeIdx <- runTestApp (opRun op localBackend args)
         _ <- buildIndex (sessionConversationPath paths (smId meta))
@@ -915,7 +1139,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         seedConversation paths (smId meta) bigMsgs
         _ <- buildIndex (sessionConversationPath paths (smId meta))
                         (sessionConversationIndexPath paths (smId meta))
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object [ "session_id" .= sessionIdText (smId meta)
                   , "limit" .= (200 :: Int) ]))
@@ -944,7 +1168,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
                   <> T.replicate 1200 "x")
               | i <- [0 .. 199 :: Int] ]
         seedConversation paths (smId meta) bigMsgs
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object [ "session_id" .= sessionIdText (smId meta)
                   , "limit" .= (200 :: Int) ]))
@@ -967,7 +1191,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
                       <> T.replicate 10000 "0123456789"
                       <> " permsg-tail-marker-xyzzy"
         seedConversation paths (smId meta) [ userMsg bigText ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object [ "session_id" .= sessionIdText (smId meta)
                   , "limit" .= (1 :: Int) ]))
@@ -994,7 +1218,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , assistantMsg "child beta"
           , userMsg "child gamma"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
             args = object
               [ "session_id" .= sessionIdText childSid
               , "limit" .= (2 :: Int)
@@ -1021,7 +1245,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           (meta { smDescription = Just (T.replicate 65536 "d") })
         seedConversation paths (smId meta)
           [ userMsg "tiny body alpha", assistantMsg "tiny body beta" ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` False
@@ -1052,7 +1276,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         saveSessionMeta paths
           (meta { smDescription = Just "short description" })
         seedConversation paths (smId meta) [ userMsg "tiny body alpha" ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` False
@@ -1080,7 +1304,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , toolResultMsg "super-secret-value"
           , userMsg "after the secret"
           ]
-        let op = sessionManageOp paths inMemorySessionSearchBackend callerSessionId
+        let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "action" .= ("get" :: Text)
@@ -1104,7 +1328,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ toolUseMsg (ToolCallId "call-b") "BIN_EXEC"
           , toolResultMsgFor (ToolCallId "call-b") "harmless tool output"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText (smId meta)]))
         orIsError r `shouldBe` False
@@ -1124,7 +1348,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           , toolResultMsg "super-secret-value"
           , userMsg "window-end"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "session_id" .= sessionIdText (smId meta)
@@ -1158,7 +1382,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           ]
         _ <- buildIndex (sessionConversationPath paths (smId meta))
                         (sessionConversationIndexPath paths (smId meta))
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
             [ "session_id" .= sessionIdText (smId meta)
@@ -1183,7 +1407,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           [ toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
           , toolResultMsg "super-secret-value"
           ]
-        let op = sessionGetOp paths callerSessionId
+        let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object ["session_id" .= sessionIdText childSid]))
         orIsError r `shouldBe` False

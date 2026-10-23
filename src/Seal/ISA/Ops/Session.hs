@@ -270,6 +270,25 @@ redactWindowedRead wr = wr
   }
 
 -- ---------------------------------------------------------------------------
+-- Search result cap + snippet clamp
+-- ---------------------------------------------------------------------------
+
+-- | Maximum number of result rows (backend matches + child matches
+-- combined, in that order) a single search renders. A broad query can
+-- match the whole session store; without a cap every row (meta line +
+-- snippet) would flood the caller's context. Excess matches are reported
+-- in the footer and as @match_total@ in 'orRecorded'.
+searchResultCap :: Int
+searchResultCap = 20
+
+-- | Maximum length, in characters of snippet content, of a rendered
+-- search-result snippet. Backend snippets arrive up to ~200 chars; the
+-- render clamp (via 'truncateSnippet') keeps every result a short
+-- reference — the full transcript still requires a targeted @get@.
+searchSnippetCap :: Int
+searchSnippetCap = 120
+
+-- ---------------------------------------------------------------------------
 -- Handlers (shared between SESSION_MANAGE and legacy shims)
 -- ---------------------------------------------------------------------------
 
@@ -320,11 +339,16 @@ handleList paths v = do
         ]
   pure (OpResult [TrpText rendered] False recorded)
 
--- | Search sessions by query. The current session is excluded from both
--- transcript matches and child (sub-agent) matches — a session never sees
--- its own contents in search results.
-handleSearch :: SessionSearchBackend -> SealPaths -> SessionId -> Value -> App OpResult
-handleSearch searchBackend paths session v = do
+-- | Search sessions by query. The sessions in the current session's
+-- lineage are excluded from both transcript matches and child (sub-agent)
+-- matches — a session never sees its own contents, nor its ancestors',
+-- in search results. The lineage is ordered self-first (the current
+-- session is the head); an empty lineage excludes nothing. Results are
+-- capped at 'searchResultCap' rendered rows (backend matches first, then
+-- child matches) with a footer when matches were cut; every rendered
+-- snippet is clamped to 'searchSnippetCap' characters of content.
+handleSearch :: SessionSearchBackend -> SealPaths -> [SessionId] -> Value -> App OpResult
+handleSearch searchBackend paths lineage v = do
   let q = fromMaybe "" (textField v "query")
   if T.null (T.strip q)
     then pure (OpResult [TrpText "search: query is empty"] True (object []))
@@ -334,20 +358,35 @@ handleSearch searchBackend paths session v = do
       rawMatched <- liftIO (ssbSearch searchBackend paths q archived)
       children <- liftIO (listChildSessions paths)
       childResults <- liftIO (mapM (searchChildSession paths qLower) children)
-      let matched = [ (m, snip) | (m, snip) <- rawMatched, smId m /= session ]
-          childMatched = [ (p, c, snip) | (p, c, Just snip) <- childResults, c /= session ]
+      let excluded = lineage
+          matched = [ (m, snip) | (m, snip) <- rawMatched, smId m `notElem` excluded ]
+          childMatched = [ (p, c, snip) | (p, c, Just snip) <- childResults, c `notElem` excluded ]
+          matchTotal = length matched + length childMatched
+          shownMatched = take searchResultCap matched
+          shownChildMatched =
+            take (max 0 (searchResultCap - length shownMatched)) childMatched
+          shownCount = length shownMatched + length shownChildMatched
+          capFooter
+            | matchTotal > searchResultCap =
+                "\n\n(showing " <> T.pack (show shownCount) <> " of "
+                  <> T.pack (show matchTotal) <> " matches — refine your query)"
+            | otherwise = ""
           rendered
             | null matched && null childMatched = "(no sessions found)"
-            | otherwise = T.intercalate "\n\n" $
-                 [ renderSessionMeta m <> "\n  snippet: " <> snip
-                 | (m, snip) <- matched ]
-              <> [ renderChildSummary p c <> "\n  snippet: " <> snip
-                 | (p, c, snip) <- childMatched ]
+            | otherwise = T.intercalate "\n\n"
+                ([ renderSessionMeta m <> "\n  snippet: "
+                     <> truncateSnippet searchSnippetCap snip
+                 | (m, snip) <- shownMatched ]
+                <> [ renderChildSummary p c <> "\n  snippet: "
+                       <> truncateSnippet searchSnippetCap snip
+                   | (p, c, snip) <- shownChildMatched ])
+                <> capFooter
           recorded = object
             [ "query" .= q
             , "archived" .= archived
-            , "match_count" .= (length matched + length childMatched)
-            , "session_ids" .= fmap (sessionIdText . smId . fst) matched
+            , "match_count" .= shownCount
+            , "match_total" .= matchTotal
+            , "session_ids" .= fmap (sessionIdText . smId . fst) shownMatched
             ]
       pure (OpResult [TrpText rendered] False recorded)
 
@@ -365,8 +404,24 @@ selfReadRefusal =
     , "or search to find other sessions, or AGENT_STATUS for sub-agent progress."
     ]
 
-handleGet :: SealPaths -> SessionId -> Value -> App OpResult
-handleGet paths session v = do
+-- | Refusal message for a session attempting to read the transcript of an
+-- ancestor session (its spawner, or any earlier generation). The ancestor
+-- transcript can contain reads of this session's own work; reading it
+-- back appends those reads to this session's transcript in the same
+-- feedback loop the self-read guard exists to prevent.
+ancestorReadRefusal :: SessionId -> Text
+ancestorReadRefusal sid =
+  T.concat
+    [ "cannot read the transcript of an ancestor session ("
+    , sessionIdText sid
+    , " is in this session's lineage): the ancestor transcript can contain "
+    , "reads of your own work, and reading it back appends those reads to "
+    , "your transcript in a loop. Use SESSION_MANAGE action=list or search "
+    , "for unrelated sessions, or AGENT_STATUS for sub-agent progress."
+    ]
+
+handleGet :: SealPaths -> [SessionId] -> Value -> App OpResult
+handleGet paths lineage v = do
   let mSidText = textField v "session_id"
       offset = fromMaybe 0 (intField v "offset")
       mLimit = intField v "limit"
@@ -374,9 +429,14 @@ handleGet paths session v = do
   case mSidText >>= either (const Nothing) Just . mkSessionId . T.strip of
     Nothing -> pure (OpResult [TrpText "invalid session id"] True (object []))
     Just sid
-      | sid == session -> pure (OpResult [TrpText selfReadRefusal] True (object
+      | self : _ <- lineage, sid == self -> pure (OpResult [TrpText selfReadRefusal] True (object
           [ "session_id" .= sessionIdText sid
           , "self_read" .= True
+          ]))
+      | sid `elem` lineage -> pure (OpResult
+          [TrpText (ancestorReadRefusal sid)] True (object
+          [ "session_id" .= sessionIdText sid
+          , "ancestor_read" .= True
           ]))
       | otherwise -> do
       metaExists <- liftIO (doesFileExist (sessionMetaPath paths sid))
@@ -478,11 +538,13 @@ authorizeManage v =
 -- ---------------------------------------------------------------------------
 
 -- | SESSION_MANAGE: action-based entry point for all session operations.
-sessionManageOp :: SealPaths -> SessionSearchBackend -> SessionId -> Opcode
-sessionManageOp paths searchBackend session = TrustedOpcode
+-- The @lineage@ is the current session's chain, self first — the head is
+-- the current session.
+sessionManageOp :: SealPaths -> SessionSearchBackend -> [SessionId] -> Opcode
+sessionManageOp paths searchBackend lineage = TrustedOpcode
   { toName = OpName "SESSION_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination). For get, order defaults to back-to-front (most recent messages first). A session cannot read its own transcript — get on the current session's id is refused, and search never includes the current session in its results."
+  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination). For get, order defaults to back-to-front (most recent messages first). A session cannot read its own transcript or any ancestor's — get on a session in this session's lineage is refused, and search never includes this session's lineage in its results. Search renders at most 20 result rows."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -521,7 +583,7 @@ sessionManageOp paths searchBackend session = TrustedOpcode
               ]
           , fromText "session_id" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Session id to read (get). Cannot be the current session's own id." :: Text)
+              , "description" .= ("Session id to read (get). Cannot be a session in this session's lineage (self or an ancestor)." :: Text)
               ]
           , fromText "offset" .= object
               [ "type" .= ("integer" :: Text)
@@ -548,8 +610,8 @@ sessionManageOp paths searchBackend session = TrustedOpcode
         Right action -> case action of
           SessNew    -> handleNew paths v
           SessList   -> handleList paths v
-          SessSearch -> handleSearch searchBackend paths session v
-          SessGet    -> handleGet paths session v
+          SessSearch -> handleSearch searchBackend paths lineage v
+          SessGet    -> handleGet paths lineage v
   }
 
 -- ---------------------------------------------------------------------------
@@ -614,12 +676,13 @@ sessionListOp paths = TrustedOpcode
   , toRun = \_ v -> handleList paths v
   }
 
--- | SESSION_SEARCH (legacy shim): delegates to the search handler.
-sessionSearchOp :: SealPaths -> SessionSearchBackend -> SessionId -> Opcode
-sessionSearchOp paths searchBackend session = TrustedOpcode
+-- | SESSION_SEARCH (legacy shim): delegates to the search handler. The
+-- @lineage@ is the current session's chain, self first.
+sessionSearchOp :: SealPaths -> SessionSearchBackend -> [SessionId] -> Opcode
+sessionSearchOp paths searchBackend lineage = TrustedOpcode
   { toName = OpName "SESSION_SEARCH"
   , toTrust = Trusted
-  , toDesc = "Search sessions by text query. Full-transcript search across all messages (user, assistant, tool calls, tool results) and session descriptions. Case-insensitive. Uses engram semantic search when available, falls back to ripgrep literal search, then in-memory scan. Never includes the current session in its results. (Legacy — prefer SESSION_MANAGE with action=\"search\".)"
+  , toDesc = "Search sessions by text query. Full-transcript search across all messages (user, assistant, tool calls, tool results) and session descriptions. Case-insensitive. Uses engram semantic search when available, falls back to ripgrep literal search, then in-memory scan. Never includes this session's lineage (self or ancestors) in its results. Renders at most 20 result rows with a footer when more matched. (Legacy — prefer SESSION_MANAGE with action=\"search\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -637,15 +700,16 @@ sessionSearchOp paths searchBackend session = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = authorizeSearch
   , toBlocking = False
-  , toRun = \_ v -> handleSearch searchBackend paths session v
+  , toRun = \_ v -> handleSearch searchBackend paths lineage v
   }
 
--- | SESSION_GET (legacy shim): delegates to the get handler.
-sessionGetOp :: SealPaths -> SessionId -> Opcode
-sessionGetOp paths session = TrustedOpcode
+-- | SESSION_GET (legacy shim): delegates to the get handler. The @lineage@
+-- is the current session's chain, self first.
+sessionGetOp :: SealPaths -> [SessionId] -> Opcode
+sessionGetOp paths lineage = TrustedOpcode
   { toName = OpName "SESSION_GET"
   , toTrust = Trusted
-  , toDesc = "Read a session's transcript (conversation messages) with pagination. Returns a metadata header followed by rendered messages. Use offset/limit to page through long transcripts. A session cannot read its own transcript. (Legacy — prefer SESSION_MANAGE with action=\"get\".)"
+  , toDesc = "Read a session's transcript (conversation messages) with pagination. Returns a metadata header followed by rendered messages. Use offset/limit to page through long transcripts. A session cannot read its own transcript or any ancestor's. (Legacy — prefer SESSION_MANAGE with action=\"get\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -672,7 +736,7 @@ sessionGetOp paths session = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = authorizeGet
   , toBlocking = False
-  , toRun = \_ v -> handleGet paths session v
+  , toRun = \_ v -> handleGet paths lineage v
   }
 
 -- ---------------------------------------------------------------------------

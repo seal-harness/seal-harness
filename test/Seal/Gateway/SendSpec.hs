@@ -181,7 +181,7 @@ mkSendDepsWith paths resolveStub = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -235,7 +235,7 @@ seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 spec :: Spec
@@ -701,7 +701,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -789,7 +789,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -828,7 +828,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"

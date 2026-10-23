@@ -549,6 +549,14 @@ data AgentStartWiring = AgentStartWiring
   , aswParentSession :: SessionId
     -- ^ The parent's session id (so the completion callback knows which
     -- @conversation.jsonl@ to append to).
+  , aswParentLineage :: [SessionId]
+    -- ^ The FULL lineage of the session that OWNS this wiring, self
+    -- first (a top-level session's wiring carries @[sid]@; a child's
+    -- carries @child : parentLineage@). Baked at wiring-construction
+    -- time so the lineage guards never need a per-call session.json
+    -- read or directory scan: a child spawned by this session inherits
+    -- @childSid : aswParentLineage@. Empty in test wirings that don't
+    -- exercise lineage (the guards degrade to self-only).
   , aswRunRecords   :: Maybe RunRecord.RunRecordRegistry
     -- ^ The durable run-record registry (WU-5). When 'Just', the
     -- completion callback checks 'shouldDeferDelivery' before appending to

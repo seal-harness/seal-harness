@@ -318,9 +318,9 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
       , sessionListOp paths
-      , sessionSearchOp paths (bSessionSearch backends) sid
-      , sessionGetOp paths sid
-      , sessionManageOp paths (bSessionSearch backends) sid
+      , sessionSearchOp paths (bSessionSearch backends) [sid]
+      , sessionGetOp paths [sid]
+      , sessionManageOp paths (bSessionSearch backends) [sid]
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.hideOpcodes legacyHidden
@@ -1100,12 +1100,13 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswWorker =
         case tdMkWorker td of
           Just stub | 1 >= tdMkWorkerStubDepth td -> stub
-          _ -> buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel 0
+          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
     , aswPaths = tdPaths td
     , aswParentSession = parentSid
+    , aswParentLineage = [parentSid]
     , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
     , aswOnIdleCompletion = ($ parentSid) <$> tdOnIdleCompletion td
     }
@@ -1148,16 +1149,17 @@ hexSuffix4 n = T.justifyRight 4 '0' (T.pack (go n))
 -- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
 -- message.
 buildWorker
-  :: TurnDeps -> Backends -> SessionId -> Env -> Either a RuntimeConfig -> Int -> Text
+  :: TurnDeps -> Backends -> SessionId -> [SessionId] -> Env -> Either a RuntimeConfig -> Int -> Text
   -> Int
      -- ^ This worker's OWN delegation depth (0 = a top-level session's
      -- worker; its children run at depth 1). Threaded so an orchestrator
      -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
   -> AgentWorkerBuilder
-buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel ownDepth =
+buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
+    , dwdParentLineage = parentLineage
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
@@ -1180,7 +1182,8 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdResolveProvider = resolveChild
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
-    , dwdChildRegistry = buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling appEnv channel
+    , dwdChildRegistry = \childLineage ->
+        buildChildRegistryAdapter childLineage td sessionBackends eCfg operatorCeiling appEnv channel
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1210,7 +1213,7 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
       resolveDefProvider (tdProvider td) fallBackProvider (ModelId fallBackModel)
     fallbackMeta tnow = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+      , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
@@ -1222,10 +1225,15 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
 -- role-conditioned nested @AGENT_START@ wired with a child-side
 -- 'AgentStartWiring' (child depth+1, child-rooted session mint, the SAME
 -- workdir⊕user union def backend, and a re-anchored worker-builder).
+-- The @lineage@ is the child's FULL chain (self first) as passed by
+-- 'Seal.Agent.Runtime.Delegation.Worker.mkDelegateWorker'
+-- (@childSid : parentLineage@) — it is baked into the child's session
+-- ops (the read guards) and into the nested wiring, never looked up at
+-- op-run time.
 buildChildRegistryAdapter
-  :: TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
+  :: [SessionId] -> TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
+buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
@@ -1265,8 +1273,8 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)
-        , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td)) childSid
-        , sessionGetOp (tdPaths td) childSid
+        , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td)) lineage
+        , sessionGetOp (tdPaths td) lineage
         , nestedAgentStartOp
         ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
@@ -1314,13 +1322,14 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
                 }
           , aswPaths = tdPaths td
           , aswParentSession = childSid
+          , aswParentLineage = lineage
           , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
           , aswOnIdleCompletion = ($ childSid) <$> tdOnIdleCompletion td
           }
       nestedWorker = case tdMkWorker td of
         Just stub
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
-        _ -> buildWorker td sessionBackends childSid adapterAppEnv
+        _ -> buildWorker td sessionBackends childSid lineage adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at

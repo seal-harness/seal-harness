@@ -146,6 +146,7 @@ buildRegistry cfgRoot workerRan sid = do
         , aswGate = gateOpen
         , aswPaths = sealPaths
         , aswParentSession = sid
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
         }
@@ -258,6 +259,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             , aswGate = gateOpen
             , aswPaths = sealPaths
             , aswParentSession = sid
+            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }
