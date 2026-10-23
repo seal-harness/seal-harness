@@ -20,7 +20,7 @@
 | WU-1 | Reproduce the bug with a failing test | COMPLETE — R1/R2/R3 fail deterministically (20 runs) |
 | WU-2 | Record the completion handoff durably | COMPLETE — R1/R2 pass; suite 3158 examples, 1 failure |
 | WU-3 | Deliver completions that arrive during a turn | COMPLETE — R3 green + 9 new chain/hook tests (commit f05b5e3; adversarial review PASS) |
-| WU-4 | Wake-path hygiene (mutex leak, skip warning, pending count at the skip) | NOT STARTED |
+| WU-4 | Wake-path hygiene (mutex leak, skip warning, pending count at the skip) | COMPLETE — commit 532504c; adversarial review PASS |
 | WU-5 | Final review, tracking items, self-reflect, PR | NOT STARTED |
 
 Session note (2026-10-23): `Seal.Agent.Runtime.Registry > agentStatus > records
