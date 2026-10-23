@@ -283,9 +283,8 @@ export interface UseTranscriptStream {
    *  click), so `loading` is derived from the seed-fetch state. */
   loading: boolean
   /** Force a re-seed. Bumps the internal `refreshCount` which re-runs the
-   *  HTTP seed fetch. Used as `useSendMessage`'s `onComplete` callback —
-   *  the WS stream usually delivers new entries live, but the re-seed
-   *  acts as a consistency check. */
+   *  HTTP seed fetch. The WS stream delivers new entries live, so a
+   *  re-seed is a consistency check rather than the live path. */
   refresh: () => void
   /** Older entries exist on disk; initialized false. */
   hasMore: boolean

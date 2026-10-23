@@ -163,6 +163,100 @@ describe('reconcileEntries', () => {
   })
 })
 
+describe('useTranscriptStream turn-completion re-seed', () => {
+  // The re-seed after a send used to fire when POST /send RETURNED — but
+  // the backend forks the turn and returns immediately, so the re-seed
+  // always saw a pre-turn transcript (measured: re-seed at t+4ms saw 0
+  // entries; the first entry landed at t+1033ms). The re-seed now fires
+  // when the turn actually COMPLETES, signalled by the WS
+  // 'harness-status: idle' activity for the focused session.
+  const stubFetch = (body: string = '[]') =>
+    vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+  const seedFetches = (m: ReturnType<typeof vi.fn>) =>
+    m.mock.calls.filter((c) => String(c[0]).includes('/transcript')).length
+
+  it(`re-seeds when the focused session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    // The turn ends -> the harness goes idle -> re-seed.
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(2)
+    expect(result.current.entries).toEqual([])
+    vi.unstubAllGlobals()
+  })
+
+  it(`does NOT re-seed when a DIFFERENT session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    await act(async () => {
+      c.pushActivity('s2', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('does NOT re-seed on the initial load (no turn has completed)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('re-seeds merge new entries rather than replacing what is shown', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    let call = 0
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      call += 1
+      const body = call === 1
+        ? JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z')])
+        : JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z'), makeEntry('e2', '2026-01-01T00:00:01Z')])
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(1)
+
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[1]!.id).toBe('e2')
+    vi.unstubAllGlobals()
+  })
+})
+
 describe('useTranscriptStream', () => {
   it('returns empty entries when sessionId is null', () => {
     const c = fakeClient()

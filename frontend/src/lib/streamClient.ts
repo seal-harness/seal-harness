@@ -579,6 +579,19 @@ async function discoverStreamUrl(): Promise<string> {
   return `${proto}//${host}:${wsPort}/`
 }
 
+// ── Test drivers ──────────────────────────────────────────────────────────
+//
+// These let a test drive the WS the way the backend does: deliver an
+// entry frame, or signal turn completion. They are no-ops in production
+// (the real client cannot inject server frames) and are only meaningful
+// in a test that mocks this module.
+
+/** Deliver a transcript entry as if the server had broadcast it. */
+export const pushWsEntry = (_entry: unknown): void => {}
+
+/** Deliver an activity frame (e.g. turn completion) for a session. */
+export const pushWsActivity = (_sessionId: string, _activity: unknown): void => {}
+
 let _instance: (StreamClient & { close(): void }) | null = null
 
 /**
