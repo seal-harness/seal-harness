@@ -29,6 +29,7 @@ module Seal.Gateway.Send
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar, tryTakeMVar, putMVar)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (TVar, newTVarIO, readTVar, readTVarIO, writeTVar, atomically)
+import Control.Exception (finally)
 import Control.Monad (unless, void, when)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
@@ -95,6 +96,7 @@ import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
   , SessionLocks, sessionTurnInFlight )
+import Seal.Session.Log (appendSessionLog)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
@@ -358,7 +360,11 @@ wakeOnPendingCompletions deps sid = do
 -- running cannot be delivered by that turn's own end-of-turn hook (the
 -- nested wake skips — this frame still holds the wake mutex), so this
 -- frame re-checks the sidecar after each turn and runs the follow-up
--- turn itself. The chain is bounded by 'maxWakeTurns'.
+-- turn itself. The chain is bounded by 'maxWakeTurns'. The mutex is held
+-- only for the duration of one synthetic turn (released in a 'finally',
+-- so a turn that throws cannot leak it), and a skipped wake-up is logged
+-- at Warning level with the pending count — the skip is where a
+-- stranding would start if nothing else delivered the completions.
 wakeIdleSession :: SendDeps -> SessionId -> IO ()
 wakeIdleSession deps sid = loop (0 :: Int)
   where
@@ -372,13 +378,13 @@ wakeIdleSession deps sid = loop (0 :: Int)
       globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: sid=" <> sessionIdText sid
         <> " inFlight=" <> (if inFlight then "true" else "false")))
       if inFlight
-        then globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: skipping (turn in flight) sid=" <> sessionIdText sid))
+        then logSkipped "turn in flight"
         else do
           acquired <- tryAcquireWake (sdWakeMutex deps) sid
           globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: sid=" <> sessionIdText sid
             <> " wakeMutexAcquired=" <> (if acquired then "true" else "false")))
           if not acquired
-            then globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: skipping (wake mutex held) sid=" <> sessionIdText sid))
+            then logSkipped "wake mutex held"
             else
               if wakeTurns >= maxWakeTurns
                 then do
@@ -392,6 +398,10 @@ wakeIdleSession deps sid = loop (0 :: Int)
                       <> " consecutive wake-up turns with " <> T.pack (show pending)
                       <> " sub-agent completion(s) still pending for sid=" <> sessionIdText sid
                       <> " — no wake-up is scheduled for them"))
+                  appendSessionLog (Just (sessionLogPath (sdPaths deps) sid)) "WARN"
+                    ("[completion-diag] wake-up chain stopped after " <> T.pack (show maxWakeTurns)
+                      <> " consecutive wake-up turns with " <> T.pack (show pending)
+                      <> " sub-agent completion(s) still pending; no wake-up is scheduled for them")
                 else do
                   mMeta <- loadSessionMeta (sdPaths deps) sid
                   case mMeta of
@@ -404,12 +414,19 @@ wakeIdleSession deps sid = loop (0 :: Int)
                       -- The synthetic message is a minimal prompt; the real
                       -- content the LLM sees comes from the sidecar completions
                       -- injected by runTurnBody.
+                      --
+                      -- [D3] The mutex is released even when the synthetic
+                      -- turn throws: an exception in the turn must not leak
+                      -- the per-session wake mutex for the lifetime of the
+                      -- process (every later completion would then skip
+                      -- with "wake mutex held" and the session could never
+                      -- be woken again). The release also happens BEFORE
+                      -- the re-check, so a follow-up frame (this loop's
+                      -- next iteration, or a concurrent wake) can acquire
+                      -- it.
                       _ <- runSessionTurn td adapter meta Nothing "."
+                             `finally` releaseWake (sdWakeMutex deps) sid
                       globalLogIO DebugS (ls ("[idle-diag] wakeIdleSession: synthetic turn completed for sid=" <> sessionIdText sid))
-                      -- Release the mutex BEFORE the re-check: a follow-up
-                      -- turn (this frame's next iteration, or a concurrent
-                      -- wake) must be able to acquire it.
-                      releaseWake (sdWakeMutex deps) sid
                       -- A completion that arrived during the synthetic turn
                       -- is still in the sidecar: the nested wake-up that
                       -- would have delivered it was skipped (this frame
@@ -420,6 +437,25 @@ wakeIdleSession deps sid = loop (0 :: Int)
                           <> " sub-agent completion(s) arrived during the wake-up turn: follow-up wake for sid="
                           <> sessionIdText sid))
                         loop (wakeTurns + 1)
+
+    -- [completion-diag] A skipped wake-up is where a stranding would start
+    -- if nothing else delivered the completions (the process can die
+    -- mid-turn, in which case the turn-end pending check never fires), so
+    -- the skip is logged at Warning level with the pending count — visible
+    -- when it happens, not only in hindsight. Both skip reasons are
+    -- normally benign ("turn in flight": the turn's end-of-turn hook will
+    -- re-check; "wake mutex held": the frame holding it re-checks after
+    -- its turn) — the count tells an operator which case they are in.
+    logSkipped :: Text -> IO ()
+    logSkipped reason = do
+      pendingCount <- pendingCompletionCount (sdPaths deps) sid
+      globalLogIO WarningS
+        (ls ("[idle-diag] wakeIdleSession: skipping (" <> reason <> ") sid=" <> sessionIdText sid
+          <> " pendingCompletions=" <> T.pack (show pendingCount)))
+      appendSessionLog (Just (sessionLogPath (sdPaths deps) sid)) "WARN"
+        ("[idle-diag] wakeIdleSession: skipping (" <> reason <> "); pendingCompletions="
+          <> T.pack (show pendingCount)
+          <> " — they stay in the sidecar until a wake-up delivers them")
 -- * @taPreTurn@ — fans out the user's message to subscribed chat channels
 --   (cross-channel mirroring, @"web"@ label). No 'replySubscribe' (the web
 --   isn't an inbox-driven channel handle).

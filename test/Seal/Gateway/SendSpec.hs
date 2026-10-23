@@ -1335,6 +1335,124 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
 
+    it "a synthetic wake-up turn that throws still releases the wake mutex (a later completion can wake the session)" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-100000-w4a"
+            verdictA = "[subagent vtag--architect-agent-w4a completed] verdict A"
+            verdictB = "[subagent vtag--designer-agent-w4b completed] verdict B"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        gate1 <- newEmptyMVar
+        gate2 <- newEmptyMVar
+        resolveCalls <- newIORef (0 :: Int)
+        phase2Ref <- newIORef False
+        let resolve _ = do
+              phase2 <- readIORef phase2Ref
+              if phase2
+                then do
+                  -- Phase 2: every resolution yields a fresh one-shot gated
+                  -- provider (one putMVar unblocks exactly one call).
+                  fr <- newIORef True
+                  pure (Right (SomeProvider (RecordingProvider recorded fr (Just gate2)), ModelId "llama3.2"))
+                else do
+                  n <- atomicModifyIORef' resolveCalls (\c -> (c + 1, c))
+                  if n == 0
+                    then pure (Right (SomeProvider (RecordingProvider recorded firstRef (Just gate1)), ModelId "llama3.2"))
+                    else throwIO (userError "simulated provider-resolution crash (test)")
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "one"
+        outcome `shouldBe` SendAssistant
+        seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen1 `shouldBe` True
+        -- The first sub-agent finishes mid-turn.
+        appendCompletionToSidecar paths sid verdictA
+        putMVar gate1 ()
+        -- The turn's end-of-turn hook wakes the session; the WAKE turn's
+        -- provider resolution throws. Without the finally-bracketed
+        -- release, the wake mutex would leak here and no later wake-up
+        -- could ever acquire it.
+        threw <- waitFor 5000000 (readIORef resolveCalls) (>= 2)
+        threw `shouldBe` True
+        -- The completion stayed pending (the crashed wake never drained
+        -- the sidecar).
+        pendingA <- pendingCompletionCount paths sid
+        pendingA `shouldBe` 1
+        -- Phase 2: the resolver works again. A second mid-turn completion
+        -- triggers a second wake — which can only acquire the wake mutex
+        -- if the crashed one released it.
+        writeIORef phase2Ref True
+        outcome2 <- handleSend sendDeps sid "two"
+        outcome2 `shouldBe` SendAssistant
+        seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
+        seen2 `shouldBe` True
+        appendCompletionToSidecar paths sid verdictB
+        putMVar gate2 ()
+        -- The wake turn runs and parks on its own one-shot gate.
+        seen3 <- waitFor 5000000 (readIORef recorded) ((>= 3) . length)
+        seen3 `shouldBe` True
+        putMVar gate2 ()
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        reqs <- readIORef recorded
+        let textsOf i = case drop i reqs of
+              (r : _) -> requestTexts r
+              []      -> []
+        -- Turn two drained verdict A (left pending by the crashed wake);
+        -- the second wake delivered verdict B.
+        any (T.isInfixOf verdictA) (textsOf 1) `shouldBe` True
+        any (T.isInfixOf verdictB) (textsOf 2) `shouldBe` True
+
+    it "a skipped wake-up is logged at Warning level with the pending count" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-100000-w4b"
+            verdictA = "[subagent vtag--cto-agent-w4b completed] verdict A"
+            verdictB = "[subagent vtag--sre-agent-w4c completed] verdict B"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        gate1 <- newEmptyMVar
+        gate2 <- newEmptyMVar
+        gatesRef <- newIORef [gate1, gate2]
+        let resolve _ = pure (Right (SomeProvider (ChainProvider recorded gatesRef), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen1 `shouldBe` True
+        appendCompletionToSidecar paths sid verdictA
+        putMVar gate1 ()
+        -- The wake-up turn is now in flight (parked on the second gate).
+        seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
+        seen2 `shouldBe` True
+        appendCompletionToSidecar paths sid verdictB
+        putMVar gate2 ()
+        -- The wake-up turn ends; its own end-of-turn hook tries to wake
+        -- again and is skipped (the outer frame holds the wake mutex) —
+        -- the skip must be visible at WARN level with the pending count.
+        seen3 <- waitFor 5000000 (readIORef recorded) ((>= 3) . length)
+        seen3 `shouldBe` True
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        logContent <- readFile (sessionDir paths sid </> "seal.log")
+        let logText = T.pack logContent
+        logText `shouldSatisfy` ("[WARN]" `T.isInfixOf`)
+        logText `shouldSatisfy` ("skipping (wake mutex held)" `T.isInfixOf`)
+        logText `shouldSatisfy` ("pendingCompletions=1" `T.isInfixOf`)
+
   describe "end-of-turn hook (engine call-site semantics)" $ do
     -- These drive 'runSessionTurn' directly with 'tdOnTurnEnd' replaced
     -- by a recorder, pinning WHERE and WHEN the engine calls the hook.
