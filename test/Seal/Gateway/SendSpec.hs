@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec) where
@@ -13,6 +14,7 @@ import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
 import Data.Either (isLeft)
+import Data.Default (def)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
@@ -22,7 +24,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Options.Applicative qualified as Opt
@@ -36,9 +38,10 @@ import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
+import Seal.Core.TurnEngine (TurnAdapter (..), TurnDeps (..), TurnOutcome (..), buildStartWiring, runSessionTurn)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps )
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
@@ -58,13 +61,13 @@ import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
-import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
-import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted)
+import Seal.Session.Lock (newReplyRegistry, newSessionLocks, sessionTurnInFlight)
+import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted, setSessionAbort)
 import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Handles.Transcript
   ( IndexedTranscriptWrite (..), appendCompletionToSidecar, itwRecordAndAck
-  , withIndexedTranscript )
+  , pendingCompletionCount, withIndexedTranscript )
 import Data.ByteString qualified as BS
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
@@ -1104,6 +1107,318 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sawVerdict = any (T.isInfixOf verdict) allTexts
         sawVerdict `shouldBe` True
 
+  -- WU-3 (plan §3 D2): a completion that arrives while a turn is in
+  -- flight is delivered when the turn ends. The engine gained 'tdOnTurnEnd'
+  -- (called from the turn bracket's release action); the gateway wakes the
+  -- session when the sidecar still holds completions. These tests drive
+  -- the whole path through the public surface (handleSend) and observe it
+  -- through the provider calls the recording providers receive — the wake
+  -- internals are deliberately not exported.
+  describe "end-of-turn completion delivery" $ do
+
+    it "a completion that arrives during a wake-up turn is delivered by a follow-up wake-up turn" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-090000-w3a"
+            verdictA = "[subagent vtag--architect-agent-w3a completed] verdict A"
+            verdictB = "[subagent vtag--designer-agent-w3b completed] verdict B"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        gate1 <- newEmptyMVar
+        gate2 <- newEmptyMVar
+        gatesRef <- newIORef [gate1, gate2]
+        let resolve _ = pure (Right (SomeProvider (ChainProvider recorded gatesRef), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        -- The parent turn is in flight (parked on the first gate).
+        seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen1 `shouldBe` True
+        -- The first sub-agent finishes while the parent is mid-turn.
+        appendCompletionToSidecar paths sid verdictA
+        putMVar gate1 ()
+        -- The turn's end-of-turn hook wakes the session; the wake-up
+        -- turn is now in flight (parked on the second gate).
+        seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
+        seen2 `shouldBe` True
+        -- The second sub-agent finishes while the WAKE-UP turn is
+        -- mid-turn. That turn's own end-of-turn hook cannot deliver it
+        -- (the nested wake skips: the outer frame holds the wake mutex),
+        -- so the outer frame's follow-up wake-up turn must.
+        appendCompletionToSidecar paths sid verdictB
+        putMVar gate2 ()
+        -- The whole chain runs inside the parent turn's release action;
+        -- the tab appears only once the parent turn returns.
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
+        n1 `shouldBe` n2
+        -- Exactly three turns: the user turn, the first wake-up turn
+        -- (which delivers verdict A), and the follow-up (verdict B).
+        n2 `shouldBe` 3
+        reqs <- readIORef recorded
+        let textsOf i = case drop i reqs of
+              (r : _) -> requestTexts r
+              []      -> []
+        any (T.isInfixOf verdictA) (textsOf 1) `shouldBe` True
+        any (T.isInfixOf verdictB) (textsOf 2) `shouldBe` True
+
+    it "the wake chain terminates: a turn that ends with an empty sidecar starts no synthetic turn" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-090000-w3b"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef Nothing), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        -- No completion ever arrived: the turn count must settle at one
+        -- (the user turn), with no synthetic turn behind it.
+        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
+        n1 `shouldBe` n2
+        n1 `shouldBe` 1
+
+    it "the wake chain is bounded: a provider that cannot be resolved produces no unbounded sequence of wake turns, and the completions stay pending" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-090000-w3c"
+            verdict = "[subagent vtag--cto-agent-w3c completed] verdict C"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        gate <- newEmptyMVar
+        resolveCalls <- newIORef (0 :: Int)
+        let resolve _ = do
+              -- The user turn resolves a working provider; every later
+              -- resolution (the wake turns) fails — the early return
+              -- that never fires the end-of-turn hook and never drains
+              -- the sidecar. Only the chain's bound can stop the loop.
+              n <- atomicModifyIORef' resolveCalls (\c -> (c + 1, c))
+              if n == 0
+                then pure (Right (SomeProvider (RecordingProvider recorded firstRef (Just gate)), ModelId "llama3.2"))
+                else pure (Left "provider resolution failure (test)")
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        seen <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen `shouldBe` True
+        appendCompletionToSidecar paths sid verdict
+        putMVar gate ()
+        -- The user turn succeeds and its end-of-turn hook starts the
+        -- chain. The tab appears only when the whole chain returns — an
+        -- unbounded chain would hang the turn and this wait would fail.
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        (c1, c2) <- unchangedAfter 300000 (readIORef resolveCalls)
+        c1 `shouldBe` c2
+        c1 `shouldSatisfy` (> 1)    -- the chain really ran wake attempts
+        c1 `shouldSatisfy` (<= 12)  -- ... and it stopped: bounded
+        -- No wake turn ever reached the provider, and the completion is
+        -- still pending in the sidecar (delivered on the next user turn).
+        reqs <- readIORef recorded
+        length reqs `shouldBe` 1
+        pendingCount <- pendingCompletionCount paths sid
+        pendingCount `shouldBe` 1
+
+    it "the no-session-meta branch of the wake loop releases the wake mutex and starts no turn" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-090000-w3d"
+            verdictA = "[subagent vtag--sre-agent-w3d completed] verdict D1"
+            verdictB = "[subagent vtag--sre-agent-w3e completed] verdict D2"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        gate1 <- newEmptyMVar
+        gate2 <- newEmptyMVar
+        gatesRef <- newIORef [gate1, gate2]
+        let resolve _ = pure (Right (SomeProvider (ChainProvider recorded gatesRef), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "one"
+        outcome `shouldBe` SendAssistant
+        seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen1 `shouldBe` True
+        -- The session's meta disappears while the turn is in flight;
+        -- the completion then arrives with nothing to run a turn against.
+        removeFile (sessionDir paths sid </> "session.json")
+        appendCompletionToSidecar paths sid verdictA
+        putMVar gate1 ()
+        -- The turn ends, the hook fires, the wake takes the mutex — and
+        -- the no-meta branch releases it and runs NO turn.
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
+        n1 `shouldBe` n2
+        n1 `shouldBe` 1
+        -- The mutex must have been released by the no-meta branch: a
+        -- LATER wake still works. Restore the meta and repeat the
+        -- mid-turn delivery — the wake for verdict B can only acquire
+        -- the mutex if the first wake released it.
+        seedSession paths sid
+        outcome2 <- handleSend sendDeps sid "two"
+        outcome2 `shouldBe` SendAssistant
+        seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
+        seen2 `shouldBe` True
+        -- Turn two delivers verdict A at its start (the no-meta wake
+        -- left it pending in the sidecar, by design).
+        appendCompletionToSidecar paths sid verdictB
+        putMVar gate2 ()
+        seen3 <- waitFor 5000000 (readIORef recorded) ((>= 3) . length)
+        seen3 `shouldBe` True
+        (m1, m2) <- unchangedAfter 200000 (length <$> readIORef recorded)
+        m1 `shouldBe` m2
+        reqs <- readIORef recorded
+        let textsOf i = case drop i reqs of
+              (r : _) -> requestTexts r
+              []      -> []
+        any (T.isInfixOf verdictA) (textsOf 1) `shouldBe` True
+        any (T.isInfixOf verdictB) (textsOf 2) `shouldBe` True
+
+    it "a wake for a session with no open tab still delivers the completion (the turn runs headless)" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-090000-w3e"
+            verdict = "[subagent vtag--pm-agent-w3e completed] verdict E"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        gate <- newEmptyMVar
+        gatesRef <- newIORef [gate]
+        let resolve _ = pure (Right (SomeProvider (ChainProvider recorded gatesRef), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen1 `shouldBe` True
+        appendCompletionToSidecar paths sid verdict
+        putMVar gate ()
+        -- No tab binds the session when the wake fires; the synthetic
+        -- turn runs anyway and delivers the verdict.
+        seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
+        seen2 `shouldBe` True
+        reqs <- readIORef recorded
+        any (any (T.isInfixOf verdict) . requestTexts) (drop 1 reqs) `shouldBe` True
+        -- The wake turn re-inserts the tab itself (the headless turn
+        -- ends by auto-tabbing the session).
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+
+  describe "end-of-turn hook (engine call-site semantics)" $ do
+    -- These drive 'runSessionTurn' directly with 'tdOnTurnEnd' replaced
+    -- by a recorder, pinning WHERE and WHEN the engine calls the hook.
+    -- The recorder stores what 'sessionTurnInFlight' observed at the
+    -- moment the hook fired ('Nothing' = the hook never fired).
+
+    it "the hook fires after the session lock is released (the wake is not skipped as 'turn in flight')" $
+      withSystemTempDirectory "seal-turn-end" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-091000-w3f"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef Nothing), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let deps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        (outcome, hookRef) <- runWithRecordedHook deps sid
+        toError outcome `shouldBe` Nothing
+        readIORef hookRef `shouldReturn` Just False
+
+    it "the hook fires on a turn that threw" $
+      withSystemTempDirectory "seal-turn-end" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-091000-w3g"
+        let resolve _ = pure (Right (SomeProvider ThrowingProvider, ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let deps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        (outcome, hookRef) <- runWithRecordedHook deps sid
+        toError outcome `shouldSatisfy` isJust
+        readIORef hookRef `shouldReturn` Just False
+
+    it "the hook does not fire on the provider-resolution early return" $
+      withSystemTempDirectory "seal-turn-end" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-091000-w3h"
+        let resolve _ = pure (Left "no provider (test)")
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let deps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        (outcome, hookRef) <- runWithRecordedHook deps sid
+        toError outcome `shouldSatisfy` isJust
+        readIORef hookRef `shouldReturn` Nothing
+
+    it "the hook does not fire when the turn was aborted by the user" $
+      withSystemTempDirectory "seal-turn-end" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+            sid = mkSid "20261023-091000-w3i"
+        recorded <- newIORef ([] :: [CompletionRequest])
+        firstRef <- newIORef True
+        gate <- newEmptyMVar
+        let resolve _ = pure (Right (SomeProvider (RecordingProvider recorded firstRef (Just gate)), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths resolve
+        tabsH <- newTabsHandle
+        let deps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        hookRef <- newIORef (Nothing :: Maybe Bool)
+        let td = (mkWebTurnDeps deps)
+              { tdOnTurnEnd = Just (\_ ->
+                  sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+        done <- newEmptyMVar
+        _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
+        seen <- waitFor 5000000 (readIORef recorded) (not . null)
+        seen `shouldBe` True
+        -- The user aborts mid-turn (the /stop button). The abort flag is
+        -- only cleared at the NEXT turn's entry, so it is still set when
+        -- the turn's release action runs.
+        setSessionAbort (sdAbortReg deps) sid
+        putMVar gate ()
+        _ <- takeMVar done
+        readIORef hookRef `shouldReturn` Nothing
+
 -- | Discriminate a ParserResult Success for informative failure messages.
 isSuccess :: ParserResult a -> Bool
 isSuccess (Success _) = True
@@ -1119,3 +1434,67 @@ extractContentText v = do
   A.Object first_ <- case V.toList arr of (x : _) -> Just x; _ -> Nothing
   A.String t <- KeyMap.lookup (fromText "text") first_
   Just t
+
+-- | A fake provider that records every 'CompletionRequest' it receives
+-- and parks the first N calls on queued gates (one 'MVar' per gated
+-- call), answering every un-gated call immediately. The wake-chain
+-- tests use it to deliver a completion \"while the parent is still
+-- working\" at any depth of the chain: each gate holds one provider
+-- call mid-turn, so a completion can be delivered between two turns no
+-- matter which turn is running.
+data ChainProvider = ChainProvider
+  { cpRequests :: IORef [CompletionRequest]
+  , cpGates    :: IORef [MVar ()]
+  }
+
+instance Provider ChainProvider where
+  complete p req = do
+    modifyIORef' (cpRequests p) (++ [req])
+    mGate <- atomicModifyIORef' (cpGates p) (\case
+      []       -> ([], Nothing)
+      (g : gs') -> (gs', Just g))
+    for_ mGate takeMVar
+    pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
+  listModels _ = pure (Right [ModelId "llama3.2"])
+
+-- | Read a value, wait the given microseconds, read it again: the pair is
+-- returned so a test can assert the two reads agree — i.e. that whatever
+-- produces the value (a wake chain) has terminated.
+unchangedAfter :: Int -> IO a -> IO (a, a)
+unchangedAfter delayUs readAction = do
+  a <- readAction
+  threadDelay delayUs
+  a' <- readAction
+  pure (a, a')
+
+-- | A minimal 'TurnAdapter' for the tests that drive 'runSessionTurn'
+-- directly (the gateway's 'mkWebTurnAdapter' is not exported). Every
+-- hook is a no-op; the start-wiring builder is the engine's own.
+testTurnAdapter :: TurnDeps -> TurnAdapter
+testTurnAdapter td = TurnAdapter
+  { taCaps = def
+  , taPreTurn = \_ _ _ -> pure ()
+  , taChannelLabel = const "test"
+  , taOnStop = const Nothing
+  , taOnToolCall = Nothing
+  , taOnTextDelta = Nothing
+  , taOnUserMessage = const Nothing
+  , taPostTurn = \_ _ -> pure ()
+  , taStartWiring = \sessionBackends s appEnv eCfg operatorCeiling _meta ->
+      buildStartWiring td sessionBackends s appEnv eCfg operatorCeiling "web"
+  }
+
+-- | Run one turn synchronously through the engine with 'tdOnTurnEnd'
+-- replaced by a recorder: the hook stores what 'sessionTurnInFlight'
+-- observed at the moment it fired ('Nothing' = the hook never fired).
+-- Used to pin the hook's call-site semantics in 'runSessionTurn' (the
+-- turn bracket's release action).
+runWithRecordedHook :: SendDeps -> SessionId -> IO (TurnOutcome, IORef (Maybe Bool))
+runWithRecordedHook deps sid = do
+  hookRef <- newIORef (Nothing :: Maybe Bool)
+  let td = (mkWebTurnDeps deps)
+        { tdOnTurnEnd = Just (\_ ->
+            sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
+  pure (outcome, hookRef)

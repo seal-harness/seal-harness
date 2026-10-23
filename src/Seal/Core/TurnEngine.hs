@@ -148,7 +148,7 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, isAborted, lookupOrCreateAbortFlag)
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
@@ -445,6 +445,21 @@ data TurnDeps = TurnDeps
     -- turn so the sidecar completions are read and processed. 'Nothing' in
     -- tests / channels that don't support idle wake-up. The action must be
     -- safe to call from a forked thread (the child's worker thread).
+  , tdOnTurnEnd :: Maybe (SessionId -> IO ())
+    -- ^ End-of-turn hook: called when a turn ends, so the surface can
+    -- deliver sub-agent completions that arrived while the turn was in
+    -- flight (their idle wake-up was skipped: "turn in flight"). Called
+    -- from the turn bracket's release action — after the idle broadcast,
+    -- with the session lock (acquired in the bracket's body) already
+    -- released — so it runs on the exception path too: a turn that threw
+    -- still delivers its completions. NOT called on the provider-
+    -- resolution early return (that path returns before the bracket is
+    -- entered and never drains the completion sidecar — firing there
+    -- would start a wake chain that cannot end), and not when the turn
+    -- was aborted by the user (an explicit "not now": the completions
+    -- stay pending until the next user message). 'Nothing' on surfaces
+    -- with no wake-up (the CLI); the gateway wires it behind the same
+    -- 'sdEnableIdleWake' switch as 'tdOnIdleCompletion'.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -574,7 +589,28 @@ runSessionTurn td adapter meta mSrc t = do
             then broadcastReplyDelivered (tdBroker td) sid
             else do
               fanoutLastReply (tdReplies td) (tdBroker td) paths sid
-              broadcastReplyDelivered (tdBroker td) sid)
+              broadcastReplyDelivered (tdBroker td) sid
+          -- [engine] End-of-turn hook (the completion-delivery stranding
+          -- fix, plan §3 D2): a completion that arrived while this turn
+          -- was in flight has no other delivery scheduled — the idle
+          -- wake-up was skipped ("turn in flight") and nothing re-checks
+          -- when the turn ends. The surface (the gateway's wake-up wiring)
+          -- uses this to wake the session now that the turn — and the
+          -- session lock, which lives in the bracket's body — is done. The
+          -- call site is the release action on purpose: it runs on the
+          -- exception path too, so a turn that threw still delivers its
+          -- completions, and it runs after the idle broadcast so a
+          -- wake-up's "thinking" reads as a new turn (idle -> thinking,
+          -- not thinking -> idle). It does NOT fire on the provider-
+          -- resolution early return above (that path never enters the
+          -- bracket and never drains the sidecar — firing there would
+          -- start a wake chain that cannot end), and it does not fire
+          -- when the user aborted the turn: an explicit "not now" — the
+          -- completions stay pending until the next user message.
+          for_ (tdOnTurnEnd td) $ \onTurnEnd -> do
+            abortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
+            aborted <- isAborted abortFlag
+            unless aborted (onTurnEnd sid))
         (\_ -> withSessionLock (tdLocks td) sid $
           withIndexedTranscript sessionDirPath $ \tHandle ->
             runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
