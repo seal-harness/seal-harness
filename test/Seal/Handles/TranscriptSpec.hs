@@ -7,6 +7,7 @@ import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (getCurrentTime, UTCTime)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -68,6 +69,31 @@ mkEntryRecordAt ts kind convLen env = EntryRecord
   , erCorrelation = Nothing
   , erMeta = Map.empty
   }
+
+-- | A harness entry that injects a completed sub-agent's message into the
+-- conversation. @convLen@ is the DELTA (the number of injected messages),
+-- matching what the turn engine writes.
+mkCompletionEntry :: Int -> IO EntryRecord
+mkCompletionEntry injected = do
+  now <- getCurrentTime
+  pure EntryRecord
+    { erId = "h1"
+    , erTimestamp = now
+    , erKind = EKHarness
+    , erConvLen = injected
+    , erEnvelope = Nothing
+    , erUsage = Nothing
+    , erStop = Nothing
+    , erDurationMs = Nothing
+    , erHarness = Just completionHarnessTag
+    , erCorrelation = Nothing
+    , erMeta = Map.empty
+    }
+
+-- | A message big enough to keep the writer daemon busy for a few
+-- milliseconds, so a test can observe the daemon mid-write.
+bulkMessage :: Int -> Message
+bulkMessage n = Message User [CbText (T.replicate n "x")]
 
 spec :: Spec
 spec = describe "Seal.Handles.Transcript" $ do
@@ -200,26 +226,30 @@ spec = describe "Seal.Handles.Transcript" $ do
           Nothing -> expectationFailure "exception was not a TranscriptError"
         Right _ -> expectationFailure "expected an exception but got none"
 
-    it "itwRecordAndAck raises TranscriptError after daemon dies (fd closed externally)" $
+    it "itwRecordAndAck raises TranscriptError after the writer is closed" $
+      -- The completion handoff is now a DURABLE write, so the turn engine
+      -- has to survive the writer being gone: a handoff that cannot be
+      -- recorded is caught and logged, not thrown into the turn. This
+      -- test is the writer-side half of that contract - a durable write
+      -- against a closed writer must raise promptly rather than hang.
+      --
+      -- The writer is a bare `forkIO` with no exposed ThreadId, so
+      -- `itwCloseTranscript` is the only way to stop it; it used to be a
+      -- no-op, which is why this test previously only asserted that a
+      -- healthy write succeeds.
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
-        -- Make the directory read-only AFTER the files are opened, then
-        -- remove the files so fsync fails. Actually, a simpler approach:
-        -- close the fd by sending a signal. The most portable approach is
-        -- to use a directory on a full/tiny filesystem, but that's complex.
-        -- Instead, we test the liveness check: after a normal session, the
-        -- daemon is alive; if we write garbage to force an error, the daemon
-        -- dies and subsequent writes raise TranscriptError.
-        --
-        -- For now, this test verifies the contract: a successful write does
-        -- not raise, and itwIsAlive is True. The daemon-death path is
-        -- exercised by the integration test (a closed fd causes fsync to
-        -- fail, the handler fires, aliveRef flips, and the next
-        -- itwRecordAndAck raises TranscriptError instead of hanging).
         e <- mkEntryRecord 1
         withIndexedTranscript dir $ \h -> do
           itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
           alive <- itwIsAlive h
           alive `shouldBe` True
+          itwCloseTranscript h
+          alive' <- itwIsAlive h
+          alive' `shouldBe` False
+          r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e))
+          case r of
+            Left (TranscriptError msg) -> msg `shouldSatisfy` T.isInfixOf "dead"
+            Right _ -> expectationFailure "expected a TranscriptError but got none"
 
     it "emits a minimal envelope delta (only changed fields) on the second request" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
@@ -337,3 +367,201 @@ spec = describe "Seal.Handles.Transcript" $ do
         BS8.unpack convContents `shouldContain` "\"b\""
         BS8.unpack convContents `shouldContain` "\"c\""
         BS8.unpack convContents `shouldContain` "\"d\""
+
+  describe "completion-delivery diagnostics" $ do
+    it "counts a read that misses a completion injection the writer was asked to record" $
+      -- Regression net for the incident in session 20261021-204208-162: the
+      -- completion injection was enqueued asynchronously and the reader that
+      -- builds the model's context read the file before the writer had
+      -- flushed it. The model then reported a finished sub-agent as still
+      -- running while its verdict sat in the transcript.
+      --
+      -- The writer daemon is kept busy with a bulk write first, so the
+      -- injection is provably still queued when the reader runs.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 1
+        let prior = [Message User [CbText "q1"]]
+            injected = [Message User [CbText "[subagent x completed]"]]
+            bulk = [bulkMessage 4000 | _ <- [1 :: Int .. 400]]
+        withIndexedTranscript dir $ \h -> do
+          -- A bulk write first: the daemon is now busy redacting, writing
+          -- and fsyncing ~1.6MB.
+          bulkEntry <- mkEntryRecordAtAt EKHarness 400
+          itwRecordAsync h (IndexedTranscriptWrite bulk bulkEntry)
+          -- Now the completion injection, and a reader that runs while the
+          -- daemon is still on the bulk write.
+          itwRecordAsync h (IndexedTranscriptWrite (prior <> injected) completionEntry)
+          snapshot <- itwReadConversation h
+          diag <- itwDiagnostics h
+          tdInjectedTailMisses diag `shouldSatisfy` (> 0)
+          -- The reader really did miss the injected completion.
+          any (`elem` injected) snapshot `shouldBe` False
+
+    it "does not count a read that sees the completion injection" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 1
+        let prior = [Message User [CbText "q1"]]
+            injected = [Message User [CbText "[subagent x completed]"]]
+        withIndexedTranscript dir $ \h -> do
+          -- The prior conversation first, then the injection. A harness
+          -- entry's erConvLen is a DELTA, so the writer takes the new
+          -- messages from the position the writer has reached.
+          priorEntry <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite prior priorEntry)
+          -- Acked: the write is durable before the read, so the reader
+          -- cannot miss it.
+          itwRecordAndAck h (IndexedTranscriptWrite (prior <> injected) completionEntry)
+          snapshot <- itwReadConversation h
+          any (`elem` injected) snapshot `shouldBe` True
+          diag <- itwDiagnostics h
+          tdInjectedTailMisses diag `shouldBe` 0
+
+    it "counts a write whose conversation is shorter than the writer's" $
+      -- The other half of the incident: after an injection the writer is
+      -- ahead of the caller's in-memory conversation, so the caller's next
+      -- writes are sliced against the wrong offset and messages are silently
+      -- dropped from conversation.jsonl.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 2
+        let prior = [Message User [CbText "q1"]]
+            injected = [ Message User [CbText "[subagent a completed]"]
+                       , Message User [CbText "[subagent b completed]"] ]
+            -- The caller's list: the prior conversation plus a nudge, but
+            -- WITHOUT the two injected completions.
+            callerList = prior <> [Message User [CbText "."]]
+        withIndexedTranscript dir $ \h -> do
+          priorEntry <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite prior priorEntry)
+          itwRecordAndAck h (IndexedTranscriptWrite (prior <> injected) completionEntry)
+          -- The caller now writes a conversation that is one message
+          -- shorter than the writer has recorded.
+          callerEntry <- mkEntryRecordAtAt EKRequest 2
+          itwRecordAndAck h (IndexedTranscriptWrite callerList callerEntry)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldSatisfy` (> 0)
+          tdDesyncDroppedMessages diag `shouldSatisfy` (> 0)
+
+    it "counts a write whose conversation is the same length but different content" $
+      -- The shape the incident actually took: the writer recorded the
+      -- injected completion, and the caller's own conversation has the same
+      -- number of messages but a different one at the boundary (the wake-up
+      -- nudge instead of the completion). The lengths agree, so only a
+      -- content comparison catches it.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 1
+        let prior = [Message User [CbText "q1"]]
+            injected = [Message User [CbText "[subagent a completed]"]]
+            -- The caller's list: the prior conversation plus the wake-up
+            -- nudge, but WITHOUT the injected completion.
+            callerList = prior <> [Message User [CbText "."]]
+        withIndexedTranscript dir $ \h -> do
+          priorEntry <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite prior priorEntry)
+          itwRecordAndAck h (IndexedTranscriptWrite (prior <> injected) completionEntry)
+          callerEntry <- mkEntryRecordAtAt EKRequest 2
+          itwRecordAndAck h (IndexedTranscriptWrite callerList callerEntry)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldSatisfy` (> 0)
+          -- Same length, so nothing is dropped — but the file and the
+          -- model's context disagree about the last message.
+          tdDesyncDroppedMessages diag `shouldBe` 0
+
+    it "does not count a desync for aligned writes" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        withIndexedTranscript dir $ \h -> do
+          let conv1 = [Message User [CbText "q1"]]
+              conv2 = conv1 <> [Message Assistant [CbText "a1"]]
+              conv3 = conv2 <> [Message User [CbText "q2"]]
+          e1 <- mkEntryRecordAtAt EKRequest 1
+          e2 <- mkEntryRecordAtAt EKResponse 2
+          e3 <- mkEntryRecordAtAt EKRequest 3
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+          itwRecordAndAck h (IndexedTranscriptWrite conv3 e3)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldBe` 0
+          tdDesyncDroppedMessages diag `shouldBe` 0
+          recorded <- itwRecordedLength h
+          recorded `shouldBe` 3
+
+    it "R4: a durable handoff is visible to the next reader, even when the writer is busy" $
+      -- The property the fix relies on: a handoff that has been recorded
+      -- durably is in the conversation the next reader sees, even when
+      -- the writer still has a backlog to get through. This is what the
+      -- turn engine needs from the transcript once it records the
+      -- completion handoff durably.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        completionEntry <- mkCompletionEntry 1
+        let injected = [Message User [CbText "[subagent x completed]"]]
+            bulk = [bulkMessage 4000 | _ <- [1 .. (400 :: Int)]]
+        withIndexedTranscript dir $ \h -> do
+          -- A bulk write first: the daemon is busy redacting, writing and
+          -- fsyncing ~1.6MB while the handoff is queued behind it.
+          bulkEntry <- mkEntryRecordAtAt EKHarness (length bulk)
+          itwRecordAsync h (IndexedTranscriptWrite bulk bulkEntry)
+          -- The handoff, recorded DURABLY, and positioned so the writer
+          -- will write it once it gets past the bulk write (the list
+          -- continues the writer's state).
+          itwRecordAndAck h (IndexedTranscriptWrite (bulk <> injected) completionEntry)
+          modelContext <- itwReadConversation h
+          any (`elem` injected) modelContext `shouldBe` True
+
+    it "does not count a desync for a write that carries no conversation messages" $
+      -- The ACK-before-execute entries and the session preamble hand the
+      -- writer an EMPTY message list: they append a line to entries.jsonl
+      -- and nothing to conversation.jsonl. Such a write cannot desync the
+      -- conversation, however long the writer's conversation already is.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        withIndexedTranscript dir $ \h -> do
+          let conv1 = [Message User [CbText "q1"]]
+              conv2 = conv1 <> [Message Assistant [CbText "a1"]]
+          e1 <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          e2 <- mkEntryRecordAtAt EKResponse 2
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+          -- An entries-only write: no messages, convLen 0.
+          e3 <- mkEntryRecordAtAt EKRequest 0
+          itwRecordAndAck h (IndexedTranscriptWrite [] e3)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldBe` 0
+          tdDesyncDroppedMessages diag `shouldBe` 0
+
+    it "does not count a desync for a write of a different conversation" $
+      -- The /model and /stop commands append a notice to a session whose
+      -- conversation they never read: they hand the writer a one-message
+      -- list that is not the session's conversation. That is not a desync
+      -- (it cannot corrupt anything), and flagging it would bury the real
+      -- signal under noise on every /model and /stop.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        withIndexedTranscript dir $ \h -> do
+          let conv1 = [Message User [CbText "q1"]]
+              conv2 = conv1 <> [Message Assistant [CbText "a1"]]
+              notice = [Message Assistant [CbText "Model set to x"]]
+          e1 <- mkEntryRecordAtAt EKRequest 1
+          itwRecordAndAck h (IndexedTranscriptWrite conv1 e1)
+          e2 <- mkEntryRecordAtAt EKResponse 2
+          itwRecordAndAck h (IndexedTranscriptWrite conv2 e2)
+          -- A one-message write that is not the session's conversation.
+          e3 <- mkEntryRecordAtAt EKResponse 1
+          itwRecordAndAck h (IndexedTranscriptWrite notice e3)
+          diag <- itwDiagnostics h
+          tdDesyncEvents diag `shouldBe` 0
+          tdDesyncDroppedMessages diag `shouldBe` 0
+
+-- | An entry record with a fixed conversation length and no envelope.
+mkEntryRecordAtAt :: EntryKind -> Int -> IO EntryRecord
+mkEntryRecordAtAt kind convLen = do
+  now <- getCurrentTime
+  pure EntryRecord
+    { erId = "r1"
+    , erTimestamp = now
+    , erKind = kind
+    , erConvLen = convLen
+    , erEnvelope = Nothing
+    , erUsage = Nothing
+    , erStop = Nothing
+    , erDurationMs = Nothing
+    , erHarness = Nothing
+    , erCorrelation = Nothing
+    , erMeta = Map.empty
+    }

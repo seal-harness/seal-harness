@@ -20,7 +20,8 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types
-import Seal.Handles.Transcript (IndexedTranscriptHandle (..), fakeIndexedTranscript)
+import Seal.Handles.Transcript
+  ( IndexedTranscriptHandle (..), emptyTranscriptDiagnostics, fakeIndexedTranscript )
 import Seal.ISA.Dispatch
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Shell (shellExecSchema)
@@ -63,6 +64,8 @@ probe ref tl =
       , itwSetSecretOps    = \_ -> pure ()
       , itwCloseTranscript = pure ()
       , itwIsAlive         = pure True
+      , itwDiagnostics     = pure emptyTranscriptDiagnostics
+      , itwRecordedLength  = pure 0
       }
   , mkProbeOpcode ref tl
   )
@@ -79,6 +82,8 @@ probeHandle ref =
     , itwSetSecretOps    = \_ -> pure ()
     , itwCloseTranscript = pure ()
     , itwIsAlive         = pure True
+    , itwDiagnostics     = pure emptyTranscriptDiagnostics
+    , itwRecordedLength  = pure 0
     }
 
 mkProbeOpcode :: IORef [String] -> TrustLevel -> Opcode
