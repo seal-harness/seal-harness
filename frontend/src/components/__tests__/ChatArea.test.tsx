@@ -279,7 +279,7 @@ describe('transcriptToMessages', () => {
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
-  it('renders a new System Prompt row when the value changes between turns', () => {
+  it('renders the System Prompt row only once, at the top of the session', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -296,8 +296,8 @@ describe('transcriptToMessages', () => {
         raw: '{}',
       }),
       // Second request: system CHANGED to 'sys-B'; tools unchanged (omitted
-      // by the backend's delta encoding, but we include them here for the
-      // test since the dedup is purely content-based).
+      // by the backend's delta encoding, but we include them here so the
+      // test covers the changed-value case).
       makeEntry({
         id: 'c3',
         direction: 'request',
@@ -306,15 +306,17 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    // Two distinct system prompts → two rows; identical tools → one row.
-    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
+    // The session preamble is rendered ONCE, by the first LLM request —
+    // a mid-session change does NOT add a second System Prompt row
+    // half-way down the conversation (that row used to pop up at the
+    // bottom of a long session the moment the user hit enter).
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
-    // The first System Prompt row appears before the second.
+    // The System Prompt row carries the FIRST request's system prompt.
     const sysRows = msgs.filter((m) => m.agentName === 'System Prompt')
+    expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
+    // The System Prompt row appears before the first user message.
     const firstIdx = msgs.indexOf(sysRows[0]!)
-    const secondIdx = msgs.indexOf(sysRows[1]!)
-    expect(firstIdx).toBeLessThan(secondIdx)
-    // The first System Prompt row appears before the first user message.
     const userIdx = msgs.findIndex((m) => m.agentName === 'You')
     expect(firstIdx).toBeLessThan(userIdx)
   })
