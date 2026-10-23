@@ -1,5 +1,10 @@
 # Handoff: sub-agent completion delivery (the parent never learns a sub-agent finished)
 
+> **2026-10-23 update:** WU-3 and WU-4 are COMPLETE (commits 058ab1b, 532504c;
+> adversarial review PASS on both), and the live-run DoD is verified — see the
+> diagnosis doc section 10. What remains of WU-5 is the PR handoff. The status
+> sections below are the 2026-10-22 snapshot.
+
 **Date**: 2026-10-22 · **Branch**: `fix/subagent-completion-delivery-diagnostics` (pushed) · **PR**: #279 (draft) · **Plan**: `docs/plans/2026-10-22-subagent-completion-delivery-fix-plan.md`
 
 ## 1. Objective

@@ -27,6 +27,15 @@
 - #81 feat: git opcodes + SSH agent forwarding (no un-encrypted secret on disk) `(enhancement, area:config, area:security)`
 - #78 feat: Source control repo registry + credential-backed cloning `(enhancement, area:config, area:security)`
 
+### Sub-agent completion delivery — follow-ups (found while diagnosing PR #279)
+
+- [ ] Gateway restart mid-turn strands the pending completions — a startup sweep over every session's `agent-completions.jsonl` sidecar is needed (gateway-lifecycle feature, out of scope of the delivery fix; plan §5)
+- [ ] `agent def not found` spawn failures were invisible to the parent (5 of 18 completions in the incident session were `agent def not found: dr3-*`); the completions now surface, but the spawn-side validation is missing (plan §5)
+- [ ] The deferred-delivery path never delivers: `Seal/ISA/Ops/Agent.hs` skips the sidecar append when a child has pending descendants (`shouldDeferDelivery`) and nothing acts on the recorded settle flag (plan §5)
+- [ ] Torn-read hazard: `readConversation` is `mapMaybe decode`, so a partially-written trailing line is silently dropped (latent — unreachable while completion handoffs are durable) (plan §5)
+- [ ] `/model` and `/stop` notices never reach `conversation.jsonl` (they append to a conversation they never read; found by the new alignment detector) (plan §5)
+- [ ] `RegistrySpec > agentStatus > records Crashed when the worker throws` is load-flaky (its poll is bounded at ~2s and flaked once under full-suite load, 2026-10-23)
+
 ### Help Wanted
 
 - #15 Run local models with Ollama `(area:providers)`

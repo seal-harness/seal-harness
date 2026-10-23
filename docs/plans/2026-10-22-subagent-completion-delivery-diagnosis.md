@@ -304,3 +304,71 @@ dr3-pm@ (and @dr3-architect@, @dr3-designer@, @dr3-security@,
 those completions were invisible too, the model never learned that five of
 its eighteen sub-agents had failed to start.
 
+
+## 10. Post-fix verification (2026-10-23)
+
+Both defects are fixed (PR #279: WU-2 the durable handoff, WU-3 the
+end-of-turn delivery, WU-4 the wake-path hygiene). Every number quoted in
+§9 was re-checked against the fixed behaviour, deterministically (the
+R-tests) and on a live gateway (two sessions on an isolated gateway —
+SEAL_HOME pointed at a scratch state dir so the operator's real home was
+untouched — with a real background sub-agent and a real provider,
+ollama/gemma4).
+
+### 10.1 The race (§9.1: 21 of 21 completions missed)
+
+**Post-fix: 0 misses.** The completion injection is recorded durably
+(`itwRecordAndAck`) before the model's context is read. Across both live
+sessions, no `[transcript-diag] COMPLETION NOT VISIBLE TO READER` line
+appeared, and no `DESYNC` line. Pinned by R1 (the parent model is given
+the verdict) and R4 (the durable-handoff property with a busy writer).
+
+### 10.2 The transcript corruption (§9.2: 18 of the parent's messages absent)
+
+**Post-fix: nothing dropped.** The writer's conversation and the caller's
+stayed the same length, so the positional diff never sliced the wrong
+range. In both live transcripts the messages read, in order: the user's
+instruction, the parent's spawn tool call + result, the parent's own reply,
+the injected completion, the synthetic `.`, and the parent's
+acknowledgement — the parent's own messages all survived. Pinned by R2.
+
+### 10.3 The stranding (§9.3: 19 skipped wake-ups, 6 completions never delivered)
+
+**Post-fix: delivered at turn end.** Both live runs hit the mid-turn
+arrival (the child finished while the parent was still writing): the
+wake-up was skipped — now **visible at WARN level with the pending count**
+(`[idle-diag] wakeIdleSession: skipping (turn in flight);
+pendingCompletions=1`) — and the completion was injected **21 ms after
+the turn ended** (`[completion-diag] injecting 1 sub-agent completion(s)`),
+after which the parent acknowledged the child's `DONE` in its own words.
+No completion was left in a sidecar. Pinned by R3 plus the chain tests
+(follow-up delivery, termination, the bound, the no-meta branch, the
+headless wake).
+
+### 10.4 The polling model (§9.4: 19 sleep-poll calls)
+
+**Post-fix: no polling needed.** The live parents were instructed not to
+poll and did not — the verdict arrived as a harness message on the turn's
+end, without any status check.
+
+### 10.5 The §9.6 instrumentation gap
+
+**Closed (WU-4).** The skipped wake-up now reports the pending count at
+the moment of the skip (global log + the session's seal.log, WARN level),
+so a stranding would be visible when it starts even if the turn never
+ends (process death). Both skip reasons log their benign continuation
+(the turn's end-of-turn hook re-checks; the outer wake frame re-checks).
+
+### 10.6 Still open (tracked in TODO.md)
+
+The gateway-restart case (§9.5), the `agent def not found` spawn failures
+(§9.7), the deferred-delivery path, the torn-read hazard, and the
+`/model` + `/stop` notices are unchanged — each is now a tracking item in
+`TODO.md` under "Sub-agent completion delivery — follow-ups".
+
+### 10.7 Suite
+
+`make check` equivalent green on the final commit: build (`-Werror`)
+clean, **3169 examples, 0 failures** (the R-tests plus the eleven new
+WU-3/WU-4 tests), hlint: No hints. The matched delivery/hook set was run
+10 times consecutively with 0 failures.
