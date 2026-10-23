@@ -769,7 +769,6 @@ spec = describe "Seal.ISA.Integration" $ do
             , aswGate = gateOpen
             , aswPaths = testPaths
             , aswParentSession = sid
-            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
             }

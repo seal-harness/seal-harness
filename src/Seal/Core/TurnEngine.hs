@@ -1116,7 +1116,6 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswGate = gateOpen
     , aswPaths = tdPaths td
     , aswParentSession = parentSid
-    , aswParentLineage = [parentSid]
     , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
     , aswOnIdleCompletion = ($ parentSid) <$> tdOnIdleCompletion td
     }
@@ -1338,7 +1337,6 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
                 }
           , aswPaths = tdPaths td
           , aswParentSession = childSid
-          , aswParentLineage = lineage
           , aswRunRecords = Just (bRunRecords (tdBaseBackends td))
           , aswOnIdleCompletion = ($ childSid) <$> tdOnIdleCompletion td
           }

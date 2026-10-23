@@ -148,9 +148,9 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdParentSid    :: SessionId
     -- ^ The parent's session id — the child's transcript nests under it.
   , dwdParentLineage :: [SessionId]
-    -- ^ The parent's FULL lineage, self first (the value of the owning
-    -- 'Seal.ISA.Ops.Agent.AgentStartWiring''s @aswParentLineage@). The
-    -- worker prepends each spawned child's own id and passes
+    -- ^ The parent's FULL lineage, self first (threaded from
+    -- @buildWorker@'s @parentLineage@ parameter in "Seal.Core.TurnEngine").
+    -- The worker prepends each spawned child's own id and passes
     -- @childSid : dwdParentLineage@ to 'dwdChildRegistry' so the child's
     -- session ops get the whole chain baked in — no per-call meta reads,
     -- no directory scans on the guard path. Empty in test deps that

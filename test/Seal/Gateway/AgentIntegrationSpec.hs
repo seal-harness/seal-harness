@@ -1058,7 +1058,6 @@ gateTestWiring gate = do
         , spCache = "/tmp/seal-test/cache"
         }
     , aswParentSession = mkSystemSessionId "gate-parent"
-            , aswParentLineage = []
             , aswRunRecords = Nothing
             , aswOnIdleCompletion = Nothing
     }

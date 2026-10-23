@@ -532,7 +532,11 @@ agentDefDeleteOp backend = TrustedOpcode
 -- turn with the goal as the first user message, and reports the outcome via
 -- 'ChildWorkerOutcome'. The 'DelegationConfig' / 'SpawnPauseFlag' /
 -- 'ParentActivity' are process-global (or per-channel) and threaded in
--- here so the opcode doesn't read config.
+-- here so the opcode doesn't read config. The spawner's lineage is not
+-- carried in this record: it reaches spawned children via @buildWorker@'s
+-- @parentLineage@ parameter → @DelegationWorkerDeps@'s @dwdParentLineage@
+-- → the worker prepends the minted @childSid@ and passes the chain to the
+-- child-registry seam, where it is baked into the child session ops.
 data AgentStartWiring = AgentStartWiring
   { aswDefBackend   :: AgentDefBackend
   , aswRuntime      :: AgentRuntime
@@ -549,14 +553,6 @@ data AgentStartWiring = AgentStartWiring
   , aswParentSession :: SessionId
     -- ^ The parent's session id (so the completion callback knows which
     -- @conversation.jsonl@ to append to).
-  , aswParentLineage :: [SessionId]
-    -- ^ The FULL lineage of the session that OWNS this wiring, self
-    -- first (a top-level session's wiring carries @[sid]@; a child's
-    -- carries @child : parentLineage@). Baked at wiring-construction
-    -- time so the lineage guards never need a per-call session.json
-    -- read or directory scan: a child spawned by this session inherits
-    -- @childSid : aswParentLineage@. Empty in test wirings that don't
-    -- exercise lineage (the guards degrade to self-only).
   , aswRunRecords   :: Maybe RunRecord.RunRecordRegistry
     -- ^ The durable run-record registry (WU-5). When 'Just', the
     -- completion callback checks 'shouldDeferDelivery' before appending to
