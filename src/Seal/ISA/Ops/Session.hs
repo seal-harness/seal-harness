@@ -44,7 +44,7 @@ import Seal.Config.Paths
   ( SealPaths, sessionConversationPath, sessionDir, sessionMetaPath
   , resolveChildSessionPath )
 import Seal.Core.Paging
-  ( Page (..), PageParams (..), paginate, paginateDesc )
+  ( Page (..), PageParams (..), clamp, paginate, paginateDesc, windowSize )
 import Seal.Core.Types
   ( OpName (..), SessionId, TrustLevel (..), mkSessionId, sessionIdText )
 import Seal.Handles.Transcript (redactMessages)
@@ -118,6 +118,13 @@ renderOrderJson OrderDesc = "back-to-front"
 -- 50-message default with a 200-message hard ceiling.
 sessionPageParams :: PageParams
 sessionPageParams = PageParams { ppFloor = 50, ppCeiling = 200, ppCoeff = 0.0 }
+
+-- | Default window size for an around-anchored read (@around_index@):
+-- when the caller passes no explicit @limit@, the anchored window covers
+-- this many messages. Passed downstream as an explicit limit so the
+-- 'sessionPageParams' floor (50) cannot enlarge it.
+getAroundDefaultLimit :: Int
+getAroundDefaultLimit = 20
 
 -- ---------------------------------------------------------------------------
 -- Get render budget
@@ -197,10 +204,39 @@ sessionReadDir paths sid = do
       mChild <- resolveChildSessionPath paths sid
       pure (maybe (sessionDir paths sid) snd mChild)
 
+-- | Resolve the effective window parameters for a transcript read. An
+-- around-anchor (@around_index@), when present, overrides the caller's
+-- offset: the window becomes @limit@ messages starting at
+-- @max 0 (around_index - limit div 2)@, read front-to-back so the
+-- anchored message sits at the window's center. The caller's explicit
+-- limit is honored; without one the around-mode default is
+-- 'getAroundDefaultLimit' (resolved through 'windowSize', so it is
+-- passed as an explicit limit — the pagination floor cannot resize it).
+-- The start clamps to @[0, max 0 (total - limit)]@, so an anchor before
+-- the transcript reads from message 0 and an anchor beyond the end
+-- yields the window ending at the tail — out-of-range anchors clamp,
+-- never error. Without an anchor the caller's order, offset, and limit
+-- pass through unchanged.
+effectiveWindowParams
+  :: ReadOrder -> PageParams -> Int -> Maybe Int -> Maybe Int -> Int
+  -> (ReadOrder, Int, Maybe Int)
+effectiveWindowParams order params offset mLimit mAround total =
+  case mAround of
+    Nothing -> (order, offset, mLimit)
+    Just around ->
+      let limit = windowSize params total
+            (Just (fromMaybe getAroundDefaultLimit mLimit))
+          start = clamp 0 (max 0 (total - limit))
+            (max 0 (around - limit `div` 2))
+      in (OrderAsc, start, Just limit)
+
 -- | Read the count-selected message window from a transcript directory.
 -- Window selection is count-based ('paginateBy') on both paths; when
 -- @conversation.idx@ exists only the window's byte range is read
--- ('readConvLines'), otherwise the whole file is read and sliced. On
+-- ('readConvLines'), otherwise the whole file is read and sliced. An
+-- around-anchor ('effectiveWindowParams') is translated here — where the
+-- message total is known — into an equivalent front-to-back window, so
+-- the anchored read runs through the same windowing machinery. On
 -- the idx path the counts are the index's line counts — equal to the
 -- decoded-message counts for well-formed files, diverging only on
 -- malformed lines (accepted: guard behavior is identical, only the
@@ -208,8 +244,9 @@ sessionReadDir paths sid = do
 -- conversation file, corrupt index) falls back to the whole-file read.
 -- Both paths also load a 'redactionScanMargin'-sized margin of messages
 -- before the window start ('wrMargin').
-readTranscriptWindow :: ReadOrder -> PageParams -> Int -> Maybe Int -> FilePath -> IO WindowedRead
-readTranscriptWindow order params offset mLimit dir = do
+readTranscriptWindow
+  :: ReadOrder -> PageParams -> Int -> Maybe Int -> Maybe Int -> FilePath -> IO WindowedRead
+readTranscriptWindow order params offset mLimit mAround dir = do
   let convPath = dir </> "conversation.jsonl"
       idxPath = dir </> "conversation.idx"
   idxExists <- doesFileExist idxPath
@@ -223,7 +260,9 @@ readTranscriptWindow order params offset mLimit dir = do
           -- Window selection is pure count math; the unit list reuses
           -- 'paginateBy' itself so the idx path cannot drift from the
           -- whole-file path's windowing.
-          let page = paginateBy order params offset mLimit (replicate lineTotal ())
+          let (order', offset', mLimit') =
+                effectiveWindowParams order params offset mLimit mAround lineTotal
+              page = paginateBy order' params offset' mLimit' (replicate lineTotal ())
               start = pgOffset page
               count = length (pgItems page)
               marginStart = max 0 (start - redactionScanMargin)
@@ -244,7 +283,9 @@ readTranscriptWindow order params offset mLimit dir = do
   where
     viaWholeFile = do
       msgs <- readMessagesFromDir dir
-      let page = paginateBy order params offset mLimit msgs
+      let (order', offset', mLimit') =
+            effectiveWindowParams order params offset mLimit mAround (length msgs)
+          page = paginateBy order' params offset' mLimit' msgs
           start = pgOffset page
           marginStart = max 0 (start - redactionScanMargin)
       pure WindowedRead
@@ -425,6 +466,7 @@ handleGet paths lineage v = do
   let mSidText = textField v "session_id"
       offset = fromMaybe 0 (intField v "offset")
       mLimit = intField v "limit"
+      mAround = intField v "around_index"
       order = parseReadOrder v
   case mSidText >>= either (const Nothing) Just . mkSessionId . T.strip of
     Nothing -> pure (OpResult [TrpText "invalid session id"] True (object []))
@@ -446,8 +488,8 @@ handleGet paths lineage v = do
       case mMeta of
         Just meta -> do
           dir <- liftIO (sessionReadDir paths sid)
-          wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit dir)
-          pure (renderGetPage (renderSessionMeta meta) order offset
+          wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit mAround dir)
+          pure (renderGetPage (renderSessionMeta meta) order offset mAround
             [ "session_id" .= sessionIdText sid
             , "provider" .= smProvider meta
             , "model" .= smModel meta
@@ -459,10 +501,10 @@ handleGet paths lineage v = do
               [TrpText ("session not found: " <> sessionIdText sid)] True
               (object ["session_id" .= sessionIdText sid]))
             Just (parentSid, childDir) -> do
-              wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit childDir)
+              wr <- liftIO (readTranscriptWindow order sessionPageParams offset mLimit mAround childDir)
               pure (renderGetPage
                 ("[child session of " <> sessionIdText parentSid <> "] " <> sessionIdText sid)
-                order offset
+                order offset mAround
                 [ "session_id" .= sessionIdText sid
                 , "child_of" .= sessionIdText parentSid
                 ] (redactWindowedRead wr))
@@ -471,11 +513,15 @@ handleGet paths lineage v = do
 -- 'getRenderHeaderBytes' UTF-8 bytes), byte-budgeted message body, and
 -- footer (the count-based paging footer plus a truncation notice when the
 -- byte budget cut the body). The @userOffset@ is the caller-supplied
--- offset, used for the footer's paging guidance. The recorded metadata
--- stays content-free; @truncated@ is true when any output was cut — the
--- header, a single message, or the page budget.
-renderGetPage :: Text -> ReadOrder -> Int -> [Pair] -> WindowedRead -> OpResult
-renderGetPage rawHeader order userOffset extraRecorded wr =
+-- offset, used for the footer's paging guidance; @mAround@ is the
+-- caller-supplied @around_index@ anchor — when present the window was
+-- read front-to-back around that anchor, the footer points at
+-- @around_index@ for the adjacent windows, and the recorded metadata
+-- reports the effective window start plus the echoed anchor. The
+-- recorded metadata stays content-free; @truncated@ is true when any
+-- output was cut — the header, a single message, or the page budget.
+renderGetPage :: Text -> ReadOrder -> Int -> Maybe Int -> [Pair] -> WindowedRead -> OpResult
+renderGetPage rawHeader order userOffset mAround extraRecorded wr =
   let (header, headerTruncated) = capHeader getRenderHeaderBytes rawHeader
       bodyBudget = max minBodyBudget
         (getRenderBudgetBytes - utf8Bytes header - getRenderFooterReserveBytes)
@@ -483,19 +529,24 @@ renderGetPage rawHeader order userOffset extraRecorded wr =
       br = renderBudgetedWindow bodyBudget getRenderMessageBytes (wrOffset wr) (wrMessages wr)
       pageTruncated = headerTruncated || brAnyTruncated br || brBudgetHit br
       body = T.intercalate "\n\n" (brParts br)
-      countFooter = renderPageFooter order (wrOffset wr) userOffset
-        (wrWindowCount wr) (wrTotal wr) (wrHasMore wr)
+      effOrder = maybe order (const OrderAsc) mAround
+      countFooter = case mAround of
+        Just _  -> renderAroundPageFooter (wrOffset wr) (wrWindowCount wr) (wrTotal wr)
+        Nothing -> renderPageFooter order (wrOffset wr) userOffset
+          (wrWindowCount wr) (wrTotal wr) (wrHasMore wr)
       footer
         | brBudgetHit br =
             countFooter <> "\n[output truncated at " <> T.pack (show (brRenderedBytes br))
-              <> " bytes — narrow the window (limit / offset) for the part you need]"
+              <> " bytes — narrow the window (limit / offset / around_index) for the part you need]"
         | otherwise = countFooter
       rendered = T.intercalate "\n\n" (filter (not . T.null) [header, body, footer])
       recorded = object
         ( extraRecorded <>
-          [ "order" .= renderOrderJson order
+          [ "order" .= renderOrderJson effOrder
           , "offset" .= wrOffset wr
-          , "limit" .= wrWindowCount wr
+          ] <>
+          maybe [] (\a -> ["around_index" .= a]) mAround <>
+          [ "limit" .= wrWindowCount wr
           , "total_messages" .= wrTotal wr
           , "has_more" .= wrHasMore wr
           , "truncated" .= pageTruncated
@@ -544,7 +595,7 @@ sessionManageOp :: SealPaths -> SessionSearchBackend -> [SessionId] -> Opcode
 sessionManageOp paths searchBackend lineage = TrustedOpcode
   { toName = OpName "SESSION_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination). For get, order defaults to back-to-front (most recent messages first). A session cannot read its own transcript or any ancestor's — get on a session in this session's lineage is refused, and search never includes this session's lineage in its results. Search renders at most 20 result rows."
+  , toDesc = "Manage sessions. Use action to select: new (create session), list (enumerate), search (by text), get (read transcript with pagination). For get, reads are anchor-based: pass around_index to center the window on a global message index (the #N the transcript renders); the default back-to-front read (order=back-to-front, offset=0, most recent messages first) is the tail anchor — the window ending at the newest message — and offset remains for literal absolute paging. A session cannot read its own transcript or any ancestor's — get on a session in this session's lineage is refused, and search never includes this session's lineage in its results. Search renders at most 20 result rows."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -587,7 +638,11 @@ sessionManageOp paths searchBackend lineage = TrustedOpcode
               ]
           , fromText "offset" .= object
               [ "type" .= ("integer" :: Text)
-              , "description" .= ("Message offset, 0-based (get). In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0." :: Text)
+              , "description" .= ("Message offset, 0-based (get). In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0. Literal absolute paging; around_index is the anchor form." :: Text)
+              ]
+          , fromText "around_index" .= object
+              [ "type" .= ("integer" :: Text)
+              , "description" .= ("Center the read window on this global message index (0-based, the same #N the transcript renders). Overrides offset. Clamps to the transcript. Default limit 20 in this mode." :: Text)
               ]
           , fromText "limit" .= object
               [ "type" .= ("integer" :: Text)
@@ -709,7 +764,7 @@ sessionGetOp :: SealPaths -> [SessionId] -> Opcode
 sessionGetOp paths lineage = TrustedOpcode
   { toName = OpName "SESSION_GET"
   , toTrust = Trusted
-  , toDesc = "Read a session's transcript (conversation messages) with pagination. Returns a metadata header followed by rendered messages. Use offset/limit to page through long transcripts. A session cannot read its own transcript or any ancestor's. (Legacy — prefer SESSION_MANAGE with action=\"get\".)"
+  , toDesc = "Read a session's transcript (conversation messages) with pagination. Returns a metadata header followed by rendered messages. Reads are anchor-based: pass around_index to center the window on a global message index (the #N the transcript renders); the default back-to-front read (order=back-to-front, offset=0) is the tail anchor — the window ending at the newest message — and offset remains for literal absolute paging. A session cannot read its own transcript or any ancestor's. (Legacy — prefer SESSION_MANAGE with action=\"get\".)"
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -719,7 +774,11 @@ sessionGetOp paths lineage = TrustedOpcode
               ]
           , fromText "offset" .= object
               [ "type" .= ("integer" :: Text)
-              , "description" .= ("0-based message offset. In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0." :: Text)
+              , "description" .= ("0-based message offset. In front-to-back mode, counts from start; in back-to-front mode, counts from end. Default: 0. Literal absolute paging; around_index is the anchor form." :: Text)
+              ]
+          , fromText "around_index" .= object
+              [ "type" .= ("integer" :: Text)
+              , "description" .= ("Center the read window on this global message index (0-based, the same #N the transcript renders). Overrides offset. Clamps to the transcript. Default limit 20 in this mode." :: Text)
               ]
           , fromText "limit" .= object
               [ "type" .= ("integer" :: Text)
@@ -981,3 +1040,33 @@ renderPageFooter order displayOffset userOffset count total hasMore
         "[messages " <> rangeText <> " of " <> totalText <> " (end of transcript)]"
       OrderDesc ->
         "[messages " <> rangeText <> " of " <> totalText <> " (beginning of transcript)]"
+
+-- | Render the around-mode page footer: the count-based global range
+-- (the same @messages X-Y of Z@ the offset footer reports) plus guidance
+-- pointing at @around_index@ anchors for the adjacent windows. The
+-- anchors are the message indices just outside each window edge; an
+-- anchored window always contains its anchor message, so stepping to
+-- the edge anchors never skips messages.
+renderAroundPageFooter :: Int -> Int -> Int -> Text
+renderAroundPageFooter displayOffset count total
+  | total == 0 = "(0 messages in transcript)"
+  | before == 0 && after == 0 =
+      "[messages " <> rangeText <> " of " <> totalText <> " (whole transcript)]"
+  | otherwise =
+      "[messages " <> rangeText <> " of " <> totalText <> "; " <> partText
+        <> " - read with " <> T.intercalate " or " anchorTexts <> "]"
+  where
+    before = displayOffset
+    windowEnd = displayOffset + count
+    after = total - windowEnd
+    rangeText = T.pack (show (displayOffset + 1)) <> "-" <> T.pack (show windowEnd)
+    totalText = T.pack (show total)
+    partText = case (before, after) of
+      (0, a) -> T.pack (show a) <> " after"
+      (b, 0) -> T.pack (show b) <> " before"
+      (b, a) -> T.pack (show b) <> " before, " <> T.pack (show a) <> " after"
+    anchorTexts =
+      [ "around_index=" <> T.pack (show (displayOffset - 1))
+          <> " for an earlier window" | before > 0 ]
+        <> [ "around_index=" <> T.pack (show windowEnd)
+               <> " for a later window" | after > 0 ]

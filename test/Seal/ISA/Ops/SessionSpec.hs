@@ -82,6 +82,14 @@ toolUseMsg tcid name = TE.decodeUtf8
   (encodeConvLine
     (ConvLine (Message Assistant [CbToolUse tcid (OpName name) (object [])])))
 
+-- | @n@ conversation lines named msg0..msg(N-1), alternating user and
+-- assistant roles (even indices are user messages, matching the msg0
+-- convention of the existing pagination fixtures).
+numberedMsgs :: Int -> [Text]
+numberedMsgs n =
+  [ (if even i then userMsg else assistantMsg) ("msg" <> T.pack (show i))
+  | i <- [0 .. n - 1] ]
+
 -- | Mint a fixed, valid SessionId from a literal text (for tests that need
 -- deterministic child ids without going through 'newSession').
 fixedSessionId :: Text -> SessionId
@@ -1149,7 +1157,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
             -- getRenderBudgetBytes is 98304: the whole rendered page fits.
             BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
             T.isInfixOf "output truncated at" t `shouldBe` True
-            T.isInfixOf "narrow the window (limit / offset)" t `shouldBe` True
+            T.isInfixOf "narrow the window (limit / offset / around_index)" t `shouldBe` True
             T.isInfixOf "[content truncated]" t `shouldBe` False
             T.isInfixOf "messages 1-200 of 200" t `shouldBe` True
             T.isInfixOf "budget payload 0 " t `shouldBe` True
@@ -1419,3 +1427,341 @@ spec = describe "Seal.ISA.Ops.Session" $ do
           _ -> expectationFailure "expected a single text part"
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
         T.isInfixOf "super-secret-value" recorded `shouldBe` False
+
+  -- -----------------------------------------------------------------------
+  -- Anchor-based windowing (around_index)
+  -- -----------------------------------------------------------------------
+  describe "around_index windowing" $ do
+    it "centers the window on around_index with true global #N indices (idx path)" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        _ <- buildIndex (sessionConversationPath paths (smId meta))
+                        (sessionConversationIndexPath paths (smId meta))
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (5 :: Int)
+            , "limit" .= (4 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- limit=4 around 5: the window starts at 5 - 4 div 2 = 3.
+            forM_ ["msg3", "msg4", "msg5", "msg6"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg2", "msg7"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            -- Global indices: the window starts at transcript index 3.
+            forM_ ["(#3)", "(#4)", "(#5)", "(#6)"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["(#2)", "(#7)"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            -- The window renders chronologically (front-to-back).
+            let posOf m = T.length (fst (T.breakOn m t))
+            posOf "msg3" `shouldSatisfy` (< posOf "msg4")
+            posOf "msg4" `shouldSatisfy` (< posOf "msg5")
+            posOf "msg5" `shouldSatisfy` (< posOf "msg6")
+            -- Footer: global range plus around_index anchors for the
+            -- adjacent windows.
+            T.isInfixOf "messages 4-7 of 12" t `shouldBe` True
+            T.isInfixOf "3 before, 5 after" t `shouldBe` True
+            T.isInfixOf "around_index=2 for an earlier window" t `shouldBe` True
+            T.isInfixOf "around_index=7 for a later window" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"offset\":3" recorded `shouldBe` True
+        T.isInfixOf "\"limit\":4" recorded `shouldBe` True
+        T.isInfixOf "\"around_index\":5" recorded `shouldBe` True
+        T.isInfixOf "\"order\":\"front-to-back\"" recorded `shouldBe` True
+
+    it "overrides offset when both are present" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (5 :: Int)
+            , "offset" .= (99 :: Int)
+            , "limit" .= (4 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- offset=99 is ignored: the window is the same centered
+            -- [3, 7) window as around_index alone.
+            forM_ ["msg3", "msg4", "msg5", "msg6"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg2", "msg7"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"offset\":3" recorded `shouldBe` True
+
+    it "defaults to limit 20 in around mode" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 30)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (15 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Default limit 20 around 15: window [5, 25).
+            forM_ ["msg5", "msg24"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg4", "msg25"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            T.count "(#" t `shouldBe` 20
+            T.isInfixOf "messages 6-25 of 30" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"limit\":20" recorded `shouldBe` True
+        T.isInfixOf "\"offset\":5" recorded `shouldBe` True
+        T.isInfixOf "\"around_index\":15" recorded `shouldBe` True
+
+    it "clamps a negative around_index to a window from the transcript start" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (-5 :: Int)
+            , "limit" .= (4 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Start clamps to 0: messages 0-3 render.
+            forM_ ["msg0", "msg1", "msg2", "msg3"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg4", "msg8"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            T.isInfixOf "messages 1-4 of 12" t `shouldBe` True
+            T.isInfixOf "8 after" t `shouldBe` True
+            T.isInfixOf "around_index=4 for a later window" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"offset\":0" recorded `shouldBe` True
+        T.isInfixOf "\"around_index\":-5" recorded `shouldBe` True
+
+    it "clamps an around_index beyond the end to a window ending at the tail" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (100 :: Int)
+            , "limit" .= (4 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Start clamps to 12 - 4 = 8: the window ends at the tail.
+            forM_ ["msg8", "msg9", "msg10", "msg11"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg6", "msg7"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            T.isInfixOf "messages 9-12 of 12" t `shouldBe` True
+            T.isInfixOf "8 before" t `shouldBe` True
+            T.isInfixOf "around_index=7 for an earlier window" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"offset\":8" recorded `shouldBe` True
+        T.isInfixOf "\"around_index\":100" recorded `shouldBe` True
+
+    it "anchors near the tail end the window at the newest message" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (11 :: Int)
+            , "limit" .= (4 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Raw start 11 - 2 = 9 clamps to 12 - 4 = 8: window [8, 12).
+            forM_ ["msg8", "msg11"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            T.isInfixOf "msg7" t `shouldBe` False
+            T.isInfixOf "8 before - read with around_index=7 for an earlier window" t
+              `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "covers the whole transcript when the around window spans it" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta) (numberedMsgs 12)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (6 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Default limit 20 exceeds the transcript: start clamps to 0
+            -- and the window is the whole transcript.
+            forM_ ["msg0", "msg11", "(#0)", "(#11)"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            T.isInfixOf "messages 1-12 of 12 (whole transcript)]" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"limit\":12" recorded `shouldBe` True
+        T.isInfixOf "\"offset\":0" recorded `shouldBe` True
+
+    it "returns the empty-transcript message without error for an around read" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (5 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> T.isInfixOf "(0 messages in transcript)" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+
+    it "applies the byte budget to around windows" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let bigMsgs =
+              [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
+                  <> T.replicate 5900 "x")
+              | i <- [0 .. 59 :: Int] ]
+        seedConversation paths (smId meta) bigMsgs
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (30 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Default limit 20 around 30: window [20, 40), and the
+            -- ~5.9KB messages blow the page budget mid-window.
+            BS.length (TE.encodeUtf8 t) `shouldSatisfy` (<= 98304)
+            T.isInfixOf "output truncated at" t `shouldBe` True
+            T.isInfixOf "narrow the window (limit / offset / around_index)" t
+              `shouldBe` True
+            T.isInfixOf "budget payload 20 " t `shouldBe` True
+            T.isInfixOf "budget payload 10 " t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"truncated\":true" recorded `shouldBe` True
+        T.isInfixOf "payload" recorded `shouldBe` False
+
+    it "redacts margin-adjacent secrets in around windows" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        seedConversation paths (smId meta)
+          [ userMsg "margin0"
+          , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
+          , toolResultMsg "super-secret-value"
+          , userMsg "window-end"
+          , userMsg "after-tail"
+          ]
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText (smId meta)
+            , "around_index" .= (3 :: Int)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- Window [2, 4): the tool result and window-end. The
+            -- tool-use at index 1 is only in the pre-window margin.
+            T.isInfixOf "<redacted:secret>" t `shouldBe` True
+            T.isInfixOf "super-secret-value" t `shouldBe` False
+            T.isInfixOf "window-end" t `shouldBe` True
+            T.isInfixOf "margin0" t `shouldBe` False
+            T.isInfixOf "after-tail" t `shouldBe` False
+            T.isInfixOf "messages 3-4 of 5" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "super-secret-value" recorded `shouldBe` False
+
+    it "refuses an around_index read of a lineage member with the same refusal" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        saveSessionMeta paths (meta { smId = lineageParentSid })
+        seedConversation paths lineageParentSid
+          [ userMsg "parent secret work"
+          , assistantMsg "parent answer"
+          ]
+        let op = sessionManageOp paths inMemorySessionSearchBackend testLineage
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "action" .= ("get" :: Text)
+            , "session_id" .= sessionIdText lineageParentSid
+            , "around_index" .= (0 :: Int)
+            ]))
+        orIsError r `shouldBe` True
+        case orParts r of
+          [TrpText t] -> do
+            T.isInfixOf "ancestor" t `shouldBe` True
+            T.isInfixOf (sessionIdText lineageParentSid) t `shouldBe` True
+            T.isInfixOf "parent secret work" t `shouldBe` False
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"ancestor_read\":true" recorded `shouldBe` True
+
+    it "supports around_index on the child-resolution branch" $ do
+      withSystemTempDirectory "seal-session-spec" $ \tmp -> do
+        let paths = mkPaths tmp
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        let childSid = fixedSessionId "20260101-120000-012"
+        seedChildConversation paths (smId parentMeta) childSid (numberedMsgs 6)
+        let op = sessionGetOp paths [callerSessionId]
+        r <- runTestApp (opRun op localBackend
+          (object
+            [ "session_id" .= sessionIdText childSid
+            , "around_index" .= (4 :: Int)
+            , "limit" .= (2 :: Int)
+            ]))
+        orIsError r `shouldBe` False
+        case orParts r of
+          [TrpText t] -> do
+            -- limit=2 around 4: window [3, 5), chronological.
+            forM_ ["msg3", "msg4", "(#3)", "(#4)"] $ \m ->
+              T.isInfixOf m t `shouldBe` True
+            forM_ ["msg2", "msg5"] $ \m ->
+              T.isInfixOf m t `shouldBe` False
+            T.isInfixOf "child session of" t `shouldBe` True
+            T.isInfixOf "messages 4-5 of 6" t `shouldBe` True
+          _ -> expectationFailure "expected a single text part"
+        let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+        T.isInfixOf "\"offset\":3" recorded `shouldBe` True
+        T.isInfixOf "\"around_index\":4" recorded `shouldBe` True
