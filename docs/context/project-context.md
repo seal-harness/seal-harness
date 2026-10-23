@@ -1,34 +1,20 @@
 # Project Context (Maintained by Orchestrator)
 
 ## Tooling
-- Package manager / build: `nix develop` + `cabal` (via Makefile wrappers)
-- Build: `make build` (cabal build all, inside nix develop)
-- Test runner: `make test` (`cabal test`); frontend `vitest`
-- Linter: `make lint` (`hlint src/ test/`)
-- Full gate: `make check` = build + test + lint
-- Frontend: React 18 + TS + Vite + Tailwind
-- Frontend gate: `cd frontend && npm run build` (tsc + vite; must exist before
-  cabal build) + `npm run test`
+- Build/test/lint: `make check` (build + test + lint) — MUST be green before any commit
+- Everything runs via Nix: `nix develop --command cabal ...`; never pipe cabal/hlint through head/tail (SIGPIPE hangs) — redirect to a file, then read it
+- Run a subset of tests: `nix develop --command cabal run test:tests -- -m "<match>" > /tmp/t.log 2>&1` then read /tmp/t.log
+- Test framework: hspec + QuickCheck; suite must stay sub-second; bound all generators
+- GHC 9.12, GHC2021, `-Wall -Werror` + strict flag set; no partial functions (head/tail/fromJust/read/!!); strict fields by default; Text not String; whole-module imports; named-field construction; Haddock comments on top-level defs are the norm (follow existing file style); no content-dependent alignment
 
 ## Completed Work Units
-| WU | Title | Key Files | Status |
-|----|-------|-----------|--------|
+| WU | Title | Key Files | Notes |
+|----|-------|-----------|-------|
+| pre-plan | Self-read refusal + search self-exclusion (commit 13b8501) | src/Seal/ISA/Ops/Session.hs, src/Seal/Core/TurnEngine.hs | sessionManageOp/sessionGetOp/sessionSearchOp take the current `session :: SessionId` baked at registry-build time; handleGet refuses `sid == session` before both top-level and child branches; handleSearch filters self from matched/childMatched |
 
 ## Established Patterns
-- CRUD views: left list pane (280px) + right editor pane, AgentsView/SecretsView/ReposView pattern
-- API handlers: `case (requestMethod, pathInfo req) of ...` manual dispatch in `apiApp`
-- Vault access: `readIORef (vrHandleRef (adVault deps))` → `Maybe VaultHandle`
-- Config access: `srConfigPath (adSessionRuntime deps)` + `updateRuntimeConfig`
-- SealRoute GADT in src-gateway-types/Seal/Gateway/Types/Route.hs + openApiMeta in OpenApi.hs
-- Route count assertion in test/Seal/Gateway/ApiRouteSpec.hs
-- Provider module shape (mirror `Seal.Providers.Anthropic`/`Seal.Providers.Ollama`):
-  pure `encodeRequest`/`decodeResponse` + `sendX` HTTP + `withApiKey` CPS for
-  the bearer header; `Manager` field on the provider record; `mkX :: Manager -> ... `
-  constructor; `httpErrorText` special-cases 429/401.
-- `withApiKey :: ApiKey -> (ByteString -> r) -> r` (Secrets.hs) — key bytes only
-  live inside the continuation.
-- Provider modules are FORBIDDEN to import `System.Process`/`System.Directory`/
-  `System.Posix`/`Servant.*`.
-
-## Active Services
-See `docs/plans/active-plan.md`.
+- Current-session identity: baked into ops at registry-build time (`sessionManageOp paths searchBackend session`), mirrors `skillManageOp backend session`
+- Op guard placement: in `handleGet`'s case, as a guard clause before both the meta branch and child-resolution branch (Session.hs ~:215-225)
+- Tests: `runTestApp` harness + `mkPaths` temp-dir SealPaths + `seedConversation`/`seedChildConversation` + `fixedSessionId`/`callerSessionId` helpers in test/Seal/ISA/Ops/SessionSpec.hs
+- TDD: write failing test first (observe runtime red with an intentionally-unused binding if needed), minimal implementation, re-run green
+- No .cabal/test-Main.hs changes needed unless new modules are added (WU4 only)

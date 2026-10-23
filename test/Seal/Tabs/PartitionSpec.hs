@@ -30,6 +30,7 @@ mkMeta s =
     , smProvider = "ollama"
     , smModel = "llama3.2"
     , smChannel = "cli"
+    , smParent = Nothing
     , smAgent = Nothing
     , smSystemOverride = Nothing
     , smAgentName = Nothing

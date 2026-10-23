@@ -63,6 +63,7 @@ import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks, sessionTurnInFlight)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted, setSessionAbort)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Handles.Transcript
@@ -238,7 +239,8 @@ mkSendDepsWith paths resolveStub = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  testRepeatReg <- newSessionRepeatRegistry
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -273,6 +275,7 @@ mkSendDepsWith paths resolveStub = do
         , sdReplies     = testReplies
         , sdLocks       = testLocks
         , sdAbortReg    = testAbortReg
+        , sdRepeatReg   = testRepeatReg
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
         , sdIsRemote    = False
@@ -292,7 +295,7 @@ seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 spec :: Spec
@@ -758,7 +761,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -846,7 +849,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -885,7 +888,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -1524,7 +1527,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let td = (mkWebTurnDeps deps)
               { tdOnTurnEnd = Just (\_ ->
                   sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
         done <- newEmptyMVar
         _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -1613,6 +1616,6 @@ runWithRecordedHook deps sid = do
   let td = (mkWebTurnDeps deps)
         { tdOnTurnEnd = Just (\_ ->
             sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
   pure (outcome, hookRef)

@@ -47,6 +47,8 @@ import Seal.Agent.Env
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag, setAbort)
+import Seal.ISA.RepeatDetect
+  (RepeatTrack, newRepeatTrack, repeatWarnNote, repeatBlockedMessage)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -58,6 +60,15 @@ import Seal.Agent.Loop
 testAbortFlag :: AbortFlag
 testAbortFlag = unsafePerformIO newAbortFlag
 {-# NOINLINE testAbortFlag #-}
+
+-- | A shared test repeat track (top-level, created once via
+-- unsafePerformIO). None of the pre-existing loop tests dispatch an
+-- opcode in 'Seal.ISA.RepeatDetect.repeatScope' (SESSION_MANAGE /
+-- SESSION_GET), so a single shared track is behaviorally inert for them;
+-- the repeat-detection tests below build their own fresh tracks.
+testRepeatTrack :: RepeatTrack
+testRepeatTrack = unsafePerformIO newRepeatTrack
+{-# NOINLINE testRepeatTrack #-}
 
 -- | A provider that returns a scripted list of responses, one per call.
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
@@ -146,6 +157,17 @@ runTestApp act = do
   env <- mkEnv logger defaultConfig
   runApp env act
 
+-- | The tool-result blocks (error flag + parts) from the final captured
+-- request: the last provider call of a turn sees every tool result fed
+-- back during the turn, so these are the results the model observed.
+lastRequestToolResults :: [CompletionRequest] -> [(Bool, [ToolResultPart])]
+lastRequestToolResults reqs = case reverse reqs of
+  (lastReq : _) ->
+    [ (cbIsError b, cbParts b)
+    | b <- concatMap msgContent (crMessages lastReq)
+    , CbToolResult{} <- pure b ]
+  [] -> []
+
 spec :: Spec
 spec = describe "Seal.Agent.Loop" $ do
   describe "stripToolCallXml" $ do
@@ -229,6 +251,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hello")
@@ -274,6 +297,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -337,6 +361,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       , aeAbortFlag = testAbortFlag
+                      , aeRepeatTrack = testRepeatTrack
                       , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
@@ -398,6 +423,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       , aeAbortFlag = testAbortFlag
+                      , aeRepeatTrack = testRepeatTrack
                       , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
@@ -475,6 +501,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       , aeAbortFlag = testAbortFlag
+                      , aeRepeatTrack = testRepeatTrack
                       , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
@@ -588,6 +615,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
@@ -636,6 +664,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
@@ -684,6 +713,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
@@ -743,6 +773,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "ping")
@@ -790,6 +821,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -836,6 +868,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -888,6 +921,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -946,6 +980,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -995,6 +1030,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -1042,6 +1078,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1088,6 +1125,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1135,6 +1173,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1179,6 +1218,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1232,6 +1272,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1281,6 +1322,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1328,6 +1370,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1372,6 +1415,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1425,6 +1469,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -1456,6 +1501,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeBackend = localBackend
                   , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
@@ -1503,6 +1549,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeBackend = localBackend
                   , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
@@ -1553,6 +1600,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeBackend = localBackend
                   , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
@@ -1602,6 +1650,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeBackend = localBackend
                   , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
@@ -1678,6 +1727,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "loop")
@@ -1776,6 +1826,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "start")
@@ -1831,6 +1882,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -1883,6 +1935,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -1931,6 +1984,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -1980,6 +2034,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -2039,6 +2094,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "ping")
@@ -2132,6 +2188,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -2182,6 +2239,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
@@ -2237,6 +2295,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   , aeAbortFlag = testAbortFlag
+                  , aeRepeatTrack = testRepeatTrack
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
@@ -2308,6 +2367,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 , aeAbortFlag = abortFlag
+                , aeRepeatTrack = testRepeatTrack
                 , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hello")
@@ -2383,6 +2443,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeOnDemandSchemas = False
             , aeLogPath = Nothing
             , aeAbortFlag = testAbortFlag
+            , aeRepeatTrack = testRepeatTrack
             , aeToolTimeout = defaultToolTimeoutConfig
             }
       runTestApp (runTurn env "hello")
@@ -2458,6 +2519,7 @@ spec = describe "Seal.Agent.Loop" $ do
             , aeOnDemandSchemas = False
             , aeLogPath = Nothing
             , aeAbortFlag = testAbortFlag
+            , aeRepeatTrack = testRepeatTrack
             , aeToolTimeout = defaultToolTimeoutConfig
             }
       runTestApp (runTurn env "hello")
@@ -2467,6 +2529,209 @@ spec = describe "Seal.Agent.Loop" $ do
       case reqs of
         (firstReq : _) -> length (crMessages firstReq) `shouldBe` 101
         [] -> expectationFailure "provider was not called"
+
+  -- ── No-progress repeat detection (session reads, WU4) ─────────────
+  describe "repeat detection (session reads)" $ do
+    it "four identical SESSION_MANAGE calls: 2nd/3rd carry the warn note, 4th is blocked and never dispatched" $ do
+      approvals <- newApprovalCache
+      spyCount <- newIORef (0 :: Int)
+      reqRef <- newIORef ([] :: [CompletionRequest])
+      let caps = def
+          -- A spy SESSION_MANAGE: Trusted (skips the confirmation gate),
+          -- run increments the spy counter. The repeat detector must let
+          -- the 1st-3rd through and block the 4th BEFORE dispatch.
+          spyOp = TrustedOpcode (OpName "SESSION_MANAGE") Trusted "spy session read"
+                      (object []) (object [])
+                      (const (Right ())) False
+                      (\_ _ -> do
+                         liftIO (modifyIORef' spyCount (+ 1))
+                         pure (OpResult [TrpText "session data"] False Null))
+          identInput = object ["action" .= ("get" :: Text), "session_id" .= ("20261022-174851-823" :: Text)]
+          script =
+            [ CompletionResponse
+                [CbToolUse (ToolCallId tid) (OpName "SESSION_MANAGE") identInput]
+                StopToolUse (Usage 0 0)
+            | tid <- ["t1", "t2", "t3", "t4"]
+            ] <>
+            [ CompletionResponse [CbText "all done"] StopEnd (Usage 0 0) ]
+          scriptRef = unsafePerformIO (newIORef script)
+      freshTrack <- newRepeatTrack
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+            { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+            , aeProviderLabel = "ollama"
+            , aeModel = ModelId "m"
+            , aeSystem = Nothing
+            , aeRegistry = mkRegistry [spyOp]
+            , aeTranscript = h
+            , aeBackend = localBackend
+            , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , aeCaps = caps
+            , aeSession = either (error "sid") id (mkSessionId "s1")
+            , aeMaxTurns = 8
+            , aeChannel = "test"
+            , aeMessageSource = Nothing
+            , aeAutonomy = Full
+            , aeApprovals = approvals
+            , aeDebugRequestsPath = Nothing
+            , aeDebugResponsePath = Nothing
+            , aeOnEntry = pure ()
+            , aeMaxModelRetries = 3
+            , aeRetryBaseDelayMs = 1000
+            , aeOnUserMessage = Nothing
+            , aeOnStop = Nothing
+            , aeStopFanoutDone = stopFanoutDoneRef
+            , aeOnToolCall = \_ _ -> pure ()
+            , aeOnTextDelta = Nothing
+            , aeOnDemandSchemas = False
+            , aeLogPath = Nothing
+            , aeAbortFlag = testAbortFlag
+            , aeRepeatTrack = freshTrack
+            , aeToolTimeout = defaultToolTimeoutConfig
+            }
+      runTestApp (runTurn env "read the session")
+      -- The spy ran exactly 3 times: the blocked 4th never dispatched.
+      readIORef spyCount `shouldReturn` 3
+      -- The final request's messages carry all four tool results in order.
+      reqs <- readIORef reqRef
+      length reqs `shouldBe` 5
+      let results = lastRequestToolResults reqs
+      results `shouldSatisfy` (== 4) . length
+      case results of
+        [r1, r2, r3, r4] -> do
+          -- 1st: unchanged result.
+          r1 `shouldBe` (False, [TrpText "session data"])
+          -- 2nd + 3rd: the warn note is PREPENDED to the result parts.
+          r2 `shouldBe` (False, [TrpText repeatWarnNote, TrpText "session data"])
+          r3 `shouldBe` (False, [TrpText repeatWarnNote, TrpText "session data"])
+          -- 4th: blocked — an actionable error, op never dispatched.
+          r4 `shouldBe` (True, [TrpText (repeatBlockedMessage (OpName "SESSION_MANAGE"))])
+        _ -> expectationFailure ("expected 4 tool results, got " <> show (length results))
+
+    it "four DISTINCT SESSION_MANAGE inputs never warn or block" $ do
+      approvals <- newApprovalCache
+      spyCount <- newIORef (0 :: Int)
+      reqRef <- newIORef ([] :: [CompletionRequest])
+      let caps = def
+          spyOp = TrustedOpcode (OpName "SESSION_MANAGE") Trusted "spy session read"
+                      (object []) (object [])
+                      (const (Right ())) False
+                      (\_ _ -> do
+                         liftIO (modifyIORef' spyCount (+ 1))
+                         pure (OpResult [TrpText "session data"] False Null))
+          script =
+            [ CompletionResponse
+                [CbToolUse (ToolCallId tid) (OpName "SESSION_MANAGE")
+                   (object ["action" .= ("get" :: Text), "offset" .= (i :: Int)])]
+                StopToolUse (Usage 0 0)
+            | (tid, i) <- zip ["t1", "t2", "t3", "t4"] [1 ..]
+            ] <>
+            [ CompletionResponse [CbText "all done"] StopEnd (Usage 0 0) ]
+          scriptRef = unsafePerformIO (newIORef script)
+      freshTrack <- newRepeatTrack
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+            { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+            , aeProviderLabel = "ollama"
+            , aeModel = ModelId "m"
+            , aeSystem = Nothing
+            , aeRegistry = mkRegistry [spyOp]
+            , aeTranscript = h
+            , aeBackend = localBackend
+            , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , aeCaps = caps
+            , aeSession = either (error "sid") id (mkSessionId "s1")
+            , aeMaxTurns = 8
+            , aeChannel = "test"
+            , aeMessageSource = Nothing
+            , aeAutonomy = Full
+            , aeApprovals = approvals
+            , aeDebugRequestsPath = Nothing
+            , aeDebugResponsePath = Nothing
+            , aeOnEntry = pure ()
+            , aeMaxModelRetries = 3
+            , aeRetryBaseDelayMs = 1000
+            , aeOnUserMessage = Nothing
+            , aeOnStop = Nothing
+            , aeStopFanoutDone = stopFanoutDoneRef
+            , aeOnToolCall = \_ _ -> pure ()
+            , aeOnTextDelta = Nothing
+            , aeOnDemandSchemas = False
+            , aeLogPath = Nothing
+            , aeAbortFlag = testAbortFlag
+            , aeRepeatTrack = freshTrack
+            , aeToolTimeout = defaultToolTimeoutConfig
+            }
+      runTestApp (runTurn env "read the session")
+      -- All four dispatched; no notes, no blocks.
+      readIORef spyCount `shouldReturn` 4
+      reqs <- readIORef reqRef
+      length reqs `shouldBe` 5
+      let results = lastRequestToolResults reqs
+      results `shouldBe` replicate 4 (False, [TrpText "session data"])
+
+    it "a spy SESSION_MANAGE with no repeat-scope op is untracked: four identical PING calls all dispatch" $ do
+      -- Out-of-scope ops must see ZERO behavior change from the detector.
+      approvals <- newApprovalCache
+      spyCount <- newIORef (0 :: Int)
+      reqRef <- newIORef ([] :: [CompletionRequest])
+      let caps = def
+          spyOp = TrustedOpcode (OpName "PING") Trusted "spy ping"
+                      (object []) (object [])
+                      (const (Right ())) False
+                      (\_ _ -> do
+                         liftIO (modifyIORef' spyCount (+ 1))
+                         pure (OpResult [TrpText "pong"] False Null))
+          script =
+            [ CompletionResponse
+                [CbToolUse (ToolCallId tid) (OpName "PING") (object [])]
+                StopToolUse (Usage 0 0)
+            | tid <- ["t1", "t2", "t3", "t4"]
+            ] <>
+            [ CompletionResponse [CbText "all done"] StopEnd (Usage 0 0) ]
+          scriptRef = unsafePerformIO (newIORef script)
+      freshTrack <- newRepeatTrack
+      (h, _) <- fakeIndexedTranscript
+      stopFanoutDoneRef <- newIORef False
+      let env = AgentEnv
+            { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+            , aeProviderLabel = "ollama"
+            , aeModel = ModelId "m"
+            , aeSystem = Nothing
+            , aeRegistry = mkRegistry [spyOp]
+            , aeTranscript = h
+            , aeBackend = localBackend
+            , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , aeCaps = caps
+            , aeSession = either (error "sid") id (mkSessionId "s1")
+            , aeMaxTurns = 8
+            , aeChannel = "test"
+            , aeMessageSource = Nothing
+            , aeAutonomy = Full
+            , aeApprovals = approvals
+            , aeDebugRequestsPath = Nothing
+            , aeDebugResponsePath = Nothing
+            , aeOnEntry = pure ()
+            , aeMaxModelRetries = 3
+            , aeRetryBaseDelayMs = 1000
+            , aeOnUserMessage = Nothing
+            , aeOnStop = Nothing
+            , aeStopFanoutDone = stopFanoutDoneRef
+            , aeOnToolCall = \_ _ -> pure ()
+            , aeOnTextDelta = Nothing
+            , aeOnDemandSchemas = False
+            , aeLogPath = Nothing
+            , aeAbortFlag = testAbortFlag
+            , aeRepeatTrack = freshTrack
+            , aeToolTimeout = defaultToolTimeoutConfig
+            }
+      runTestApp (runTurn env "ping repeatedly")
+      readIORef spyCount `shouldReturn` 4
+      reqs <- readIORef reqRef
+      let results = lastRequestToolResults reqs
+      results `shouldBe` replicate 4 (False, [TrpText "pong"])
 
   -- ── Fallback XML tool call parser ────────────────────────────────
   describe "parseXmlToolCalls (fallback for GLM XML tool calls)" $ do

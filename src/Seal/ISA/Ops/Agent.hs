@@ -532,7 +532,11 @@ agentDefDeleteOp backend = TrustedOpcode
 -- turn with the goal as the first user message, and reports the outcome via
 -- 'ChildWorkerOutcome'. The 'DelegationConfig' / 'SpawnPauseFlag' /
 -- 'ParentActivity' are process-global (or per-channel) and threaded in
--- here so the opcode doesn't read config.
+-- here so the opcode doesn't read config. The spawner's lineage is not
+-- carried in this record: it reaches spawned children via @buildWorker@'s
+-- @parentLineage@ parameter → @DelegationWorkerDeps@'s @dwdParentLineage@
+-- → the worker prepends the minted @childSid@ and passes the chain to the
+-- child-registry seam, where it is baked into the child session ops.
 data AgentStartWiring = AgentStartWiring
   { aswDefBackend   :: AgentDefBackend
   , aswRuntime      :: AgentRuntime

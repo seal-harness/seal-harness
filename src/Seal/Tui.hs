@@ -46,6 +46,7 @@ import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (..))
 import Seal.Handles.Tab (TabKind (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -152,6 +153,7 @@ runTui autonomy logger = do
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   arProbeAndSweep agentRegH
   abortReg <- newSessionAbortRegistry
+  repeatReg <- newSessionRepeatRegistry
   -- The /new command: mints a fresh session and inserts a new tab into
   -- the TabsHandle. The ndInsertTab closure reads the old sid from
   -- srActive BEFORE swapping, inserts a new tab bound to the new session,
@@ -198,4 +200,4 @@ runTui autonomy logger = do
         )
   harnessReg <- newHarnessRegistry
   tmuxRunner <- mkRealTmuxRunner
-  runCliTui paths rt repoReg agentRegH pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg
+  runCliTui paths rt repoReg agentRegH pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg repeatReg

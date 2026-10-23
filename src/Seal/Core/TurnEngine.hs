@@ -149,6 +149,7 @@ import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, isAborted, lookupOrCreateAbortFlag)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
@@ -320,9 +321,9 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
       , sessionListOp paths
-      , sessionSearchOp paths (bSessionSearch backends)
-      , sessionGetOp paths
-      , sessionManageOp paths (bSessionSearch backends)
+      , sessionSearchOp paths (bSessionSearch backends) [sid]
+      , sessionGetOp paths [sid]
+      , sessionManageOp paths (bSessionSearch backends) [sid]
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.hideOpcodes legacyHidden
@@ -390,6 +391,13 @@ data TurnDeps = TurnDeps
   , tdReplies      :: ReplyRegistry
   , tdLocks        :: SessionLocks
   , tdAbortReg     :: SessionAbortRegistry
+  , tdRepeatReg    :: SessionRepeatRegistry
+    -- ^ Process-lifetime no-progress repeat registry (session-read
+    -- hardening WU4). Created ONCE per process at the same origination
+    -- sites as 'tdAbortReg' (channels/web via 'newChannelDeps'; CLI/TUI at
+    -- entry) and threaded identically — a per-request registry would
+    -- silently reset the cross-turn window. The engine looks up the
+    -- session's 'RepeatTrack' per turn (mirroring 'lookupOrCreateAbortFlag').
   , tdTabsHandle   :: TabsHandle
   , tdLogger       :: SealLogger
   , tdIsRemote     :: Bool
@@ -721,6 +729,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               autoloadId injectCatalog injectAgents catalogAgentDefs
               parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
+  turnRepeatTrack <- lookupOrCreateRepeatTrack (tdRepeatReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
@@ -762,6 +771,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
                    Nothing   -> pure ()
               , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag
+              , teRepeatTrack   = turnRepeatTrack
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               })
             { aeMessageSource = mSrc }
@@ -1193,7 +1203,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswWorker =
         case tdMkWorker td of
           Just stub | 1 >= tdMkWorkerStubDepth td -> stub
-          _ -> buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel 0
+          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
@@ -1241,16 +1251,17 @@ hexSuffix4 n = T.justifyRight 4 '0' (T.pack (go n))
 -- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
 -- message.
 buildWorker
-  :: TurnDeps -> Backends -> SessionId -> Env -> Either a RuntimeConfig -> Int -> Text
+  :: TurnDeps -> Backends -> SessionId -> [SessionId] -> Env -> Either a RuntimeConfig -> Int -> Text
   -> Int
      -- ^ This worker's OWN delegation depth (0 = a top-level session's
      -- worker; its children run at depth 1). Threaded so an orchestrator
      -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
   -> AgentWorkerBuilder
-buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel ownDepth =
+buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
+    , dwdParentLineage = parentLineage
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
@@ -1273,7 +1284,8 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdResolveProvider = resolveChild
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
-    , dwdChildRegistry = buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling appEnv channel
+    , dwdChildRegistry = \childLineage ->
+        buildChildRegistryAdapter childLineage td sessionBackends eCfg operatorCeiling appEnv channel
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1283,6 +1295,12 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdOnEntry = pure ()
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
+    , dwdRepeatTrack = lookupOrCreateRepeatTrack (tdRepeatReg td)
+      -- ^ Same shape as 'dwdAbortFlag': the CHILD's own track, keyed by the
+      -- child's session id at consumption time (session-read hardening WU4).
+      -- The child's repeat window is independent of the parent's — a child
+      -- re-reading its own session transcript is guarded by the child's
+      -- own counts.
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
     }
   where
@@ -1303,7 +1321,7 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
       resolveDefProvider (tdProvider td) fallBackProvider (ModelId fallBackModel)
     fallbackMeta tnow = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+      , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
@@ -1315,10 +1333,15 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
 -- role-conditioned nested @AGENT_START@ wired with a child-side
 -- 'AgentStartWiring' (child depth+1, child-rooted session mint, the SAME
 -- workdir⊕user union def backend, and a re-anchored worker-builder).
+-- The @lineage@ is the child's FULL chain (self first) as passed by
+-- 'Seal.Agent.Runtime.Delegation.Worker.mkDelegateWorker'
+-- (@childSid : parentLineage@) — it is baked into the child's session
+-- ops (the read guards) and into the nested wiring, never looked up at
+-- op-run time.
 buildChildRegistryAdapter
-  :: TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
+  :: [SessionId] -> TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
+buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
@@ -1358,8 +1381,8 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)
-       , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td))
-       , sessionGetOp (tdPaths td)
+        , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td)) lineage
+        , sessionGetOp (tdPaths td) lineage
         , nestedAgentStartOp
         ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
@@ -1413,7 +1436,7 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
       nestedWorker = case tdMkWorker td of
         Just stub
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
-        _ -> buildWorker td sessionBackends childSid adapterAppEnv
+        _ -> buildWorker td sessionBackends childSid lineage adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at
