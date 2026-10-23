@@ -1,0 +1,68 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>module Seal.Types.Command
+<span class="lineno">    2 </span>  ( Command(..)
+<span class="lineno">    3 </span>  , pCommand
+<span class="lineno">    4 </span>  ) where
+<span class="lineno">    5 </span>
+<span class="lineno">    6 </span>import Options.Applicative
+<span class="lineno">    7 </span>
+<span class="lineno">    8 </span>import Seal.Security.Policy (AutonomyLevel (..))
+<span class="lineno">    9 </span>
+<span class="lineno">   10 </span>-- | The subcommand selected on the command line. 'CommandNoOp' is the
+<span class="lineno">   11 </span>-- harmless placeholder carried by 'defaultConfig'; it is not exposed as a
+<span class="lineno">   12 </span>-- subcommand (the subcommands are @tui@, @signal@, and @serve@) and is
+<span class="lineno">   13 </span>-- excluded from the config-file 'FromJSON'/'ToJSON' instances.
+<span class="lineno">   14 </span>-- Each subcommand carries the autonomy level selected via @--yolo@
+<span class="lineno">   15 </span>-- ('Full' — bypass the human-confirmation gate) vs the default
+<span class="lineno">   16 </span>-- ('Supervised' — prompt before running any Untrusted opcode).
+<span class="lineno">   17 </span>data Command
+<span class="lineno">   18 </span>  = CommandNoOp
+<span class="lineno">   19 </span>  | CommandTui AutonomyLevel
+<span class="lineno">   20 </span>  | CommandSignal AutonomyLevel
+<span class="lineno">   21 </span>  | CommandTelegram AutonomyLevel
+<span class="lineno">   22 </span>  | CommandServe AutonomyLevel
+<span class="lineno">   23 </span>  | CommandGenOpenApi
+<span class="lineno">   24 </span>  deriving (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>pCommand :: Parser Command
+<span class="lineno">   27 </span><span class="decl"><span class="istickedoff">pCommand = hsubparser</span>
+<span class="lineno">   28 </span><span class="spaces">  </span><span class="istickedoff">$  command <span class="nottickedoff">&quot;tui&quot;</span> <span class="nottickedoff">(info (CommandTui &lt;$&gt; pAutonomy)</span></span>
+<span class="lineno">   29 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">(progDesc &quot;Start the interactive terminal UI (TUI)&quot;))</span></span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;signal&quot; (info (CommandSignal &lt;$&gt; pAutonomy)</span>
+<span class="lineno">   31 </span><span class="spaces">                             </span><span class="istickedoff">(progDesc &quot;Run the agent over the Signal channel&quot;))</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;telegram&quot; (info (CommandTelegram &lt;$&gt; pAutonomy)</span>
+<span class="lineno">   33 </span><span class="spaces">                               </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Run the agent over the Telegram channel&quot;</span>))</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;serve&quot; (info (CommandServe &lt;$&gt; pAutonomy)</span>
+<span class="lineno">   35 </span><span class="spaces">                            </span><span class="istickedoff">(progDesc &quot;Run the web gateway server&quot;))</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;gen-openapi&quot; <span class="nottickedoff">(info (pure CommandGenOpenApi)</span></span>
+<span class="lineno">   37 </span><span class="spaces">                                  </span><span class="istickedoff"><span class="nottickedoff">(progDesc &quot;Print the OpenAPI 3.1 spec (JSON) to stdout&quot;))</span></span></span>
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | @--yolo@ sets 'Full' autonomy (bypass the untrusted-opcode approval
+<span class="lineno">   40 </span>-- gate); absent defaults to 'Supervised'.
+<span class="lineno">   41 </span>pAutonomy :: Parser AutonomyLevel
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">pAutonomy = flag Supervised Full</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">( long &quot;yolo&quot;</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help &quot;Bypass the approval gate so untrusted opcodes run without prompting (ACK audit still recorded)&quot;</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+
+</pre>
+</body>
+</html>

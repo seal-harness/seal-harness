@@ -1,0 +1,115 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | Channel metadata attached to log entries via 'withChannelContext'.
+<span class="lineno">    4 </span>-- Carries the channel kind (typed 'ChannelKind' enum, not a magic string),
+<span class="lineno">    5 </span>-- a SHA-256 hash of the conversation id (first 12 hex chars — PII defense:
+<span class="lineno">    6 </span>-- phone numbers and chat ids are never logged in full to the operator
+<span class="lineno">    7 </span>-- console), and the session id (timestamp-derived, not PII).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The context is 'Maybe'-heavy so partial states (a reader thread with no
+<span class="lineno">   10 </span>-- session yet, a slash command before the turn starts) can still log with
+<span class="lineno">   11 </span>-- whatever metadata is available.
+<span class="lineno">   12 </span>module Seal.Logging.ChannelContext
+<span class="lineno">   13 </span>  ( ChannelContext (..)
+<span class="lineno">   14 </span>  , ctxFromMessageSource
+<span class="lineno">   15 </span>  , ctxFromSession
+<span class="lineno">   16 </span>  , hashConversationId
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Aeson (ToJSON (..), object, (.=))
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   23 </span>import GHC.Generics (Generic)
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Katip (LogItem (..), ToObject (..), PayloadSelection (..))
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText, channelKindFromText)
+<span class="lineno">   28 </span>import Seal.Core.MessageSource (MessageSource (..), conversationIdText)
+<span class="lineno">   29 </span>import Seal.Core.Types (sessionIdText)
+<span class="lineno">   30 </span>import Seal.Security.Crypto (sha256Hash)
+<span class="lineno">   31 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | Structured channel metadata for log entries. Attached to a 'SealLogger'
+<span class="lineno">   34 </span>-- via 'withChannelContext' at the start of each turn.
+<span class="lineno">   35 </span>data ChannelContext = ChannelContext
+<span class="lineno">   36 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ccChannelKind</span></span></span>         :: Maybe ChannelKind
+<span class="lineno">   37 </span>    -- ^ The typed channel enum ('Telegram', 'Signal', 'Web', 'Cli', etc.).
+<span class="lineno">   38 </span>    -- Serialized via 'channelKindToText' in the 'ToJSON' instance.
+<span class="lineno">   39 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccConversationIdHash</span></span></span>  :: Maybe Text
+<span class="lineno">   40 </span>    -- ^ SHA-256 hash (first 12 hex chars) of the conversation id. PII
+<span class="lineno">   41 </span>    -- defense: phone numbers (Signal) and chat ids (Telegram) are never
+<span class="lineno">   42 </span>    -- logged in full to the operator console. The full conversation id is
+<span class="lineno">   43 </span>    -- available only in the per-session @seal.log@.
+<span class="lineno">   44 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccSessionId</span></span></span>           :: Maybe Text
+<span class="lineno">   45 </span>    -- ^ The session id (timestamp-derived, not PII). Logged in full so the
+<span class="lineno">   46 </span>    -- operator can correlate log lines to sessions.
+<span class="lineno">   47 </span>  }
+<span class="lineno">   48 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ChannelContext</span></span></span></span></span></span></span></span> where
+<span class="lineno">   51 </span>  <span class="decl"><span class="istickedoff">toJSON ctx = object</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;channelKind&quot;        .= fmap channelKindToText (ccChannelKind ctx)</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">, &quot;conversationIdHash&quot; .= ccConversationIdHash ctx</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">, &quot;sessionId&quot;          .= ccSessionId ctx</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>instance <span class="decl"><span class="istickedoff">ToObject ChannelContext</span></span>
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>instance LogItem ChannelContext where
+<span class="lineno">   60 </span>  <span class="decl"><span class="istickedoff">payloadKeys _ _ = AllKeys</span></span>
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | Build a 'ChannelContext' from a 'MessageSource' (if available) and an
+<span class="lineno">   63 </span>-- optional 'SessionMeta'. The conversation id is hashed (never logged in
+<span class="lineno">   64 </span>-- full). Used by inbox channels (Telegram, Signal) which have a
+<span class="lineno">   65 </span>-- 'MessageSource'.
+<span class="lineno">   66 </span>ctxFromMessageSource :: Maybe MessageSource -&gt; Maybe SessionMeta -&gt; ChannelContext
+<span class="lineno">   67 </span><span class="decl"><span class="nottickedoff">ctxFromMessageSource mSrc mMeta =</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="nottickedoff">ChannelContext</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="nottickedoff">{ ccChannelKind        = fmap msChannelKind mSrc</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="nottickedoff">, ccConversationIdHash = fmap (hashConversationId . conversationIdText . msConversationId) mSrc</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="nottickedoff">, ccSessionId          = fmap (sessionIdText . smId) mMeta</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="nottickedoff">}</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | Build a 'ChannelContext' from a 'SessionMeta' alone (no 'MessageSource').
+<span class="lineno">   75 </span>-- Used by the CLI and web paths which don't have a 'MessageSource' with
+<span class="lineno">   76 </span>-- channel kind. The channel kind is derived from 'smChannel' if it
+<span class="lineno">   77 </span>-- matches a known 'ChannelKind'.
+<span class="lineno">   78 </span>ctxFromSession :: SessionMeta -&gt; ChannelContext
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">ctxFromSession meta =</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">ChannelContext</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">{ ccChannelKind        = channelKindFromText (smChannel meta)</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">, ccConversationIdHash = Nothing</span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">, ccSessionId          = Just (sessionIdText (smId meta))</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | Hash a conversation id to its first 12 hex chars (SHA-256). This is
+<span class="lineno">   87 </span>-- the PII defense: the operator log carries the hash, not the full id.
+<span class="lineno">   88 </span>-- The hash is sufficient for correlation (matching log lines to a
+<span class="lineno">   89 </span>-- conversation) without exposing phone numbers or chat ids.
+<span class="lineno">   90 </span>hashConversationId :: Text -&gt; Text
+<span class="lineno">   91 </span><span class="decl"><span class="nottickedoff">hashConversationId cid =</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="nottickedoff">T.take 12 (T.pack (show (sha256Hash (TE.encodeUtf8 cid))))</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,906 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Append-only session transcript with a single-writer daemon.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Two coexisting on-disk formats:
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- [Legacy] @transcript.jsonl@ — one 'TranscriptEntry' per line, the old O(N²)
+<span class="lineno">    7 </span>-- format where each 'Request' entry re-serializes the whole prior
+<span class="lineno">    8 </span>-- conversation. Read-only for new sessions; old sessions are still readable.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- [New] @conversation.jsonl@ + @entries.jsonl@ + @conversation.idx@ — the
+<span class="lineno">   11 </span>-- indexed transcript format. @conversation.jsonl@ is one raw 'Message' per
+<span class="lineno">   12 </span>-- line (the pure content list, grown by deltas). @entries.jsonl@ is one 'EntryRecord' per event
+<span class="lineno">   13 </span>-- (payload-free, with an envelope-delta recorded only when changed). The new
+<span class="lineno">   14 </span>-- format is what the writer produces for sessions that did not already have a
+<span class="lineno">   15 </span>-- @transcript.jsonl@.
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- 'recordAndAck' returns ONLY after the entry is fsync'd to disk — the
+<span class="lineno">   18 </span>-- durability primitive the Untrusted dispatch gate depends on
+<span class="lineno">   19 </span>-- (ACK-before-execute).
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- Integrity rests on the append-only single-writer + fsync, and on keeping
+<span class="lineno">   22 </span>-- untrusted actions off the box that holds the log — not on a hash chain.
+<span class="lineno">   23 </span>module Seal.Handles.Transcript
+<span class="lineno">   24 </span>  ( TranscriptHandle (..)
+<span class="lineno">   25 </span>  , withTranscript
+<span class="lineno">   26 </span>  , fakeTranscript
+<span class="lineno">   27 </span>  , withIndexedTranscript
+<span class="lineno">   28 </span>  , fakeIndexedTranscript
+<span class="lineno">   29 </span>  , IndexedTranscriptHandle (..)
+<span class="lineno">   30 </span>  , IndexedTranscriptWrite (..)
+<span class="lineno">   31 </span>  , TranscriptError (..)
+<span class="lineno">   32 </span>  , TranscriptDiagnostics (..)
+<span class="lineno">   33 </span>  , emptyTranscriptDiagnostics
+<span class="lineno">   34 </span>  , completionHarnessTag
+<span class="lineno">   35 </span>  , pendingCompletionCount
+<span class="lineno">   36 </span>  , defaultAckTimeoutUs
+<span class="lineno">   37 </span>  , appendConversationMessage
+<span class="lineno">   38 </span>  , appendCompletionToSidecar
+<span class="lineno">   39 </span>  , readAndClearCompletions
+<span class="lineno">   40 </span>  ) where
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>import Control.Concurrent (forkIO, threadDelay)
+<span class="lineno">   43 </span>import Control.Concurrent.MVar
+<span class="lineno">   44 </span>import Control.Concurrent.STM
+<span class="lineno">   45 </span>  ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
+<span class="lineno">   46 </span>  , modifyTVar', orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry
+<span class="lineno">   47 </span>  , takeTMVar, tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
+<span class="lineno">   48 </span>import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
+<span class="lineno">   49 </span>import Control.Monad (void, foldM, unless, when)
+<span class="lineno">   50 </span>import Data.Aeson (decode)
+<span class="lineno">   51 </span>import Data.ByteString qualified as BS
+<span class="lineno">   52 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   53 </span>import Data.ByteString.Unsafe qualified as BSU
+<span class="lineno">   54 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   55 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   56 </span>import Data.Set (Set)
+<span class="lineno">   57 </span>import Data.Set qualified as Set
+<span class="lineno">   58 </span>import Data.Text (Text)
+<span class="lineno">   59 </span>import Data.Text qualified as T
+<span class="lineno">   60 </span>import Data.Word (Word8)
+<span class="lineno">   61 </span>import Foreign.Ptr (Ptr, castPtr, plusPtr)
+<span class="lineno">   62 </span>import System.Directory (doesFileExist, renameFile, removeFile)
+<span class="lineno">   63 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   64 </span>import System.Posix.IO
+<span class="lineno">   65 </span>  ( OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags
+<span class="lineno">   66 </span>  , fdWriteBuf, fdSeek, openFd )
+<span class="lineno">   67 </span>import System.Posix.Types (Fd, FileMode)
+<span class="lineno">   68 </span>import System.Posix.Unistd (fileSynchronise)
+<span class="lineno">   69 </span>import System.IO (SeekMode(..))
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>import Katip (Severity (..), ls)
+<span class="lineno">   72 </span>import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionConversationIndexPath, sessionDir)
+<span class="lineno">   73 </span>import Seal.Core.Types (OpName, ToolCallId, ModelId (..), SessionId)
+<span class="lineno">   74 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   75 </span>import Seal.Providers.Class
+<span class="lineno">   76 </span>  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), ToolChoice (..) )
+<span class="lineno">   77 </span>import Seal.Session.Log (appendSessionLog)
+<span class="lineno">   78 </span>import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
+<span class="lineno">   79 </span>import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
+<span class="lineno">   80 </span>import Seal.Transcript.Entries
+<span class="lineno">   81 </span>  ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
+<span class="lineno">   82 </span>  , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
+<span class="lineno">   83 </span>import Seal.Transcript.Types
+<span class="lineno">   84 </span>  ( TranscriptEntry (..), encodeEntryRaw )
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | The @erHarness@ tag the turn engine stamps on the entry that injects a
+<span class="lineno">   87 </span>-- completed sub-agent's message into the conversation. The writer uses it to
+<span class="lineno">   88 </span>-- recognise a completion injection and to assert that the injected messages
+<span class="lineno">   89 </span>-- actually reach the reader that builds the model's context.
+<span class="lineno">   90 </span>completionHarnessTag :: Text
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">completionHarnessTag = &quot;subagent-completion&quot;</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Exception raised by 'itwRecordAndAck' when the single-writer daemon has
+<span class="lineno">   94 </span>-- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
+<span class="lineno">   95 </span>-- leaves the ACK 'TMVar' empty and the caller blocks forever — the
+<span class="lineno">   96 </span>-- root-cause of session @20260724-113851-844@ silently hanging mid-dispatch.
+<span class="lineno">   97 </span>newtype TranscriptError = TranscriptError T.Text
+<span class="lineno">   98 </span>  deriving newtype (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">Exception TranscriptError</span></span></span></span></span></span></span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>-- | Handle to the legacy single-file transcript writer. All fields are
+<span class="lineno">  103 </span>-- functions so the type is uniform between the real (file-backed) and fake
+<span class="lineno">  104 </span>-- (in-memory) variants.
+<span class="lineno">  105 </span>data TranscriptHandle = TranscriptHandle
+<span class="lineno">  106 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">recordAndAck</span></span></span> :: TranscriptEntry -&gt; IO ()
+<span class="lineno">  107 </span>  -- ^ Enqueue an entry and block until it is flushed and fsync'd to disk.
+<span class="lineno">  108 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">recordAsync</span></span></span> :: TranscriptEntry -&gt; IO ()
+<span class="lineno">  109 </span>  -- ^ Fire-and-forget enqueue; no durability guarantee before return.
+<span class="lineno">  110 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">closeTranscript</span></span></span> :: IO ()
+<span class="lineno">  111 </span>  -- ^ No-op for the file-backed handle (bracket closes the fd); available
+<span class="lineno">  112 </span>  -- for callers that want an explicit close point.
+<span class="lineno">  113 </span>  }
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | A unit of work for the single-writer daemon. 'Write' carries an entry and
+<span class="lineno">  116 </span>-- an optional ack slot (filled after fsync). 'Shutdown' tells the daemon to
+<span class="lineno">  117 </span>-- drain any remaining queued writes, fill its ack slot, and exit.
+<span class="lineno">  118 </span>data Item
+<span class="lineno">  119 </span>  = Write TranscriptEntry (Maybe (TMVar ()))
+<span class="lineno">  120 </span>  | Shutdown (TMVar ())
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- | Write the strict 'ByteString' to 'fd' using the Posix primitive, which
+<span class="lineno">  123 </span>-- bypasses any user-space buffer. Loops until the whole buffer is written,
+<span class="lineno">  124 </span>-- advancing past each (possibly short) write; 'fdWriteBuf' itself retries the
+<span class="lineno">  125 </span>-- underlying syscall on @EINTR@, so an interrupted write resumes rather than
+<span class="lineno">  126 </span>-- truncating the line.
+<span class="lineno">  127 </span>writeFd :: Fd -&gt; BS.ByteString -&gt; IO ()
+<span class="lineno">  128 </span><span class="decl"><span class="istickedoff">writeFd fd bs =</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -&gt;</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">go (castPtr ptr) len</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">go :: Ptr Word8 -&gt; Int -&gt; IO ()</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">go _ 0 = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">go ptr remaining = do</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">written &lt;- fromIntegral &lt;$&gt; fdWriteBuf fd ptr (fromIntegral remaining)</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">go <span class="nottickedoff">(ptr `plusPtr` written)</span> (remaining - written)</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | Open the transcript file in O_APPEND mode, spawn the single-writer daemon,
+<span class="lineno">  139 </span>-- run @action@, then close. Every 'recordAndAck' blocks until 'fileSynchronise'
+<span class="lineno">  140 </span>-- returns, guaranteeing the entry is durable before the caller proceeds.
+<span class="lineno">  141 </span>withTranscript :: FilePath -&gt; (TranscriptHandle -&gt; IO a) -&gt; IO a
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">withTranscript path action = do</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">q &lt;- newTQueueIO</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">let flags = defaultFileFlags</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff">{ append = True</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">, creat = Just (0o600 :: FileMode)</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">ack = maybe (pure <span class="nottickedoff">()</span>) (\tv -&gt; atomically (putTMVar tv <span class="nottickedoff">()</span>))</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">writeEntry fd e = do</span>
+<span class="lineno">  150 </span><span class="spaces">        </span><span class="istickedoff">writeFd fd (encodeEntryRaw e &lt;&gt; &quot;\n&quot;)</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="istickedoff">fileSynchronise fd</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">-- Drain every currently-queued write (used at shutdown), fsyncing and</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">-- acking each, so nothing is lost before the fd is closed.</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">drain fd = do</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">next &lt;- atomically (tryReadTQueue q)</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">case next of</span>
+<span class="lineno">  157 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff">Just (Write e mack) -&gt; <span class="nottickedoff">writeEntry fd e &gt;&gt; ack mack &gt;&gt; drain fd</span></span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">Just (Shutdown done) -&gt; <span class="nottickedoff">atomically (putTMVar done ()) &gt;&gt; drain fd</span></span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">-- Single-writer daemon: process writes; on Shutdown, drain the queue,</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">-- signal completion, and exit (no 'forever', so it stops deterministically).</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">daemon fd = do</span>
+<span class="lineno">  163 </span><span class="spaces">        </span><span class="istickedoff">item &lt;- atomically (readTQueue q)</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="istickedoff">case item of</span>
+<span class="lineno">  165 </span><span class="spaces">          </span><span class="istickedoff">Write e mack -&gt; writeEntry fd e &gt;&gt; ack mack &gt;&gt; daemon fd</span>
+<span class="lineno">  166 </span><span class="spaces">          </span><span class="istickedoff">Shutdown done -&gt; drain <span class="nottickedoff">fd</span> &gt;&gt; atomically (putTMVar done <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">-- Cleanup: tell the daemon to drain+exit and WAIT for it before closing</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">-- the fd, so no queued write races (or writes to) a closed fd.</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">shutdown fd = do</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="istickedoff">done &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="istickedoff">atomically (writeTQueue q (Shutdown done))</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">atomically (takeTMVar done)</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">closeFd fd</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">bracket (openFd path WriteOnly flags) shutdown $ \fd -&gt; do</span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">void $ forkIO (daemon fd)</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff">let enqueue e = atomically (writeTQueue q (Write e Nothing))</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="istickedoff">ackWrite e = do</span>
+<span class="lineno">  178 </span><span class="spaces">          </span><span class="istickedoff">tv &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  179 </span><span class="spaces">          </span><span class="istickedoff">atomically (writeTQueue q (Write e (Just tv)))</span>
+<span class="lineno">  180 </span><span class="spaces">          </span><span class="istickedoff">atomically (takeTMVar tv)</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">action TranscriptHandle</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">{ recordAndAck = ackWrite</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">, recordAsync = enqueue</span>
+<span class="lineno">  184 </span><span class="spaces">      </span><span class="istickedoff">, closeTranscript = <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>-- | In-memory handle for tests. Records entries in invocation order. No file
+<span class="lineno">  188 </span>-- IO, no daemon thread. The second element of the pair reads back the log.
+<span class="lineno">  189 </span>fakeTranscript :: IO (TranscriptHandle, IO [TranscriptEntry])
+<span class="lineno">  190 </span><span class="decl"><span class="istickedoff">fakeTranscript = do</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">ref &lt;- newMVar ([] :: [TranscriptEntry])</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">let push e = modifyMVar_ ref (pure . (++ [e]))</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">pure</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="istickedoff">( TranscriptHandle</span>
+<span class="lineno">  195 </span><span class="spaces">        </span><span class="istickedoff">{ recordAndAck = push</span>
+<span class="lineno">  196 </span><span class="spaces">        </span><span class="istickedoff">, recordAsync = <span class="nottickedoff">push</span></span>
+<span class="lineno">  197 </span><span class="spaces">        </span><span class="istickedoff">, closeTranscript = <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  198 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">, readMVar ref</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  203 </span>-- Indexed transcript format (conversation.jsonl + entries.jsonl)
+<span class="lineno">  204 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  205 </span>
+<span class="lineno">  206 </span>-- | A structured write request for the indexed transcript writer. The writer diffs
+<span class="lineno">  207 </span>-- @itwMessages@ against the conversation as it exists on disk and appends only
+<span class="lineno">  208 </span>-- the new lines (with @CbToolResult@ parts redacted), then appends the entry
+<span class="lineno">  209 </span>-- record. Crash semantics: messages first, then the entry line, so a torn tail
+<span class="lineno">  210 </span>-- leaves at most orphan message lines / a malformed last line — both already
+<span class="lineno">  211 </span>-- tolerated by the skip-malformed decode path.
+<span class="lineno">  212 </span>data IndexedTranscriptWrite = IndexedTranscriptWrite
+<span class="lineno">  213 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">itwMessages</span></span></span> :: [Message]
+<span class="lineno">  214 </span>  -- ^ The full message list in effect at this turn (the conversation prefix +
+<span class="lineno">  215 </span>  -- any new messages). The writer diffs against the on-disk conversation and
+<span class="lineno">  216 </span>  -- appends only the new lines.
+<span class="lineno">  217 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwEntry</span></span></span>    :: EntryRecord
+<span class="lineno">  218 </span>  -- ^ The event line to append to @entries.jsonl@.
+<span class="lineno">  219 </span>  }
+<span class="lineno">  220 </span>
+<span class="lineno">  221 </span>-- | Handle to the indexed transcript writer. 'itwRecordAndAck' blocks until both files
+<span class="lineno">  222 </span>-- are fsync'd; 'itwRecordAsync' is fire-and-forget.
+<span class="lineno">  223 </span>data IndexedTranscriptHandle = IndexedTranscriptHandle
+<span class="lineno">  224 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">itwRecordAndAck</span></span></span> :: IndexedTranscriptWrite -&gt; IO ()
+<span class="lineno">  225 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwRecordAsync</span></span></span>  :: IndexedTranscriptWrite -&gt; IO ()
+<span class="lineno">  226 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwReadConversation</span></span></span> :: IO [Message]
+<span class="lineno">  227 </span>  -- ^ Read back the on-disk conversation (for tests / replay).
+<span class="lineno">  228 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwReadEntries</span></span></span>     :: IO [EntryRecord]
+<span class="lineno">  229 </span>  -- ^ Read back the on-disk entry log.
+<span class="lineno">  230 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwSetSecretOps</span></span></span>    :: Set OpName -&gt; IO ()
+<span class="lineno">  231 </span>  -- ^ Set the set of opcode names whose tool results should be redacted from
+<span class="lineno">  232 </span>  -- the on-disk conversation file. Call this after building the ISA registry
+<span class="lineno">  233 </span>  -- so the writer knows which 'CbToolResult's may carry secrets. Results from
+<span class="lineno">  234 </span>  -- opcodes NOT in this set (e.g. SHELL_EXEC, FILE_READ) pass through verbatim.
+<span class="lineno">  235 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwCloseTranscript</span></span></span> :: IO ()
+<span class="lineno">  236 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwIsAlive</span></span></span> :: IO Bool
+<span class="lineno">  237 </span>  -- ^ Is the single-writer daemon still running? Returns 'False' after a
+<span class="lineno">  238 </span>  -- write error killed it. Callers that depend on durability (the dispatch
+<span class="lineno">  239 </span>  -- ACK-before-execute gate) should check this before trusting a prior write.
+<span class="lineno">  240 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwDiagnostics</span></span></span> :: IO TranscriptDiagnostics
+<span class="lineno">  241 </span>  -- ^ Counters for the writer's internal invariants. Both counters are
+<span class="lineno">  242 </span>  -- expected to stay at zero: a non-zero value means the transcript and
+<span class="lineno">  243 </span>  -- the conversation handed to the model have diverged (see
+<span class="lineno">  244 </span>  -- @docs\/plans\/2026-10-22-subagent-completion-delivery-diagnosis.md@).
+<span class="lineno">  245 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itwRecordedLength</span></span></span> :: IO Int
+<span class="lineno">  246 </span>  -- ^ How many conversation messages the writer has recorded so far. The
+<span class="lineno">  247 </span>  -- writer's own view of the conversation — compare against
+<span class="lineno">  248 </span>  -- @length &lt;$&gt; itwReadConversation@ to spot a reader that is behind the
+<span class="lineno">  249 </span>  -- writer (a completion injection the model never saw).
+<span class="lineno">  250 </span>  }
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | Invariant counters for the indexed transcript writer.
+<span class="lineno">  253 </span>--
+<span class="lineno">  254 </span>-- Both counters describe ways the transcript can drift away from the
+<span class="lineno">  255 </span>-- conversation the model is actually given:
+<span class="lineno">  256 </span>--
+<span class="lineno">  257 </span>-- * 'tdInjectedTailMisses' — a read that did not contain a completion
+<span class="lineno">  258 </span>--   injection the writer had already been asked to record. The model is
+<span class="lineno">  259 </span>--   then told that a sub-agent is still running while its verdict sits in
+<span class="lineno">  260 </span>--   the transcript.
+<span class="lineno">  261 </span>-- * 'tdDesyncEvents' — a write whose incoming conversation was not a
+<span class="lineno">  262 </span>--   prefix-extension of the conversation the writer had recorded. The
+<span class="lineno">  263 </span>--   writer's positional diff then slices the wrong range and silently
+<span class="lineno">  264 </span>--   drops messages from @conversation.jsonl@.
+<span class="lineno">  265 </span>data TranscriptDiagnostics = TranscriptDiagnostics
+<span class="lineno">  266 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tdInjectedTailMisses</span></span></span> :: Int
+<span class="lineno">  267 </span>  -- ^ Reads that missed a pending completion injection.
+<span class="lineno">  268 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdDesyncEvents</span></span></span> :: Int
+<span class="lineno">  269 </span>  -- ^ Writes whose incoming conversation diverged from the writer's.
+<span class="lineno">  270 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdDesyncDroppedMessages</span></span></span> :: Int
+<span class="lineno">  271 </span>  -- ^ Total messages the writer had to drop because of a desync.
+<span class="lineno">  272 </span>  }
+<span class="lineno">  273 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  274 </span>
+<span class="lineno">  275 </span>-- | A diagnostics record with every counter at zero.
+<span class="lineno">  276 </span>emptyTranscriptDiagnostics :: TranscriptDiagnostics
+<span class="lineno">  277 </span><span class="decl"><span class="istickedoff">emptyTranscriptDiagnostics = TranscriptDiagnostics</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">{ tdInjectedTailMisses = 0</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">, tdDesyncEvents = 0</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">, tdDesyncDroppedMessages = 0</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  282 </span>
+<span class="lineno">  283 </span>-- | Default ACK timeout (30 seconds). If the daemon does not acknowledge a
+<span class="lineno">  284 </span>-- write within this window, 'itwRecordAndAck' raises 'TranscriptError' instead
+<span class="lineno">  285 </span>-- of hanging forever. Tuned generously — normal writes complete in
+<span class="lineno">  286 </span>-- milliseconds; 30s is a fail-safe for a stuck/dead daemon, not a performance
+<span class="lineno">  287 </span>-- bound.
+<span class="lineno">  288 </span>defaultAckTimeoutUs :: Int
+<span class="lineno">  289 </span><span class="decl"><span class="istickedoff">defaultAckTimeoutUs = 30_000_000</span></span>
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- | The daemon's accumulated state: the conversation lines written so far (so
+<span class="lineno">  292 </span>-- the diff can be computed without re-reading the file each turn) and the
+<span class="lineno">  293 </span>-- fsync'd fds.
+<span class="lineno">  294 </span>data IndexedTranscriptState = IndexedTranscriptState
+<span class="lineno">  295 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">itsConvFd</span></span></span> :: Fd
+<span class="lineno">  296 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itsEntriesFd</span></span></span> :: Fd
+<span class="lineno">  297 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itsConvIdxFd</span></span></span> :: Fd
+<span class="lineno">  298 </span>  -- ^ The fd for @conversation.idx@ (O_APPEND). Appended after each
+<span class="lineno">  299 </span>  -- conversation line is written + fsync'd.
+<span class="lineno">  300 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itsWritten</span></span></span> :: [Message]
+<span class="lineno">  301 </span>  -- ^ The conversation as it exists on disk, in order. Grown by each write
+<span class="lineno">  302 </span>  -- so the next diff can be computed in-memory.
+<span class="lineno">  303 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itsSecretOpsRef</span></span></span> :: IORef (Set OpName)
+<span class="lineno">  304 </span>  -- ^ The set of opcode names whose tool results may carry secrets and must
+<span class="lineno">  305 </span>  -- be redacted from the on-disk conversation file. An IORef so the caller
+<span class="lineno">  306 </span>  -- can set it after building the registry (the registry construction may
+<span class="lineno">  307 </span>  -- depend on values only available inside the 'withIndexedTranscript'
+<span class="lineno">  308 </span>  -- callback, e.g. session id or worker functions).
+<span class="lineno">  309 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">itsPriorEnv</span></span></span> :: Maybe Envelope
+<span class="lineno">  310 </span>  -- ^ The effective envelope at the most recent 'EKRequest' entry. Used by
+<span class="lineno">  311 </span>  -- 'writeOne' to compute a minimal 'EnvelopeDelta' — only fields that
+<span class="lineno">  312 </span>  -- differ from the prior envelope are emitted, so a stable system prompt
+<span class="lineno">  313 </span>  -- + tools array isn't re-serialized on every turn (a 146-turn session
+<span class="lineno">  314 </span>  -- with a 36KB system prompt would otherwise waste ~5MB). 'Nothing' until
+<span class="lineno">  315 </span>  -- the first request entry lands.
+<span class="lineno">  316 </span>  }
+<span class="lineno">  317 </span>
+<span class="lineno">  318 </span>-- | A work item for the indexed transcript daemon.
+<span class="lineno">  319 </span>data IndexedTranscriptItem
+<span class="lineno">  320 </span>  = ITWrite IndexedTranscriptWrite (Maybe (TMVar ()))
+<span class="lineno">  321 </span>  | ITShutdown (TMVar ())
+<span class="lineno">  322 </span>
+<span class="lineno">  323 </span>-- | Open both files in O_APPEND mode, spawn the single-writer daemon, run
+<span class="lineno">  324 </span>-- @action@, then close. Every 'itwRecordAndAck' blocks until both files are
+<span class="lineno">  325 </span>-- fsync'd.
+<span class="lineno">  326 </span>--
+<span class="lineno">  327 </span>-- If the session directory already contains a legacy @transcript.jsonl@ and no
+<span class="lineno">  328 </span>-- @conversation.jsonl@, the legacy file is left untouched (the legacy read path
+<span class="lineno">  329 </span>-- handles it); the new writer simply creates the two new files alongside it.
+<span class="lineno">  330 </span>withIndexedTranscript :: FilePath -&gt; (IndexedTranscriptHandle -&gt; IO a) -&gt; IO a
+<span class="lineno">  331 </span><span class="decl"><span class="istickedoff">withIndexedTranscript dir action = do</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">q &lt;- newTQueueIO</span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="istickedoff">aliveRef &lt;- newTVarIO True</span>
+<span class="lineno">  334 </span><span class="spaces">  </span><span class="istickedoff">diagTv &lt;- newTVarIO emptyTranscriptDiagnostics</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="istickedoff">writtenLenTv &lt;- newTVarIO 0</span>
+<span class="lineno">  336 </span><span class="spaces">  </span><span class="istickedoff">pendingInjectedTv &lt;- newTVarIO []</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">let sessionLog = dir &lt;/&gt; &quot;seal.log&quot;</span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">let convPath     = dir &lt;/&gt; &quot;conversation.jsonl&quot;</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">entriesPath  = dir &lt;/&gt; &quot;entries.jsonl&quot;</span>
+<span class="lineno">  340 </span><span class="spaces">      </span><span class="istickedoff">idxPath      = dir &lt;/&gt; &quot;conversation.idx&quot;</span>
+<span class="lineno">  341 </span><span class="spaces">      </span><span class="istickedoff">flags = defaultFileFlags</span>
+<span class="lineno">  342 </span><span class="spaces">        </span><span class="istickedoff">{ append = True</span>
+<span class="lineno">  343 </span><span class="spaces">        </span><span class="istickedoff">, creat = Just (0o600 :: FileMode)</span>
+<span class="lineno">  344 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  345 </span><span class="spaces">      </span><span class="istickedoff">ack = maybe (pure <span class="nottickedoff">()</span>) (\tv -&gt; atomically (putTMVar tv ()))</span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="istickedoff">writeOne st (IndexedTranscriptWrite msgs entry) = do</span>
+<span class="lineno">  347 </span><span class="spaces">        </span><span class="istickedoff">secretOps &lt;- readIORef (itsSecretOpsRef st)</span>
+<span class="lineno">  348 </span><span class="spaces">        </span><span class="istickedoff">let redactedMsgs = redactMessages secretOps msgs msgs</span>
+<span class="lineno">  349 </span><span class="spaces">            </span><span class="istickedoff">writtenLen = length (itsWritten st)</span>
+<span class="lineno">  350 </span><span class="spaces">            </span><span class="istickedoff">-- Positional suffix extraction: the entry's erConvLen tells us</span>
+<span class="lineno">  351 </span><span class="spaces">            </span><span class="istickedoff">-- the total conversation length after this write (for</span>
+<span class="lineno">  352 </span><span class="spaces">            </span><span class="istickedoff">-- request/response) or the number of new lines (for harness).</span>
+<span class="lineno">  353 </span><span class="spaces">            </span><span class="istickedoff">-- For request/response: new = take (erConvLen - writtenLen)</span>
+<span class="lineno">  354 </span><span class="spaces">            </span><span class="istickedoff">--   (drop writtenLen redactedMsgs)</span>
+<span class="lineno">  355 </span><span class="spaces">            </span><span class="istickedoff">-- For harness: erConvLen is a delta, so new = take erConvLen</span>
+<span class="lineno">  356 </span><span class="spaces">            </span><span class="istickedoff">--   (drop writtenLen redactedMsgs)</span>
+<span class="lineno">  357 </span><span class="spaces">            </span><span class="istickedoff">-- For compaction: erConvLen is the new cursor (total), same as</span>
+<span class="lineno">  358 </span><span class="spaces">            </span><span class="istickedoff">--   request/response.</span>
+<span class="lineno">  359 </span><span class="spaces">            </span><span class="istickedoff">newLen = case erKind entry of</span>
+<span class="lineno">  360 </span><span class="spaces">              </span><span class="istickedoff">EKHarness -&gt; erConvLen entry</span>
+<span class="lineno">  361 </span><span class="spaces">              </span><span class="istickedoff">_ -&gt; max 0 (erConvLen entry - writtenLen)</span>
+<span class="lineno">  362 </span><span class="spaces">            </span><span class="istickedoff">new = take newLen (drop writtenLen redactedMsgs)</span>
+<span class="lineno">  363 </span><span class="spaces">        </span><span class="istickedoff">checkAlignment st redactedMsgs entry</span>
+<span class="lineno">  364 </span><span class="spaces">        </span><span class="istickedoff">-- 1. Append new conversation lines + index entries, fsync both.</span>
+<span class="lineno">  365 </span><span class="spaces">        </span><span class="istickedoff">convOffset &lt;- fromIntegral &lt;$&gt; fdSeek (itsConvFd st) SeekFromEnd 0</span>
+<span class="lineno">  366 </span><span class="spaces">        </span><span class="istickedoff">newOffset &lt;- foldM (\off m -&gt; do</span>
+<span class="lineno">  367 </span><span class="spaces">            </span><span class="istickedoff">let bs = encodeConvLine (ConvLine m) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  368 </span><span class="spaces">            </span><span class="istickedoff">writeFd (itsConvFd st) bs</span>
+<span class="lineno">  369 </span><span class="spaces">            </span><span class="istickedoff">let off' = off + fromIntegral (BS.length bs)</span>
+<span class="lineno">  370 </span><span class="spaces">            </span><span class="istickedoff">writeIdxEntry (itsConvIdxFd st) off'</span>
+<span class="lineno">  371 </span><span class="spaces">            </span><span class="istickedoff">pure off'</span>
+<span class="lineno">  372 </span><span class="spaces">          </span><span class="istickedoff">) convOffset new</span>
+<span class="lineno">  373 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- newOffset `seq` pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="istickedoff">fileSynchronise (itsConvFd st)</span>
+<span class="lineno">  375 </span><span class="spaces">        </span><span class="istickedoff">fileSynchronise (itsConvIdxFd st)</span>
+<span class="lineno">  376 </span><span class="spaces">        </span><span class="istickedoff">-- 2. Compute a minimal envelope delta for EKRequest entries. The</span>
+<span class="lineno">  377 </span><span class="spaces">        </span><span class="istickedoff">-- caller passes a FULL delta (every field set to 'Just'); the writer</span>
+<span class="lineno">  378 </span><span class="spaces">        </span><span class="istickedoff">-- compares it against the prior effective envelope and emits only</span>
+<span class="lineno">  379 </span><span class="spaces">        </span><span class="istickedoff">-- the fields that differ. This keeps a stable system prompt + tools</span>
+<span class="lineno">  380 </span><span class="spaces">        </span><span class="istickedoff">-- array from being re-serialized on every turn (a 146-turn session</span>
+<span class="lineno">  381 </span><span class="spaces">        </span><span class="istickedoff">-- with a 36KB system prompt would otherwise waste ~5MB). The first</span>
+<span class="lineno">  382 </span><span class="spaces">        </span><span class="istickedoff">-- request (no prior envelope) emits the full delta so</span>
+<span class="lineno">  383 </span><span class="spaces">        </span><span class="istickedoff">-- reconstruction has a baseline to fold from.</span>
+<span class="lineno">  384 </span><span class="spaces">        </span><span class="istickedoff">let (entry', mNextEnv) = case erKind entry of</span>
+<span class="lineno">  385 </span><span class="spaces">              </span><span class="istickedoff">EKRequest -&gt; case erEnvelope entry of</span>
+<span class="lineno">  386 </span><span class="spaces">                </span><span class="istickedoff">Just delta -&gt;</span>
+<span class="lineno">  387 </span><span class="spaces">                  </span><span class="istickedoff">let baseline = fromMaybe defaultEnv (itsPriorEnv st)</span>
+<span class="lineno">  388 </span><span class="spaces">                      </span><span class="istickedoff">nextEnv = applyDelta baseline delta</span>
+<span class="lineno">  389 </span><span class="spaces">                      </span><span class="istickedoff">minimal = minimalDelta (itsPriorEnv st) nextEnv</span>
+<span class="lineno">  390 </span><span class="spaces">                  </span><span class="istickedoff">in (entry { erEnvelope = minimal }, Just nextEnv)</span>
+<span class="lineno">  391 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; (entry, <span class="nottickedoff">itsPriorEnv st</span>)</span>
+<span class="lineno">  392 </span><span class="spaces">              </span><span class="istickedoff">_ -&gt; (entry, itsPriorEnv st)</span>
+<span class="lineno">  393 </span><span class="spaces">        </span><span class="istickedoff">-- 3. Append the entry line, fsync.</span>
+<span class="lineno">  394 </span><span class="spaces">        </span><span class="istickedoff">writeFd (itsEntriesFd st) (encodeEntryRecordRaw entry' &lt;&gt; &quot;\n&quot;)</span>
+<span class="lineno">  395 </span><span class="spaces">        </span><span class="istickedoff">fileSynchronise (itsEntriesFd st)</span>
+<span class="lineno">  396 </span><span class="spaces">        </span><span class="istickedoff">let st' = st { itsWritten = itsWritten st &lt;&gt; new, itsPriorEnv = mNextEnv }</span>
+<span class="lineno">  397 </span><span class="spaces">        </span><span class="istickedoff">atomically (writeTVar writtenLenTv (length (itsWritten st')))</span>
+<span class="lineno">  398 </span><span class="spaces">        </span><span class="istickedoff">-- The injection is on disk now: a later read that still misses it is</span>
+<span class="lineno">  399 </span><span class="spaces">        </span><span class="istickedoff">-- a torn read, not a race with the writer.</span>
+<span class="lineno">  400 </span><span class="spaces">        </span><span class="istickedoff">when (erHarness entry == Just completionHarnessTag) $</span>
+<span class="lineno">  401 </span><span class="spaces">          </span><span class="istickedoff">atomically (writeTVar pendingInjectedTv [])</span>
+<span class="lineno">  402 </span><span class="spaces">        </span><span class="istickedoff">pure st'</span>
+<span class="lineno">  403 </span><span class="spaces">      </span><span class="istickedoff">-- | Assert that the caller's conversation is a prefix-extension of</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">-- the conversation the writer has recorded. When it is not, the</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="istickedoff">-- positional diff below slices the wrong range and silently drops</span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">-- messages from @conversation.jsonl@ — the transcript then no longer</span>
+<span class="lineno">  407 </span><span class="spaces">      </span><span class="istickedoff">-- matches the conversation the model was given.</span>
+<span class="lineno">  408 </span><span class="spaces">      </span><span class="istickedoff">--</span>
+<span class="lineno">  409 </span><span class="spaces">      </span><span class="istickedoff">-- Two cheap checks, no full prefix scan:</span>
+<span class="lineno">  410 </span><span class="spaces">      </span><span class="istickedoff">--</span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="istickedoff">-- * a non-harness entry whose @erConvLen@ is below the writer's</span>
+<span class="lineno">  412 </span><span class="spaces">      </span><span class="istickedoff">--   length means the caller's list is SHORTER than what the writer</span>
+<span class="lineno">  413 </span><span class="spaces">      </span><span class="istickedoff">--   has recorded, so the writer will drop @writtenLen - erConvLen@</span>
+<span class="lineno">  414 </span><span class="spaces">      </span><span class="istickedoff">--   messages;</span>
+<span class="lineno">  415 </span><span class="spaces">      </span><span class="istickedoff">-- * a non-harness entry whose last already-written message differs</span>
+<span class="lineno">  416 </span><span class="spaces">      </span><span class="istickedoff">--   from the caller's message at the same position means the two</span>
+<span class="lineno">  417 </span><span class="spaces">      </span><span class="istickedoff">--   conversations have drifted apart (same length, different</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff">--   content) — the file and the model's context disagree.</span>
+<span class="lineno">  419 </span><span class="spaces">      </span><span class="istickedoff">checkAlignment st redactedMsgs entry = do</span>
+<span class="lineno">  420 </span><span class="spaces">        </span><span class="istickedoff">let writtenLen = length (itsWritten st)</span>
+<span class="lineno">  421 </span><span class="spaces">            </span><span class="istickedoff">isHarness = erKind entry == EKHarness</span>
+<span class="lineno">  422 </span><span class="spaces">            </span><span class="istickedoff">-- A write that carries no conversation messages (the</span>
+<span class="lineno">  423 </span><span class="spaces">            </span><span class="istickedoff">-- ACK-before-execute entries, the session preamble) appends</span>
+<span class="lineno">  424 </span><span class="spaces">            </span><span class="istickedoff">-- nothing to @conversation.jsonl@ and cannot desync it.</span>
+<span class="lineno">  425 </span><span class="spaces">            </span><span class="istickedoff">carriesMessages = not (null redactedMsgs)</span>
+<span class="lineno">  426 </span><span class="spaces">            </span><span class="istickedoff">-- Two conversations are &quot;the same conversation&quot; when they</span>
+<span class="lineno">  427 </span><span class="spaces">            </span><span class="istickedoff">-- start with the same message. A caller that writes a</span>
+<span class="lineno">  428 </span><span class="spaces">            </span><span class="istickedoff">-- DIFFERENT conversation (the @\/model@ and @\/stop@</span>
+<span class="lineno">  429 </span><span class="spaces">            </span><span class="istickedoff">-- notices, which append one message to a session whose</span>
+<span class="lineno">  430 </span><span class="spaces">            </span><span class="istickedoff">-- conversation they did not read) is not desyncing anything</span>
+<span class="lineno">  431 </span><span class="spaces">            </span><span class="istickedoff">-- — its write is a no-op against the writer's state, which is</span>
+<span class="lineno">  432 </span><span class="spaces">            </span><span class="istickedoff">-- a separate (pre-existing) issue.</span>
+<span class="lineno">  433 </span><span class="spaces">            </span><span class="istickedoff">sameConversation =</span>
+<span class="lineno">  434 </span><span class="spaces">              </span><span class="istickedoff">carriesMessages</span>
+<span class="lineno">  435 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; not (null (itsWritten st))</span>
+<span class="lineno">  436 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; elementAt 0 redactedMsgs == elementAt 0 (itsWritten st)</span>
+<span class="lineno">  437 </span><span class="spaces">            </span><span class="istickedoff">-- The caller's conversation length: its own claim, capped by</span>
+<span class="lineno">  438 </span><span class="spaces">            </span><span class="istickedoff">-- the number of messages it actually handed over.</span>
+<span class="lineno">  439 </span><span class="spaces">            </span><span class="istickedoff">callerLen = min (erConvLen entry) (length redactedMsgs)</span>
+<span class="lineno">  440 </span><span class="spaces">            </span><span class="istickedoff">tooShort =</span>
+<span class="lineno">  441 </span><span class="spaces">              </span><span class="istickedoff">not isHarness</span>
+<span class="lineno">  442 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; carriesMessages</span>
+<span class="lineno">  443 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; sameConversation</span>
+<span class="lineno">  444 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; callerLen &lt; writtenLen</span>
+<span class="lineno">  445 </span><span class="spaces">            </span><span class="istickedoff">tailMismatch =</span>
+<span class="lineno">  446 </span><span class="spaces">              </span><span class="istickedoff">not isHarness</span>
+<span class="lineno">  447 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; carriesMessages</span>
+<span class="lineno">  448 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; writtenLen &gt; 0</span>
+<span class="lineno">  449 </span><span class="spaces">              </span><span class="istickedoff">&amp;&amp; case (lastOf (itsWritten st), elementAt (writtenLen - 1) redactedMsgs) of</span>
+<span class="lineno">  450 </span><span class="spaces">                   </span><span class="istickedoff">(Just a, Just b) -&gt; a /= b</span>
+<span class="lineno">  451 </span><span class="spaces">                   </span><span class="istickedoff">_                -&gt; False</span>
+<span class="lineno">  452 </span><span class="spaces">        </span><span class="istickedoff">when (tooShort || tailMismatch) $ do</span>
+<span class="lineno">  453 </span><span class="spaces">          </span><span class="istickedoff">let dropped = max 0 (writtenLen - callerLen)</span>
+<span class="lineno">  454 </span><span class="spaces">          </span><span class="istickedoff">atomically (modifyTVar' diagTv $ \d -&gt; d</span>
+<span class="lineno">  455 </span><span class="spaces">            </span><span class="istickedoff">{ tdDesyncEvents = tdDesyncEvents d + 1</span>
+<span class="lineno">  456 </span><span class="spaces">            </span><span class="istickedoff">, tdDesyncDroppedMessages = tdDesyncDroppedMessages d + dropped</span>
+<span class="lineno">  457 </span><span class="spaces">            </span><span class="istickedoff">})</span>
+<span class="lineno">  458 </span><span class="spaces">          </span><span class="istickedoff">globalLogIO <span class="nottickedoff">ErrorS</span></span>
+<span class="lineno">  459 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(ls (&quot;[transcript-diag] DESYNC: the caller's conversation is not a &quot;</span></span>
+<span class="lineno">  460 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;prefix-extension of the writer's. writerLen=&quot; &lt;&gt; T.pack (show writtenLen)</span></span>
+<span class="lineno">  461 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; callerLen=&quot; &lt;&gt; T.pack (show callerLen)</span></span>
+<span class="lineno">  462 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; dropped=&quot; &lt;&gt; T.pack (show dropped)</span></span>
+<span class="lineno">  463 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; tailMismatch=&quot; &lt;&gt; (if tailMismatch then &quot;true&quot; else &quot;false&quot;)))</span></span>
+<span class="lineno">  464 </span><span class="spaces">          </span><span class="istickedoff">appendSessionLog (Just sessionLog) &quot;ERROR&quot;</span>
+<span class="lineno">  465 </span><span class="spaces">            </span><span class="istickedoff">(&quot;[transcript-diag] DESYNC: caller conversation is not a &quot;</span>
+<span class="lineno">  466 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; &quot;prefix-extension of the writer's conversation. writerLen=&quot;</span>
+<span class="lineno">  467 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; T.pack (show writtenLen) &lt;&gt; &quot; callerLen=&quot; &lt;&gt; T.pack (show callerLen)</span>
+<span class="lineno">  468 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; &quot; droppedMessages=&quot; &lt;&gt; T.pack (show dropped))</span>
+<span class="lineno">  469 </span><span class="spaces">      </span><span class="istickedoff">drain st = do</span>
+<span class="lineno">  470 </span><span class="spaces">        </span><span class="istickedoff">next &lt;- atomically (tryReadTQueue q)</span>
+<span class="lineno">  471 </span><span class="spaces">        </span><span class="istickedoff">case next of</span>
+<span class="lineno">  472 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">st</span></span>
+<span class="lineno">  473 </span><span class="spaces">          </span><span class="istickedoff">Just (ITWrite w mack) -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  474 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">st' &lt;- writeOne st w</span></span>
+<span class="lineno">  475 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">ack mack</span></span>
+<span class="lineno">  476 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">drain st'</span></span>
+<span class="lineno">  477 </span><span class="spaces">          </span><span class="istickedoff">Just (ITShutdown done) -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  478 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">atomically (putTMVar done ())</span></span>
+<span class="lineno">  479 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">drain st</span></span>
+<span class="lineno">  480 </span><span class="spaces">      </span><span class="istickedoff">daemon st = do</span>
+<span class="lineno">  481 </span><span class="spaces">        </span><span class="istickedoff">item &lt;- atomically (readTQueue q)</span>
+<span class="lineno">  482 </span><span class="spaces">        </span><span class="istickedoff">case item of</span>
+<span class="lineno">  483 </span><span class="spaces">          </span><span class="istickedoff">ITWrite w mack -&gt; do</span>
+<span class="lineno">  484 </span><span class="spaces">            </span><span class="istickedoff">st' &lt;- writeOne st w</span>
+<span class="lineno">  485 </span><span class="spaces">            </span><span class="istickedoff">ack mack</span>
+<span class="lineno">  486 </span><span class="spaces">            </span><span class="istickedoff">daemon st'</span>
+<span class="lineno">  487 </span><span class="spaces">          </span><span class="istickedoff">ITShutdown done -&gt; do</span>
+<span class="lineno">  488 </span><span class="spaces">            </span><span class="istickedoff">st' &lt;- drain <span class="nottickedoff">st</span></span>
+<span class="lineno">  489 </span><span class="spaces">            </span><span class="istickedoff">atomically (putTMVar done <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  490 </span><span class="spaces">            </span><span class="istickedoff">pure <span class="nottickedoff">st'</span></span>
+<span class="lineno">  491 </span><span class="spaces">      </span><span class="istickedoff">shutdown convFd entriesFd idxFd done = do</span>
+<span class="lineno">  492 </span><span class="spaces">        </span><span class="istickedoff">atomically (writeTQueue q (ITShutdown done))</span>
+<span class="lineno">  493 </span><span class="spaces">        </span><span class="istickedoff">atomically (takeTMVar done)</span>
+<span class="lineno">  494 </span><span class="spaces">        </span><span class="istickedoff">closeFd convFd</span>
+<span class="lineno">  495 </span><span class="spaces">        </span><span class="istickedoff">closeFd entriesFd</span>
+<span class="lineno">  496 </span><span class="spaces">        </span><span class="istickedoff">closeFd idxFd</span>
+<span class="lineno">  497 </span><span class="spaces">  </span><span class="istickedoff">-- Read existing conversation (if any) so the diff starts from the right</span>
+<span class="lineno">  498 </span><span class="spaces">  </span><span class="istickedoff">-- baseline. A torn legacy file or a fresh session yields [].</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">existingConv &lt;- do</span>
+<span class="lineno">  500 </span><span class="spaces">    </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  501 </span><span class="spaces">    </span><span class="istickedoff">if exists</span>
+<span class="lineno">  502 </span><span class="spaces">      </span><span class="istickedoff">then readConversation &lt;$&gt; BS.readFile convPath</span>
+<span class="lineno">  503 </span><span class="spaces">      </span><span class="istickedoff">else pure []</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="istickedoff">-- Build the index if missing (one-time migration for pre-existing sessions).</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="istickedoff">-- For fresh sessions, write the initial [0] offset so the index is valid</span>
+<span class="lineno">  506 </span><span class="spaces">  </span><span class="istickedoff">-- (not empty) before the daemon's first write.</span>
+<span class="lineno">  507 </span><span class="spaces">  </span><span class="istickedoff">convExists &lt;- doesFileExist convPath</span>
+<span class="lineno">  508 </span><span class="spaces">  </span><span class="istickedoff">idxExists  &lt;- doesFileExist idxPath</span>
+<span class="lineno">  509 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">convExists &amp;&amp; not idxExists</span></span>
+<span class="lineno">  510 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">void (buildIndex convPath idxPath)</span></span>
+<span class="lineno">  511 </span><span class="spaces">    </span><span class="istickedoff">else when (not convExists &amp;&amp; not idxExists) $ do</span>
+<span class="lineno">  512 </span><span class="spaces">      </span><span class="istickedoff">-- Create the index with the initial [0] offset</span>
+<span class="lineno">  513 </span><span class="spaces">      </span><span class="istickedoff">let idxFlags = defaultFileFlags { append = False, creat = Just (0o600 :: FileMode) }</span>
+<span class="lineno">  514 </span><span class="spaces">      </span><span class="istickedoff">idxFd0 &lt;- openFd idxPath WriteOnly idxFlags</span>
+<span class="lineno">  515 </span><span class="spaces">      </span><span class="istickedoff">writeIdxEntry idxFd0 0</span>
+<span class="lineno">  516 </span><span class="spaces">      </span><span class="istickedoff">fileSynchronise idxFd0</span>
+<span class="lineno">  517 </span><span class="spaces">      </span><span class="istickedoff">closeFd idxFd0</span>
+<span class="lineno">  518 </span><span class="spaces">  </span><span class="istickedoff">bracket</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="istickedoff">(do convFd     &lt;- openFd convPath    WriteOnly flags</span>
+<span class="lineno">  520 </span><span class="spaces">        </span><span class="istickedoff">entriesFd  &lt;- openFd entriesPath WriteOnly flags</span>
+<span class="lineno">  521 </span><span class="spaces">        </span><span class="istickedoff">idxFd      &lt;- openFd idxPath     WriteOnly flags</span>
+<span class="lineno">  522 </span><span class="spaces">        </span><span class="istickedoff">pure (convFd, entriesFd, idxFd))</span>
+<span class="lineno">  523 </span><span class="spaces">    </span><span class="istickedoff">(\(convFd, entriesFd, idxFd) -&gt; do</span>
+<span class="lineno">  524 </span><span class="spaces">        </span><span class="istickedoff">done &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  525 </span><span class="spaces">        </span><span class="istickedoff">shutdown convFd entriesFd idxFd done)</span>
+<span class="lineno">  526 </span><span class="spaces">    </span><span class="istickedoff">$ \(convFd, entriesFd, idxFd) -&gt; do</span>
+<span class="lineno">  527 </span><span class="spaces">        </span><span class="istickedoff">secretOpsRef &lt;- newIORef Set.empty</span>
+<span class="lineno">  528 </span><span class="spaces">        </span><span class="istickedoff">let st0 = IndexedTranscriptState convFd entriesFd idxFd existingConv secretOpsRef Nothing</span>
+<span class="lineno">  529 </span><span class="spaces">            </span><span class="istickedoff">-- The daemon with an exception handler: if writeOne throws, mark</span>
+<span class="lineno">  530 </span><span class="spaces">            </span><span class="istickedoff">-- the daemon dead, fail every queued ACK (so callers blocked on</span>
+<span class="lineno">  531 </span><span class="spaces">            </span><span class="istickedoff">-- takeTMVar unblock immediately), and log to stderr. The daemon</span>
+<span class="lineno">  532 </span><span class="spaces">            </span><span class="istickedoff">-- then exits — no further writes are attempted.</span>
+<span class="lineno">  533 </span><span class="spaces">            </span><span class="istickedoff">safeDaemon st =</span>
+<span class="lineno">  534 </span><span class="spaces">              </span><span class="istickedoff">daemon st `catch` <span class="nottickedoff">\e -&gt; do</span></span>
+<span class="lineno">  535 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">atomically (writeTVar aliveRef False)</span></span>
+<span class="lineno">  536 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">globalLogIO ErrorS (&quot;[transcript] writer daemon died: &quot; &lt;&gt; ls (T.pack (show (e :: SomeException))))</span></span>
+<span class="lineno">  537 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- Drain remaining queue items WITHOUT filling their ACK slots</span></span>
+<span class="lineno">  538 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- (the writes never completed). Callers blocked on takeTMVar</span></span>
+<span class="lineno">  539 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- unblock via the aliveRef check in ackWrite's orElse. Shutdown</span></span>
+<span class="lineno">  540 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- items still get their done signal so the bracket cleanup</span></span>
+<span class="lineno">  541 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">-- completes.</span></span>
+<span class="lineno">  542 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">let drainRemaining = do</span></span>
+<span class="lineno">  543 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">item &lt;- atomically (tryReadTQueue q)</span></span>
+<span class="lineno">  544 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">case item of</span></span>
+<span class="lineno">  545 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure ()</span></span>
+<span class="lineno">  546 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">Just (ITWrite _ _mack) -&gt; drainRemaining</span></span>
+<span class="lineno">  547 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">Just (ITShutdown done) -&gt; do</span></span>
+<span class="lineno">  548 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">atomically (putTMVar done ())</span></span>
+<span class="lineno">  549 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">drainRemaining</span></span>
+<span class="lineno">  550 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">pure st</span></span>
+<span class="lineno">  551 </span><span class="spaces">            </span><span class="istickedoff">-- | Assert that a reader about to build the model's context can</span>
+<span class="lineno">  552 </span><span class="spaces">            </span><span class="istickedoff">-- see the completion injection the writer has been asked to</span>
+<span class="lineno">  553 </span><span class="spaces">            </span><span class="istickedoff">-- record. The expectation is dropped as soon as the writer has</span>
+<span class="lineno">  554 </span><span class="spaces">            </span><span class="istickedoff">-- actually written the injection, so a read that misses it is a</span>
+<span class="lineno">  555 </span><span class="spaces">            </span><span class="istickedoff">-- genuine race — the model is about to be told that a finished</span>
+<span class="lineno">  556 </span><span class="spaces">            </span><span class="istickedoff">-- sub-agent is still running.</span>
+<span class="lineno">  557 </span><span class="spaces">            </span><span class="istickedoff">checkVisibility msgs = do</span>
+<span class="lineno">  558 </span><span class="spaces">              </span><span class="istickedoff">pending &lt;- readTVarIO pendingInjectedTv</span>
+<span class="lineno">  559 </span><span class="spaces">              </span><span class="istickedoff">unless (null pending) $ do</span>
+<span class="lineno">  560 </span><span class="spaces">                </span><span class="istickedoff">let missing = [ <span class="nottickedoff">m</span> | m &lt;- pending, <span class="tickonlytrue">m `notElem` msgs</span> ]</span>
+<span class="lineno">  561 </span><span class="spaces">                </span><span class="istickedoff">unless (null missing) $ do</span>
+<span class="lineno">  562 </span><span class="spaces">                  </span><span class="istickedoff">atomically (modifyTVar' diagTv $ \d -&gt; d</span>
+<span class="lineno">  563 </span><span class="spaces">                    </span><span class="istickedoff">{ tdInjectedTailMisses = tdInjectedTailMisses d + 1 })</span>
+<span class="lineno">  564 </span><span class="spaces">                  </span><span class="istickedoff">writerLen &lt;- readTVarIO writtenLenTv</span>
+<span class="lineno">  565 </span><span class="spaces">                  </span><span class="istickedoff">let detail =</span>
+<span class="lineno">  566 </span><span class="spaces">                        </span><span class="istickedoff">&quot;injected=&quot; &lt;&gt; T.pack (show (length pending))</span>
+<span class="lineno">  567 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot; missingFromReader=&quot; &lt;&gt; T.pack (show (length missing))</span>
+<span class="lineno">  568 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot; readerLen=&quot; &lt;&gt; T.pack (show (length msgs))</span>
+<span class="lineno">  569 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot; writerLen=&quot; &lt;&gt; T.pack (show writerLen)</span>
+<span class="lineno">  570 </span><span class="spaces">                  </span><span class="istickedoff">globalLogIO <span class="nottickedoff">ErrorS</span></span>
+<span class="lineno">  571 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">(ls (&quot;[transcript-diag] COMPLETION NOT VISIBLE TO READER: the &quot;</span></span>
+<span class="lineno">  572 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;writer has been asked to record a sub-agent completion but the &quot;</span></span>
+<span class="lineno">  573 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;conversation the model is given does not contain it. &quot; &lt;&gt; detail))</span></span>
+<span class="lineno">  574 </span><span class="spaces">                  </span><span class="istickedoff">appendSessionLog (Just sessionLog) &quot;ERROR&quot;</span>
+<span class="lineno">  575 </span><span class="spaces">                    </span><span class="istickedoff">(&quot;[transcript-diag] COMPLETION NOT VISIBLE TO READER. &quot; &lt;&gt; detail)</span>
+<span class="lineno">  576 </span><span class="spaces">        </span><span class="istickedoff">void $ forkIO (void (safeDaemon st0))</span>
+<span class="lineno">  577 </span><span class="spaces">        </span><span class="istickedoff">-- | Remember a completion injection the writer has been asked to</span>
+<span class="lineno">  578 </span><span class="spaces">        </span><span class="istickedoff">-- record but has not written yet. A read that happens before the</span>
+<span class="lineno">  579 </span><span class="spaces">        </span><span class="istickedoff">-- write lands hands the model a conversation without the</span>
+<span class="lineno">  580 </span><span class="spaces">        </span><span class="istickedoff">-- completion — the model then reports the sub-agent as still</span>
+<span class="lineno">  581 </span><span class="spaces">        </span><span class="istickedoff">-- running while its verdict is on its way to disk.</span>
+<span class="lineno">  582 </span><span class="spaces">        </span><span class="istickedoff">let notePendingInjection w =</span>
+<span class="lineno">  583 </span><span class="spaces">              </span><span class="istickedoff">when (erHarness (itwEntry w) == Just completionHarnessTag) $ do</span>
+<span class="lineno">  584 </span><span class="spaces">                </span><span class="istickedoff">let n = erConvLen (itwEntry w)</span>
+<span class="lineno">  585 </span><span class="spaces">                    </span><span class="istickedoff">msgs = itwMessages w</span>
+<span class="lineno">  586 </span><span class="spaces">                </span><span class="istickedoff">when (n &gt; 0 &amp;&amp; n &lt;= length msgs) $</span>
+<span class="lineno">  587 </span><span class="spaces">                  </span><span class="istickedoff">atomically (writeTVar pendingInjectedTv (take n (reverse msgs)))</span>
+<span class="lineno">  588 </span><span class="spaces">        </span><span class="istickedoff">-- Close the handle: mark the writer dead so a further durable</span>
+<span class="lineno">  589 </span><span class="spaces">        </span><span class="istickedoff">-- write raises 'TranscriptError' instead of hanging. The daemon</span>
+<span class="lineno">  590 </span><span class="spaces">        </span><span class="istickedoff">-- thread itself is stopped by the bracket's shutdown (enqueuing a</span>
+<span class="lineno">  591 </span><span class="spaces">        </span><span class="istickedoff">-- second 'ITShutdown' here would deadlock that shutdown, which</span>
+<span class="lineno">  592 </span><span class="spaces">        </span><span class="istickedoff">-- waits on the daemon's ack). The writer has no other way to be</span>
+<span class="lineno">  593 </span><span class="spaces">        </span><span class="istickedoff">-- stopped — it is a bare `forkIO` with no exposed 'ThreadId' — so</span>
+<span class="lineno">  594 </span><span class="spaces">        </span><span class="istickedoff">-- without this the &quot;the writer died&quot; path is unreachable from a</span>
+<span class="lineno">  595 </span><span class="spaces">        </span><span class="istickedoff">-- test. Never called in production.</span>
+<span class="lineno">  596 </span><span class="spaces">        </span><span class="istickedoff">let closeHandle = atomically (writeTVar aliveRef False)</span>
+<span class="lineno">  597 </span><span class="spaces">        </span><span class="istickedoff">let enqueue w = do</span>
+<span class="lineno">  598 </span><span class="spaces">              </span><span class="istickedoff">notePendingInjection w</span>
+<span class="lineno">  599 </span><span class="spaces">              </span><span class="istickedoff">atomically (writeTQueue q (ITWrite w Nothing))</span>
+<span class="lineno">  600 </span><span class="spaces">            </span><span class="istickedoff">ackWrite w = do</span>
+<span class="lineno">  601 </span><span class="spaces">              </span><span class="istickedoff">notePendingInjection w</span>
+<span class="lineno">  602 </span><span class="spaces">              </span><span class="istickedoff">alive &lt;- readTVarIO aliveRef</span>
+<span class="lineno">  603 </span><span class="spaces">              </span><span class="istickedoff">if not alive</span>
+<span class="lineno">  604 </span><span class="spaces">                </span><span class="istickedoff">then throwIO (TranscriptError &quot;transcript writer daemon is dead&quot;)</span>
+<span class="lineno">  605 </span><span class="spaces">                </span><span class="istickedoff">else do</span>
+<span class="lineno">  606 </span><span class="spaces">                  </span><span class="istickedoff">tv &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  607 </span><span class="spaces">                  </span><span class="istickedoff">timeoutVar &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  608 </span><span class="spaces">                  </span><span class="istickedoff">atomically (writeTQueue q (ITWrite w (Just tv)))</span>
+<span class="lineno">  609 </span><span class="spaces">                  </span><span class="istickedoff">void $ forkIO $ do</span>
+<span class="lineno">  610 </span><span class="spaces">                    </span><span class="istickedoff">threadDelay defaultAckTimeoutUs</span>
+<span class="lineno">  611 </span><span class="spaces">                    </span><span class="istickedoff">void $ atomically (tryPutTMVar timeoutVar <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  612 </span><span class="spaces">                  </span><span class="istickedoff">mResult &lt;- atomically $</span>
+<span class="lineno">  613 </span><span class="spaces">                    </span><span class="istickedoff">(Right &lt;$&gt; takeTMVar tv)</span>
+<span class="lineno">  614 </span><span class="spaces">                      </span><span class="istickedoff">`orElse` (<span class="nottickedoff">Left</span> &lt;$&gt; takeTMVar timeoutVar)</span>
+<span class="lineno">  615 </span><span class="spaces">                      </span><span class="istickedoff">`orElse` (do</span>
+<span class="lineno">  616 </span><span class="spaces">                         </span><span class="istickedoff">stillAlive &lt;- readTVar aliveRef</span>
+<span class="lineno">  617 </span><span class="spaces">                         </span><span class="istickedoff">if <span class="tickonlytrue">stillAlive</span> then retry else <span class="nottickedoff">pure (Left ())</span>)</span>
+<span class="lineno">  618 </span><span class="spaces">                  </span><span class="istickedoff">case mResult of</span>
+<span class="lineno">  619 </span><span class="spaces">                    </span><span class="istickedoff">Right () -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  620 </span><span class="spaces">                    </span><span class="istickedoff">Left ()  -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  621 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">stillAlive &lt;- readTVarIO aliveRef</span></span>
+<span class="lineno">  622 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">if stillAlive</span></span>
+<span class="lineno">  623 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">then throwIO (TranscriptError &quot;transcript write timed out (daemon stuck)&quot;)</span></span>
+<span class="lineno">  624 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">else throwIO (TranscriptError &quot;transcript writer daemon died during write&quot;)</span></span>
+<span class="lineno">  625 </span><span class="spaces">        </span><span class="istickedoff">action IndexedTranscriptHandle</span>
+<span class="lineno">  626 </span><span class="spaces">          </span><span class="istickedoff">{ itwRecordAndAck = ackWrite</span>
+<span class="lineno">  627 </span><span class="spaces">          </span><span class="istickedoff">, itwRecordAsync  = enqueue</span>
+<span class="lineno">  628 </span><span class="spaces">          </span><span class="istickedoff">, itwReadConversation = do</span>
+<span class="lineno">  629 </span><span class="spaces">              </span><span class="istickedoff">msgs &lt;- readConversation &lt;$&gt; BS.readFile convPath</span>
+<span class="lineno">  630 </span><span class="spaces">              </span><span class="istickedoff">checkVisibility msgs</span>
+<span class="lineno">  631 </span><span class="spaces">              </span><span class="istickedoff">pure msgs</span>
+<span class="lineno">  632 </span><span class="spaces">          </span><span class="istickedoff">, itwReadEntries     = readEntries entriesPath</span>
+<span class="lineno">  633 </span><span class="spaces">          </span><span class="istickedoff">, itwSetSecretOps    = writeIORef secretOpsRef</span>
+<span class="lineno">  634 </span><span class="spaces">          </span><span class="istickedoff">, itwCloseTranscript = closeHandle</span>
+<span class="lineno">  635 </span><span class="spaces">          </span><span class="istickedoff">, itwIsAlive = readTVarIO aliveRef</span>
+<span class="lineno">  636 </span><span class="spaces">          </span><span class="istickedoff">, itwDiagnostics = readTVarIO diagTv</span>
+<span class="lineno">  637 </span><span class="spaces">          </span><span class="istickedoff">, itwRecordedLength = readTVarIO writtenLenTv</span>
+<span class="lineno">  638 </span><span class="spaces">          </span><span class="istickedoff">}</span></span>
+<span class="lineno">  639 </span>
+<span class="lineno">  640 </span>-- | Read back the entries file, skipping malformed lines.
+<span class="lineno">  641 </span>readEntries :: FilePath -&gt; IO [EntryRecord]
+<span class="lineno">  642 </span><span class="decl"><span class="istickedoff">readEntries path = do</span>
+<span class="lineno">  643 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  644 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  645 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  646 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  647 </span><span class="spaces">      </span><span class="istickedoff">bs &lt;- BS.readFile path</span>
+<span class="lineno">  648 </span><span class="spaces">      </span><span class="istickedoff">let lns = filter (not . BS.null) (BS.split 0x0a bs)</span>
+<span class="lineno">  649 </span><span class="spaces">      </span><span class="istickedoff">pure (mapMaybe (decode . BL.fromStrict) lns)</span></span>
+<span class="lineno">  650 </span>
+<span class="lineno">  651 </span>-- | In-memory indexed transcript handle for tests. No file IO, no daemon.
+<span class="lineno">  652 </span>fakeIndexedTranscript :: IO (IndexedTranscriptHandle, IO ([Message], [EntryRecord]))
+<span class="lineno">  653 </span><span class="decl"><span class="istickedoff">fakeIndexedTranscript = do</span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">convRef    &lt;- newMVar ([] :: [Message])</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">entriesRef &lt;- newMVar ([] :: [EntryRecord])</span>
+<span class="lineno">  656 </span><span class="spaces">  </span><span class="istickedoff">secretOpsRef &lt;- newIORef <span class="nottickedoff">Set.empty</span></span>
+<span class="lineno">  657 </span><span class="spaces">  </span><span class="istickedoff">let pushConv m = modifyMVar_ convRef (pure . (++ [m]))</span>
+<span class="lineno">  658 </span><span class="spaces">      </span><span class="istickedoff">pushEntry e = modifyMVar_ entriesRef (pure . (++ [e]))</span>
+<span class="lineno">  659 </span><span class="spaces">      </span><span class="istickedoff">handle w = do</span>
+<span class="lineno">  660 </span><span class="spaces">        </span><span class="istickedoff">secretOps &lt;- readIORef secretOpsRef</span>
+<span class="lineno">  661 </span><span class="spaces">        </span><span class="istickedoff">written &lt;- readMVar convRef</span>
+<span class="lineno">  662 </span><span class="spaces">        </span><span class="istickedoff">let redactedMsgs = redactMessages <span class="nottickedoff">secretOps</span> <span class="nottickedoff">(itwMessages w)</span> (itwMessages w)</span>
+<span class="lineno">  663 </span><span class="spaces">            </span><span class="istickedoff">writtenLen = length written</span>
+<span class="lineno">  664 </span><span class="spaces">            </span><span class="istickedoff">newLen = case erKind (itwEntry w) of</span>
+<span class="lineno">  665 </span><span class="spaces">              </span><span class="istickedoff">EKHarness -&gt; erConvLen (itwEntry w)</span>
+<span class="lineno">  666 </span><span class="spaces">              </span><span class="istickedoff">_ -&gt; max 0 (erConvLen (itwEntry w) - writtenLen)</span>
+<span class="lineno">  667 </span><span class="spaces">            </span><span class="istickedoff">newRedacted = take newLen (drop writtenLen redactedMsgs)</span>
+<span class="lineno">  668 </span><span class="spaces">        </span><span class="istickedoff">mapM_ pushConv newRedacted</span>
+<span class="lineno">  669 </span><span class="spaces">        </span><span class="istickedoff">pushEntry (itwEntry w)</span>
+<span class="lineno">  670 </span><span class="spaces">  </span><span class="istickedoff">pure</span>
+<span class="lineno">  671 </span><span class="spaces">    </span><span class="istickedoff">( IndexedTranscriptHandle</span>
+<span class="lineno">  672 </span><span class="spaces">        </span><span class="istickedoff">{ itwRecordAndAck = handle</span>
+<span class="lineno">  673 </span><span class="spaces">        </span><span class="istickedoff">, itwRecordAsync  = handle</span>
+<span class="lineno">  674 </span><span class="spaces">        </span><span class="istickedoff">, itwReadConversation = readMVar convRef</span>
+<span class="lineno">  675 </span><span class="spaces">        </span><span class="istickedoff">, itwReadEntries     = <span class="nottickedoff">readMVar entriesRef</span></span>
+<span class="lineno">  676 </span><span class="spaces">        </span><span class="istickedoff">, itwSetSecretOps    = <span class="nottickedoff">writeIORef secretOpsRef</span></span>
+<span class="lineno">  677 </span><span class="spaces">        </span><span class="istickedoff">, itwCloseTranscript = <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  678 </span><span class="spaces">        </span><span class="istickedoff">, itwIsAlive = pure True</span>
+<span class="lineno">  679 </span><span class="spaces">        </span><span class="istickedoff">, itwDiagnostics = <span class="nottickedoff">pure emptyTranscriptDiagnostics</span></span>
+<span class="lineno">  680 </span><span class="spaces">        </span><span class="istickedoff">, itwRecordedLength = <span class="nottickedoff">length &lt;$&gt; readMVar convRef</span></span>
+<span class="lineno">  681 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  682 </span><span class="spaces">    </span><span class="istickedoff">, do cs &lt;- readMVar convRef</span>
+<span class="lineno">  683 </span><span class="spaces">         </span><span class="istickedoff">es &lt;- readMVar entriesRef</span>
+<span class="lineno">  684 </span><span class="spaces">         </span><span class="istickedoff">pure (cs, es)</span>
+<span class="lineno">  685 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">  686 </span>
+<span class="lineno">  687 </span>-- | How many completion messages are waiting in the sidecar file, without
+<span class="lineno">  688 </span>-- consuming them. A non-zero count when a turn ends means a finished
+<span class="lineno">  689 </span>-- sub-agent has no delivery scheduled: the wake-up was skipped because a
+<span class="lineno">  690 </span>-- turn was in flight, and nothing will pick the message up until a human
+<span class="lineno">  691 </span>-- sends the next message.
+<span class="lineno">  692 </span>pendingCompletionCount :: SealPaths -&gt; SessionId -&gt; IO Int
+<span class="lineno">  693 </span><span class="decl"><span class="istickedoff">pendingCompletionCount paths sid =</span>
+<span class="lineno">  694 </span><span class="spaces">  </span><span class="istickedoff">catch @IOException</span>
+<span class="lineno">  695 </span><span class="spaces">    </span><span class="istickedoff">( do</span>
+<span class="lineno">  696 </span><span class="spaces">        </span><span class="istickedoff">let sidecarPath = completionSidecarPath paths sid</span>
+<span class="lineno">  697 </span><span class="spaces">        </span><span class="istickedoff">exists &lt;- doesFileExist sidecarPath</span>
+<span class="lineno">  698 </span><span class="spaces">        </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  699 </span><span class="spaces">          </span><span class="istickedoff">then pure 0</span>
+<span class="lineno">  700 </span><span class="spaces">          </span><span class="istickedoff">else length . readConversation &lt;$&gt; BS.readFile sidecarPath</span>
+<span class="lineno">  701 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">  702 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">( \e -&gt; do</span></span>
+<span class="lineno">  703 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">globalLogIO ErrorS</span></span>
+<span class="lineno">  704 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(ls (&quot;pendingCompletionCount failed: &quot; &lt;&gt; T.pack (show e)))</span></span>
+<span class="lineno">  705 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure 0</span></span>
+<span class="lineno">  706 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">)</span></span></span>
+<span class="lineno">  707 </span>
+<span class="lineno">  708 </span>-- | Redact tool-result parts that may carry secret values. Only results from
+<span class="lineno">  709 </span>-- secret-producing opcodes (those whose name is in the provided set) are
+<span class="lineno">  710 </span>-- redacted — Untrusted opcodes (SHELL_EXEC, FILE_READ, etc.) produce non-secret
+<span class="lineno">  711 </span>-- output that passes through verbatim so the frontend can display it.
+<span class="lineno">  712 </span>--
+<span class="lineno">  713 </span>-- The @allMsgs@ list (the full conversation) is scanned for 'CbToolUse' blocks
+<span class="lineno">  714 </span>-- whose 'cbName' is in the secret-opcode-name set; their 'cbId's form the set
+<span class="lineno">  715 </span>-- of tool-call ids whose results should be redacted. Only the @newMsgs@ are
+<span class="lineno">  716 </span>-- returned (after redaction); @allMsgs@ is only used for the scan.
+<span class="lineno">  717 </span>redactMessages :: Set OpName -&gt; [Message] -&gt; [Message] -&gt; [Message]
+<span class="lineno">  718 </span><span class="decl"><span class="istickedoff">redactMessages secretOps allMsgs newMsgs =</span>
+<span class="lineno">  719 </span><span class="spaces">  </span><span class="istickedoff">let secretIds = buildSecretIds secretOps allMsgs</span>
+<span class="lineno">  720 </span><span class="spaces">  </span><span class="istickedoff">in map (redactMessage secretIds) newMsgs</span>
+<span class="lineno">  721 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  722 </span><span class="spaces">    </span><span class="istickedoff">buildSecretIds :: Set OpName -&gt; [Message] -&gt; Set ToolCallId</span>
+<span class="lineno">  723 </span><span class="spaces">    </span><span class="istickedoff">buildSecretIds ops = foldr go mempty</span>
+<span class="lineno">  724 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  725 </span><span class="spaces">        </span><span class="istickedoff">go (Message _ blocks) acc = acc &lt;&gt; foldr goBlock mempty blocks</span>
+<span class="lineno">  726 </span><span class="spaces">          </span><span class="istickedoff">where</span>
+<span class="lineno">  727 </span><span class="spaces">            </span><span class="istickedoff">goBlock (CbToolUse tcid name _) a</span>
+<span class="lineno">  728 </span><span class="spaces">              </span><span class="istickedoff">| name `Set.member` ops = tcid `Set.insert` a</span>
+<span class="lineno">  729 </span><span class="spaces">              </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = a</span>
+<span class="lineno">  730 </span><span class="spaces">            </span><span class="istickedoff">goBlock _ a = a</span>
+<span class="lineno">  731 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  732 </span><span class="spaces">    </span><span class="istickedoff">redactMessage :: Set ToolCallId -&gt; Message -&gt; Message</span>
+<span class="lineno">  733 </span><span class="spaces">    </span><span class="istickedoff">redactMessage secretIds (Message role blocks) =</span>
+<span class="lineno">  734 </span><span class="spaces">      </span><span class="istickedoff">Message role (map (redactBlock secretIds) blocks)</span>
+<span class="lineno">  735 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  736 </span><span class="spaces">        </span><span class="istickedoff">redactBlock ids (CbToolResult tcid parts isErr)</span>
+<span class="lineno">  737 </span><span class="spaces">          </span><span class="istickedoff">| tcid `Set.member` ids = CbToolResult tcid (map redactPart parts) isErr</span>
+<span class="lineno">  738 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = CbToolResult tcid parts isErr</span>
+<span class="lineno">  739 </span><span class="spaces">        </span><span class="istickedoff">redactBlock _ other = other</span>
+<span class="lineno">  740 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  741 </span><span class="spaces">        </span><span class="istickedoff">redactPart (TrpText t)</span>
+<span class="lineno">  742 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">not (T.null t)</span> = TrpText &quot;&lt;redacted:secret&gt;&quot;</span>
+<span class="lineno">  743 </span><span class="spaces">          </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>      = <span class="nottickedoff">TrpText t</span></span></span>
+<span class="lineno">  744 </span>
+<span class="lineno">  745 </span>-- | A neutral baseline envelope used when no prior envelope exists (the
+<span class="lineno">  746 </span>-- first request). Mirrors 'Seal.Transcript.Reconstruct.defaultEnv'.
+<span class="lineno">  747 </span>defaultEnv :: Envelope
+<span class="lineno">  748 </span><span class="decl"><span class="istickedoff">defaultEnv = Envelope (ModelId &quot;&quot;) Nothing [] ToolAuto 0</span></span>
+<span class="lineno">  749 </span>
+<span class="lineno">  750 </span>-- | Compute the minimal 'EnvelopeDelta' that, when applied to the prior
+<span class="lineno">  751 </span>-- envelope, yields the next envelope. 'Nothing' fields mean &quot;inherit&quot; — so
+<span class="lineno">  752 </span>-- a field that's unchanged from the prior is emitted as 'Nothing' and
+<span class="lineno">  753 </span>-- omitted from the on-disk JSON entirely. When there is no prior envelope
+<span class="lineno">  754 </span>-- (the first request), the full delta is returned so reconstruction has a
+<span class="lineno">  755 </span>-- baseline to fold from.
+<span class="lineno">  756 </span>minimalDelta :: Maybe Envelope -&gt; Envelope -&gt; Maybe EnvelopeDelta
+<span class="lineno">  757 </span><span class="decl"><span class="istickedoff">minimalDelta mPrior next = case mPrior of</span>
+<span class="lineno">  758 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; Just EnvelopeDelta</span>
+<span class="lineno">  759 </span><span class="spaces">    </span><span class="istickedoff">{ edModel = Just (envModel next)</span>
+<span class="lineno">  760 </span><span class="spaces">    </span><span class="istickedoff">, edSystem = Just (envSystem next)</span>
+<span class="lineno">  761 </span><span class="spaces">    </span><span class="istickedoff">, edTools = Just (envTools next)</span>
+<span class="lineno">  762 </span><span class="spaces">    </span><span class="istickedoff">, edToolChoice = Just (envToolChoice next)</span>
+<span class="lineno">  763 </span><span class="spaces">    </span><span class="istickedoff">, edMaxTokens = Just (envMaxTokens next)</span>
+<span class="lineno">  764 </span><span class="spaces">    </span><span class="istickedoff">}</span>
+<span class="lineno">  765 </span><span class="spaces">  </span><span class="istickedoff">Just prior -&gt;</span>
+<span class="lineno">  766 </span><span class="spaces">    </span><span class="istickedoff">let d = EnvelopeDelta</span>
+<span class="lineno">  767 </span><span class="spaces">          </span><span class="istickedoff">{ edModel = if <span class="tickonlytrue">envModel next == envModel prior</span> then Nothing else <span class="nottickedoff">Just (envModel next)</span></span>
+<span class="lineno">  768 </span><span class="spaces">          </span><span class="istickedoff">, edSystem = if <span class="tickonlytrue">envSystem next == envSystem prior</span> then Nothing else <span class="nottickedoff">Just (envSystem next)</span></span>
+<span class="lineno">  769 </span><span class="spaces">          </span><span class="istickedoff">, edTools = if <span class="tickonlytrue">envTools next == envTools prior</span> then Nothing else <span class="nottickedoff">Just (envTools next)</span></span>
+<span class="lineno">  770 </span><span class="spaces">          </span><span class="istickedoff">, edToolChoice = if <span class="tickonlytrue">envToolChoice next == envToolChoice prior</span> then Nothing else <span class="nottickedoff">Just (envToolChoice next)</span></span>
+<span class="lineno">  771 </span><span class="spaces">          </span><span class="istickedoff">, edMaxTokens = if <span class="tickonlytrue">envMaxTokens next == envMaxTokens prior</span> then Nothing else <span class="nottickedoff">Just (envMaxTokens next)</span></span>
+<span class="lineno">  772 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">  773 </span><span class="spaces">    </span><span class="istickedoff">in if <span class="tickonlytrue">d == emptyEnvelopeDelta</span> then Nothing else <span class="nottickedoff">Just d</span></span></span>
+<span class="lineno">  774 </span>
+<span class="lineno">  775 </span>-- | Append a single 'Message' to a session's @conversation.jsonl@ file
+<span class="lineno">  776 </span>-- using direct @O_APPEND@ + @fsync@, and append the new byte offset to
+<span class="lineno">  777 </span>-- @conversation.idx@. This is used by the async delegation completion
+<span class="lineno">  778 </span>-- callback — which runs in a forked child thread that may outlive the
+<span class="lineno">  779 </span>-- parent's 'withIndexedTranscript' bracket (and its single-writer daemon).
+<span class="lineno">  780 </span>-- POSIX @O_APPEND@ guarantees each @write()@ atomically seeks to
+<span class="lineno">  781 </span>-- end-of-file, so concurrent writes (from the daemon during the parent's
+<span class="lineno">  782 </span>-- turn, or from another completion callback) do not interleave.
+<span class="lineno">  783 </span>--
+<span class="lineno">  784 </span>-- IO errors are swallowed (best-effort): a completion write failure must
+<span class="lineno">  785 </span>-- not crash the forked child thread. The error is logged via the global
+<span class="lineno">  786 </span>-- katip scribe.
+<span class="lineno">  787 </span>appendConversationMessage :: SealPaths -&gt; SessionId -&gt; Message -&gt; IO ()
+<span class="lineno">  788 </span><span class="decl"><span class="nottickedoff">appendConversationMessage paths sid msg =</span>
+<span class="lineno">  789 </span><span class="spaces">  </span><span class="nottickedoff">catch @IOException</span>
+<span class="lineno">  790 </span><span class="spaces">    </span><span class="nottickedoff">( do</span>
+<span class="lineno">  791 </span><span class="spaces">        </span><span class="nottickedoff">let convPath = sessionConversationPath paths sid</span>
+<span class="lineno">  792 </span><span class="spaces">            </span><span class="nottickedoff">idxPath  = sessionConversationIndexPath paths sid</span>
+<span class="lineno">  793 </span><span class="spaces">            </span><span class="nottickedoff">flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }</span>
+<span class="lineno">  794 </span><span class="spaces">        </span><span class="nottickedoff">convFd &lt;- openFd convPath ReadWrite flags</span>
+<span class="lineno">  795 </span><span class="spaces">        </span><span class="nottickedoff">let bs = encodeConvLine (ConvLine msg) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  796 </span><span class="spaces">        </span><span class="nottickedoff">BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -&gt; do</span>
+<span class="lineno">  797 </span><span class="spaces">          </span><span class="nottickedoff">_ &lt;- fdWriteBuf convFd (castPtr ptr) (fromIntegral len)</span>
+<span class="lineno">  798 </span><span class="spaces">          </span><span class="nottickedoff">pure ()</span>
+<span class="lineno">  799 </span><span class="spaces">        </span><span class="nottickedoff">fileSynchronise convFd</span>
+<span class="lineno">  800 </span><span class="spaces">        </span><span class="nottickedoff">-- Append the new EOF offset to the index</span>
+<span class="lineno">  801 </span><span class="spaces">        </span><span class="nottickedoff">newOffset &lt;- fromIntegral &lt;$&gt; fdSeek convFd SeekFromEnd 0</span>
+<span class="lineno">  802 </span><span class="spaces">        </span><span class="nottickedoff">idxFd &lt;- openFd idxPath WriteOnly flags</span>
+<span class="lineno">  803 </span><span class="spaces">        </span><span class="nottickedoff">writeIdxEntry idxFd newOffset</span>
+<span class="lineno">  804 </span><span class="spaces">        </span><span class="nottickedoff">fileSynchronise idxFd</span>
+<span class="lineno">  805 </span><span class="spaces">        </span><span class="nottickedoff">closeFd idxFd</span>
+<span class="lineno">  806 </span><span class="spaces">        </span><span class="nottickedoff">closeFd convFd</span>
+<span class="lineno">  807 </span><span class="spaces">    </span><span class="nottickedoff">)</span>
+<span class="lineno">  808 </span><span class="spaces">    </span><span class="nottickedoff">( \e -&gt; globalLogIO ErrorS</span>
+<span class="lineno">  809 </span><span class="spaces">              </span><span class="nottickedoff">(ls (&quot;appendConversationMessage failed: &quot; &lt;&gt; T.pack (show e)))</span>
+<span class="lineno">  810 </span><span class="spaces">    </span><span class="nottickedoff">)</span></span>
+<span class="lineno">  811 </span>
+<span class="lineno">  812 </span>-- | The sidecar file for agent completion messages. Each line is a
+<span class="lineno">  813 </span>-- JSON-encoded 'Message' (user role, text content). The turn engine reads
+<span class="lineno">  814 </span>-- and clears this file at the start of each turn, injecting the messages
+<span class="lineno">  815 </span>-- into the conversation. This avoids interfering with the single-writer
+<span class="lineno">  816 </span>-- daemon's in-memory diff state during the ongoing turn.
+<span class="lineno">  817 </span>completionSidecarPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  818 </span><span class="decl"><span class="istickedoff">completionSidecarPath paths sid = sessionDir paths sid &lt;/&gt; &quot;agent-completions.jsonl&quot;</span></span>
+<span class="lineno">  819 </span>
+<span class="lineno">  820 </span>-- | Append a completion message to the sidecar file. Called from forked
+<span class="lineno">  821 </span>-- child threads when a subagent completes. The message is a plain text
+<span class="lineno">  822 </span>-- string (the 'completionMessage' from the opcode layer). It is encoded as
+<span class="lineno">  823 </span>-- a JSON 'Message' (user role, 'CbText' content) so the turn engine can
+<span class="lineno">  824 </span>-- decode and inject it directly. IO errors are swallowed (best-effort).
+<span class="lineno">  825 </span>appendCompletionToSidecar :: SealPaths -&gt; SessionId -&gt; Text -&gt; IO ()
+<span class="lineno">  826 </span><span class="decl"><span class="istickedoff">appendCompletionToSidecar paths sid text =</span>
+<span class="lineno">  827 </span><span class="spaces">  </span><span class="istickedoff">catch @IOException</span>
+<span class="lineno">  828 </span><span class="spaces">    </span><span class="istickedoff">( do</span>
+<span class="lineno">  829 </span><span class="spaces">        </span><span class="istickedoff">let sidecarPath = completionSidecarPath paths sid</span>
+<span class="lineno">  830 </span><span class="spaces">            </span><span class="istickedoff">flags = defaultFileFlags { append = True, creat = Just (0o600 :: FileMode) }</span>
+<span class="lineno">  831 </span><span class="spaces">        </span><span class="istickedoff">fd &lt;- openFd sidecarPath ReadWrite flags</span>
+<span class="lineno">  832 </span><span class="spaces">        </span><span class="istickedoff">let msg = Message User [CbText text]</span>
+<span class="lineno">  833 </span><span class="spaces">            </span><span class="istickedoff">bs = encodeConvLine (ConvLine msg) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  834 </span><span class="spaces">        </span><span class="istickedoff">BSU.unsafeUseAsCStringLen bs $ \(ptr, len) -&gt; do</span>
+<span class="lineno">  835 </span><span class="spaces">          </span><span class="istickedoff">_ &lt;- fdWriteBuf fd (castPtr ptr) (fromIntegral len)</span>
+<span class="lineno">  836 </span><span class="spaces">          </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  837 </span><span class="spaces">        </span><span class="istickedoff">fileSynchronise fd</span>
+<span class="lineno">  838 </span><span class="spaces">        </span><span class="istickedoff">closeFd fd</span>
+<span class="lineno">  839 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">  840 </span><span class="spaces">    </span><span class="istickedoff">( \e -&gt; globalLogIO <span class="nottickedoff">ErrorS</span></span>
+<span class="lineno">  841 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">(ls (&quot;appendCompletionToSidecar failed: &quot; &lt;&gt; T.pack (show e)))</span></span>
+<span class="lineno">  842 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">  843 </span>
+<span class="lineno">  844 </span>-- | Read and clear the completion sidecar file. Returns the 'Message' list
+<span class="lineno">  845 </span>-- (user-role messages from completed subagents). The file is atomically
+<span class="lineno">  846 </span>-- renamed to a temp file, read, and deleted — so concurrent appends during
+<span class="lineno">  847 </span>-- the read don't lose messages (they go to the new sidecar file). Called
+<span class="lineno">  848 </span>-- by the turn engine at the start of each turn.
+<span class="lineno">  849 </span>readAndClearCompletions :: SealPaths -&gt; SessionId -&gt; IO [Message]
+<span class="lineno">  850 </span><span class="decl"><span class="istickedoff">readAndClearCompletions paths sid =</span>
+<span class="lineno">  851 </span><span class="spaces">  </span><span class="istickedoff">catch @IOException</span>
+<span class="lineno">  852 </span><span class="spaces">    </span><span class="istickedoff">( do</span>
+<span class="lineno">  853 </span><span class="spaces">        </span><span class="istickedoff">let sidecarPath = completionSidecarPath paths sid</span>
+<span class="lineno">  854 </span><span class="spaces">        </span><span class="istickedoff">exists &lt;- doesFileExist sidecarPath</span>
+<span class="lineno">  855 </span><span class="spaces">        </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  856 </span><span class="spaces">          </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  857 </span><span class="spaces">          </span><span class="istickedoff">else do</span>
+<span class="lineno">  858 </span><span class="spaces">            </span><span class="istickedoff">-- Atomic rename so concurrent appends go to a new file</span>
+<span class="lineno">  859 </span><span class="spaces">            </span><span class="istickedoff">let tmpPath = sidecarPath &lt;&gt; &quot;.read&quot;</span>
+<span class="lineno">  860 </span><span class="spaces">            </span><span class="istickedoff">System.Directory.renameFile sidecarPath tmpPath</span>
+<span class="lineno">  861 </span><span class="spaces">            </span><span class="istickedoff">raw &lt;- BS.readFile tmpPath</span>
+<span class="lineno">  862 </span><span class="spaces">            </span><span class="istickedoff">System.Directory.removeFile tmpPath</span>
+<span class="lineno">  863 </span><span class="spaces">            </span><span class="istickedoff">pure (readConversation raw)</span>
+<span class="lineno">  864 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">  865 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">( \e -&gt; do</span></span>
+<span class="lineno">  866 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">globalLogIO ErrorS</span></span>
+<span class="lineno">  867 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(ls (&quot;readAndClearCompletions failed: &quot; &lt;&gt; T.pack (show e)))</span></span>
+<span class="lineno">  868 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure []</span></span>
+<span class="lineno">  869 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">)</span></span></span>
+<span class="lineno">  870 </span>
+<span class="lineno">  871 </span>-- | The last element of a list, if it has one. Total: no partial
+<span class="lineno">  872 </span>-- functions, so the invariant check can run on every write.
+<span class="lineno">  873 </span>lastOf :: [a] -&gt; Maybe a
+<span class="lineno">  874 </span><span class="decl"><span class="istickedoff">lastOf [] = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  875 </span><span class="spaces"></span><span class="istickedoff">lastOf [x] = Just x</span>
+<span class="lineno">  876 </span><span class="spaces"></span><span class="istickedoff">lastOf (_ : xs) = lastOf xs</span></span>
+<span class="lineno">  877 </span>
+<span class="lineno">  878 </span>-- | The element at a 0-based index, if the list is long enough. Total.
+<span class="lineno">  879 </span>elementAt :: Int -&gt; [a] -&gt; Maybe a
+<span class="lineno">  880 </span><span class="decl"><span class="istickedoff">elementAt n _ | <span class="tickonlyfalse">n &lt; 0</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  881 </span><span class="spaces"></span><span class="istickedoff">elementAt 0 (x : _) = Just x</span>
+<span class="lineno">  882 </span><span class="spaces"></span><span class="istickedoff">elementAt n (_ : xs) = elementAt (n - 1) xs</span>
+<span class="lineno">  883 </span><span class="spaces"></span><span class="istickedoff">elementAt _ [] = Nothing</span></span>
+
+</pre>
+</body>
+</html>

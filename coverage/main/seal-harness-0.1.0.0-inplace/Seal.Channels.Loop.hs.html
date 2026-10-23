@@ -1,0 +1,189 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The shared 'ChannelDeps' record — the dependency bundle built once at
+<span class="lineno">    3 </span>-- startup (in 'Seal.Command.Serve') and shared between the web send
+<span class="lineno">    4 </span>-- handler ('Seal.Gateway.Send.SendDeps') and the tab-close notifier. The
+<span class="lineno">    5 </span>-- old inbox-driven channel loop ('runChannelLoop', 'plainTurn', etc.) has
+<span class="lineno">    6 </span>-- been replaced by the standalone 'seal-chat-channels' package
+<span class="lineno">    7 </span>-- ('Seal.Channels.Chat.Loop'); this module retains only the shared deps
+<span class="lineno">    8 </span>-- infrastructure that the web serve path still needs.
+<span class="lineno">    9 </span>module Seal.Channels.Loop
+<span class="lineno">   10 </span>  ( ChannelDeps (..)
+<span class="lineno">   11 </span>  , newChannelDeps
+<span class="lineno">   12 </span>  , mkTabCloseNotifier
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Seal.Channel.Cli (Backends)
+<span class="lineno">   18 </span>import Seal.Channels.Cursor (CursorStore, cursorClearAll)
+<span class="lineno">   19 </span>import Seal.Command.Provider (ProviderRuntime)
+<span class="lineno">   20 </span>import Seal.Command.Tab (TabCloseNotifier)
+<span class="lineno">   21 </span>import Seal.Config.File (RuntimeConfig)
+<span class="lineno">   22 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   23 </span>import Seal.Core.Types (sessionIdText)
+<span class="lineno">   24 </span>import Seal.Gateway.StreamBroker (StreamBroker)
+<span class="lineno">   25 </span>import Seal.Handles.AskReply (ApprovalCache)
+<span class="lineno">   26 </span>import Seal.Harness.Registry (HarnessRegistry)
+<span class="lineno">   27 </span>import Seal.Harness.Tmux (TmuxRunner)
+<span class="lineno">   28 </span>import Seal.Logging.Logger (SealLogger)
+<span class="lineno">   29 </span>import Seal.Session.ExecCache (SessionExecCache, newSessionExecCache)
+<span class="lineno">   30 </span>import Seal.Session.Lock
+<span class="lineno">   31 </span>  (ReplyRegistry, SessionLocks, newReplyRegistry, newSessionLocks, replyFanout)
+<span class="lineno">   32 </span>import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
+<span class="lineno">   33 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">   34 </span>import Seal.Tabs (TabsHandle)
+<span class="lineno">   35 </span>import Seal.Tabs.Types (TabRef (..))
+<span class="lineno">   36 </span>import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+<span class="lineno">   37 </span>import qualified Seal.Security.Policy as Policy (AutonomyLevel)
+<span class="lineno">   38 </span>import Seal.Vault.Commands (VaultRuntime)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | The dependencies a channel turn needs to have full parity with the web
+<span class="lineno">   41 </span>-- and CLI paths. Built once at startup (in 'Seal.Command.Serve') and shared
+<span class="lineno">   42 </span>-- across all turns. The reply registry, write locks, abort registry, and
+<span class="lineno">   43 </span>-- exec cache created inside 'newChannelDeps' are shared with the web send
+<span class="lineno">   44 </span>-- handler ('Seal.Gateway.Send.SendDeps') so turns from all surfaces
+<span class="lineno">   45 </span>-- (web, chat channels) hit the same stores.
+<span class="lineno">   46 </span>data ChannelDeps = ChannelDeps
+<span class="lineno">   47 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdPaths</span></span></span>      :: SealPaths
+<span class="lineno">   48 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdVault</span></span></span>      :: VaultRuntime
+<span class="lineno">   49 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdRepoReg</span></span></span>    :: RepoRegistryHandle
+<span class="lineno">   50 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdAgentReg</span></span></span>   :: AgentRegistryHandle
+<span class="lineno">   51 </span>    -- ^ The shared ssh-agent registry (one per process). Threaded through
+<span class="lineno">   52 </span>    -- 'TurnDeps' so all git-op call sites share the same 'arhLive' set.
+<span class="lineno">   53 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdProvider</span></span></span>   :: ProviderRuntime
+<span class="lineno">   54 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdBackends</span></span></span>   :: Backends
+<span class="lineno">   55 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdAutonomy</span></span></span>   :: Policy.AutonomyLevel
+<span class="lineno">   56 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdBroker</span></span></span>     :: Maybe StreamBroker
+<span class="lineno">   57 </span>    -- ^ The WS broker for pushing live transcript entries to the frontend.
+<span class="lineno">   58 </span>    -- 'Nothing' in standalone modes (no web frontend); 'Just' under
+<span class="lineno">   59 </span>    -- @seal serve@ so channel turns surface in the web UI in real time.
+<span class="lineno">   60 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdHarnessRegistry</span></span></span> :: HarnessRegistry
+<span class="lineno">   61 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdTmuxRunner</span></span></span>  :: TmuxRunner
+<span class="lineno">   62 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdHttpManager</span></span></span> :: Maybe Manager
+<span class="lineno">   63 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdApprovals</span></span></span>   :: ApprovalCache
+<span class="lineno">   64 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdCursors</span></span></span>     :: CursorStore
+<span class="lineno">   65 </span>    -- ^ Per-conversation tab cursors. Each conversation (Telegram chat,
+<span class="lineno">   66 </span>    -- Signal conversation) has its own cursor into the shared tab list.
+<span class="lineno">   67 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdReplies</span></span></span>     :: ReplyRegistry
+<span class="lineno">   68 </span>    -- ^ Per-session reply fan-out registry. Channels subscribe their
+<span class="lineno">   69 </span>    -- 'ChannelHandle' when they focus a tab; replies are fanned out to
+<span class="lineno">   70 </span>    -- all subscribed handles after each turn.
+<span class="lineno">   71 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdLocks</span></span></span>       :: SessionLocks
+<span class="lineno">   72 </span>    -- ^ Per-session write locks. Serializes concurrent turns on the same
+<span class="lineno">   73 </span>    -- session to prevent transcript corruption.
+<span class="lineno">   74 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdAbortReg</span></span></span>     :: SessionAbortRegistry
+<span class="lineno">   75 </span>    -- ^ Per-session abort registry. The channel @\/stop@ command calls
+<span class="lineno">   76 </span>    -- 'setSessionAbort' on this; the turn path looks up the per-session
+<span class="lineno">   77 </span>    -- 'AbortFlag' via 'lookupOrCreateAbortFlag' and passes it into
+<span class="lineno">   78 </span>    -- 'mkSessionAgentEnv' as 'aeAbortFlag'. Mirrors 'cdLocks'.
+<span class="lineno">   79 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdTabs</span></span></span>        :: TabsHandle
+<span class="lineno">   80 </span>    -- ^ The shared, unified tab handle. Under @seal serve@, this is the SAME
+<span class="lineno">   81 </span>    -- handle as the web gateway's 'adTabsHandle', so a tab inserted by any
+<span class="lineno">   82 </span>    -- channel is visible in the web sidebar.
+<span class="lineno">   83 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdConfig</span></span></span>      :: IO RuntimeConfig
+<span class="lineno">   84 </span>    -- ^ Load the current config (re-read per turn so config changes take
+<span class="lineno">   85 </span>    -- effect without a restart). Used for default provider/model/agent
+<span class="lineno">   86 </span>    -- when creating a new session for a conversation.
+<span class="lineno">   87 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdIsRemote</span></span></span>    :: Bool
+<span class="lineno">   88 </span>    -- ^ Whether the untrusted executor runs commands over SSH (remote
+<span class="lineno">   89 </span>    -- mode from the security config). Set once at startup from
+<span class="lineno">   90 </span>    -- @isJust (untrustedExecConfigFromSecurity secCfg)@. Threaded into
+<span class="lineno">   91 </span>    -- 'CloneDeps' so the deploy-key clone path knows to use agent
+<span class="lineno">   92 </span>    -- forwarding (@ssh -A@) + a remote @known_hosts@ temp file.
+<span class="lineno">   93 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdLogger</span></span></span>      :: SealLogger
+<span class="lineno">   94 </span>    -- ^ The shared logger for structured katip logging. Built once at
+<span class="lineno">   95 </span>    -- startup via 'withSealLogger', threaded through all channel turns.
+<span class="lineno">   96 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdExecCache</span></span></span>   :: SessionExecCache
+<span class="lineno">   97 </span>    -- ^ The per-process session-exec + workdir-discovery cache (created by
+<span class="lineno">   98 </span>    -- 'newChannelDeps'). Under @seal serve@ the SAME instance backs the
+<span class="lineno">   99 </span>    -- web 'SendDeps'/'ApiDeps' so a scan runs once per session across all
+<span class="lineno">  100 </span>    -- surfaces.
+<span class="lineno">  101 </span>  }
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>-- | Build a 'ChannelDeps' with fresh reply/lock/abort stores and the given
+<span class="lineno">  104 </span>-- config loader. Used by 'Seal.Command.Serve'. The 'tabsH' is the
+<span class="lineno">  105 </span>-- shared/unified handle. The 'cursors' is supplied by the caller: a
+<span class="lineno">  106 </span>-- persisting store ('Seal.Channels.Cursor.newPersistingCursorStore') under
+<span class="lineno">  107 </span>-- @seal serve@ so the conversation→tab bindings survive a restart, or a
+<span class="lineno">  108 </span>-- non-persisting 'newCursorStore' in tests. The caller is responsible for
+<span class="lineno">  109 </span>-- loading + seeding the cursor store at boot (see
+<span class="lineno">  110 </span>-- 'Seal.Channels.Cursor.Persist.loadCursorMap' + 'seedCursorStore'); this
+<span class="lineno">  111 </span>-- function does NOT touch disk for cursors.
+<span class="lineno">  112 </span>newChannelDeps
+<span class="lineno">  113 </span>  :: SealPaths -&gt; VaultRuntime -&gt; RepoRegistryHandle -&gt; AgentRegistryHandle -&gt; ProviderRuntime -&gt; Backends
+<span class="lineno">  114 </span>  -&gt; Policy.AutonomyLevel -&gt; Maybe StreamBroker
+<span class="lineno">  115 </span>  -&gt; HarnessRegistry -&gt; TmuxRunner -&gt; Maybe Manager
+<span class="lineno">  116 </span>  -&gt; ApprovalCache -&gt; IO RuntimeConfig
+<span class="lineno">  117 </span>  -&gt; Bool
+<span class="lineno">  118 </span>  -&gt; TabsHandle
+<span class="lineno">  119 </span>  -&gt; SealLogger
+<span class="lineno">  120 </span>  -&gt; CursorStore
+<span class="lineno">  121 </span>  -&gt; IO ChannelDeps
+<span class="lineno">  122 </span><span class="decl"><span class="nottickedoff">newChannelDeps paths vault repoReg agentReg provider backends autonomy broker</span>
+<span class="lineno">  123 </span><span class="spaces">               </span><span class="nottickedoff">harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger cursors = do</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="nottickedoff">replies &lt;- newReplyRegistry</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="nottickedoff">locks   &lt;- newSessionLocks</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="nottickedoff">abortReg &lt;- newSessionAbortRegistry</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="nottickedoff">execCache &lt;- newSessionExecCache</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="nottickedoff">pure ChannelDeps</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="nottickedoff">{ cdPaths      = paths</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="nottickedoff">, cdVault      = vault</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="nottickedoff">, cdRepoReg    = repoReg</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="nottickedoff">, cdAgentReg   = agentReg</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="nottickedoff">, cdProvider   = provider</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="nottickedoff">, cdBackends   = backends</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="nottickedoff">, cdAutonomy   = autonomy</span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="nottickedoff">, cdBroker     = broker</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="nottickedoff">, cdHarnessRegistry = harnessReg</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="nottickedoff">, cdTmuxRunner  = tmux</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="nottickedoff">, cdHttpManager = httpMgr</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="nottickedoff">, cdApprovals   = approvals</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="nottickedoff">, cdCursors     = cursors</span>
+<span class="lineno">  142 </span><span class="spaces">    </span><span class="nottickedoff">, cdReplies     = replies</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="nottickedoff">, cdLocks       = locks</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="nottickedoff">, cdAbortReg    = abortReg</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="nottickedoff">, cdTabs        = tabsH</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="nottickedoff">, cdConfig      = loadCfg</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="nottickedoff">, cdIsRemote    = isRemote</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="nottickedoff">, cdLogger      = logger</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="nottickedoff">, cdExecCache   = execCache</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Build a 'TabCloseNotifier' from the shared cursor store + reply
+<span class="lineno">  153 </span>-- registry. When a tab is closed, every conversation whose cursor points
+<span class="lineno">  154 </span>-- at the closed tab's session is notified (via 'replyFanout') and the
+<span class="lineno">  155 </span>-- cursor is cleared (so the next message mints a fresh tab). For
+<span class="lineno">  156 </span>-- 'BoundHarness' tabs there are no channel subscriptions, so this is a
+<span class="lineno">  157 </span>-- no-op. Used by the slash-command registry's @\/tab close@ and the REST
+<span class="lineno">  158 </span>-- @POST \/api\/tabs\/:index\/close@ path.
+<span class="lineno">  159 </span>mkTabCloseNotifier :: CursorStore -&gt; ReplyRegistry -&gt; TabCloseNotifier
+<span class="lineno">  160 </span><span class="decl"><span class="nottickedoff">mkTabCloseNotifier cursors replies ref = case ref of</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">BoundSession sid -&gt; do</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="nottickedoff">replyFanout replies sid (msg sid)</span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="nottickedoff">cursorClearAll cursors ref</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="nottickedoff">BoundHarness _ -&gt; pure ()</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="nottickedoff">msg sid = &quot;tab closed (session &quot; &lt;&gt; sessionIdText sid &lt;&gt; &quot;); a new tab will be created on your next message&quot;</span></span>
+
+</pre>
+</body>
+</html>

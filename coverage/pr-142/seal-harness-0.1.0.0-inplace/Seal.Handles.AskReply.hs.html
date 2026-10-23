@@ -1,0 +1,685 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The medium-agnostic ask/reply primitive.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Synchronous channels (the CLI TUI) can block inline on a direct prompt —
+<span class="lineno">    5 </span>-- the human is right there typing. Asynchronous channels (web, Signal,
+<span class="lineno">    6 </span>-- Telegram, …) cannot: the agent loop is running in one request/thread, and
+<span class="lineno">    7 </span>-- the human's answer will arrive in a *separate* future message. This module
+<span class="lineno">    8 </span>-- provides the shared, in-process store that bridges that gap without knowing
+<span class="lineno">    9 </span>-- anything about the transport.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- The flow:
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- 1. The agent calls @ASK_HUMAN@, which runs @ccPrompt q@.
+<span class="lineno">   14 </span>-- 2. The channel's @ccPrompt@ closure calls 'askHuman', which mints a fresh
+<span class="lineno">   15 </span>--    'AskId', registers a 'PendingAsk' (with an empty answer slot) in the
+<span class="lineno">   16 </span>--    store, fires a medium-specific @notify@ callback (web: broadcast a WS
+<span class="lineno">   17 </span>--    event; Signal: @chSend@ the question to the peer; Telegram: send a
+<span class="lineno">   18 </span>--    message), and **blocks** on the answer slot (an STM 'TMVar').
+<span class="lineno">   19 </span>-- 3. The human's reply arrives through the channel's inbound path (web:
+<span class="lineno">   20 </span>--    POST @/api/sessions/:id/questions/:qid/answer@; Signal/Telegram: the
+<span class="lineno">   21 </span>--    next inbound message from that peer). That path calls 'deliverAnswer',
+<span class="lineno">   22 </span>--    which fills the answer slot and unblocks the agent-loop thread.
+<span class="lineno">   23 </span>-- 4. 'askHuman' returns the answer (or an 'AskOutcome' on timeout/cancel),
+<span class="lineno">   24 </span>--    and @ccPrompt@ maps it to 'Text' for the opcode.
+<span class="lineno">   25 </span>--
+<span class="lineno">   26 </span>-- The store is keyed by 'AskId'. 'pendingForSession' lets a channel list the
+<span class="lineno">   27 </span>-- open questions for a session (so the frontend can render them on
+<span class="lineno">   28 </span>-- reconnect). 'cancelAsk' abandons a question (timeout, session close).
+<span class="lineno">   29 </span>-- 'deliverAnswer' is idempotent on a given 'AskId' (a second answer is
+<span class="lineno">   30 </span>-- rejected).
+<span class="lineno">   31 </span>module Seal.Handles.AskReply
+<span class="lineno">   32 </span>  ( AskReplyStore
+<span class="lineno">   33 </span>  , AskId (..)
+<span class="lineno">   34 </span>  , askIdText
+<span class="lineno">   35 </span>  , parseAskId
+<span class="lineno">   36 </span>  , PendingAsk (..)
+<span class="lineno">   37 </span>  , AskOutcome (..)
+<span class="lineno">   38 </span>  , AskReply (..)
+<span class="lineno">   39 </span>  , ApprovalScope (..)
+<span class="lineno">   40 </span>  , ApprovalCache
+<span class="lineno">   41 </span>  , newApprovalCache
+<span class="lineno">   42 </span>  , approvalScopeText
+<span class="lineno">   43 </span>  , parseApprovalScope
+<span class="lineno">   44 </span>  , newAskReplyStore
+<span class="lineno">   45 </span>  , askHuman
+<span class="lineno">   46 </span>  , askHumanWithMeta
+<span class="lineno">   47 </span>  , deliverAnswer
+<span class="lineno">   48 </span>  , deliverNextAnswer
+<span class="lineno">   49 </span>  , deliverNextAnswerAny
+<span class="lineno">   50 </span>  , deliverNextAnswerResolved
+<span class="lineno">   51 </span>  , deliverNextAnswerResolvedAny
+<span class="lineno">   52 </span>  , findByAskIdPrefix
+<span class="lineno">   53 </span>  , cancelAsk
+<span class="lineno">   54 </span>  , cancelSessionAsks
+<span class="lineno">   55 </span>  , pendingForSession
+<span class="lineno">   56 </span>  , lookupAsk
+<span class="lineno">   57 </span>  , checkApproval
+<span class="lineno">   58 </span>  , recordApproval
+<span class="lineno">   59 </span>  , QuestionOption (..)
+<span class="lineno">   60 </span>  , validateOptions
+<span class="lineno">   61 </span>  , askHumanWithOptions
+<span class="lineno">   62 </span>  , PendingQuestionInfo (..)
+<span class="lineno">   63 </span>  , formatQuestionWithOptions
+<span class="lineno">   64 </span>  ) where
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>import Control.Concurrent (forkIO, threadDelay)
+<span class="lineno">   67 </span>import Control.Concurrent.STM
+<span class="lineno">   68 </span>  ( TMVar, TVar, atomically, modifyTVar', newEmptyTMVarIO, newTVarIO, readTVar, readTVarIO
+<span class="lineno">   69 </span>  , takeTMVar, tryPutTMVar, writeTVar, tryReadTMVar )
+<span class="lineno">   70 </span>import Control.Monad (void)
+<span class="lineno">   71 </span>import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.!=), (.=))
+<span class="lineno">   72 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   73 </span>import Data.Bits ((.&amp;.), (.|.), complement)
+<span class="lineno">   74 </span>import Data.ByteString qualified as BS
+<span class="lineno">   75 </span>import Data.IORef (IORef, newIORef, readIORef)
+<span class="lineno">   76 </span>import Data.List (nub, sortBy)
+<span class="lineno">   77 </span>import Data.Map.Strict (Map)
+<span class="lineno">   78 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   79 </span>import Data.Set (Set)
+<span class="lineno">   80 </span>import Data.Set qualified as Set
+<span class="lineno">   81 </span>import Data.Text (Text)
+<span class="lineno">   82 </span>import Data.Text qualified as T
+<span class="lineno">   83 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   84 </span>import Data.Text.Read qualified as TR (decimal)
+<span class="lineno">   85 </span>import Data.Time (UTCTime, getCurrentTime)
+<span class="lineno">   86 </span>import Data.UUID.Types qualified as U
+<span class="lineno">   87 </span>import Data.Word (Word64)
+<span class="lineno">   88 </span>import GHC.Generics (Generic)
+<span class="lineno">   89 </span>import System.Random (randomIO)
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>import Seal.Core.Types (OpName (..), SessionId)
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | A UUID-backed identifier for one pending question. Minted by 'askHuman';
+<span class="lineno">   94 </span>-- | quoted in the notify event so the medium's inbound path can quote it back
+<span class="lineno">   95 </span>-- | in 'deliverAnswer'. The text form is a canonical UUID string.
+<span class="lineno">   96 </span>newtype AskId = AskId Text
+<span class="lineno">   97 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | The text form (a UUID string) — the value the medium carries in its
+<span class="lineno">  100 </span>-- answer-delivery path (the web route param, the Signal reply metadata, …).
+<span class="lineno">  101 </span>askIdText :: AskId -&gt; Text
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">askIdText (AskId t) = t</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Parse an 'AskId' from its text form. 'Left' on malformed input.
+<span class="lineno">  105 </span>parseAskId :: Text -&gt; Either Text AskId
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">parseAskId t</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">| isValidUuidText t = Right (AskId t)</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>         = Left (&quot;invalid AskId: &quot; &lt;&gt; t)</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | True if the text is a valid UUID (8-4-4-4-12 hex, case-insensitive).
+<span class="lineno">  111 </span>isValidUuidText :: Text -&gt; Bool
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">isValidUuidText t = case U.fromString (T.unpack t) of</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">Just _  -&gt; True</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; False</span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Mint a fresh random 'AskId' (UUID v4). IO because it reads randomness.
+<span class="lineno">  117 </span>newAskId :: IO AskId
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">newAskId = do</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">w1 &lt;- randomIO</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">w2 &lt;- randomIO</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">let v1 = (w1 .&amp;. complement 0x0000F000) .|. (0x4000 :: Word64)</span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="istickedoff">v2 = (w2 .|. 0x8000000000000000) .&amp;. complement 0x4000000000000000</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">pure (AskId (T.pack (U.toString (U.fromWords64 v1 v2))))</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | The outcome when 'askHuman' unblocks without an answer.
+<span class="lineno">  126 </span>data AskOutcome = AoAnswered | AoCancelled | AoTimedOut
+<span class="lineno">  127 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | The scope of a human approval for an Untrusted opcode. Determines how
+<span class="lineno">  130 </span>-- long the approval is cached (so subsequent calls to the same opcode skip
+<span class="lineno">  131 </span>-- the prompt). 'ScopeOnce' never caches; 'ScopeForSession' caches for the
+<span class="lineno">  132 </span>-- session; 'ScopeAlways' caches globally; 'ScopeRejected' denies this call
+<span class="lineno">  133 </span>-- (and, for 'ScopeForSession'/'ScopeAlways', future calls to the same opcode).
+<span class="lineno">  134 </span>data ApprovalScope
+<span class="lineno">  135 </span>  = ScopeOnce
+<span class="lineno">  136 </span>  | ScopeForSession
+<span class="lineno">  137 </span>  | ScopeAlways
+<span class="lineno">  138 </span>  | ScopeRejected
+<span class="lineno">  139 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>-- | The wire text for an 'ApprovalScope' (used by the API + frontend).
+<span class="lineno">  142 </span>approvalScopeText :: ApprovalScope -&gt; Text
+<span class="lineno">  143 </span><span class="decl"><span class="nottickedoff">approvalScopeText ScopeOnce        = &quot;once&quot;</span>
+<span class="lineno">  144 </span><span class="spaces"></span><span class="nottickedoff">approvalScopeText ScopeForSession  = &quot;for_session&quot;</span>
+<span class="lineno">  145 </span><span class="spaces"></span><span class="nottickedoff">approvalScopeText ScopeAlways      = &quot;always&quot;</span>
+<span class="lineno">  146 </span><span class="spaces"></span><span class="nottickedoff">approvalScopeText ScopeRejected    = &quot;rejected&quot;</span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | ToJSON for 'ApprovalScope' — encodes as the wire text (so transcript
+<span class="lineno">  149 </span>-- evidence carries a human-readable scope, not a constructor tag).
+<span class="lineno">  150 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ApprovalScope</span></span></span></span></span></span></span></span> where
+<span class="lineno">  151 </span>  <span class="decl"><span class="nottickedoff">toJSON = toJSON . approvalScopeText</span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | Parse an 'ApprovalScope' from its wire text. 'Left' on unknown.
+<span class="lineno">  154 </span>parseApprovalScope :: Text -&gt; Either Text ApprovalScope
+<span class="lineno">  155 </span><span class="decl"><span class="istickedoff">parseApprovalScope t = case T.toLower t of</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">&quot;once&quot;        -&gt; Right ScopeOnce</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">&quot;for_session&quot; -&gt; <span class="nottickedoff">Right ScopeForSession</span></span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">&quot;always&quot;      -&gt; <span class="nottickedoff">Right ScopeAlways</span></span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">&quot;rejected&quot;    -&gt; Right ScopeRejected</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">_             -&gt; <span class="nottickedoff">Left (&quot;unknown approval scope: &quot; &lt;&gt; t)</span></span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>-- | The structured reply to a pending question. For @ASK_HUMAN@, 'arScope' is
+<span class="lineno">  163 </span>-- 'ScopeOnce' and 'arText' is the human's typed reply. For the confirmation
+<span class="lineno">  164 </span>-- gate, 'arScope' is the chosen button and 'arText' is a display label
+<span class="lineno">  165 </span>-- (e.g. @&quot;yes, once&quot;@, @&quot;rejected&quot;@).
+<span class="lineno">  166 </span>data AskReply = AskReply
+<span class="lineno">  167 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">arScope</span></span></span> :: ApprovalScope
+<span class="lineno">  168 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">arText</span></span></span>  :: Text
+<span class="lineno">  169 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | One discrete choice offered to the human alongside an @ASK_HUMAN@
+<span class="lineno">  172 </span>-- question. The 'qoLabel' is the value returned to the agent when the human
+<span class="lineno">  173 </span>-- picks this choice; the 'qoDescription' is a one-line explanation shown
+<span class="lineno">  174 </span>-- alongside the button (may be empty). Labels MUST be non-empty, ≤ 64
+<span class="lineno">  175 </span>-- bytes (UTF-8), and unique within one question's offer set — enforced by
+<span class="lineno">  176 </span>-- 'validateOptions'.
+<span class="lineno">  177 </span>data QuestionOption = QuestionOption
+<span class="lineno">  178 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">qoLabel</span></span></span>       :: !Text
+<span class="lineno">  179 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">qoDescription</span></span></span> :: !Text
+<span class="lineno">  180 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">  181 </span>
+<span class="lineno">  182 </span>-- | ToJSON for 'QuestionOption' — encodes as @{label, description}@ (the
+<span class="lineno">  183 </span>-- 'qo' field prefix stripped so the wire shape matches the LLM schema + the
+<span class="lineno">  184 </span>-- frontend 'QuestionOption' type).
+<span class="lineno">  185 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON QuestionOption</span></span></span></span></span></span></span></span> where
+<span class="lineno">  186 </span>  <span class="decl"><span class="nottickedoff">toJSON (QuestionOption lbl desc) = object</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="nottickedoff">[ fromText &quot;label&quot; .= lbl</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="nottickedoff">, fromText &quot;description&quot; .= desc</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>-- | FromJSON for 'QuestionOption' — decodes from @{label, description}@.
+<span class="lineno">  192 </span>-- 'description' defaults to empty when absent.
+<span class="lineno">  193 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON QuestionOption</span></span></span></span> where
+<span class="lineno">  194 </span>  <span class="decl"><span class="nottickedoff">parseJSON = withObject &quot;QuestionOption&quot; $ \o -&gt; QuestionOption</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="nottickedoff">&lt;$&gt; o .: fromText &quot;label&quot;</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="nottickedoff">&lt;*&gt; o .:? fromText &quot;description&quot; .!= &quot;&quot;</span></span>
+<span class="lineno">  197 </span>
+<span class="lineno">  198 </span>-- | Validate a list of 'QuestionOption's for an @ASK_HUMAN@ invocation.
+<span class="lineno">  199 </span>-- Pure (no IO); returns 'Right' the validated list on success, 'Left' an
+<span class="lineno">  200 </span>-- error message on failure. Rules:
+<span class="lineno">  201 </span>--
+<span class="lineno">  202 </span>-- 1. Non-empty list (1 ≤ length).
+<span class="lineno">  203 </span>-- 2. At most 8 options.
+<span class="lineno">  204 </span>-- 3. Each 'qoLabel' non-empty and ≤ 64 bytes (UTF-8; 'Data.Text.length'
+<span class="lineno">  205 </span>--    counts code points, so we measure bytes explicitly to bound non-ASCII).
+<span class="lineno">  206 </span>-- 4. Each 'qoDescription' ≤ 200 chars.
+<span class="lineno">  207 </span>-- 5. Labels unique within the list (case-sensitive).
+<span class="lineno">  208 </span>validateOptions :: [QuestionOption] -&gt; Either Text [QuestionOption]
+<span class="lineno">  209 </span><span class="decl"><span class="istickedoff">validateOptions [] = Left &quot;options must be non-empty&quot;</span>
+<span class="lineno">  210 </span><span class="spaces"></span><span class="istickedoff">validateOptions opts</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">| length opts &gt; 8 = Left <span class="nottickedoff">&quot;options must be at most 8&quot;</span></span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case foldr checkOpt (Right <span class="nottickedoff">[]</span>) opts of</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; Left <span class="nottickedoff">e</span></span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">Right _ -&gt;</span>
+<span class="lineno">  215 </span><span class="spaces">        </span><span class="istickedoff">let labels = map qoLabel opts</span>
+<span class="lineno">  216 </span><span class="spaces">        </span><span class="istickedoff">in if length labels /= length (nub labels)</span>
+<span class="lineno">  217 </span><span class="spaces">             </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;option labels must be unique&quot;</span></span>
+<span class="lineno">  218 </span><span class="spaces">             </span><span class="istickedoff">else Right opts</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  220 </span><span class="spaces">    </span><span class="istickedoff">checkOpt _ (Left e) = <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  221 </span><span class="spaces">    </span><span class="istickedoff">checkOpt opt@(QuestionOption lbl desc) (Right acc)</span>
+<span class="lineno">  222 </span><span class="spaces">      </span><span class="istickedoff">| T.null lbl          = Left <span class="nottickedoff">&quot;option label must be non-empty&quot;</span></span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">| labelBytes &gt; 64     = Left <span class="nottickedoff">(&quot;option label exceeds 64 bytes: &quot; &lt;&gt; lbl)</span></span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">| T.length desc &gt; 200 = Left <span class="nottickedoff">(&quot;option description exceeds 200 chars: &quot; &lt;&gt; qoLabel opt)</span></span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Right <span class="nottickedoff">(opt : acc)</span></span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="istickedoff">labelBytes = BS.length (TE.encodeUtf8 lbl)</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Format a question + its options as a numbered list for chat channels
+<span class="lineno">  230 </span>-- (Signal, CLI TUI). When the options are non-empty, the format is:
+<span class="lineno">  231 </span>--
+<span class="lineno">  232 </span>-- @
+<span class="lineno">  233 </span>-- \&lt;question\&gt;
+<span class="lineno">  234 </span>--
+<span class="lineno">  235 </span>-- 1) main — the default branch
+<span class="lineno">  236 </span>-- 2) develop — ...
+<span class="lineno">  237 </span>--
+<span class="lineno">  238 </span>-- Reply with a number or type your own answer.
+<span class="lineno">  239 </span>-- @
+<span class="lineno">  240 </span>--
+<span class="lineno">  241 </span>-- When the options are empty, just the question text (today's behavior).
+<span class="lineno">  242 </span>-- Pure (no IO).
+<span class="lineno">  243 </span>formatQuestionWithOptions :: Text -&gt; [QuestionOption] -&gt; Text
+<span class="lineno">  244 </span><span class="decl"><span class="istickedoff">formatQuestionWithOptions question [] = question</span>
+<span class="lineno">  245 </span><span class="spaces"></span><span class="istickedoff">formatQuestionWithOptions question opts =</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">question</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; T.intercalate &quot;\n&quot; (zipWith formatLine [1 :: Int ..] opts)</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n\nReply with a number or type your own answer.&quot;</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">formatLine n (QuestionOption lbl desc)</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">T.null desc</span> = T.pack (show n &lt;&gt; &quot;) &quot;) &lt;&gt; lbl</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>   = <span class="nottickedoff">T.pack (show n &lt;&gt; &quot;) &quot;) &lt;&gt; lbl &lt;&gt; &quot; — &quot; &lt;&gt; desc</span></span></span>
+<span class="lineno">  254 </span>
+<span class="lineno">  255 </span>-- | One pending question: the session it belongs to, the question text, the
+<span class="lineno">  256 </span>-- timestamp it was minted, optional metadata (opcode name + input for the
+<span class="lineno">  257 </span>-- confirmation gate), the offered options (for @ASK_HUMAN@; empty for the
+<span class="lineno">  258 </span>-- confirmation gate), and the answer slot. The slot carries 'Left' on
+<span class="lineno">  259 </span>-- cancel/timeout, 'Right' on a delivered answer.
+<span class="lineno">  260 </span>data PendingAsk = PendingAsk
+<span class="lineno">  261 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">paId</span></span></span>        :: AskId
+<span class="lineno">  262 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paSession</span></span></span>   :: SessionId
+<span class="lineno">  263 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paQuestion</span></span></span>  :: Text
+<span class="lineno">  264 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paCreatedAt</span></span></span> :: UTCTime
+<span class="lineno">  265 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paMeta</span></span></span>      :: Maybe Value  -- ^ opcode name + input (for the confirmation gate); Nothing for ASK_HUMAN
+<span class="lineno">  266 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paOptions</span></span></span>   :: [QuestionOption]  -- ^ offered options (for ASK_HUMAN); empty for open-ended + the confirmation gate
+<span class="lineno">  267 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">paSlot</span></span></span>      :: TMVar (Either AskOutcome AskReply)
+<span class="lineno">  268 </span>  }
+<span class="lineno">  269 </span>
+<span class="lineno">  270 </span>-- | A read-only view of a pending question for medium rendering (the web
+<span class="lineno">  271 </span>-- frontend polls this via GET @/api/sessions/:id/questions@; the WS @ask@
+<span class="lineno">  272 </span>-- event carries the same fields). Does /not/ expose the answer slot.
+<span class="lineno">  273 </span>data PendingQuestionInfo = PendingQuestionInfo
+<span class="lineno">  274 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">pqiId</span></span></span>        :: !AskId
+<span class="lineno">  275 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">pqiSession</span></span></span>   :: !SessionId
+<span class="lineno">  276 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pqiQuestion</span></span></span>  :: !Text
+<span class="lineno">  277 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">pqiCreatedAt</span></span></span> :: !UTCTime
+<span class="lineno">  278 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">pqiMeta</span></span></span>      :: !(Maybe Value)
+<span class="lineno">  279 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pqiOptions</span></span></span>   :: ![QuestionOption]
+<span class="lineno">  280 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  281 </span>
+<span class="lineno">  282 </span>-- | The shared, in-process store. STM-backed: a 'TVar' of pending questions
+<span class="lineno">  283 </span>-- keyed by 'AskId'. The timeout (microseconds; 0 = block indefinitely) bounds
+<span class="lineno">  284 </span>-- how long 'askHuman' waits before returning 'AoTimedOut'.
+<span class="lineno">  285 </span>data AskReplyStore = AskReplyStore
+<span class="lineno">  286 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">arsPending</span></span></span>   :: TVar (Map AskId PendingAsk)
+<span class="lineno">  287 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">arsTimeoutUs</span></span></span> :: IORef Int
+<span class="lineno">  288 </span>  }
+<span class="lineno">  289 </span>
+<span class="lineno">  290 </span>-- | Build a new store with the given default timeout in microseconds
+<span class="lineno">  291 </span>-- (0 = block indefinitely). The timeout bounds every 'askHuman' call.
+<span class="lineno">  292 </span>newAskReplyStore :: Int -&gt; IO AskReplyStore
+<span class="lineno">  293 </span><span class="decl"><span class="istickedoff">newAskReplyStore timeoutUs =</span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="istickedoff">AskReplyStore &lt;$&gt; newTVarIO Map.empty &lt;*&gt; newIORef timeoutUs</span></span>
+<span class="lineno">  295 </span>
+<span class="lineno">  296 </span>-- | The approval cache: maps @(SessionId, OpName)@ → 'ApprovalScope' so that
+<span class="lineno">  297 </span>-- &quot;for this session&quot; and &quot;always&quot; approvals short-circuit the prompt for
+<span class="lineno">  298 </span>-- subsequent calls to the same opcode. 'ScopeForSession' entries are keyed
+<span class="lineno">  299 </span>-- by session; 'ScopeAlways' entries use a synthetic global session key.
+<span class="lineno">  300 </span>data ApprovalCache = ApprovalCache
+<span class="lineno">  301 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">acSession</span></span></span>  :: TVar (Map (SessionId, OpName) ApprovalScope)
+<span class="lineno">  302 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">acGlobal</span></span></span>   :: TVar (Set OpName)
+<span class="lineno">  303 </span>  }
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- | Build a new, empty approval cache.
+<span class="lineno">  306 </span>newApprovalCache :: IO ApprovalCache
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">newApprovalCache = ApprovalCache &lt;$&gt; newTVarIO Map.empty &lt;*&gt; newTVarIO Set.empty</span></span>
+<span class="lineno">  308 </span>
+<span class="lineno">  309 </span>-- | Check the approval cache for a @(SessionId, OpName)@ pair. Returns
+<span class="lineno">  310 </span>-- 'Just ScopeRejected' if the opcode was previously rejected (for this
+<span class="lineno">  311 </span>-- session or globally), 'Just scope' if it was approved at that scope,
+<span class="lineno">  312 </span>-- 'Nothing' if no prior approval exists (the caller should prompt).
+<span class="lineno">  313 </span>checkApproval :: ApprovalCache -&gt; SessionId -&gt; OpName -&gt; IO (Maybe ApprovalScope)
+<span class="lineno">  314 </span><span class="decl"><span class="istickedoff">checkApproval cache sid opName = do</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">global &lt;- readTVarIO (acGlobal cache)</span>
+<span class="lineno">  316 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">opName `Set.member` global</span></span>
+<span class="lineno">  317 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure (Just ScopeAlways)</span></span>
+<span class="lineno">  318 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff">m &lt;- readTVarIO (acSession cache)</span>
+<span class="lineno">  320 </span><span class="spaces">      </span><span class="istickedoff">pure (Map.lookup (<span class="nottickedoff">sid</span>, <span class="nottickedoff">opName</span>) m)</span></span>
+<span class="lineno">  321 </span>
+<span class="lineno">  322 </span>-- | Record an approval in the cache. 'ScopeOnce' is a no-op (no caching);
+<span class="lineno">  323 </span>-- 'ScopeForSession' inserts a session-scoped entry; 'ScopeAlways' inserts a
+<span class="lineno">  324 </span>-- global entry; 'ScopeRejected' inserts a session-scoped rejection (so
+<span class="lineno">  325 </span>-- subsequent calls in the same session short-circuit to denied). A
+<span class="lineno">  326 </span>-- 'ScopeRejected' does NOT elevate to global — the human may want to allow
+<span class="lineno">  327 </span>-- the opcode in another session.
+<span class="lineno">  328 </span>recordApproval :: ApprovalCache -&gt; SessionId -&gt; OpName -&gt; ApprovalScope -&gt; IO ()
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">recordApproval cache sid opName scope =</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">case scope of</span>
+<span class="lineno">  331 </span><span class="spaces">    </span><span class="istickedoff">ScopeOnce       -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  332 </span><span class="spaces">    </span><span class="istickedoff">ScopeForSession -&gt; <span class="nottickedoff">atomically (modifyTVar' (acSession cache) (Map.insert (sid, opName) ScopeForSession))</span></span>
+<span class="lineno">  333 </span><span class="spaces">    </span><span class="istickedoff">ScopeAlways     -&gt; <span class="nottickedoff">atomically (modifyTVar' (acGlobal cache) (Set.insert opName))</span></span>
+<span class="lineno">  334 </span><span class="spaces">    </span><span class="istickedoff">ScopeRejected   -&gt; atomically (modifyTVar' (acSession cache) (Map.insert (<span class="nottickedoff">sid</span>, <span class="nottickedoff">opName</span>) ScopeRejected))</span></span>
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- | Register a pending question, fire the @notify@ callback with its 'AskId',
+<span class="lineno">  337 </span>-- and block until the answer is delivered, the question is cancelled, or the
+<span class="lineno">  338 </span>-- timeout elapses. Returns 'Right' the reply, or 'Left' the outcome. The
+<span class="lineno">  339 </span>-- @notify@ callback is the medium-specific seam: the web broadcasts a WS
+<span class="lineno">  340 </span>-- event, Signal/Telegram @chSend@ the question to the peer. It is invoked
+<span class="lineno">  341 </span>-- /before/ blocking so the medium surfaces the question immediately. If
+<span class="lineno">  342 </span>-- @notify@ throws, the pending question is left registered (the caller may
+<span class="lineno">  343 </span>-- still deliver an answer); this is intentional — a flaky notify should not
+<span class="lineno">  344 </span>-- strand the agent loop, and 'cancelSessionAsks' cleans up on session close.
+<span class="lineno">  345 </span>askHuman
+<span class="lineno">  346 </span>  :: AskReplyStore
+<span class="lineno">  347 </span>  -&gt; SessionId
+<span class="lineno">  348 </span>  -&gt; Text          -- ^ the question text
+<span class="lineno">  349 </span>  -&gt; (AskId -&gt; IO ())  -- ^ the medium-specific notify callback
+<span class="lineno">  350 </span>  -&gt; IO (Either AskOutcome Text)
+<span class="lineno">  351 </span><span class="decl"><span class="istickedoff">askHuman store sid question notify = do</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- askHumanCore store sid question Nothing [] notify</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="istickedoff">pure (case r of</span>
+<span class="lineno">  354 </span><span class="spaces">    </span><span class="istickedoff">Left o   -&gt; Left o</span>
+<span class="lineno">  355 </span><span class="spaces">    </span><span class="istickedoff">Right ar -&gt; Right (arText ar))</span></span>
+<span class="lineno">  356 </span>
+<span class="lineno">  357 </span>-- | Like 'askHuman' but carries optional metadata (opcode name + input for
+<span class="lineno">  358 </span>-- the confirmation gate) in the 'PendingAsk'. The metadata is surfaced in the
+<span class="lineno">  359 </span>-- WS @ask@ event so the frontend can display the opcode name + input alongside
+<span class="lineno">  360 </span>-- the question. Returns the full 'AskReply' (scope + text).
+<span class="lineno">  361 </span>askHumanWithMeta
+<span class="lineno">  362 </span>  :: AskReplyStore
+<span class="lineno">  363 </span>  -&gt; SessionId
+<span class="lineno">  364 </span>  -&gt; Text          -- ^ the question text
+<span class="lineno">  365 </span>  -&gt; Maybe Value   -- ^ optional metadata (opcode name + input)
+<span class="lineno">  366 </span>  -&gt; (AskId -&gt; IO ())  -- ^ the medium-specific notify callback
+<span class="lineno">  367 </span>  -&gt; IO (Either AskOutcome AskReply)
+<span class="lineno">  368 </span><span class="decl"><span class="nottickedoff">askHumanWithMeta store sid question meta =</span>
+<span class="lineno">  369 </span><span class="spaces">  </span><span class="nottickedoff">askHumanCore store sid question meta []</span></span>
+<span class="lineno">  370 </span>
+<span class="lineno">  371 </span>-- | Like 'askHuman' but carries the offered 'QuestionOption's in the
+<span class="lineno">  372 </span>-- 'PendingAsk'. The options are surfaced in the WS @ask@ event + the
+<span class="lineno">  373 </span>-- @GET .../questions@ REST route so the frontend can render one button per
+<span class="lineno">  374 </span>-- option. The @notify@ callback fires before the blocking wait so the medium
+<span class="lineno">  375 </span>-- can surface the question + options immediately. Returns the human's typed
+<span class="lineno">  376 </span>-- reply (a chosen option's label or a free-text &quot;Other&quot; reply).
+<span class="lineno">  377 </span>askHumanWithOptions
+<span class="lineno">  378 </span>  :: AskReplyStore
+<span class="lineno">  379 </span>  -&gt; SessionId
+<span class="lineno">  380 </span>  -&gt; Text              -- ^ the question text
+<span class="lineno">  381 </span>  -&gt; [QuestionOption]  -- ^ the offered options (validated by the opcode before this call)
+<span class="lineno">  382 </span>  -&gt; (AskId -&gt; IO ())  -- ^ the medium-specific notify callback
+<span class="lineno">  383 </span>  -&gt; IO (Either AskOutcome Text)
+<span class="lineno">  384 </span><span class="decl"><span class="istickedoff">askHumanWithOptions store sid question opts notify = do</span>
+<span class="lineno">  385 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- askHumanCore store sid question Nothing opts notify</span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="istickedoff">pure (case r of</span>
+<span class="lineno">  387 </span><span class="spaces">    </span><span class="istickedoff">Left o   -&gt; <span class="nottickedoff">Left o</span></span>
+<span class="lineno">  388 </span><span class="spaces">    </span><span class="istickedoff">Right ar -&gt; Right (arText ar))</span></span>
+<span class="lineno">  389 </span>
+<span class="lineno">  390 </span>-- | The shared core for 'askHuman'/'askHumanWithMeta'/'askHumanWithOptions'.
+<span class="lineno">  391 </span>askHumanCore
+<span class="lineno">  392 </span>  :: AskReplyStore
+<span class="lineno">  393 </span>  -&gt; SessionId
+<span class="lineno">  394 </span>  -&gt; Text              -- ^ the question text
+<span class="lineno">  395 </span>  -&gt; Maybe Value       -- ^ optional metadata (opcode name + input)
+<span class="lineno">  396 </span>  -&gt; [QuestionOption]  -- ^ offered options (empty for open-ended + the confirmation gate)
+<span class="lineno">  397 </span>  -&gt; (AskId -&gt; IO ())  -- ^ the medium-specific notify callback
+<span class="lineno">  398 </span>  -&gt; IO (Either AskOutcome AskReply)
+<span class="lineno">  399 </span><span class="decl"><span class="istickedoff">askHumanCore store sid question meta opts notify = do</span>
+<span class="lineno">  400 </span><span class="spaces">  </span><span class="istickedoff">qid &lt;- newAskId</span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="istickedoff">slot &lt;- newEmptyTMVarIO</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">let pa = PendingAsk { paId = qid, paSession = sid, paQuestion = question</span>
+<span class="lineno">  404 </span><span class="spaces">                      </span><span class="istickedoff">, paCreatedAt = now, paMeta = meta, paOptions = opts, paSlot = slot }</span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">atomically (modifyTVar' (arsPending store) (Map.insert qid pa))</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">notify qid</span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">timeoutUs &lt;- readIORef (arsTimeoutUs store)</span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">if timeoutUs &lt;= 0</span>
+<span class="lineno">  409 </span><span class="spaces">    </span><span class="istickedoff">then atomically (takeTMVar slot)</span>
+<span class="lineno">  410 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- forkIO $ do</span>
+<span class="lineno">  412 </span><span class="spaces">        </span><span class="istickedoff">threadDelay timeoutUs</span>
+<span class="lineno">  413 </span><span class="spaces">        </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  414 </span><span class="spaces">          </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  415 </span><span class="spaces">          </span><span class="istickedoff">case Map.lookup qid m of</span>
+<span class="lineno">  416 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  417 </span><span class="spaces">            </span><span class="istickedoff">Just pendingPa -&gt; void (tryPutTMVar (paSlot pendingPa) (Left AoTimedOut))</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff">atomically (takeTMVar slot)</span></span>
+<span class="lineno">  419 </span>
+<span class="lineno">  420 </span>-- | Deliver an answer to a pending question. Returns 'True' if the answer
+<span class="lineno">  421 </span>-- | was accepted (the question was pending and not yet answered), 'False'
+<span class="lineno">  422 </span>-- | otherwise (unknown id, already answered, or already cancelled). The
+<span class="lineno">  423 </span>-- | accepted answer unblocks the waiting 'askHuman' thread. Idempotent on a
+<span class="lineno">  424 </span>-- | given 'AskId': a second call is rejected.
+<span class="lineno">  425 </span>deliverAnswer :: AskReplyStore -&gt; AskId -&gt; AskReply -&gt; IO Bool
+<span class="lineno">  426 </span><span class="decl"><span class="istickedoff">deliverAnswer store qid reply = do</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">mPa &lt;- atomically $ do</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  429 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup qid m of</span>
+<span class="lineno">  430 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  431 </span><span class="spaces">      </span><span class="istickedoff">Just pa -&gt; do</span>
+<span class="lineno">  432 </span><span class="spaces">        </span><span class="istickedoff">let slot = paSlot pa</span>
+<span class="lineno">  433 </span><span class="spaces">        </span><span class="istickedoff">won &lt;- tryPutTMVar slot (Right reply)</span>
+<span class="lineno">  434 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlytrue">won</span></span>
+<span class="lineno">  435 </span><span class="spaces">          </span><span class="istickedoff">then writeTVar (arsPending store) (Map.delete qid m) &gt;&gt; pure (Just <span class="nottickedoff">pa</span>)</span>
+<span class="lineno">  436 </span><span class="spaces">          </span><span class="istickedoff">else <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  437 </span><span class="spaces">  </span><span class="istickedoff">pure (case mPa of Just _ -&gt; True; Nothing -&gt; False)</span></span>
+<span class="lineno">  438 </span>
+<span class="lineno">  439 </span>-- | Deliver an answer to the /oldest/ pending question for a session. Used by
+<span class="lineno">  440 </span>-- | inbox-driven async channels (Signal, Telegram) where the human's reply
+<span class="lineno">  441 </span>-- | arrives as the next inbound message from the peer — there is no ask-id in
+<span class="lineno">  442 </span>-- | the transport, so the FIFO queue of pending questions is matched in order.
+<span class="lineno">  443 </span>-- | Returns 'True' if a pending question was found and answered, 'False' if
+<span class="lineno">  444 </span>-- | the session has no pending questions (the answer is a spurious / unsolicited
+<span class="lineno">  445 </span>-- | inbound message the caller may route as a plain turn instead).
+<span class="lineno">  446 </span>deliverNextAnswer :: AskReplyStore -&gt; SessionId -&gt; Text -&gt; IO Bool
+<span class="lineno">  447 </span><span class="decl"><span class="istickedoff">deliverNextAnswer store sid ans = do</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">let reply = AskReply <span class="nottickedoff">ScopeOnce</span> ans</span>
+<span class="lineno">  449 </span><span class="spaces">  </span><span class="istickedoff">mQid &lt;- atomically $ do</span>
+<span class="lineno">  450 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  451 </span><span class="spaces">    </span><span class="istickedoff">let matching = filter (\pa -&gt; paSession pa == sid)</span>
+<span class="lineno">  452 </span><span class="spaces">                  </span><span class="istickedoff">$ sortByCreatedAt (Map.elems m)</span>
+<span class="lineno">  453 </span><span class="spaces">    </span><span class="istickedoff">case matching of</span>
+<span class="lineno">  454 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; pure Nothing</span>
+<span class="lineno">  455 </span><span class="spaces">      </span><span class="istickedoff">pa : _ -&gt;</span>
+<span class="lineno">  456 </span><span class="spaces">        </span><span class="istickedoff">let slot = paSlot pa in do</span>
+<span class="lineno">  457 </span><span class="spaces">          </span><span class="istickedoff">won &lt;- tryPutTMVar slot (Right reply)</span>
+<span class="lineno">  458 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlytrue">won</span></span>
+<span class="lineno">  459 </span><span class="spaces">            </span><span class="istickedoff">then writeTVar (arsPending store) (Map.delete (paId pa) m)</span>
+<span class="lineno">  460 </span><span class="spaces">                 </span><span class="istickedoff">&gt;&gt; pure (Just <span class="nottickedoff">(paId pa)</span>)</span>
+<span class="lineno">  461 </span><span class="spaces">            </span><span class="istickedoff">else</span>
+<span class="lineno">  462 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">writeTVar (arsPending store) (Map.delete (paId pa) m)</span></span>
+<span class="lineno">  463 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&gt;&gt; pure Nothing</span></span>
+<span class="lineno">  464 </span><span class="spaces">  </span><span class="istickedoff">case mQid of</span>
+<span class="lineno">  465 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; pure True</span>
+<span class="lineno">  466 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  467 </span><span class="spaces">      </span><span class="istickedoff">do</span>
+<span class="lineno">  468 </span><span class="spaces">        </span><span class="istickedoff">mQid2 &lt;- atomically $ do</span>
+<span class="lineno">  469 </span><span class="spaces">          </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  470 </span><span class="spaces">          </span><span class="istickedoff">let matching = filter (\pa -&gt; paSession pa == sid)</span>
+<span class="lineno">  471 </span><span class="spaces">                        </span><span class="istickedoff">$ sortByCreatedAt (Map.elems m)</span>
+<span class="lineno">  472 </span><span class="spaces">          </span><span class="istickedoff">case matching of</span>
+<span class="lineno">  473 </span><span class="spaces">            </span><span class="istickedoff">[] -&gt; pure Nothing</span>
+<span class="lineno">  474 </span><span class="spaces">            </span><span class="istickedoff">pa : _ -&gt;</span>
+<span class="lineno">  475 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">let slot = paSlot pa in do</span></span>
+<span class="lineno">  476 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">won &lt;- tryPutTMVar slot (Right reply)</span></span>
+<span class="lineno">  477 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">if won</span></span>
+<span class="lineno">  478 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">then writeTVar (arsPending store) (Map.delete (paId pa) m)</span></span>
+<span class="lineno">  479 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&gt;&gt; pure (Just (paId pa))</span></span>
+<span class="lineno">  480 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">else writeTVar (arsPending store) (Map.delete (paId pa) m)</span></span>
+<span class="lineno">  481 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&gt;&gt; pure Nothing</span></span>
+<span class="lineno">  482 </span><span class="spaces">        </span><span class="istickedoff">pure (case mQid2 of Just _ -&gt; <span class="nottickedoff">True</span>; Nothing -&gt; False)</span></span>
+<span class="lineno">  483 </span>
+<span class="lineno">  484 </span>-- | Sort pending questions oldest-first by 'paCreatedAt'. 'Map.elems' is
+<span class="lineno">  485 </span>-- unsorted (keyed by 'AskId'), so an explicit sort is needed for FIFO
+<span class="lineno">  486 </span>-- delivery.
+<span class="lineno">  487 </span>sortByCreatedAt :: [PendingAsk] -&gt; [PendingAsk]
+<span class="lineno">  488 </span><span class="decl"><span class="istickedoff">sortByCreatedAt = sortBy (\a b -&gt; compare (paCreatedAt a) (paCreatedAt b))</span></span>
+<span class="lineno">  489 </span>
+<span class="lineno">  490 </span>-- | Deliver an inbound line as the answer to the oldest pending question
+<span class="lineno">  491 </span>-- across /all/ sessions (FIFO by 'paCreatedAt'). Returns 'True' if a
+<span class="lineno">  492 </span>-- pending question was found and answered, 'False' if none exists (the
+<span class="lineno">  493 </span>-- caller may route the line as a normal turn).
+<span class="lineno">  494 </span>--
+<span class="lineno">  495 </span>-- This is the session-agnostic counterpart of 'deliverNextAnswer': it serves
+<span class="lineno">  496 </span>-- channels with a single shared input stream that may answer questions for
+<span class="lineno">  497 </span>-- more than one session (e.g. the CLI TUI, where a @/bg@ turn forks a
+<span class="lineno">  498 </span>-- background session whose confirmation prompts must be answerable from the
+<span class="lineno">  499 </span>-- same @&gt;@ prompt that serves the active session). Inbox-driven channels
+<span class="lineno">  500 </span>-- (Signal/Telegram) use the per-session 'deliverNextAnswer' because each
+<span class="lineno">  501 </span>-- conversation has its own inbound stream and cursor.
+<span class="lineno">  502 </span>deliverNextAnswerAny :: AskReplyStore -&gt; Text -&gt; IO Bool
+<span class="lineno">  503 </span><span class="decl"><span class="nottickedoff">deliverNextAnswerAny store ans = do</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="nottickedoff">let reply = AskReply ScopeOnce ans</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="nottickedoff">mQid &lt;- atomically $ do</span>
+<span class="lineno">  506 </span><span class="spaces">    </span><span class="nottickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  507 </span><span class="spaces">    </span><span class="nottickedoff">case sortByCreatedAt (Map.elems m) of</span>
+<span class="lineno">  508 </span><span class="spaces">      </span><span class="nottickedoff">[] -&gt; pure Nothing</span>
+<span class="lineno">  509 </span><span class="spaces">      </span><span class="nottickedoff">pa : _ -&gt;</span>
+<span class="lineno">  510 </span><span class="spaces">        </span><span class="nottickedoff">let slot = paSlot pa in do</span>
+<span class="lineno">  511 </span><span class="spaces">          </span><span class="nottickedoff">won &lt;- tryPutTMVar slot (Right reply)</span>
+<span class="lineno">  512 </span><span class="spaces">          </span><span class="nottickedoff">if won</span>
+<span class="lineno">  513 </span><span class="spaces">            </span><span class="nottickedoff">then writeTVar (arsPending store) (Map.delete (paId pa) m)</span>
+<span class="lineno">  514 </span><span class="spaces">                 </span><span class="nottickedoff">&gt;&gt; pure (Just (paId pa))</span>
+<span class="lineno">  515 </span><span class="spaces">            </span><span class="nottickedoff">else</span>
+<span class="lineno">  516 </span><span class="spaces">              </span><span class="nottickedoff">writeTVar (arsPending store) (Map.delete (paId pa) m)</span>
+<span class="lineno">  517 </span><span class="spaces">              </span><span class="nottickedoff">&gt;&gt; pure Nothing</span>
+<span class="lineno">  518 </span><span class="spaces">  </span><span class="nottickedoff">pure (case mQid of Just _ -&gt; True; Nothing -&gt; False)</span></span>
+<span class="lineno">  519 </span>
+<span class="lineno">  520 </span>-- | Resolve a 1-based numeric index into the pending ask's 'paOptions'.
+<span class="lineno">  521 </span>-- If the body (after 'T.strip') is a decimal 'Int' in @[1..length opts]@,
+<span class="lineno">  522 </span>-- return the indexed option's 'qoLabel'; otherwise return the body as-is.
+<span class="lineno">  523 </span>-- Pure (safe inside STM).
+<span class="lineno">  524 </span>resolveOptionIndex :: Text -&gt; [QuestionOption] -&gt; Text
+<span class="lineno">  525 </span><span class="decl"><span class="istickedoff">resolveOptionIndex body opts =</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="istickedoff">let stripped = T.strip body</span>
+<span class="lineno">  527 </span><span class="spaces">  </span><span class="istickedoff">in case TR.decimal stripped of</span>
+<span class="lineno">  528 </span><span class="spaces">       </span><span class="istickedoff">Right (n, rest) | T.null rest &amp;&amp; n &gt;= 1 &amp;&amp; n &lt;= length opts -&gt;</span>
+<span class="lineno">  529 </span><span class="spaces">         </span><span class="istickedoff">qoLabel (opts !! (n - 1))</span>
+<span class="lineno">  530 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; body</span></span>
+<span class="lineno">  531 </span>
+<span class="lineno">  532 </span>-- | Like 'deliverNextAnswer' but resolves a 1-based numeric index into the
+<span class="lineno">  533 </span>-- oldest pending ask's 'paOptions' to the indexed option's label. The
+<span class="lineno">  534 </span>-- resolution + the delivery happen in the /same/ STM transaction (gate:
+<span class="lineno">  535 </span>-- Architect #4, Security #2 — eliminates the TOCTOU race + the double-read
+<span class="lineno">  536 </span>-- of the original @resolveStockIndex@ design). 'T.strip' is applied before
+<span class="lineno">  537 </span>-- parsing; @02@ → 2 is accepted. Out-of-range numbers, non-numeric text,
+<span class="lineno">  538 </span>-- and asks with no options are delivered as-is (&quot;Other&quot;). Returns
+<span class="lineno">  539 </span>-- @(deliveredText, accepted)@.
+<span class="lineno">  540 </span>deliverNextAnswerResolved :: AskReplyStore -&gt; SessionId -&gt; Text -&gt; IO (Text, Bool)
+<span class="lineno">  541 </span><span class="decl"><span class="istickedoff">deliverNextAnswerResolved store sid body = do</span>
+<span class="lineno">  542 </span><span class="spaces">  </span><span class="istickedoff">mResult &lt;- atomically $ do</span>
+<span class="lineno">  543 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  544 </span><span class="spaces">    </span><span class="istickedoff">let matching = filter (\pa -&gt; paSession pa == sid)</span>
+<span class="lineno">  545 </span><span class="spaces">                  </span><span class="istickedoff">$ sortByCreatedAt (Map.elems m)</span>
+<span class="lineno">  546 </span><span class="spaces">    </span><span class="istickedoff">case matching of</span>
+<span class="lineno">  547 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; pure Nothing</span>
+<span class="lineno">  548 </span><span class="spaces">      </span><span class="istickedoff">pa : _ -&gt;</span>
+<span class="lineno">  549 </span><span class="spaces">        </span><span class="istickedoff">let resolved = resolveOptionIndex body (paOptions pa)</span>
+<span class="lineno">  550 </span><span class="spaces">            </span><span class="istickedoff">slot = paSlot pa</span>
+<span class="lineno">  551 </span><span class="spaces">            </span><span class="istickedoff">reply' = AskReply <span class="nottickedoff">ScopeOnce</span> resolved</span>
+<span class="lineno">  552 </span><span class="spaces">        </span><span class="istickedoff">in do</span>
+<span class="lineno">  553 </span><span class="spaces">          </span><span class="istickedoff">won &lt;- tryPutTMVar slot (Right reply')</span>
+<span class="lineno">  554 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlytrue">won</span></span>
+<span class="lineno">  555 </span><span class="spaces">            </span><span class="istickedoff">then writeTVar (arsPending store) <span class="nottickedoff">(Map.delete (paId pa) m)</span></span>
+<span class="lineno">  556 </span><span class="spaces">                 </span><span class="istickedoff">&gt;&gt; pure (Just (resolved, True))</span>
+<span class="lineno">  557 </span><span class="spaces">            </span><span class="istickedoff">else <span class="nottickedoff">writeTVar (arsPending store) (Map.delete (paId pa) m)</span></span>
+<span class="lineno">  558 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">&gt;&gt; pure (Just (resolved, False))</span></span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="istickedoff">pure (case mResult of</span>
+<span class="lineno">  560 </span><span class="spaces">    </span><span class="istickedoff">Just (resolved, accepted) -&gt; (resolved, accepted)</span>
+<span class="lineno">  561 </span><span class="spaces">    </span><span class="istickedoff">Nothing                   -&gt; (body, False))</span></span>
+<span class="lineno">  562 </span>
+<span class="lineno">  563 </span>-- | The session-agnostic counterpart of 'deliverNextAnswerResolved' (mirrors
+<span class="lineno">  564 </span>-- 'deliverNextAnswerAny'). Finds the oldest pending ask across /all/ sessions
+<span class="lineno">  565 </span>-- (FIFO by 'paCreatedAt'), resolves a numeric index to the indexed label
+<span class="lineno">  566 </span>-- (same 'resolveOptionIndex' logic), delivers, returns @(deliveredText,
+<span class="lineno">  567 </span>-- accepted)@. Used by the CLI TUI's foreground REPL
+<span class="lineno">  568 </span>-- ('Seal.Channel.Cli':716) where one input stream serves the active session
+<span class="lineno">  569 </span>-- plus any @/bg@ background sessions.
+<span class="lineno">  570 </span>deliverNextAnswerResolvedAny :: AskReplyStore -&gt; Text -&gt; IO (Text, Bool)
+<span class="lineno">  571 </span><span class="decl"><span class="istickedoff">deliverNextAnswerResolvedAny store body = do</span>
+<span class="lineno">  572 </span><span class="spaces">  </span><span class="istickedoff">mResult &lt;- atomically $ do</span>
+<span class="lineno">  573 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  574 </span><span class="spaces">    </span><span class="istickedoff">case sortByCreatedAt (Map.elems m) of</span>
+<span class="lineno">  575 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; pure Nothing</span>
+<span class="lineno">  576 </span><span class="spaces">      </span><span class="istickedoff">pa : _ -&gt;</span>
+<span class="lineno">  577 </span><span class="spaces">        </span><span class="istickedoff">let resolved = resolveOptionIndex body (paOptions pa)</span>
+<span class="lineno">  578 </span><span class="spaces">            </span><span class="istickedoff">slot = paSlot pa</span>
+<span class="lineno">  579 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">reply' = AskReply ScopeOnce resolved</span></span>
+<span class="lineno">  580 </span><span class="spaces">        </span><span class="istickedoff">in do</span>
+<span class="lineno">  581 </span><span class="spaces">          </span><span class="istickedoff">won &lt;- tryPutTMVar slot <span class="nottickedoff">(Right reply')</span></span>
+<span class="lineno">  582 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlytrue">won</span></span>
+<span class="lineno">  583 </span><span class="spaces">            </span><span class="istickedoff">then writeTVar (arsPending store) <span class="nottickedoff">(Map.delete (paId pa) m)</span></span>
+<span class="lineno">  584 </span><span class="spaces">                 </span><span class="istickedoff">&gt;&gt; pure (Just (resolved, True))</span>
+<span class="lineno">  585 </span><span class="spaces">            </span><span class="istickedoff">else <span class="nottickedoff">writeTVar (arsPending store) (Map.delete (paId pa) m)</span></span>
+<span class="lineno">  586 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">&gt;&gt; pure (Just (resolved, False))</span></span>
+<span class="lineno">  587 </span><span class="spaces">  </span><span class="istickedoff">pure (case mResult of</span>
+<span class="lineno">  588 </span><span class="spaces">    </span><span class="istickedoff">Just (resolved, accepted) -&gt; (resolved, accepted)</span>
+<span class="lineno">  589 </span><span class="spaces">    </span><span class="istickedoff">Nothing                   -&gt; (body, False))</span></span>
+<span class="lineno">  590 </span>
+<span class="lineno">  591 </span>-- | 'True' if the question was pending and is now cancelled.
+<span class="lineno">  592 </span>cancelAsk :: AskReplyStore -&gt; AskId -&gt; IO Bool
+<span class="lineno">  593 </span><span class="decl"><span class="istickedoff">cancelAsk store qid = do</span>
+<span class="lineno">  594 </span><span class="spaces">  </span><span class="istickedoff">mPa &lt;- atomically $ do</span>
+<span class="lineno">  595 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  596 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup qid m of</span>
+<span class="lineno">  597 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  598 </span><span class="spaces">      </span><span class="istickedoff">Just pa -&gt; do</span>
+<span class="lineno">  599 </span><span class="spaces">        </span><span class="istickedoff">won &lt;- tryPutTMVar (paSlot pa) (Left AoCancelled)</span>
+<span class="lineno">  600 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlytrue">won</span></span>
+<span class="lineno">  601 </span><span class="spaces">          </span><span class="istickedoff">then writeTVar (arsPending store) <span class="nottickedoff">(Map.delete qid m)</span> &gt;&gt; pure (Just <span class="nottickedoff">pa</span>)</span>
+<span class="lineno">  602 </span><span class="spaces">          </span><span class="istickedoff">else <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  603 </span><span class="spaces">  </span><span class="istickedoff">pure (case mPa of Just _ -&gt; True; Nothing -&gt; False)</span></span>
+<span class="lineno">  604 </span>
+<span class="lineno">  605 </span>-- | Cancel every pending question for a session (e.g. on session close or
+<span class="lineno">  606 </span>-- | agent termination). Each still-waiting 'askHuman' thread unblocks with
+<span class="lineno">  607 </span>-- | 'AoCancelled'. Already-answered questions are unaffected.
+<span class="lineno">  608 </span>cancelSessionAsks :: AskReplyStore -&gt; SessionId -&gt; IO ()
+<span class="lineno">  609 </span><span class="decl"><span class="istickedoff">cancelSessionAsks store sid = do</span>
+<span class="lineno">  610 </span><span class="spaces">  </span><span class="istickedoff">toCancel &lt;- atomically $ do</span>
+<span class="lineno">  611 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar (arsPending store)</span>
+<span class="lineno">  612 </span><span class="spaces">    </span><span class="istickedoff">let matching = Map.filter (\pa -&gt; paSession pa == sid) m</span>
+<span class="lineno">  613 </span><span class="spaces">        </span><span class="istickedoff">remaining = Map.difference m matching</span>
+<span class="lineno">  614 </span><span class="spaces">    </span><span class="istickedoff">writeTVar (arsPending store) remaining</span>
+<span class="lineno">  615 </span><span class="spaces">    </span><span class="istickedoff">pure (Map.elems matching)</span>
+<span class="lineno">  616 </span><span class="spaces">  </span><span class="istickedoff">mapM_ (\pa -&gt; atomically (void (tryPutTMVar (paSlot pa) (Left AoCancelled)))) toCancel</span></span>
+<span class="lineno">  617 </span>
+<span class="lineno">  618 </span>-- | List the pending questions for a session, oldest-first. Used by a medium
+<span class="lineno">  619 </span>-- | to render open questions on reconnect (the web frontend polls this via
+<span class="lineno">  620 </span>-- | GET /api/sessions/:id/questions). Does /not/ expose the answer slot.
+<span class="lineno">  621 </span>-- | Includes the metadata (opcode name + input) when present so the frontend
+<span class="lineno">  622 </span>-- | can display it, and the offered options (for @ASK_HUMAN@) so the frontend
+<span class="lineno">  623 </span>-- | can render one button per option.
+<span class="lineno">  624 </span>pendingForSession
+<span class="lineno">  625 </span>  :: AskReplyStore -&gt; SessionId
+<span class="lineno">  626 </span>  -&gt; IO [PendingQuestionInfo]
+<span class="lineno">  627 </span><span class="decl"><span class="istickedoff">pendingForSession store sid =</span>
+<span class="lineno">  628 </span><span class="spaces">  </span><span class="istickedoff">map (\pa -&gt; PendingQuestionInfo</span>
+<span class="lineno">  629 </span><span class="spaces">              </span><span class="istickedoff">{ pqiId = paId pa</span>
+<span class="lineno">  630 </span><span class="spaces">              </span><span class="istickedoff">, pqiSession = paSession pa</span>
+<span class="lineno">  631 </span><span class="spaces">              </span><span class="istickedoff">, pqiQuestion = paQuestion pa</span>
+<span class="lineno">  632 </span><span class="spaces">              </span><span class="istickedoff">, pqiCreatedAt = paCreatedAt pa</span>
+<span class="lineno">  633 </span><span class="spaces">              </span><span class="istickedoff">, pqiMeta = paMeta pa</span>
+<span class="lineno">  634 </span><span class="spaces">              </span><span class="istickedoff">, pqiOptions = paOptions pa</span>
+<span class="lineno">  635 </span><span class="spaces">              </span><span class="istickedoff">})</span>
+<span class="lineno">  636 </span><span class="spaces">  </span><span class="istickedoff">. filter (\pa -&gt; paSession pa == sid)</span>
+<span class="lineno">  637 </span><span class="spaces">  </span><span class="istickedoff">. Map.elems &lt;$&gt; readTVarIO (arsPending store)</span></span>
+<span class="lineno">  638 </span>
+<span class="lineno">  639 </span>-- | Find a pending ask by an 8-hex prefix of its 'AskId'. Used by the
+<span class="lineno">  640 </span>-- Telegram inbound path: the @callback_data@ is @\&quot;&lt;8hex&gt;:&lt;label&gt;\&quot;@, and
+<span class="lineno">  641 </span>-- this scans the session's pending asks for one whose 'askIdText' starts
+<span class="lineno">  642 </span>-- with the prefix. Returns 'Nothing' if no match (the body was not a
+<span class="lineno">  643 </span>-- callback — fall through to 'deliverNextAnswerResolved').
+<span class="lineno">  644 </span>findByAskIdPrefix :: AskReplyStore -&gt; SessionId -&gt; Text -&gt; IO (Maybe AskId)
+<span class="lineno">  645 </span><span class="decl"><span class="istickedoff">findByAskIdPrefix store sid prefix = do</span>
+<span class="lineno">  646 </span><span class="spaces">  </span><span class="istickedoff">ps &lt;- pendingForSession store sid</span>
+<span class="lineno">  647 </span><span class="spaces">  </span><span class="istickedoff">pure (case filter (T.isPrefixOf prefix . askIdText . pqiId) ps of</span>
+<span class="lineno">  648 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; Nothing</span>
+<span class="lineno">  649 </span><span class="spaces">    </span><span class="istickedoff">info : _ -&gt; Just (pqiId info))</span></span>
+<span class="lineno">  650 </span>
+<span class="lineno">  651 </span>-- | Look up a single pending question by id (for the delivery path to
+<span class="lineno">  652 </span>-- | validate). Returns 'Nothing' if the id is unknown or already answered.
+<span class="lineno">  653 </span>lookupAsk :: AskReplyStore -&gt; AskId -&gt; IO (Maybe (SessionId, Text))
+<span class="lineno">  654 </span><span class="decl"><span class="istickedoff">lookupAsk store qid = do</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">m &lt;- readTVarIO (arsPending store)</span>
+<span class="lineno">  656 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup qid m of</span>
+<span class="lineno">  657 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  658 </span><span class="spaces">    </span><span class="istickedoff">Just pa -&gt; do</span>
+<span class="lineno">  659 </span><span class="spaces">      </span><span class="istickedoff">mRes &lt;- atomically (tryReadTMVar (paSlot pa))</span>
+<span class="lineno">  660 </span><span class="spaces">      </span><span class="istickedoff">case mRes of</span>
+<span class="lineno">  661 </span><span class="spaces">        </span><span class="istickedoff">Just _  -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  662 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (Just (paSession pa, paQuestion pa))</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,258 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>module Seal.Config.Paths
+<span class="lineno">    2 </span>  ( SealPaths (..)
+<span class="lineno">    3 </span>  , resolveSealHome
+<span class="lineno">    4 </span>  , getSealPaths
+<span class="lineno">    5 </span>  , ensureSealDirs
+<span class="lineno">    6 </span>  , configFilePath
+<span class="lineno">    7 </span>  , vaultFilePath
+<span class="lineno">    8 </span>  , securityFilePath
+<span class="lineno">    9 </span>  , reposFilePath
+<span class="lineno">   10 </span>  , repoCloneStateDir
+<span class="lineno">   11 </span>  , repoKeysDir
+<span class="lineno">   12 </span>  , sshAgentsDir
+<span class="lineno">   13 </span>  , sessionsRoot
+<span class="lineno">   14 </span>  , sessionDir
+<span class="lineno">   15 </span>  , sessionMetaPath
+<span class="lineno">   16 </span>  , sessionArchivedMarkerPath
+<span class="lineno">   17 </span>  , sessionTranscriptPath
+<span class="lineno">   18 </span>  , sessionConversationPath
+<span class="lineno">   19 </span>  , sessionEntriesPath
+<span class="lineno">   20 </span>  , sessionRequestsPath
+<span class="lineno">   21 </span>  , sessionLogPath
+<span class="lineno">   22 </span>  , agentSessionDir
+<span class="lineno">   23 </span>  , workdirsRoot
+<span class="lineno">   24 </span>  , sessionWorkdir
+<span class="lineno">   25 </span>  , tabListPath
+<span class="lineno">   26 </span>  , cursorMapPath
+<span class="lineno">   27 </span>  ) where
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import System.Directory (createDirectoryIfMissing, getHomeDirectory)
+<span class="lineno">   30 </span>import System.Environment (lookupEnv)
+<span class="lineno">   31 </span>import System.FilePath ((&lt;/&gt;), takeDirectory)
+<span class="lineno">   32 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>import Data.Text qualified as T
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | All paths derived from the seal home directory.
+<span class="lineno">   39 </span>--
+<span class="lineno">   40 </span>-- * 'spConfig' — version-controllable config tree; ordinary directory
+<span class="lineno">   41 </span>-- * 'spState'  — mutable runtime state; ordinary directory
+<span class="lineno">   42 </span>-- * 'spKeys'   — key material; created mode 0700, never version-controlled
+<span class="lineno">   43 </span>data SealPaths = SealPaths
+<span class="lineno">   44 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">spHome</span></span></span>   :: FilePath   -- ^ @SEAL_HOME@ env var or @~\/.seal@
+<span class="lineno">   45 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">spConfig</span></span></span> :: FilePath   -- ^ @\&lt;home\&gt;\/config@
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">spState</span></span></span>  :: FilePath   -- ^ @\&lt;home\&gt;\/state@
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">spKeys</span></span></span>   :: FilePath   -- ^ @\&lt;home\&gt;\/keys@
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">spCache</span></span></span>  :: FilePath   -- ^ @\&lt;home\&gt;\/cache@ (per-session workdirs)
+<span class="lineno">   49 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Resolve the seal home directory.
+<span class="lineno">   52 </span>--
+<span class="lineno">   53 </span>-- Returns the value of @SEAL_HOME@ when the variable is set; otherwise
+<span class="lineno">   54 </span>-- returns @~\/.seal@ via 'getHomeDirectory'.
+<span class="lineno">   55 </span>resolveSealHome :: IO FilePath
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">resolveSealHome = do</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">mEnv &lt;- lookupEnv &quot;SEAL_HOME&quot;</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">case mEnv of</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">Just h  -&gt; pure h</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="istickedoff">home &lt;- getHomeDirectory</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">pure (home &lt;/&gt; &quot;.seal&quot;)</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Compute all sub-paths under the seal home directory without touching
+<span class="lineno">   65 </span>-- the filesystem.
+<span class="lineno">   66 </span>getSealPaths :: IO SealPaths
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">getSealPaths = do</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">home &lt;- resolveSealHome</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">pure SealPaths</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">{ spHome   = home</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">, spConfig = home &lt;/&gt; &quot;config&quot;</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">, spState  = home &lt;/&gt; &quot;state&quot;</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">, spKeys   = home &lt;/&gt; &quot;keys&quot;</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">, spCache  = home &lt;/&gt; &quot;cache&quot;</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Create the seal directory tree, setting restrictive permissions on the
+<span class="lineno">   78 </span>-- keys directory.
+<span class="lineno">   79 </span>--
+<span class="lineno">   80 </span>-- * @config\/@ and @state\/@ are created with default (umask-governed) mode.
+<span class="lineno">   81 </span>-- * @keys\/@ is created and then explicitly set to mode @0700@.
+<span class="lineno">   82 </span>--
+<span class="lineno">   83 </span>-- Calling this function when the directories already exist is safe
+<span class="lineno">   84 </span>-- ('createDirectoryIfMissing' is idempotent; 'setFileMode' is idempotent).
+<span class="lineno">   85 </span>ensureSealDirs :: SealPaths -&gt; IO ()
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">ensureSealDirs paths = do</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (spConfig paths)</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (spState  paths)</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (spCache  paths)</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (spKeys   paths)</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">-- The vault lives in a subdirectory of config/ ('vaultFilePath'); create it</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">-- so the atomic vault write has an existing parent for its .tmp file.</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory (vaultFilePath paths))</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">-- The persistent ssh-agent registry lives in a subdirectory of state/repos;</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">-- create it so the registry file has an existing parent (#88).</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (sshAgentsDir paths)</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">setFileMode (spKeys paths) 0o700</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Absolute path to the TOML config file: @\&lt;config\&gt;\/config.toml@.
+<span class="lineno">  100 </span>configFilePath :: SealPaths -&gt; FilePath
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">configFilePath paths = spConfig paths &lt;/&gt; &quot;config.toml&quot;</span></span>
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>-- | Absolute path to the encrypted vault file:
+<span class="lineno">  104 </span>-- @\&lt;config\&gt;\/vault\/vault.age@.
+<span class="lineno">  105 </span>vaultFilePath :: SealPaths -&gt; FilePath
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">vaultFilePath paths = spConfig paths &lt;/&gt; &quot;vault&quot; &lt;/&gt; &quot;vault.age&quot;</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | Absolute path to the security config file: @\&lt;home\&gt;\/security.toml@.
+<span class="lineno">  109 </span>-- This is a SIBLING of @config\/@ (NOT inside it) so the git-versioned config
+<span class="lineno">  110 </span>-- repo cannot resurrect a lower-security version (design V8). The file holds
+<span class="lineno">  111 </span>-- the boot-only, agent-immutable 'SecurityConfig' (untrusted_execution +
+<span class="lineno">  112 </span>-- vault settings). Mode 0600, owned by the harness user.
+<span class="lineno">  113 </span>securityFilePath :: SealPaths -&gt; FilePath
+<span class="lineno">  114 </span><span class="decl"><span class="istickedoff">securityFilePath paths = spHome paths &lt;/&gt; &quot;security.toml&quot;</span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Absolute path to the source-control repo registry TOML file:
+<span class="lineno">  117 </span>-- @\&lt;config\&gt;\/repos.toml@.
+<span class="lineno">  118 </span>reposFilePath :: SealPaths -&gt; FilePath
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">reposFilePath paths = spConfig paths &lt;/&gt; &quot;repos.toml&quot;</span></span>
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>-- | Private state dir for clone-time temp files (GIT_ASKPASS helper scripts,
+<span class="lineno">  122 </span>-- deploy-key keyfiles, managed known_hosts). Security invariants: created
+<span class="lineno">  123 </span>-- mode @0700@, never under @\/tmp@ (so secrets never touch a world-writable
+<span class="lineno">  124 </span>-- temp dir), never version-controlled (so secret bytes never land in git).
+<span class="lineno">  125 </span>repoCloneStateDir :: SealPaths -&gt; FilePath
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">repoCloneStateDir paths = spState paths &lt;/&gt; &quot;repos&quot;</span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | The harness-private dir holding the encrypted deploy-key keyfiles (rev 3
+<span class="lineno">  129 </span>-- of the design: the encrypted keyfile stays on the harness disk as
+<span class="lineno">  130 </span>-- ciphertext; the passphrase lives in the vault; @ssh-add@ decrypts the
+<span class="lineno">  131 </span>-- keyfile into agent memory at git-op time using the passphrase piped to its
+<span class="lineno">  132 </span>-- stdin). Path: @\&lt;state\&gt;\/repos\/keys@. Created mode @0700@ by the caller
+<span class="lineno">  133 </span>-- (the @ssh-keygen@ invocation in W5 creates it on first key generation).
+<span class="lineno">  134 </span>-- The encrypted keyfile is the per-repo artifact named by 'repoIdText'.
+<span class="lineno">  135 </span>repoKeysDir :: SealPaths -&gt; FilePath
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">repoKeysDir paths = repoCloneStateDir paths &lt;/&gt; &quot;keys&quot;</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | The directory holding the persistent ssh-agent registry file:
+<span class="lineno">  139 </span>-- @\&lt;state\&gt;\/repos\/ssh-agents@. The registry (@registry.json@) records the
+<span class="lineno">  140 </span>-- @SSH_AUTH_SOCK@ \/ @SSH_AGENT_PID@ of each repo's agent so they survive
+<span class="lineno">  141 </span>-- @seal serve@ restarts (#88). Created mode @0700@ by 'ensureSealDirs'
+<span class="lineno">  142 </span>-- (the socket paths are not secrets but shouldn't be world-readable).
+<span class="lineno">  143 </span>sshAgentsDir :: SealPaths -&gt; FilePath
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">sshAgentsDir paths = repoCloneStateDir paths &lt;/&gt; &quot;ssh-agents&quot;</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Root directory holding one subdirectory per session: @\&lt;state\&gt;\/sessions@.
+<span class="lineno">  147 </span>sessionsRoot :: SealPaths -&gt; FilePath
+<span class="lineno">  148 </span><span class="decl"><span class="istickedoff">sessionsRoot paths = spState paths &lt;/&gt; &quot;sessions&quot;</span></span>
+<span class="lineno">  149 </span>
+<span class="lineno">  150 </span>-- | Directory for one session: @\&lt;state\&gt;\/sessions\/\&lt;id\&gt;@.
+<span class="lineno">  151 </span>sessionDir :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  152 </span><span class="decl"><span class="istickedoff">sessionDir paths sid = sessionsRoot paths &lt;/&gt; T.unpack (sessionIdText sid)</span></span>
+<span class="lineno">  153 </span>
+<span class="lineno">  154 </span>-- | The session's metadata file: @\&lt;sessionDir\&gt;\/session.json@.
+<span class="lineno">  155 </span>sessionMetaPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">sessionMetaPath paths sid = sessionDir paths sid &lt;/&gt; &quot;session.json&quot;</span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | The session's archived marker: @\&lt;sessionDir\&gt;\/archived@. An empty file
+<span class="lineno">  159 </span>-- whose presence marks the session as archived (a UI hint — the transcript
+<span class="lineno">  160 </span>-- and session.json stay on disk). Absent = not archived.
+<span class="lineno">  161 </span>sessionArchivedMarkerPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  162 </span><span class="decl"><span class="istickedoff">sessionArchivedMarkerPath paths sid = sessionDir paths sid &lt;/&gt; &quot;archived&quot;</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | The session's transcript: @\&lt;sessionDir\&gt;\/transcript.jsonl@.
+<span class="lineno">  165 </span>sessionTranscriptPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">sessionTranscriptPath paths sid = sessionDir paths sid &lt;/&gt; &quot;transcript.jsonl&quot;</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | The session's conversation file (new two-file format): @\&lt;sessionDir\&gt;\/conversation.jsonl@.
+<span class="lineno">  169 </span>sessionConversationPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  170 </span><span class="decl"><span class="istickedoff">sessionConversationPath paths sid = sessionDir paths sid &lt;/&gt; &quot;conversation.jsonl&quot;</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | The session's entry log (new two-file format): @\&lt;sessionDir\&gt;\/entries.jsonl@.
+<span class="lineno">  173 </span>sessionEntriesPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  174 </span><span class="decl"><span class="istickedoff">sessionEntriesPath paths sid = sessionDir paths sid &lt;/&gt; &quot;entries.jsonl&quot;</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>-- | The session's debug requests file: @\&lt;sessionDir\&gt;\/requests.jsonl@. Each
+<span class="lineno">  177 </span>-- line is the complete 'CompletionRequest' JSON exactly as sent to the LLM,
+<span class="lineno">  178 </span>-- including the full @crMessages@ history. Only written when the
+<span class="lineno">  179 </span>-- @debug_session_transcript@ config flag is set.
+<span class="lineno">  180 </span>sessionRequestsPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  181 </span><span class="decl"><span class="istickedoff">sessionRequestsPath paths sid = sessionDir paths sid &lt;/&gt; &quot;requests.jsonl&quot;</span></span>
+<span class="lineno">  182 </span>
+<span class="lineno">  183 </span>-- | The session's diagnostic log: @\&lt;sessionDir\&gt;\/seal.log@. Records turn
+<span class="lineno">  184 </span>-- lifecycle events (start/end/duration) and failures (exceptions, provider
+<span class="lineno">  185 </span>-- errors) that are NOT already captured in @entries.jsonl@ or
+<span class="lineno">  186 </span>-- @conversation.jsonl@. Best-effort: a write error is swallowed (the log
+<span class="lineno">  187 </span>-- must never break the agent loop). Append-only, one line per event, with
+<span class="lineno">  188 </span>-- an ISO-8601 timestamp prefix.
+<span class="lineno">  189 </span>sessionLogPath :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  190 </span><span class="decl"><span class="istickedoff">sessionLogPath paths sid = sessionDir paths sid &lt;/&gt; &quot;seal.log&quot;</span></span>
+<span class="lineno">  191 </span>
+<span class="lineno">  192 </span>-- | The persisted tab list: @\&lt;state\&gt;\/tabs.json@. Mirrors 'ui_state.json'
+<span class="lineno">  193 </span>-- (the frontend-owned recall file). Written atomically (0600) by
+<span class="lineno">  194 </span>-- 'Seal.Tabs.Persist.saveTabList' on every tab mutation; loaded at boot by
+<span class="lineno">  195 </span>-- 'loadTabList' so the tab list survives a @seal serve@ restart.
+<span class="lineno">  196 </span>tabListPath :: SealPaths -&gt; FilePath
+<span class="lineno">  197 </span><span class="decl"><span class="nottickedoff">tabListPath paths = spState paths &lt;/&gt; &quot;tabs.json&quot;</span></span>
+<span class="lineno">  198 </span>
+<span class="lineno">  199 </span>-- | The persisted cursor map: @\&lt;state\&gt;\/cursors.json@. Maps each
+<span class="lineno">  200 </span>-- conversation ('ConversationKey') to the 'TabRef' it's focused on.
+<span class="lineno">  201 </span>-- Written atomically (0600) by 'Seal.Channels.Cursor.Persist.saveCursorMap'
+<span class="lineno">  202 </span>-- on every cursor mutation; loaded at boot by 'loadCursorMap' so a
+<span class="lineno">  203 </span>-- conversation re-resolves to its prior session (carrying the user's
+<span class="lineno">  204 </span>-- @\/model use@ choice) after a @seal serve@ restart. Without this, the
+<span class="lineno">  205 </span>-- in-memory cursor store is lost on restart and the loop mints a fresh
+<span class="lineno">  206 </span>-- default-model session for every existing conversation.
+<span class="lineno">  207 </span>cursorMapPath :: SealPaths -&gt; FilePath
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">cursorMapPath paths = spState paths &lt;/&gt; &quot;cursors.json&quot;</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- | Directory for a sub-agent's transcript, nested under its parent session:
+<span class="lineno">  211 </span>-- @\&lt;state\&gt;\/sessions\/\&lt;parent-id\&gt;\/agents\/\&lt;child-id\&gt;@. Each forked agent
+<span class="lineno">  212 </span>-- instance gets its own two-file transcript here so the parent's
+<span class="lineno">  213 </span>-- @conversation.jsonl@ \/ @entries.jsonl@ stay uncontaminated (the two-file
+<span class="lineno">  214 </span>-- format's @erConvLen@ and envelope-delta fold are per-session; mixing a
+<span class="lineno">  215 </span>-- sub-agent's entries into the parent's files would corrupt reconstruction).
+<span class="lineno">  216 </span>-- The Audited log is shared (cross-session and canonical).
+<span class="lineno">  217 </span>agentSessionDir :: SealPaths -&gt; SessionId -&gt; SessionId -&gt; FilePath
+<span class="lineno">  218 </span><span class="decl"><span class="istickedoff">agentSessionDir paths parentSid childSid =</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">sessionDir paths parentSid &lt;/&gt; &quot;agents&quot; &lt;/&gt; T.unpack (sessionIdText childSid)</span></span>
+<span class="lineno">  220 </span>
+<span class="lineno">  221 </span>-- | Root for per-session working directories: @\&lt;cache\&gt;\/workdirs@.
+<span class="lineno">  222 </span>workdirsRoot :: SealPaths -&gt; FilePath
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">workdirsRoot paths = spCache paths &lt;/&gt; &quot;workdirs&quot;</span></span>
+<span class="lineno">  224 </span>
+<span class="lineno">  225 </span>-- | One session's working directory: @\&lt;cache\&gt;\/workdirs\/\&lt;session-id\&gt;@.
+<span class="lineno">  226 </span>-- Asserts 'isValidSessionId' as defense-in-depth (the constructor is
+<span class="lineno">  227 </span>-- locked down, but this catches any future raw-constructor leak before
+<span class="lineno">  228 </span>-- the path reaches mkdir or rm -rf).
+<span class="lineno">  229 </span>sessionWorkdir :: SealPaths -&gt; SessionId -&gt; FilePath
+<span class="lineno">  230 </span><span class="decl"><span class="istickedoff">sessionWorkdir paths sid</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">isValidSessionId (sessionIdText sid)</span> =</span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">workdirsRoot paths &lt;/&gt; T.unpack (sessionIdText sid)</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> =</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">error (&quot;sessionWorkdir: invalid session id: &quot; &lt;&gt; T.unpack (sessionIdText sid))</span></span></span>
+<span class="lineno">  235 </span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,317 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The assembled Warp application: the REST API routes + static file
+<span class="lineno">    3 </span>-- serving with SPA fallback + the non-loopback bind warning. The WS
+<span class="lineno">    4 </span>-- stream server is MOUNTED in the same application (via
+<span class="lineno">    5 </span>-- 'Seal.Gateway.Stream.streamMiddleware'), so the gateway serves HTTP and
+<span class="lineno">    6 </span>-- WebSocket traffic on a single port.
+<span class="lineno">    7 </span>module Seal.Gateway.Server
+<span class="lineno">    8 </span>  ( gatewayApp
+<span class="lineno">    9 </span>  , gatewayAppWithStream
+<span class="lineno">   10 </span>  , requestTimingMiddleware
+<span class="lineno">   11 </span>  , requestTimingMiddlewareWith
+<span class="lineno">   12 </span>  , runGateway
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Data.ByteString.Char8 qualified as BC
+<span class="lineno">   16 </span>import Data.ByteString.Lazy qualified as LBS
+<span class="lineno">   17 </span>import Data.Char (toLower)
+<span class="lineno">   18 </span>import Data.List (isPrefixOf)
+<span class="lineno">   19 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   20 </span>import Data.Text qualified as T
+<span class="lineno">   21 </span>import Data.Time (diffUTCTime, getCurrentTime)
+<span class="lineno">   22 </span>import Katip (Severity (..), ls)
+<span class="lineno">   23 </span>import Network.HTTP.Types (status200, status404)
+<span class="lineno">   24 </span>import Network.HTTP.Types qualified as HT (statusCode)
+<span class="lineno">   25 </span>import Network.HTTP.Types.Header (ResponseHeaders)
+<span class="lineno">   26 </span>import Network.Wai
+<span class="lineno">   27 </span>  ( Application, pathInfo, requestMethod, responseFile
+<span class="lineno">   28 </span>  , responseLBS, responseStatus, Response )
+<span class="lineno">   29 </span>import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeout, Settings)
+<span class="lineno">   30 </span>import System.Directory (doesFileExist)
+<span class="lineno">   31 </span>import System.FilePath ((&lt;/&gt;), takeExtension)
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>import Seal.Gateway.API (apiApp, ApiDeps (..))
+<span class="lineno">   34 </span>import Seal.Gateway.Config (GatewayConfig (..))
+<span class="lineno">   35 </span>import Seal.Gateway.Embedded (embeddedAssets)
+<span class="lineno">   36 </span>import Seal.Gateway.Stream (StreamGuard, streamMiddleware)
+<span class="lineno">   37 </span>import Seal.Gateway.StreamBroker (StreamBroker)
+<span class="lineno">   38 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   39 </span>import Seal.Security.Path
+<span class="lineno">   40 </span>  ( PathError (..)
+<span class="lineno">   41 </span>  , WorkspaceRoot (..)
+<span class="lineno">   42 </span>  , getSafePath
+<span class="lineno">   43 </span>  , mkSafePath
+<span class="lineno">   44 </span>  )
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | The assembled WAI application: the REST API routes, then static file
+<span class="lineno">   47 </span>-- serving. When a @static_dir@ is configured, serves from disk (dev path);
+<span class="lineno">   48 </span>-- otherwise falls back to the compile-time-embedded asset map (release
+<span class="lineno">   49 </span>-- default). Each request is wrapped with 'requestTimingMiddleware' so the
+<span class="lineno">   50 </span>-- method, path, status, and duration are logged via Katip for observability.
+<span class="lineno">   51 </span>gatewayApp :: SealLogger -&gt; ApiDeps -&gt; Maybe FilePath -&gt; Application
+<span class="lineno">   52 </span><span class="decl"><span class="istickedoff">gatewayApp logger deps mStaticDir =</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">requestTimingMiddleware logger $ \req respond -&gt;</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">case pathInfo req of</span>
+<span class="lineno">   55 </span><span class="spaces">      </span><span class="istickedoff">(&quot;api&quot; : _) -&gt; apiApp deps req respond</span>
+<span class="lineno">   56 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; case mStaticDir of</span>
+<span class="lineno">   57 </span><span class="spaces">        </span><span class="istickedoff">Just staticDir -&gt; serveStatic staticDir req respond</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="istickedoff">Nothing        -&gt; serveEmbedded req respond</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | The assembled application WITH the WebSocket stream endpoint mounted
+<span class="lineno">   61 </span>-- on the same port.
+<span class="lineno">   62 </span>--
+<span class="lineno">   63 </span>-- The WS upgrade is handled by 'streamMiddleware'; every non-WebSocket
+<span class="lineno">   64 </span>-- request falls through to the ordinary gateway app. This is what makes
+<span class="lineno">   65 </span>-- the gateway single-port: one listener, one bind, no second port to
+<span class="lineno">   66 </span>-- collide with.
+<span class="lineno">   67 </span>gatewayAppWithStream
+<span class="lineno">   68 </span>  :: SealLogger
+<span class="lineno">   69 </span>  -&gt; ApiDeps
+<span class="lineno">   70 </span>  -&gt; Maybe FilePath
+<span class="lineno">   71 </span>  -&gt; StreamGuard
+<span class="lineno">   72 </span>  -&gt; StreamBroker
+<span class="lineno">   73 </span>  -&gt; Application
+<span class="lineno">   74 </span><span class="decl"><span class="nottickedoff">gatewayAppWithStream logger deps mStaticDir guard broker =</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="nottickedoff">streamMiddleware guard broker (gatewayApp logger deps mStaticDir)</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | WAI middleware that logs each request's HTTP method, path, response
+<span class="lineno">   78 </span>-- status, and total duration (in milliseconds) via the Katip 'SealLogger'.
+<span class="lineno">   79 </span>requestTimingMiddleware :: SealLogger -&gt; Application -&gt; Application
+<span class="lineno">   80 </span><span class="decl"><span class="istickedoff">requestTimingMiddleware logger = requestTimingMiddlewareWith (logIO logger InfoS . <span class="nottickedoff">ls</span>)</span></span>
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>-- | Like 'requestTimingMiddleware' but with an injectable logger (for
+<span class="lineno">   83 </span>-- tests).
+<span class="lineno">   84 </span>requestTimingMiddlewareWith :: (String -&gt; IO ()) -&gt; Application -&gt; Application
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">requestTimingMiddlewareWith logger innerApp req respond = do</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">startTime &lt;- getCurrentTime</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">innerApp req $ \resp -&gt; do</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">endTime &lt;- getCurrentTime</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">let durationMs = floor (diffUTCTime endTime startTime * 1000) :: Int</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">method = BC.unpack (requestMethod req)</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">path = &quot;/&quot; &lt;&gt; T.unpack (T.intercalate &quot;/&quot; (pathInfo req))</span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">status = HT.statusCode (responseStatus resp)</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">logger (&quot;HTTP &quot; &lt;&gt; method &lt;&gt; &quot; &quot; &lt;&gt; path &lt;&gt; &quot; -&gt; &quot; &lt;&gt; show status &lt;&gt; &quot; (&quot; &lt;&gt; show durationMs &lt;&gt; &quot;ms)&quot;)</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">respond resp</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Serve from the compile-time-embedded asset map. Traversal is
+<span class="lineno">   97 </span>-- structurally impossible (pure Map lookup, no filesystem involved).
+<span class="lineno">   98 </span>-- SPA routes fall back to the embedded @index.html@; misses on
+<span class="lineno">   99 </span>-- asset-like extensions 404 (so a bad asset URL never returns HTML).
+<span class="lineno">  100 </span>-- When the map is empty (fresh checkout / pure nix build), returns a
+<span class="lineno">  101 </span>-- helpful HTML page explaining the situation.
+<span class="lineno">  102 </span>serveEmbedded :: Application
+<span class="lineno">  103 </span><span class="decl"><span class="istickedoff">serveEmbedded req respond =</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">let segs = pathInfo req</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">key  = T.intercalate &quot;/&quot; segs</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">in case Map.lookup (T.unpack key) embeddedAssets of</span>
+<span class="lineno">  107 </span><span class="spaces">       </span><span class="istickedoff">Just bytes -&gt; <span class="nottickedoff">respond (embeddedResponse (T.unpack key) bytes)</span></span>
+<span class="lineno">  108 </span><span class="spaces">       </span><span class="istickedoff">Nothing</span>
+<span class="lineno">  109 </span><span class="spaces">         </span><span class="istickedoff">| <span class="tickonlyfalse">isAssetPath segs</span> -&gt; <span class="nottickedoff">respond notFoundResponse</span></span>
+<span class="lineno">  110 </span><span class="spaces">         </span><span class="istickedoff">| Just idx &lt;- Map.lookup &quot;index.html&quot; embeddedAssets -&gt;</span>
+<span class="lineno">  111 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">respond (indexResponse idx)</span></span>
+<span class="lineno">  112 </span><span class="spaces">         </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; respond emptyEmbedResponse</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Serve a static file from disk with SPA fallback. Routes through
+<span class="lineno">  115 </span>-- 'mkSafePath' for traversal containment (lexical collapse +
+<span class="lineno">  116 </span>-- canonicalizePath + symlink containment + blocked-name filtering).
+<span class="lineno">  117 </span>-- The root path (@pathInfo = []@) is special-cased to serve @index.html@
+<span class="lineno">  118 </span>-- directly, bypassing @mkSafePath@ (which would return the directory
+<span class="lineno">  119 </span>-- itself). Asset-extension misses 404 instead of returning HTML.
+<span class="lineno">  120 </span>serveStatic :: FilePath -&gt; Application
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">serveStatic staticDir req respond = do</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">let segs = pathInfo req</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">case segs of</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; respond (responseFile status200</span>
+<span class="lineno">  125 </span><span class="spaces">                     </span><span class="istickedoff"><span class="nottickedoff">(contentTypeHeader &quot;.html&quot; &lt;&gt; cacheHeadersFor &quot;index.html&quot; &lt;&gt; nosniffHeader)</span></span>
+<span class="lineno">  126 </span><span class="spaces">                     </span><span class="istickedoff"><span class="nottickedoff">(staticDir &lt;/&gt; &quot;index.html&quot;)</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">_  -&gt; do</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">let key = T.unpack (T.intercalate &quot;/&quot; segs)</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath (WorkspaceRoot staticDir) key</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  131 </span><span class="spaces">        </span><span class="istickedoff">Left (PathEscapesWorkspace _) -&gt; respond notFoundResponse</span>
+<span class="lineno">  132 </span><span class="spaces">        </span><span class="istickedoff">Left (PathIsBlocked _)        -&gt; <span class="nottickedoff">respond notFoundResponse</span></span>
+<span class="lineno">  133 </span><span class="spaces">        </span><span class="istickedoff">Left (PathInsecureMode _)     -&gt; <span class="nottickedoff">respond notFoundResponse</span></span>
+<span class="lineno">  134 </span><span class="spaces">        </span><span class="istickedoff">Left (PathDoesNotExist _)</span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">isAssetPath segs</span> -&gt; respond notFoundResponse</span>
+<span class="lineno">  136 </span><span class="spaces">          </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>        -&gt; <span class="nottickedoff">respond (responseFile status200</span></span>
+<span class="lineno">  137 </span><span class="spaces">                                          </span><span class="istickedoff"><span class="nottickedoff">(contentTypeHeader &quot;.html&quot; &lt;&gt; cacheHeadersFor &quot;index.html&quot; &lt;&gt; nosniffHeader)</span></span>
+<span class="lineno">  138 </span><span class="spaces">                                          </span><span class="istickedoff"><span class="nottickedoff">(staticDir &lt;/&gt; &quot;index.html&quot;) Nothing)</span></span>
+<span class="lineno">  139 </span><span class="spaces">        </span><span class="istickedoff">Right safePath -&gt; do</span>
+<span class="lineno">  140 </span><span class="spaces">          </span><span class="istickedoff">let fp = getSafePath safePath</span>
+<span class="lineno">  141 </span><span class="spaces">          </span><span class="istickedoff">exists &lt;- doesFileExist fp</span>
+<span class="lineno">  142 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlytrue">exists</span></span>
+<span class="lineno">  143 </span><span class="spaces">            </span><span class="istickedoff">then respond (responseFile status200</span>
+<span class="lineno">  144 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">(contentTypeHeader (takeExtension fp) &lt;&gt; cacheHeadersFor key &lt;&gt; nosniffHeader)</span></span>
+<span class="lineno">  145 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">fp</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  146 </span><span class="spaces">            </span><span class="istickedoff">else <span class="nottickedoff">respond notFoundResponse</span></span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | Build a 200 response for an embedded asset with MIME + cache + nosniff.
+<span class="lineno">  149 </span>embeddedResponse :: FilePath -&gt; BC.ByteString -&gt; Network.Wai.Response
+<span class="lineno">  150 </span><span class="decl"><span class="nottickedoff">embeddedResponse key bytes =</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="nottickedoff">responseLBS status200</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="nottickedoff">(contentTypeHeader (takeExtension key) &lt;&gt; cacheHeadersFor key &lt;&gt; nosniffHeader)</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="nottickedoff">(LBS.fromStrict bytes)</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | Build a 200 response for SPA fallback (index.html) with no-cache.
+<span class="lineno">  156 </span>indexResponse :: BC.ByteString -&gt; Network.Wai.Response
+<span class="lineno">  157 </span><span class="decl"><span class="nottickedoff">indexResponse bytes =</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">responseLBS status200</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="nottickedoff">[(&quot;Content-Type&quot;, &quot;text/html; charset=utf-8&quot;)</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="nottickedoff">,(&quot;Cache-Control&quot;, &quot;no-cache&quot;)</span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="nottickedoff">,(&quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;)]</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="nottickedoff">(LBS.fromStrict bytes)</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | 404 for missing asset-like paths (prevents content-type confusion).
+<span class="lineno">  165 </span>notFoundResponse :: Network.Wai.Response
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">notFoundResponse =</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">responseLBS status404</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">[(&quot;Content-Type&quot;, &quot;text/plain&quot;)</span></span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">,(&quot;Cache-Control&quot;, &quot;no-cache&quot;)</span></span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">,(&quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;)]</span></span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;not found&quot;</span></span></span>
+<span class="lineno">  172 </span>
+<span class="lineno">  173 </span>-- | Helpful HTML page when no assets are embedded (fresh checkout / nix).
+<span class="lineno">  174 </span>emptyEmbedResponse :: Network.Wai.Response
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">emptyEmbedResponse =</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">responseLBS status404</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">[(&quot;Content-Type&quot;, &quot;text/html; charset=utf-8&quot;)</span></span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">,(&quot;Cache-Control&quot;, &quot;no-cache&quot;)</span></span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">,(&quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;)]</span></span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;&lt;html&gt;&lt;body&gt;&lt;h1&gt;No UI embedded in this build&lt;/h1&gt;\</span></span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">\&lt;p&gt;Run &lt;code&gt;make build&lt;/code&gt; with the frontend built, or set\</span></span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">\[gateway] static_dir in config.toml.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;&quot;</span></span></span>
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | Content-Type header from a file extension (case-insensitive).
+<span class="lineno">  185 </span>contentTypeHeader :: String -&gt; ResponseHeaders
+<span class="lineno">  186 </span><span class="decl"><span class="nottickedoff">contentTypeHeader ext =</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="nottickedoff">[(&quot;Content-Type&quot;, contentTypeFor (map toLower ext))]</span></span>
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>-- | Cache-Control headers per §4.4 policy: @assets\/@ prefix → immutable,
+<span class="lineno">  190 </span>-- everything else (index.html, SPA fallback) → no-cache.
+<span class="lineno">  191 </span>cacheHeadersFor :: FilePath -&gt; ResponseHeaders
+<span class="lineno">  192 </span><span class="decl"><span class="nottickedoff">cacheHeadersFor key</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="nottickedoff">| &quot;assets/&quot; `isPrefixOf` key = [(&quot;Cache-Control&quot;, &quot;public, max-age=31536000, immutable&quot;)]</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise                  = [(&quot;Cache-Control&quot;, &quot;no-cache&quot;)]</span></span>
+<span class="lineno">  195 </span>
+<span class="lineno">  196 </span>-- | @X-Content-Type-Options: nosniff@ — prevents MIME-sniffing. Present
+<span class="lineno">  197 </span>-- on ALL static responses in M1.
+<span class="lineno">  198 </span>nosniffHeader :: ResponseHeaders
+<span class="lineno">  199 </span><span class="decl"><span class="nottickedoff">nosniffHeader = [(&quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;)]</span></span>
+<span class="lineno">  200 </span>
+<span class="lineno">  201 </span>-- | Whether the path looks like a static asset (has a known extension in
+<span class="lineno">  202 </span>-- the final segment). EXCLUDES @.html@ so extensionless SPA routes
+<span class="lineno">  203 </span>-- always fall back to @index.html@. Case-insensitive via 'T.toLower'.
+<span class="lineno">  204 </span>isAssetPath :: [T.Text] -&gt; Bool
+<span class="lineno">  205 </span><span class="decl"><span class="istickedoff">isAssetPath segs = case segs of</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">_  -&gt; let ext = T.toLower (T.pack (takeExtension (T.unpack (last segs))))</span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="istickedoff">in ext `elem` assetExtensions</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- | Pinned asset extension set (20 extensions, excludes @.html@).
+<span class="lineno">  211 </span>assetExtensions :: [T.Text]
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">assetExtensions =</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;.js&quot;, &quot;.mjs&quot;, &quot;.css&quot;, &quot;.map&quot;, &quot;.json&quot;, &quot;.txt&quot;, &quot;.webmanifest&quot;</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">, &quot;.png&quot;, &quot;.jpg&quot;, &quot;.jpeg&quot;, &quot;.gif&quot;, &quot;.webp&quot;, &quot;.avif&quot;, &quot;.svg&quot;, &quot;.ico&quot;</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">, &quot;.woff&quot;, &quot;.woff2&quot;, &quot;.ttf&quot;, &quot;.otf&quot;, &quot;.wasm&quot;</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>-- | The content-type for a file extension (case-insensitive — caller
+<span class="lineno">  219 </span>-- should lowercase the input via 'contentTypeHeader' or pre-normalize).
+<span class="lineno">  220 </span>contentTypeFor :: String -&gt; BC.ByteString
+<span class="lineno">  221 </span><span class="decl"><span class="nottickedoff">contentTypeFor ext = case ext of</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.html&quot;        -&gt; &quot;text/html; charset=utf-8&quot;</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.js&quot;          -&gt; &quot;application/javascript&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.mjs&quot;         -&gt; &quot;application/javascript&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.css&quot;         -&gt; &quot;text/css&quot;</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.json&quot;        -&gt; &quot;application/json&quot;</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.txt&quot;         -&gt; &quot;text/plain&quot;</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.webmanifest&quot; -&gt; &quot;application/manifest+json&quot;</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.svg&quot;         -&gt; &quot;image/svg+xml&quot;</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.png&quot;         -&gt; &quot;image/png&quot;</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.jpg&quot;         -&gt; &quot;image/jpeg&quot;</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.jpeg&quot;        -&gt; &quot;image/jpeg&quot;</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.gif&quot;         -&gt; &quot;image/gif&quot;</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.webp&quot;        -&gt; &quot;image/webp&quot;</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.avif&quot;        -&gt; &quot;image/avif&quot;</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.ico&quot;         -&gt; &quot;image/x-icon&quot;</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.woff&quot;        -&gt; &quot;font/woff&quot;</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.woff2&quot;       -&gt; &quot;font/woff2&quot;</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.ttf&quot;         -&gt; &quot;font/ttf&quot;</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.otf&quot;         -&gt; &quot;font/otf&quot;</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="nottickedoff">&quot;.wasm&quot;        -&gt; &quot;application/wasm&quot;</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="nottickedoff">_              -&gt; &quot;application/octet-stream&quot;</span></span>
+<span class="lineno">  243 </span>
+<span class="lineno">  244 </span>-- | Run the gateway. Logs a startup banner with the bind address via the
+<span class="lineno">  245 </span>-- Katip 'SealLogger'. When the host is non-loopback:
+<span class="lineno">  246 </span>--   - If @failClosedOnNonLoopback@ is True (mode=remote), REFUSES to start.
+<span class="lineno">  247 </span>--   - Otherwise, warns (the full slash-command surface is reachable).
+<span class="lineno">  248 </span>--
+<span class="lineno">  249 </span>-- The WebSocket stream endpoint is served by the SAME listener (mounted
+<span class="lineno">  250 </span>-- via 'gatewayAppWithStream'), so there is exactly one port and one bind.
+<span class="lineno">  251 </span>-- A bind failure now aborts the whole server with a clear message, rather
+<span class="lineno">  252 </span>-- than leaving a half-running gateway whose live transcript was dead.
+<span class="lineno">  253 </span>runGateway
+<span class="lineno">  254 </span>  :: SealLogger
+<span class="lineno">  255 </span>  -&gt; GatewayConfig
+<span class="lineno">  256 </span>  -&gt; Bool
+<span class="lineno">  257 </span>  -&gt; ApiDeps
+<span class="lineno">  258 </span>  -&gt; StreamGuard
+<span class="lineno">  259 </span>  -&gt; StreamBroker
+<span class="lineno">  260 </span>  -&gt; IO ()
+<span class="lineno">  261 </span><span class="decl"><span class="nottickedoff">runGateway logger cfg failClosedOnNonLoopback deps guard broker = do</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="nottickedoff">let host = gcHost cfg</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="nottickedoff">port = gcPort cfg</span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="nottickedoff">logIO logger InfoS &quot;Seal Harness gateway&quot;</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="nottickedoff">logIO logger InfoS (&quot;  URL:      http://&quot; &lt;&gt; ls host &lt;&gt; &quot;:&quot; &lt;&gt; ls (show port))</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="nottickedoff">logIO logger InfoS (&quot;  Stream:   ws://&quot; &lt;&gt; ls host &lt;&gt; &quot;:&quot; &lt;&gt; ls (show port) &lt;&gt; &quot;/ (same port)&quot;)</span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="nottickedoff">if host /= &quot;127.0.0.1&quot; &amp;&amp; host /= &quot;::1&quot; &amp;&amp; host /= &quot;localhost&quot;</span>
+<span class="lineno">  268 </span><span class="spaces">    </span><span class="nottickedoff">then</span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="nottickedoff">if failClosedOnNonLoopback</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="nottickedoff">then do</span>
+<span class="lineno">  271 </span><span class="spaces">          </span><span class="nottickedoff">logIO logger ErrorS (&quot;refusing to start gateway on non-loopback address &quot; &lt;&gt; ls host</span>
+<span class="lineno">  272 </span><span class="spaces">                               </span><span class="nottickedoff">&lt;&gt; &quot; in remote-only mode — bind 127.0.0.1 or disable remote-only&quot;)</span>
+<span class="lineno">  273 </span><span class="spaces">          </span><span class="nottickedoff">pure ()</span>
+<span class="lineno">  274 </span><span class="spaces">        </span><span class="nottickedoff">else do</span>
+<span class="lineno">  275 </span><span class="spaces">          </span><span class="nottickedoff">logIO logger WarningS (&quot;binding to &quot; &lt;&gt; ls host</span>
+<span class="lineno">  276 </span><span class="spaces">                                 </span><span class="nottickedoff">&lt;&gt; &quot; — the full slash-command surface is reachable by anything that can reach this address&quot;)</span>
+<span class="lineno">  277 </span><span class="spaces">          </span><span class="nottickedoff">let mStaticDir = fmap T.unpack (gcStaticDir cfg)</span>
+<span class="lineno">  278 </span><span class="spaces">              </span><span class="nottickedoff">app = gatewayAppWithStream logger deps mStaticDir guard broker</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="nottickedoff">runSettings (setPort port settings) app</span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="nottickedoff">else do</span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="nottickedoff">let mStaticDir = fmap T.unpack (gcStaticDir cfg)</span>
+<span class="lineno">  282 </span><span class="spaces">          </span><span class="nottickedoff">app = gatewayAppWithStream logger deps mStaticDir guard broker</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="nottickedoff">runSettings (setPort port settings) app</span></span>
+<span class="lineno">  284 </span>
+<span class="lineno">  285 </span>-- | Warp settings for the gateway.
+<span class="lineno">  286 </span>--
+<span class="lineno">  287 </span>-- Warp's default request timeout is 30s, which would tear down an idle
+<span class="lineno">  288 </span>-- WebSocket connection (the stream is idle between transcript events).
+<span class="lineno">  289 </span>-- The WS server sends a ping every 30s (see 'withPingThread'), so the
+<span class="lineno">  290 </span>-- timeout is raised well above that: a connection silent for two minutes
+<span class="lineno">  291 </span>-- is genuinely dead. HTTP requests are unaffected in practice (the
+<span class="lineno">  292 </span>-- gateway answers in milliseconds).
+<span class="lineno">  293 </span>settings :: Settings
+<span class="lineno">  294 </span><span class="decl"><span class="nottickedoff">settings = setTimeout 120_000 defaultSettings</span></span>
+
+</pre>
+</body>
+</html>
