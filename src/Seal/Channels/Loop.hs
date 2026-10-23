@@ -34,6 +34,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tabs (TabsHandle)
 import Seal.Tabs.Types (TabRef (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel)
 import Seal.Vault.Commands (VaultRuntime)
 
@@ -76,6 +77,12 @@ data ChannelDeps = ChannelDeps
     -- 'setSessionAbort' on this; the turn path looks up the per-session
     -- 'AbortFlag' via 'lookupOrCreateAbortFlag' and passes it into
     -- 'mkSessionAgentEnv' as 'aeAbortFlag'. Mirrors 'cdLocks'.
+  , cdRepeatReg    :: SessionRepeatRegistry
+    -- ^ Process-lifetime no-progress repeat registry (session-read
+    -- hardening WU4). Created here ONCE per process (the same lifetime as
+    -- 'cdAbortReg') and threaded to the turn engine so a session's
+    -- sliding window survives across turns and requests. Mirrors
+    -- 'cdAbortReg'.
   , cdTabs        :: TabsHandle
     -- ^ The shared, unified tab handle. Under @seal serve@, this is the SAME
     -- handle as the web gateway's 'adTabsHandle', so a tab inserted by any
@@ -124,6 +131,7 @@ newChannelDeps paths vault repoReg agentReg provider backends autonomy broker
   replies <- newReplyRegistry
   locks   <- newSessionLocks
   abortReg <- newSessionAbortRegistry
+  repeatReg <- newSessionRepeatRegistry
   execCache <- newSessionExecCache
   pure ChannelDeps
     { cdPaths      = paths
@@ -142,6 +150,7 @@ newChannelDeps paths vault repoReg agentReg provider backends autonomy broker
     , cdReplies     = replies
     , cdLocks       = locks
     , cdAbortReg    = abortReg
+    , cdRepeatReg   = repeatReg
     , cdTabs        = tabsH
     , cdConfig      = loadCfg
     , cdIsRemote    = isRemote

@@ -30,6 +30,7 @@ import Data.Text.Encoding qualified as TE
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend qualified as AgentDefBackend
@@ -88,6 +89,7 @@ import Seal.Tools.Args (textShellCommand)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (newAbortFlag)
+import Seal.ISA.RepeatDetect (RepeatTrack, newRepeatTrack)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkLocalUntrustedIO, mkRemoteUntrustedIOStub )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -105,6 +107,13 @@ import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (Provi
 
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
+
+-- | A shared test repeat track (session-read hardening WU4). No
+-- repeat-scope opcode is dispatched twice with identical input in this
+-- spec, so a shared track is behaviorally inert.
+testRepeatTrack :: RepeatTrack
+testRepeatTrack = unsafePerformIO newRepeatTrack
+{-# NOINLINE testRepeatTrack #-}
 
 -- | A minimal 'WebSearchConfig' for tests: no manager (fail-closed),
 -- 'ProviderParallel' default, empty allow-list, no vault/key.
@@ -249,7 +258,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) abortFlag defaultToolTimeoutConfig
+                    (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) abortFlag testRepeatTrack defaultToolTimeoutConfig
                     caps sid 8 "test" Nothing Full approvals Nothing Nothing 3 1000 (pure ()) Nothing Nothing stopFanoutDoneRef (\_ _ -> pure ()) Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent

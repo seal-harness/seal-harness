@@ -147,6 +147,7 @@ import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
@@ -388,6 +389,13 @@ data TurnDeps = TurnDeps
   , tdReplies      :: ReplyRegistry
   , tdLocks        :: SessionLocks
   , tdAbortReg     :: SessionAbortRegistry
+  , tdRepeatReg    :: SessionRepeatRegistry
+    -- ^ Process-lifetime no-progress repeat registry (session-read
+    -- hardening WU4). Created ONCE per process at the same origination
+    -- sites as 'tdAbortReg' (channels/web via 'newChannelDeps'; CLI/TUI at
+    -- entry) and threaded identically — a per-request registry would
+    -- silently reset the cross-turn window. The engine looks up the
+    -- session's 'RepeatTrack' per turn (mirroring 'lookupOrCreateAbortFlag').
   , tdTabsHandle   :: TabsHandle
   , tdLogger       :: SealLogger
   , tdIsRemote     :: Bool
@@ -683,6 +691,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               autoloadId injectCatalog injectAgents catalogAgentDefs
               parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
+  turnRepeatTrack <- lookupOrCreateRepeatTrack (tdRepeatReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
@@ -724,6 +733,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
                    Nothing   -> pure ()
               , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag
+              , teRepeatTrack   = turnRepeatTrack
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               })
             { aeMessageSource = mSrc }
@@ -1193,6 +1203,12 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
     , dwdOnEntry = pure ()
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
+    , dwdRepeatTrack = lookupOrCreateRepeatTrack (tdRepeatReg td)
+      -- ^ Same shape as 'dwdAbortFlag': the CHILD's own track, keyed by the
+      -- child's session id at consumption time (session-read hardening WU4).
+      -- The child's repeat window is independent of the parent's — a child
+      -- re-reading its own session transcript is guarded by the child's
+      -- own counts.
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
     }
   where

@@ -116,6 +116,7 @@ import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder, ChildWorkerOutcome (..)
   , ChildExitReason (..) )
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
@@ -407,6 +408,7 @@ buildTestEnv tmp mode mRepo opts = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
+  testRepeatReg <- newSessionRepeatRegistry
 
   let paths = SealPaths
         { spHome = tmp, spState = stateRoot, spConfig = configRoot
@@ -501,6 +503,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdReplies = testReplies
         , sdLocks = testLocks
         , sdAbortReg = testAbortReg
+        , sdRepeatReg = testRepeatReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
         , sdIsRemote = mode == UemRemote

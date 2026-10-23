@@ -47,6 +47,7 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (withIndexedTranscript)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
+import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
 import Seal.Session.Meta (SessionMeta (..))
@@ -233,6 +234,15 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- (looked up from the 'Seal.Tools.Exec.Abort.SessionAbortRegistry').
     -- The child's abort is independent of the parent's in v1 (a parent
     -- abort doesn't auto-abort the child, and vice versa).
+  , dwdRepeatTrack :: SessionId -> IO RepeatTrack
+    -- ^ Construct the child's no-progress repeat window from the child's
+    -- session id (looked up from the process-lifetime
+    -- 'Seal.ISA.RepeatDetect.SessionRepeatRegistry'; session-read hardening
+    -- WU4). Mirrors 'dwdAbortFlag': the wiring layer passes the partially
+    -- applied 'Seal.ISA.RepeatDetect.lookupOrCreateRepeatTrack' and the
+    -- worker resolves it with the minted child sid at spawn time, so the
+    -- child's window is independent of the parent's and survives across
+    -- the child's turns.
   , dwdToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config, inherited from the parent
     -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
@@ -280,6 +290,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         childUioEnv <- dwdMkUIOEnv deps anchor childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
         childAbortFlag <- dwdAbortFlag deps childSid
+        childRepeatTrack <- dwdRepeatTrack deps childSid
         -- Capture the final answer via 'aeOnStop': the loop's
         -- final-answer path calls 'notifyStop' (the replyFanout hook)
         -- rather than 'ccSend' — the double-delivery fix. The
@@ -313,8 +324,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeOnTextDelta = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
-              , aeAbortFlag  = childAbortFlag
-              , aeToolTimeout = dwdToolTimeout deps
+               , aeAbortFlag  = childAbortFlag
+               , aeRepeatTrack = childRepeatTrack
+               , aeToolTimeout = dwdToolTimeout deps
               }
         runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
           `catch` \e -> writeIORef summaryRef

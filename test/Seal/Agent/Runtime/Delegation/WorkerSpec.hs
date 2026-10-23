@@ -30,6 +30,7 @@ import Seal.Config.Paths (SealPaths (..), agentSessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.ISA.Registry (mkRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
@@ -269,6 +270,7 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
   logger <- testSealLogger
   appEnv <- mkEnv logger defaultConfig
   approvals <- newApprovalCache
+  repeatReg <- newSessionRepeatRegistry
   pure DelegationWorkerDeps
     { dwdPaths = samplePaths tmp
     , dwdParentSid = sampleSession
@@ -294,6 +296,11 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
     , dwdOnEntry = pure ()
     , dwdChannel = "test"
     , dwdAbortFlag = const newAbortFlag
+    , dwdRepeatTrack = lookupOrCreateRepeatTrack repeatReg
+      -- ^ Mirrors the production wiring (TurnEngine.buildWorker): the
+      -- registry is created once per test deps-build, the worker resolves
+      -- the CHILD's own track from the minted child sid at spawn time
+      -- (session-read hardening WU4).
     , dwdToolTimeout = defaultToolTimeoutConfig
     }
 

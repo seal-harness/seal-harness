@@ -57,6 +57,7 @@ import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Transcript.Conv (readConversation)
 import Data.ByteString qualified as BS
 import Seal.Session.Meta (SessionMeta (..))
@@ -181,6 +182,7 @@ mkSendDepsWith paths resolveStub = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
+  testRepeatReg <- newSessionRepeatRegistry
   let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
@@ -216,6 +218,7 @@ mkSendDepsWith paths resolveStub = do
         , sdReplies     = testReplies
         , sdLocks       = testLocks
         , sdAbortReg    = testAbortReg
+        , sdRepeatReg   = testRepeatReg
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
         , sdIsRemote    = False

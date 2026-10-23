@@ -73,6 +73,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
@@ -96,6 +97,12 @@ import Seal.Memory.Embedding (nullEmbeddingBackend)
 testAbortReg :: SessionAbortRegistry
 testAbortReg = unsafePerformIO newSessionAbortRegistry
 {-# NOINLINE testAbortReg #-}
+
+-- | A shared test repeat registry (session-read hardening WU4; mirrors
+-- 'testAbortReg').
+testRepeatReg :: SessionRepeatRegistry
+testRepeatReg = unsafePerformIO newSessionRepeatRegistry
+{-# NOINLINE testRepeatReg #-}
 
 -- | A provider that returns a scripted list of responses, one per call
 -- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
@@ -4430,6 +4437,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the 404 path"
             , sdLocks       = error "sdLocks: unused on the 404 path"
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             , sdLogger      = error "sdLogger: unused on the 404 path"
             , sdIsRemote    = False
@@ -4538,6 +4546,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -4687,6 +4696,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = testLog
             , sdIsRemote    = False
@@ -4813,6 +4823,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -4941,6 +4952,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = testLog
             , sdIsRemote    = False

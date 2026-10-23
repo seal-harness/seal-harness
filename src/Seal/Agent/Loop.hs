@@ -22,6 +22,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BLC
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -43,6 +44,8 @@ import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
+import Seal.ISA.RepeatDetect
+  (RepeatVerdict (..), recordCall, repeatScope, repeatWarnNote, repeatBlockedMessage)
 import Seal.Providers.Class
 import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
@@ -565,13 +568,31 @@ runTurn env userText = do
       -- on chat channels, so the user sees which tools are running.
       liftIO $ aeOnToolCall env name input
       mConfirmed <- checkConfirmation name mOp input
-      res <- case mConfirmed of
-        Left denyMsg -> pure (Left (Denied denyMsg))
-        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
-      let result = case res of
+      -- No-progress repeat detection (session-read hardening WU4).
+      -- In-scope session reads ('repeatScope') are keyed by (opcode,
+      -- encoded input) into the session's sliding window
+      -- ('aeRepeatTrack'). 2nd–3rd identical call within the window
+      -- warns (dispatch proceeds, a note is prepended to the result
+      -- parts); ≥4th is blocked outright — the op is never dispatched.
+      -- A denied call never reached execution, so it is not recorded.
+      -- Ops outside the scope are untouched.
+      mRepeat <- case mConfirmed of
+        Left _ -> pure Nothing
+        Right ()
+          | Set.member name repeatScope ->
+              Just <$> liftIO (recordCall (aeRepeatTrack env) name input)
+          | otherwise -> pure Nothing
+      result <- case mRepeat of
+        Just RvBlock ->
+          pure (CbToolResult tcid [TrpText (repeatBlockedMessage name)] True)
+        _ -> do
+          res <- case mConfirmed of
+            Left denyMsg -> pure (Left (Denied denyMsg))
+            Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
+          pure $ case res of
             Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
-            Right r -> CbToolResult tcid (orParts r) (orIsError r)
-          (isErr, partCount) = case result of
+            Right r -> CbToolResult tcid (prependRepeatNote mRepeat (orParts r)) (orIsError r)
+      let (isErr, partCount) = case result of
             CbToolResult _ parts err -> (err, length parts)
             _ -> (False, 0)
       liftIO (logToolDispatch (aeLogPath env) name isErr partCount)
@@ -650,6 +671,13 @@ runTurn env userText = do
         -- name, input, and approval scope as evidence of the human's
         -- decision. This is separate from the dispatcher's own entry (which
         -- records the invocation, not the approval).
+        -- | Prepend the no-progress warning note to a dispatched result's
+        -- parts when the repeat detector flagged this call. The note is
+        -- model-visible only (a tool-result part); nothing content-bearing
+        -- is added to the recorded metadata.
+        prependRepeatNote :: Maybe RepeatVerdict -> [ToolResultPart] -> [ToolResultPart]
+        prependRepeatNote (Just RvWarn) parts = TrpText repeatWarnNote : parts
+        prependRepeatNote _ parts = parts
         recordApprovalEvidence :: OpName -> Value -> ApprovalScope -> App ()
         recordApprovalEvidence opName' input' scope = liftIO $ do
           now <- getCurrentTime

@@ -65,6 +65,7 @@ import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption, mkHostKeyAdoption)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Routing.Route qualified
 import Seal.Session.ExecCache (newSessionExecCache)
@@ -145,8 +146,8 @@ runCliTui
   :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
   -> AskReplyStore -> SealLogger -> HarnessRegistry -> TmuxRunner
-  -> SessionAbortRegistry -> IO ()
-runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg = do
+  -> SessionAbortRegistry -> SessionRepeatRegistry -> IO ()
+runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg repeatReg = do
   approvals <- newApprovalCache
   replies <- newReplyRegistry
   locks <- newSessionLocks
@@ -229,6 +230,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
@@ -285,6 +287,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
@@ -316,6 +319,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
