@@ -9,6 +9,11 @@ module Seal.Channels.Chat.Loop
   , handleInbound
   , handleFocus
   , handleServerEvent
+  , handleCallback
+    -- * Pending asks (for testing)
+  , PendingAsks
+  , newPendingAsks
+  , pendingAsksFor
     -- * Background sessions (for testing)
   , BgSession (..)
   , BgSessions
@@ -97,11 +102,28 @@ import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToCh
 data PendingAsk = PendingAsk
   { paAskId :: !Text
   , paOptions :: ![QuestionOption]
+  , paSeq :: !Int
+    -- ^ Registration order. Gives a total order across the conversation's
+    -- sessions, which the per-session lists cannot provide (each list is
+    -- newest-first, but there is no global insertion order). A plain-text
+    -- answer goes to the earliest-registered ask.
   }
 
--- | The pending-asks store: session id → list of pending asks. Thread-safe
--- via 'TVar'.
-type PendingAsks = TVar (Map SessionId [PendingAsk])
+-- | The pending-asks store: session id → list of pending asks (newest
+-- first), plus a monotonic registration counter so asks raised on different
+-- sessions can still be ordered. Thread-safe via 'TVar's.
+data PendingAsks = PendingAsks
+  { paStore :: TVar (Map SessionId [PendingAsk])
+  , paNext  :: TVar Int
+  }
+
+-- | Create an empty pending-asks store.
+newPendingAsks :: IO PendingAsks
+newPendingAsks = PendingAsks <$> newTVarIO Map.empty <*> newTVarIO 0
+
+-- | Snapshot of the store, keyed by session. Used by tests.
+pendingAsksFor :: PendingAsks -> IO (Map SessionId [PendingAsk])
+pendingAsksFor = readTVarIO . paStore
 
 -- | Per-conversation watch-all-tabs toggle state. When 'True' for a
 -- conversation, the channel receives a notification every time any
@@ -251,7 +273,7 @@ bgOwnsSession bgs key sid =
 bgInsert :: BgSessions -> ConversationKey -> BgSession -> IO ()
 bgInsert bgs key sess = do
   atomically (modifyTVar' (bsLive bgs)
-    (Map.insertWith (\new old -> old ++ new) key [sess]))
+    (Map.insertWith (flip (++)) key [sess]))
   atomically (modifyTVar' (bsKnown bgs)
     (Map.insertWith (\new old -> take maxKnownBgSids (new ++ filter (`notElem` new) old))
        key [bgSid sess]))
@@ -279,7 +301,7 @@ bgRemove bgs key sid = atomically $ do
 -- resolvable by a later button tap).
 dropPendingAsks :: PendingAsks -> SessionId -> IO ()
 dropPendingAsks pendingAsks sid =
-  atomically (modifyTVar' pendingAsks (Map.delete sid))
+  atomically (modifyTVar' (paStore pendingAsks) (Map.delete sid))
 
 -- | Configuration for the generic loop.
 data ChatChannelConfig = ChatChannelConfig
@@ -298,6 +320,12 @@ data ChatChannelConfig = ChatChannelConfig
   , cccStartWs :: Text -> Int -> WsEventCallback -> IO (Either Text WsClient)
     -- ^ Connect a WS client. The seam the @/bg@ handler uses for the bg
     -- session's dedicated connection; the default is 'startWsClient'.
+  , cccAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> IO (Either Text Bool)
+    -- ^ @POST /api/sessions/:id/questions/:qid/answer@. The seam used to
+    -- answer a pending ask (text answer or button tap); the default is
+    -- 'httpAnswerQuestion'. 'Right False' means the question was already
+    -- answered/cancelled/unknown (the endpoint still returns 200), so the
+    -- ask is resolved either way but the answer was not the one accepted.
   }
 
 -- | Default config with sensible defaults.
@@ -309,6 +337,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccNewSession = httpNewSession
   , cccSendMessage = httpSend
   , cccStartWs = startWsClient
+  , cccAnswerQuestion = httpAnswerQuestion
   }
 
 -- | Debug log to stderr.
@@ -323,7 +352,7 @@ runChatChannel cfg chan watchState = do
   sessions <- newSessionMap
   -- Map of conversation keys to their WS client + streaming state.
   wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
-  pendingAsks <- newTVarIO Map.empty :: IO PendingAsks
+  pendingAsks <- newPendingAsks
   tabTracker <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))
   thinkingTabs <- newThinkingTabs
   bgSessions <- newBgSessions
@@ -390,7 +419,7 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
         mSid <- sessionLookup sessions key
         case mSid of
           Just sid -> do
-            eResult <- httpSend mgr apiBase sid "/tab"
+            eResult <- cccSendMessage cfg mgr apiBase sid "/tab"
             case eResult of
               Right sr -> ccSend chan (srResponse sr)
               Left e -> ccSend chan ("error: " <> e)
@@ -407,8 +436,14 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
         sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
-      Right (ChatPlain text) ->
-        sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
+      Right (ChatPlain text) -> do
+        -- A plain message answers a pending ask from one of this
+        -- conversation's background sessions, if there is one. Checked
+        -- here (not before routing) so a /command is never consumed as an
+        -- answer.
+        consumed <- answerPendingBgAsk cfg chan pendingAsks bgSessions key text
+        unless consumed $
+          sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
       Left _ -> ccSend chan "error: invalid command"
 
 -- | Handle a focus command: resolve the tab index to a session id via
@@ -481,7 +516,7 @@ handleInject cfg chan idx payload = do
                 -- Do NOT update the session map, send a FocusOp, or
                 -- send a focus confirmation — the current focused tab
                 -- is unchanged.
-                eResult <- httpSend mgr apiBase sid payload
+                eResult <- cccSendMessage cfg mgr apiBase sid payload
                 case eResult of
                   Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
                   Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -553,8 +588,8 @@ handleBackground cfg chan pendingAsks bgSessions key prompt
           -- (c) per-session streaming state + delivery flag.
           ss <- newStreamingState
           delivered <- newIORef False
-          let callback ev =
-                handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered ev
+          let callback =
+                handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered
           -- (d) the dedicated connection for the bg session.
           eWs <- cccStartWs cfg (gcHost gwCfg) (gcWsPort gwCfg) callback
           case eWs of
@@ -630,6 +665,7 @@ handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered ev =
           writeIORef delivered True
     SeAsk sid val
       | sid == bgSid -> handleAsk cfg chan key pendingAsks sid val
+    SeAskResolved _ val -> forgetAskByPrefix pendingAsks (extractAskId val)
     SeActivity sid val
       | sid == bgSid -> case extractActivityKind val of
           "tool-call" -> handleToolCallActivity cfg chan ss val
@@ -717,6 +753,9 @@ handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchSt
     -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key pendingAsks sid val
+    -- A question answered/cancelled/timed out elsewhere (the web UI) is no
+    -- longer answerable from this channel.
+    SeAskResolved _ val -> forgetAskByPrefix pendingAsks (extractAskId val)
     SeLists val -> handleLists cfg chan key tabTracker watchState thinkingTabs val
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
 
@@ -1119,8 +1158,12 @@ handleAsk _cfg chan _key pendingAsks sid val = do
   -- the option label. An ask without an id can never be resolved — it is
   -- not registered.
   unless (T.null askId) $ do
-    let entry = PendingAsk { paAskId = askId, paOptions = opts }
-    atomically (modifyTVar' pendingAsks (Map.insertWith (++) sid [entry]))
+    seqNo <- atomically $ do
+      n <- readTVar (paNext pendingAsks)
+      writeTVar (paNext pendingAsks) (n + 1)
+      pure n
+    let entry = PendingAsk { paAskId = askId, paOptions = opts, paSeq = seqNo }
+    atomically (modifyTVar' (paStore pendingAsks) (Map.insertWith (++) sid [entry]))
 
 -- | Send a plain text message via the HTTP API. Resolves the conversation's
 -- session (creating one if it doesn't exist yet).
@@ -1135,7 +1178,7 @@ sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState
   sid <- resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eResult <- httpSend mgr apiBase sid text
+  eResult <- cccSendMessage cfg mgr apiBase sid text
   case eResult of
     Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
     Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -1224,38 +1267,153 @@ handleCallback
   => ChatChannelConfig -> c -> SessionMap -> PendingAsks -> BgSessions
   -> ConversationKey -> MessageSource -> Text
   -> IO ()
-handleCallback cfg chan sessions pendingAsks _bgSessions key _src cbData = do
+handleCallback cfg chan sessions pendingAsks bgSessions key _src cbData = do
   case parseCallbackData cbData of
     Nothing -> pure ()  -- not a valid callback_data format
     Just (prefix, idx) -> do
-      mSid <- sessionLookup sessions key
-      case mSid of
-        Nothing -> pure ()
-        Just sid -> do
-          asksMap <- readTVarIO pendingAsks
-          case Map.lookup sid asksMap of
+      -- Only asks owned by this conversation are answerable: its focused
+      -- session, or one of its own background sessions. A tap in another
+      -- conversation can never resolve them.
+      sids <- answerableSids sessions bgSessions key
+      asksMap <- readTVarIO (paStore pendingAsks)
+      let matches =
+            [ (sid, ask)
+            | sid <- sids
+            , Just asks <- [Map.lookup sid asksMap]
+            , ask <- asks
+            , T.isPrefixOf prefix (paAskId ask)
+            ]
+      case matches of
+        [] -> pure ()
+        ((sid, ask) : _) ->
+          case atIndex (paOptions ask) idx of
             Nothing -> pure ()
-            Just asks ->
-              case [ a | a <- asks, T.isPrefixOf prefix (paAskId a) ] of
-                (ask : _) ->
-                  case atIndex (paOptions ask) idx of
-                    Nothing -> pure ()
-                    Just opt -> do
-                      let apiBase = gcApiBase (cccGateway cfg)
-                          mgr = cccHttpManager cfg
-                      -- Answer the question via the HTTP API.
-                      _ <- httpAnswerQuestion mgr apiBase sid (paAskId ask) (qoLabel opt) "once"
-                      -- Acknowledge the callback (dismiss spinner).
-                      -- We don't have the callback_query_id here (it's in
-                      -- the InboundMessage but not passed through). The
-                      -- ccAnswerCallback method needs it. For now, skip
-                      -- the callback ack — the button still works, the
-                      -- spinner just persists a bit longer.
-                      -- Send a confirmation to the chat.
-                      ccSend chan ("✓ " <> qoLabel opt)
-                      let remaining = filter (not . T.isPrefixOf prefix . paAskId) asks
-                      atomically (modifyTVar' pendingAsks (Map.insert sid remaining))
-                [] -> pure ()
+            Just opt -> answerAsk cfg chan pendingAsks sid (paAskId ask) (qoLabel opt)
+
+-- | The sessions whose pending asks a conversation may answer: its focused
+-- session (when it has one) plus its own background sessions.
+answerableSids :: SessionMap -> BgSessions -> ConversationKey -> IO [SessionId]
+answerableSids sessions bgSessions key = do
+  mFocused <- sessionLookup sessions key
+  bgSids <- map bgSid <$> bgSessionsFor bgSessions key
+  pure (maybe [] pure mFocused <> bgSids)
+
+-- | Answer a pending ask by id, then dequeue it and confirm on the channel.
+-- The answer goes to the ask's own session (a background session's ask is
+-- owned by that session, not by the conversation's).
+--
+-- A transport/HTTP failure leaves the ask pending so the operator can retry.
+-- A @200 {"accepted": false}@ response means the question was already
+-- answered, cancelled, or unknown: it is resolved either way, so the ask is
+-- dequeued, but the answer is not claimed as accepted.
+answerAsk
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> SessionId -> Text -> Text -> IO ()
+answerAsk cfg chan pendingAsks sid askId answer = do
+  let apiBase = gcApiBase (cccGateway cfg)
+      mgr = cccHttpManager cfg
+  eRes <- cccAnswerQuestion cfg mgr apiBase sid askId answer
+  case eRes of
+    Left e -> ccSend chan ("answer failed: " <> e)
+    Right accepted -> do
+      forgetAsk pendingAsks sid askId
+      ccSend chan
+        (if accepted
+           then "✓ " <> answer
+           else "question was already resolved; answer not accepted")
+
+-- | Remove one pending ask (by id) from a session's list.
+forgetAsk :: PendingAsks -> SessionId -> Text -> IO ()
+forgetAsk pendingAsks sid askId = atomically $ do
+  let tv = paStore pendingAsks
+  m <- readTVar tv
+  case Map.lookup sid m of
+    Nothing -> pure ()
+    Just asks ->
+      case filter ((/= askId) . paAskId) asks of
+        []    -> writeTVar tv (Map.delete sid m)
+        kept  -> writeTVar tv (Map.insert sid kept m)
+
+-- | Drop every pending ask whose id starts with @prefix@, across sessions.
+-- Driven by @ask_resolved@: a question answered from the web (or cancelled,
+-- or timed out) must stop being answerable -- and must stop accumulating in
+-- the pending map.
+forgetAskByPrefix :: PendingAsks -> Text -> IO ()
+forgetAskByPrefix pendingAsks prefix
+  | T.null prefix = pure ()
+  | otherwise = atomically (modifyTVar' (paStore pendingAsks) (Map.mapMaybe keep))
+  where
+    keep asks = case filter (not . T.isPrefixOf prefix . paAskId) asks of
+      []   -> Nothing
+      kept -> Just kept
+
+-- | Answer a pending ask belonging to one of this conversation's background
+-- sessions with an inbound plain-text message. Returns 'True' when the
+-- message was consumed as an answer (so it must NOT be routed to the
+-- focused session).
+--
+-- A numeric body (1-based) selects the corresponding option label; any other
+-- body is delivered verbatim -- which is what the confirmation gate needs
+-- (@y@/@yes@ approve once, anything else rejects). The oldest pending ask
+-- wins: bg sessions are scanned in creation order, and each session's list
+-- is newest-first ('handleAsk' prepends), so the oldest ask for a session is
+-- its last element.
+answerPendingBgAsk
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> BgSessions -> ConversationKey -> Text
+  -> IO Bool
+answerPendingBgAsk cfg chan pendingAsks bgSessions key body = do
+  bg <- bgSessionsFor bgSessions key
+  asksMap <- readTVarIO (paStore pendingAsks)
+  -- Per session the earliest-registered ask is the list tail ('handleAsk'
+  -- prepends); across sessions 'paSeq' orders them, which session order
+  -- cannot.
+  let candidates =
+        [ (bgSid sess, ask)
+        | sess <- bg
+        , Just asks <- [Map.lookup (bgSid sess) asksMap]
+        , Just ask <- [earliestRegistered asks]
+        ]
+  case oldestAcross candidates of
+    Nothing -> pure False
+    Just (sid, ask) -> do
+      answerAsk cfg chan pendingAsks sid (paAskId ask) (resolveAnswer (paOptions ask) body)
+      pure True
+
+-- | The earliest-registered ask of all candidates (ties keep list order).
+oldestAcross :: [(SessionId, PendingAsk)] -> Maybe (SessionId, PendingAsk)
+oldestAcross = foldl' pick Nothing
+  where
+    pick Nothing x = Just x
+    pick (Just best) x
+      | paSeq (snd x) < paSeq (snd best) = Just x
+      | otherwise                        = Just best
+
+-- | The earliest-registered ask in one session's list (ties keep list order).
+earliestRegistered :: [PendingAsk] -> Maybe PendingAsk
+earliestRegistered = foldl' pick Nothing
+  where
+    pick Nothing ask = Just ask
+    pick (Just best) ask
+      | paSeq ask < paSeq best = Just ask
+      | otherwise              = Just best
+
+-- | Resolve an inbound text body against a question's options: a 1-based
+-- numeric body selects that option's label, anything else is the answer
+-- verbatim.
+resolveAnswer :: [QuestionOption] -> Text -> Text
+resolveAnswer opts body
+  | Just opt <- numericOption opts body = qoLabel opt
+  | otherwise                          = body
+
+-- | The option a 1-based numeric body selects, if any.
+numericOption :: [QuestionOption] -> Text -> Maybe QuestionOption
+numericOption opts body
+  | T.null t || T.length t > 6 || not (T.all isDigit t) = Nothing
+  | otherwise = atIndex opts (T.foldl' step 0 t - 1)
+  where
+    t = T.strip body
+    step acc c = acc * 10 + (fromEnum c - fromEnum '0')
 
 -- | Handle a @lists@ WS event: compare the new tab list with the last known
 -- one for this conversation. If the focused session's tab was removed (closed),

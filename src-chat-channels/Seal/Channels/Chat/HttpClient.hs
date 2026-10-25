@@ -19,6 +19,7 @@ module Seal.Channels.Chat.HttpClient
   , httpStopSession
     -- * Questions (ASK_HUMAN)
   , httpAnswerQuestion
+  , answerBodyJson
   , httpCancelQuestion
     -- * Helpers
   , parseJsonBody
@@ -127,14 +128,39 @@ httpStopSession mgr apiBase sid = do
     Right _ -> pure (Right ())
 
 -- | @POST /api/sessions/:id/questions/:qid/answer@ — answer a pending
--- ASK_HUMAN question.
-httpAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> Text -> IO (Either Text ())
-httpAnswerQuestion mgr apiBase sid qid answer scope = do
+-- ASK_HUMAN question (or the confirmation gate) with free text.
+--
+-- The body carries an @answer@ and nothing else: the server's parser rejects
+-- a body that carries both @answer@ and @scope@ with 400 ("ambiguous: send
+-- either {scope} or {answer}, not both", 'parseAnswerBody'). The
+-- confirmation gate parses the text itself — @y@/@yes@ approve once,
+-- anything else rejects — so one shape serves both ask kinds.
+--
+-- The endpoint answers @200 {ok:true, accepted:<bool>}@; @accepted:false@
+-- means the question was already answered, cancelled, or unknown, which is
+-- a resolution but not an accepted answer.
+httpAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> IO (Either Text Bool)
+httpAnswerQuestion mgr apiBase sid qid answer = do
   let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid)
             <> "/questions/" <> T.unpack qid <> "/answer"
-  doRequest mgr url methodPost (Just (A.object ["answer" .= answer, "scope" .= scope])) >>= \case
+  doRequest mgr url methodPost (Just (answerBodyJson answer)) >>= \case
     Left e -> pure (Left e)
-    Right _ -> pure (Right ())
+    Right body -> pure (Right (acceptedFrom body))
+
+-- | Read the @accepted@ flag from an answer response. Absent/malformed
+-- (e.g. a server that predates the flag) counts as accepted.
+acceptedFrom :: BL.ByteString -> Bool
+acceptedFrom body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "accepted") o of
+      Just (A.Bool b) -> b
+      _               -> True
+    _ -> True
+
+-- | The request body for answering a pending question: the answer only.
+-- Pure and exported so the wire shape is pinned by a test.
+answerBodyJson :: Text -> Value
+answerBodyJson answer = A.object ["answer" .= answer]
 
 -- | @POST /api/sessions/:id/questions/:qid/cancel@ — cancel a pending
 -- ASK_HUMAN question.
