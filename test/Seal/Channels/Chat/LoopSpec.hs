@@ -17,11 +17,12 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Network.HTTP.Client (newManager, defaultManagerSettings)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy, expectationFailure)
+import Network.HTTP.Client (Manager, newManager, defaultManagerSettings)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, expectationFailure)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Loop
+import Seal.Channels.Chat.HttpClient (SendResult (..))
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
@@ -30,8 +31,10 @@ import Seal.Channels.Chat.Types
   , newSessionMap
   , newStreamingState
   , defaultGatewayConfig
+  , sessionInsert
+  , sessionLookup
   )
-import Seal.Channels.Chat.WsClient (WsClient (..))
+import Seal.Channels.Chat.WsClient (WsClient (..), WsEventCallback)
 import Seal.Gateway.Types.Core (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 
@@ -44,6 +47,9 @@ data MockChan = MockChan
     -- ^ (content, returned id) pairs, in order.
   , mcEdits    :: IORef [(Text, Text)]
     -- ^ (id, new content) pairs, in order.
+  , mcWithOpts :: IORef [(Text, [Text])]
+    -- ^ (question, option labels) pairs passed to 'ccSendWithOptions', in
+    -- order.
   , mcNextId   :: IORef Int
   }
 
@@ -58,11 +64,15 @@ instance ChatChannel MockChan where
   ccEditMessage ch (ChatMessageId i) content = do
     modifyIORef' (mcEdits ch) ((i, content) :)
     pure True
+  ccSendWithOptions ch question opts _prefix = do
+    modifyIORef' (mcWithOpts ch) ((question, map qoLabel opts) :)
+    pure (Just (ChatMessageId "with-options"))
   ccLabel _ = "mock"
 
 mkMockChan :: IO MockChan
 mkMockChan = MockChan
   <$> newIORef []
+  <*> newIORef []
   <*> newIORef []
   <*> newIORef []
   <*> newIORef 0
@@ -76,6 +86,15 @@ getSendIds ch = map fst . reverse <$> readIORef (mcSendIds ch)
 getEdits :: MockChan -> IO [Text]
 getEdits ch = map snd . reverse <$> readIORef (mcEdits ch)
 
+-- | The (question, option labels) pairs handed to 'ccSendWithOptions'.
+getWithOptions :: MockChan -> IO [(Text, [Text])]
+getWithOptions ch = reverse <$> readIORef (mcWithOpts ch)
+
+
+-- | Everything the loop posted on the channel — plain sends and
+-- id-returning sends (the reply path uses 'ccSendWithId').
+getAllSent :: MockChan -> IO [Text]
+getAllSent ch = (++) <$> getSends ch <*> getSendIds ch
 -- | A stub WS client (the streaming handlers never use it).
 stubWs :: WsClient
 stubWs = WsClient
@@ -125,6 +144,140 @@ mkSid t = case mkSessionId t of
 lastOrCrash :: [a] -> a
 lastOrCrash = last
 
+-- ---------------------------------------------------------------------------
+-- /bg (background session) scaffolding
+-- ---------------------------------------------------------------------------
+
+-- | A 'WsClient' stub that records the sessions it was asked to focus and
+-- how many times it was closed. Used for both the conversation's own
+-- connection (where \"no focus\" is the observable) and a bg session's
+-- dedicated connection.
+data WsRecorder = WsRecorder
+  { wrFocused :: IORef [SessionId]
+  , wrCloses  :: IORef Int
+  }
+
+mkWsRecorder :: IO WsRecorder
+mkWsRecorder = WsRecorder <$> newIORef [] <*> newIORef 0
+
+recorderClient :: WsRecorder -> WsClient
+recorderClient r = WsClient
+  { wcFocus = \sid -> modifyIORef' (wrFocused r) (sid :)
+  , wcFocusSince = \sid _ -> modifyIORef' (wrFocused r) (sid :)
+  , wcClose = modifyIORef' (wrCloses r) (+ 1)
+  }
+
+getFocused :: WsRecorder -> IO [SessionId]
+getFocused = fmap reverse . readIORef . wrFocused
+
+getCloses :: WsRecorder -> IO Int
+getCloses = readIORef . wrCloses
+
+-- | The recorded calls into a stub config's gateway seams, plus the canned
+-- results each seam returns (popped from a queue, so a test can script
+-- mint / connect / send outcomes in call order).
+data Seams = Seams
+  { smMints     :: IORef [A.Value]
+    -- ^ Bodies passed to the mint seam, in call order.
+  , smSends     :: IORef [(SessionId, Text)]
+    -- ^ (session, prompt) pairs passed to the send seam, in call order.
+  , smCallbacks :: IORef [WsEventCallback]
+    -- ^ The event callbacks handed to the WS seam, in call order.
+  , smRecorders :: IORef [WsRecorder]
+    -- ^ The WS clients handed back by the WS seam, in call order.
+  , smMintQueue :: IORef [Either Text Text]
+    -- ^ Queued mint results; an empty queue yields a mint failure.
+  , smSendQueue :: IORef [Either Text SendResult]
+    -- ^ Queued send results; an empty queue yields a successful send.
+  , smWsQueue   :: IORef [Either Text WsRecorder]
+    -- ^ Queued connect results; an empty queue yields a fresh recorder.
+  }
+
+mkSeams :: IO Seams
+mkSeams = Seams
+  <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
+  <*> newIORef [] <*> newIORef [] <*> newIORef []
+
+-- | Pop the next queued result, falling back to a default when the queue is
+-- empty.
+nextQueued :: IORef [a] -> a -> IO a
+nextQueued ref dflt = do
+  queued <- readIORef ref
+  case queued of
+    (x : rest) -> writeIORef ref rest >> pure x
+    []         -> pure dflt
+
+-- | A successful @POST /send@ result (the reply arrives over WS).
+okSendResult :: SendResult
+okSendResult = SendResult
+  { srKind = "assistant"
+  , srResponse = ""
+  , srSessionId = Nothing
+  , srError = Nothing
+  }
+
+-- | A 'ChatChannelConfig' whose gateway seams are stubbed: every call is
+-- recorded in the 'Seams', and the result comes from the corresponding
+-- queue.
+stubCfg :: Manager -> Seams -> ChatChannelConfig
+stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
+  { cccNewSession = \_mgr _apiBase body -> do
+      modifyIORef' (smMints seams) (body :)
+      nextQueued (smMintQueue seams) (Left "no session minted for this test")
+  , cccSendMessage = \_mgr _apiBase sid prompt -> do
+      modifyIORef' (smSends seams) ((sid, prompt) :)
+      nextQueued (smSendQueue seams) (Right okSendResult)
+  , cccStartWs = \_host _port cb -> do
+      modifyIORef' (smCallbacks seams) (cb :)
+      queued <- readIORef (smWsQueue seams)
+      case queued of
+        (Left e : rest) -> do
+          writeIORef (smWsQueue seams) rest
+          pure (Left e)
+        (Right rec : rest) -> do
+          writeIORef (smWsQueue seams) rest
+          modifyIORef' (smRecorders seams) (rec :)
+          pure (Right (recorderClient rec))
+        [] -> do
+          rec <- mkWsRecorder
+          modifyIORef' (smRecorders seams) (rec :)
+          pure (Right (recorderClient rec))
+  }
+
+getMints :: Seams -> IO [A.Value]
+getMints = fmap reverse . readIORef . smMints
+
+getSendCalls :: Seams -> IO [(SessionId, Text)]
+getSendCalls = fmap reverse . readIORef . smSends
+
+getCallbacks :: Seams -> IO [WsEventCallback]
+getCallbacks = fmap reverse . readIORef . smCallbacks
+
+getRecorders :: Seams -> IO [WsRecorder]
+getRecorders = fmap reverse . readIORef . smRecorders
+
+-- | Queue the session ids the mint seam returns, in call order.
+queueMints :: Seams -> [Text] -> IO ()
+queueMints seams = writeIORef (smMintQueue seams) . map Right
+
+-- | Make the mint seam fail.
+queueMintFailure :: Seams -> Text -> IO ()
+queueMintFailure seams e = writeIORef (smMintQueue seams) [Left e]
+
+-- | Queue the WS clients the connect seam returns, in call order.
+
+-- | Make the connect seam fail.
+queueConnectFailure :: Seams -> Text -> IO ()
+queueConnectFailure seams e = writeIORef (smWsQueue seams) [Left e]
+
+-- | Make the send seam fail.
+queueSendFailure :: Seams -> Text -> IO ()
+queueSendFailure seams e = writeIORef (smSendQueue seams) [Left e]
+
+-- | A recorded response entry for the given text (the bg reply).
+bgReplyJson :: Text -> A.Value
+bgReplyJson = entryJsonFor
+
 spec :: Spec
 spec = do
   describe "loop streaming behavior (issue #198 follow-up)" $ do
@@ -145,14 +298,15 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "sess1"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       fire "pre-tool text streams in here"
       -- A tool call fires.
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid (SeActivity sid (toolCallJson "SHELL_EXEC"))
       -- Post-tool text streams in.
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid (SeEntryUpdate sid (streamingJsonFor "post-tool text"))
       -- The tool line was sent as its own platform message.
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
@@ -182,13 +336,14 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "sess2"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Stream some text (creates the bubble), then the final recorded
       -- entry arrives (finalize), then a LATE entry-update arrives.
       fire "partial text"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
         (SeEntry sid (entryJsonFor "the complete final text"))
       editsAfterFinalize0 <- getEdits chan
       -- A LATE update arrives with enough NEW codepoints to pass the
@@ -219,17 +374,18 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "sess3"
-          fire t = handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+          fire t = handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
                     (SeEntryUpdate sid (streamingJsonFor t))
       -- Turn 1: stream + go idle (finalize path).
       fire "turn one text"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "idle"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "idle"))
       -- Turn 2: fresh text must create a NEW bubble.
       -- (Production sequence: the server broadcasts harness-status
       -- "thinking" at turn start, which clears the finalized flag —
       -- then entry-updates stream. The test mirrors that.)
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid (SeActivity sid (statusJson "thinking"))
       sendIdsBefore <- getSendIds chan
       fire "turn two text"
       sendIdsAfter <- getSendIds chan
@@ -364,8 +520,9 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "emoji-test"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "SHELL_EXEC"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x1F4BB")
@@ -383,8 +540,9 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "emoji-test2"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "BIN_EXEC"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x2699\xFE0F")
@@ -401,8 +559,9 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let sid = mkSid "emoji-test3"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker watchState thinkingTabs sid
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker watchState thinkingTabs sid
         (SeActivity sid (toolCallJson "MEMORY_MANAGE"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "\x1F9E0")
@@ -473,7 +632,8 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
-      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6 hello world"
+      bg <- newBgSessions
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs injectKey "/6 hello world"
       sends <- getSends chan
       sends `shouldSatisfy` not . any ("focused tab" `T.isInfixOf`)
 
@@ -487,7 +647,8 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
-      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6 hello world"
+      bg <- newBgSessions
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs injectKey "/6 hello world"
       sends <- getSends chan
       sends `shouldSatisfy` not . any ("focus" `T.isInfixOf`)
 
@@ -504,7 +665,8 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
-      handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs injectKey "/6"
+      bg <- newBgSessions
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs injectKey "/6"
       sends <- getSends chan
       sends `shouldSatisfy` any ("focus" `T.isInfixOf`)
   describe "watch-all-tabs" $ do
@@ -642,14 +804,15 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
       handleWatchToggle chan watchState key "/watch on"
       _ <- getSends chan
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "thinking"))
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
@@ -666,12 +829,13 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "thinking"))
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
@@ -688,11 +852,12 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
       handleWatchToggle chan watchState key "/watch on"
       _ <- getSends chan
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
@@ -709,11 +874,12 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
       handleWatchToggle chan watchState key "/watch on"
       _ <- getSends chan
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "thinking"))
       thinkingMap <- readTVarIO thinkingTabs
@@ -732,11 +898,12 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
       handleWatchToggle chan watchState key "/watch on"
       _ <- getSends chan
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (toolCallJson "SHELL_EXEC"))
       sends <- getSends chan
@@ -758,6 +925,7 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
           listsVal = A.object
@@ -768,12 +936,12 @@ spec = do
       _ <- getSends chan
       -- Simulate the SeLists event arriving on WS connect (no prior
       -- thinking event was received — the turn started before WS connect).
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeLists listsVal)
       -- Now the idle event arrives — should notify because the thinking
       -- set was seeded from the lists snapshot.
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
@@ -790,6 +958,7 @@ spec = do
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
       thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
       let focusedSid = mkSid "focused"
           otherSid = mkSid "other"
           listsVal = A.object
@@ -798,11 +967,538 @@ spec = do
             ]
       handleWatchToggle chan watchState key "/watch on"
       _ <- getSends chan
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeLists listsVal)
-      handleServerEvent cfg chan key conns pendingAsks tabTracker
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
         watchState thinkingTabs focusedSid
         (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+  describe "/bg (background sessions)" $ do
+    let bgKey = ConversationKey "signal" "conv-bg"
+        convSid = mkSid "conversation-session"
+        bgSid1 = mkSid "bgsid-1"
+        bgSid2 = mkSid "bgsid-2"
+
+    it "answers a bare /bg with usage and creates nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg"
+      getSends chan `shouldReturn` ["usage: /bg <prompt>"]
+      getMints seams `shouldReturn` []
+      getSendCalls seams `shouldReturn` []
+      recs <- getRecorders seams
+      length recs `shouldBe` 0
+
+    it "answers /bg -h with the command help and creates nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg -h"
+      sends <- getSends chan
+      -- The help text is distinguishable from the usage line: it explains
+      -- the headless contract (the usage line alone would satisfy a
+      -- "/bg <prompt>" infix assertion).
+      T.concat sends `shouldSatisfy` T.isInfixOf "The background session is created headless"
+      getMints seams `shouldReturn` []
+      getSendCalls seams `shouldReturn` []
+      recs <- getRecorders seams
+      length recs `shouldBe` 0
+
+    it "answers /bg --help the same way, creating nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg --help"
+      sends <- getSends chan
+      T.concat sends `shouldSatisfy` T.isInfixOf "The background session is created headless"
+      getMints seams `shouldReturn` []
+      getSendCalls seams `shouldReturn` []
+
+    it "mints a headless session, runs the prompt on it, and leaves the conversation untouched" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      sessionInsert sessions bgKey convSid
+      ss <- newStreamingState
+      convRec <- mkWsRecorder
+      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      -- The mint body asks for a headless session.
+      getMints seams `shouldReturn` [A.object ["headless" .= A.Bool True]]
+      -- The prompt went to the NEW session, never the conversation's.
+      getSendCalls seams `shouldReturn` [(bgSid1, "hi")]
+      -- The conversation's focused session is unchanged and its client
+      -- received no FocusOp.
+      mConvSid <- sessionLookup sessions bgKey
+      mConvSid `shouldBe` Just convSid
+      getFocused convRec `shouldReturn` []
+      -- The bg connection was focused on the bg session.
+      recs <- getRecorders seams
+      case recs of
+        (bgRec : _) -> getFocused bgRec `shouldReturn` [bgSid1]
+        []          -> expectationFailure "expected a bg WS connection"
+      -- The bg session is tracked, and the confirmation was posted.
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` [bgSid1]
+      getSends chan `shouldReturn` ["bg session bgsid-1 started"]
+
+    it "works when the conversation has no session yet" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      getSendCalls seams `shouldReturn` [(bgSid1, "hi")]
+      mConvSid <- sessionLookup sessions bgKey
+      mConvSid `shouldBe` Nothing
+
+    it "posts the recorded response entry from the bg connection" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> cb (SeEntry bgSid1 (bgReplyJson "the background answer"))
+        []       -> expectationFailure "expected a bg WS callback"
+      sent <- getAllSent chan
+      sent `shouldSatisfy` any (T.isInfixOf "the background answer")
+
+    it "ignores entry-updates, list snapshots, and other sessions on the bg connection" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> do
+          cb (SeEntryUpdate bgSid1 (streamingJsonFor "half a streamed reply"))
+          cb (SeLists (A.object [ "type" .= ("lists" :: Text)
+                                , "thinkingSessionIds" .= ([] :: [Text]) ]))
+          cb (SeEntry (mkSid "some-other-session") (bgReplyJson "not my reply"))
+        [] -> expectationFailure "expected a bg WS callback"
+      -- Nothing but the /bg confirmation was posted: no streamed delta, no
+      -- list handling, no reply for a foreign session. getAllSent covers
+      -- ccSendWithId (which the streaming/finalize path uses), so a
+      -- regression that routed any of these events into the streaming
+      -- handlers is observable here.
+      sent <- getAllSent chan
+      sent `shouldBe` ["bg session bgsid-1 started"]
+      getWithOptions chan `shouldReturn` []
+      getEdits chan `shouldReturn` []
+
+    it "closes the bg connection on harness-status idle, exactly once" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> do
+          cb (SeEntry bgSid1 (bgReplyJson "the answer"))
+          cb (SeActivity bgSid1 (statusJson "idle"))
+          -- A second idle event must not close (or report) again.
+          cb (SeActivity bgSid1 (statusJson "idle"))
+        [] -> expectationFailure "expected a bg WS callback"
+      recs <- getRecorders seams
+      case recs of
+        (bgRec : _) -> getCloses bgRec `shouldReturn` 1
+        []          -> expectationFailure "expected a bg WS connection"
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` []
+      sent <- getAllSent chan
+      sent `shouldSatisfy` not . any (T.isInfixOf "produced no reply")
+
+    it "posts a tool-progress line for a bg turn's tool-call activity" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> cb (SeActivity bgSid1 (toolCallJson "SHELL_EXEC"))
+        [] -> expectationFailure "expected a bg WS callback"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
+
+    it "registers a bg ask that offers options, and one that offers none" $ do
+      -- Option-less asks (open-ended ASK_HUMAN, or the confirmation gate's
+      -- bare prompt) must be registered too, so a text answer can resolve
+      -- and dequeue them instead of letting them leak.
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1", "bgsid-2"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg one"
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg two"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb1 : cb2 : _) -> do
+          cb1 (SeAsk bgSid1 (A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Pick one" :: Text)
+            , "options" .= [A.object [ "label" .= ("red" :: Text), "description" .= ("" :: Text) ]]
+            ]))
+          cb2 (SeAsk bgSid2 (A.object
+            [ "id" .= ("bbbbbbbb-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Type something" :: Text)
+            , "options" .= ([] :: [A.Value])
+            ]))
+        _ -> expectationFailure "expected two bg WS callbacks"
+      -- The option-ful ask rendered as an inline keyboard.
+      opts <- getWithOptions chan
+      map snd opts `shouldBe` [["red"]]
+      -- Both asks are pending, keyed by their own (bg) session.
+      asks <- readTVarIO pendingAsks
+      (length <$> Map.lookup bgSid1 asks) `shouldBe` Just 1
+      (length <$> Map.lookup bgSid2 asks) `shouldBe` Just 1
+      -- The option-less one rendered as plain question text (no keyboard),
+      -- yet is still registered (that is the fix).
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "Type something")
+
+    it "drops a bg session's pending asks when the session retires" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> do
+          cb (SeAsk bgSid1 (A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Pick one" :: Text)
+            , "options" .= ([] :: [A.Value])
+            ]))
+          asksBefore <- readTVarIO pendingAsks
+          Map.member bgSid1 asksBefore `shouldBe` True
+          cb (SeActivity bgSid1 (statusJson "idle"))
+        _ -> expectationFailure "expected a bg WS callback"
+      asksAfter <- readTVarIO pendingAsks
+      Map.member bgSid1 asksAfter `shouldBe` False
+
+    it "reports a bg turn that produced no reply when it goes idle" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> cb (SeActivity bgSid1 (statusJson "idle"))
+        []       -> expectationFailure "expected a bg WS callback"
+      sent <- getAllSent chan
+      sent `shouldSatisfy` any (T.isInfixOf "bg session bgsid-1 produced no reply")
+      recs <- getRecorders seams
+      case recs of
+        (bgRec : _) -> getCloses bgRec `shouldReturn` 1
+        []          -> expectationFailure "expected a bg WS connection"
+
+    it "reports a mint failure and tracks nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMintFailure seams "gateway down"
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      getSends chan `shouldReturn` ["bg session failed: gateway down"]
+      getSendCalls seams `shouldReturn` []
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` []
+
+    it "reports a connect failure and tracks nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      queueConnectFailure seams "ws refused"
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      getSends chan `shouldReturn` ["bg session failed: ws refused"]
+      -- The prompt was never delivered and nothing is tracked.
+      getSendCalls seams `shouldReturn` []
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` []
+
+    it "reports a send failure, closes the connection, and tracks nothing" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      queueSendFailure seams "send refused"
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      getSends chan `shouldReturn` ["bg session failed: send refused"]
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` []
+      recs <- getRecorders seams
+      case recs of
+        (bgRec : _) -> getCloses bgRec `shouldReturn` 1
+        []          -> expectationFailure "expected a bg WS connection"
+
+    it "tracks two concurrent bg sessions and delivers both replies" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1", "bgsid-2"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          run = handleInbound cfg chan sessions wsConns pendingAsks bg
+                  tabTracker watchState thinkingTabs bgKey
+      run "/bg one"
+      run "/bg two"
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` [bgSid1, bgSid2]
+      getSendCalls seams `shouldReturn` [(bgSid1, "one"), (bgSid2, "two")]
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb1 : cb2 : _) -> do
+          cb1 (SeEntry bgSid1 (bgReplyJson "first answer"))
+          cb2 (SeEntry bgSid2 (bgReplyJson "second answer"))
+        _ -> expectationFailure "expected two bg WS callbacks"
+      sent <- getAllSent chan
+      sent `shouldSatisfy` any (T.isInfixOf "first answer")
+      sent `shouldSatisfy` any (T.isInfixOf "second answer")
+
+    it "evicts the oldest bg session when a fifth starts" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1", "bgsid-2", "bgsid-3", "bgsid-4", "bgsid-5"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          run = handleInbound cfg chan sessions wsConns pendingAsks bg
+                  tabTracker watchState thinkingTabs bgKey
+      mapM_ (\n -> run ("/bg prompt " <> T.pack (show n))) [1 :: Int, 2, 3, 4, 5]
+      bgSessionsFor bg bgKey
+        >>= (`shouldBe` map mkSid ["bgsid-2", "bgsid-3", "bgsid-4", "bgsid-5"])
+          . map bgSid
+      recs <- getRecorders seams
+      mapM getCloses recs `shouldReturn` [1, 0, 0, 0, 0]
+
+    it "never routes a bg session's non-focused activity to watch mode" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      sessionInsert sessions bgKey convSid
+      ss <- newStreamingState
+      convRec <- mkWsRecorder
+      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          fire _sid = handleServerEvent cfg chan bgKey wsConns pendingAsks bg
+                       tabTracker watchState thinkingTabs convSid
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      handleWatchToggle chan watchState bgKey "/watch on"
+      fire bgSid1 (SeActivity bgSid1 (statusJson "thinking"))
+      fire bgSid1 (SeActivity bgSid1 (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+      -- Sanity check: a non-bg session still notifies, so the exclusion
+      -- above is not vacuous.
+      let otherSid = mkSid "another-tab"
+      fire otherSid (SeActivity otherSid (statusJson "thinking"))
+      fire otherSid (SeActivity otherSid (statusJson "idle"))
+      sends' <- getSends chan
+      sends' `shouldSatisfy` any (T.isInfixOf "finished thinking")
+
+    it "keeps a retired bg session out of watch mode (late activity events)" $ do
+      -- BeActivity is broadcast to every subscriber, so the conversation's
+      -- own connection also sees the bg session's idle — possibly after the
+      -- bg connection's reader retired it. The exclusion must survive
+      -- retirement, or every /bg turn would emit a bogus "Tab ?" line plus
+      -- a duplicate reply.
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      sessionInsert sessions bgKey convSid
+      ss <- newStreamingState
+      convRec <- mkWsRecorder
+      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      pendingAsks <- newTVarIO Map.empty
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          fire = handleServerEvent cfg chan bgKey wsConns pendingAsks bg
+                   tabTracker watchState thinkingTabs convSid
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      handleWatchToggle chan watchState bgKey "/watch on"
+      -- The bg connection retires the session first...
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> cb (SeActivity bgSid1 (statusJson "idle"))
+        [] -> expectationFailure "expected a bg WS callback"
+      sids <- map bgSid <$> bgSessionsFor bg bgKey
+      sids `shouldBe` []
+      -- ...and only then does the conversation's own connection process the
+      -- same all-subscriber activity.
+      fire (SeActivity bgSid1 (statusJson "thinking"))
+      fire (SeActivity bgSid1 (statusJson "idle"))
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
