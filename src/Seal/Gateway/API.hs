@@ -843,6 +843,12 @@ handleTabNew deps v =
 -- anthropic as the default, not a hardcoded fallback. When the body omits
 -- a field, the config default applies; when no default agent is
 -- configured, the session starts unbound. Does NOT touch TabsHandle.
+--
+-- The optional boolean @headless@ field selects the session's channel label:
+-- @true@ labels it @"bg"@ (a background session, invisible to Active Tabs
+-- because 'Seal.Core.TurnEngine.shouldAutoTab' is @False@ for that label),
+-- anything else @"web"@. Everything else — no tab, one broadcast — is
+-- identical for both.
 handleSessionNew :: ApiDeps -> A.Value -> IO Response
 handleSessionNew deps v = do
   let paths = srPaths (adSessionRuntime deps)
@@ -856,7 +862,8 @@ handleSessionNew deps v = do
       mAgent = case lookupBodyStr "agent" of
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
-  meta <- newSession paths provider model "web" mAgent
+      channel = if lookupBodyBool "headless" then "bg" else "web"
+  meta <- newSession paths provider model channel mAgent
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
@@ -865,6 +872,11 @@ handleSessionNew deps v = do
     lookupBodyStr k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
       Just (A.String t) | not (T.null t) -> Just t
       _                                 -> Nothing
+    -- Absent, null, or non-boolean @headless@ means "not headless" (the
+    -- web UI omits the field entirely).
+    lookupBodyBool k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
+      Just (A.Bool b) -> b
+      _               -> False
     eitherToMaybe (Right x) = Just x
     eitherToMaybe (Left _)  = Nothing
 
