@@ -255,7 +255,7 @@ mkIdx n = case mkTabIndex n of
 metaWithDescription :: SessionId -> Maybe Text -> SessionMeta
 metaWithDescription sid mDesc = SessionMeta
   { smId = sid, smProvider = "ollama", smModel = "llama3.2"
-  , smChannel = "cli", smAgent = Nothing
+  , smChannel = "cli", smParent = Nothing, smAgent = Nothing
   , smSystemOverride = Nothing, smAgentName = Nothing
   , smDescription = mDesc
   , smSealFrontMatter = True

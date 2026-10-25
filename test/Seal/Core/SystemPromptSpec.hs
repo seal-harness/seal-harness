@@ -41,7 +41,7 @@ metaWith frontMatter =
       aid = fromRight (error "bad agent id") (mkAgentDefId "zoe")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "web", smAgent = Just aid, smSystemOverride = Nothing
+       , smChannel = "web", smParent = Nothing, smAgent = Just aid, smSystemOverride = Nothing
        , smAgentName = Just "zoe", smDescription = Nothing
        , smSealFrontMatter = frontMatter
        , smRepoUrl = Nothing

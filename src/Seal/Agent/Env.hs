@@ -17,6 +17,7 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..))
 import Seal.ISA.Opcode (BackendExec, localBackend)
 import Seal.ISA.Registry (Registry)
+import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tools.Exec.Abort (AbortFlag)
@@ -57,6 +58,15 @@ data AgentEnv = AgentEnv
     -- Looked up from a 'Seal.Tools.Exec.Abort.SessionAbortRegistry' by
     -- 'SessionId' (the web gateway has no 'AgentEnv' at the @/stop@ call
     -- site — the registry is the vehicle, design Blocker Resolution #2).
+  , aeRepeatTrack :: RepeatTrack
+    -- ^ The session's no-progress repeat window (session-read hardening
+    -- WU4). Sliding window of the last 'Seal.ISA.RepeatDetect.repeatWindowCapacity'
+    -- canonical keys for in-scope opcodes ('Seal.ISA.RepeatDetect.repeatScope'),
+    -- consulted by the loop's dispatch path: 2nd–3rd identical call warns
+    -- (a note is prepended to the result parts), ≥4th is blocked (the op is
+    -- never dispatched). Looked up per turn from the process-lifetime
+    -- 'Seal.ISA.RepeatDetect.SessionRepeatRegistry' (same journey as
+    -- 'aeAbortFlag'), so the window survives across turns.
   , aeToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config (default 120s, max 600s, 3
     -- retries, 2s base delay, 2.0 backoff, 50KB output cap). Loaded from
@@ -218,6 +228,11 @@ data TurnEnv = TurnEnv
   , teOnToolCall    :: OpName -> Value -> IO ()
   , teOnTextDelta   :: Maybe (Text -> IO ())
   , teAbortFlag     :: AbortFlag
+  , teRepeatTrack   :: RepeatTrack
+    -- ^ The session's no-progress repeat window (WU4). Looked up from the
+    -- process-lifetime registry by 'SessionId' each turn (mirrors
+    -- 'teAbortFlag'), so identical session reads across turns count
+    -- against the same window.
   , teToolTimeout   :: ToolTimeoutConfig
   }
 
@@ -257,5 +272,6 @@ mkSessionAgentEnv te = AgentEnv
   , aeOnDemandSchemas = teOnDemand te
   , aeLogPath    = teLogPath te
   , aeAbortFlag  = teAbortFlag te
+  , aeRepeatTrack = teRepeatTrack te
   , aeToolTimeout = teToolTimeout te
   }
