@@ -269,6 +269,7 @@ library
         Seal.ISA.Ops.Session
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
+        Seal.ISA.RepeatDetect
         Seal.Memory.Path
         Seal.Memory.Store
         Seal.Memory.Embedding
@@ -598,5 +599,6 @@ test-suite tests
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
+        Seal.ISA.RepeatDetectSpec
         Seal.Logging.LoggerSpec
         Seal.Logging.ExceptionsSpec

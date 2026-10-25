@@ -98,6 +98,7 @@ import Seal.Session.Lock
   , SessionLocks, sessionTurnInFlight )
 import Seal.Session.Log (appendSessionLog)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry)
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
@@ -177,6 +178,13 @@ data SendDeps = SendDeps
     -- 'lookupOrCreateAbortFlag' and passes it into 'mkSessionAgentEnv' as
     -- 'aeAbortFlag'. Mirrors 'sdLocks' (the registry is a session-keyed
     -- map, lazily created per session).
+  , sdRepeatReg :: SessionRepeatRegistry
+    -- ^ Process-lifetime no-progress repeat registry (session-read
+    -- hardening WU4). Sourced from the shared 'ChannelDeps' registry
+    -- ('cdRepeatReg') — the SAME instance backs every web turn, so a
+    -- session's sliding window survives across requests. 'mkWebTurnDeps'
+    -- threads it into 'TurnDeps'; a per-request registry would silently
+    -- reset the cross-turn window. Mirrors 'sdAbortReg'.
   , sdTabsHandle :: TabsHandle
     -- ^ The shared tab handle. 'handleSend' auto-tabs the session after a
     -- successful turn (W2 invariant 2: any message sent to a session with
@@ -269,6 +277,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdReplies      = sdReplies deps
   , tdLocks        = sdLocks deps
   , tdAbortReg     = sdAbortReg deps
+  , tdRepeatReg    = sdRepeatReg deps
   , tdTabsHandle   = sdTabsHandle deps
   , tdLogger       = sdLogger deps
   , tdIsRemote     = sdIsRemote deps

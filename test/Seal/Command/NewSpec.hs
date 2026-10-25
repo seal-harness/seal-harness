@@ -65,6 +65,7 @@ spec = describe "Seal.Command.New" $ do
           , smProvider = "anthropic"
           , smModel = "claude-sonnet-4-20250514"
           , smChannel = "cli"
+          , smParent = Nothing
           , smAgent = Nothing
           , smSystemOverride = Nothing
           , smAgentName = Nothing

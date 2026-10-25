@@ -286,6 +286,7 @@ runServeMain autonomy mCliStaticDir logger = do
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
         , sdAbortReg    = cdAbortReg chanDeps
+        , sdRepeatReg   = cdRepeatReg chanDeps
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec

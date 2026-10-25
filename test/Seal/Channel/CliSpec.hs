@@ -19,6 +19,7 @@ import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.ISA.RepeatDetect (RepeatTrack, newRepeatTrack)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (commandAction)
@@ -40,6 +41,13 @@ testAbortFlag :: AbortFlag
 testAbortFlag = unsafePerformIO newAbortFlag
 {-# NOINLINE testAbortFlag #-}
 
+-- | A shared test repeat track (session-read hardening WU4). No
+-- repeat-scope opcode is dispatched in this spec, so a shared track is
+-- behaviorally inert.
+testRepeatTrack :: RepeatTrack
+testRepeatTrack = unsafePerformIO newRepeatTrack
+{-# NOINLINE testRepeatTrack #-}
+
 -- | A minimal in-process provider for testing 'mkSessionAgentEnv'.
 data StubProvider = StubProvider
 instance Provider StubProvider where
@@ -52,7 +60,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing True Nothing t t
+  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing t t
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
@@ -169,6 +177,7 @@ spec = do
                   , teOnToolCall    = \_ _ -> pure ()
                   , teOnTextDelta   = Nothing
                   , teAbortFlag     = testAbortFlag
+                  , teRepeatTrack   = testRepeatTrack
                   , teToolTimeout   = defaultToolTimeoutConfig
                   }
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
