@@ -21,6 +21,7 @@ import Seal.Channels.Chat.Loop
   , newWatchState
   , newThinkingTabs
   , newBgSessions
+  , newPendingAsks
   , handleServerEvent
   )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
@@ -208,7 +209,7 @@ spec = do
                       { cccStreamCfg = defaultStreamProgressConfig }
             frameLen i = 79 + 5 * (i - 1)  -- frame i (1-based) total length
             frame i = streamingJsonFor (T.replicate (frameLen i) "x")
-        pendingAsks <- newTVarIO Map.empty
+        pendingAsks <- newPendingAsks
         tabTracker <- newTVarIO Map.empty
         watchState <- newWatchState
         thinkingTabs <- newThinkingTabs

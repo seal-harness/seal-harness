@@ -6,11 +6,14 @@ module Seal.Channels.Chat.HttpClientSpec (spec) where
 
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Text (Text)
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Test.Hspec (Spec, describe, it, shouldBe, expectationFailure)
 
 import Seal.Channels.Chat.HttpClient
   ( SendResult (..)
+  , answerBodyJson
   , parseSendResult
   , TabJson (..)
   , parseJsonBody
@@ -73,6 +76,17 @@ spec = do
 
     it "returns Left for invalid JSON" $
       parseJsonBody "not json" `shouldBe` Left "failed to parse JSON"
+
+  describe "answerBodyJson" $ do
+    -- The server's parseAnswerBody rejects a body carrying BOTH answer and
+    -- scope ("ambiguous"), so the request must send exactly one field.
+    it "carries only the answer field" $
+      answerBodyJson "green" `shouldBe` A.object ["answer" .= ("green" :: Text)]
+
+    it "has no scope field" $
+      case answerBodyJson "y" of
+        A.Object o -> KeyMap.member (Key.fromText "scope") o `shouldBe` False
+        _          -> expectationFailure "expected a JSON object"
 
   describe "TabJson" $ do
     it "has the expected fields" $ do
