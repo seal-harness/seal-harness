@@ -84,6 +84,28 @@ spec = do
     it "does NOT route /vault as Inject v ault (no space after v)" $
       route "/vault" `shouldNotBe` Right (ChatInject (mkIdxC 'v') "ault")
 
+  describe "route — /bg (background sessions)" $ do
+    it "routes a bare /bg to ChatBackground with an empty prompt" $
+      route "/bg" `shouldBe` Right (ChatBackground "")
+
+    it "routes /bg with a prompt to ChatBackground" $
+      route "/bg hi there" `shouldBe` Right (ChatBackground "hi there")
+
+    it "routes /bg with a quoted prompt verbatim (quotes preserved)" $
+      route "/bg \"quoted thing\"" `shouldBe` Right (ChatBackground "\"quoted thing\"")
+
+    it "recognises /bg case-insensitively" $
+      route "/BG x" `shouldBe` Right (ChatBackground "x")
+
+    it "keeps the text after the first space verbatim" $
+      route "/bg  extra" `shouldBe` Right (ChatBackground " extra")
+
+    it "does NOT route /bgx (the first word must be exactly bg)" $
+      route "/bgx" `shouldBe` Right (ChatSlash "bgx")
+
+    it "still routes /b as a tab focus (the /bg case does not shadow it)" $
+      route "/b" `shouldBe` Right (ChatFocus (mkIdxC 'b'))
+
   describe "parseTabFocus" $ do
     it "parses /tab focus 3" $
       parseTabFocus "/tab focus 3" `shouldBe` Just (mkIdxD 3)
