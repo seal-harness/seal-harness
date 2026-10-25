@@ -314,6 +314,41 @@ healthField key mv = case mv of
   Just (A.Object o) -> KeyMap.lookup (Key.fromText key) o
   _ -> Nothing
 
+-- | POST @\/api\/sessions\/new@ with the given body against a FRESH state
+-- dir, and read the created session's 'SessionMeta' back from
+-- @session.json@. The fresh dir is required: the shared dir used by the
+-- @mkApp@ tests accumulates sessions from every other test, so the channel
+-- label could not be attributed to this call. Asserts the parts common to
+-- every caller (200 + a non-empty @session_id@ + no tab inserted — the
+-- handler must not touch TabsHandle, headless or not) and hands the decoded
+-- meta back so a test can assert on the persisted channel label.
+postSessionNewMeta :: A.Value -> IO SessionMeta
+postSessionNewMeta body = withSystemTempDirectory "seal-api-new-session" $ \d -> do
+  createDirectoryIfMissing True (d </> "sessions")
+  let paths = fakePaths { spState = d }
+  deps <- mkDepsFor paths
+  let app = apiApp deps
+  req <- testPost ["api", "sessions", "new"] (A.encode body)
+  (status, respBody) <- runAppBody app req
+  status `shouldBe` 200
+  let sid = case A.decode respBody :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "session_id" o of
+          Just (A.String s) | not (T.null s) -> s
+          _ -> error ("expected a non-empty session_id string, got: " <> show respBody)
+        _ -> error ("expected JSON object, got: " <> show respBody)
+  -- No tab may have been inserted for a bare session.
+  (_, tabsBody) <- runAppBody app (testRequest methodGet ["api", "tabs"])
+  case A.decode tabsBody :: Maybe [A.Value] of
+    Just tabs -> tabs `shouldSatisfy` null
+    Nothing   -> error "expected a tabs array"
+  sidParsed <- case mkSessionId sid of
+    Right s -> pure s
+    Left e  -> error ("invalid session id " <> T.unpack sid <> ": " <> T.unpack e)
+  mMeta <- decodeFileStrict (sessionMetaPath paths sidParsed)
+  case mMeta of
+    Just m  -> pure m
+    Nothing -> error ("expected session.json on disk for " <> T.unpack sid)
+
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
 -- registry and whose @rrhMutate@ always succeeds (no disk I/O). Used by
 -- tests that need an 'ApiDeps' but don't exercise the repo CRUD path.
@@ -512,6 +547,21 @@ spec = describe "Seal.Gateway.API" $ do
     case A.decode body2 :: Maybe [A.Value] of
       Just tabs -> tabs `shouldSatisfy` null
       Nothing   -> expectationFailure "expected a tabs array"
+
+  it "POST /api/sessions/new with headless=true labels the session channel \"bg\"" $ do
+    meta <- postSessionNewMeta
+      (A.object [ "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text), "headless" .= True ])
+    -- /bg sessions carry channel "bg": TurnEngine.shouldAutoTab keys off it to
+    -- keep a headless turn out of Active Tabs.
+    smChannel meta `shouldBe` "bg"
+
+  it "POST /api/sessions/new without a headless field labels the session channel \"web\"" $ do
+    -- The default must stay "web" — the web UI calls this endpoint too.
+    metaWeb <- postSessionNewMeta (A.object [])
+    smChannel metaWeb `shouldBe` "web"
+    -- An explicit `{"headless": false}` is also "web".
+    metaExplicit <- postSessionNewMeta (A.object [ "headless" .= False ])
+    smChannel metaExplicit `shouldBe` "web"
 
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
