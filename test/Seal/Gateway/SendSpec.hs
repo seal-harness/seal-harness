@@ -287,13 +287,19 @@ mkSendDepsWith paths resolveStub = do
         }
   pure sendDeps
 
--- | Seed a session.json on disk for the given sid.
-seedSession :: SealPaths -> SessionId -> IO ()
-seedSession paths sid = do
+-- | Seed a session.json on disk for the given sid, created on the given
+-- channel. Used by the auto-tab tests to build a @channel="bg"@ (headless)
+-- session as well as the usual @web@ one.
+seedSessionChannel :: SealPaths -> Text -> SessionId -> IO ()
+seedSessionChannel paths channel sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
   saveSessionMeta paths meta
+
+-- | Seed a session.json on disk for the given sid (channel @web@).
+seedSession :: SealPaths -> SessionId -> IO ()
+seedSession paths = seedSessionChannel paths "web"
 
 spec :: Spec
 spec = describe "Seal.Gateway.Send auto-tab" $ do
@@ -352,6 +358,81 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (case tlTabs snap of [t] -> Just (tRef t); _ -> Nothing))
           (\mRef -> mRef == Just (BoundSession sid))
         tabSeen `shouldBe` True
+
+    it "Plain route on a channel=bg session -> runs the turn but does NOT auto-tab (shouldAutoTab)" $
+      -- /bg sessions run headless: TurnEngine.shouldAutoTab keeps them out of
+      -- the sidebar. The gateway's own post-turn auto-tab must respect the
+      -- same predicate, or the /bg session leaks back into Active Tabs.
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef
+          [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261025-120000-bg01"
+            convPath = sessionDir paths sid </> "conversation.jsonl"
+        seedSessionChannel paths "bg" sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        -- Positive proof the turn actually ran: the scripted reply lands in
+        -- the transcript. Without this, "no tab" could pass vacuously (a turn
+        -- that never started cannot tab).
+        replied <- waitFor 5000000
+          (do exists <- doesFileExist convPath
+              if not exists
+                then pure False
+                else do
+                  raw <- BS.readFile convPath
+                  let texts = [t | Message _ bs <- readConversation raw, CbText t <- bs]
+                  pure ("ok" `elem` texts))
+          id
+        replied `shouldBe` True
+        -- Now give a (buggy) post-turn auto-tab ample time to land, then
+        -- assert it never does: a bg session stays headless.
+        tabbed <- waitFor 1500000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (not . null)
+        tabbed `shouldBe` False
+
+    it "Plain route on a channel=web session still auto-tabs (regression guard)" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef
+          [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261025-120000-web01"
+        seedSessionChannel paths "web" sid
+        outcome <- handleSend sendDeps sid "hello"
+        outcome `shouldBe` SendAssistant
+        tabSeen <- waitFor 5000000
+          (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
+          (elem (BoundSession sid))
+        tabSeen `shouldBe` True
+
+    it "web /bg pin -> still an unknown command for a web session (no bg command on the gateway)" $
+      -- DoD 7: /bg stays a chat-channel affordance. POST /send must keep
+      -- answering "unknown command: bg" (the slash route's auto-tab
+      -- behaviour for web sessions is unchanged and deliberately not
+      -- asserted here).
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261025-120000-web02"
+        seedSessionChannel paths "web" sid
+        outcome <- handleSend sendDeps sid "/bg hi"
+        outcome `shouldBe` SendSlash "unknown command: bg" Nothing
 
     it "SendError (404 missing session) -> no auto-tab" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
