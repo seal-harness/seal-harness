@@ -15,6 +15,7 @@ Plan: `docs/plans/active-plan.md` (rev 9 of `docs/superpowers/plans/2026-10-26-c
 | WU-2 | /tab new mints a real session (registry + CLI) | DONE | `ec2516d` | no `tab-session` remains |
 | WU-3 | /tab list renders client-side in D5 format | DONE | `047464a` | new TabRender module |
 | WU-4 | /tab resume golden reply + registry coverage | DONE | `d9396cd` | |
+| WU-5a | REST: /api/tabs/:idx/rename + tab resume | DONE | `cc0eef0` | D1 reinstated by operator |
 | WU-5 | Stale WS filter (recreate conn on sid change) | PENDING | — | RISKY: core delivery path |
 | WU-6 | Gateway: sessions/:id/new body+rebind_error, GET /api/commands | PENDING | — | |
 | WU-7 | Chat /new: args, rebind XOR mint, -r, golden line | PENDING | — | needs WU-5 + WU-6 |
@@ -23,7 +24,7 @@ Plan: `docs/plans/active-plan.md` (rev 9 of `docs/superpowers/plans/2026-10-26-c
 
 ## Gate status at this checkpoint
 - `cabal build all` clean
-- `cabal test`: **3241 examples, 0 failures, 42 pending** (baseline was 3212/0/42)
+- `cabal test`: **3246 examples, 0 failures, 42 pending** (baseline was 3212/0/42)
 - `hlint src/ test/` and `hlint src-chat-channels/`: No hints
 
 ## Ordering note for resuming
