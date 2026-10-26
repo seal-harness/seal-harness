@@ -90,7 +90,7 @@ spec = do
 
   describe "TabJson" $ do
     it "has the expected fields" $ do
-      let tab = TabJson { tjIndex = 3, tjSessionId = Just "sess123", tjKind = "session:ai", tjLabel = Just "my tab" }
+      let tab = TabJson { tjIndex = 3, tjSessionId = Just "sess123", tjKind = "session:ai", tjLabel = Just "my tab", tjStatus = Nothing }
       tjIndex tab `shouldBe` 3
       tjSessionId tab `shouldBe` Just "sess123"
       tjKind tab `shouldBe` "session:ai"

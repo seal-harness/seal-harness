@@ -11,12 +11,14 @@ module Seal.Channels.Chat.HttpClient
     -- * Tabs
   , httpGetTabs
   , TabJson (..)
+  , ListsJson (..)
     -- * Sessions list
   , httpGetSessions
     -- * Sessions
   , httpNewSession
   , httpGetTranscript
   , httpStopSession
+  , httpGetLists
     -- * Questions (ASK_HUMAN)
   , httpAnswerQuestion
   , answerBodyJson
@@ -31,7 +33,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
@@ -68,6 +70,16 @@ data TabJson = TabJson
   , tjSessionId :: Maybe Text   -- ^ session id (Nothing for harness tabs)
   , tjKind      :: Text         -- ^ tab kind wire string
   , tjLabel     :: Maybe Text   -- ^ optional user-set label
+  , tjStatus    :: Maybe Text   -- ^ harness liveness: @"running"@ | @"idle"@ | @"exited"@
+  } deriving stock (Eq, Show)
+
+-- | The @GET /api/lists@ snapshot, restricted to what @/tab list@ needs: the
+-- tabs, the session info of every tab-bound session (for @\<repo\>@ and
+-- @\<name\>@), and the set of sessions currently thinking (for @busy@).
+data ListsJson = ListsJson
+  { ljTabs               :: [TabJson]
+  , ljTabSessions        :: [Value]
+  , ljThinkingSessionIds :: [Text]
   } deriving stock (Eq, Show)
 
 -- | @POST /api/sessions/:id/send@ — send a message to a session.
@@ -99,6 +111,16 @@ httpGetSessions mgr apiBase = do
       case A.decode body :: Maybe [Value] of
         Just vs -> pure (Right vs)
         Nothing -> pure (Left "failed to parse sessions JSON array")
+
+-- | @GET /api/lists@ — the partitioned snapshot. Carries what @GET /api/tabs@
+-- cannot: @thinkingSessionIds@ (the only source of the @busy@ state) and
+-- @tabSessions@ (the session metadata behind each tab).
+httpGetLists :: Manager -> Text -> IO (Either Text ListsJson)
+httpGetLists mgr apiBase = do
+  let url = T.unpack apiBase <> "/lists"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> pure (parseListsBody body)
 
 -- | @POST /api/sessions/new@ — create a new session.
 httpNewSession :: Manager -> Text -> Value -> IO (Either Text Text)
@@ -219,6 +241,24 @@ extractSessionId body =
     Just _ -> Left "session response is not a JSON object"
     Nothing -> Left "failed to parse session response JSON"
 
+-- | Parse the @GET /api/lists@ response body.
+parseListsBody :: BL.ByteString -> Either Text ListsJson
+parseListsBody body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) -> do
+      tabs <- case KeyMap.lookup (Key.fromText "tabs") o of
+        Just (A.Array arr) -> traverse parseTabJson (foldr (:) [] arr)
+        _                  -> Left "lists response missing 'tabs' array"
+      let arrOf k = case KeyMap.lookup (Key.fromText k) o of
+            Just (A.Array arr) -> foldr (:) [] arr
+            _                  -> []
+      pure ListsJson
+        { ljTabs               = tabs
+        , ljTabSessions        = arrOf "tabSessions"
+        , ljThinkingSessionIds = mapMaybe asText (arrOf "thinkingSessionIds")
+        }
+    _ -> Left "failed to parse lists response JSON object"
+
 -- | Parse the @GET /api/tabs@ response body.
 parseTabsBody :: BL.ByteString -> Either Text [TabJson]
 parseTabsBody body =
@@ -236,6 +276,7 @@ parseTabJson (A.Object o) =
     , tjSessionId = asText =<< KeyMap.lookup (Key.fromText "session_id") o
     , tjKind = fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "kind") o)
     , tjLabel = asText =<< KeyMap.lookup (Key.fromText "label") o
+    , tjStatus = asText =<< KeyMap.lookup (Key.fromText "status") o
     }
 parseTabJson _ = Left "tab is not a JSON object"
 
