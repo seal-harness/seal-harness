@@ -2760,3 +2760,172 @@ describe('ChatArea connection modal', () => {
     expect(screen.getByText('a message that must stay visible')).toBeTruthy()
   })
 })
+
+// ── Scroll button no-op regression ───────────────────────────────────────
+//
+// When the user switches tabs and switches back, the data cache may have
+// pinned entries for the original session. If loadLatest() finds the
+// pinned entries are the same array reference as the current entries,
+// setEntries() is a no-op (React useState bails out on same ref) → no
+// re-render → useLayoutEffect never fires → pendingScrollToBottom is
+// never consumed → no scroll. The fix: a requestAnimationFrame fallback
+// in the button handler that scrolls directly if the pending flag is
+// still true after paint.
+
+describe('scroll button no-op after tab switch', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    cleanup()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('"Scroll to bottom" works after switching tabs and back (loadLatest no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadLatest = vi.fn() // no-op — simulates pinned cache hit with same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          loadLatest={loadLatest}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to bottom" — loadLatest is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to bottom'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The scroller must have been called — either by the
+      // useLayoutEffect (entries changed) or by the rAF fallback
+      // (entries didn't change, no-op loadLatest). Without the fix,
+      // neither fires and scrollTo is never called.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('"Scroll to top" works after switching tabs and back (loadFromBeginning no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadFromBeginning = vi.fn() // no-op — simulates pinned cache hit with same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to top" — loadFromBeginning is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to top'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The scroller must have been called — either by the
+      // useLayoutEffect (entries changed) or by the rAF fallback
+      // (entries didn't change, no-op loadFromBeginning). Without the
+      // fix, neither fires and scrollTo is never called.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+})
