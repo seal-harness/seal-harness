@@ -651,6 +651,62 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 404
 
+  it "POST /api/tabs/0/rename renames the tab" $ do
+    app <- mkApp
+    _ <- runAppStatus app =<< testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text) ]))
+    req <- testPost ["api", "tabs", "0", "rename"]
+      (A.encode (A.object [ "label" .= ("renamed" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "label" o `shouldBe` Just (A.String "renamed")
+        lookupK "tab_index" o `shouldBe` Just (A.Number 0)
+      other -> error ("unexpected rename body: " ++ show other)
+
+  it "POST /api/tabs/9/rename returns 404 for an out-of-range index" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "9", "rename"]
+      (A.encode (A.object [ "label" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/tabs/0/rename returns 400 for a blank label" $ do
+    app <- mkApp
+    _ <- runAppStatus app =<< testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text) ]))
+    req <- testPost ["api", "tabs", "0", "rename"]
+      (A.encode (A.object [ "label" .= ("   " :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/tabs/new {kind:resume} opens a tab on an existing session" $ do
+    app <- mkApp
+    (_, newBody) <- runAppBody app =<< testPost ["api", "sessions", "new"]
+      (A.encode (A.object []))
+    sid <- case A.decode newBody :: Maybe A.Value of
+      Just (A.Object o) -> case lookupK "session_id" o of
+        Just (A.String t) -> pure t
+        _                 -> error "sessions/new response had no session_id"
+      _ -> error "sessions/new returned a non-object"
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("resume" :: T.Text), "session_id" .= sid ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "session_id" o `shouldBe` Just (A.String sid)
+      other -> error ("unexpected resume body: " ++ show other)
+
+  it "POST /api/tabs/new {kind:resume} returns 404 for an unknown session" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("resume" :: T.Text)
+        , "session_id" .= ("20200101-000000-999" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
   it "POST /api/tabs/0/dismiss returns 204" $ do
     app <- mkApp
     req1 <- testPost ["api", "tabs", "new"]
