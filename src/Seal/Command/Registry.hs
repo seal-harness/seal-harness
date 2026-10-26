@@ -15,6 +15,7 @@
 module Seal.Command.Registry
   ( CoreCommandDeps (..)
   , coreCommandSpecs
+  , mintTabSession
   ) where
 
 import Seal.Agent.Def.Backend (AgentDefBackend)
@@ -27,7 +28,11 @@ import Seal.Command.Spec (CommandSpec)
 import Seal.Command.Stop (StopTranscriptWriter, stopCommandSpec)
 import Seal.Command.Tab (TabCloseNotifier, tabCommandSpec, terseGrammarSpec)
 import Seal.Config.Paths (SealPaths)
-import Seal.Session.Store (SessionRuntime)
+import Data.Either (fromRight)
+import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig)
+import Data.Text (Text)
+import Seal.Session.Meta (SessionMeta)
+import Seal.Session.Store (SessionRuntime, initSessionMeta)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tabs (TabsHandle)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
@@ -112,7 +117,22 @@ coreCommandSpecs d =
   , modelCommandSpec (ccdProvider d) (ccdSession d) (ccdModelWriter d)
   , agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)
   , tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)
+      (mintTabSession (ccdPaths d) (loadRuntimeConfig (ccdCfgPath d)) (ccdAgentDefs d))
   , stopCommandSpec (ccdAbortReg d) (ccdRunRecords d) (ccdSession d) (ccdStopWriter d)
   , terseGrammarSpec
   ]
   <> [ repoCommandSpec (ccdRepoReg d) seam | Just seam <- [ccdRepoSeam d] ]
+
+-- | Mint a session for a new provider tab, /without persisting it/.
+--
+-- The caller ('Seal.Command.Tab.newCmd') binds a tab to the returned session
+-- and only then calls 'Seal.Session.Store.saveSessionMeta'. Kept unsaved so a
+-- failed tab insert cannot leave an orphaned @session.json@ on disk.
+--
+-- Provider/model come from the runtime config's defaults (via
+-- 'initSessionMeta'); a config that fails to load falls back to
+-- 'defaultRuntimeConfig', matching every other config read in the harness.
+mintTabSession :: SealPaths -> IO (Either Text RuntimeConfig) -> AgentDefBackend -> IO SessionMeta
+mintTabSession paths loadCfg backend = do
+  eCfg <- loadCfg
+  initSessionMeta paths (fromRight defaultRuntimeConfig eCfg) backend

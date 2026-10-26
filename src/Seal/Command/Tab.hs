@@ -24,6 +24,7 @@ import Seal.Gateway.Transcript (firstUserMessageSnippet)
 import Seal.Handles.Tab (mkTabIndex, TabIndex, TabKind (..), tabIndexToChar)
 import Seal.Routing.Route (terseSynopsis)
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveSessionMeta)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
 import Seal.Util.StrictIO (decodeFileStrict)
@@ -44,13 +45,14 @@ noTabCloseNotifier _ = pure ()
 -- 'Seal.Routing.Route' as 'CurrentTab' (show the focused tab) BEFORE the
 -- registry is consulted, so this spec's parser only runs when a subcommand
 -- is present (@/tab list@, @/tab new@, etc.).
-tabCommandSpec :: SealPaths -> TabsHandle -> TabCloseNotifier -> CommandSpec
-tabCommandSpec paths h closeNotifier = CommandSpec
+tabCommandSpec :: SealPaths -> TabsHandle -> TabCloseNotifier
+               -> IO SessionMeta -> CommandSpec
+tabCommandSpec paths h closeNotifier mint = CommandSpec
   { csName         = CommandName "tab"
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"
-  , csParserInfo   = tabParserInfo paths h closeNotifier
+  , csParserInfo   = tabParserInfo paths h closeNotifier mint
   , csAvailability = AlwaysAvailable
   }
 
@@ -67,18 +69,20 @@ terseGrammarSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
 
-tabParserInfo :: SealPaths -> TabsHandle -> TabCloseNotifier -> ParserInfo CommandAction
-tabParserInfo paths h closeNotifier =
-  info (tabParser paths h closeNotifier <**> helper)
+tabParserInfo :: SealPaths -> TabsHandle -> TabCloseNotifier
+              -> IO SessionMeta -> ParserInfo CommandAction
+tabParserInfo paths h closeNotifier mint =
+  info (tabParser paths h closeNotifier mint <**> helper)
     (  progDesc "Manage tabs"
     <> header   "tab — manage tabs (new/list/close/focus/resume/rename)"
     )
 
-tabParser :: SealPaths -> TabsHandle -> TabCloseNotifier -> Parser CommandAction
-tabParser paths h closeNotifier = hsubparser
+tabParser :: SealPaths -> TabsHandle -> TabCloseNotifier
+          -> IO SessionMeta -> Parser CommandAction
+tabParser paths h closeNotifier mint = hsubparser
   $  command "list"   (info (pure (listCmd paths h))   (progDesc "List all tabs"))
-  <> command "new"    (info (newCmd h <$> optional kindArg)
-                                 (progDesc "Create a new tab (default kind: ai)"))
+  <> command "new"    (info (newCmd paths h mint <$> optional kindArg)
+                                 (progDesc "Create a new tab bound to a fresh session"))
   <> command "close"  (info (closeCmd h closeNotifier <$> tabIndexArg <*> forceFlag)
                                  (progDesc "Close a tab by index (compacts the list)"))
   <> command "focus"  (info (focusCmd h <$> tabIndexArg)
@@ -128,19 +132,24 @@ resolveTabName paths t
             Nothing   -> firstUserMessageSnippet paths sid
   | otherwise = pure Nothing
 
--- | The /tab new subcommand. (For 6b the kind is informational; a session
--- tab is the default. A harness tab needs the wizard — deferred.)
-newCmd :: TabsHandle -> Maybe Text -> CommandAction
-newCmd h _mKind = commandAction $ \caps -> do
-  let ref = BoundSession placeholder
-  r <- insertTabH h ref KindAi Nothing
+-- | The /tab new subcommand. The kind argument is informational (a provider
+-- tab is the only supported kind today; the wizard would be needed for a
+-- harness tab).
+--
+-- The tab is bound to a /real/ session. Ordering matters and mirrors the
+-- gateway's 'handleTabNew': mint an /unsaved/ 'SessionMeta', insert the tab,
+-- and only then persist. A failed insert (full 36-slot list, or an I2
+-- collision) therefore leaves no @session.json@ behind — an orphaned session
+-- would otherwise surface in Recent Sessions with no tab to back it.
+newCmd :: SealPaths -> TabsHandle -> IO SessionMeta -> Maybe Text -> CommandAction
+newCmd paths h mint _mKind = commandAction $ \caps -> do
+  meta <- mint
+  r <- insertTabH h (BoundSession (smId meta)) KindProvider Nothing
   case r of
     Left e  -> ccSend caps ("tab new failed: " <> e)
-    Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")
-  where
-    placeholder = case mkSessionId "tab-session" of
-      Right s -> s
-      Left _  -> error "placeholder session id"
+    Right i -> do
+      saveSessionMeta paths meta
+      ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")
 
 -- | The /tab close subcommand. Snapshots the tab's 'TabRef' before removing
 -- it so the close notifier can tell attached channels which tab was closed.
