@@ -299,6 +299,58 @@ spec = describe "Seal.Command.Tab" $ do
       sent <- readIORef ref
       sent `shouldSatisfy` any ("focused" `T.isInfixOf`)
 
+
+  describe "/tab registry parity (previously untested paths)" $ do
+    it "/tab resume <sid> replies 'tab N resumed' and binds the tab" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab resume resumed-session" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldBe` ["tab 0 resumed"]
+        snap <- snapshotTabs h
+        map tRef (tlTabs snap) `shouldBe` [BoundSession (mkSid "resumed-session")]
+
+    it "/tab close <out of range> replies 'close failed: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab close 5" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("close failed" `T.isInfixOf`)
+
+    it "/tab close --force <out of range> replies 'force close: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab close 5 --force" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("force close" `T.isInfixOf`)
+
+    it "/tab rename <out of range> replies 'rename failed: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab rename 5 nope" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("rename failed" `T.isInfixOf`)
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------

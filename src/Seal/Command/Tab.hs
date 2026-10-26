@@ -198,7 +198,7 @@ resumeCmd h sidText = commandAction $ \caps -> do
       r <- insertTabH h (BoundSession s) KindAi Nothing
       case r of
         Left e  -> ccSend caps ("resume failed: " <> e)
-        Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " resumed " <> sessionIdText s)
+        Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " resumed")
 
 -- | The /tab rename subcommand.
 renameCmd :: TabsHandle -> Int -> Text -> CommandAction
