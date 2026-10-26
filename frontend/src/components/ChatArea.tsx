@@ -3057,6 +3057,17 @@ export function ChatArea({
                   pendingScrollToTop.current = true
                   wasAtBottom.current = false
                   loadFromBeginning()
+                  // Fallback: if loadFromBeginning was a no-op (pinned
+                  // entries are the same reference → useState bails out →
+                  // no re-render → useLayoutEffect never fires →
+                  // pendingScrollToTop never consumed), do the scroll
+                  // directly after paint.
+                  requestAnimationFrame(() => {
+                    if (pendingScrollToTop.current) {
+                      scrollerRef.current?.scrollTo({ top: 0 })
+                      pendingScrollToTop.current = false
+                    }
+                  })
                 } else {
                   scrollerRef.current?.scrollTo({ top: 0 })
                 }
@@ -3089,6 +3100,18 @@ export function ChatArea({
                   pendingScrollToBottom.current = true
                   wasAtBottom.current = true
                   loadLatest()
+                  // Fallback: if loadLatest was a no-op (pinned entries
+                  // are the same reference → useState bails out → no
+                  // re-render → useLayoutEffect never fires →
+                  // pendingScrollToBottom never consumed), do the scroll
+                  // directly after paint.
+                  requestAnimationFrame(() => {
+                    if (pendingScrollToBottom.current) {
+                      const el = scrollerRef.current
+                      if (el) el.scrollTo({ top: el.scrollHeight })
+                      pendingScrollToBottom.current = false
+                    }
+                  })
                   // Diagnostic: check if loadLatest was a no-op (same
                   // entries reference → no re-render → useLayoutEffect
                   // never fires → pendingScrollToBottom never consumed).
