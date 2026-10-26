@@ -55,39 +55,9 @@ import Seal.Session.Store
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
--- | Optional arguments for @/new@. All fields are 'Maybe' — 'Nothing' means
--- "use the config default" (for provider/model) or "no repo" (for repo).
-data NewArgs = NewArgs
-  { naProvider :: Maybe Text
-  , naModel    :: Maybe Text
-  , naRepo     :: Maybe Text
-  } deriving stock (Eq, Show)
-
--- | The empty 'NewArgs' — no overrides, use all config defaults.
-emptyNewArgs :: NewArgs
-emptyNewArgs = NewArgs { naProvider = Nothing, naModel = Nothing, naRepo = Nothing }
-
--- | Parse the raw argument text from the routing layer into 'NewArgs'.
--- This is a simple manual parse used by the inbox-channel loop path
--- ('Seal.Channels.Chat.Loop'), which doesn't go through
--- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@, and
--- @-r@\/@--repo@ with a single value each. Unknown flags are ignored.
-parseNewArgs :: Text -> NewArgs
-parseNewArgs raw =
-  go (splitArgs raw) emptyNewArgs
-  where
-    go [] acc = acc
-    go (flag : val : rest) acc
-      | flag `elem` ["-p", "--provider"] = go rest acc { naProvider = Just val }
-      | flag `elem` ["-m", "--model"]    = go rest acc { naModel    = Just val }
-      | flag `elem` ["-r", "--repo"]     = go rest acc { naRepo     = Just val }
-      | otherwise                        = go (val : rest) acc
-    go (_flag : rest) acc = go rest acc
-
-    -- Split on whitespace, preserving non-empty tokens.
-    splitArgs t = case T.words t of
-      [] -> []
-      ws -> ws
+import Seal.Gateway.Types.NewArgs
+  ( NewArgs (..), emptyNewArgs, parseNewArgs
+  , renderNewSessionConfirmation )
 
 -- | Resolve the @-r@\/@--repo@ value to a git URL. First tries the value
 -- as a registered repo ID (looked up via 'RepoRegistryHandle'); if found,
@@ -235,7 +205,8 @@ mintNewSession args deps = do
 -- PM/designer review.
 renderNewConfirmation :: SessionMeta -> SessionId -> Text
 renderNewConfirmation meta oldSid =
-  "new session " <> sessionIdText (smId meta)
-    <> " (" <> smProvider meta <> "/" <> smModel meta <> ")"
-    <> " — prior session " <> sessionIdText oldSid
-    <> " kept in /session list"
+  renderNewSessionConfirmation
+    (sessionIdText (smId meta))
+    (smProvider meta)
+    (smModel meta)
+    (sessionIdText oldSid)

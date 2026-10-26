@@ -51,6 +51,7 @@ library seal-gateway-types
         Seal.Gateway.Types.Stream
         Seal.Gateway.Types.ListsSnapshot
         Seal.Gateway.Types.AesonUtils
+        Seal.Gateway.Types.NewArgs
     build-depends:
         base >= 4.18 && < 5
       , aeson
