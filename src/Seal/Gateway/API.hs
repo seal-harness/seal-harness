@@ -120,7 +120,7 @@ import Seal.Session.Store
   , updateSessionDescription
   , updateSessionSealFrontMatter )
 import Seal.Command.Tab (TabCloseNotifier)
-import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
+import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
@@ -651,6 +651,9 @@ apiApp deps req respond =
       respond =<< handleSessionRebindNew deps sid
     (m', ["api", "tabs", idx, "close"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
+    (m', ["api", "tabs", idx, "rename"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleTabRename deps idx body
     (m', ["api", "tabs", idx, "dismiss"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
     (m', ["api", "tabs", idx, "acknowledge"]) | m' == methodPost ->
@@ -834,7 +837,64 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       triggerBroadcast deps
       pure (tabInsertResponse res Nothing "harness")
+    Just "resume" -> case parseResumeSessionId v of
+      Nothing -> pure (errJson status400 "missing or invalid 'session_id' field")
+      Just sid -> do
+        -- Inserting a tab does not validate that the session exists, so a
+        -- well-formed id for a deleted session would create a dead tab.
+        -- Mirror handleSessionRebindNew's existence guard.
+        let paths = srPaths (adSessionRuntime deps)
+        exists <- doesFileExist (sessionMetaPath paths sid)
+        if not exists
+          then pure (errJson status404 "session not found")
+          else do
+            res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+            case res of
+              Left e -> pure (errJson status400 e)
+              Right _ -> do
+                triggerBroadcast deps
+                pure (tabInsertResponse res (Just sid) "session:provider")
+
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | Parse the @session_id@ field of a @POST /api/tabs/new {kind:"resume"}@ body.
+parseResumeSessionId :: A.Value -> Maybe SessionId
+parseResumeSessionId v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "session_id") o of
+    Just (A.String t) -> either (const Nothing) Just (mkSessionId t)
+    _                 -> Nothing
+  _ -> Nothing
+
+-- | Handle @POST /api/tabs/:index/rename@. Body: @{"label": "<text>"}@.
+-- Replies @200 {ok, tab_index, label}@, @404@ when the index is out of range,
+-- @400@ on a missing/blank label.
+handleTabRename :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleTabRename deps idxTxt body =
+  case parseIndex idxTxt of
+    Nothing   -> pure (errJson status400 "invalid tab index")
+    Just idx  -> case parseLabelBody body of
+      Nothing  -> pure (errJson status400 "missing or invalid 'label' field")
+      Just lbl -> do
+        r <- renameTabH (adTabsHandle deps) idx lbl
+        case r of
+          Left _   -> pure (errJson status404 "tab index out of range")
+          Right () -> do
+            triggerBroadcast deps
+            pure (jsonOk (object
+              [ "ok" .= True
+              , "tab_index" .= tabIndexToInt idx
+              , "label" .= lbl
+              ]))
+
+-- | Parse the @label@ field of a @POST /api/tabs/:index/rename@ body.
+-- A missing, blank, or non-string label is rejected.
+parseLabelBody :: BL.ByteString -> Maybe Text
+parseLabelBody body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "label") o of
+      Just (A.String t) | not (T.null (T.strip t)) -> Just (T.strip t)
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Handle POST /api/sessions/new — create a bare session (no tab attached)
 -- and return its id. The "Recent Sessions +" button calls this. Body is
