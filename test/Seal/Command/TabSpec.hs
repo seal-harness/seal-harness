@@ -38,6 +38,7 @@ stubMeta = SessionMeta
   , smProvider = "ollama"
   , smModel = "llama3.2"
   , smChannel = "web"
+  , smParent = Nothing
   , smAgent = Nothing
   , smSystemOverride = Nothing
   , smAgentName = Nothing
