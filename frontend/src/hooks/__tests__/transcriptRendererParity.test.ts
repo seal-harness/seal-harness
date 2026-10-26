@@ -829,6 +829,10 @@ describe('data-layer parity: useTranscriptMessages vs transcriptToMessages', () 
       ])
     })
 
+    it('non-JSON request and response payloads in the same transcript', () => {
+      expectFullParity(conversationWithNonJsonPayload())
+    })
+
     it('response with only thinking blocks (no text)', () => {
       expectFullParity([
         makeEntry({
@@ -1375,6 +1379,13 @@ describe('property: visible content matches after any navigation sequence', () =
         expect(startIndex).toBeLessThanOrEqual(visibleStart)
         expect(endIndex).toBeGreaterThanOrEqual(visibleEnd)
 
+        // Property 1b: the window MUST also cover the overscan buffer
+        // on both sides — that buffer is what keeps scrolling from
+        // showing blank rows between a scroll event and the next
+        // range update.
+        expect(startIndex).toBeLessThanOrEqual(Math.max(0, visibleStart - OVERSCAN))
+        expect(endIndex).toBeGreaterThanOrEqual(Math.min(messageCount, visibleEnd + OVERSCAN))
+
         // Property 2: the visible content from both renderers must be
         // identical — same messages at the same indices.
         for (let i = visibleStart; i < visibleEnd; i++) {
@@ -1384,6 +1395,12 @@ describe('property: visible content matches after any navigation sequence', () =
         // Property 3: the virtual window's overscan is within bounds.
         expect(startIndex).toBeGreaterThanOrEqual(0)
         expect(endIndex).toBeLessThanOrEqual(messageCount)
+
+        // Property 4: the window renders at least MIN_RENDERED
+        // messages, bounded by what is left in the transcript.
+        expect(endIndex - startIndex).toBeGreaterThanOrEqual(
+          Math.min(MIN_RENDERED, messageCount - startIndex),
+        )
       }
     }
   })
