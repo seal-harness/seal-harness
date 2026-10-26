@@ -9,6 +9,7 @@ module Seal.Channels.Chat.Telegram
   , TelegramButton (..)
   , mkMockTelegramChatTransport
   , mkRealTelegramChatTransport
+  , tgSetCommandsViaApi
   , chunkMessage
   ) where
 
@@ -24,6 +25,8 @@ import Data.Text qualified as T
 import System.IO (hPutStrLn, stderr)
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.TelegramCommands
+  (BotCommand, commandsPayload)
 import Seal.Channels.Chat.Types
   (InboundMessage (..), ChatMessageId (..), ReceivedMessage (..))
 import Seal.Gateway.Types.AllowList (AllowList (..))
@@ -496,6 +499,46 @@ sendViaApi mgr token chatId body = do
                      }
       _ <- try @SomeException (httpLbs req mgr)
       pure ()
+
+-- | Register the bot's command menu (@setMyCommands@). This is what the
+-- Telegram client renders after the user types @\/@; registering the same
+-- list twice is harmless (the last call wins).
+--
+-- Errors carry the Bot API's @description@ when it sent one (Telegram
+-- returns @{\"ok\":false,\"description\":\"…\"}@), otherwise
+-- @HTTP \<code\>@.
+tgSetCommandsViaApi :: Manager -> Text -> [BotCommand] -> IO (Either Text ())
+tgSetCommandsViaApi mgr token cmds = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/setMyCommands")))
+  case eReq of
+    Left _ -> pure (Left "invalid Telegram API URL")
+    Right req0 -> do
+      let req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode (commandsPayload cmds))
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left e -> pure (Left (T.pack (show e)))
+        Right resp ->
+          let code = statusCode (responseStatus resp)
+          in if code >= 200 && code <= 299
+               then pure (Right ())
+               else pure (Left (telegramErrorText code (responseBody resp)))
+
+-- | The text of a failed Bot API response: its @description@ when present,
+-- otherwise @HTTP \<code\>@.
+telegramErrorText :: Int -> BL.ByteString -> Text
+telegramErrorText code body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) ->
+      case KeyMap.lookup (Key.fromText "description") o of
+        Just (A.String d) | not (T.null d) -> d
+        _                                  -> fallback
+    _ -> fallback
+  where
+    fallback = "HTTP " <> T.pack (show code)
 
 -- | Send a message and return the @message_id@.
 tgSendWithIdViaApi :: Manager -> Text -> Text -> Text -> IO (Maybe Text)

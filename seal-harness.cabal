@@ -51,6 +51,7 @@ library seal-gateway-types
         Seal.Gateway.Types.Stream
         Seal.Gateway.Types.ListsSnapshot
         Seal.Gateway.Types.AesonUtils
+        Seal.Gateway.Types.NewArgs
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -79,8 +80,10 @@ library seal-chat-channels
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
         Seal.Channels.Chat.ToolRender
+        Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
+        Seal.Channels.Chat.TelegramCommands
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -486,6 +489,7 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
+        Seal.Channels.Chat.TabRenderSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
@@ -495,6 +499,7 @@ test-suite tests
         Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
+        Seal.Channels.Chat.TelegramCommandsSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec

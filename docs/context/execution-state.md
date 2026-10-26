@@ -1,46 +1,48 @@
 # Execution State
-<!-- updated: 2026-10-23 (merge of main into fix/session-self-read-guard) -->
+<!-- updated: 2026-10-26 -->
 
-> **Work streams in this repo.** Two streams are recorded here: the session
-> read hardening branch (this branch — COMPLETE) and the sub-agent
-> completion delivery stream (merged from main; handoff at
-> `docs/handoffs/handoff-2026-10-22-subagent-completion-delivery.md`).
+Plan: `docs/plans/active-plan.md` (**completed**) — rev 9 of
+`docs/superpowers/plans/2026-10-26-chat-slash-command-parity-plan.md`.
 
-## Session read hardening (this branch — COMPLETE, merged with main)
+## Current Position
+- Active work unit: none — **all work units done**
+- Current phase: —
+- Retry count: 0
 
-- Plan: `docs/plans/session-read-hardening-plan.md` (gate: 3/3 PASS)
-- Branch: `fix/session-self-read-guard`
-- Learnings: `docs/plans/session-read-hardening-learnings.md`
+## Work Unit Status
+| WU | Title | Status | Commit | Notes |
+|----|-------|--------|--------|-------|
+| WU-1 | Shared NewArgs + renderNewSessionConfirmation in seal-gateway-types | DONE | `0a193e2` | NewSpec unchanged, +2 pins |
+| WU-2 | /tab new mints a real session (registry + CLI) | DONE | `ec2516d` | no `tab-session` remains |
+| WU-3 | /tab list renders client-side in D5 format | DONE | `047464a` | new TabRender module |
+| WU-4 | /tab resume golden reply + registry coverage | DONE | `d9396cd` | |
+| WU-5a | REST: /api/tabs/:idx/rename + tab resume | DONE | `cc0eef0` | D1 reinstated by operator |
+| WU-5 | Stale WS filter (recreate conn on sid change) | DONE | `72e61b7` | conn map now carries its bound sid |
+| WU-6 | Gateway: sessions/:id/new body+rebind_error, GET /api/commands | DONE | `da4f358` | route count 61 → 62 |
+| WU-7 | Chat /new: args, rebind XOR mint, -r, golden line | DONE | `eeb0807` | one mint per /new, pinned |
+| WU-8 | Telegram command menu + registerWithRetry | DONE | `7bc4c8c` | request body pinned, not the menu |
+| WU-9 | Docs + full gate | DONE | — | this file + handoff/plan updates |
 
-| WU | Title | Status |
-|----|-------|--------|
-| pre-plan | Self-read refusal + search self-exclusion | COMPLETE (13b8501) |
-| WU1 | Byte-bounded reads + conversation.idx windowing | COMPLETE (cd005e0) |
-| WU2 | Read-path secret redaction | COMPLETE (bba7b90) |
-| WU3 | smParent + baked-lineage guard + search caps | COMPLETE (7cd342c) |
-| WU4 | Repeat detection (warn ≥2 / block ≥4 / window 16) | COMPLETE (0173564) |
-| WU5 | around_index anchor windowing | COMPLETE (226016f) |
-| final | Dead aswParentLineage cleanup + learnings | COMPLETE (76f10af, 0704e76) |
+## Gate status
+- `cabal build all` clean
+- `cabal test`: **3296 examples, 0 failures, 42 pending** (3212 at WU-1 start)
+- `hlint src/ src-gateway-types/ test/ src-chat-channels/`: No hints
 
-Final comprehensive review: PASS (all 10 cross-unit checks).
-PR creation intentionally deferred per maintainer.
+## Decisions worth keeping
+- `tab_index` in the `/api/sessions/:id/new` response is `null` when no tab was
+  bound, otherwise the index of the tab the rebind targeted (on failure it
+  stays bound to the old session). `rebind_error` is `null` (not absent) on
+  success, so consumers can read it unconditionally.
+- An unparseable/absent body on `sessions/:id/new` is treated as `{}` (matching
+  `/api/sessions/new`), not a 400.
+- The config default agent's provider/model overrides are NOT applied on the
+  rebind path: provider/model come from the old session or explicit overrides;
+  only the agent id comes from config defaults (D8).
+- `ensureWsConn` now goes through the `cccStartWs` seam (production default is
+  still `startWsClient`) — the loop's WS connections are injectable.
+- `WsConn = (SessionId, WsClient, StreamingState)`: the bound session is part of
+  the connection value because the callback filters by it by value.
 
-## Sub-agent completion delivery (from main)
-
-- Plan: `docs/plans/2026-10-22-subagent-completion-delivery-fix-plan.md`
-  (gate: 3/3 PASS)
-- Handoff: `docs/handoffs/handoff-2026-10-22-subagent-completion-delivery.md`
-- Branch: `fix/subagent-completion-delivery-diagnostics` · PR #279
-
-| WU | Title | Status |
-|----|-------|--------|
-| WU-1 | Reproduce the bug with a failing test | COMPLETE — R1/R2/R3 fail deterministically (20 runs) |
-| WU-2 | Record the completion handoff durably | COMPLETE — R1/R2 pass |
-| WU-3 | Deliver completions that arrive during a turn | COMPLETE (f05b5e3; adversarial review PASS) |
-| WU-4 | Wake-path hygiene (mutex leak, skip warning, pending count) | COMPLETE (532504c; adversarial review PASS) |
-| WU-5 | Final review, tracking items, self-reflect, PR | NOT STARTED |
-
-Session note (2026-10-23): `Seal.Agent.Runtime.Registry > agentStatus >
-records Crashed when the worker throws` flaked once under full-suite load
-(its poll is capped at ~2s and its own comment documents the history).
-Unrelated to either work stream — tracking item for a load-tolerant wait.
+## Remaining / not done here
+- Nothing on the plan. The branch has **not** been pushed or rebased from this
+  workspace (shallow clone, no `main` history) and PR #283 is still a draft.

@@ -4,6 +4,7 @@
 module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
+  , rebindNewResponse
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), withObject)
@@ -53,6 +54,7 @@ import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId
   , sanitizeAgentDefFields )
 import Seal.Core.AllowList (AllowList (..))
+import Seal.Command.Spec (CommandName (..), CommandSpec (..), Registry (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
@@ -120,7 +122,7 @@ import Seal.Session.Store
   , updateSessionDescription
   , updateSessionSealFrontMatter )
 import Seal.Command.Tab (TabCloseNotifier)
-import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
+import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
@@ -187,6 +189,14 @@ apiApp deps req respond =
           , "wsStatus" .= streamHealthStatus wsHealth
           , "wsMessage" .= streamHealthMessage wsHealth
           ]))
+    -- GET /api/commands -> the slash-command menu as
+    -- [{"name": …, "synopsis": …}], one entry per registered CommandSpec
+    -- (canonical names only — aliases are not advertised). The chat channels
+    -- render this as /help on Signal/Telegram. [] when the send plumbing is
+    -- unwired: the registry lives on SendDeps, so a gateway without it has no
+    -- menu to report.
+    (m', ["api", "commands"]) | m' == methodGet ->
+      respond =<< handleCommands deps
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
@@ -643,14 +653,21 @@ apiApp deps req respond =
         Just v  -> respond =<< handleSessionNew deps v
         Nothing -> respond =<< handleSessionNew deps (A.object [])
     -- POST /api/sessions/:id/new — rebind the tab (if any) bound to :id to a
-    -- fresh session, and return the new sid + tab_index + rebound flag. The
+    -- fresh session, and return the new sid + tab_index + rebound flag +
+    -- rebind_error. Body is optional (provider/model/channel overrides). The
     -- old session is kept on disk. 404 when :id doesn't resolve to an
     -- on-disk session (matches handleSessionPrompt/handleSessionAgent —
     -- prevents orphan-session spam).
-    (m', ["api", "sessions", sid, "new"]) | m' == methodPost ->
-      respond =<< handleSessionRebindNew deps sid
+    (m', ["api", "sessions", sid, "new"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleSessionRebindNew deps sid v
+        Nothing -> respond =<< handleSessionRebindNew deps sid (A.object [])
     (m', ["api", "tabs", idx, "close"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
+    (m', ["api", "tabs", idx, "rename"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleTabRename deps idx body
     (m', ["api", "tabs", idx, "dismiss"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
     (m', ["api", "tabs", idx, "acknowledge"]) | m' == methodPost ->
@@ -834,7 +851,64 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       triggerBroadcast deps
       pure (tabInsertResponse res Nothing "harness")
+    Just "resume" -> case parseResumeSessionId v of
+      Nothing -> pure (errJson status400 "missing or invalid 'session_id' field")
+      Just sid -> do
+        -- Inserting a tab does not validate that the session exists, so a
+        -- well-formed id for a deleted session would create a dead tab.
+        -- Mirror handleSessionRebindNew's existence guard.
+        let paths = srPaths (adSessionRuntime deps)
+        exists <- doesFileExist (sessionMetaPath paths sid)
+        if not exists
+          then pure (errJson status404 "session not found")
+          else do
+            res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+            case res of
+              Left e -> pure (errJson status400 e)
+              Right _ -> do
+                triggerBroadcast deps
+                pure (tabInsertResponse res (Just sid) "session:provider")
+
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | Parse the @session_id@ field of a @POST /api/tabs/new {kind:"resume"}@ body.
+parseResumeSessionId :: A.Value -> Maybe SessionId
+parseResumeSessionId v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "session_id") o of
+    Just (A.String t) -> either (const Nothing) Just (mkSessionId t)
+    _                 -> Nothing
+  _ -> Nothing
+
+-- | Handle @POST /api/tabs/:index/rename@. Body: @{"label": "<text>"}@.
+-- Replies @200 {ok, tab_index, label}@, @404@ when the index is out of range,
+-- @400@ on a missing/blank label.
+handleTabRename :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleTabRename deps idxTxt body =
+  case parseIndex idxTxt of
+    Nothing   -> pure (errJson status400 "invalid tab index")
+    Just idx  -> case parseLabelBody body of
+      Nothing  -> pure (errJson status400 "missing or invalid 'label' field")
+      Just lbl -> do
+        r <- renameTabH (adTabsHandle deps) idx lbl
+        case r of
+          Left _   -> pure (errJson status404 "tab index out of range")
+          Right () -> do
+            triggerBroadcast deps
+            pure (jsonOk (object
+              [ "ok" .= True
+              , "tab_index" .= tabIndexToInt idx
+              , "label" .= lbl
+              ]))
+
+-- | Parse the @label@ field of a @POST /api/tabs/:index/rename@ body.
+-- A missing, blank, or non-string label is rejected.
+parseLabelBody :: BL.ByteString -> Maybe Text
+parseLabelBody body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "label") o of
+      Just (A.String t) | not (T.null (T.strip t)) -> Just (T.strip t)
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Handle POST /api/sessions/new — create a bare session (no tab attached)
 -- and return its id. The "Recent Sessions +" button calls this. Body is
@@ -843,6 +917,12 @@ handleTabNew deps v =
 -- anthropic as the default, not a hardcoded fallback. When the body omits
 -- a field, the config default applies; when no default agent is
 -- configured, the session starts unbound. Does NOT touch TabsHandle.
+--
+-- The optional boolean @headless@ field selects the session's channel label:
+-- @true@ labels it @"bg"@ (a background session, invisible to Active Tabs
+-- because 'Seal.Core.TurnEngine.shouldAutoTab' is @False@ for that label),
+-- anything else @"web"@. Everything else — no tab, one broadcast — is
+-- identical for both.
 handleSessionNew :: ApiDeps -> A.Value -> IO Response
 handleSessionNew deps v = do
   let paths = srPaths (adSessionRuntime deps)
@@ -856,7 +936,8 @@ handleSessionNew deps v = do
       mAgent = case lookupBodyStr "agent" of
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
-  meta <- newSession paths provider model "web" mAgent
+      channel = if lookupBodyBool "headless" then "bg" else "web"
+  meta <- newSession paths provider model channel mAgent
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
@@ -865,6 +946,11 @@ handleSessionNew deps v = do
     lookupBodyStr k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
       Just (A.String t) | not (T.null t) -> Just t
       _                                 -> Nothing
+    -- Absent, null, or non-boolean @headless@ means "not headless" (the
+    -- web UI omits the field entirely).
+    lookupBodyBool k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
+      Just (A.Bool b) -> b
+      _               -> False
     eitherToMaybe (Right x) = Just x
     eitherToMaybe (Left _)  = Nothing
 
@@ -873,8 +959,22 @@ handleSessionNew deps v = do
 -- flag. The old session is kept on disk (still in /session list). 404 when
 -- :id doesn't resolve to an on-disk session (prevents orphan-session spam;
 -- matches handleSessionPrompt/handleSessionAgent).
-handleSessionRebindNew :: ApiDeps -> Text -> IO Response
-handleSessionRebindNew deps sidTxt =
+--
+-- The optional body carries @{provider?, model?, channel?}@:
+--
+--   * an absent @provider@\/@model@ inherits the old session's value, so a
+--     mid-session @\/model use@ survives @\/new@;
+--   * an absent @channel@ means @"web"@;
+--   * @agent@ is ALWAYS resolved from the config defaults
+--     ('resolveDefaultAgent') — the old session's agent is deliberately not
+--     inherited (D8, golden parity).
+--
+-- A failed rebind answers @200@ with @rebound: false@ and the raw
+-- @rebind_error@ instead of a @400@: the session is minted before the
+-- rebind, so a 4xx would discard the id the caller needs to print both the
+-- warning and the confirmation line.
+handleSessionRebindNew :: ApiDeps -> Text -> A.Value -> IO Response
+handleSessionRebindNew deps sidTxt body =
   case mkSessionId sidTxt of
     Left e  -> pure (errJson status400 ("invalid session id: " <> e))
     Right oldSid -> do
@@ -888,28 +988,71 @@ handleSessionRebindNew deps sidTxt =
           case mOldMeta of
             Nothing -> pure (errJson status404 "session not found")
             Just oldMeta -> do
-              meta <- newSession paths (smProvider oldMeta) (smModel oldMeta) "web" (smAgent oldMeta)
+              eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+              let cfg = fromRight defaultRuntimeConfig eCfg
+              (mDefAgent, _, _) <- resolveDefaultAgent (adAgentDefs deps) cfg
+              let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
+                  model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
+                  channel  = fromMaybe "web" (bodyStr "channel" body)
+              meta <- newSession paths provider model channel mDefAgent
               let newSid = smId meta
+                  newSidTxt = sessionIdText newSid
               snap <- snapshotTabs (adTabsHandle deps)
               case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
                 []       -> do
                   triggerBroadcast deps
-                  pure (jsonOk (object
-                    [ "session_id" .= sessionIdText newSid
-                    , "tab_index" .= (Nothing :: Maybe Int)
-                    , "rebound" .= False
-                    ]))
+                  pure (jsonOk (rebindNewResponse
+                    newSidTxt Nothing False Nothing provider model))
                 (tab : _) -> do
+                  let idx = tabIndexToInt (tIndex tab)
                   r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
-                  case r of
-                    Left e -> pure (errJson status400 ("tab rebind failed: " <> e))
-                    Right _ -> do
-                      triggerBroadcast deps
-                      pure (jsonOk (object
-                        [ "session_id" .= sessionIdText newSid
-                        , "tab_index" .= tabIndexToInt (tIndex tab)
-                        , "rebound" .= True
-                        ]))
+                  triggerBroadcast deps
+                  pure (jsonOk $ case r of
+                    Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
+                    Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
+
+-- | The response body of @POST \/api\/sessions\/:id\/new@. Pure, so the
+-- rebind-failure branch (reachable only via an out-of-range race or a
+-- same-millisecond sid collision) is pinned by a unit test rather than an
+-- unreliable integration test.
+--
+-- @tab_index@ is 'Nothing' when no tab was bound to the old session; when a
+-- tab was bound it is the index of the tab we attempted to rebind (on
+-- failure that tab stays bound to the old session). @rebind_error@ carries
+-- the raw 'rebindTabH' error text; a 'Nothing' here serialises to JSON null.
+rebindNewResponse :: Text -> Maybe Int -> Bool -> Maybe Text -> Text -> Text -> A.Value
+rebindNewResponse newSid mTabIndex rebound mRebindError provider model = object
+  [ "session_id"   .= newSid
+  , "tab_index"    .= mTabIndex
+  , "rebound"      .= rebound
+  , "rebind_error" .= mRebindError
+  , "provider"     .= provider
+  , "model"        .= model
+  ]
+
+-- | Look up a non-empty string field of a JSON body. A missing body, a
+-- non-object body, an empty string and a non-string value all read as
+-- 'Nothing' (so the caller's default applies).
+bodyStr :: Text -> A.Value -> Maybe Text
+bodyStr k (A.Object o) = case KeyMap.lookup (Key.fromText k) o of
+  Just (A.String t) | not (T.null t) -> Just t
+  _                                 -> Nothing
+bodyStr _ _ = Nothing
+
+-- | Handle @GET \/api\/commands@ — the slash-command menu, one entry per
+-- registered 'CommandSpec' in registry order. Canonical names only (aliases
+-- are never advertised). Returns @[]@ when the send plumbing is unwired: the
+-- registry lives on 'SendDeps', so a gateway without it has no menu.
+handleCommands :: ApiDeps -> IO Response
+handleCommands deps = case adSend deps of
+  Nothing -> pure (jsonLBS status200 (A.encode ([] :: [A.Value])))
+  Just sd -> pure (jsonLBS status200 (A.encode (map commandJson (registrySpecs (sdRegistry sd)))))
+  where
+    commandJson spec = case csName spec of
+      CommandName n -> object
+        [ "name" .= n
+        , "synopsis" .= csSynopsis spec
+        ]
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when

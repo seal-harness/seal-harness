@@ -9,6 +9,10 @@ import Data.Time (UTCTime (..), fromGregorian)
 import Test.Hspec
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Directory (doesFileExist)
+import Seal.Agent.Def.Backend qualified as Def
+import Seal.Command.Registry (mintTabSession)
+import Seal.Config.File (defaultRuntimeConfig)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
@@ -16,7 +20,7 @@ import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Parse (parseSlash, ParseOutcome (..))
 import Seal.Command.Spec (CommandAction(..), mkRegistry)
 import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec, TabCloseNotifier)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sessionMetaPath)
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Handles.Tab (tabIndexToChar, TabKind(..), mkTabIndex, TabIndex)
 import Seal.Session.Meta (SessionMeta (..))
@@ -25,6 +29,29 @@ import Seal.Tabs (insertTabH, newTabsHandle, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList(..), TabRef(..), tabCount)
 
 -- | A recording ChannelCaps.
+-- | A deterministic mint for the @/tab new@ tests: a valid, real-looking
+-- 'SessionMeta' that the mint itself does /not/ persist (the command persists
+-- it only after the tab insert succeeds).
+stubMeta :: SessionMeta
+stubMeta = SessionMeta
+  { smId = either (error "stubMint: bad sid") id (mkSessionId "20260719-120000-001")
+  , smProvider = "ollama"
+  , smModel = "llama3.2"
+  , smChannel = "web"
+  , smParent = Nothing
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = Nothing
+  , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
+  , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
+  }
+
+stubMint :: IO SessionMeta
+stubMint = pure stubMeta
+
 recordingCaps :: IO (IORef [Text], ChannelCaps)
 recordingCaps = do
   ref <- newIORef []
@@ -47,7 +74,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       case parseSlash reg "/tab list" of
         ParsedAction act -> runCommand act caps
@@ -59,7 +86,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       case parseSlash reg "/tab new" of
         ParsedAction act -> runCommand act caps
@@ -74,7 +101,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       case parseSlash reg "/tab new" of
         ParsedAction act -> runCommand act caps
@@ -92,7 +119,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
       case parseSlash reg "/tab close 0" of
@@ -110,7 +137,7 @@ spec = describe "Seal.Command.Tab" $ do
       let notifier :: TabCloseNotifier
           notifier r = modifyIORef' notifiedRef (r :)
           paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h notifier]
+          reg = mkRegistry [tabCommandSpec paths h notifier stubMint]
       (ref, caps) <- recordingCaps
       let sid = mkSid "close-notify"
       _ <- insertTabH h (BoundSession sid) KindAi Nothing
@@ -126,7 +153,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
       case parseSlash reg "/tab rename 0 work" of
@@ -143,7 +170,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       _ <- insertTabH h (BoundSession (mkSid "a")) KindProvider Nothing
       case parseSlash reg "/tab list" of
@@ -157,7 +184,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       let sid = mkSid "desc-session"
       saveSessionMeta paths (metaWithDescription sid (Just "My Custom Name"))
@@ -172,7 +199,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       let sid = mkSid "no-desc"
       saveSessionMeta paths (metaWithDescription sid Nothing)
@@ -189,7 +216,7 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       let sid = mkSid "both"
       saveSessionMeta paths (metaWithDescription sid (Just "Session Description"))
@@ -205,16 +232,66 @@ spec = describe "Seal.Command.Tab" $ do
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier, terseGrammarSpec]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint, terseGrammarSpec]
           help = renderHelpIndex reg
       T.unpack help `shouldContain` "/tab"
       T.unpack help `shouldContain` "N [payload]"
+
+  describe "/tab new mints a real session" $ do
+    it "mintTabSession labels the session 'web' and does not persist it" $
+      withSystemTempDirectory "seal-mint" $ \tmp -> do
+        let paths = dummyPaths tmp
+        backend <- Def.staticAgentDefBackend []
+        meta <- mintTabSession paths (pure (Right defaultRuntimeConfig)) backend
+        smChannel meta `shouldBe` "web"
+        -- The mint must not write session.json: the caller persists only
+        -- after the tab insert succeeds.
+        exists <- doesFileExist (sessionMetaPath paths (smId meta))
+        exists `shouldBe` False
+
+    it "binds a provider tab to a real session and persists it" $
+      withSystemTempDirectory "seal-tab-new" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab new" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("created" `T.isInfixOf`)
+        snap <- snapshotTabs h
+        case tlTabs snap of
+          [t] -> do
+            tKind t `shouldBe` KindProvider
+            tRef t `shouldBe` BoundSession (smId stubMeta)
+          _ -> expectationFailure "expected exactly one tab"
+        exists <- doesFileExist (sessionMetaPath paths (smId stubMeta))
+        exists `shouldBe` True
+
+    it "leaves no session.json behind when the tab list is full" $
+      withSystemTempDirectory "seal-tab-new-full" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+            pad3 n = let s = show (n :: Int)
+                     in T.pack (replicate (3 - length s) '0' <> s)
+            sids = [ mkSid (T.pack "20260719-120000-" <> pad3 n) | n <- [1 .. 36] ]
+        mapM_ (\s -> insertTabH h (BoundSession s) KindAi Nothing) sids
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab new" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("tab new failed" `T.isInfixOf`)
+        exists <- doesFileExist (sessionMetaPath paths (smId stubMeta))
+        exists `shouldBe` False
 
   it "/tab focus 0 (with a tab present) replies 'focused'" $
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
       let paths = dummyPaths tmp
-          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
       case parseSlash reg "/tab focus 0" of
@@ -222,6 +299,58 @@ spec = describe "Seal.Command.Tab" $ do
         other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
       sent <- readIORef ref
       sent `shouldSatisfy` any ("focused" `T.isInfixOf`)
+
+
+  describe "/tab registry parity (previously untested paths)" $ do
+    it "/tab resume <sid> replies 'tab N resumed' and binds the tab" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab resume resumed-session" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldBe` ["tab 0 resumed"]
+        snap <- snapshotTabs h
+        map tRef (tlTabs snap) `shouldBe` [BoundSession (mkSid "resumed-session")]
+
+    it "/tab close <out of range> replies 'close failed: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab close 5" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("close failed" `T.isInfixOf`)
+
+    it "/tab close --force <out of range> replies 'force close: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab close 5 --force" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("force close" `T.isInfixOf`)
+
+    it "/tab rename <out of range> replies 'rename failed: <e>'" $
+      withSystemTempDirectory "seal-tab" $ \tmp -> do
+        h <- newTabsHandle
+        let paths = dummyPaths tmp
+            reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
+        (ref, caps) <- recordingCaps
+        case parseSlash reg "/tab rename 5 nope" of
+          ParsedAction act -> runCommand act caps
+          other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+        sent <- readIORef ref
+        sent `shouldSatisfy` any ("rename failed" `T.isInfixOf`)
 
 -- ---------------------------------------------------------------------------
 -- Helpers

@@ -30,7 +30,9 @@ import Seal.Channels.Chat.Types qualified as ChatTypes
 import Seal.Channels.Chat.Signal as ChatSignal
   (withSignalChatChannel, mkRealSignalChatTransport)
 import Seal.Channels.Chat.Telegram as ChatTelegram
-  (withTelegramChatChannel, mkRealTelegramChatTransport)
+  (withTelegramChatChannel, mkRealTelegramChatTransport, tgSetCommandsViaApi)
+import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
+import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
 
 import Seal.Agent.Runtime.Registry (AgentRuntime)
@@ -562,6 +564,19 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
+      -- Register the bot's command menu (/help on Telegram shows it) from
+      -- the gateway's slash-command registry. Forked: the chat listeners are
+      -- started before 'runGateway' binds the HTTP port, so an immediate
+      -- fetch always races the bind — 'registerWithRetry' retries for ~10s.
+      -- Failure is non-fatal (the bot still works; the menu is stale).
+      void (forkIO (do
+        eRes <- registerWithRetry 10 1000000
+                  (ChatHttp.httpGetCommands mgr (ChatTypes.gcApiBase chatGwCfg))
+                  (tgSetCommandsViaApi mgr tokenText)
+        case eRes of
+          Right () -> pure ()
+          Left e   -> logIO logger WarningS
+                        ("telegram chat channel: command menu not registered: " <> ls e)))
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit

@@ -36,7 +36,15 @@ data ChatRoute
   | ChatPlain Text                     -- ^ plain text to the focused session
   | ChatTabCommand TabSlashCommand     -- ^ /tab <subcommand> …
   | ChatCurrentTab                     -- ^ bare /tab — show the current tab
+  | ChatTabList                        -- ^ /tab list — render the tab list
+                                       --   client-side (the gateway's own
+                                       --   rendering cannot show busy/idle
+                                       --   or a repo)
   | ChatNewSession Text                -- ^ /new [args] — the raw arg string
+  | ChatBackground Text                -- ^ /bg [prompt] — the raw prompt text
+                                       --   (empty for a bare @/bg@); runs the
+                                       --   prompt in a freshly minted headless
+                                       --   session, untracked as a tab
   | ChatSlash Text                     -- ^ other /commands (deferred to the HTTP API)
   deriving stock (Eq, Show)
 
@@ -47,6 +55,8 @@ data ChatRoute
 -- * @\/N payload@  -> 'ChatInject' N payload (sent without changing focus)
 -- * @\/tab@        -> 'ChatCurrentTab' (show the current tab)
 -- * @\/new [args]@ -> 'ChatNewSession' (the raw text after @/new @)
+-- * @\/bg [prompt]@-> 'ChatBackground' (the raw text after @/bg @; the first
+--                   word is matched case-insensitively)
 -- * @\/<other>…@   -> 'ChatSlash' (deferred to the HTTP API — the gateway
 --                   server routes slash commands for the web frontend)
 -- * anything else  -> 'ChatPlain'
@@ -66,12 +76,25 @@ route t
                     Right idx -> Right (focusOrInject idx after)
                | rest == "tab" ->
                   Right ChatCurrentTab
+               | isTabListCmd rest -> Right ChatTabList
                | rest == "new" || T.isPrefixOf "new " rest ->
                   Right (ChatNewSession (stripNewPrefix rest))
+               | T.toCaseFold (T.takeWhile (/= ' ') rest) == "bg" ->
+                  Right (ChatBackground (stripBgPrefix rest))
                | otherwise ->
                   Right (ChatSlash rest)
   where
     isTabChar c = isDigit c || isAsciiLower c
+
+-- | Is this the @\/tab list@ subcommand? Case-insensitive, and tolerant of
+-- surrounding / internal whitespace (the same forms the terse grammar accepts
+-- elsewhere). A trailing argument (@\/tab list foo@) is /not/ matched: it
+-- falls through to the gateway's registry parser, which reports the error.
+isTabListCmd :: Text -> Bool
+isTabListCmd rest =
+  case T.words (T.toCaseFold rest) of
+    ["tab", "list"] -> True
+    _               -> False
 
 -- | Extract the argument text from the @new@ prefix. @\"new\"@ yields
 -- @\"\"@; @\"new -p anthropic\"@ yields @\"-p anthropic\"@.
@@ -80,6 +103,13 @@ stripNewPrefix rest =
   if rest == "new"
     then ""
     else T.drop 1 (snd (T.breakOn " " rest))  -- everything after the first space
+
+-- | Extract the prompt text from the @bg@ prefix. @bg@ yields the empty
+-- text; @bg hi there@ yields @hi there@. The text is taken verbatim (no
+-- quote stripping, no whitespace collapsing) — only the first word is
+-- dropped.
+stripBgPrefix :: Text -> Text
+stripBgPrefix = stripNewPrefix  -- same shape: drop the first word + one space
 
 -- | Given a valid tab index + the text after it: if the rest is empty (or
 -- whitespace-only), it's a Focus; otherwise it's an Inject (the payload is

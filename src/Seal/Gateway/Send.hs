@@ -64,7 +64,7 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
 import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
-   TurnOutcome (..), runSessionTurn, sessionSkillBackend)
+   TurnOutcome (..), runSessionTurn, sessionSkillBackend, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -529,7 +529,9 @@ sendOutcomeJson = \case
 -- that is NOT 'SendError'), auto-tabs the session via
 -- 'ensureTabForSession' (W2 invariant 2). The 'TabCommand'/'Focus'/'Inject'
 -- routes return 'SendSlash' but no message was sent — they are explicitly
--- excluded from auto-tabbing.
+-- excluded from auto-tabbing. The auto-tab is gated on
+-- 'Seal.Core.TurnEngine.shouldAutoTab' exactly as the turn engine's own is, so
+-- a @\/bg@ session (@channel="bg"@) stays headless.
 handleSend :: SendDeps -> SessionId -> Text -> IO SendOutcome
 handleSend deps sid rawText = do
   mMeta <- loadSessionMeta (sdPaths deps) sid
@@ -552,7 +554,8 @@ handleSend deps sid rawText = do
             Left _   -> pure ()
             Right (Left _) -> pure ()
             Right (Right ()) -> do
-              ensureTabForSession (sdTabsHandle deps) KindProvider sid'
+              when (shouldAutoTab meta) $
+                ensureTabForSession (sdTabsHandle deps) KindProvider sid'
               triggerBroadcast deps))
         pure SendAssistant
       Right (SlashCommand cmdName) -> do
@@ -569,8 +572,10 @@ handleSend deps sid rawText = do
             -- auto-tabbing the request's session afterward would resurrect
             -- a tab that /tab close just removed. Skip the auto-tab for
             -- /tab; still broadcast so the frontend reflects any mutation.
+            -- A /bg session is headless: never auto-tab it either.
             unless (isTabCommand cmdName) $
-              ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+              when (shouldAutoTab meta) $
+                ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure r
       Right (NewSession _args) -> do
@@ -578,7 +583,8 @@ handleSend deps sid rawText = do
         case r of
           SendError _ _ -> pure r
           _            -> do
-            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            when (shouldAutoTab meta) $
+              ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure r
       Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)" Nothing)

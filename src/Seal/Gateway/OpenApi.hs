@@ -78,9 +78,11 @@ openApiMeta :: SealRoute caps qrys req resp
                      caps qrys req resp
 openApiMeta = \case
   RouteHealth -> api (match "health" ./ end) qend bodyless (resp (one openApiJsonBody)) M.get
+  RouteCommands -> api (match "commands" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteTabsList -> api (match "tabs" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteTabsNew -> api (match "tabs" ./ match "new" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteTabsClose -> api (match "tabs" ./ capture oaTabIndex ./ match "close" ./ end) qend bodyless (resp (one ffBody)) M.post
+  RouteTabsRename -> api (match "tabs" ./ capture oaTabIndex ./ match "rename" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteTabsDismiss -> api (match "tabs" ./ capture oaTabIndex ./ match "dismiss" ./ end) qend bodyless (resp (one ffBody)) M.post
   RouteTabsAcknowledge -> api (match "tabs" ./ capture oaTabIndex ./ match "acknowledge" ./ end) qend bodyless (resp (one ffBody)) M.post
   RouteTabsRelease -> api (match "tabs" ./ capture oaTabIndex ./ match "release" ./ end) qend bodyless (resp (one ffBody)) M.post

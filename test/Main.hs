@@ -97,6 +97,7 @@ import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
+import qualified Seal.Channels.Chat.TabRenderSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
@@ -104,6 +105,7 @@ import qualified Seal.Channels.Chat.WatchPersistSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
+import qualified Seal.Channels.Chat.TelegramCommandsSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
@@ -292,6 +294,7 @@ specs = do
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
+  Seal.Channels.Chat.TabRenderSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
@@ -299,6 +302,7 @@ specs = do
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
+  Seal.Channels.Chat.TelegramCommandsSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.ConvIndexSpec.spec
