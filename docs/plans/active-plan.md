@@ -2,7 +2,29 @@
 <!-- approved: 2026-10-26T14:40:00Z -->
 <!-- gate-iterations: 6 -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: completed -->
+<!-- completed: 2026-10-26 -->
+
+## Outcome
+
+All nine work units landed on `chat/bg-restore-279` (PR #283). Commits, oldest
+first:
+
+| WU | Commit | What landed |
+|---|---|---|
+| WU-1 | `0a193e2` | `NewArgs`/`parseNewArgs`/`renderNewSessionConfirmation` moved into `seal-gateway-types` |
+| WU-2 | `ec2516d` | `/tab new` mints a real session (registry + CLI) |
+| WU-3 | `047464a` | `/tab list` renders client-side from `GET /api/lists` |
+| WU-4 | `d9396cd` | `/tab resume` golden reply + registry coverage |
+| WU-5a | `cc0eef0` | REST: `tabs/:idx/rename` + tab resume (D1 reinstated) |
+| WU-6 | `da4f358` | gateway: `GET /api/commands`, `sessions/:id/new` body + `rebind_error` |
+| WU-7 | `eeb0807` | chat `/new`: args, one-mint rebind XOR mint, `-r`, golden line |
+| WU-5 | `72e61b7` | rebuild the WS connection when a conversation is re-targeted |
+| WU-8 | `7bc4c8c` | Telegram command menu from the slash registry |
+
+Final gate: `cabal build all` clean, **3296 examples / 0 failures / 42
+pending**, `hlint` clean for `src/`, `src-gateway-types/`, `test/` and
+`src-chat-channels/`.
 
 # Chat-channel slash-command parity (rev 9)
 
