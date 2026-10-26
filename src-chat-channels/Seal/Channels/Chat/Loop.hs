@@ -74,7 +74,8 @@ import Network.HTTP.Client (Manager)
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.HttpClient
   (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
-   SendResult (..), TabJson (..))
+   httpGetLists, SendResult (..), TabJson (..), ListsJson (..))
+import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
    shouldEdit, addCursor, stripCursor)
@@ -313,6 +314,9 @@ data ChatChannelConfig = ChatChannelConfig
     -- ^ The shared HTTP manager for gateway API calls.
   , cccNewSession :: Manager -> Text -> Value -> IO (Either Text Text)
     -- ^ @POST /api/sessions/new@. The seam the @/bg@ handler uses to mint
+  , cccGetLists :: Manager -> Text -> IO (Either Text ListsJson)
+    -- ^ @GET /api/lists@. The seam @/tab list@ uses to render rows; the
+    -- default is 'httpGetLists'.
     -- the headless session; the default is 'httpNewSession'.
   , cccSendMessage :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
     -- ^ @POST /api/sessions/:id/send@. The seam the @/bg@ handler uses to
@@ -338,6 +342,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccSendMessage = httpSend
   , cccStartWs = startWsClient
   , cccAnswerQuestion = httpAnswerQuestion
+  , cccGetLists = httpGetLists
   }
 
 -- | Debug log to stderr.
@@ -436,6 +441,7 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
         sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
+      Right ChatTabList -> handleTabList cfg chan
       Right (ChatPlain text) -> do
         -- A plain message answers a pending ask from one of this
         -- conversation's background sessions, if there is one. Checked
@@ -1648,3 +1654,21 @@ lastAssistantText entries =
 asText :: Value -> Maybe Text
 asText (A.String t) = Just t
 asText _ = Nothing
+
+-- | Handle @\/tab list@: render the tab list from @GET \/api\/lists@, one
+-- message per tab (@no tabs@ when empty), then report any fetch failure.
+--
+-- Rendered client-side rather than through the gateway's @\/send@ because the
+-- registry's @\/tab list@ cannot see the broker's thinking set (so no
+-- @busy@\/@idle@) and its format carries no repo.
+handleTabList :: ChatChannel c => ChatChannelConfig -> c -> IO ()
+handleTabList cfg chan = do
+  let mgr = cccHttpManager cfg
+      apiBase = gcApiBase (cccGateway cfg)
+  eLists <- cccGetLists cfg mgr apiBase
+  case eLists of
+    Left e -> ccSend chan ("tab list failed: " <> e)
+    Right lj ->
+      case tabListRows lj of
+        []   -> ccSend chan "no tabs"
+        rows -> mapM_ (ccSend chan . renderTabListRow) rows

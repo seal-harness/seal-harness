@@ -36,6 +36,10 @@ data ChatRoute
   | ChatPlain Text                     -- ^ plain text to the focused session
   | ChatTabCommand TabSlashCommand     -- ^ /tab <subcommand> …
   | ChatCurrentTab                     -- ^ bare /tab — show the current tab
+  | ChatTabList                        -- ^ /tab list — render the tab list
+                                       --   client-side (the gateway's own
+                                       --   rendering cannot show busy/idle
+                                       --   or a repo)
   | ChatNewSession Text                -- ^ /new [args] — the raw arg string
   | ChatBackground Text                -- ^ /bg [prompt] — the raw prompt text
                                        --   (empty for a bare @/bg@); runs the
@@ -72,6 +76,7 @@ route t
                     Right idx -> Right (focusOrInject idx after)
                | rest == "tab" ->
                   Right ChatCurrentTab
+               | isTabListCmd rest -> Right ChatTabList
                | rest == "new" || T.isPrefixOf "new " rest ->
                   Right (ChatNewSession (stripNewPrefix rest))
                | T.toCaseFold (T.takeWhile (/= ' ') rest) == "bg" ->
@@ -80,6 +85,16 @@ route t
                   Right (ChatSlash rest)
   where
     isTabChar c = isDigit c || isAsciiLower c
+
+-- | Is this the @\/tab list@ subcommand? Case-insensitive, and tolerant of
+-- surrounding / internal whitespace (the same forms the terse grammar accepts
+-- elsewhere). A trailing argument (@\/tab list foo@) is /not/ matched: it
+-- falls through to the gateway's registry parser, which reports the error.
+isTabListCmd :: Text -> Bool
+isTabListCmd rest =
+  case T.words (T.toCaseFold rest) of
+    ["tab", "list"] -> True
+    _               -> False
 
 -- | Extract the argument text from the @new@ prefix. @\"new\"@ yields
 -- @\"\"@; @\"new -p anthropic\"@ yields @\"-p anthropic\"@.

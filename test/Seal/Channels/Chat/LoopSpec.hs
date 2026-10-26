@@ -22,7 +22,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, ex
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Loop
-import Seal.Channels.Chat.HttpClient (SendResult (..))
+import Seal.Channels.Chat.HttpClient (ListsJson (..), SendResult (..), TabJson (..))
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
@@ -1903,3 +1903,66 @@ spec = do
       fire (SeActivity bgSid1 (statusJson "idle"))
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+  describe "/tab list (client-side renderer)" $ do
+    it "sends one D5-formatted message per tab" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      let rows =
+            [ TabJson 0 (Just "s1") "session:ai" (Just "first") Nothing
+            , TabJson 1 (Just "s2") "session:ai" Nothing Nothing
+            ]
+          lists = ListsJson
+            { ljTabs = rows
+            , ljTabSessions = [A.object [ "id" .= ("s2" :: Text), "description" .= ("second" :: Text) ]]
+            , ljThinkingSessionIds = ["s1"]
+            }
+          cfg = (stubCfg mgr seams) { cccGetLists = \_ _ -> pure (Right lists) }
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let key = ConversationKey "signal" "tablist-conv"
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs key "/tab list"
+      sends <- getSends chan
+      sends `shouldBe` ["0 busy: first", "1 idle: second"]
+
+    it "replies 'no tabs' when the list is empty" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      let cfg = (stubCfg mgr seams)
+                  { cccGetLists = \_ _ -> pure (Right (ListsJson [] [] [])) }
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let key = ConversationKey "signal" "tablist-empty"
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs key "/tab list"
+      sends <- getSends chan
+      sends `shouldBe` ["no tabs"]
+
+    it "replies 'tab list failed: <e>' when the fetch fails" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      let cfg = (stubCfg mgr seams)
+                  { cccGetLists = \_ _ -> pure (Left "boom") }
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let key = ConversationKey "signal" "tablist-fail"
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs key "/tab list"
+      sends <- getSends chan
+      sends `shouldBe` ["tab list failed: boom"]

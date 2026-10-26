@@ -80,6 +80,7 @@ library seal-chat-channels
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
         Seal.Channels.Chat.ToolRender
+        Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
     build-depends:
@@ -486,6 +487,7 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
+        Seal.Channels.Chat.TabRenderSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
