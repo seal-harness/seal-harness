@@ -1,46 +1,36 @@
 # Execution State
-<!-- updated: 2026-10-23 (merge of main into fix/session-self-read-guard) -->
+<!-- updated: 2026-10-26 -->
 
-> **Work streams in this repo.** Two streams are recorded here: the session
-> read hardening branch (this branch — COMPLETE) and the sub-agent
-> completion delivery stream (merged from main; handoff at
-> `docs/handoffs/handoff-2026-10-22-subagent-completion-delivery.md`).
+Plan: `docs/plans/active-plan.md` (rev 9 of `docs/superpowers/plans/2026-10-26-chat-slash-command-parity-plan.md`)
 
-## Session read hardening (this branch — COMPLETE, merged with main)
+## Current Position
+- Active work unit: none (checkpoint between WU-4 and WU-5)
+- Current phase: —
+- Retry count: 0
 
-- Plan: `docs/plans/session-read-hardening-plan.md` (gate: 3/3 PASS)
-- Branch: `fix/session-self-read-guard`
-- Learnings: `docs/plans/session-read-hardening-learnings.md`
+## Work Unit Status
+| WU | Title | Status | Commit | Notes |
+|----|-------|--------|--------|-------|
+| WU-1 | Shared NewArgs + renderNewSessionConfirmation in seal-gateway-types | DONE | `0a193e2` | NewSpec unchanged, +2 pins |
+| WU-2 | /tab new mints a real session (registry + CLI) | DONE | `ec2516d` | no `tab-session` remains |
+| WU-3 | /tab list renders client-side in D5 format | DONE | `047464a` | new TabRender module |
+| WU-4 | /tab resume golden reply + registry coverage | DONE | `d9396cd` | |
+| WU-5 | Stale WS filter (recreate conn on sid change) | PENDING | — | RISKY: core delivery path |
+| WU-6 | Gateway: sessions/:id/new body+rebind_error, GET /api/commands | PENDING | — | |
+| WU-7 | Chat /new: args, rebind XOR mint, -r, golden line | PENDING | — | needs WU-5 + WU-6 |
+| WU-8 | Telegram command menu + registerWithRetry | PENDING | — | |
+| WU-9 | Docs + full gate | PENDING | — | |
 
-| WU | Title | Status |
-|----|-------|--------|
-| pre-plan | Self-read refusal + search self-exclusion | COMPLETE (13b8501) |
-| WU1 | Byte-bounded reads + conversation.idx windowing | COMPLETE (cd005e0) |
-| WU2 | Read-path secret redaction | COMPLETE (bba7b90) |
-| WU3 | smParent + baked-lineage guard + search caps | COMPLETE (7cd342c) |
-| WU4 | Repeat detection (warn ≥2 / block ≥4 / window 16) | COMPLETE (0173564) |
-| WU5 | around_index anchor windowing | COMPLETE (226016f) |
-| final | Dead aswParentLineage cleanup + learnings | COMPLETE (76f10af, 0704e76) |
+## Gate status at this checkpoint
+- `cabal build all` clean
+- `cabal test`: **3241 examples, 0 failures, 42 pending** (baseline was 3212/0/42)
+- `hlint src/ test/` and `hlint src-chat-channels/`: No hints
 
-Final comprehensive review: PASS (all 10 cross-unit checks).
-PR creation intentionally deferred per maintainer.
+## Ordering note for resuming
+The plan sequences WU-5 (WS fix) before WU-6/WU-7, but WU-5 has no user-visible
+effect until WU-7 lands (nothing but `/new` changes the focused sid). Suggested
+resume order: WU-6 → WU-7 → WU-5 → WU-8 → WU-9, so the WS fix can be validated
+against a working `/new`.
 
-## Sub-agent completion delivery (from main)
-
-- Plan: `docs/plans/2026-10-22-subagent-completion-delivery-fix-plan.md`
-  (gate: 3/3 PASS)
-- Handoff: `docs/handoffs/handoff-2026-10-22-subagent-completion-delivery.md`
-- Branch: `fix/subagent-completion-delivery-diagnostics` · PR #279
-
-| WU | Title | Status |
-|----|-------|--------|
-| WU-1 | Reproduce the bug with a failing test | COMPLETE — R1/R2/R3 fail deterministically (20 runs) |
-| WU-2 | Record the completion handoff durably | COMPLETE — R1/R2 pass |
-| WU-3 | Deliver completions that arrive during a turn | COMPLETE (f05b5e3; adversarial review PASS) |
-| WU-4 | Wake-path hygiene (mutex leak, skip warning, pending count) | COMPLETE (532504c; adversarial review PASS) |
-| WU-5 | Final review, tracking items, self-reflect, PR | NOT STARTED |
-
-Session note (2026-10-23): `Seal.Agent.Runtime.Registry > agentStatus >
-records Crashed when the worker throws` flaked once under full-suite load
-(its poll is capped at ~2s and its own comment documents the history).
-Unrelated to either work stream — tracking item for a load-tolerant wait.
+## Blocked / Escalated
+None.
