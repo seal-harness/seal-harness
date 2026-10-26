@@ -135,13 +135,17 @@ spec = do
 
     it "returns the last error once the attempts are exhausted" $ do
       calls <- newIORef (0 :: Int)
+      registrations <- newIORef (0 :: Int)
       let fetch = do
             modifyIORef' calls (+ 1)
             pure (Left "connection refused")
-          register _ = pure (Right ())
+          register _ = modifyIORef' registrations (+ 1) >> pure (Right ())
       res <- registerWithRetry 3 0 fetch register
       res `shouldBe` Left "connection refused"
       readIORef calls `shouldReturn` 3
+      -- A failed fetch never reaches the register step (an empty menu would
+      -- otherwise be registered, wiping the bot's menu).
+      readIORef registrations `shouldReturn` 0
 
     it "treats a non-positive attempt count as one attempt" $ do
       calls <- newIORef (0 :: Int)
