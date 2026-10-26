@@ -7,10 +7,11 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (catch)
 import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -34,6 +35,7 @@ import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
 import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
 
+import Seal.Agent.Runtime.Registry (AgentRuntime)
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Cursor
   ( newPersistingCursorStore, seedCursorStore )
@@ -48,6 +50,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
+import Seal.Command.Shutdown (handleServeInterrupt)
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
@@ -96,8 +99,22 @@ import Seal.Web.UiState (newUiStateHandle)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
+--
+-- Ctrl-C is handled here: SIGINT reaches the RTS as a 'UserInterrupt' on the
+-- main thread, which 'handleServeInterrupt' turns into a shutdown log line
+-- naming the live sub-agents (whose forked threads die with this process)
+-- followed by exit 130.
 runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
 runServeMain autonomy mCliStaticDir logger = do
+  -- Filled in once the backends exist; 'Nothing' means an interrupt landed
+  -- during startup, before there was a runtime to report on.
+  runtimeRef <- newIORef Nothing
+  runServeMainInner autonomy mCliStaticDir logger runtimeRef
+    `catch` handleServeInterrupt logger runtimeRef
+
+runServeMainInner
+  :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
+runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
@@ -143,6 +160,10 @@ runServeMain autonomy mCliStaticDir logger = do
   let repo = openConfigRepo cfgRoot
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
   backends <- newBackends paths repo embedding
+  -- Publish the sub-agent runtime so an interrupt during the gateway run can
+  -- log exactly which children are being taken down with the process
+  -- ('Seal.Command.Shutdown').
+  writeIORef runtimeRef (Just (bRuntime backends))
   wakeMutex <- newSessionWakeMutex
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for

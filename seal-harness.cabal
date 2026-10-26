@@ -162,6 +162,7 @@ library
         Seal.Command.Provider
         Seal.Command.Session
         Seal.Command.Serve
+        Seal.Command.Shutdown
         Seal.Command.Skill
         Seal.Command.Stop
         Seal.Command.Repo
@@ -505,6 +506,7 @@ test-suite tests
         Seal.Command.ProviderSpec
         Seal.Command.SessionSpec
         Seal.Command.ServeSpec
+        Seal.Command.ShutdownSpec
         Seal.Command.SkillSpec
         Seal.Command.RepoSpec
         Seal.Command.AgentSpec
