@@ -5,6 +5,8 @@ module Seal.Channels.Chat.Loop
   ( runChatChannel
   , ChatChannelConfig (..)
   , defaultChatChannelConfig
+    -- * WS connections (for testing)
+  , WsConn
     -- * Event handlers (for testing)
   , handleInbound
   , handleFocus
@@ -308,6 +310,16 @@ dropPendingAsks :: PendingAsks -> SessionId -> IO ()
 dropPendingAsks pendingAsks sid =
   atomically (modifyTVar' (paStore pendingAsks) (Map.delete sid))
 
+-- | A conversation's WS connection: the session its callback was built for,
+-- the client, and the streaming state.
+--
+-- The bound session is part of the value because 'handleServerEvent' closes
+-- over the focused session **by value**: a connection built for session A
+-- keeps filtering for A however many FocusOps arrive. Re-targeting a
+-- conversation therefore requires closing the connection and rebuilding it
+-- (see 'ensureWsConn').
+type WsConn = (SessionId, WsClient, StreamingState)
+
 -- | Configuration for the generic loop.
 data ChatChannelConfig = ChatChannelConfig
   { cccGateway     :: GatewayConfig
@@ -375,7 +387,7 @@ runChatChannel :: ChatChannel c => ChatChannelConfig -> c -> WatchState -> IO ()
 runChatChannel cfg chan watchState = do
   sessions <- newSessionMap
   -- Map of conversation keys to their WS client + streaming state.
-  wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+  wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
   pendingAsks <- newPendingAsks
   tabTracker <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))
   thinkingTabs <- newThinkingTabs
@@ -403,7 +415,7 @@ runChatChannel cfg chan watchState = do
 handleInbound
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
   -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
@@ -477,7 +489,7 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
 handleFocus
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
   -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
@@ -710,10 +722,17 @@ handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered ev =
 -- | Ensure a WS connection exists for the conversation. If one exists,
 -- send a FocusOp to change focus. If not, start a new WS connection with
 -- the streaming event handler and send a FocusOp.
+--
+-- A connection is only reusable for the session it was built for.
+-- 'handleServerEvent' closes over the focused session **by value**, so a
+-- FocusOp cannot re-target the filter: an existing connection focused on
+-- session A keeps dropping session B's entries and asks. Re-targeting
+-- therefore closes the old connection and builds a new one whose callback
+-- is bound to the new session.
 ensureWsConn
   :: ChatChannel c
   => ChatChannelConfig -> c
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
   -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
@@ -722,20 +741,33 @@ ensureWsConn
   -> ConversationKey -> SessionId
   -> IO ()
 ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid = do
-  let gwCfg = cccGateway cfg
   conns <- readTVarIO wsConns
   dbg ("[watch] ensureWsConn key=" <> ckConv key <> " hasConn=" <> (case Map.lookup key conns of Just _ -> "true"; Nothing -> "false"))
   case Map.lookup key conns of
-    Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
+    Just (boundSid, ws, _)
+      | boundSid == sid -> wcFocus ws sid  -- already connected; just change focus
+      -- Re-target: the callback closed over 'boundSid' by value, so a
+      -- FocusOp alone would leave this conversation deaf to 'sid'.
+      | otherwise -> do
+          dbg ("[watch] ensureWsConn re-target " <> sessionIdText boundSid
+               <> " -> " <> sessionIdText sid)
+          wcClose ws
+          atomically (modifyTVar' wsConns (Map.delete key))
+          connectWs
     Nothing -> do
-      -- Start a new WS connection with the streaming event handler.
-      let callback = handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs sid
+      connectWs
+  where
+    -- Start a new WS connection whose event handler is bound to 'sid'.
+    connectWs = do
+      let gwCfg = cccGateway cfg
+          callback = handleServerEvent cfg chan key wsConns pendingAsks
+            bgSessions tabTracker watchState thinkingTabs sid
       eWs <- cccStartWs cfg (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
         Left e -> dbg ("[watch] WS connect FAILED: " <> e)
         Right ws -> do
           ss <- newStreamingState
-          atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
+          atomically (modifyTVar' wsConns (Map.insert key (sid, ws, ss)))
           wcFocus ws sid
 
 -- | The WS event handler: processes streaming events for one conversation.
@@ -744,7 +776,7 @@ ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState think
 handleServerEvent
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
   -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
@@ -787,13 +819,13 @@ handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchSt
 -- | Run an action with the conversation's streaming state, if it has a WS
 -- connection (and therefore a state) at all.
 withStreamingState
-  :: TVar (Map ConversationKey (WsClient, StreamingState))
+  :: TVar (Map ConversationKey WsConn)
   -> ConversationKey
   -> (StreamingState -> IO ())
   -> IO ()
 withStreamingState wsConns key act = do
   conns <- readTVarIO wsConns
-  for_ (Map.lookup key conns) (\(_, ss) -> act ss)
+  for_ (Map.lookup key conns) (\(_, _, ss) -> act ss)
 
 -- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
 -- or @/watch on@ / @/watch off@ / @/watch status@ / @/watch -h@). Pure.
@@ -1194,7 +1226,7 @@ handleAsk _cfg chan _key pendingAsks sid val = do
 -- session (creating one if it doesn't exist yet).
 sendPlain
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
@@ -1213,7 +1245,7 @@ sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState
 -- | Send a slash command via the HTTP API.
 sendSlash
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
@@ -1247,7 +1279,7 @@ data NewOutcome = NewOutcome
 -- confirmation.
 handleNewSession
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
@@ -1340,7 +1372,7 @@ lookupRepoUrl rid repos = listToMaybe
 -- | Resolve the conversation's session. If the conversation has no session
 -- yet, create one via the HTTP API.
 resolveSession
-  :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
+  :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey

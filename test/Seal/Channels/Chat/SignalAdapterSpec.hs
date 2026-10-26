@@ -199,7 +199,7 @@ spec = do
               , wcClose = pure ()
               }
         ss <- newStreamingState
-        conns <- newTVarIO (Map.singleton key (stubWs, ss))
+        conns <- newTVarIO (Map.singleton key (mkSid "stream", stubWs, ss))
         -- Fire 40 entry-updates back-to-back. Frame 1 carries 79 chars
         -- (creates the bubble); each subsequent frame adds 5 chars, so
         -- the TOTAL crosses 80 at frame 2 — but the NEW text per frame is

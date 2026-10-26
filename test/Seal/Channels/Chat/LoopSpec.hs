@@ -27,7 +27,6 @@ import Seal.Channels.Chat.HttpClient
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
-  , StreamingState
   , ConversationKey (..)
   , newSessionMap
   , newStreamingState
@@ -378,7 +377,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -416,7 +415,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -454,7 +453,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -600,7 +599,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -620,7 +619,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -639,7 +638,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -712,7 +711,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -727,7 +726,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -745,7 +744,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -884,7 +883,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -909,7 +908,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -932,7 +931,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -954,7 +953,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -978,7 +977,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1005,7 +1004,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1038,7 +1037,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1139,7 +1138,7 @@ spec = do
       sessionInsert sessions bgKey convSid
       ss <- newStreamingState
       convRec <- mkWsRecorder
-      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      wsConns <- newTVarIO (Map.singleton bgKey (convSid, recorderClient convRec, ss))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -1524,7 +1523,7 @@ spec = do
       sessionInsert sessions bgKey convSid
       ss <- newStreamingState
       convRec <- mkWsRecorder
-      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      wsConns <- newTVarIO (Map.singleton bgKey (convSid, recorderClient convRec, ss))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -1751,7 +1750,7 @@ spec = do
       sessionInsert sessions bgKey convSid
       ss <- newStreamingState
       convRec <- mkWsRecorder
-      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      wsConns <- newTVarIO (Map.singleton bgKey (convSid, recorderClient convRec, ss))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -1929,7 +1928,7 @@ spec = do
       sessionInsert sessions bgKey convSid
       ss <- newStreamingState
       convRec <- mkWsRecorder
-      wsConns <- newTVarIO (Map.singleton bgKey (recorderClient convRec, ss))
+      wsConns <- newTVarIO (Map.singleton bgKey (convSid, recorderClient convRec, ss))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -1971,7 +1970,7 @@ spec = do
             }
           cfg = (stubCfg mgr seams) { cccGetLists = \_ _ -> pure (Right lists) }
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -1989,7 +1988,7 @@ spec = do
       let cfg = (stubCfg mgr seams)
                   { cccGetLists = \_ _ -> pure (Right (ListsJson [] [] [])) }
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -2007,7 +2006,7 @@ spec = do
       let cfg = (stubCfg mgr seams)
                   { cccGetLists = \_ _ -> pure (Left "boom") }
       sessions <- newSessionMap
-      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
       pendingAsks <- newPendingAsks
       bg <- newBgSessions
       tabTracker <- newTVarIO Map.empty
@@ -2209,3 +2208,55 @@ spec = do
         [ "warning: /new tab rebind failed: no tab"
         , "repo setup failed: clone failed: denied"
         , confirmNew ]
+
+  -- ── WU-5: a /new re-target must rebuild the WS connection ─────────────
+  --
+  -- 'handleServerEvent' closes over the focused session BY VALUE, so a
+  -- FocusOp cannot re-target an existing connection's filter: after /new
+  -- the old connection keeps dropping the new session's entries and asks.
+  -- Asserting "a focus was recorded on the new sid" would pass while the
+  -- bug persists — the pin must be a SECOND connect + a close of the old
+  -- client + delivery through the NEW callback.
+  describe "/new WS re-target (WU-5)" $ do
+    it "rebuilds the conversation's WS connection when /new switches session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      let key = ConversationKey "signal" "conn-retarget"
+          sidA = mkSid "sid-a"
+          sidB = mkSid "sid-b"
+      queueRebinds seams [Right (rebindOk "sid-b" "p" "m")]
+      sessions <- newSessionMap
+      -- The conversation is already focused on sid A, with a live connection
+      -- whose callback was built for A.
+      sessionInsert sessions key sidA
+      ss <- newStreamingState
+      recA <- mkWsRecorder
+      wsConns <- newTVarIO (Map.singleton key (sidA, recorderClient recA, ss))
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          run = handleInbound cfg chan sessions wsConns pendingAsks bg
+                  tabTracker watchState thinkingTabs key
+      -- /new switches the conversation to sid B.
+      run "/new"
+      recs <- getRecorders seams
+      cbs <- getCallbacks seams
+      -- A SECOND connect (the old one could not be re-targeted) ...
+      length cbs `shouldBe` 1
+      case (recs, cbs) of
+        ([recB], [cbB]) -> do
+          -- ... the old client was closed ...
+          getCloses recA `shouldReturn` 1
+          -- ... and the new connection is focused on the new session.
+          getFocused recB `shouldReturn` [sidB]
+          -- The pin that matters: an entry for B dispatched through the NEW
+          -- callback reaches the platform (it is no longer filtered out by a
+          -- callback closed over A).
+          cbB (SeEntry sidB (bgReplyJson "reply on B"))
+          sent <- getAllSent chan
+          sent `shouldSatisfy` any (T.isInfixOf "reply on B")
+        _ -> expectationFailure "expected exactly one new WS connection"
