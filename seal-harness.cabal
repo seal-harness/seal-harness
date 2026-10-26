@@ -83,6 +83,7 @@ library seal-chat-channels
         Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
+        Seal.Channels.Chat.TelegramCommands
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -497,6 +498,7 @@ test-suite tests
         Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
+        Seal.Channels.Chat.TelegramCommandsSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec

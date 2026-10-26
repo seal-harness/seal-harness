@@ -27,6 +27,9 @@ module Seal.Channels.Chat.HttpClient
   , httpGetTranscript
   , httpStopSession
   , httpGetLists
+    -- * Slash-command registry
+  , httpGetCommands
+  , CommandJson (..)
     -- * Questions (ASK_HUMAN)
   , httpAnswerQuestion
   , answerBodyJson
@@ -130,6 +133,33 @@ httpGetLists mgr apiBase = do
   doRequest mgr url methodGet Nothing >>= \case
     Left e -> pure (Left e)
     Right body -> pure (parseListsBody body)
+
+-- | One entry of the gateway's slash-command menu: the canonical command name
+-- (no leading slash, aliases are never listed) and its one-line synopsis.
+data CommandJson = CommandJson
+  { cjName     :: Text
+  , cjSynopsis :: Text
+  } deriving stock (Eq, Show)
+
+-- | @GET /api/commands@ — the slash-command menu the chat channels render as
+-- @\/help@ (and register as the platform's command menu). Malformed entries
+-- are skipped rather than failing the whole list.
+httpGetCommands :: Manager -> Text -> IO (Either Text [CommandJson])
+httpGetCommands mgr apiBase = do
+  let url = T.unpack apiBase <> "/commands"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> case A.decode body :: Maybe [Value] of
+      Just vs -> pure (Right (mapMaybe parseCommandJson vs))
+      Nothing -> pure (Left "failed to parse commands JSON array")
+
+-- | Parse one @\/api\/commands@ entry.
+parseCommandJson :: Value -> Maybe CommandJson
+parseCommandJson (A.Object o) = do
+  n <- asText =<< KeyMap.lookup (Key.fromText "name") o
+  let syn = fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "synopsis") o)
+  pure (CommandJson n syn)
+parseCommandJson _ = Nothing
 
 -- | @POST /api/sessions/new@ — create a new session.
 httpNewSession :: Manager -> Text -> Value -> IO (Either Text Text)

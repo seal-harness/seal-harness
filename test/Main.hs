@@ -104,6 +104,7 @@ import qualified Seal.Channels.Chat.WatchPersistSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
+import qualified Seal.Channels.Chat.TelegramCommandsSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
@@ -299,6 +300,7 @@ specs = do
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
+  Seal.Channels.Chat.TelegramCommandsSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.ConvIndexSpec.spec
