@@ -82,6 +82,24 @@ sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 1) 0
 
 mkSid :: String -> SessionId
+-- | A deterministic mint for @/tab new@: a valid 'SessionMeta' the mint does
+-- not itself persist.
+stubMint :: IO SessionMeta
+stubMint = pure SessionMeta
+  { smId = mkSid "20260719-120000-001"
+  , smProvider = "ollama"
+  , smModel = "llama3.2"
+  , smChannel = "web"
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = Nothing
+  , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
+  , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
+  }
+
 mkSid s = case mkSessionId (T.pack s) of
   Right x -> x
   Left _  -> error ("bad sid: " <> s)
@@ -460,7 +478,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier stubMint] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
         outcome <- handleSend sendDeps sid "/tab list"
@@ -553,7 +571,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier stubMint] }
             sid = mkSid "20260701-120000-108"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
