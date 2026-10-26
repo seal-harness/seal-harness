@@ -61,7 +61,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -74,7 +74,9 @@ import Network.HTTP.Client (Manager)
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.HttpClient
   (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
-   httpGetLists, SendResult (..), TabJson (..), ListsJson (..))
+   httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos,
+   rebindBody, mintBody, setupRepoBody,
+   SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..))
 import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
@@ -96,6 +98,8 @@ import Seal.Gateway.Types.Core
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 import Seal.Gateway.Types.MessageSource (MessageSource)
 import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToChar)
+import Seal.Gateway.Types.NewArgs
+  (NewArgs (..), parseNewArgs, renderNewSessionConfirmation)
 
 -- | A pending ASK_HUMAN question tracked by the loop: the ask id text +
 -- the offered options (so the callback handler can resolve a button index
@@ -318,6 +322,18 @@ data ChatChannelConfig = ChatChannelConfig
     -- ^ @GET /api/lists@. The seam @/tab list@ uses to render rows; the
     -- default is 'httpGetLists'.
     -- the headless session; the default is 'httpNewSession'.
+  , cccRebindNew :: Manager -> Text -> SessionId -> Value -> IO (Either Text NewSessionResult)
+    -- ^ @POST /api/sessions/:id/new@ — mint a fresh session and rebind the
+    -- tab bound to the given session, in ONE call. This is the seam @/new@
+    -- uses when the conversation already has a session; the default is
+    -- 'httpRebindNew'. Calling this *and* 'cccNewSession' would mint two
+    -- sessions.
+  , cccSetupRepo :: Manager -> Text -> SessionId -> Value -> IO (Either Text ())
+    -- ^ @POST /api/sessions/:id/setup-repo@. The seam @/new -r@ uses to clone
+    -- the repo into the NEW session's workdir; the default is 'httpSetupRepo'.
+  , cccGetRepos :: Manager -> Text -> IO (Either Text [Value])
+    -- ^ @GET /api/repos@. The seam @/new -r@ uses to resolve a registered
+    -- repo id to its URL; the default is 'httpGetRepos'.
   , cccSendMessage :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
     -- ^ @POST /api/sessions/:id/send@. The seam the @/bg@ handler uses to
     -- deliver the prompt; the default is 'httpSend'.
@@ -339,6 +355,9 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccStreamCfg = defaultStreamProgressConfig
   , cccHttpManager = mgr
   , cccNewSession = httpNewSession
+  , cccRebindNew = httpRebindNew
+  , cccSetupRepo = httpSetupRepo
+  , cccGetRepos = httpGetRepos
   , cccSendMessage = httpSend
   , cccStartWs = startWsClient
   , cccAnswerQuestion = httpAnswerQuestion
@@ -711,7 +730,7 @@ ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState think
     Nothing -> do
       -- Start a new WS connection with the streaming event handler.
       let callback = handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs sid
-      eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
+      eWs <- cccStartWs cfg (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
         Left e -> dbg ("[watch] WS connect FAILED: " <> e)
         Right ws -> do
@@ -1201,7 +1220,31 @@ sendSlash
   -> IO ()
 sendSlash = sendPlain  -- same mechanism; the gateway routes slash commands
 
--- | Handle /new: create a new session via HTTP, update the session map.
+-- | What a successful @/new@ produced, in the shape the reply needs.
+data NewOutcome = NewOutcome
+  { noSid         :: Text
+  , noRebindError :: Maybe Text
+  , noOldSid      :: Maybe Text
+  , noProvider    :: Maybe Text
+  , noModel       :: Maybe Text
+  }
+
+-- | Handle /new: mint a fresh session and make it the conversation's
+-- focused session.
+--
+-- Exactly ONE mint happens per @/new@:
+--
+--   * the conversation already has a session ⇒ @POST \/api\/sessions\/:id\/new@
+--     ('cccRebindNew'), which mints AND rebinds the tab in one call;
+--   * no prior session ⇒ @POST \/api\/sessions\/new@ ('cccNewSession').
+--
+-- Minting on both paths would create two sessions and reproduce the exact
+-- orphan-session bug this work exists to fix.
+--
+-- The arguments are the CLI's (@-p\/--provider@, @-m\/--model@,
+-- @-r\/--repo@), parsed by the shared 'parseNewArgs' so chat and CLI accept
+-- the same flags. Message order: rebind warning, then repo failure, then the
+-- confirmation.
 handleNewSession
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
@@ -1209,19 +1252,90 @@ handleNewSession
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key _args = do
+handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key args = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eSid <- httpNewSession mgr apiBase (A.object [])
-  case eSid of
+      na = parseNewArgs args
+  mPrior <- sessionLookup sessions key
+  eOutcome <- case mPrior of
+    Just oldSid -> do
+      -- Absent provider/model inherit the old session's (the gateway applies
+      -- that); the channel is this channel's label, so the new session stays
+      -- attributable to the medium it was created from.
+      eRes <- cccRebindNew cfg mgr apiBase oldSid
+        (rebindBody (naProvider na) (naModel na) (Just (ccLabel chan)))
+      pure $ fmap (\res -> NewOutcome
+        { noSid         = nsrSessionId res
+        , noRebindError = nsrRebindError res
+        , noOldSid      = Just (sessionIdText oldSid)
+        , noProvider    = Just (nsrProvider res)
+        , noModel       = Just (nsrModel res)
+        }) eRes
+    Nothing -> do
+      eSid <- cccNewSession cfg mgr apiBase (mintBody (naProvider na) (naModel na))
+      pure $ fmap (\sidText -> NewOutcome
+        { noSid         = sidText
+        , noRebindError = Nothing
+        , noOldSid      = Nothing
+        , noProvider    = Nothing
+        , noModel       = Nothing
+        }) eSid
+  case eOutcome of
     Left e -> ccSend chan ("new session failed: " <> e)
-    Right sidText -> case mkSessionId sidText of
+    Right out -> case mkSessionId (noSid out) of
       Left _ -> ccSend chan "new session failed: invalid session id"
       Right sid -> do
         sessionInsert sessions key sid
-        -- Ensure a WS connection exists for this conversation.
+        -- Re-target the conversation's WS connection on BOTH paths: without
+        -- this the new session's replies and asks are filtered out (WU-5).
         ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid
-        ccSend chan ("new session " <> sessionIdText sid)
+        -- A rebind failure is a warning, not a failure: the session exists.
+        for_ (noRebindError out) $ \e ->
+          ccSend chan ("warning: /new tab rebind failed: " <> e)
+        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na)
+        for_ mRepoErr $ \e -> ccSend chan ("repo setup failed: " <> e)
+        ccSend chan (newConfirmation out)
+
+-- | The @/new@ confirmation line: the shared renderer names the old session
+-- and the resume hint when there was one; a first @/new@ has nothing to name.
+newConfirmation :: NewOutcome -> Text
+newConfirmation out = case (noOldSid out, noProvider out, noModel out) of
+  (Just oldSid, Just prov, Just model) ->
+    renderNewSessionConfirmation (noSid out) prov model oldSid
+  _ -> "new session " <> noSid out
+
+-- | Run @-r@ after a successful @/new@: resolve a registered repo id to its
+-- URL, then dispatch SETUP_REPO on the NEW session. 'Nothing' when no @-r@
+-- was given or the clone succeeded (success is silent).
+setupRepoFor
+  :: ChatChannelConfig -> Manager -> Text -> SessionId -> Maybe Text
+  -> IO (Maybe Text)
+setupRepoFor cfg mgr apiBase sid mRepo = case mRepo of
+  Nothing  -> pure Nothing
+  Just raw -> do
+    url <- resolveRepoArg cfg mgr apiBase raw
+    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url)
+    pure (either Just (const Nothing) eRes)
+
+-- | Resolve a @-r@ value to a git URL: an exact match on a registered repo id
+-- (after trimming) resolves to that repo's @url@; anything else — and a
+-- failed @GET \/api\/repos@ — is used verbatim (never an error).
+resolveRepoArg :: ChatChannelConfig -> Manager -> Text -> Text -> IO Text
+resolveRepoArg cfg mgr apiBase raw = do
+  eRepos <- cccGetRepos cfg mgr apiBase
+  pure $ case eRepos of
+    Right repos | Just url <- lookupRepoUrl (T.strip raw) repos -> url
+    _ -> raw
+
+-- | Find a registered repo's URL by exact id match.
+lookupRepoUrl :: Text -> [Value] -> Maybe Text
+lookupRepoUrl rid repos = listToMaybe
+  [ url
+  | A.Object o <- repos
+  , Just (A.String i) <- [KeyMap.lookup (Key.fromText "id") o]
+  , i == rid
+  , Just (A.String url) <- [KeyMap.lookup (Key.fromText "url") o]
+  ]
 
 -- | Resolve the conversation's session. If the conversation has no session
 -- yet, create one via the HTTP API.

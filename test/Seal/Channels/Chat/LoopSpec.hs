@@ -22,7 +22,8 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, ex
 
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.Loop
-import Seal.Channels.Chat.HttpClient (ListsJson (..), SendResult (..), TabJson (..))
+import Seal.Channels.Chat.HttpClient
+  ( ListsJson (..), NewSessionResult (..), SendResult (..), TabJson (..) )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
@@ -182,6 +183,10 @@ getCloses = readIORef . wrCloses
 data Seams = Seams
   { smMints     :: IORef [A.Value]
     -- ^ Bodies passed to the mint seam, in call order.
+  , smRebinds   :: IORef [(SessionId, A.Value)]
+    -- ^ (old session, body) pairs passed to the rebind seam, in call order.
+  , smRepoSetups :: IORef [(SessionId, A.Value)]
+    -- ^ (session, body) pairs passed to the setup-repo seam, in call order.
   , smSends     :: IORef [(SessionId, Text)]
     -- ^ (session, prompt) pairs passed to the send seam, in call order.
   , smCallbacks :: IORef [WsEventCallback]
@@ -190,6 +195,12 @@ data Seams = Seams
     -- ^ The WS clients handed back by the WS seam, in call order.
   , smMintQueue :: IORef [Either Text Text]
     -- ^ Queued mint results; an empty queue yields a mint failure.
+  , smRebindQueue :: IORef [Either Text NewSessionResult]
+    -- ^ Queued rebind results; an empty queue yields a rebind failure.
+  , smRepoSetupQueue :: IORef [Either Text ()]
+    -- ^ Queued setup-repo results; an empty queue yields success.
+  , smReposQueue :: IORef [Either Text [A.Value]]
+    -- ^ Queued @GET \/api\/repos@ results; an empty queue yields @[]@.
   , smSendQueue :: IORef [Either Text SendResult]
     -- ^ Queued send results; an empty queue yields a successful send.
   , smWsQueue   :: IORef [Either Text WsRecorder]
@@ -205,7 +216,8 @@ mkSeams :: IO Seams
 mkSeams = Seams
   <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
   <*> newIORef [] <*> newIORef [] <*> newIORef []
-  <*> newIORef [] <*> newIORef []
+  <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
+  <*> newIORef [] <*> newIORef [] <*> newIORef []
 
 -- | Pop the next queued result, falling back to a default when the queue is
 -- empty.
@@ -233,6 +245,14 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
   { cccNewSession = \_mgr _apiBase body -> do
       modifyIORef' (smMints seams) (body :)
       nextQueued (smMintQueue seams) (Left "no session minted for this test")
+  , cccRebindNew = \_mgr _apiBase oldSid body -> do
+      modifyIORef' (smRebinds seams) ((oldSid, body) :)
+      nextQueued (smRebindQueue seams) (Left "no rebind queued for this test")
+  , cccSetupRepo = \_mgr _apiBase sid body -> do
+      modifyIORef' (smRepoSetups seams) ((sid, body) :)
+      nextQueued (smRepoSetupQueue seams) (Right ())
+  , cccGetRepos = \_mgr _apiBase ->
+      nextQueued (smReposQueue seams) (Right [])
   , cccSendMessage = \_mgr _apiBase sid prompt -> do
       modifyIORef' (smSends seams) ((sid, prompt) :)
       nextQueued (smSendQueue seams) (Right okSendResult)
@@ -258,6 +278,37 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
 
 getMints :: Seams -> IO [A.Value]
 getMints = fmap reverse . readIORef . smMints
+
+-- | The rebind-seam calls recorded so far, in order.
+getRebinds :: Seams -> IO [(SessionId, A.Value)]
+getRebinds = fmap reverse . readIORef . smRebinds
+
+-- | The setup-repo-seam calls recorded so far, in order.
+getRepoSetups :: Seams -> IO [(SessionId, A.Value)]
+getRepoSetups = fmap reverse . readIORef . smRepoSetups
+
+-- | Queue rebind results, in call order.
+queueRebinds :: Seams -> [Either Text NewSessionResult] -> IO ()
+queueRebinds seams = writeIORef (smRebindQueue seams)
+
+-- | A successful rebind result with the given session id + provider/model.
+rebindOk :: Text -> Text -> Text -> NewSessionResult
+rebindOk sid prov model = NewSessionResult
+  { nsrSessionId   = sid
+  , nsrTabIndex    = Just 0
+  , nsrRebound     = True
+  , nsrRebindError = Nothing
+  , nsrProvider    = prov
+  , nsrModel       = model
+  }
+
+-- | Make the setup-repo seam fail.
+queueRepoSetupFailure :: Seams -> Text -> IO ()
+queueRepoSetupFailure seams e = writeIORef (smRepoSetupQueue seams) [Left e]
+
+-- | Queue the @GET \/api\/repos@ results, in call order.
+queueRepos :: Seams -> [Either Text [A.Value]] -> IO ()
+queueRepos seams = writeIORef (smReposQueue seams)
 
 getSendCalls :: Seams -> IO [(SessionId, Text)]
 getSendCalls = fmap reverse . readIORef . smSends
@@ -1966,3 +2017,195 @@ spec = do
       handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker watchState thinkingTabs key "/tab list"
       sends <- getSends chan
       sends `shouldBe` ["tab list failed: boom"]
+
+  -- ── /new: slash-command parity (WU-7) ──────────────────────────────────
+  describe "/new (slash-command parity)" $ do
+    let newKey = ConversationKey "signal" "new-conv"
+        oldSid = mkSid "old-sid"
+        newSid = mkSid "new-sid"
+        freshSid = mkSid "fresh-sid"
+        confirmNew = "new session new-sid (p/m) — prior session old-sid kept in /session list"
+
+    it "rebinds (exactly one mint) when the conversation already has a session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "anthropic" "claude-sonnet-4")]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          run = handleInbound cfg chan sessions wsConns pendingAsks bg
+                  tabTracker watchState thinkingTabs newKey
+      run "/new"
+      -- ONE mint: the rebind call mints; the plain mint seam must not run.
+      getMints seams `shouldReturn` []
+      getRebinds seams `shouldReturn`
+        [(oldSid, A.object ["channel" .= ("mock" :: Text)])]
+      getSends chan `shouldReturn`
+        ["new session new-sid (anthropic/claude-sonnet-4) — prior session old-sid kept in /session list"]
+      -- The conversation now routes to the new session.
+      sessionLookup sessions newKey `shouldReturn` Just newSid
+      run "hello"
+      getSendCalls seams `shouldReturn` [(newSid, "hello")]
+
+    it "mints once with the provider/model flags when there is no prior session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["fresh-sid"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -p anthropic -m claude-sonnet-4"
+      getMints seams `shouldReturn`
+        [A.object
+          [ "provider" .= ("anthropic" :: Text)
+          , "model" .= ("claude-sonnet-4" :: Text) ]]
+      getRebinds seams `shouldReturn` []
+      -- No prior session: nothing to warn about and nothing to resume.
+      getSends chan `shouldReturn` ["new session fresh-sid"]
+      sessionLookup sessions newKey `shouldReturn` Just freshSid
+
+    it "warns about a failed tab rebind, then still confirms the new session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams
+        [Right ((rebindOk "new-sid" "p" "m")
+                  { nsrRebound = False
+                  , nsrTabIndex = Nothing
+                  , nsrRebindError = Just "tab index out of range" })]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new"
+      getSends chan `shouldReturn`
+        [ "warning: /new tab rebind failed: tab index out of range"
+        , confirmNew ]
+
+    it "confirms without a warning when no tab was bound (rebound false, no error)" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams
+        [Right ((rebindOk "new-sid" "p" "m")
+                  { nsrRebound = False, nsrTabIndex = Nothing })]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new"
+      getSends chan `shouldReturn` [confirmNew]
+
+    it "keeps the conversation's session when the rebind call fails" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Left "session not found"]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new"
+      getSends chan `shouldReturn` ["new session failed: session not found"]
+      sessionLookup sessions newKey `shouldReturn` Just oldSid
+
+    it "resolves -r against the repo registry and sets the repo up on the NEW session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "p" "m")]
+      queueRepos seams
+        [Right [A.object
+          [ "id" .= ("seal" :: Text)
+          , "url" .= ("git@github.com:o/r.git" :: Text) ]]]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -r seal"
+      getRepoSetups seams `shouldReturn`
+        [(newSid, A.object ["url" .= ("git@github.com:o/r.git" :: Text)])]
+      -- A successful setup is silent: only the confirmation.
+      getSends chan `shouldReturn` [confirmNew]
+
+    it "uses -r verbatim when the repo registry cannot be read" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["fresh-sid"]
+      queueRepos seams [Left "boom"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -r https://github.com/o/r.git"
+      getRepoSetups seams `shouldReturn`
+        [(freshSid, A.object ["url" .= ("https://github.com/o/r.git" :: Text)])]
+      getSends chan `shouldReturn` ["new session fresh-sid"]
+
+    it "orders the rebind warning before the repo failure before the confirmation" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams
+        [Right ((rebindOk "new-sid" "p" "m") { nsrRebindError = Just "no tab" })]
+      queueRepos seams [Right []]
+      queueRepoSetupFailure seams "clone failed: denied"
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -r https://x/y.git"
+      getSends chan `shouldReturn`
+        [ "warning: /new tab rebind failed: no tab"
+        , "repo setup failed: clone failed: denied"
+        , confirmNew ]
