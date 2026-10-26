@@ -79,6 +79,8 @@ data Req
 data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   -- Health
   RouteHealth        :: SealRoute '[] '[] Bodyless Text
+  -- Commands
+  RouteCommands      :: SealRoute '[] '[] Bodyless Resp
   -- Tabs
   RouteTabsList       :: SealRoute '[] '[] Bodyless Resp
   RouteTabsNew       :: SealRoute '[] '[] (Body Req) Resp
@@ -162,6 +164,7 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
 routeMeta :: SealRoute caps qrys req resp -> MetaCodec caps qrys req resp
 routeMeta = \case
   RouteHealth -> Meta (match "health" ./ end) qend bodyless (resp (one jsonBodyCodec)) M.get
+  RouteCommands -> Meta (match "commands" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsList -> Meta (match "tabs" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsNew -> Meta (match "tabs" ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteTabsClose -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "close" ./ end) qend bodyless (resp (one respCodec)) M.post
@@ -229,6 +232,7 @@ routeMeta = \case
 allRoutes :: [Constructed SealRoute]
 allRoutes =
   [ Constructed RouteHealth
+  , Constructed RouteCommands
   , Constructed RouteTabsList
   , Constructed RouteTabsNew
   , Constructed RouteTabsClose

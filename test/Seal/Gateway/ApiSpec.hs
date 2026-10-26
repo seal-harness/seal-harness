@@ -33,17 +33,21 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
-import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
-import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
+import Seal.Agent.Def.Backend (AgentDefBackend, noneBackend, adbUpdate)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec
+  ( Availability (..), CommandGroup (..), CommandName (..), CommandSpec (..)
+  , commandAction, mkRegistry )
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
+import Seal.Core.Types
+  ( ModelId (..), SessionId, mkSystemSessionId, mkSessionId, sessionIdText
+  , ToolCallId (..), OpName (..) )
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
@@ -70,7 +74,11 @@ import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
 import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime, makeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
+import Seal.Session.Store
+  ( SessionRuntime (..), listSessions, newSession, saveSessionMeta )
+import Seal.TestHelpers.ApiTestHarness
+  ( ApiTestEnv (..), defaultApiTestOptions, runApiTestLocal )
+import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
@@ -78,7 +86,7 @@ import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
-import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
+import Seal.Handles.Tab (TabKind (KindAi, KindHarness, KindProvider))
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
@@ -299,6 +307,86 @@ mkDepsFor paths = do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
+
+-- | Run a body against a FRESH state + config tree, with @config.toml@
+-- written from the given 'RuntimeConfig' and an in-memory agent-def backend
+-- the body can seed.
+--
+-- The rebind-new tests need their own sessions tree: the shared @mkApp@
+-- state dir accumulates sessions from every other test, so "which session
+-- did this call mint" is not attributable there. They also need a real
+-- @config.toml@ path, because the config-default agent is resolved from it
+-- (D8: @\/new@ always resolves the agent from config defaults — it never
+-- inherits the old session's agent).
+withRebindNewEnv
+  :: RuntimeConfig
+  -> (AgentDefBackend -> IO ())
+  -> (ApiDeps -> SealPaths -> IO ())
+  -> IO ()
+withRebindNewEnv cfg seed body = withSystemTempDirectory "seal-rebind-new" $ \tmp -> do
+  let configRoot = tmp </> "config"
+      stateRoot  = tmp </> "state"
+      cfgPath    = configRoot </> "config.toml"
+      paths      = fakePaths { spState = stateRoot, spConfig = configRoot }
+  createDirectoryIfMissing True configRoot
+  createDirectoryIfMissing True (stateRoot </> "sessions")
+  saveRuntimeConfig cfgPath cfg
+  adb <- noneBackend
+  seed adb
+  baseDeps <- mkDepsFor paths
+  let deps = baseDeps
+        { adSessionRuntime = (adSessionRuntime baseDeps) { srConfigPath = cfgPath }
+        , adAgentDefs      = adb
+        }
+  body deps paths
+
+-- | The agent def the config-default-agent tests bind to.
+zoeIdForTest :: AgentDefId
+zoeIdForTest = case mkAgentDefId "zoe" of
+  Right x -> x
+  Left _  -> error "zoe id"
+
+zoeDef :: AgentDef
+zoeDef = AgentDef zoeIdForTest "zoe" "" (ModelId "") Nothing AllowAll
+           Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+  where
+    now = UTCTime (fromGregorian 2026 7 1) 0
+
+-- | Decode a response body that must be a JSON object.
+decodedObject :: BL.ByteString -> IO (KeyMap.KeyMap A.Value)
+decodedObject body = case A.decode body :: Maybe A.Value of
+  Just (A.Object o) -> pure o
+  other             -> error ("expected a JSON object, got: " <> show other)
+
+-- | Read the @session_id@ out of a POST @\/api\/sessions\/:id\/new@ response.
+sidFromRebindResponse :: BL.ByteString -> IO SessionId
+sidFromRebindResponse body = do
+  o <- decodedObject body
+  case lookupK "session_id" o of
+    Just (A.String s) -> case mkSessionId s of
+      Right sid -> pure sid
+      Left e    -> error ("invalid session_id in response: " <> T.unpack e)
+    other -> error ("expected a session_id string, got: " <> show other)
+
+-- | Read a session's @session.json@ back from disk.
+readSessionMeta :: SealPaths -> SessionId -> IO SessionMeta
+readSessionMeta paths sid = do
+  mMeta <- decodeFileStrict (sessionMetaPath paths sid)
+  case mMeta of
+    Just m  -> pure m
+    Nothing -> error ("expected session.json on disk for " <> T.unpack (sessionIdText sid))
+
+-- | A minimal 'CommandSpec' for the @GET \/api\/commands@ tests. Carries an
+-- alias so the test can pin "canonical names only, no aliases".
+menuSpec :: T.Text -> T.Text -> CommandSpec
+menuSpec nm syn = CommandSpec
+  { csName         = CommandName nm
+  , csAliases      = [CommandName (nm <> "-alias")]
+  , csGroup        = GroupGeneral
+  , csSynopsis     = syn
+  , csParserInfo   = info (pure (commandAction (\_ -> pure ()))) mempty
+  , csAvailability = AlwaysAvailable
+  }
 
 -- | The same deps, but with the WS health state overridden. Used to
 -- assert that @\/api\/health@ reports the ACTUAL WS liveness rather than
@@ -611,6 +699,132 @@ spec = describe "Seal.Gateway.API" $ do
           _ -> expectationFailure "expected session_id in tab row"
       Just xs -> expectationFailure ("expected one tab, got " <> show (length xs))
       Nothing -> expectationFailure "expected a tabs array"
+
+  -- ── WU-6: POST /api/sessions/:id/new accepts provider/model/channel and
+  -- reports the outcome in a 200 body (never a 400 — see the D2 rationale
+  -- in the plan: the session is minted before the rebind, so a 400 would
+  -- discard the id the caller needs to print the warning + confirmation).
+  describe "POST /api/sessions/:id/new (WU-6)" $ do
+    it "honours provider/model/channel overrides (D2)" $
+      withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
+        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing
+        -- Bind a tab so the real rebind path is exercised (not the
+        -- no-tab path).
+        _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
+        threadDelay 5000  -- >1ms: sid minting is millisecond-precision
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object
+            [ "provider" .= ("x" :: T.Text)
+            , "model"    .= ("y" :: T.Text)
+            , "channel"  .= ("telegram" :: T.Text) ]))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "provider" o `shouldBe` Just (A.String "x")
+        lookupK "model" o `shouldBe` Just (A.String "y")
+        lookupK "rebound" o `shouldBe` Just (A.Bool True)
+        lookupK "rebind_error" o `shouldBe` Just A.Null
+        newSid <- sidFromRebindResponse body
+        newSid `shouldNotBe` smId oldMeta
+        meta <- readSessionMeta paths newSid
+        smProvider meta `shouldBe` "x"
+        smModel meta `shouldBe` "y"
+        smChannel meta `shouldBe` "telegram"
+
+    it "inherits provider/model, takes the agent from config defaults, labels web" $
+      withRebindNewEnv (defaultRuntimeConfig { rcDefaultAgent = Just "zoe" })
+                       (`adbUpdate` zoeDef) $ \deps paths -> do
+        let oldAgent = case mkAgentDefId "old-agent" of
+              Right x -> x
+              Left _  -> error "old agent id"
+        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent)
+        _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
+        threadDelay 5000
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object []))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        lookupK "model" o `shouldBe` Just (A.String "claude-sonnet-4")
+        newSid <- sidFromRebindResponse body
+        meta <- readSessionMeta paths newSid
+        smProvider meta `shouldBe` "anthropic"
+        smModel meta `shouldBe` "claude-sonnet-4"
+        smChannel meta `shouldBe` "web"
+        -- D8: the config-default agent, NOT the old session's agent.
+        smAgent meta `shouldBe` Just zoeIdForTest
+
+    it "returns tab_index null + rebound false when no tab is bound" $
+      withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
+        oldMeta <- newSession paths "anthropic" "m" "web" Nothing
+        threadDelay 5000
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object []))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "tab_index" o `shouldBe` Just A.Null
+        lookupK "rebound" o `shouldBe` Just (A.Bool False)
+        lookupK "rebind_error" o `shouldBe` Just A.Null
+        -- The session is still minted: the caller needs the id even when
+        -- there was no tab to rebind.
+        newSid <- sidFromRebindResponse body
+        _ <- readSessionMeta paths newSid
+        pure ()
+
+  -- The rebind-failure branch is not reliably inducible over HTTP (it needs
+  -- an out-of-range race or a same-millisecond sid collision), so it is
+  -- pinned through the pure response builder the handler calls.
+  describe "rebindNewResponse" $ do
+    it "renders the no-tab response (tab_index null, rebound false)" $
+      rebindNewResponse "20260101-000000-000" Nothing False Nothing "anthropic" "m"
+        `shouldBe` A.object
+          [ "session_id"   .= ("20260101-000000-000" :: T.Text)
+          , "tab_index"    .= (Nothing :: Maybe Int)
+          , "rebound"      .= False
+          , "rebind_error" .= (Nothing :: Maybe T.Text)
+          , "provider"     .= ("anthropic" :: T.Text)
+          , "model"        .= ("m" :: T.Text)
+          ]
+    it "renders the rebind-failure response (200 body carrying the raw error)" $
+      rebindNewResponse "sid" (Just 2) False (Just "tab index out of range") "p" "m"
+        `shouldBe` A.object
+          [ "session_id"   .= ("sid" :: T.Text)
+          , "tab_index"    .= Just (2 :: Int)
+          , "rebound"      .= False
+          , "rebind_error" .= (Just "tab index out of range" :: Maybe T.Text)
+          , "provider"     .= ("p" :: T.Text)
+          , "model"        .= ("m" :: T.Text)
+          ]
+
+  -- ── WU-6: GET /api/commands — the slash-command menu the chat channels
+  -- render (/help on Signal/Telegram). Canonical names only, no aliases.
+  describe "GET /api/commands (WU-6)" $ do
+    it "returns [] when the send plumbing is unwired" $ do
+      app <- mkApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "commands"])
+      status `shouldBe` 200
+      A.decode body `shouldBe` Just ([] :: [A.Value])
+
+    runApiTestLocal Nothing defaultApiTestOptions $ \env -> do
+      let registry = mkRegistry
+            [ menuSpec "alpha" "Alpha synopsis"
+            , menuSpec "beta" "Beta synopsis"
+            ]
+          baseDeps = ateDeps env
+          deps = baseDeps
+            { adSend = fmap (\sd -> sd { sdRegistry = registry }) (adSend baseDeps) }
+      (status, body) <- runAppBody (apiApp deps) (testRequest methodGet ["api", "commands"])
+      status `shouldBe` 200
+      A.decode body `shouldBe` Just
+        [ A.object
+            [ "name" .= ("alpha" :: T.Text)
+            , "synopsis" .= ("Alpha synopsis" :: T.Text) ]
+        , A.object
+            [ "name" .= ("beta" :: T.Text)
+            , "synopsis" .= ("Beta synopsis" :: T.Text) ]
+        ]
 
   it "GET /api/harnesses returns 200" $ do
     app <- mkApp
