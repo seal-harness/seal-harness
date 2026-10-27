@@ -91,6 +91,7 @@ import Seal.Config.Security
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -114,6 +115,7 @@ import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder, ChildWorkerOutcome (..)
   , ChildExitReason (..) )
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
@@ -405,6 +407,7 @@ buildTestEnv tmp mode mRepo opts = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
+  testRepeatReg <- newSessionRepeatRegistry
 
   let paths = SealPaths
         { spHome = tmp, spState = stateRoot, spConfig = configRoot
@@ -426,8 +429,7 @@ buildTestEnv tmp mode mRepo opts = do
 
   -- Session runtime.
   let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
-        "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing
+        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
         (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
   activeRef <- newIORef meta0
   let sr = SessionRuntime
@@ -500,6 +502,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdReplies = testReplies
         , sdLocks = testLocks
         , sdAbortReg = testAbortReg
+        , sdRepeatReg = testRepeatReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
         , sdIsRemote = mode == UemRemote
@@ -532,7 +535,8 @@ buildTestEnv tmp mode mRepo opts = do
         , adConfigRepo = configRepo
         , adVault = rt
         , adPaths = paths
-        , adWsPort = 8081
+        
+        , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg = testAbortReg
         , adSecurityConfig = secCfg
         , adMkSessionExec = Nothing

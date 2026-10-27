@@ -10,6 +10,7 @@ import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
   , NewArgs (..), parseNewArgs, emptyNewArgs, resolveNewModel, resolveRepoUrl )
+import Seal.Gateway.Types.NewArgs (renderNewSessionConfirmation)
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
 import Seal.Command.Spec (mkRegistry, runCommandAction)
 import Seal.Config.File (defaultRuntimeConfig)
@@ -61,22 +62,24 @@ stubDeps =
 
 spec_main :: Spec
 spec_main = describe "Seal.Command.New" $ do
+  let newMeta = SessionMeta
+        { smId = mkSid "20260719-120000-001"
+        , smProvider = "anthropic"
+        , smModel = "claude-sonnet-4-20250514"
+        , smChannel = "cli"
+        , smParent = Nothing
+        , smAgent = Nothing
+        , smSystemOverride = Nothing
+        , smAgentName = Nothing
+        , smDescription = Nothing
+        , smSealFrontMatter = True
+        , smRepoUrl = Nothing
+        , smCreatedAt = error "unused"
+        , smLastActive = error "unused"
+        }
+      oldSid = mkSid "20260701-000000-000"
+      line = renderNewConfirmation newMeta oldSid
   describe "renderNewConfirmation" $ do
-    let newMeta = SessionMeta
-          { smId = mkSid "20260719-120000-001"
-          , smProvider = "anthropic"
-          , smModel = "claude-sonnet-4-20250514"
-          , smChannel = "cli"
-          , smAgent = Nothing
-          , smSystemOverride = Nothing
-          , smAgentName = Nothing
-          , smDescription = Nothing
-          , smRepoUrl = Nothing
-          , smCreatedAt = error "unused"
-          , smLastActive = error "unused"
-          }
-        oldSid = mkSid "20260701-000000-000"
-        line = renderNewConfirmation newMeta oldSid
     it "names the new session id" $
       T.unpack line `shouldContain` "new session 20260719-120000-001"
     it "names the provider/model" $
@@ -84,6 +87,18 @@ spec_main = describe "Seal.Command.New" $ do
     it "names the prior session + resume hint" $ do
       T.unpack line `shouldContain` "prior session 20260701-000000-000"
       T.unpack line `shouldContain` "/session list"
+
+  -- The shared renderer lives in 'seal-gateway-types' so the gateway-API chat
+  -- channels (which cannot import this module) emit byte-identical text.
+  describe "Seal.Gateway.Types.NewArgs.renderNewSessionConfirmation" $ do
+    let golden =
+          "new session 20260719-120000-001 (anthropic/claude-sonnet-4-20250514) — prior session 20260701-000000-000 kept in /session list"
+    it "renders the exact golden /new confirmation line" $
+      renderNewSessionConfirmation
+        "20260719-120000-001" "anthropic" "claude-sonnet-4-20250514" "20260701-000000-000"
+        `shouldBe` golden
+    it "is the same text 'renderNewConfirmation' produces (no drift)" $
+      line `shouldBe` golden
 
   describe "parseNewArgs" $ do
     it "empty string yields emptyNewArgs" $

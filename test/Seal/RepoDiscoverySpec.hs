@@ -717,9 +717,10 @@ spec = do
               zoe = case mkAgentDefId "zoe" of Right a -> a; Left _ -> error "bad zoe id"
               meta = SessionMeta
                 { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-                , smChannel = "web", smAgent = Just zoe
+                , smChannel = "web", smParent = Nothing, smAgent = Just zoe
                 , smSystemOverride = Nothing, smAgentName = Just "zoe"
                 , smDescription = Nothing
+                , smSealFrontMatter = True
                 , smRepoUrl = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
@@ -761,9 +762,10 @@ spec = do
       let sid = case mkSessionId "20260817-131404-504" of Right s -> s; Left _ -> error "bad sid"
           meta = SessionMeta
             { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-            , smChannel = "web", smAgent = pickedId
+            , smChannel = "web", smParent = Nothing, smAgent = pickedId
             , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
             , smDescription = Nothing
+            , smSealFrontMatter = True
             , smRepoUrl = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta

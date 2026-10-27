@@ -10,6 +10,7 @@ import qualified Seal.Core.MessageSourceSpec
 import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
+import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
@@ -24,6 +25,7 @@ import qualified Seal.Gateway.SendSpec
 import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
+import qualified Seal.Gateway.StreamHealthSpec
 import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
@@ -72,6 +74,7 @@ import qualified Seal.Command.ParseSpec
 import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SessionSpec
 import qualified Seal.Command.ServeSpec
+import qualified Seal.Command.ShutdownSpec
 import qualified Seal.Command.SkillSpec
 import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
@@ -94,6 +97,7 @@ import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
+import qualified Seal.Channels.Chat.TabRenderSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
@@ -101,6 +105,7 @@ import qualified Seal.Channels.Chat.WatchPersistSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
+import qualified Seal.Channels.Chat.TelegramCommandsSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
@@ -183,6 +188,7 @@ import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
+import qualified Seal.ISA.RepeatDetectSpec
 import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
 import qualified Seal.Tools.TimeoutSpec
@@ -202,6 +208,7 @@ specs = do
   Seal.Core.AllowListSpec.spec
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
+  Seal.Core.SystemPromptSpec.spec
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
@@ -215,6 +222,7 @@ specs = do
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
+  Seal.Gateway.StreamHealthSpec.spec
   Seal.Gateway.TranscriptSpec.spec
   Seal.Gateway.OpenApiSpec.spec
   Seal.Util.StrictIOSpec.spec
@@ -264,6 +272,7 @@ specs = do
   Seal.Command.ProviderSpec.spec
   Seal.Command.SessionSpec.spec
   Seal.Command.ServeSpec.spec
+  Seal.Command.ShutdownSpec.spec
   Seal.Command.SkillSpec.spec
   Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
@@ -286,6 +295,7 @@ specs = do
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
+  Seal.Channels.Chat.TabRenderSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
@@ -293,6 +303,7 @@ specs = do
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
+  Seal.Channels.Chat.TelegramCommandsSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.ConvIndexSpec.spec
@@ -375,6 +386,7 @@ specs = do
   Seal.RepoDiscoverySpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
+  Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
   Seal.Tools.TimeoutSpec.spec

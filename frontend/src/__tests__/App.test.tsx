@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import App from '../App'
+import { pushWsEntry, pushWsActivity } from '../lib/streamClient'
 import { WS_GRACE_MS } from '../hooks/useApi'
 import type { SessionInfo, TranscriptEntry } from '../types'
 
@@ -11,11 +12,16 @@ import type { SessionInfo, TranscriptEntry } from '../types'
 // re-trigger their effects every render and loop).
 vi.mock('../lib/streamClient', () => {
   const unsub = () => {}
+  // The WS is the live path for transcript entries: the backend broadcasts
+  // each entry as it is written, and signals turn completion with a
+  // 'harness-status: idle' activity. Tests drive both.
+  const entryCbs = new Set<(e: unknown) => void>()
+  const activityCbs = new Set<(sid: string, a: unknown) => void>()
   const client = {
     status: 'closed',
     focus: () => {},
-    onEntry: () => unsub,
-    onActivity: () => unsub,
+    onEntry: (cb: (e: unknown) => void) => { entryCbs.add(cb); return () => { entryCbs.delete(cb) } },
+    onActivity: (cb: (sid: string, a: unknown) => void) => { activityCbs.add(cb); return () => { activityCbs.delete(cb) } },
     onLists: () => unsub,
     onStatusChange: () => unsub,
     onAsk: () => unsub,
@@ -26,8 +32,16 @@ vi.mock('../lib/streamClient', () => {
     requestEntries: () => {},
     onEntriesChunk: () => unsub,
     lastError: () => null,
+    reconnectAttempts: () => 0,
+    reconnectNow: () => {},
   }
-  return { streamClient: () => client }
+  const api = {
+    streamClient: () => client,
+    // Test drivers: deliver a WS entry / a turn-completion signal.
+    pushWsEntry: (e: unknown) => { for (const cb of entryCbs) cb(e) },
+    pushWsActivity: (sid: string, a: unknown) => { for (const cb of activityCbs) cb(sid, a) },
+  }
+  return api
 })
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
@@ -175,6 +189,55 @@ describe('App — sidebar selection', () => {
     // The chat-header title should now read the session's title (the
     // EditableSessionTitle shows it).
     expect(screen.getAllByText('Session A').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('the empty-session form shows the "Add Seal Harness front matter" toggle, on by default', async () => {
+    defaultFetchDispatch()
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      let body: unknown = []
+      if (url === '/api/sessions') body = [makeSession({ id: 'sess-A', description: 'Session A' })]
+      else if (url === '/api/agents') body = [{ name: 'zoe', isDefault: true }]
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true }]
+      else if (url === '/api/sessions/sess-A/agents') body = [{ name: 'zoe', isDefault: true }]
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    const rows = await screen.findAllByText('Session A', {}, { timeout: 4000 })
+    fireEvent.click(rows[0]!)
+    const box = await screen.findByLabelText('Add Seal Harness front matter', {}, { timeout: 4000 })
+    expect((box as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('toggling the front matter off PUTs to the session and unchecks the box', async () => {
+    defaultFetchDispatch()
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      let body: unknown = []
+      if (url === '/api/sessions') body = [makeSession({ id: 'sess-A', description: 'Session A' })]
+      else if (url === '/api/agents') body = [{ name: 'zoe', isDefault: true }]
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true }]
+      else if (url === '/api/sessions/sess-A/agents') body = [{ name: 'zoe', isDefault: true }]
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    const rows = await screen.findAllByText('Session A', {}, { timeout: 4000 })
+    fireEvent.click(rows[0]!)
+    const box = await screen.findByLabelText('Add Seal Harness front matter', {}, { timeout: 4000 })
+    fireEvent.click(box)
+    await waitFor(() => {
+      const call = fetchCalls.find((c) => c.url === '/api/sessions/sess-A/seal-front-matter')
+      expect(call).toBeTruthy()
+      expect(call!.init!.method).toBe('PUT')
+      expect(JSON.parse(call!.init!.body as string)).toEqual({ enabled: false })
+    })
+    expect((box as HTMLInputElement).checked).toBe(false)
   })
 
   it('clicking the New Tab button opens the composer', async () => {
@@ -772,14 +835,19 @@ describe('App — slash bubble inline ordering', () => {
     await waitFor(() => {
       expect(fetchCalls.filter((c) => c.url === '/api/sessions/sess-slash/send').length).toBe(2)
     })
-    // Wait for the transcript re-fetch to deliver the second entry and
-    // clear the optimistic pending message. After the send completes,
-    // refresh() triggers a transcript re-fetch which returns the updated
-    // transcript (with e2). The pending message clears once entries.length
+    // The backend broadcasts the new entry over the WS as it is written —
+    // the WS is the live path; the HTTP re-seed is only a consistency check
+    // that runs when the turn completes. Deliver the entry, then signal
+    // turn completion. The pending message clears once entries.length
     // grows beyond entryCountAtSend. Wait for the typing indicator (from
     // the pending-thinking row) to disappear — that signals the pending
     // state has cleared and the transcript-derived rows are the only ones
     // left.
+    await act(async () => {
+      pushWsEntry(makeEntry({ id: 'e2', timestamp: '2024-06-01T12:00:05Z',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'after slash' }] }] }) }))
+      pushWsActivity('sess-slash', { kind: 'harness-status', status: 'idle' })
+    })
     await waitFor(() => {
       expect(document.querySelector('.typing-dot')).toBeFalsy()
     })

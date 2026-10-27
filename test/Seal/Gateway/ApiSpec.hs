@@ -33,11 +33,13 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
-import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
-import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
+import Seal.Agent.Def.Backend (AgentDefBackend, noneBackend, adbUpdate)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec
+  ( Availability (..), CommandGroup (..), CommandName (..), CommandSpec (..)
+  , commandAction, mkRegistry )
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig
@@ -46,9 +48,12 @@ import Seal.Config.File
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
+import Seal.Core.Types
+  ( ModelId (..), SessionId, mkSystemSessionId, mkSessionId, sessionIdText
+  , ToolCallId (..), OpName (..) )
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -73,14 +78,19 @@ import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
 import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime, makeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
+import Seal.Session.Store
+  ( SessionRuntime (..), listSessions, newSession, saveSessionMeta )
+import Seal.TestHelpers.ApiTestHarness
+  ( ApiTestEnv (..), defaultApiTestOptions, runApiTestLocal )
+import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
-import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
+import Seal.Handles.Tab (TabKind (KindAi, KindHarness, KindProvider))
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
@@ -99,6 +109,12 @@ import Seal.Memory.Embedding (nullEmbeddingBackend)
 testAbortReg :: SessionAbortRegistry
 testAbortReg = unsafePerformIO newSessionAbortRegistry
 {-# NOINLINE testAbortReg #-}
+
+-- | A shared test repeat registry (session-read hardening WU4; mirrors
+-- 'testAbortReg').
+testRepeatReg :: SessionRepeatRegistry
+testRepeatReg = unsafePerformIO newSessionRepeatRegistry
+{-# NOINLINE testRepeatReg #-}
 
 -- | A provider that returns a scripted list of responses, one per call
 -- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
@@ -142,7 +158,7 @@ stubHandle = ChannelHandle
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -290,10 +306,139 @@ mkDepsFor paths = do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
+
+-- | Run a body against a FRESH state + config tree, with @config.toml@
+-- written from the given 'RuntimeConfig' and an in-memory agent-def backend
+-- the body can seed.
+--
+-- The rebind-new tests need their own sessions tree: the shared @mkApp@
+-- state dir accumulates sessions from every other test, so "which session
+-- did this call mint" is not attributable there. They also need a real
+-- @config.toml@ path, because the config-default agent is resolved from it
+-- (D8: @\/new@ always resolves the agent from config defaults — it never
+-- inherits the old session's agent).
+withRebindNewEnv
+  :: RuntimeConfig
+  -> (AgentDefBackend -> IO ())
+  -> (ApiDeps -> SealPaths -> IO ())
+  -> IO ()
+withRebindNewEnv cfg seed body = withSystemTempDirectory "seal-rebind-new" $ \tmp -> do
+  let configRoot = tmp </> "config"
+      stateRoot  = tmp </> "state"
+      cfgPath    = configRoot </> "config.toml"
+      paths      = fakePaths { spState = stateRoot, spConfig = configRoot }
+  createDirectoryIfMissing True configRoot
+  createDirectoryIfMissing True (stateRoot </> "sessions")
+  saveRuntimeConfig cfgPath cfg
+  adb <- noneBackend
+  seed adb
+  baseDeps <- mkDepsFor paths
+  let deps = baseDeps
+        { adSessionRuntime = (adSessionRuntime baseDeps) { srConfigPath = cfgPath }
+        , adAgentDefs      = adb
+        }
+  body deps paths
+
+-- | The agent def the config-default-agent tests bind to.
+zoeIdForTest :: AgentDefId
+zoeIdForTest = case mkAgentDefId "zoe" of
+  Right x -> x
+  Left _  -> error "zoe id"
+
+zoeDef :: AgentDef
+zoeDef = AgentDef zoeIdForTest "zoe" "" (ModelId "") Nothing AllowAll
+           Nothing Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+  where
+    now = UTCTime (fromGregorian 2026 7 1) 0
+
+-- | Decode a response body that must be a JSON object.
+decodedObject :: BL.ByteString -> IO (KeyMap.KeyMap A.Value)
+decodedObject body = case A.decode body :: Maybe A.Value of
+  Just (A.Object o) -> pure o
+  other             -> error ("expected a JSON object, got: " <> show other)
+
+-- | Read the @session_id@ out of a POST @\/api\/sessions\/:id\/new@ response.
+sidFromRebindResponse :: BL.ByteString -> IO SessionId
+sidFromRebindResponse body = do
+  o <- decodedObject body
+  case lookupK "session_id" o of
+    Just (A.String s) -> case mkSessionId s of
+      Right sid -> pure sid
+      Left e    -> error ("invalid session_id in response: " <> T.unpack e)
+    other -> error ("expected a session_id string, got: " <> show other)
+
+-- | Read a session's @session.json@ back from disk.
+readSessionMeta :: SealPaths -> SessionId -> IO SessionMeta
+readSessionMeta paths sid = do
+  mMeta <- decodeFileStrict (sessionMetaPath paths sid)
+  case mMeta of
+    Just m  -> pure m
+    Nothing -> error ("expected session.json on disk for " <> T.unpack (sessionIdText sid))
+
+-- | A minimal 'CommandSpec' for the @GET \/api\/commands@ tests. Carries an
+-- alias so the test can pin "canonical names only, no aliases".
+menuSpec :: T.Text -> T.Text -> CommandSpec
+menuSpec nm syn = CommandSpec
+  { csName         = CommandName nm
+  , csAliases      = [CommandName (nm <> "-alias")]
+  , csGroup        = GroupGeneral
+  , csSynopsis     = syn
+  , csParserInfo   = info (pure (commandAction (\_ -> pure ()))) mempty
+  , csAvailability = AlwaysAvailable
+  }
+
+-- | The same deps, but with the WS health state overridden. Used to
+-- assert that @\/api\/health@ reports the ACTUAL WS liveness rather than
+-- the configured port.
+mkDepsWithHealth :: SealPaths -> StreamHealth -> IO ApiDeps
+mkDepsWithHealth paths health = do
+  deps <- mkDepsFor paths
+  pure deps { adWsHealth = pure health }
+
+-- | Read a field from a decoded JSON object.
+healthField :: T.Text -> Maybe A.Value -> Maybe A.Value
+healthField key mv = case mv of
+  Just (A.Object o) -> KeyMap.lookup (Key.fromText key) o
+  _ -> Nothing
+
+-- | POST @\/api\/sessions\/new@ with the given body against a FRESH state
+-- dir, and read the created session's 'SessionMeta' back from
+-- @session.json@. The fresh dir is required: the shared dir used by the
+-- @mkApp@ tests accumulates sessions from every other test, so the channel
+-- label could not be attributed to this call. Asserts the parts common to
+-- every caller (200 + a non-empty @session_id@ + no tab inserted — the
+-- handler must not touch TabsHandle, headless or not) and hands the decoded
+-- meta back so a test can assert on the persisted channel label.
+postSessionNewMeta :: A.Value -> IO SessionMeta
+postSessionNewMeta body = withSystemTempDirectory "seal-api-new-session" $ \d -> do
+  createDirectoryIfMissing True (d </> "sessions")
+  let paths = fakePaths { spState = d }
+  deps <- mkDepsFor paths
+  let app = apiApp deps
+  req <- testPost ["api", "sessions", "new"] (A.encode body)
+  (status, respBody) <- runAppBody app req
+  status `shouldBe` 200
+  let sid = case A.decode respBody :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "session_id" o of
+          Just (A.String s) | not (T.null s) -> s
+          _ -> error ("expected a non-empty session_id string, got: " <> show respBody)
+        _ -> error ("expected JSON object, got: " <> show respBody)
+  -- No tab may have been inserted for a bare session.
+  (_, tabsBody) <- runAppBody app (testRequest methodGet ["api", "tabs"])
+  case A.decode tabsBody :: Maybe [A.Value] of
+    Just tabs -> tabs `shouldSatisfy` null
+    Nothing   -> error "expected a tabs array"
+  sidParsed <- case mkSessionId sid of
+    Right s -> pure s
+    Left e  -> error ("invalid session id " <> T.unpack sid <> ": " <> T.unpack e)
+  mMeta <- decodeFileStrict (sessionMetaPath paths sidParsed)
+  case mMeta of
+    Just m  -> pure m
+    Nothing -> error ("expected session.json on disk for " <> T.unpack sid)
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
 -- registry and whose @rrhMutate@ always succeeds (no disk I/O). Used by
@@ -331,7 +476,8 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault            = vr
     , adPaths            = fakePaths
-    , adWsPort           = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
@@ -388,11 +534,33 @@ spec_main = describe "Seal.Gateway.API" $ do
 
   let mkPaths = fakePaths { spState = sharedStateDir }
       mkApp = apiApp <$> mkDepsFor mkPaths
+      mkAppWithHealth health = apiApp <$> mkDepsWithHealth mkPaths health
 
   it "GET /api/health returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "health"])
     status `shouldBe` 200
+
+  it "GET /api/health reports the WS status as up when the WS is healthy" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "health"])
+    status `shouldBe` 200
+    healthField "wsStatus" (A.decode body) `shouldBe` Just (A.String "up")
+
+  it "GET /api/health reports the WS status as failed when the WS could not bind" $ do
+    -- The regression: the health endpoint used to report the CONFIGURED
+    -- ws_port unconditionally, so a WS that failed to bind (port already
+    -- in use) still advertised the dead port and the frontend connected
+    -- to a non-WebSocket port.
+    app <- mkAppWithHealth (StreamHealth "failed" 9092)
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "health"])
+    status `shouldBe` 200
+    let decoded = A.decode body
+    healthField "wsStatus" decoded `shouldBe` Just (A.String "failed")
+    healthField "wsPort" decoded `shouldBe` Just (A.Number 9092)
+    case healthField "wsMessage" decoded of
+      Just (A.String msg) -> msg `shouldSatisfy` T.isInfixOf "9092"
+      other -> expectationFailure ("expected a wsMessage string, got " <> show other)
 
   it "GET /api/tabs returns 200" $ do
     app <- mkApp
@@ -470,6 +638,21 @@ spec_main = describe "Seal.Gateway.API" $ do
       Just tabs -> tabs `shouldSatisfy` null
       Nothing   -> expectationFailure "expected a tabs array"
 
+  it "POST /api/sessions/new with headless=true labels the session channel \"bg\"" $ do
+    meta <- postSessionNewMeta
+      (A.object [ "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text), "headless" .= True ])
+    -- /bg sessions carry channel "bg": TurnEngine.shouldAutoTab keys off it to
+    -- keep a headless turn out of Active Tabs.
+    smChannel meta `shouldBe` "bg"
+
+  it "POST /api/sessions/new without a headless field labels the session channel \"web\"" $ do
+    -- The default must stay "web" — the web UI calls this endpoint too.
+    metaWeb <- postSessionNewMeta (A.object [])
+    smChannel metaWeb `shouldBe` "web"
+    -- An explicit `{"headless": false}` is also "web".
+    metaExplicit <- postSessionNewMeta (A.object [ "headless" .= False ])
+    smChannel metaExplicit `shouldBe` "web"
+
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "99999999-000000-000", "new"] (A.encode (A.object []))
@@ -519,6 +702,132 @@ spec_main = describe "Seal.Gateway.API" $ do
       Just xs -> expectationFailure ("expected one tab, got " <> show (length xs))
       Nothing -> expectationFailure "expected a tabs array"
 
+  -- ── WU-6: POST /api/sessions/:id/new accepts provider/model/channel and
+  -- reports the outcome in a 200 body (never a 400 — see the D2 rationale
+  -- in the plan: the session is minted before the rebind, so a 400 would
+  -- discard the id the caller needs to print the warning + confirmation).
+  describe "POST /api/sessions/:id/new (WU-6)" $ do
+    it "honours provider/model/channel overrides (D2)" $
+      withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
+        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing
+        -- Bind a tab so the real rebind path is exercised (not the
+        -- no-tab path).
+        _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
+        threadDelay 5000  -- >1ms: sid minting is millisecond-precision
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object
+            [ "provider" .= ("x" :: T.Text)
+            , "model"    .= ("y" :: T.Text)
+            , "channel"  .= ("telegram" :: T.Text) ]))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "provider" o `shouldBe` Just (A.String "x")
+        lookupK "model" o `shouldBe` Just (A.String "y")
+        lookupK "rebound" o `shouldBe` Just (A.Bool True)
+        lookupK "rebind_error" o `shouldBe` Just A.Null
+        newSid <- sidFromRebindResponse body
+        newSid `shouldNotBe` smId oldMeta
+        meta <- readSessionMeta paths newSid
+        smProvider meta `shouldBe` "x"
+        smModel meta `shouldBe` "y"
+        smChannel meta `shouldBe` "telegram"
+
+    it "inherits provider/model, takes the agent from config defaults, labels web" $
+      withRebindNewEnv (defaultRuntimeConfig { rcDefaultAgent = Just "zoe" })
+                       (`adbUpdate` zoeDef) $ \deps paths -> do
+        let oldAgent = case mkAgentDefId "old-agent" of
+              Right x -> x
+              Left _  -> error "old agent id"
+        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent)
+        _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
+        threadDelay 5000
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object []))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        lookupK "model" o `shouldBe` Just (A.String "claude-sonnet-4")
+        newSid <- sidFromRebindResponse body
+        meta <- readSessionMeta paths newSid
+        smProvider meta `shouldBe` "anthropic"
+        smModel meta `shouldBe` "claude-sonnet-4"
+        smChannel meta `shouldBe` "web"
+        -- D8: the config-default agent, NOT the old session's agent.
+        smAgent meta `shouldBe` Just zoeIdForTest
+
+    it "returns tab_index null + rebound false when no tab is bound" $
+      withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
+        oldMeta <- newSession paths "anthropic" "m" "web" Nothing
+        threadDelay 5000
+        req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
+          (A.encode (A.object []))
+        (status, body) <- runAppBody (apiApp deps) req
+        status `shouldBe` 200
+        o <- decodedObject body
+        lookupK "tab_index" o `shouldBe` Just A.Null
+        lookupK "rebound" o `shouldBe` Just (A.Bool False)
+        lookupK "rebind_error" o `shouldBe` Just A.Null
+        -- The session is still minted: the caller needs the id even when
+        -- there was no tab to rebind.
+        newSid <- sidFromRebindResponse body
+        _ <- readSessionMeta paths newSid
+        pure ()
+
+  -- The rebind-failure branch is not reliably inducible over HTTP (it needs
+  -- an out-of-range race or a same-millisecond sid collision), so it is
+  -- pinned through the pure response builder the handler calls.
+  describe "rebindNewResponse" $ do
+    it "renders the no-tab response (tab_index null, rebound false)" $
+      rebindNewResponse "20260101-000000-000" Nothing False Nothing "anthropic" "m"
+        `shouldBe` A.object
+          [ "session_id"   .= ("20260101-000000-000" :: T.Text)
+          , "tab_index"    .= (Nothing :: Maybe Int)
+          , "rebound"      .= False
+          , "rebind_error" .= (Nothing :: Maybe T.Text)
+          , "provider"     .= ("anthropic" :: T.Text)
+          , "model"        .= ("m" :: T.Text)
+          ]
+    it "renders the rebind-failure response (200 body carrying the raw error)" $
+      rebindNewResponse "sid" (Just 2) False (Just "tab index out of range") "p" "m"
+        `shouldBe` A.object
+          [ "session_id"   .= ("sid" :: T.Text)
+          , "tab_index"    .= Just (2 :: Int)
+          , "rebound"      .= False
+          , "rebind_error" .= (Just "tab index out of range" :: Maybe T.Text)
+          , "provider"     .= ("p" :: T.Text)
+          , "model"        .= ("m" :: T.Text)
+          ]
+
+  -- ── WU-6: GET /api/commands — the slash-command menu the chat channels
+  -- render (/help on Signal/Telegram). Canonical names only, no aliases.
+  describe "GET /api/commands (WU-6)" $ do
+    it "returns [] when the send plumbing is unwired" $ do
+      app <- mkApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "commands"])
+      status `shouldBe` 200
+      A.decode body `shouldBe` Just ([] :: [A.Value])
+
+    runApiTestLocal Nothing defaultApiTestOptions $ \env -> do
+      let registry = mkRegistry
+            [ menuSpec "alpha" "Alpha synopsis"
+            , menuSpec "beta" "Beta synopsis"
+            ]
+          baseDeps = ateDeps env
+          deps = baseDeps
+            { adSend = fmap (\sd -> sd { sdRegistry = registry }) (adSend baseDeps) }
+      (status, body) <- runAppBody (apiApp deps) (testRequest methodGet ["api", "commands"])
+      status `shouldBe` 200
+      A.decode body `shouldBe` Just
+        [ A.object
+            [ "name" .= ("alpha" :: T.Text)
+            , "synopsis" .= ("Alpha synopsis" :: T.Text) ]
+        , A.object
+            [ "name" .= ("beta" :: T.Text)
+            , "synopsis" .= ("Beta synopsis" :: T.Text) ]
+        ]
+
   it "GET /api/harnesses returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "harnesses"])
@@ -555,6 +864,62 @@ spec_main = describe "Seal.Gateway.API" $ do
   it "POST /api/tabs/0/close returns 404 when no tab exists" $ do
     app <- mkApp
     req <- testPost ["api", "tabs", "0", "close"] BL.empty
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/tabs/0/rename renames the tab" $ do
+    app <- mkApp
+    _ <- runAppStatus app =<< testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text) ]))
+    req <- testPost ["api", "tabs", "0", "rename"]
+      (A.encode (A.object [ "label" .= ("renamed" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "label" o `shouldBe` Just (A.String "renamed")
+        lookupK "tab_index" o `shouldBe` Just (A.Number 0)
+      other -> error ("unexpected rename body: " ++ show other)
+
+  it "POST /api/tabs/9/rename returns 404 for an out-of-range index" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "9", "rename"]
+      (A.encode (A.object [ "label" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/tabs/0/rename returns 400 for a blank label" $ do
+    app <- mkApp
+    _ <- runAppStatus app =<< testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text) ]))
+    req <- testPost ["api", "tabs", "0", "rename"]
+      (A.encode (A.object [ "label" .= ("   " :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/tabs/new {kind:resume} opens a tab on an existing session" $ do
+    app <- mkApp
+    (_, newBody) <- runAppBody app =<< testPost ["api", "sessions", "new"]
+      (A.encode (A.object []))
+    sid <- case A.decode newBody :: Maybe A.Value of
+      Just (A.Object o) -> case lookupK "session_id" o of
+        Just (A.String t) -> pure t
+        _                 -> error "sessions/new response had no session_id"
+      _ -> error "sessions/new returned a non-object"
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("resume" :: T.Text), "session_id" .= sid ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "session_id" o `shouldBe` Just (A.String sid)
+      other -> error ("unexpected resume body: " ++ show other)
+
+  it "POST /api/tabs/new {kind:resume} returns 404 for an unknown session" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("resume" :: T.Text)
+        , "session_id" .= ("20200101-000000-999" :: T.Text) ]))
     status <- runAppStatus app req
     status `shouldBe` 404
 
@@ -608,7 +973,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -638,7 +1003,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -669,7 +1034,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -692,7 +1057,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -732,7 +1097,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1224,7 +1589,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1259,7 +1624,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0))
                   { smDescription = Just "old name" }
@@ -1287,7 +1652,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1304,7 +1669,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1384,7 +1749,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1415,7 +1780,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1440,7 +1805,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1466,7 +1831,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1505,7 +1870,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1523,7 +1888,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1548,7 +1913,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1566,7 +1931,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1599,7 +1964,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) (Just "one-off") Nothing Nothing Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1626,7 +1991,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) Nothing Nothing Nothing Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1651,7 +2016,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just "one-off") Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1669,6 +2034,81 @@ spec_main = describe "Seal.Gateway.API" $ do
           lookupK "system_override" o `shouldBe` Just (A.String "one-off")
         _ -> expectationFailure "session.json missing or unparseable"
 
+  -- The "Add Seal Harness front matter" toggle. The endpoint persists the
+  -- choice to session.json so subsequent turns resolve the system prompt
+  -- accordingly (the agent's prompt alone when the front matter is off).
+  it "PUT /api/sessions/<sid>/seal-front-matter sets seal_front_matter to false" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-080"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "seal-front-matter"]
+        (A.encode (A.object [ "enabled" .= False ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "seal_front_matter" o `shouldBe` Just (A.Bool False)
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/seal-front-matter sets seal_front_matter back to true" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-081"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      -- Turn it off first.
+      req0 <- testPut ["api", "sessions", sidTxt, "seal-front-matter"]
+        (A.encode (A.object [ "enabled" .= False ]))
+      s0 <- runAppStatus app req0
+      s0 `shouldBe` 200
+      -- Then back on.
+      req <- testPut ["api", "sessions", sidTxt, "seal-front-matter"]
+        (A.encode (A.object [ "enabled" .= True ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "seal_front_matter" o `shouldBe` Just (A.Bool True)
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/seal-front-matter rejects a missing 'enabled' field" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-082"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "seal-front-matter"]
+        (A.encode (A.object []))
+      status <- runAppStatus app req
+      status `shouldBe` 400
+
   it "PUT /api/sessions/<sid>/agent sets agent_name to the agent's id" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
@@ -1676,7 +2116,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1699,7 +2139,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
@@ -1726,7 +2166,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "You are a helpful agent with no frontmatter."
@@ -1751,7 +2191,7 @@ spec_main = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "my-uploaded-agent") Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1805,7 +2245,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -1882,7 +2322,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -1949,7 +2389,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2017,7 +2457,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2110,7 +2550,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2168,7 +2608,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2225,7 +2665,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2263,7 +2703,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2353,7 +2793,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2409,7 +2849,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2464,7 +2904,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2513,7 +2953,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2571,7 +3011,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2832,7 +3272,8 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
-                , adWsPort           = 8081
+                
+                , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
@@ -3020,7 +3461,8 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
-                , adWsPort           = 8081
+                
+                , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
@@ -3092,7 +3534,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3136,7 +3578,8 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = vr
             , adPaths            = fakePaths
-            , adWsPort           = 8081
+            
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
@@ -3319,7 +3762,8 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = vr
             , adPaths            = paths
-            , adWsPort           = 8081
+            
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
@@ -4223,7 +4667,7 @@ spec_main = describe "Seal.Gateway.API" $ do
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -4356,7 +4800,8 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
+            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+            , adWsHealth = pure (StreamHealth "up" 8081)
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
@@ -4418,6 +4863,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the 404 path"
             , sdLocks       = error "sdLocks: unused on the 404 path"
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             , sdLogger      = error "sdLogger: unused on the 404 path"
             , sdIsRemote    = False
@@ -4446,7 +4892,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4525,6 +4971,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -4553,7 +5000,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4673,6 +5120,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = testLog
             , sdIsRemote    = False
@@ -4701,7 +5149,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = fakeRepoRegistryHandle
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = fakeLockedVaultRuntime
-            , adPaths            = paths, adWsPort = 8081, adAbortReg = testAbortReg
+            , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -4798,6 +5246,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -4826,7 +5275,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4925,6 +5374,7 @@ spec_main = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
+            , sdRepeatReg   = testRepeatReg
             , sdTabsHandle  = tabsH
             , sdLogger      = testLog
             , sdIsRemote    = False
@@ -4953,7 +5403,7 @@ spec_main = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

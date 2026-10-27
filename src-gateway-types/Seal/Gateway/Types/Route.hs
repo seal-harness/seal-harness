@@ -79,6 +79,8 @@ data Req
 data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   -- Health
   RouteHealth        :: SealRoute '[] '[] Bodyless Text
+  -- Commands
+  RouteCommands      :: SealRoute '[] '[] Bodyless Resp
   -- Tabs
   RouteTabsList       :: SealRoute '[] '[] Bodyless Resp
   RouteTabsNew       :: SealRoute '[] '[] (Body Req) Resp
@@ -87,6 +89,7 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteTabsAcknowledge :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
   RouteTabsRelease   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
   RouteTabsDestroy   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+  RouteTabsRename    :: SealRoute '[TabIndexOrErr] '[] (Body Req) Resp
   -- Lists
   RouteLists         :: SealRoute '[] '[] Bodyless Resp
   -- Sessions
@@ -161,6 +164,7 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
 routeMeta :: SealRoute caps qrys req resp -> MetaCodec caps qrys req resp
 routeMeta = \case
   RouteHealth -> Meta (match "health" ./ end) qend bodyless (resp (one jsonBodyCodec)) M.get
+  RouteCommands -> Meta (match "commands" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsList -> Meta (match "tabs" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsNew -> Meta (match "tabs" ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteTabsClose -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "close" ./ end) qend bodyless (resp (one respCodec)) M.post
@@ -168,6 +172,7 @@ routeMeta = \case
   RouteTabsAcknowledge -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "acknowledge" ./ end) qend bodyless (resp (one respCodec)) M.post
   RouteTabsRelease -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "release" ./ end) qend bodyless (resp (one respCodec)) M.post
   RouteTabsDestroy -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "destroy" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsRename -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "rename" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteLists -> Meta (match "lists" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSessionsList -> Meta (match "sessions" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSessionsArchived -> Meta (match "sessions" ./ match "archived" ./ end) qend bodyless (resp (one respCodec)) M.get
@@ -227,6 +232,7 @@ routeMeta = \case
 allRoutes :: [Constructed SealRoute]
 allRoutes =
   [ Constructed RouteHealth
+  , Constructed RouteCommands
   , Constructed RouteTabsList
   , Constructed RouteTabsNew
   , Constructed RouteTabsClose
@@ -234,6 +240,7 @@ allRoutes =
   , Constructed RouteTabsAcknowledge
   , Constructed RouteTabsRelease
   , Constructed RouteTabsDestroy
+  , Constructed RouteTabsRename
   , Constructed RouteLists
   , Constructed RouteSessionsList
   , Constructed RouteSessionsArchived

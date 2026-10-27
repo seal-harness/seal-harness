@@ -22,6 +22,11 @@ data SessionMeta = SessionMeta
   , smProvider   :: Text      -- ^ Provider label, e.g. @\"anthropic\"@.
   , smModel      :: Text      -- ^ Model id, e.g. @\"claude-opus-4-8\"@.
   , smChannel    :: Text      -- ^ Channel that created the session, e.g. @\"cli\"@.
+  , smParent     :: !(Maybe SessionId)
+    -- ^ The session that spawned this session ('Nothing' for top-level
+    -- sessions). Written by the delegation worker when a child transcript
+    -- is created. Audit metadata only — the lineage guard uses the
+    -- baked chain threaded through the spawn path, not this field.
   , smAgent      :: Maybe AgentDefId
     -- ^ The agent definition bound to this session at init (from
     -- @default_agent@ in @config.toml@). 'Nothing' means no agent is bound.
@@ -44,6 +49,14 @@ data SessionMeta = SessionMeta
     -- @session.json@ so it survives restarts and propagates to the
     -- sidebar (which reads the live session list, not a client-side
     -- override).
+  , smSealFrontMatter :: Bool
+    -- ^ Whether the harness injects its own front matter into the session's
+    -- system prompt (the static behavioral guidance blocks, the auto-loaded
+    -- @seal-usage@ skill, the codegraph skill, and the available-skills /
+    -- available-agents catalogs). 'True' (the default) injects it;
+    -- 'False' means the system prompt is the selected agent's prompt and
+    -- nothing else. Set by the session-setup form's "Add Seal Harness
+    -- front matter" toggle.
   , smRepoUrl :: Maybe Text
     -- ^ The URL of the repository cloned into the session's workdir via
     -- @SETUP_REPO@ (either agent-invoked or the web setup-repo endpoint).
@@ -59,10 +72,12 @@ instance ToJSON SessionMeta where
     , "provider"    .= smProvider m
     , "model"       .= smModel m
     , "channel"     .= smChannel m
+    , "parent"      .= smParent m
     , "agent"       .= smAgent m
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
     , "description" .= smDescription m
+    , "seal_front_matter" .= smSealFrontMatter m
     , "repo_url"    .= smRepoUrl m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
@@ -74,10 +89,12 @@ instance FromJSON SessionMeta where
     <*> o .:  "provider"
     <*> o .:  "model"
     <*> o .:? "channel" .!= "cli"
+    <*> o .:? "parent"
     <*> o .:? "agent"
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
     <*> o .:? "description"
+    <*> o .:? "seal_front_matter" .!= True
     <*> o .:? "repo_url"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

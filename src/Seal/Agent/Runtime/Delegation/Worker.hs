@@ -26,7 +26,8 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (createDirectoryIfMissing)
+import Data.Time (getCurrentTime)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 
 import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..))
@@ -40,19 +41,23 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
-import Seal.Config.Paths (SealPaths, agentSessionDir)
+import Seal.Config.Paths (SealPaths, agentSessionDir, sessionMetaPath)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (withIndexedTranscript)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
+import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveChildSessionMeta)
 import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Timeout (ToolTimeoutConfig)
 import Seal.Types.App (runApp)
 import Seal.Types.Env (Env)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | Opcodes that a child agent must NEVER have access to. Mirrors Hermes'
 -- @DELEGATE_BLOCKED_TOOLS@. Stripping these means a child cannot:
@@ -142,6 +147,14 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   { dwdPaths        :: SealPaths
   , dwdParentSid    :: SessionId
     -- ^ The parent's session id — the child's transcript nests under it.
+  , dwdParentLineage :: [SessionId]
+    -- ^ The parent's FULL lineage, self first (threaded from
+    -- @buildWorker@'s @parentLineage@ parameter in "Seal.Core.TurnEngine").
+    -- The worker prepends each spawned child's own id and passes
+    -- @childSid : dwdParentLineage@ to 'dwdChildRegistry' so the child's
+    -- session ops get the whole chain baked in — no per-call meta reads,
+    -- no directory scans on the guard path. Empty in test deps that
+    -- don't exercise lineage.
   , dwdAppEnv       :: Env
     -- ^ The top-level app env (katip logging, config) — re-used for the
     -- child's 'runApp'.
@@ -187,12 +200,16 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- spawn repo-shipped specialists. In mode=remote this reuses the
     -- parent's cachedWorkdirScan result — no new control-plane FS reads.
   , dwdChildRegistry
-      :: AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO Registry
-    -- ^ Build the child's narrowed ISA registry. W2 signature (was
-    -- @AgentDef -> SessionId -> ChannelCaps@): gains the CHILD's own
-    -- delegation depth ('dwdParentDepth' + 1) and the child's effective
-    -- role, both computed by 'mkDelegateWorker'. The wiring layer is
-    -- responsible for applying the role-aware blocklist
+      :: [SessionId] -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO Registry
+    -- ^ Build the child's narrowed ISA registry. The first argument is
+    -- the CHILD's full lineage (self first), computed by
+    -- 'mkDelegateWorker' as @childSid : dwdParentLineage@ — the
+    -- registry bakes it into the child's session ops so the
+    -- self/ancestor read guards never need a per-call lookup. W2
+    -- signature (was @AgentDef -> SessionId -> ChannelCaps@): gains the
+    -- CHILD's own delegation depth ('dwdParentDepth' + 1) and the
+    -- child's effective role, both computed by 'mkDelegateWorker'. The
+    -- wiring layer is responsible for applying the role-aware blocklist
     -- ('childBlocklist') to the ops list AND the def's @adTools@
     -- allow-list ('narrowAllowListWith' / 'intersectAllowList') and
     -- constructing the registry — including, for orchestrator children,
@@ -217,6 +234,15 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- (looked up from the 'Seal.Tools.Exec.Abort.SessionAbortRegistry').
     -- The child's abort is independent of the parent's in v1 (a parent
     -- abort doesn't auto-abort the child, and vice versa).
+  , dwdRepeatTrack :: SessionId -> IO RepeatTrack
+    -- ^ Construct the child's no-progress repeat window from the child's
+    -- session id (looked up from the process-lifetime
+    -- 'Seal.ISA.RepeatDetect.SessionRepeatRegistry'; session-read hardening
+    -- WU4). Mirrors 'dwdAbortFlag': the wiring layer passes the partially
+    -- applied 'Seal.ISA.RepeatDetect.lookupOrCreateRepeatTrack' and the
+    -- worker resolves it with the minted child sid at spawn time, so the
+    -- child's window is independent of the parent's and survives across
+    -- the child's turns.
   , dwdToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config, inherited from the parent
     -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
@@ -246,19 +272,25 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                        CerError 0 0 (Just childSid))
     Right (prov, model) ->
       withIndexedTranscript childDir $ \childTHandle -> do
+        writeChildMeta deps childSid
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
         let capturingCaps = def
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
               , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
-        childReg <- dwdChildRegistry deps agentDef childDepth
-                                     (effectiveRole (adRole agentDef) (ctRole task))
-                                     childSid capturingCaps
+        -- The child's full lineage, self first: the child's own id
+        -- prepended to the parent's baked chain. Passed into the
+        -- registry seam so the child's session ops get the whole chain.
+        let childLineage = childSid : dwdParentLineage deps
+        childReg <- dwdChildRegistry deps childLineage agentDef childDepth
+                                      (effectiveRole (adRole agentDef) (ctRole task))
+                                      childSid capturingCaps
         let anchor = if ctIsolateWorkdir task then Nothing else dwdParentWorkdir deps
         childUioEnv <- dwdMkUIOEnv deps anchor childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
         childAbortFlag <- dwdAbortFlag deps childSid
+        childRepeatTrack <- dwdRepeatTrack deps childSid
         -- Capture the final answer via 'aeOnStop': the loop's
         -- final-answer path calls 'notifyStop' (the replyFanout hook)
         -- rather than 'ccSend' — the double-delivery fix. The
@@ -292,8 +324,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeOnTextDelta = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
-              , aeAbortFlag  = childAbortFlag
-              , aeToolTimeout = dwdToolTimeout deps
+               , aeAbortFlag  = childAbortFlag
+               , aeRepeatTrack = childRepeatTrack
+               , aeToolTimeout = dwdToolTimeout deps
               }
         runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
           `catch` \e -> writeIORef summaryRef
@@ -309,3 +342,42 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         pure (ChildWorkerOutcome summary exitReason 0 0 (Just childSid))
   where
     providerLabel d = if T.null (adProvider d) then "ollama" else adProvider d
+
+-- | Write a minimal 'SessionMeta' for a spawned child session into its
+-- child dir (@\<parent\>\/agents\/\<child\>\/session.json@): the child's
+-- own id, the parent's provider/model (the audit trail records what the
+-- parent session ran on), channel @"agent"@, and 'smParent' = the
+-- spawning parent. Unreadable parent meta falls back to @\"unknown\"@.
+-- Idempotent — overwrites harmlessly. The child meta never appears in
+-- 'Seal.Session.Store.listSessions' (which scans only top-level dirs).
+writeChildMeta :: DelegationWorkerDeps -> SessionId -> IO ()
+writeChildMeta deps childSid = do
+  mParent <- loadParentMeta deps
+  now <- getCurrentTime
+  let (provider, model) = case mParent of
+        Just pm -> (smProvider pm, smModel pm)
+        Nothing -> ("unknown", "unknown")
+  saveChildSessionMeta (dwdPaths deps) (dwdParentSid deps) childSid SessionMeta
+    { smId = childSid
+    , smProvider = provider
+    , smModel = model
+    , smChannel = "agent"
+    , smParent = Just (dwdParentSid deps)
+    , smAgent = Nothing
+    , smSystemOverride = Nothing
+    , smAgentName = Nothing
+    , smDescription = Nothing
+    , smSealFrontMatter = True
+    , smRepoUrl = Nothing
+    , smCreatedAt = now
+    , smLastActive = now
+    }
+
+-- | Load the parent session's 'SessionMeta', if readable. Local mirror of
+-- the engine's @loadSessionMeta@ (the worker cannot import the engine
+-- without an import cycle).
+loadParentMeta :: DelegationWorkerDeps -> IO (Maybe SessionMeta)
+loadParentMeta deps = do
+  let mp = sessionMetaPath (dwdPaths deps) (dwdParentSid deps)
+  exists <- doesFileExist mp
+  if not exists then pure Nothing else decodeFileStrict mp

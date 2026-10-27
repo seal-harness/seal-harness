@@ -18,8 +18,9 @@ sampleMeta =
   let sid = fromRight (error "bad id") (mkSessionId "20260701-120000-042")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+       , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
        , smDescription = Nothing
+       , smSealFrontMatter = True
        , smRepoUrl = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
@@ -106,3 +107,34 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smRepoUrl (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smSealFrontMatter = False" $ do
+    let m = sampleMeta { smSealFrontMatter = False }
+    fmap smSealFrontMatter (decode (encode m)) `shouldBe` Just False
+
+  it "defaults smSealFrontMatter to True when absent (backwards-compat)" $ do
+    -- A session.json written before the toggle existed has no
+    -- 'seal_front_matter' key — it must load with the front matter ON.
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smSealFrontMatter (decode (encode j)) `shouldBe` Just True
+
+  it "defaults smParent to Nothing when absent (backwards-compat)" $ do
+    -- A session.json written before the parent link existed has no
+    -- 'parent' key — it must load as a top-level session.
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smParent (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smParent = Just sid" $ do
+    let sid = fromRight (error "bad id") (mkSessionId "20260601-120000-009")
+        m = sampleMeta { smParent = Just sid }
+    fmap smParent (decode (encode m)) `shouldBe` Just (Just sid)

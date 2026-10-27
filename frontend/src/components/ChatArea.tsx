@@ -2,6 +2,8 @@ import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } fr
 import { createPortal } from 'react-dom'
 import { Profiler, memo } from 'react'
 import type { Agent, AgentInfo, Message, MessageContent, CodeSpan, ToolCallInfo, ToolDefsBlock, SessionInfo, TranscriptEntry } from '../types'
+import { WS_RECONNECT_ALERT_THRESHOLD } from '../types/stream'
+import type { StreamStatus } from '../types/stream'
 import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
@@ -10,6 +12,134 @@ import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
+
+/** The connection-state banner shown above the transcript when the
+ *  WebSocket stream is not live.
+ *
+ *  The transcript's only data path is the WebSocket, so when the socket
+ *  dies the transcript silently stops updating — the user cannot tell
+ *  whether the agent is still thinking or the connection is broken. This
+ *  banner makes the state visible.
+ *
+ *  Deliberately non-modal: the transcript stays fully readable (the HTTP
+ *  seed still works), because the user may be reading history while the
+ *  live tail is down. */
+function StreamConnectionBanner({
+  status,
+  error,
+}: {
+  status: StreamStatus | undefined
+  error: string | null | undefined
+}) {
+  // 'live' is the healthy state. 'closed' is the terminal state after an
+  // explicit client.close() — warning about it would be noise. 'replaying'
+  // is a normal transient state (the client is catching up), so it does
+  // not warrant a banner.
+  if (status === undefined || status === 'live' || status === 'closed' || status === 'replaying') {
+    return null
+  }
+  const label = status === 'connecting'
+    ? 'Connecting to the live stream\u2026'
+    : 'Live updates disconnected \u2014 reconnecting.'
+  return (
+    <div
+      data-testid="ws-connection-banner"
+      role="status"
+      className="flex items-center gap-2 text-xs px-3 py-2 mb-4 rounded-md"
+      style={{
+        background: 'var(--bg-elevated)',
+        border: '1px solid var(--border)',
+        color: 'var(--text-muted)',
+      }}
+    >
+      <span
+        aria-hidden="true"
+        className="inline-block w-2 h-2 rounded-full shrink-0"
+        style={{ background: 'var(--needs-input)' }}
+      />
+      <span>{label}</span>
+      {error && <span style={{ color: 'var(--text-muted)' }}>\u2014 {error}</span>}
+    </div>
+  )
+}
+
+/** The terminal-disconnect modal.
+ *
+ *  Shown once the reconnect ladder has been exhausted (see
+ *  'WS_RECONNECT_ALERT_THRESHOLD'). A brief disconnect is self-healing and
+ *  gets only the banner; a PERSISTENT one leaves the transcript frozen
+ *  with no explanation, and the user may sit waiting for a reply that is
+ *  already on disk.
+ *
+ *  Deliberately NOT a blocking overlay: the transcript stays readable and
+ *  the composer stays usable, because the agent keeps running server-side
+ *  regardless of the WebSocket state. */
+function StreamConnectionModal({
+  status,
+  error,
+  attempts,
+  onReconnect,
+}: {
+  status: StreamStatus | undefined
+  error: string | null | undefined
+  attempts: number
+  onReconnect?: () => void
+}) {
+  const [dismissed, setDismissed] = useState(false)
+  // The modal is terminal-state only: a live (or closed) stream has nothing
+  // to report.
+  const terminal =
+    status !== undefined && status !== 'live' && status !== 'closed' && status !== 'replaying'
+  // A successful connection clears the dismissal, so a LATER outage is
+  // reported again rather than staying silently dismissed.
+  useEffect(() => {
+    if (status === 'live') setDismissed(false)
+  }, [status])
+  if (!terminal || dismissed || attempts < WS_RECONNECT_ALERT_THRESHOLD) return null
+  return (
+    <div
+      className="ws-connection-modal-backdrop"
+      data-testid="ws-connection-modal-backdrop"
+      onClick={() => setDismissed(true)}
+    >
+      <div
+        className="ws-connection-modal"
+        data-testid="ws-connection-modal"
+        role="dialog"
+        aria-modal="false"
+        aria-labelledby="ws-connection-modal-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <span id="ws-connection-modal-title" className="ws-connection-modal-title">
+          Live updates unavailable
+        </span>
+        <p className="ws-connection-modal-body">
+          The connection to the gateway could not be re-established after {attempts} attempts.
+          The transcript shown may be out of date — the agent may still be working.
+        </p>
+        {error && <p className="ws-connection-modal-error">{error}</p>}
+        <div className="ws-connection-modal-actions">
+          {onReconnect && (
+            <button
+              data-testid="ws-connection-reconnect"
+              className="btn btn-primary"
+              onClick={() => onReconnect()}
+            >
+              Reconnect now
+            </button>
+          )}
+          <button
+            data-testid="ws-connection-dismiss"
+            className="btn btn-ghost"
+            onClick={() => setDismissed(true)}
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -1508,12 +1638,22 @@ function SessionSetup({
   onAgentChange,
   customPromptFile,
   onCustomPromptFile,
+  sealFrontMatter,
+  onSealFrontMatterChange,
 }: {
   agents: AgentInfo[]
   currentAgent: string | null
   onAgentChange: (agent: string) => void
   customPromptFile: { name: string; content: string } | null
   onCustomPromptFile: (file: { name: string; content: string } | null) => void
+  /** Whether the harness injects its own front matter into the session's
+   *  system prompt (the static guidance blocks, the auto-loaded
+   *  `seal-usage` skill, the codegraph skill, and the available-skills /
+   *  available-agents catalogs). True (the default) injects it; false
+   *  means the system prompt is the selected agent's prompt and nothing
+   *  else. */
+  sealFrontMatter: boolean
+  onSealFrontMatterChange: (enabled: boolean) => void
 }) {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1580,6 +1720,35 @@ function SessionSetup({
           </select>
         </div>
       )}
+
+      {/* The "Add Seal Harness front matter" toggle. On (the default), the
+          harness appends its own front matter — the static behavioral
+          guidance, the auto-loaded `seal-usage` skill, the codegraph skill,
+          and the available-skills / available-agents catalogs — to the
+          selected agent's prompt. Off, the system prompt is the agent's
+          prompt and nothing else. */}
+      <label
+        className="w-full flex items-start gap-2 cursor-pointer"
+        data-testid="session-setup-seal-front-matter"
+      >
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          aria-label="Add Seal Harness front matter"
+          checked={sealFrontMatter}
+          onChange={(e) => onSealFrontMatterChange(e.target.checked)}
+        />
+        <span>
+          <span className="text-xs font-medium block" style={{ color: 'var(--text-primary)' }}>
+            Add Seal Harness front matter
+          </span>
+          <span className="text-xs block" style={{ color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            {sealFrontMatter
+              ? "Seal's guidance and skills are added to the agent's prompt."
+              : "The agent's prompt is used on its own, with nothing added."}
+          </span>
+        </span>
+      </label>
 
       <div className="flex items-center gap-3 w-full" style={{ color: 'var(--text-faint)' }}>
         <div className="flex-1" style={{ borderTop: '1px solid var(--border)' }} />
@@ -1846,18 +2015,53 @@ export function extractToolDefs(tools: unknown[]): { names: string[]; descriptio
   return { names, descriptions }
 }
 
+/** The id of the entry that renders the session preamble (the "System
+ *  Prompt" and "Tools" rows) — the first LLM request in the view.
+ *
+ *  The preamble is the session's CONFIGURATION: it belongs at the top of
+ *  the transcript, not in the middle of the conversation. The backend
+ *  ships the system prompt and the tool definitions on every request
+ *  entry where they CHANGED (the transcript's envelope-delta encoding),
+ *  so a mid-session change — e.g. the agent catalog growing, or the
+ *  project's instructions being edited — produced a second preamble group
+ *  half-way down the session. Rendering that group inline made a
+ *  "System Prompt" section pop up at the bottom of a long session the
+ *  moment the user hit enter.
+ *
+ *  Opcode-invocation entries (SETUP_REPO, /skill load, approvals) are
+ *  request-direction too, but they are not LLM requests — their payload
+ *  carries the `op`/`harness` keys, which an LLM request payload never
+ *  does. */
+export function findPreambleId(entries: TranscriptEntry[]): string | undefined {
+  for (const e of entries) {
+    if (e.direction !== 'request') continue
+    // Harness-internal entries (the synthetic continuation prompt) are
+    // skipped by the renderer — they must not anchor the preamble.
+    if (e.internal === true) continue
+    const parsed = tryParsePayload(e.payload)
+    if (parsed && !('op' in parsed) && !('harness' in parsed)) return e.id
+  }
+  return undefined
+}
+
 /** Convert transcript entries to the Message format ChatArea expects.
  *  Parses each entry's payload JSON to extract text, code blocks, tool calls,
  *  and matches tool calls to their results by tool_use_id. Groups the system
- *  prompt into a collapsed System row (first occurrence only). The verbatim
- *  on-disk transcript line (`raw`) is carried through to the "View raw JSON
- *  (message)" modal so Seal always makes EVERYTHING visible to the user. */
+ *  prompt into a collapsed System row (the session preamble — rendered by the
+ *  first LLM request in the view, see `findPreambleId`). The verbatim on-disk
+ *  transcript line (`raw`) is carried through to the "View raw JSON (message)"
+ *  modal so Seal always makes EVERYTHING visible to the user. */
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
   const toolResults = buildToolResultIndex(entries)
-  const seenSystem = new Set<string>()
-  const seenTools = new Set<string>()
+  // The session preamble (the "System Prompt" + "Tools" rows) is rendered
+  // by the first LLM request in the view — and by no other entry. The
+  // backend ships the system prompt and the tools on every request entry
+  // where they CHANGED, so a mid-session change used to render a second
+  // preamble group half-way down the session. See the sibling hook
+  // `useTranscriptMessages` for the full rationale.
+  const preambleId = findPreambleId(entries)
 
   for (const e of entries) {
     const ts = formatTimestamp(e.timestamp)
@@ -1966,48 +2170,43 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // System Prompt and Tools rows: deduplicate by content. The
+        // The session preamble (System Prompt + Tools rows) is rendered by
+        // the first LLM request in the view — and by no other entry. The
         // backend's delta encoding only includes `system` and `tools` when
-        // they CHANGE from the prior request. The frontend deduplicates by
-        // content: the first occurrence of each unique system prompt /
-        // tools array renders a row; subsequent identical values are
-        // skipped. This keeps System Prompt and Tools rows at their
-        // first-occurrence positions (typically the top of the
-        // transcript) and prevents them from shifting when new entries
-        // arrive. Changed values DO render a new row at their change
-        // position, so the user can see when the system prompt or tools
-        // changed mid-conversation.
-        const sysPrompt = parsed.system as string | undefined
-        const tools = parsed.tools
-        const hasTools = Array.isArray(tools) && tools.length > 0
-        const toolsKey = hasTools ? JSON.stringify(tools) : ''
-        const toolDefsBlock = hasTools
-          ? (() => {
-              const { names, descriptions } = extractToolDefs(tools)
-              return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
-            })()
-          : undefined
-        if (sysPrompt && !seenSystem.has(sysPrompt)) {
-          seenSystem.add(sysPrompt)
-          messages.push({
-            id: e.id + '-sys',
-            agentName: 'System Prompt',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
-            rawJson,
-          })
-        }
-        if (toolDefsBlock && !seenTools.has(toolsKey)) {
-          seenTools.add(toolsKey)
-          messages.push({
-            id: e.id + '-tools',
-            agentName: 'Tools',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
-            rawJson,
-          })
+        // they CHANGE from the prior request, so a mid-session change used
+        // to render a second preamble group half-way down the session (a
+        // "System Prompt" section popping up at the bottom of a long
+        // session the moment the user hit enter).
+        if (preambleId === e.id) {
+          const sysPrompt = parsed.system as string | undefined
+          const tools = parsed.tools
+          const hasTools = Array.isArray(tools) && tools.length > 0
+          const toolDefsBlock = hasTools
+            ? (() => {
+                const { names, descriptions } = extractToolDefs(tools)
+                return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
+              })()
+            : undefined
+          if (sysPrompt) {
+            messages.push({
+              id: e.id + '-sys',
+              agentName: 'System Prompt',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+              rawJson,
+            })
+          }
+          if (toolDefsBlock) {
+            messages.push({
+              id: e.id + '-tools',
+              agentName: 'Tools',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+              rawJson,
+            })
+          }
         }
         // Extract only the LAST message from the request — it's the new
         // one being sent. Earlier messages in the array are conversation
@@ -2290,6 +2489,8 @@ export function ChatArea({
   onAgentChange,
   customPromptFile,
   onCustomPromptFile,
+  sealFrontMatter,
+  onSealFrontMatterChange,
   composerControls,
   newTabFocusTick,
   selectedId,
@@ -2307,6 +2508,10 @@ export function ChatArea({
   onCancelQuestion,
   hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest,
   isViewingLatest,
+  streamStatus,
+  streamError,
+  streamReconnectAttempts,
+  onStreamReconnect,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -2333,6 +2538,11 @@ export function ChatArea({
   onAgentChange?: (agent: string) => void
   customPromptFile?: { name: string; content: string } | null
   onCustomPromptFile?: (file: { name: string; content: string } | null) => void
+  /** Whether the harness injects its own front matter into the session's
+   *  system prompt. True (the default) injects it; false means the system
+   *  prompt is the selected agent's prompt and nothing else. */
+  sealFrontMatter?: boolean
+  onSealFrontMatterChange?: (enabled: boolean) => void
   /** When set, ChatArea is in "new tab compose" mode. The messages region
    *  renders `panel` instead of the transcript, and the bottom input
    *  drives the new-tab create-and-send flow via `onSubmit`. The input
@@ -2371,6 +2581,17 @@ export function ChatArea({
   /** When set, an inline error banner is shown inside the composer region
    *  (e.g. a failed branch create). Cleared by the caller. */
   composeError?: string | null
+  /** The live-stream connection status. When it is not 'live', a
+   *  connection banner is shown above the transcript so a dead WebSocket
+   *  is visible rather than silent. */
+  streamStatus?: StreamStatus
+  /** The last live-stream error, shown in the connection banner. */
+  streamError?: string | null
+  /** Consecutive failed connection attempts. At or above
+   *  'WS_RECONNECT_ALERT_THRESHOLD' a modal is shown. */
+  streamReconnectAttempts?: number
+  /** Invoked by the modal's "Reconnect now" action. */
+  onStreamReconnect?: () => void
   /** The model the next /send should use for an existing session. Default
    *  is the most-recent transcript `_te_model`; the user can override via
    *  the input-row dropdown. Frontend-only state (never persisted). */
@@ -2786,6 +3007,12 @@ export function ChatArea({
   }
   return (
     <div className="flex-1 flex flex-col min-w-0" style={{ background: 'var(--bg-base)' }}>
+      <StreamConnectionModal
+        status={streamStatus}
+        error={streamError}
+        attempts={streamReconnectAttempts ?? 0}
+        onReconnect={onStreamReconnect}
+      />
       {/* Chat header */}
       <div
         className="px-5 py-3 flex items-center gap-2.5 shrink-0"
@@ -2830,6 +3057,17 @@ export function ChatArea({
                   pendingScrollToTop.current = true
                   wasAtBottom.current = false
                   loadFromBeginning()
+                  // Fallback: if loadFromBeginning was a no-op (pinned
+                  // entries are the same reference → useState bails out →
+                  // no re-render → useLayoutEffect never fires →
+                  // pendingScrollToTop never consumed), do the scroll
+                  // directly after paint.
+                  requestAnimationFrame(() => {
+                    if (pendingScrollToTop.current) {
+                      scrollerRef.current?.scrollTo({ top: 0 })
+                      pendingScrollToTop.current = false
+                    }
+                  })
                 } else {
                   scrollerRef.current?.scrollTo({ top: 0 })
                 }
@@ -2862,6 +3100,18 @@ export function ChatArea({
                   pendingScrollToBottom.current = true
                   wasAtBottom.current = true
                   loadLatest()
+                  // Fallback: if loadLatest was a no-op (pinned entries
+                  // are the same reference → useState bails out → no
+                  // re-render → useLayoutEffect never fires →
+                  // pendingScrollToBottom never consumed), do the scroll
+                  // directly after paint.
+                  requestAnimationFrame(() => {
+                    if (pendingScrollToBottom.current) {
+                      const el = scrollerRef.current
+                      if (el) el.scrollTo({ top: el.scrollHeight })
+                      pendingScrollToBottom.current = false
+                    }
+                  })
                   // Diagnostic: check if loadLatest was a no-op (same
                   // entries reference → no re-render → useLayoutEffect
                   // never fires → pendingScrollToBottom never consumed).
@@ -2914,6 +3164,10 @@ export function ChatArea({
       {/* Messages or composer panel */}
       <div ref={scrollerRef} className="flex-1 overflow-y-auto chat-scroll px-5 py-6">
         <div className="flex flex-col gap-5">
+          {/* Live-stream connection state. Non-modal: the transcript below
+              stays readable (the HTTP seed still works) while the live
+              tail is down. */}
+          <StreamConnectionBanner status={streamStatus} error={streamError} />
           {/* Load older entries UI */}
           {hasMore && !loadingMore && loadOlder && (
             <button
@@ -2961,6 +3215,8 @@ export function ChatArea({
               onAgentChange={onAgentChange}
               customPromptFile={customPromptFile ?? null}
               onCustomPromptFile={onCustomPromptFile}
+              sealFrontMatter={sealFrontMatter ?? true}
+              onSealFrontMatterChange={onSealFrontMatterChange ?? (() => {})}
             />
           ) : messages.length === 0 ? (
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>

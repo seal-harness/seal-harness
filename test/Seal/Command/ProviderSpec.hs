@@ -339,8 +339,9 @@ legacyMeta =
       sid = fromRight (error "bad sid") (mkSessionId "legacy")
   in SessionMeta
        { smId = sid, smProvider = "openai-compat", smModel = "deepseek/x"
-       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing
-       , smAgentName = Nothing, smDescription = Nothing, smRepoUrl = Nothing
+       , smChannel = "cli", smParent = Nothing, smAgent = Nothing
+       , smSystemOverride = Nothing, smAgentName = Nothing
+       , smDescription = Nothing, smSealFrontMatter = True, smRepoUrl = Nothing
        , smCreatedAt = t, smLastActive = t
        }
 

@@ -17,13 +17,16 @@ import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Config.File
   (ProviderConfig (..), defaultRuntimeConfig, upsertProvider, RuntimeConfig (..))
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionMetaPath)
 import Seal.Core.Types (isValidSessionId, sessionIdText)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, initSession, listSessions
-  , newSession, saveSessionMeta )
+  , newSession, saveSessionMeta, saveChildSessionMeta
+  , updateSessionSealFrontMatter )
+import Seal.Util.StrictIO (decodeFileStrict)
 
 mkPaths :: FilePath -> SealPaths
 mkPaths root = SealPaths
@@ -66,8 +69,9 @@ spec = describe "Seal.Session.Store" $ do
               let sid = fromRight (error "invalid sid") (Seal.Core.Types.mkSessionId idText)
               saveSessionMeta paths SessionMeta
                 { smId = sid, smProvider = "anthropic", smModel = "m"
-                , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+                , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
                 , smDescription = Nothing
+                , smSealFrontMatter = True
                 , smRepoUrl = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
@@ -79,6 +83,46 @@ spec = describe "Seal.Session.Store" $ do
         metas <- listSessions paths
         map (sessionIdText . smId) metas
           `shouldBe` ["20260701-120000-002", "20260701-120000-001"]
+
+  describe "saveChildSessionMeta" $ do
+    it "writes session.json into the child (agents) dir with smParent = parent" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+            parent = fromRight (error "bad parent") (Seal.Core.Types.mkSessionId "20260701-120000-010")
+            child = fromRight (error "bad child") (Seal.Core.Types.mkSessionId "20260701-120000-011")
+            childMeta = SessionMeta
+              { smId = child, smProvider = "anthropic", smModel = "m"
+              , smChannel = "agent", smParent = Just parent, smAgent = Nothing
+              , smSystemOverride = Nothing, smAgentName = Nothing
+              , smDescription = Nothing
+              , smSealFrontMatter = True
+              , smRepoUrl = Nothing
+              , smCreatedAt = aTime, smLastActive = aTime }
+        saveChildSessionMeta paths parent child childMeta
+        let childMetaPath = agentSessionDir paths parent child </> "session.json"
+        exists <- doesFileExist childMetaPath
+        exists `shouldBe` True
+        mMeta <- decodeFileStrict childMetaPath
+        fmap smParent mMeta `shouldBe` Just (Just parent)
+        fmap smId mMeta `shouldBe` Just child
+        fmap smChannel mMeta `shouldBe` Just "agent"
+
+    it "the child meta does not appear in listSessions" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+            parent = fromRight (error "bad parent") (Seal.Core.Types.mkSessionId "20260701-120000-012")
+            child = fromRight (error "bad child") (Seal.Core.Types.mkSessionId "20260701-120000-013")
+            childMeta = SessionMeta
+              { smId = child, smProvider = "anthropic", smModel = "m"
+              , smChannel = "agent", smParent = Just parent, smAgent = Nothing
+              , smSystemOverride = Nothing, smAgentName = Nothing
+              , smDescription = Nothing
+              , smSealFrontMatter = True
+              , smRepoUrl = Nothing
+              , smCreatedAt = aTime, smLastActive = aTime }
+        saveChildSessionMeta paths parent child childMeta
+        metas <- listSessions paths
+        any ((== child) . smId) metas `shouldBe` False
 
   describe "defaultSessionSelection" $ do
     it "uses the parsed provider's default model when no model is configured" $ do
@@ -146,3 +190,31 @@ spec = describe "Seal.Session.Store" $ do
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
+
+  describe "updateSessionSealFrontMatter" $ do
+    it "persists the front-matter flag to session.json" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        -- The default is ON (front matter injected).
+        smSealFrontMatter m `shouldBe` True
+        ok <- updateSessionSealFrontMatter paths (smId m) False
+        ok `shouldBe` True
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smSealFrontMatter mAfter `shouldBe` Just False
+
+    it "can turn the front matter back on" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        _ <- updateSessionSealFrontMatter paths (smId m) False
+        ok <- updateSessionSealFrontMatter paths (smId m) True
+        ok `shouldBe` True
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smSealFrontMatter mAfter `shouldBe` Just True
+
+    it "returns False for a session that does not exist" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+            sid = fromRight (error "bad sid") (Seal.Core.Types.mkSessionId "20260701-120000-042")
+        updateSessionSealFrontMatter paths sid False `shouldReturn` False

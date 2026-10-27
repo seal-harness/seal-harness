@@ -48,6 +48,7 @@ import {
   setSessionDescription,
   setSessionArchived,
   setSessionPrompt,
+  setSessionSealFrontMatter,
   createTab,
   closeTab,
   dismissTab,
@@ -316,27 +317,45 @@ describe('useTranscript', () => {
 describe('useSendMessage', () => {
   it('POSTs /api/sessions/:id/send with {message, model?} and returns the parsed body', async () => {
     setNextResponse({ kind: 'slash', response: '/help text' })
-    const onComplete = vi.fn()
-    const { result } = renderHook(() => useSendMessage('s1', onComplete))
+    const { result } = renderHook(() => useSendMessage('s1'))
     let res: { kind: string; response: string } | null = null
     await act(async () => { res = await result.current.send('/help') })
     expect(res).toEqual({ kind: 'slash', response: '/help text' })
     expect(fetchCalls.some((c) => c.url === '/api/sessions/s1/send')).toBe(true)
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/send')!
     expect(JSON.parse(call.init!.body as string)).toEqual({ message: '/help' })
-    expect(onComplete).toHaveBeenCalled()
+  })
+
+  it('does NOT re-seed the transcript when POST /send returns', async () => {
+    // The backend forks the turn and returns from POST /send IMMEDIATELY
+    // (measured: 3ms), while the turn's first entry lands ~1s later. A
+    // re-seed fired here always raced the turn and saw a pre-turn
+    // transcript, so it was a wasted request that could never catch
+    // anything. The re-seed now runs when the turn COMPLETES (the WS
+    // 'harness-status: idle' activity), which is after the entries are on
+    // disk.
+    setNextResponse({ kind: 'assistant', response: '' })
+    const fetchMock = vi.fn(async (_url: string) => new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useSendMessage('s1'))
+    await act(async () => { await result.current.send('hi') })
+    // Only the POST /send went over HTTP — no transcript re-seed.
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => u.includes('/transcript'))).toBe(false)
+    expect(urls.some((u) => u.includes('/send'))).toBe(true)
+    vi.unstubAllGlobals()
   })
 
   it('includes model in the body when provided', async () => {
     setNextResponse({ kind: 'assistant', response: '' })
-    const { result } = renderHook(() => useSendMessage('s1', () => {}))
+    const { result } = renderHook(() => useSendMessage('s1'))
     await act(async () => { await result.current.send('hi', 'claude-sonnet-4') })
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/send')!
     expect(JSON.parse(call.init!.body as string)).toEqual({ message: 'hi', model: 'claude-sonnet-4' })
   })
 
   it('returns null when sessionId is null', async () => {
-    const { result } = renderHook(() => useSendMessage(null, () => {}))
+    const { result } = renderHook(() => useSendMessage(null))
     let res: unknown = 'uninit'
     await act(async () => { res = await result.current.send('hi') })
     expect(res).toBeNull()
@@ -357,7 +376,7 @@ describe('useSendMessage', () => {
       })
     }))
     const { result, rerender } = renderHook(
-      ({ sid }: { sid: string | null }) => useSendMessage(sid, () => {}),
+      ({ sid }: { sid: string | null }) => useSendMessage(sid),
       { initialProps: { sid: 's1' as string | null } },
     )
     // Kick off a send on s1 — the POST stays in flight (never resolves).
@@ -382,7 +401,7 @@ describe('useSendMessage', () => {
         }))
       })
     }))
-    const { result } = renderHook(() => useSendMessage('s1', () => {}))
+    const { result } = renderHook(() => useSendMessage('s1'))
     // Kick off a send — POST stays in flight.
     await act(async () => { void result.current.send('hi') })
     await act(async () => { await Promise.resolve() })
@@ -430,6 +449,15 @@ describe('session mutators', () => {
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/prompt')!
     expect(call.init!.method).toBe('PUT')
     expect(JSON.parse(call.init!.body as string)).toEqual({ prompt: 'be concise' })
+  })
+
+  it('setSessionSealFrontMatter PUTs /api/sessions/:id/seal-front-matter with {enabled}', async () => {
+    setNextResponse('{}')
+    const ok = await setSessionSealFrontMatter('s1', false)
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/seal-front-matter')!
+    expect(call.init!.method).toBe('PUT')
+    expect(JSON.parse(call.init!.body as string)).toEqual({ enabled: false })
   })
 })
 

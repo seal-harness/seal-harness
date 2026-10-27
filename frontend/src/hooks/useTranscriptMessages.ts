@@ -14,9 +14,10 @@
  *   the existing map without re-scanning the full transcript. When a new
  *   tool_result arrives, previously-cached entries that have matching
  *   tool_use blocks are re-processed so their tool calls get the result.
- * - Dedup state (seenSystem, seenTools) is maintained incrementally — only
- *   entries carrying `system` or `tools` fields affect it, and those are
- *   rare (the backend's delta encoding omits unchanged values).
+ * - The session preamble (the "System Prompt" + "Tools" rows) is rendered
+ *   by the first LLM request in the view and by no other entry, so the
+ *   rows stay at the top of the session instead of re-appearing wherever
+ *   the system prompt or the tool set changed mid-session.
  *
  * On session change (different first entry id), the cache is cleared and
  * rebuilt from scratch.
@@ -34,6 +35,7 @@ import {
   extractThinking,
   extractToolCalls,
   extractToolDefs,
+  findPreambleId,
   formatTimestamp,
   tryParsePayload,
 } from '../components/ChatArea'
@@ -76,8 +78,9 @@ function formatToolResultContent(content: unknown): string {
  *  single entry into `Message[]`. */
 interface ProcessContext {
   toolResults: Map<string, ToolResultRecord>
-  seenSystem: Set<string>
-  seenTools: Set<string>
+  /** Id of the entry that renders the session preamble (the "System
+   *  Prompt" and "Tools" rows) — the first LLM request in the view. */
+  preambleId: string | undefined
 }
 
 /** Process a single transcript entry into `Message[]`, using the shared
@@ -89,18 +92,24 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
   const rawJson: () => string = () => e.raw || (typeof e.payload === "string" ? e.payload : JSON.stringify(e.payload, null, 2))
   const messages: Message[] = []
 
+  // Skip harness-internal entries (e.g. the synthetic continuation
+  // prompt appended after a StopMaxTokens truncation). These are
+  // system-injected messages that should not appear as user bubbles.
+  if (e.internal === true) return []
+
   if (e.direction === 'request') {
     const parsed = tryParsePayload(e.payload)
     if (parsed) {
       const opName = (parsed.op as { name?: string } | undefined)?.name
-      if (opName === 'SKILL_LOAD' && parsed.result) {
+      const isSkillLoad = opName === 'SKILL_LOAD' || (opName === 'SKILL_MANAGE' && (parsed.input as { action?: string } | undefined)?.action === 'load')
+      if (isSkillLoad && parsed.result) {
         const input = parsed.input as { id?: string } | undefined
         const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
         const body = result?.body ?? ''
         const channel = e.channel
         const tc: ToolCallInfo = {
           id: 'skillload-' + e.id,
-          name: 'SKILL_LOAD',
+          name: opName === 'SKILL_MANAGE' ? 'SKILL_MANAGE' : 'SKILL_LOAD',
           input: input ?? {},
           result: body,
           resultIsError: false,
@@ -162,38 +171,39 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         })
         return messages
       }
-      // System Prompt and Tools rows: deduplicate by content.
-      const sysPrompt = parsed.system as string | undefined
-      const tools = parsed.tools
-      const hasTools = Array.isArray(tools) && tools.length > 0
-      const toolsKey = hasTools ? JSON.stringify(tools) : ''
-      const toolDefsBlock = hasTools
-        ? (() => {
-            const { names, descriptions } = extractToolDefs(tools)
-            return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
-          })()
-        : undefined
-      if (sysPrompt && !ctx.seenSystem.has(sysPrompt)) {
-        ctx.seenSystem.add(sysPrompt)
-        messages.push({
-          id: e.id + '-sys',
-          agentName: 'System Prompt',
-          agentStatus: 'idle',
-          timestamp: ts,
-          blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
-          rawJson,
-        })
-      }
-      if (toolDefsBlock && !ctx.seenTools.has(toolsKey)) {
-        ctx.seenTools.add(toolsKey)
-        messages.push({
-          id: e.id + '-tools',
-          agentName: 'Tools',
-          agentStatus: 'idle',
-          timestamp: ts,
-          blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
-          rawJson,
-        })
+      // The session preamble (System Prompt + Tools rows) is rendered by
+      // the first LLM request in the view — and by no other entry. See
+      // `findPreambleId`.
+      if (ctx.preambleId === e.id) {
+        const sysPrompt = parsed.system as string | undefined
+        const tools = parsed.tools
+        const hasTools = Array.isArray(tools) && tools.length > 0
+        const toolDefsBlock = hasTools
+          ? (() => {
+              const { names, descriptions } = extractToolDefs(tools)
+              return { count: names.length, names, descriptions, json: JSON.stringify(tools, null, 2) }
+            })()
+          : undefined
+        if (sysPrompt) {
+          messages.push({
+            id: e.id + '-sys',
+            agentName: 'System Prompt',
+            agentStatus: 'idle',
+            timestamp: ts,
+            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+            rawJson,
+          })
+        }
+        if (toolDefsBlock) {
+          messages.push({
+            id: e.id + '-tools',
+            agentName: 'Tools',
+            agentStatus: 'idle',
+            timestamp: ts,
+            blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+            rawJson,
+          })
+        }
       }
       const msgs = parsed.messages as Array<{ role: string; content: Array<{ type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }> }> | undefined
       if (msgs && msgs.length > 0) {
@@ -261,7 +271,14 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         blocks.push({ id: 'r-' + e.id + '-tk-' + i, thinkingText: tk }))
       if (textParts) blocks.push({ id: 'r-' + e.id + '-text', text: textParts })
       for (const tc of toolCalls) blocks.push({ id: 'tc-' + tc.id, toolCall: tc })
-      if (blocks.length === 0) blocks.push({ id: 'r-' + e.id + '-empty', text: '(empty response)' })
+      if (blocks.length === 0) {
+        const stopReason = parsed.stop as string | undefined
+        const isEmptyMaxTokens = stopReason === 'max_tokens'
+        blocks.push({
+          id: 'r-' + e.id + '-empty',
+          text: isEmptyMaxTokens ? '(truncated — continuing…)' : '(empty response)',
+        })
+      }
 
       messages.push({
         id: e.id,
@@ -337,8 +354,14 @@ interface CachedEntry {
 class TranscriptRenderer {
   private cache: Map<string, CachedEntry> = new Map()
   private toolResults: Map<string, ToolResultRecord> = new Map()
-  private seenSystem: Set<string> = new Set()
-  private seenTools: Set<string> = new Set()
+  /** The entry that rendered the session preamble in the last update —
+   *  re-processed when the anchor moves so the preamble rows follow it. */
+  private preambleId: string | undefined = undefined
+  /** The id of the first entry of the last view. The preamble anchor can
+ *  only move when it changes (the view grew upwards or was replaced), so
+ *  the anchor is recomputed only then — keeping the (large) preamble
+ *  payload parse off the per-event path. */
+  private firstEntryId: string | undefined = undefined
   private lastSessionId: string | null = null
 
   /** Process the full entries array and return the derived messages.
@@ -358,17 +381,31 @@ class TranscriptRenderer {
     }
     this.lastSessionId = sessionId
 
+    // The session preamble (the "System Prompt" + "Tools" rows) is
+    // rendered by the first LLM request in the view — and by no other
+    // entry. See `findPreambleId`.
+    //
+    // The anchor can only MOVE when the view's first entry changes (the
+    // anchor is the first LLM request, so anything before it is an opcode
+    // entry at the start of the view). It can also APPEAR while the view
+    // grows: a view that starts with opcode entries only (a session that
+    // has not sent anything yet) gets its first LLM request later. So the
+    // anchor is recomputed while there is none.
+    const firstEntryId = entries[0]?.id
+    if (firstEntryId !== this.firstEntryId || this.preambleId === undefined) {
+      this.firstEntryId = firstEntryId
+      this.preambleId = findPreambleId(entries)
+    }
+    const preambleId = this.preambleId
     const ctx: ProcessContext = {
       toolResults: this.toolResults,
-      seenSystem: this.seenSystem,
-      seenTools: this.seenTools,
+      preambleId,
     }
 
     // First pass: identify new/changed entries and update tool result index.
     const changedIds: Set<string> = new Set()
     const newToolResultIds: Set<string> = new Set()
     const currentIds: Set<string> = new Set()
-    let dedupRebuildNeeded = false
 
     for (const e of entries) {
       currentIds.add(e.id)
@@ -384,17 +421,6 @@ class TranscriptRenderer {
       // Entry is new or changed (different reference or not in cache).
       changedIds.add(e.id)
 
-      // If a changed entry carries system/tools, the dedup sets from the
-      // prior render would skip re-creating the System Prompt / Tools
-      // blocks (seenSystem/seenTools already contain the content). Flag
-      // for a full dedup rebuild so these blocks are re-created in their
-      // correct first-occurrence positions.
-      const changedParsed = tryParsePayload(e.payload)
-      if (changedParsed) {
-        if (changedParsed.system) dedupRebuildNeeded = true
-        if (Array.isArray(changedParsed.tools) && changedParsed.tools.length > 0) dedupRebuildNeeded = true
-      }
-
       // Extract new tool_results from this entry.
       const resultIds = extractToolResultIds(e)
       for (const rid of resultIds) {
@@ -405,14 +431,8 @@ class TranscriptRenderer {
     }
 
     // Remove evicted entries from cache (streaming placeholder eviction).
-    for (const [id, cached] of this.cache) {
+    for (const id of this.cache.keys()) {
       if (!currentIds.has(id)) {
-        // Check if this entry contributed to dedup sets.
-        const parsed = tryParsePayload(cached.entry.payload)
-        if (parsed) {
-          if (parsed.system) dedupRebuildNeeded = true
-          if (Array.isArray(parsed.tools) && parsed.tools.length > 0) dedupRebuildNeeded = true
-        }
         this.cache.delete(id)
       }
     }
@@ -432,19 +452,19 @@ class TranscriptRenderer {
       }
     }
 
-    // If entries were removed and they carried system/tools, rebuild dedup
-    // sets from scratch. This is rare (streaming placeholder eviction).
-    if (dedupRebuildNeeded) {
-      this.seenSystem.clear()
-      this.seenTools.clear()
-      // Re-process all entries that carry system/tools.
-      for (const e of entries) {
-        const parsed = tryParsePayload(e.payload)
-        if (parsed && (parsed.system || (Array.isArray(parsed.tools) && parsed.tools.length > 0))) {
-          changedIds.add(e.id)
-        }
-      }
+    // The preamble anchor moved (older entries were prepended, or the view
+    // was replaced): re-process the previous anchor so it stops rendering
+    // the preamble rows, and the new anchor so it renders them. The new
+    // anchor is re-processed unconditionally — cheap (one entry), and it
+    // guarantees the preamble rows survive a re-fetch that replaced the
+    // entry objects.
+    if (this.preambleId !== undefined && this.preambleId !== preambleId) {
+      changedIds.add(this.preambleId)
     }
+    if (preambleId !== undefined) {
+      changedIds.add(preambleId)
+    }
+    this.preambleId = preambleId
 
     // Process all changed entries.
     for (const e of entries) {
@@ -466,8 +486,8 @@ class TranscriptRenderer {
   private reset(): void {
     this.cache.clear()
     this.toolResults.clear()
-    this.seenSystem.clear()
-    this.seenTools.clear()
+    this.preambleId = undefined
+    this.firstEntryId = undefined
   }
 
   /** Update the tool result index with tool_results from an entry. */

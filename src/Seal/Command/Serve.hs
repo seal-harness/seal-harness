@@ -7,10 +7,11 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (catch)
 import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -29,9 +30,12 @@ import Seal.Channels.Chat.Types qualified as ChatTypes
 import Seal.Channels.Chat.Signal as ChatSignal
   (withSignalChatChannel, mkRealSignalChatTransport)
 import Seal.Channels.Chat.Telegram as ChatTelegram
-  (withTelegramChatChannel, mkRealTelegramChatTransport)
+  (withTelegramChatChannel, mkRealTelegramChatTransport, tgSetCommandsViaApi)
+import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
+import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
 
+import Seal.Agent.Runtime.Registry (AgentRuntime)
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Cursor
   ( newPersistingCursorStore, seedCursorStore )
@@ -46,6 +50,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
+import Seal.Command.Shutdown (handleServeInterrupt)
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
@@ -58,7 +63,7 @@ import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureS
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
-import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -93,8 +98,22 @@ import Seal.Web.UiState (newUiStateHandle)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
+--
+-- Ctrl-C is handled here: SIGINT reaches the RTS as a 'UserInterrupt' on the
+-- main thread, which 'handleServeInterrupt' turns into a shutdown log line
+-- naming the live sub-agents (whose forked threads die with this process)
+-- followed by exit 130.
 runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
 runServeMain autonomy mCliStaticDir logger = do
+  -- Filled in once the backends exist; 'Nothing' means an interrupt landed
+  -- during startup, before there was a runtime to report on.
+  runtimeRef <- newIORef Nothing
+  runServeMainInner autonomy mCliStaticDir logger runtimeRef
+    `catch` handleServeInterrupt logger runtimeRef
+
+runServeMainInner
+  :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
+runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
@@ -140,6 +159,10 @@ runServeMain autonomy mCliStaticDir logger = do
   let repo = openConfigRepo cfgRoot
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
   backends <- newBackends paths repo embedding
+  -- Publish the sub-agent runtime so an interrupt during the gateway run can
+  -- log exactly which children are being taken down with the process
+  -- ('Seal.Command.Shutdown').
+  writeIORef runtimeRef (Just (bRuntime backends))
   wakeMutex <- newSessionWakeMutex
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
@@ -285,6 +308,7 @@ runServeMain autonomy mCliStaticDir logger = do
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
         , sdAbortReg    = cdAbortReg chanDeps
+        , sdRepeatReg   = cdRepeatReg chanDeps
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
@@ -317,7 +341,14 @@ runServeMain autonomy mCliStaticDir logger = do
       gwCfg  = case mCliStaticDir of
         Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
         Nothing  -> gwCfg0
-      deps = ApiDeps
+  -- The WS stream server's liveness, published through /api/health. The
+  -- ref is created BEFORE the ApiDeps that reads it and is filled in by
+  -- the WS server thread once it has attempted its bind. Reporting the
+  -- CONFIGURED port unconditionally was the bug: a WS that failed to bind
+  -- (port already in use) still advertised the dead port, so the frontend
+  -- connected to a non-WebSocket port and its transcript froze.
+  wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
+  let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
         , adHarnessRegistry = reg
@@ -334,12 +365,14 @@ runServeMain autonomy mCliStaticDir logger = do
         , adConfigRepo       = repo
         , adVault            = rt
         , adPaths            = paths
-        , adWsPort           = gcWsPort gwCfg
+        , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
         }
-  -- Start the WS stream server on the WS port.
+  -- The WS stream server is MOUNTED in the HTTP application (same port),
+  -- so there is no second listener and no second port to collide with.
+  --
   -- The Origin allowlist is the configured list PLUS origins derived from
   -- the HTTP server's host + port. A wildcard host (0.0.0.0) means "bind all
   -- interfaces" — the browser may reach the server via any of them, so we
@@ -354,8 +387,12 @@ runServeMain autonomy mCliStaticDir logger = do
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
-  logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
-  _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
+  -- The WS server shares the HTTP listener, so it is up as soon as the
+  -- HTTP server is. Record that in the health state the /api/health
+  -- endpoint publishes.
+  writeIORef wsHealthRef (StreamHealth "up" (gcPort gwCfg))
+  logIO logger InfoS ("WS stream server mounted on the same port ("
+    <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))) <> ")")
   -- Periodically clear stale "thinking" sessions (safety net for sessions
   -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
   -- every 5 minutes; clears sessions thinking longer than 30 minutes.
@@ -374,7 +411,7 @@ runServeMain autonomy mCliStaticDir logger = do
   let isRemote = case scUntrustedExec secCfg of
         Just uefc -> uefcMode uefc == "remote"
         Nothing   -> False
-  runGateway logger gwCfg isRemote deps
+  runGateway logger gwCfg isRemote deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -470,11 +507,12 @@ forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
       let chatGwCfg = ChatTypes.GatewayConfig
             { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            -- The WS stream is served on the SAME port as the HTTP API.
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
             , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           accountText = Seal.Signal.Config.signalAccountText account
@@ -509,15 +547,29 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
       let chatGwCfg = ChatTypes.GatewayConfig
             { ChatTypes.gcHost = clientHost
             , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
+            -- The WS stream is served on the SAME port as the HTTP API.
+            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
             , ChatTypes.gcApiBase = "http://" <> clientHost
                 <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
             , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
+                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
             }
           chanCfg = defaultChatChannelConfig mgr chatGwCfg
           tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
+      -- Register the bot's command menu (/help on Telegram shows it) from
+      -- the gateway's slash-command registry. Forked: the chat listeners are
+      -- started before 'runGateway' binds the HTTP port, so an immediate
+      -- fetch always races the bind — 'registerWithRetry' retries for ~10s.
+      -- Failure is non-fatal (the bot still works; the menu is stale).
+      void (forkIO (do
+        eRes <- registerWithRetry 10 1000000
+                  (ChatHttp.httpGetCommands mgr (ChatTypes.gcApiBase chatGwCfg))
+                  (tgSetCommandsViaApi mgr tokenText)
+        case eRes of
+          Right () -> pure ()
+          Left e   -> logIO logger WarningS
+                        ("telegram chat channel: command menu not registered: " <> ls e)))
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit

@@ -18,6 +18,7 @@ import System.Directory (createDirectoryIfMissing)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
@@ -57,7 +58,7 @@ fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", s
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 runAppStatus :: Application -> Request -> IO Int
 runAppStatus app req = do
@@ -108,7 +109,8 @@ mkDeps = do
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
-    , adWsPort = 8081
+    
+    , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg

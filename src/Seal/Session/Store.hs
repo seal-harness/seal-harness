@@ -9,6 +9,7 @@ module Seal.Session.Store
   , newSession
   , newSessionMeta
   , saveSessionMeta
+  , saveChildSessionMeta
   , listSessions
   , listArchivedSessions
   , listChildSessions
@@ -21,6 +22,7 @@ module Seal.Session.Store
   , updateSessionSystemOverride
   , updateSessionDescription
   , updateSessionRepoUrl
+  , updateSessionSealFrontMatter
   , autoBindRepoAgent
   , autoBindRepoAgentWith
   , SessionRuntime (..)
@@ -41,7 +43,7 @@ import Data.Time
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , listDirectory, removeFile, renameFile )
-import System.FilePath ((</>), takeBaseName)
+import System.FilePath ((</>), takeBaseName, takeDirectory)
 import System.IO
   ( hClose, openBinaryTempFile )
 import System.Posix.Files (setFileMode)
@@ -50,7 +52,8 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
 import Seal.Config.File (RuntimeConfig (..))
 import Seal.Config.Paths
-  ( SealPaths, sessionArchivedMarkerPath, sessionDir, sessionMetaPath, sessionsRoot )
+  ( SealPaths, agentSessionDir, sessionArchivedMarkerPath
+  , sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModelFor)
 import Seal.Session.Meta (SessionMeta (..))
@@ -87,9 +90,10 @@ newSessionMeta _paths provider model channel mAgent = do
     Left e  -> ioError (userError ("session id generation failed: " <> T.unpack e))
   pure SessionMeta
     { smId = sid, smProvider = provider, smModel = model
-    , smChannel = channel, smAgent = mAgent
+    , smChannel = channel, smParent = Nothing, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
     , smDescription = Nothing
+    , smSealFrontMatter = True
     , smRepoUrl = Nothing
     , smCreatedAt = now, smLastActive = now }
 
@@ -106,9 +110,26 @@ newSession paths provider model channel mAgent = do
 -- /model command) don't collide on a shared @.tmp@ path ("resource busy"
 -- / "does not exist" rename race). The rename is atomic on POSIX.
 saveSessionMeta :: SealPaths -> SessionMeta -> IO ()
-saveSessionMeta paths meta = do
-  let dir  = sessionDir paths (smId meta)
-      path = sessionMetaPath paths (smId meta)
+saveSessionMeta paths meta = writeMetaFileAtomic (sessionMetaPath paths (smId meta)) meta
+
+-- | Persist a child (sub-agent) session's @session.json@ under
+-- @sessions\/\<parent\>\/agents\/\<child\>@ atomically. The same
+-- durability guarantees as 'saveSessionMeta' (dir 0700, unique temp
+-- file, chmod 0600, rename). The child meta is nested one level below
+-- the top-level dirs that 'listSessions' scans, so it never appears in
+-- the SESSION_MANAGE list.
+saveChildSessionMeta :: SealPaths -> SessionId -> SessionId -> SessionMeta -> IO ()
+saveChildSessionMeta paths parentSid childSid =
+  writeMetaFileAtomic (agentSessionDir paths parentSid childSid </> "session.json")
+
+-- | The shared temp-write-chmod-rename body of 'saveSessionMeta' and
+-- 'saveChildSessionMeta': create the containing dir (0700), write a
+-- unique temp file, chmod 0600, rename over the destination. The temp
+-- file is unique per call (via 'openBinaryTempFile') so concurrent
+-- saves don't collide; the rename is atomic on POSIX.
+writeMetaFileAtomic :: FilePath -> SessionMeta -> IO ()
+writeMetaFileAtomic path meta = do
+  let dir = takeDirectory path
   createDirectoryIfMissing True dir
   setFileMode dir 0o700
   (tmp, h) <- openBinaryTempFile dir (takeBaseName path <> ".tmp")
@@ -412,6 +433,29 @@ updateSessionRepoUrl paths sid mUrl = do
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing
       Nothing                      -> Nothing
+
+-- | Set (or clear) whether the harness injects its own front matter into
+-- the session's system prompt. 'True' injects the static guidance blocks,
+-- the auto-loaded @seal-usage@ skill, the codegraph skill, and the
+-- available-skills / available-agents catalogs; 'False' leaves the system
+-- prompt as the selected agent's prompt and nothing else. Returns 'False'
+-- when the session's @session.json@ can't be found or parsed; 'True' on a
+-- successful write. Only touches 'smSealFrontMatter' — all other fields
+-- (agent binding, override, description) are preserved.
+updateSessionSealFrontMatter :: SealPaths -> SessionId -> Bool -> IO Bool
+updateSessionSealFrontMatter paths sid enabled = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smSealFrontMatter = enabled }
+          saveSessionMeta paths next
+          pure True
 
 -- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
 -- Returns 'Nothing' when the file has no frontmatter or no @id@ key.

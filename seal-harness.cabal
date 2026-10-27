@@ -51,6 +51,7 @@ library seal-gateway-types
         Seal.Gateway.Types.Stream
         Seal.Gateway.Types.ListsSnapshot
         Seal.Gateway.Types.AesonUtils
+        Seal.Gateway.Types.NewArgs
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -79,8 +80,10 @@ library seal-chat-channels
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
         Seal.Channels.Chat.ToolRender
+        Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
+        Seal.Channels.Chat.TelegramCommands
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -160,6 +163,7 @@ library
         Seal.Command.Provider
         Seal.Command.Session
         Seal.Command.Serve
+        Seal.Command.Shutdown
         Seal.Command.Skill
         Seal.Command.Stop
         Seal.Command.Repo
@@ -270,6 +274,7 @@ library
         Seal.ISA.Ops.Session
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
+        Seal.ISA.RepeatDetect
         Seal.Memory.Path
         Seal.Memory.Store
         Seal.Memory.Embedding
@@ -334,6 +339,7 @@ library
       , wai
       , warp
       , websockets
+      , wai-websockets
       , case-insensitive
       , trasa
       , trasa-server
@@ -377,6 +383,7 @@ test-suite tests
        , http-client
        , http-client-tls
        , katip
+      , network
        , optparse-applicative
        , stm
        , temporary
@@ -408,6 +415,7 @@ test-suite tests
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
+        Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
         Seal.Gateway.ApiRouteSpec
@@ -421,6 +429,7 @@ test-suite tests
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
+        Seal.Gateway.StreamHealthSpec
         Seal.Gateway.TranscriptSpec
         Seal.Gateway.OpenApiSpec
         Seal.Harness.IdSpec
@@ -481,6 +490,7 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
+        Seal.Channels.Chat.TabRenderSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
@@ -490,12 +500,14 @@ test-suite tests
         Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
+        Seal.Channels.Chat.TelegramCommandsSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec
         Seal.Command.ProviderSpec
         Seal.Command.SessionSpec
         Seal.Command.ServeSpec
+        Seal.Command.ShutdownSpec
         Seal.Command.SkillSpec
         Seal.Command.RepoSpec
         Seal.Command.AgentSpec
@@ -596,5 +608,6 @@ test-suite tests
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
+        Seal.ISA.RepeatDetectSpec
         Seal.Logging.LoggerSpec
         Seal.Logging.ExceptionsSpec

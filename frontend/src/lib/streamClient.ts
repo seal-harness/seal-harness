@@ -36,6 +36,11 @@ import { rateLimitedLog, detectLoop } from './diag'
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
 const HEARTBEAT_TIMEOUT_MS = 90_000
+// How long a socket may take to reach OPEN before it is treated as
+// dead. The server's 30s ping keeps an established connection alive,
+// but a connection that never opens is a failure (e.g. the peer is not
+// a WebSocket server) and must not hang forever.
+const CONNECT_TIMEOUT_MS = 30_000
 // Exponent ceiling for the backoff calc. Past this the delay is already
 // pinned at RECONNECT_MAX_MS, and it keeps `reconnectAttempt` from feeding
 // an unbounded value into Math.pow during a very long outage.
@@ -56,6 +61,9 @@ class StreamClientImpl implements StreamClient {
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  // Deadline for the current socket to reach OPEN. Cleared on open,
+  // on close, and on error.
+  private connectTimer: ReturnType<typeof setTimeout> | null = null
   private closedByUser = false
   private _lastError: string | null = null
   private statusListeners = new Set<(s: StreamStatus) => void>()
@@ -187,6 +195,31 @@ class StreamClientImpl implements StreamClient {
     }
   }
 
+  /** The number of consecutive failed connection attempts since the last
+   *  successful message. The UI uses this to decide when a disconnect has
+   *  become terminal (and should escalate from a banner to a modal). */
+  reconnectAttempts(): number {
+    return this.reconnectAttempt
+  }
+
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. Used by the "Reconnect now" action in the connection modal.
+   *  A no-op after an explicit 'close()'. */
+  reconnectNow(): void {
+    if (this.closedByUser) return
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    // Drop the current socket so the new attempt is not confused with it.
+    if (this.ws !== null) {
+      try { this.ws.close(4000, 'manual reconnect') } catch { /* ignore */ }
+      this.ws = null
+    }
+    this.clearConnectTimer()
+    this.connect()
+  }
+
   /** Closes the connection permanently. No further reconnect attempts. */
   close(): void {
     this.closedByUser = true
@@ -198,6 +231,7 @@ class StreamClientImpl implements StreamClient {
       clearTimeout(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
+    this.clearConnectTimer()
     if (this.ws !== null) {
       try {
         this.ws.close(1000, 'client closed')
@@ -230,12 +264,25 @@ class StreamClientImpl implements StreamClient {
     sock.onopen = () => this.handleOpen()
     sock.onmessage = (ev: MessageEvent) => this.handleMessage(ev)
     sock.onclose = (ev: CloseEvent) => this.handleClose(ev)
-    sock.onerror = () => {
-      // onerror always precedes onclose; we let close handle the bookkeeping.
-    }
+    sock.onerror = () => this.handleError(sock)
+    // A socket that never reaches OPEN is dead (e.g. the peer is not a
+    // WebSocket server, or the TCP connection is black-holed). Without a
+    // deadline the client waits forever: no error, no retry, no way out.
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null
+      if (this.ws !== sock) return
+      if (sock.readyState === WebSocket.OPEN) return
+      this._lastError = 'connection timed out — the server did not accept the WebSocket'
+      try {
+        sock.close(4000, 'connect timeout')
+      } catch {
+        /* ignore */
+      }
+    }, CONNECT_TIMEOUT_MS)
   }
 
   private handleOpen(): void {
+    this.clearConnectTimer()
     this.setStatus('live')
     this.resetHeartbeat()
     if (this.focusState.kind === 'focused') {
@@ -385,6 +432,7 @@ class StreamClientImpl implements StreamClient {
       clearTimeout(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
+    this.clearConnectTimer()
     if (this.closedByUser) {
       this.setStatus('closed')
       return
@@ -402,6 +450,14 @@ class StreamClientImpl implements StreamClient {
   }
 
   private scheduleReconnect(): void {
+    // Idempotent: a socket error is often followed by a close event, and
+    // both paths schedule a reconnect. Clearing the pending timer keeps
+    // a single live timer (and therefore a single retry).
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.closedByUser) return
     const attempt = this.reconnectAttempt
     this.reconnectAttempt += 1
     const expo = Math.min(
@@ -417,10 +473,46 @@ class StreamClientImpl implements StreamClient {
     }, delay)
   }
 
+  /** Handle a socket error. The browser fires `onerror` for a failed
+   *  connection, and `onclose` usually follows — but NOT always: against
+   *  a peer that is not a WebSocket server, `onerror` fires and
+   *  `onclose` never does, leaving `readyState` at CONNECTING forever.
+   *
+   *  The historical implementation treated `onerror` as a no-op on the
+   *  assumption that "onerror always precedes onclose; we let close
+   *  handle the bookkeeping". When that assumption broke, the client
+   *  never retried and never reported the failure — the transcript just
+   *  silently stopped updating.
+   *
+   *  So: schedule the reconnect HERE rather than waiting for a close
+   *  that may never come. `scheduleReconnect` is idempotent, so a
+   *  subsequent `onclose` does not double-schedule. */
+  private handleError(sock: WebSocket): void {
+    if (this.closedByUser) return
+    // A stale socket (superseded by a newer connection) must not
+    // disturb the current one.
+    if (this.ws !== sock) return
+    if (this._lastError === null) {
+      this._lastError = 'connection error — the server may not be reachable'
+    }
+    this.clearConnectTimer()
+    this.ws = null
+    this.setStatus('reconnecting')
+    this.scheduleReconnect()
+  }
+
   private setStatus(s: StreamStatus): void {
     if (this._status === s) return
     this._status = s
     for (const cb of this.statusListeners) cb(s)
+  }
+
+  /** Clear the connect-deadline timer, if one is pending. */
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
   }
 
   /** Reset the heartbeat watchdog. Called on every received message (data
@@ -451,21 +543,27 @@ export function createStreamClient(url: string): StreamClient & { close(): void 
 }
 
 /**
- * Build the default WS URL from the current page. The WS port is discovered
- * at runtime from `/api/health` (the backend's `wsPort` field), falling back
- * to `VITE_WS_PORT` and then `8081`. Uses `wss:` on https pages and `ws:` on
- * http pages.
+ * Build the default WS URL from the current page.
+ *
+ * The gateway serves the WebSocket stream on the SAME port as the HTTP
+ * API, so the normal case is simply the page's own origin — no port
+ * discovery, no second listener, nothing to collide with.
+ *
+ * `/api/health` still reports `wsPort`, and it is used as a fallback: a
+ * server that still runs the WS on a separate port (or a build served from
+ * a different host than the API) is honoured. `VITE_WS_PORT` remains the
+ * last-resort fallback for dev servers with no health endpoint.
+ *
+ * Uses `wss:` on https pages and `ws:` on http pages.
  */
 async function discoverStreamUrl(): Promise<string> {
   const fallbackPort = import.meta.env.VITE_WS_PORT ?? '8081'
   if (typeof window === 'undefined') return `ws://localhost:${fallbackPort}/`
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const host = window.location.hostname
-  // Discover the WS port from the backend at runtime so the frontend never
-  // needs a build-time VITE_WS_PORT that matches the server's config. The
-  // build-time env var is only a fallback for dev servers without the
-  // health endpoint.
-  let wsPort = fallbackPort
+  // Default to the page's own port — that is where the gateway serves the
+  // WS stream.
+  let wsPort = window.location.port
   try {
     const res = await fetch('/api/health')
     if (res.ok) {
@@ -475,10 +573,24 @@ async function discoverStreamUrl(): Promise<string> {
       }
     }
   } catch {
-    // Health endpoint unreachable — fall back to the env var / default.
+    // Health endpoint unreachable — keep the page's own port.
   }
+  if (!wsPort) wsPort = fallbackPort
   return `${proto}//${host}:${wsPort}/`
 }
+
+// ── Test drivers ──────────────────────────────────────────────────────────
+//
+// These let a test drive the WS the way the backend does: deliver an
+// entry frame, or signal turn completion. They are no-ops in production
+// (the real client cannot inject server frames) and are only meaningful
+// in a test that mocks this module.
+
+/** Deliver a transcript entry as if the server had broadcast it. */
+export const pushWsEntry = (_entry: unknown): void => {}
+
+/** Deliver an activity frame (e.g. turn completion) for a session. */
+export const pushWsActivity = (_sessionId: string, _activity: unknown): void => {}
 
 let _instance: (StreamClient & { close(): void }) | null = null
 

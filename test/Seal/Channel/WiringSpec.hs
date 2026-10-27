@@ -9,6 +9,7 @@ import Seal.Agent.Env
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
+import Seal.ISA.RepeatDetect (RepeatTrack, newRepeatTrack)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Channel.Cli
@@ -28,6 +29,13 @@ import Seal.Types.Env
 testAbortFlag :: AbortFlag
 testAbortFlag = unsafePerformIO newAbortFlag
 {-# NOINLINE testAbortFlag #-}
+
+-- | A shared test repeat track (session-read hardening WU4). No
+-- repeat-scope opcode is dispatched in this spec, so a shared track is
+-- behaviorally inert.
+testRepeatTrack :: RepeatTrack
+testRepeatTrack = unsafePerformIO newRepeatTrack
+{-# NOINLINE testRepeatTrack #-}
 
 -- | A scripted provider: pops responses from the list in order;
 -- returns a "done" sentinel when exhausted.
@@ -77,8 +85,9 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
                     , aeOnToolCall = \_ _ -> pure (), aeOnTextDelta = Nothing
           , aeOnDemandSchemas = False
           , aeLogPath = Nothing
-          , aeAbortFlag = testAbortFlag
-          , aeToolTimeout = defaultToolTimeoutConfig
+           , aeAbortFlag = testAbortFlag
+           , aeRepeatTrack = testRepeatTrack
+           , aeToolTimeout = defaultToolTimeoutConfig
           }
     logger <- testSealLogger
     env <- mkEnv logger defaultConfig

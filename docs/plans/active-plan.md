@@ -11,3 +11,7 @@ Issue: #271, step 3 — a first-class `ProviderFamily` (Anthropic/Ollama/OpenAI)
 a generic `openai` provider (base URL required) and an `openrouter` provider
 (OpenAI API with the base URL fixed). Supersedes the #271
 `openrouter → openai-compat` rename (never released).
+
+Merged from `main` on 2026-10-27: the chat-channel slash-command parity plan
+(rev 9, complete) — see
+`docs/superpowers/plans/2026-10-26-chat-slash-command-parity-plan.md`.

@@ -11,17 +11,32 @@ module Seal.Channels.Chat.HttpClient
     -- * Tabs
   , httpGetTabs
   , TabJson (..)
+  , ListsJson (..)
     -- * Sessions list
   , httpGetSessions
     -- * Sessions
   , httpNewSession
+  , httpRebindNew
+  , NewSessionResult (..)
+  , parseNewSessionResult
+  , rebindBody
+  , mintBody
+  , httpSetupRepo
+  , setupRepoBody
+  , httpGetRepos
   , httpGetTranscript
   , httpStopSession
+  , httpGetLists
+    -- * Slash-command registry
+  , httpGetCommands
+  , CommandJson (..)
     -- * Questions (ASK_HUMAN)
   , httpAnswerQuestion
+  , answerBodyJson
   , httpCancelQuestion
     -- * Helpers
   , parseJsonBody
+  , parseErrorBody
   ) where
 
 import Control.Exception (try)
@@ -30,7 +45,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
@@ -67,6 +82,16 @@ data TabJson = TabJson
   , tjSessionId :: Maybe Text   -- ^ session id (Nothing for harness tabs)
   , tjKind      :: Text         -- ^ tab kind wire string
   , tjLabel     :: Maybe Text   -- ^ optional user-set label
+  , tjStatus    :: Maybe Text   -- ^ harness liveness: @"running"@ | @"idle"@ | @"exited"@
+  } deriving stock (Eq, Show)
+
+-- | The @GET /api/lists@ snapshot, restricted to what @/tab list@ needs: the
+-- tabs, the session info of every tab-bound session (for @\<repo\>@ and
+-- @\<name\>@), and the set of sessions currently thinking (for @busy@).
+data ListsJson = ListsJson
+  { ljTabs               :: [TabJson]
+  , ljTabSessions        :: [Value]
+  , ljThinkingSessionIds :: [Text]
   } deriving stock (Eq, Show)
 
 -- | @POST /api/sessions/:id/send@ — send a message to a session.
@@ -99,6 +124,43 @@ httpGetSessions mgr apiBase = do
         Just vs -> pure (Right vs)
         Nothing -> pure (Left "failed to parse sessions JSON array")
 
+-- | @GET /api/lists@ — the partitioned snapshot. Carries what @GET /api/tabs@
+-- cannot: @thinkingSessionIds@ (the only source of the @busy@ state) and
+-- @tabSessions@ (the session metadata behind each tab).
+httpGetLists :: Manager -> Text -> IO (Either Text ListsJson)
+httpGetLists mgr apiBase = do
+  let url = T.unpack apiBase <> "/lists"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> pure (parseListsBody body)
+
+-- | One entry of the gateway's slash-command menu: the canonical command name
+-- (no leading slash, aliases are never listed) and its one-line synopsis.
+data CommandJson = CommandJson
+  { cjName     :: Text
+  , cjSynopsis :: Text
+  } deriving stock (Eq, Show)
+
+-- | @GET /api/commands@ — the slash-command menu the chat channels render as
+-- @\/help@ (and register as the platform's command menu). Malformed entries
+-- are skipped rather than failing the whole list.
+httpGetCommands :: Manager -> Text -> IO (Either Text [CommandJson])
+httpGetCommands mgr apiBase = do
+  let url = T.unpack apiBase <> "/commands"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> case A.decode body :: Maybe [Value] of
+      Just vs -> pure (Right (mapMaybe parseCommandJson vs))
+      Nothing -> pure (Left "failed to parse commands JSON array")
+
+-- | Parse one @\/api\/commands@ entry.
+parseCommandJson :: Value -> Maybe CommandJson
+parseCommandJson (A.Object o) = do
+  n <- asText =<< KeyMap.lookup (Key.fromText "name") o
+  let syn = fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "synopsis") o)
+  pure (CommandJson n syn)
+parseCommandJson _ = Nothing
+
 -- | @POST /api/sessions/new@ — create a new session.
 httpNewSession :: Manager -> Text -> Value -> IO (Either Text Text)
 httpNewSession mgr apiBase body = do
@@ -106,6 +168,102 @@ httpNewSession mgr apiBase body = do
   doRequest mgr url methodPost (Just body) >>= \case
     Left e -> pure (Left e)
     Right respBody -> pure (extractSessionId respBody)
+
+-- | The parsed body of @POST \/api\/sessions\/:id\/new@: the minted session
+-- plus the rebind outcome. 'nsrRebindError' carries the gateway's raw
+-- @rebind_error@ (the tab could not be rebound — the new session exists
+-- regardless); 'nsrTabIndex' is 'Nothing' when no tab was bound to the old
+-- session.
+data NewSessionResult = NewSessionResult
+  { nsrSessionId   :: Text
+  , nsrTabIndex    :: Maybe Int
+  , nsrRebound     :: Bool
+  , nsrRebindError :: Maybe Text
+  , nsrProvider    :: Text
+  , nsrModel       :: Text
+  } deriving stock (Eq, Show)
+
+-- | @POST /api/sessions/:id/new@ — mint a fresh session and rebind the tab
+-- bound to @sid@ (if any) in one call. One mint, one rebind: the caller must
+-- NOT also call 'httpNewSession' for the same @/new@.
+httpRebindNew :: Manager -> Text -> SessionId -> Value -> IO (Either Text NewSessionResult)
+httpRebindNew mgr apiBase sid body = do
+  let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid) <> "/new"
+  doRequest mgr url methodPost (Just body) >>= \case
+    Left e -> pure (Left e)
+    Right respBody -> pure (parseNewSessionResult respBody)
+
+-- | The request body for @POST \/api\/sessions\/:id\/new@. Absent overrides
+-- are omitted entirely — never sent as JSON @null@.
+rebindBody :: Maybe Text -> Maybe Text -> Maybe Text -> Value
+rebindBody mProvider mModel mChannel = A.object (catMaybes
+  [ ("provider" .=) <$> mProvider
+  , ("model" .=) <$> mModel
+  , ("channel" .=) <$> mChannel
+  ])
+
+-- | The request body for @POST \/api\/sessions\/new@ on the @\/new@ path
+-- (no prior session): provider\/model overrides only. The gateway labels
+-- such a session @"web"@.
+mintBody :: Maybe Text -> Maybe Text -> Value
+mintBody mProvider mModel = A.object (catMaybes
+  [ ("provider" .=) <$> mProvider
+  , ("model" .=) <$> mModel
+  ])
+
+-- | The request body of @POST \/api\/sessions\/:id\/setup-repo@.
+setupRepoBody :: Text -> Value
+setupRepoBody url = A.object ["url" .= url]
+
+-- | @POST /api/sessions/:id/setup-repo@ — clone a repo into the session's
+-- workdir before the first turn. Errors carry the gateway's @error@ text
+-- when it sent one (e.g. @clone failed: …@), so @repo setup failed: …@ names
+-- the real reason.
+httpSetupRepo :: Manager -> Text -> SessionId -> Value -> IO (Either Text ())
+httpSetupRepo mgr apiBase sid body = do
+  let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid) <> "/setup-repo"
+  doRequest mgr url methodPost (Just body) >>= \case
+    Left e  -> pure (Left e)
+    Right _ -> pure (Right ())
+
+-- | @GET /api/repos@ — the registered repos. Each element carries @id@ and
+-- @url@ (plus credential metadata this client ignores).
+httpGetRepos :: Manager -> Text -> IO (Either Text [Value])
+httpGetRepos mgr apiBase = do
+  let url = T.unpack apiBase <> "/repos"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> case A.decode body :: Maybe [Value] of
+      Just vs -> pure (Right vs)
+      Nothing -> pure (Left "failed to parse repos JSON array")
+
+-- | Parse the @POST \/api\/sessions\/:id\/new@ response body.
+parseNewSessionResult :: BL.ByteString -> Either Text NewSessionResult
+parseNewSessionResult body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) ->
+      case asText =<< KeyMap.lookup (Key.fromText "session_id") o of
+        Nothing -> Left "new-session response missing 'session_id' field"
+        Just sid
+          | T.null sid -> Left "new-session response has an empty 'session_id'"
+          | otherwise  -> Right NewSessionResult
+              { nsrSessionId   = sid
+              , nsrTabIndex    = asInt =<< KeyMap.lookup (Key.fromText "tab_index") o
+              , nsrRebound     = fromMaybe False
+                                   (asBool =<< KeyMap.lookup (Key.fromText "rebound") o)
+              , nsrRebindError = asText =<< KeyMap.lookup (Key.fromText "rebind_error") o
+              , nsrProvider    = fromMaybe ""
+                                   (asText =<< KeyMap.lookup (Key.fromText "provider") o)
+              , nsrModel       = fromMaybe ""
+                                   (asText =<< KeyMap.lookup (Key.fromText "model") o)
+              }
+    Just _  -> Left "new-session response is not a JSON object"
+    Nothing -> Left "failed to parse new-session response JSON"
+  where
+    asInt (A.Number n) = Just (round n)
+    asInt _            = Nothing
+    asBool (A.Bool b)  = Just b
+    asBool _           = Nothing
 
 -- | @GET /api/sessions/:id/transcript@ — get the transcript as a JSON array.
 httpGetTranscript :: Manager -> Text -> SessionId -> IO (Either Text [Value])
@@ -127,14 +285,39 @@ httpStopSession mgr apiBase sid = do
     Right _ -> pure (Right ())
 
 -- | @POST /api/sessions/:id/questions/:qid/answer@ — answer a pending
--- ASK_HUMAN question.
-httpAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> Text -> IO (Either Text ())
-httpAnswerQuestion mgr apiBase sid qid answer scope = do
+-- ASK_HUMAN question (or the confirmation gate) with free text.
+--
+-- The body carries an @answer@ and nothing else: the server's parser rejects
+-- a body that carries both @answer@ and @scope@ with 400 ("ambiguous: send
+-- either {scope} or {answer}, not both", 'parseAnswerBody'). The
+-- confirmation gate parses the text itself — @y@/@yes@ approve once,
+-- anything else rejects — so one shape serves both ask kinds.
+--
+-- The endpoint answers @200 {ok:true, accepted:<bool>}@; @accepted:false@
+-- means the question was already answered, cancelled, or unknown, which is
+-- a resolution but not an accepted answer.
+httpAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> IO (Either Text Bool)
+httpAnswerQuestion mgr apiBase sid qid answer = do
   let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid)
             <> "/questions/" <> T.unpack qid <> "/answer"
-  doRequest mgr url methodPost (Just (A.object ["answer" .= answer, "scope" .= scope])) >>= \case
+  doRequest mgr url methodPost (Just (answerBodyJson answer)) >>= \case
     Left e -> pure (Left e)
-    Right _ -> pure (Right ())
+    Right body -> pure (Right (acceptedFrom body))
+
+-- | Read the @accepted@ flag from an answer response. Absent/malformed
+-- (e.g. a server that predates the flag) counts as accepted.
+acceptedFrom :: BL.ByteString -> Bool
+acceptedFrom body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "accepted") o of
+      Just (A.Bool b) -> b
+      _               -> True
+    _ -> True
+
+-- | The request body for answering a pending question: the answer only.
+-- Pure and exported so the wire shape is pinned by a test.
+answerBodyJson :: Text -> Value
+answerBodyJson answer = A.object ["answer" .= answer]
 
 -- | @POST /api/sessions/:id/questions/:qid/cancel@ — cancel a pending
 -- ASK_HUMAN question.
@@ -180,7 +363,22 @@ doRequest mgr url m mBody = do
           let code = statusCode (responseStatus resp)
           in if code >= 200 && code <= 299
                then pure (Right (responseBody resp))
-               else pure (Left ("HTTP " <> T.pack (show code)))
+               else pure (Left (parseErrorBody code (responseBody resp)))
+
+-- | The text of a failed HTTP response. Prefers the gateway's
+-- @{\"error\": \"…\"}@ shape ('errJson' in 'Seal.Gateway.API') so callers can
+-- surface the real reason (e.g. @clone failed: …@); falls back to
+-- @HTTP \<code\>@ for a non-JSON or shapeless body (a proxy, a plain-text
+-- 5xx).
+parseErrorBody :: Int -> BL.ByteString -> Text
+parseErrorBody code body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) -> case asText =<< KeyMap.lookup (Key.fromText "error") o of
+      Just msg | not (T.null msg) -> msg
+      _                           -> fallback
+    _ -> fallback
+  where
+    fallback = "HTTP " <> T.pack (show code)
 
 -- | Extract the @id@ field from a session info JSON object.
 extractSessionId :: BL.ByteString -> Either Text Text
@@ -192,6 +390,24 @@ extractSessionId body =
         Nothing  -> Left "session response missing 'session_id' field"
     Just _ -> Left "session response is not a JSON object"
     Nothing -> Left "failed to parse session response JSON"
+
+-- | Parse the @GET /api/lists@ response body.
+parseListsBody :: BL.ByteString -> Either Text ListsJson
+parseListsBody body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) -> do
+      tabs <- case KeyMap.lookup (Key.fromText "tabs") o of
+        Just (A.Array arr) -> traverse parseTabJson (foldr (:) [] arr)
+        _                  -> Left "lists response missing 'tabs' array"
+      let arrOf k = case KeyMap.lookup (Key.fromText k) o of
+            Just (A.Array arr) -> foldr (:) [] arr
+            _                  -> []
+      pure ListsJson
+        { ljTabs               = tabs
+        , ljTabSessions        = arrOf "tabSessions"
+        , ljThinkingSessionIds = mapMaybe asText (arrOf "thinkingSessionIds")
+        }
+    _ -> Left "failed to parse lists response JSON object"
 
 -- | Parse the @GET /api/tabs@ response body.
 parseTabsBody :: BL.ByteString -> Either Text [TabJson]
@@ -210,6 +426,7 @@ parseTabJson (A.Object o) =
     , tjSessionId = asText =<< KeyMap.lookup (Key.fromText "session_id") o
     , tjKind = fromMaybe "" (asText =<< KeyMap.lookup (Key.fromText "kind") o)
     , tjLabel = asText =<< KeyMap.lookup (Key.fromText "label") o
+    , tjStatus = asText =<< KeyMap.lookup (Key.fromText "status") o
     }
 parseTabJson _ = Left "tab is not a JSON object"
 

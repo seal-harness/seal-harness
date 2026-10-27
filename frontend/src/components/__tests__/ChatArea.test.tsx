@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
+import { WS_RECONNECT_ALERT_THRESHOLD } from '../../types/stream'
+import type { StreamStatus } from '../../types/stream'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -277,7 +279,7 @@ describe('transcriptToMessages', () => {
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
-  it('renders a new System Prompt row when the value changes between turns', () => {
+  it('renders the System Prompt row only once, at the top of the session', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -294,8 +296,8 @@ describe('transcriptToMessages', () => {
         raw: '{}',
       }),
       // Second request: system CHANGED to 'sys-B'; tools unchanged (omitted
-      // by the backend's delta encoding, but we include them here for the
-      // test since the dedup is purely content-based).
+      // by the backend's delta encoding, but we include them here so the
+      // test covers the changed-value case).
       makeEntry({
         id: 'c3',
         direction: 'request',
@@ -304,15 +306,17 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    // Two distinct system prompts → two rows; identical tools → one row.
-    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
+    // The session preamble is rendered ONCE, by the first LLM request —
+    // a mid-session change does NOT add a second System Prompt row
+    // half-way down the conversation (that row used to pop up at the
+    // bottom of a long session the moment the user hit enter).
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
-    // The first System Prompt row appears before the second.
+    // The System Prompt row carries the FIRST request's system prompt.
     const sysRows = msgs.filter((m) => m.agentName === 'System Prompt')
+    expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
+    // The System Prompt row appears before the first user message.
     const firstIdx = msgs.indexOf(sysRows[0]!)
-    const secondIdx = msgs.indexOf(sysRows[1]!)
-    expect(firstIdx).toBeLessThan(secondIdx)
-    // The first System Prompt row appears before the first user message.
     const userIdx = msgs.findIndex((m) => m.agentName === 'You')
     expect(firstIdx).toBeLessThan(userIdx)
   })
@@ -1199,6 +1203,81 @@ describe('SessionSetup Agent dropdown', () => {
     ])
     expect(screen.getByText('b (default)')).toBeTruthy()
     expect(screen.getByText('a')).toBeTruthy()
+  })
+})
+
+describe('SessionSetup "Add Seal Harness front matter" toggle', () => {
+  // The toggle lives on the empty-session form: it decides whether the
+  // harness appends its own front matter (static guidance, the seal-usage
+  // skill, the codegraph skill, the skills/agents catalogs) to the selected
+  // agent's prompt.
+  function renderToggle(
+    overrides: {
+      sealFrontMatter?: boolean
+      onSealFrontMatterChange?: (enabled: boolean) => void
+    } = {},
+  ) {
+    const onSealFrontMatterChange = overrides.onSealFrontMatterChange ?? (() => {})
+    return render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={[{ name: 'zoe', isDefault: true }]}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+        sealFrontMatter={overrides.sealFrontMatter ?? true}
+        onSealFrontMatterChange={onSealFrontMatterChange}
+      />,
+    )
+  }
+
+  it('renders the toggle labelled "Add Seal Harness front matter"', () => {
+    renderToggle()
+    expect(screen.getByLabelText('Add Seal Harness front matter')).toBeTruthy()
+  })
+
+  it('defaults to ON (checked) when the prop is true', () => {
+    renderToggle({ sealFrontMatter: true })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(true)
+  })
+
+  it('defaults to ON (checked) when the prop is omitted', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={[{ name: 'zoe', isDefault: true }]}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+      />,
+    )
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(true)
+  })
+
+  it('is unchecked when the front matter is off', () => {
+    renderToggle({ sealFrontMatter: false })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    expect(box.checked).toBe(false)
+  })
+
+  it('reports turning the toggle off to the parent', () => {
+    const onChange = vi.fn()
+    renderToggle({ sealFrontMatter: true, onSealFrontMatterChange: onChange })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    fireEvent.click(box)
+    expect(onChange).toHaveBeenCalledWith(false)
+  })
+
+  it('reports turning the toggle on to the parent', () => {
+    const onChange = vi.fn()
+    renderToggle({ sealFrontMatter: false, onSealFrontMatterChange: onChange })
+    const box = screen.getByLabelText('Add Seal Harness front matter') as HTMLInputElement
+    fireEvent.click(box)
+    expect(onChange).toHaveBeenCalledWith(true)
   })
 })
 
@@ -2512,5 +2591,341 @@ describe('Scroll-to-top behavior', () => {
       />,
     )
     expect(loadLatest).not.toHaveBeenCalled()
+  })
+})
+
+// ── WebSocket connection state banner ─────────────────────────────────────
+//
+// The transcript's only data path is the WebSocket. When the socket dies,
+// the transcript silently stops updating — the user has no idea whether
+// the agent is thinking or the connection is broken. These tests pin the
+// banner that makes the state visible.
+
+describe('ChatArea connection state banner', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        {...props}
+      />,
+    )
+
+  it('shows no banner while the stream is live', () => {
+    renderWith({ streamStatus: 'live' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('shows a reconnecting banner when the stream is reconnecting', () => {
+    renderWith({ streamStatus: 'reconnecting' satisfies StreamStatus })
+    const banner = screen.getByTestId('ws-connection-banner')
+    expect(banner.textContent).toMatch(/reconnect/i)
+  })
+
+  it('shows a banner when the stream is still connecting', () => {
+    renderWith({ streamStatus: 'connecting' satisfies StreamStatus })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('shows the last error text in the banner when present', () => {
+    renderWith({
+      streamStatus: 'reconnecting' satisfies StreamStatus,
+      streamError: 'connection closed (code 1006)',
+    })
+    expect(screen.getByTestId('ws-connection-banner').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('does not show a banner when the stream is closed by the user', () => {
+    // 'closed' is the terminal state after an explicit client.close();
+    // warning about it would be noise.
+    renderWith({ streamStatus: 'closed' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('does not show a banner for the replaying state (a normal, transient state)', () => {
+    renderWith({ streamStatus: 'replaying' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('keeps the transcript readable while the banner is shown', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages, streamStatus: 'reconnecting' })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
+  })
+})
+
+// ── WebSocket connection modal (terminal disconnect) ──────────────────────
+//
+// A brief disconnect is self-healing and deserves only a banner. A
+// PERSISTENT one (the gateway is down, or the port is wrong) leaves the
+// transcript frozen with no way for the user to know why. Once the
+// reconnect ladder has been exhausted, the UI escalates to a modal.
+
+describe('ChatArea connection modal', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+        {...props}
+      />,
+    )
+
+  it('shows no modal before the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD - 1 })
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('shows the modal once the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+  })
+
+  it('states that live updates are unavailable and the transcript may be stale', () => {
+    renderWith({})
+    const modal = screen.getByTestId('ws-connection-modal')
+    expect(modal.textContent).toMatch(/unavailable/i)
+    expect(modal.textContent).toMatch(/out of date|stale/i)
+  })
+
+  it('shows the last error when present', () => {
+    renderWith({ streamError: 'connection closed (code 1006)' })
+    expect(screen.getByTestId('ws-connection-modal').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('the "Reconnect now" action calls the reconnect callback', () => {
+    const onStreamReconnect = vi.fn()
+    renderWith({ onStreamReconnect })
+    fireEvent.click(screen.getByTestId('ws-connection-reconnect'))
+    expect(onStreamReconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('"Dismiss" closes the modal but the banner remains', () => {
+    renderWith({})
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('ws-connection-dismiss'))
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+    // The non-modal banner is still shown — the connection is still down.
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('closes automatically when the stream comes back', () => {
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+      />,
+    )
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'live'}
+        streamReconnectAttempts={0}
+      />,
+    )
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('does not block the transcript from being read', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
+  })
+})
+
+// ── Scroll button no-op regression ───────────────────────────────────────
+//
+// When the user switches tabs and switches back, the data cache may have
+// pinned entries for the original session. If loadLatest() finds the
+// pinned entries are the same array reference as the current entries,
+// setEntries() is a no-op (React useState bails out on same ref) → no
+// re-render → useLayoutEffect never fires → pendingScrollToBottom is
+// never consumed → no scroll. The fix: a requestAnimationFrame fallback
+// in the button handler that scrolls directly if the pending flag is
+// still true after paint.
+
+describe('scroll button no-op after tab switch', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    cleanup()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('"Scroll to bottom" works after switching tabs and back (loadLatest no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadLatest = vi.fn() // no-op — simulates pinned cache hit with same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          loadLatest={loadLatest}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to bottom" — loadLatest is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to bottom'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The scroller must have been called — either by the
+      // useLayoutEffect (entries changed) or by the rAF fallback
+      // (entries didn't change, no-op loadLatest). Without the fix,
+      // neither fires and scrollTo is never called.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('"Scroll to top" works after switching tabs and back (loadFromBeginning no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadFromBeginning = vi.fn() // no-op — simulates pinned cache hit with same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to top" — loadFromBeginning is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to top'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The scroller must have been called — either by the
+      // useLayoutEffect (entries changed) or by the rAF fallback
+      // (entries didn't change, no-op loadFromBeginning). Without the
+      // fix, neither fires and scrollTo is never called.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
   })
 })

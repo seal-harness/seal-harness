@@ -5,10 +5,23 @@ module Seal.Channels.Chat.Loop
   ( runChatChannel
   , ChatChannelConfig (..)
   , defaultChatChannelConfig
+    -- * WS connections (for testing)
+  , WsConn
     -- * Event handlers (for testing)
   , handleInbound
   , handleFocus
   , handleServerEvent
+  , handleCallback
+    -- * Pending asks (for testing)
+  , PendingAsks
+  , newPendingAsks
+  , pendingAsksFor
+    -- * Background sessions (for testing)
+  , BgSession (..)
+  , BgSessions
+  , newBgSessions
+  , bgSessionsFor
+  , bgOwnsSession
     -- * Pure helpers (for testing)
   , extractEntryText
   , extractActivityKind
@@ -42,14 +55,15 @@ import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (when, unless, void)
 import Data.Foldable (for_)
-import Data.Aeson (Value)
+import Data.List (partition)
+import Data.Aeson (Value, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
-import Data.IORef (readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -62,7 +76,10 @@ import Network.HTTP.Client (Manager)
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
 import Seal.Channels.Chat.HttpClient
   (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
-   SendResult (..), TabJson (..))
+   httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos,
+   rebindBody, mintBody, setupRepoBody,
+   SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..))
+import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
    shouldEdit, addCursor, stripCursor)
@@ -76,13 +93,15 @@ import Seal.Channels.Chat.Types
 import Seal.Channels.Chat.ToolRender
   (formatToolLine)
 import Seal.Channels.Chat.WsClient
-  (WsClient (..), startWsClient)
+  (WsClient (..), WsEventCallback, startWsClient)
 
 import Seal.Gateway.Types.Core
   (SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Types.Stream (ServerEvent (..))
 import Seal.Gateway.Types.MessageSource (MessageSource)
 import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToChar)
+import Seal.Gateway.Types.NewArgs
+  (NewArgs (..), parseNewArgs, renderNewSessionConfirmation)
 
 -- | A pending ASK_HUMAN question tracked by the loop: the ask id text +
 -- the offered options (so the callback handler can resolve a button index
@@ -90,11 +109,28 @@ import Seal.Gateway.Types.Tab (TabIndex, mkTabIndex, tabIndexToInt, tabIndexToCh
 data PendingAsk = PendingAsk
   { paAskId :: !Text
   , paOptions :: ![QuestionOption]
+  , paSeq :: !Int
+    -- ^ Registration order. Gives a total order across the conversation's
+    -- sessions, which the per-session lists cannot provide (each list is
+    -- newest-first, but there is no global insertion order). A plain-text
+    -- answer goes to the earliest-registered ask.
   }
 
--- | The pending-asks store: session id → list of pending asks. Thread-safe
--- via 'TVar'.
-type PendingAsks = TVar (Map SessionId [PendingAsk])
+-- | The pending-asks store: session id → list of pending asks (newest
+-- first), plus a monotonic registration counter so asks raised on different
+-- sessions can still be ordered. Thread-safe via 'TVar's.
+data PendingAsks = PendingAsks
+  { paStore :: TVar (Map SessionId [PendingAsk])
+  , paNext  :: TVar Int
+  }
+
+-- | Create an empty pending-asks store.
+newPendingAsks :: IO PendingAsks
+newPendingAsks = PendingAsks <$> newTVarIO Map.empty <*> newTVarIO 0
+
+-- | Snapshot of the store, keyed by session. Used by tests.
+pendingAsksFor :: PendingAsks -> IO (Map SessionId [PendingAsk])
+pendingAsksFor = readTVarIO . paStore
 
 -- | Per-conversation watch-all-tabs toggle state. When 'True' for a
 -- conversation, the channel receives a notification every time any
@@ -186,6 +222,104 @@ type ThinkingTabs = TVar (Map ConversationKey (Set SessionId))
 newThinkingTabs :: IO ThinkingTabs
 newThinkingTabs = newTVarIO Map.empty
 
+-- | One live background (@/bg@) session owned by a conversation.
+--
+-- A bg session is a freshly minted, headless session (no tab) plus the
+-- dedicated WS connection focused on it. The conversation's own
+-- connection, focused session, and tab tracking are never involved.
+data BgSession = BgSession
+  { bgSid       :: !SessionId
+    -- ^ The minted headless session the prompt runs on.
+  , bgWs        :: !WsClient
+    -- ^ The dedicated WS connection focused on 'bgSid'. Closing it is the
+    -- only way to stop receiving that session's events.
+  }
+
+-- | The per-conversation background-session store. Each conversation's
+-- list is in creation order (oldest first) so the per-conversation cap can
+-- evict the oldest session when a new one is started. Thread-safe via
+-- 'TVar'.
+--
+-- The store also remembers the session ids this conversation has owned for
+-- a bounded window after they are retired ('bsKnown'). That memory is what
+-- keeps a bg turn out of the watch-all-tabs path: 'BeActivity' is broadcast
+-- to every subscriber, so the conversation's own connection receives
+-- @harness-status idle@ / @tool-call@ for the bg session too -- possibly
+-- after the bg connection's reader has already retired it. Without the
+-- memory those late events would be classified as "not a bg session" and
+-- produce a bogus "Tab ?" watch notification plus a duplicate reply.
+data BgSessions = BgSessions
+  { bsLive  :: TVar (Map ConversationKey [BgSession])
+  , bsKnown :: TVar (Map ConversationKey [SessionId])
+  }
+
+-- | How many retired bg session ids a conversation remembers for the watch
+-- exclusion. Bounded so a long-lived conversation cannot grow without
+-- limit; the window only has to outlive one turn's activity broadcasts.
+maxKnownBgSids :: Int
+maxKnownBgSids = 32
+
+-- | Create a new empty background-session store.
+newBgSessions :: IO BgSessions
+newBgSessions = BgSessions <$> newTVarIO Map.empty <*> newTVarIO Map.empty
+
+-- | The conversation's live background sessions, oldest first.
+bgSessionsFor :: BgSessions -> ConversationKey -> IO [BgSession]
+bgSessionsFor bgs key =
+  fromMaybe [] . Map.lookup key <$> readTVarIO (bsLive bgs)
+
+-- | Does @sid@ belong to one of this conversation's background sessions
+-- (live, or retired within the remembered window)? Used to keep bg turns
+-- out of the watch-all-tabs path.
+bgOwnsSession :: BgSessions -> ConversationKey -> SessionId -> IO Bool
+bgOwnsSession bgs key sid =
+  elem sid . fromMaybe [] . Map.lookup key <$> readTVarIO (bsKnown bgs)
+
+-- | Register a background session at the end of its conversation's list
+-- (creation order) and remember its id for the watch exclusion.
+bgInsert :: BgSessions -> ConversationKey -> BgSession -> IO ()
+bgInsert bgs key sess = do
+  atomically (modifyTVar' (bsLive bgs)
+    (Map.insertWith (flip (++)) key [sess]))
+  atomically (modifyTVar' (bsKnown bgs)
+    (Map.insertWith (\new old -> take maxKnownBgSids (new ++ filter (`notElem` new) old))
+       key [bgSid sess]))
+
+-- | Untrack a background session. Returns the session when it was tracked,
+-- 'Nothing' when it was already gone (so retirements are idempotent).
+-- Retiring does NOT forget the session id (see 'bsKnown'): late activity
+-- events for it still must stay out of the watch path.
+bgRemove :: BgSessions -> ConversationKey -> SessionId -> IO (Maybe BgSession)
+bgRemove bgs key sid = atomically $ do
+  let tv = bsLive bgs
+  m <- readTVar tv
+  let sessions = fromMaybe [] (Map.lookup key m)
+      (dropped, kept) = partition ((== sid) . bgSid) sessions
+      m' = case kept of
+             [] -> Map.delete key m
+             _  -> Map.insert key kept m
+  writeTVar tv m'
+  pure (case dropped of
+          (s : _) -> Just s
+          []      -> Nothing)
+
+-- | Drop every pending ask registered for a session. A retired bg session
+-- can no longer be answered, so its asks must not accumulate (or be
+-- resolvable by a later button tap).
+dropPendingAsks :: PendingAsks -> SessionId -> IO ()
+dropPendingAsks pendingAsks sid =
+  atomically (modifyTVar' (paStore pendingAsks) (Map.delete sid))
+
+-- | A conversation's WS connection: the session its callback was built for,
+-- the client, and the streaming state.
+--
+-- The bound session is part of the value because 'handleServerEvent' closes
+-- over the focused session **by value**: a connection built for session A
+-- keeps filtering for A however many FocusOps arrive. Re-targeting a
+-- conversation therefore requires closing the connection and rebuilding it
+-- (see 'ensureWsConn').
+type WsConn = (SessionId, WsClient, StreamingState)
+
 -- | Configuration for the generic loop.
 data ChatChannelConfig = ChatChannelConfig
   { cccGateway     :: GatewayConfig
@@ -194,6 +328,36 @@ data ChatChannelConfig = ChatChannelConfig
     -- ^ Rate-limiting config for streaming edits.
   , cccHttpManager :: Manager
     -- ^ The shared HTTP manager for gateway API calls.
+  , cccNewSession :: Manager -> Text -> Value -> IO (Either Text Text)
+    -- ^ @POST /api/sessions/new@. The seam the @/bg@ handler uses to mint
+  , cccGetLists :: Manager -> Text -> IO (Either Text ListsJson)
+    -- ^ @GET /api/lists@. The seam @/tab list@ uses to render rows; the
+    -- default is 'httpGetLists'.
+    -- the headless session; the default is 'httpNewSession'.
+  , cccRebindNew :: Manager -> Text -> SessionId -> Value -> IO (Either Text NewSessionResult)
+    -- ^ @POST /api/sessions/:id/new@ — mint a fresh session and rebind the
+    -- tab bound to the given session, in ONE call. This is the seam @/new@
+    -- uses when the conversation already has a session; the default is
+    -- 'httpRebindNew'. Calling this *and* 'cccNewSession' would mint two
+    -- sessions.
+  , cccSetupRepo :: Manager -> Text -> SessionId -> Value -> IO (Either Text ())
+    -- ^ @POST /api/sessions/:id/setup-repo@. The seam @/new -r@ uses to clone
+    -- the repo into the NEW session's workdir; the default is 'httpSetupRepo'.
+  , cccGetRepos :: Manager -> Text -> IO (Either Text [Value])
+    -- ^ @GET /api/repos@. The seam @/new -r@ uses to resolve a registered
+    -- repo id to its URL; the default is 'httpGetRepos'.
+  , cccSendMessage :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
+    -- ^ @POST /api/sessions/:id/send@. The seam the @/bg@ handler uses to
+    -- deliver the prompt; the default is 'httpSend'.
+  , cccStartWs :: Text -> Int -> WsEventCallback -> IO (Either Text WsClient)
+    -- ^ Connect a WS client. The seam the @/bg@ handler uses for the bg
+    -- session's dedicated connection; the default is 'startWsClient'.
+  , cccAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> IO (Either Text Bool)
+    -- ^ @POST /api/sessions/:id/questions/:qid/answer@. The seam used to
+    -- answer a pending ask (text answer or button tap); the default is
+    -- 'httpAnswerQuestion'. 'Right False' means the question was already
+    -- answered/cancelled/unknown (the endpoint still returns 200), so the
+    -- ask is resolved either way but the answer was not the one accepted.
   }
 
 -- | Default config with sensible defaults.
@@ -202,6 +366,14 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   { cccGateway = gw
   , cccStreamCfg = defaultStreamProgressConfig
   , cccHttpManager = mgr
+  , cccNewSession = httpNewSession
+  , cccRebindNew = httpRebindNew
+  , cccSetupRepo = httpSetupRepo
+  , cccGetRepos = httpGetRepos
+  , cccSendMessage = httpSend
+  , cccStartWs = startWsClient
+  , cccAnswerQuestion = httpAnswerQuestion
+  , cccGetLists = httpGetLists
   }
 
 -- | Debug log to stderr.
@@ -215,13 +387,14 @@ runChatChannel :: ChatChannel c => ChatChannelConfig -> c -> WatchState -> IO ()
 runChatChannel cfg chan watchState = do
   sessions <- newSessionMap
   -- Map of conversation keys to their WS client + streaming state.
-  wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (WsClient, StreamingState)))
-  pendingAsks <- newTVarIO Map.empty :: IO PendingAsks
+  wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
+  pendingAsks <- newPendingAsks
   tabTracker <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey (SessionId, [TabJson])))
   thinkingTabs <- newThinkingTabs
-  loop sessions wsConns pendingAsks tabTracker watchState thinkingTabs
+  bgSessions <- newBgSessions
+  loop sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs
   where
-    loop sessions wsConns pendingAsks tabTracker ws tt = do
+    loop sessions wsConns pendingAsks bgSessions tabTracker ws tt = do
       mMsg <- ccReceive chan
       case mMsg of
         Nothing -> pure ()  -- EOF
@@ -232,24 +405,25 @@ runChatChannel cfg chan watchState = do
             Just cbData -> do
               -- Callback query (button tap): resolve to a pending ask,
               -- answer via HTTP, acknowledge, and remove keyboard.
-              handleCallback cfg chan sessions pendingAsks key src cbData
+              handleCallback cfg chan sessions pendingAsks bgSessions key src cbData
             Nothing ->
               -- Regular text message: route normally.
-              handleInbound cfg chan sessions wsConns pendingAsks tabTracker ws tt key body
-          loop sessions wsConns pendingAsks tabTracker ws tt
+              handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker ws tt key body
+          loop sessions wsConns pendingAsks bgSessions tabTracker ws tt
 
 -- | Handle one inbound message: resolve the session, route, and dispatch.
 handleInbound
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
+  -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState
   -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body = do
+handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   -- Intercept /watch (and /watch on|off) before normal routing — it
@@ -265,13 +439,13 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
       watchOn <- lookupWatch watchState key
       dbg ("[watch] watchOn=" <> (if watchOn then "true" else "false") <> ", ensuring WS conn")
       when watchOn $
-        void (resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key)
+        void (resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key)
     else case parseTabFocus body of
     Just idx -> do
-      handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
+      handleFocus cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key idx
     Nothing -> case route body of
       Right (ChatFocus idx) ->
-        handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx
+        handleFocus cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key idx
       Right (ChatInject idx payload) -> do
         -- Send the payload to the target tab's session WITHOUT changing
         -- the focused tab (no FocusOp, no "focused tab N" confirmation).
@@ -281,21 +455,32 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
         mSid <- sessionLookup sessions key
         case mSid of
           Just sid -> do
-            eResult <- httpSend mgr apiBase sid "/tab"
+            eResult <- cccSendMessage cfg mgr apiBase sid "/tab"
             case eResult of
               Right sr -> ccSend chan (srResponse sr)
               Left e -> ccSend chan ("error: " <> e)
           Nothing -> ccSend chan "no current tab"
       Right (ChatNewSession args) -> do
         -- Create a new session via HTTP, update the session map.
-        handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key args
+        handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key args
+      Right (ChatBackground prompt) -> do
+        -- Run the prompt in a freshly minted headless session. The
+        -- conversation's focused session and tab list are untouched.
+        handleBackground cfg chan pendingAsks bgSessions key prompt
       Right (ChatSlash _cmd) ->
-        sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
+        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
-        sendSlash cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key body
-      Right (ChatPlain text) ->
-        sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text
+        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
+      Right ChatTabList -> handleTabList cfg chan
+      Right (ChatPlain text) -> do
+        -- A plain message answers a pending ask from one of this
+        -- conversation's background sessions, if there is one. Checked
+        -- here (not before routing) so a /command is never consumed as an
+        -- answer.
+        consumed <- answerPendingBgAsk cfg chan pendingAsks bgSessions key text
+        unless consumed $
+          sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
       Left _ -> ccSend chan "error: invalid command"
 
 -- | Handle a focus command: resolve the tab index to a session id via
@@ -304,14 +489,15 @@ handleInbound cfg chan sessions wsConns pendingAsks tabTracker watchState thinki
 handleFocus
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
+  -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState
   -> ThinkingTabs
   -> ConversationKey -> TabIndex
   -> IO ()
-handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key idx = do
+handleFocus cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key idx = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eTabs <- httpGetTabs mgr apiBase
@@ -331,7 +517,7 @@ handleFocus cfg chan sessions wsConns pendingAsks tabTracker watchState thinking
                 -- Track the focused session + current tab list for tab-close detection.
                 atomically (modifyTVar' tabTracker (Map.insert key (sid, tabs)))
                 -- Ensure a WS connection exists for this conversation.
-                ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
+                ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid
                 -- Send "focused tab N" confirmation.
                 ccSend chan ("focused tab " <> T.singleton (tabIndexToChar idx))
                 -- Fetch and send the last assistant reply for context.
@@ -367,41 +553,221 @@ handleInject cfg chan idx payload = do
                 -- Do NOT update the session map, send a FocusOp, or
                 -- send a focus confirmation — the current focused tab
                 -- is unchanged.
-                eResult <- httpSend mgr apiBase sid payload
+                eResult <- cccSendMessage cfg mgr apiBase sid payload
                 case eResult of
                   Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
                   Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
                   Right _ -> pure ()  -- assistant response comes via WS
                   Left e -> ccSend chan ("error: " <> e)
 
+-- | The usage line for a bare (or blank-prompt) @/bg@.
+bgUsage :: Text
+bgUsage = "usage: /bg <prompt>"
+
+-- | The help text for @/bg@, rendered in the same style as 'watchHelp'.
+bgHelp :: Text
+bgHelp = T.unlines
+  [ "Run a prompt in a fresh background session and post the reply here"
+  , ""
+  , "Usage: /bg <prompt>"
+  , ""
+  , "The background session is created headless: it never appears in Active"
+  , "Tabs, and this conversation's focused session is left untouched. The"
+  , "reply — and any question the turn asks — is posted to this conversation."
+  , ""
+  , "Options:"
+  , "  -h, --help  Show this help"
+  ]
+
+-- | Is the @/bg@ argument the help flag?
+isBgHelpArg :: Text -> Bool
+isBgHelpArg arg = T.strip arg `elem` ["-h", "--help"]
+
+-- | The short form of a session id used in @/bg@ confirmations — the same
+-- 12-character prefix the session list renders.
+shortSessionId :: SessionId -> Text
+shortSessionId = T.take 12 . sessionIdText
+
+-- | The maximum number of live background sessions a conversation may hold
+-- at once. Bounds the connection leak when a bg turn never reports @idle@
+-- (a provider-resolution failure never enters the turn bracket, and a
+-- subscription refused by the broker's subscriber cap delivers nothing).
+maxBgSessions :: Int
+maxBgSessions = 4
+
+-- | Handle @/bg <prompt>@: mint a headless session (no tab), open a
+-- dedicated WS connection focused on it, register it, and run the prompt on
+-- it. The reply is posted back to this conversation by
+-- 'handleBgServerEvent'; the conversation's focused session, session map,
+-- and tab tracking are never touched.
+--
+-- A blank prompt answers 'bgUsage' and creates nothing; @-h@ / @--help@
+-- answers 'bgHelp' and creates nothing. Every failure (mint, connect, send)
+-- closes whatever it opened, untracks the session, drops its pending asks,
+-- and reports on the channel.
+handleBackground
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> BgSessions
+  -> ConversationKey -> Text
+  -> IO ()
+handleBackground cfg chan pendingAsks bgSessions key prompt
+  | T.null (T.strip prompt) = ccSend chan bgUsage
+  | isBgHelpArg prompt      = ccSend chan bgHelp
+  | otherwise               = do
+      let apiBase = gcApiBase (cccGateway cfg)
+          mgr = cccHttpManager cfg
+          gwCfg = cccGateway cfg
+      -- (a) mint a headless session, (b) validate its id.
+      eMinted <- cccNewSession cfg mgr apiBase (A.object ["headless" .= A.Bool True])
+      case eMinted >>= mkSessionId of
+        Left e -> ccSend chan ("bg session failed: " <> e)
+        Right bgSid -> do
+          -- (c) per-session streaming state + delivery flag.
+          ss <- newStreamingState
+          delivered <- newIORef False
+          let callback =
+                handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered
+          -- (d) the dedicated connection for the bg session.
+          eWs <- cccStartWs cfg (gcHost gwCfg) (gcWsPort gwCfg) callback
+          case eWs of
+            Left e -> ccSend chan ("bg session failed: " <> e)
+            Right ws -> do
+              -- (e) focus before registering or sending, so no turn event
+              -- can arrive for an untracked session (which would leak the
+              -- connection and skip the watch exclusion).
+              wcFocus ws bgSid
+              evictOldestBgSession pendingAsks bgSessions key
+              bgInsert bgSessions key BgSession { bgSid = bgSid, bgWs = ws }
+              -- (f) run the prompt on the bg session (never on the
+              -- conversation's session) and confirm.
+              eSent <- cccSendMessage cfg mgr apiBase bgSid prompt
+              case eSent of
+                Right sr | srKind sr /= "error" ->
+                  ccSend chan ("bg session " <> shortSessionId bgSid <> " started")
+                failure -> do
+                  _ <- bgRemove bgSessions key bgSid
+                  wcClose ws
+                  dropPendingAsks pendingAsks bgSid
+                  ccSend chan ("bg session failed: " <> bgSendFailure failure)
+  where
+    bgSendFailure (Left e)   = e
+    bgSendFailure (Right sr) = fromMaybe "send failed" (srError sr)
+
+-- | Enforce the per-conversation cap: when the conversation already holds
+-- 'maxBgSessions' live bg sessions, retire the oldest one so a further
+-- session can start.
+evictOldestBgSession :: PendingAsks -> BgSessions -> ConversationKey -> IO ()
+evictOldestBgSession pendingAsks bgSessions key = do
+  existing <- bgSessionsFor bgSessions key
+  when (length existing >= maxBgSessions) $
+    case existing of
+      (oldest : _) -> void (retireBgSession pendingAsks bgSessions key (bgSid oldest))
+      []           -> pure ()
+
+-- | Retire one background session: close its WS connection, untrack it, and
+-- drop its pending asks. Returns 'True' when it was still tracked, so a
+-- repeated @idle@ is a no-op.
+retireBgSession
+  :: PendingAsks -> BgSessions -> ConversationKey -> SessionId -> IO Bool
+retireBgSession pendingAsks bgSessions key sid = do
+  mSess <- bgRemove bgSessions key sid
+  for_ mSess (wcClose . bgWs)
+  dropPendingAsks pendingAsks sid
+  pure (isJust mSess)
+
+-- | The WS event handler for a background session's dedicated connection.
+-- Acts only on events for 'bgSid':
+--
+-- * a @response@ 'SeEntry' — post the recorded reply to the conversation and
+--   mark it delivered. Token deltas are deliberately not streamed for bg
+--   turns (pre-regression parity: the reply arrives on the recorded entry).
+-- * 'SeAsk' — render the question on the conversation (and register it as
+--   pending, so a button tap can answer it).
+-- * @tool-call@ activity — post the tool-progress line.
+-- * @harness-status@ @idle@ — retire the session (close, untrack, drop its
+--   asks) and report a turn that produced no reply.
+-- * everything else (entry-updates, list snapshots, replay markers, other
+--   sessions) — ignored.
+handleBgServerEvent
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> ConversationKey -> PendingAsks -> BgSessions
+  -> SessionId -> StreamingState -> IORef Bool -> ServerEvent -> IO ()
+handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered ev =
+  case ev of
+    SeEntry sid val
+      | sid == bgSid
+      , extractDirection val == "response"
+      , not (T.null (extractEntryText val)) -> do
+          handleEntry cfg chan ss val
+          writeIORef delivered True
+    SeAsk sid val
+      | sid == bgSid -> handleAsk cfg chan key pendingAsks sid val
+    SeAskResolved _ val -> forgetAskByPrefix pendingAsks (extractAskId val)
+    SeActivity sid val
+      | sid == bgSid -> case extractActivityKind val of
+          "tool-call" -> handleToolCallActivity cfg chan ss val
+          "harness-status"
+            | extractActivityStatus val == "idle" -> do
+                -- The close trigger is harness-status idle only (not
+                -- reply-delivered, which also fires at every turn end when
+                -- sub-agent children keep the session thinking).
+                wasTracked <- retireBgSession pendingAsks bgSessions key bgSid
+                when wasTracked $ do
+                  wasDelivered <- readIORef delivered
+                  unless wasDelivered $
+                    ccSend chan ("bg session " <> shortSessionId bgSid <> " produced no reply")
+          _ -> pure ()
+    _ -> pure ()
+
 -- | Ensure a WS connection exists for the conversation. If one exists,
 -- send a FocusOp to change focus. If not, start a new WS connection with
 -- the streaming event handler and send a FocusOp.
+--
+-- A connection is only reusable for the session it was built for.
+-- 'handleServerEvent' closes over the focused session **by value**, so a
+-- FocusOp cannot re-target the filter: an existing connection focused on
+-- session A keeps dropping session B's entries and asks. Re-targeting
+-- therefore closes the old connection and builds a new one whose callback
+-- is bound to the new session.
 ensureWsConn
   :: ChatChannel c
   => ChatChannelConfig -> c
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
+  -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState
   -> ThinkingTabs
   -> ConversationKey -> SessionId
   -> IO ()
-ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid = do
-  let gwCfg = cccGateway cfg
+ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid = do
   conns <- readTVarIO wsConns
   dbg ("[watch] ensureWsConn key=" <> ckConv key <> " hasConn=" <> (case Map.lookup key conns of Just _ -> "true"; Nothing -> "false"))
   case Map.lookup key conns of
-    Just (ws, _) -> wcFocus ws sid  -- already connected; just change focus
+    Just (boundSid, ws, _)
+      | boundSid == sid -> wcFocus ws sid  -- already connected; just change focus
+      -- Re-target: the callback closed over 'boundSid' by value, so a
+      -- FocusOp alone would leave this conversation deaf to 'sid'.
+      | otherwise -> do
+          dbg ("[watch] ensureWsConn re-target " <> sessionIdText boundSid
+               <> " -> " <> sessionIdText sid)
+          wcClose ws
+          atomically (modifyTVar' wsConns (Map.delete key))
+          connectWs
     Nothing -> do
-      -- Start a new WS connection with the streaming event handler.
-      let callback = handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs sid
-      eWs <- startWsClient (gcHost gwCfg) (gcWsPort gwCfg) callback
+      connectWs
+  where
+    -- Start a new WS connection whose event handler is bound to 'sid'.
+    connectWs = do
+      let gwCfg = cccGateway cfg
+          callback = handleServerEvent cfg chan key wsConns pendingAsks
+            bgSessions tabTracker watchState thinkingTabs sid
+      eWs <- cccStartWs cfg (gcHost gwCfg) (gcWsPort gwCfg) callback
       case eWs of
         Left e -> dbg ("[watch] WS connect FAILED: " <> e)
         Right ws -> do
           ss <- newStreamingState
-          atomically (modifyTVar' wsConns (Map.insert key (ws, ss)))
+          atomically (modifyTVar' wsConns (Map.insert key (sid, ws, ss)))
           wcFocus ws sid
 
 -- | The WS event handler: processes streaming events for one conversation.
@@ -410,32 +776,56 @@ ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key
 handleServerEvent
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
+  -> TVar (Map ConversationKey WsConn)
   -> PendingAsks
+  -> BgSessions
   -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState
   -> ThinkingTabs
   -> SessionId -> ServerEvent -> IO ()
-handleServerEvent cfg chan key wsConns pendingAsks tabTracker watchState thinkingTabs focusedSid ev =
+handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs focusedSid ev =
   case ev of
     SeEntryUpdate sid val
-      | sid == focusedSid -> handleEntryUpdate cfg chan key wsConns val
+      | sid == focusedSid ->
+          withStreamingState wsConns key (\ss -> handleEntryUpdate cfg chan ss val)
     SeEntry sid val
-      | sid == focusedSid -> handleEntry cfg chan key wsConns val
+      | sid == focusedSid ->
+          withStreamingState wsConns key (\ss -> handleEntry cfg chan ss val)
     SeActivity sid val
       | sid == focusedSid -> do
           dbg ("[watch] SeActivity focused sid=" <> sessionIdText sid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
-          handleActivity cfg chan key wsConns val
+          withStreamingState wsConns key (\ss -> handleActivity cfg chan ss val)
       | otherwise         -> do
-          dbg ("[watch] SeActivity non-focused sid=" <> sessionIdText sid <> " focusedSid=" <> sessionIdText focusedSid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val)
-          handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
+          -- A background session's activity arrives on that session's own
+          -- WS connection, but it can also be broadcast to this one. It
+          -- must never reach the watch-all-tabs path: a bg turn is tracked
+          -- by 'handleBgServerEvent', and a watch notification would emit
+          -- a bogus "Tab ?" line plus a duplicate reply for every bg turn.
+          isBg <- bgOwnsSession bgSessions key sid
+          dbg ("[watch] SeActivity non-focused sid=" <> sessionIdText sid <> " focusedSid=" <> sessionIdText focusedSid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val <> " bg=" <> (if isBg then "true" else "false"))
+          unless isBg $
+            handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
     -- Tool-call events are BeActivity with kind="tool-call", broadcast
     -- by the server's aeOnToolCall hook. They arrive as SeActivity.
     -- handleActivity dispatches on kind internally.
     SeAsk sid val
       | sid == focusedSid -> handleAsk cfg chan key pendingAsks sid val
+    -- A question answered/cancelled/timed out elsewhere (the web UI) is no
+    -- longer answerable from this channel.
+    SeAskResolved _ val -> forgetAskByPrefix pendingAsks (extractAskId val)
     SeLists val -> handleLists cfg chan key tabTracker watchState thinkingTabs val
     _ -> pure ()  -- ignore events for other sessions or irrelevant types
+
+-- | Run an action with the conversation's streaming state, if it has a WS
+-- connection (and therefore a state) at all.
+withStreamingState
+  :: TVar (Map ConversationKey WsConn)
+  -> ConversationKey
+  -> (StreamingState -> IO ())
+  -> IO ()
+withStreamingState wsConns key act = do
+  conns <- readTVarIO wsConns
+  for_ (Map.lookup key conns) (\(_, _, ss) -> act ss)
 
 -- | Check whether the inbound body is a @/watch@ command (bare @/watch@,
 -- or @/watch on@ / @/watch off@ / @/watch status@ / @/watch -h@). Pure.
@@ -634,61 +1024,53 @@ sessionDisplayTitle val =
 -- | Handle an @entry-update@ event: create or edit the streaming bubble.
 handleEntryUpdate
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> Value -> IO ()
-handleEntryUpdate cfg chan key wsConns val = do
-  conns <- readTVarIO wsConns
-  case Map.lookup key conns of
-    Nothing -> pure ()  -- no streaming state; ignore
-    Just (_, ss) -> do
-      let streamCfg = cccStreamCfg cfg
-          text = extractEntryText val
-      if T.null text
-        then pure ()
-        else do
-          -- Post-finalize guard (issue #198 follow-up): a late
-          -- entry-update can arrive AFTER the turn's recorded entry
-          -- (the server's streaming path and the post-turn broadcast
-          -- are unsynchronized). Editing now would overwrite the
-          -- finalized text and re-add the cursor. Ignore updates
-          -- entirely while the turn is finalized.
-          finalized <- readIORef (ssFinalized ss)
-          unless finalized $ do
-            writeIORef (ssAccumulated ss) text
-            -- For channels that don't support streaming (Signal), just
-            -- accumulate the text without sending intermediate edits.
-            -- The final text is sent as a single message when the
-            -- recorded entry or idle status arrives (finalizeBubble).
-            when (ccSupportsStreaming chan) $ do
-              now <- getCurrentTime
-              mLastEdit <- readIORef (ssLastEdit ss)
-              mMsgId <- readIORef (ssMsgId ss)
-              -- Gate on NEW text since the last edit, not the total length
-              -- (issue #198, part 3). The accumulator only grows within a
-              -- response, so a total-length threshold degenerates to an edit
-              -- on EVERY frame once the text passes spcBufferThreshold —
-              -- one outbound platform edit per arriving WS frame (the
-              -- 'lots of small updates' flood). Measuring the delta since
-              -- the last edit keeps the cadence the config intends: an edit
-              -- per interval, or per 80 NEW codepoints, whichever first.
-              lastLen <- readIORef (ssLastLen ss)
-              when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
-                let content = addCursor streamCfg text
-                case mMsgId of
-                  Nothing -> do
-                    mId <- ccSendWithId chan content
-                    case mId of
-                      Just id' -> do
-                        writeIORef (ssMsgId ss) (Just id')
-                        writeIORef (ssLastEdit ss) (Just now)
-                        writeIORef (ssLastLen ss) (T.length text)
-                      Nothing -> pure ()
-                  Just id' -> do
-                    ok <- ccEditMessage chan id' content
-                    when ok $ do
-                      writeIORef (ssLastEdit ss) (Just now)
-                      writeIORef (ssLastLen ss) (T.length text)
+  => ChatChannelConfig -> c -> StreamingState -> Value -> IO ()
+handleEntryUpdate cfg chan ss val = do
+  let streamCfg = cccStreamCfg cfg
+      text = extractEntryText val
+  unless (T.null text) $ do
+    -- Post-finalize guard (issue #198 follow-up): a late
+    -- entry-update can arrive AFTER the turn's recorded entry
+    -- (the server's streaming path and the post-turn broadcast
+    -- are unsynchronized). Editing now would overwrite the
+    -- finalized text and re-add the cursor. Ignore updates
+    -- entirely while the turn is finalized.
+    finalized <- readIORef (ssFinalized ss)
+    unless finalized $ do
+      writeIORef (ssAccumulated ss) text
+      -- For channels that don't support streaming (Signal), just
+      -- accumulate the text without sending intermediate edits.
+      -- The final text is sent as a single message when the
+      -- recorded entry or idle status arrives (finalizeBubble).
+      when (ccSupportsStreaming chan) $ do
+        now <- getCurrentTime
+        mLastEdit <- readIORef (ssLastEdit ss)
+        mMsgId <- readIORef (ssMsgId ss)
+        -- Gate on NEW text since the last edit, not the total length
+        -- (issue #198, part 3). The accumulator only grows within a
+        -- response, so a total-length threshold degenerates to an edit
+        -- on EVERY frame once the text passes spcBufferThreshold —
+        -- one outbound platform edit per arriving WS frame (the
+        -- 'lots of small updates' flood). Measuring the delta since
+        -- the last edit keeps the cadence the config intends: an edit
+        -- per interval, or per 80 NEW codepoints, whichever first.
+        lastLen <- readIORef (ssLastLen ss)
+        when (shouldEdit streamCfg now mLastEdit (T.length text - lastLen)) $ do
+          let content = addCursor streamCfg text
+          case mMsgId of
+            Nothing -> do
+              mId <- ccSendWithId chan content
+              case mId of
+                Just id' -> do
+                  writeIORef (ssMsgId ss) (Just id')
+                  writeIORef (ssLastEdit ss) (Just now)
+                  writeIORef (ssLastLen ss) (T.length text)
+                Nothing -> pure ()
+            Just id' -> do
+              ok <- ccEditMessage chan id' content
+              when ok $ do
+                writeIORef (ssLastEdit ss) (Just now)
+                writeIORef (ssLastLen ss) (T.length text)
 
 -- | Finalize the current streaming bubble for one conversation: edit it
 -- without the cursor (or, if the edit fails, send the full text as a new
@@ -718,49 +1100,34 @@ finalizeBubble cfg chan ss text markFinal = do
 -- streaming bubble with the definitive text (mark the turn final).
 handleEntry
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> Value -> IO ()
-handleEntry cfg chan key wsConns val = do
+  => ChatChannelConfig -> c -> StreamingState -> Value -> IO ()
+handleEntry cfg chan ss val = do
   -- Only process response entries (skip request entries which would
   -- incorrectly finalize the streaming bubble with the user's text).
   let direction = extractDirection val
-  if direction /= "response"
-    then pure ()
-    else do
-      conns <- readTVarIO wsConns
-      case Map.lookup key conns of
-        Nothing -> pure ()
-        Just (_, ss) -> do
-          let text = extractEntryText val
-          if T.null text
-            then pure ()
-            else do
-              -- The recorded entry is the definitive delivery: mark the
-              -- turn finalized so late entry-updates are ignored.
-              -- For non-streaming channels, the recorded entry's text
-              -- is the authoritative full response — send it even if
-              -- we already sent the accumulated text via idle (the
-              -- recorded entry is the canonical source). Skip if we
-              -- already delivered via finalizeBubble (mMsgId was set
-              -- and finalized).
-              alreadyDelivered <- readIORef (ssFinalized ss)
-              if alreadyDelivered
-                then pure ()
-                else finalizeBubble cfg chan ss text True
+  when (direction == "response") $ do
+    let text = extractEntryText val
+    unless (T.null text) $ do
+      -- The recorded entry is the definitive delivery: mark the turn
+      -- finalized so late entry-updates are ignored. For non-streaming
+      -- channels, the recorded entry's text is the authoritative full
+      -- response — send it even if we already sent the accumulated text
+      -- via idle (the recorded entry is the canonical source). Skip if
+      -- we already delivered via finalizeBubble (mMsgId was set and
+      -- finalized).
+      alreadyDelivered <- readIORef (ssFinalized ss)
+      unless alreadyDelivered $
+        finalizeBubble cfg chan ss text True
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
 handleActivity
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> Value -> IO ()
-handleActivity cfg chan key wsConns val = do
-  let kind = extractActivityKind val
-  case kind of
-    "harness-status" -> handleHarnessStatus cfg chan key wsConns val
-    "tool-call" -> handleToolCallActivity cfg chan key wsConns val
+  => ChatChannelConfig -> c -> StreamingState -> Value -> IO ()
+handleActivity cfg chan ss val =
+  case extractActivityKind val of
+    "harness-status" -> handleHarnessStatus cfg chan ss val
+    "tool-call" -> handleToolCallActivity cfg chan ss val
     _ -> pure ()
 
 -- | Handle a @harness-status@ activity: on @thinking@ (turn start),
@@ -770,36 +1137,27 @@ handleActivity cfg chan key wsConns val = do
 -- and reset all streaming state.
 handleHarnessStatus
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> Value -> IO ()
-handleHarnessStatus cfg chan key wsConns val = do
-    let status = extractActivityStatus val
-    case status of
-      "thinking" -> do
-        conns <- readTVarIO wsConns
-        for_ (Map.lookup key conns) $ \(_, ss) ->
-          writeIORef (ssFinalized ss) False
-      "idle" -> do
-        conns <- readTVarIO wsConns
-        case Map.lookup key conns of
-          Nothing -> pure ()
-          Just (_, ss) -> do
-            mMsgId <- readIORef (ssMsgId ss)
-            accum <- readIORef (ssAccumulated ss)
-            -- For non-streaming channels (Signal), the accumulated text
-            -- is the full response. Send it as a new message (mMsgId is
-            -- Nothing because no streaming bubble was created). For
-            -- streaming channels, only finalize if there's an active
-            -- streaming bubble (mMsgId is Just).
-            -- Don't mark as finalized — the recorded entry is the
-            -- canonical finalize path. This is just a safety net.
-            when (not (T.null accum) &&
-                  (not (ccSupportsStreaming chan) || isJust mMsgId)) $
-              finalizeBubble cfg chan ss accum False
-            resetStreamingState ss
-            writeIORef (ssFinalized ss) True
-      _ -> pure ()
+  => ChatChannelConfig -> c -> StreamingState -> Value -> IO ()
+handleHarnessStatus cfg chan ss val =
+  case extractActivityStatus val of
+    "thinking" ->
+      -- Turn start: clear the finalized flag so the new turn streams.
+      writeIORef (ssFinalized ss) False
+    "idle" -> do
+      mMsgId <- readIORef (ssMsgId ss)
+      accum <- readIORef (ssAccumulated ss)
+      -- For non-streaming channels (Signal), the accumulated text is the
+      -- full response. Send it as a new message (mMsgId is Nothing because
+      -- no streaming bubble was created). For streaming channels, only
+      -- finalize if there's an active streaming bubble (mMsgId is Just).
+      -- Don't mark as finalized — the recorded entry is the canonical
+      -- finalize path. This is just a safety net.
+      when (not (T.null accum) &&
+            (not (ccSupportsStreaming chan) || isJust mMsgId)) $
+        finalizeBubble cfg chan ss accum False
+      resetStreamingState ss
+      writeIORef (ssFinalized ss) True
+    _ -> pure ()
 
 -- | Handle a @tool-call@ activity: finalize the current text bubble
 -- (segment break — the pre-tool text stays its own message, and the
@@ -807,25 +1165,21 @@ handleHarnessStatus cfg chan key wsConns val = do
 -- the tool-progress line as its own platform message.
 handleToolCallActivity
   :: ChatChannel c
-  => ChatChannelConfig -> c -> ConversationKey
-  -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> Value -> IO ()
-handleToolCallActivity cfg chan key wsConns val = do
+  => ChatChannelConfig -> c -> StreamingState -> Value -> IO ()
+handleToolCallActivity cfg chan ss val = do
   -- Segment break (issue #198 follow-up, symptom 1): the pre-tool
   -- streamed text and the post-tool streamed text must be SEPARATE
   -- platform messages, with the tool line between them. Without this,
   -- the next entry-update edits the pre-tool bubble (ssMsgId is still
   -- set) and appends the post-tool text onto the pre-tool text.
-  conns <- readTVarIO wsConns
-  for_ (Map.lookup key conns) $ \(_, ss) -> do
-    mMsgId <- readIORef (ssMsgId ss)
-    accum <- readIORef (ssAccumulated ss)
-    -- For non-streaming channels, finalize when there's accumulated text
-    -- even without a streaming bubble (mMsgId is Nothing). For streaming
-    -- channels, only finalize when there's an in-progress bubble.
-    when (not (T.null accum) &&
-          (not (ccSupportsStreaming chan) || isJust mMsgId)) $
-      finalizeBubble cfg chan ss accum False
+  mMsgId <- readIORef (ssMsgId ss)
+  accum <- readIORef (ssAccumulated ss)
+  -- For non-streaming channels, finalize when there's accumulated text
+  -- even without a streaming bubble (mMsgId is Nothing). For streaming
+  -- channels, only finalize when there's an in-progress bubble.
+  when (not (T.null accum) &&
+        (not (ccSupportsStreaming chan) || isJust mMsgId)) $
+    finalizeBubble cfg chan ss accum False
   case extractToolName val of
     Nothing -> pure ()
     Just toolName -> do
@@ -838,6 +1192,9 @@ handleToolCallActivity cfg chan key wsConns val = do
 -- question + an inline keyboard (one button per option). Otherwise falls
 -- back to the numbered-list text rendering. Registers the pending ask so
 -- the callback handler can resolve a button tap to the option label.
+-- The ask is registered even when it offers no options (an open-ended
+-- 'ASK_HUMAN', or the confirmation gate's bare prompt), so it can still be
+-- resolved and dequeued instead of leaking into the pending map.
 handleAsk
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey -> PendingAsks -> SessionId -> Value
@@ -854,23 +1211,31 @@ handleAsk _cfg chan _key pendingAsks sid val = do
       case mMsgId of
         Just _  -> pure ()
         Nothing -> ccSend chan (formatQuestionWithOptions question opts)
-      let entry = PendingAsk { paAskId = askId, paOptions = opts }
-      atomically (modifyTVar' pendingAsks (Map.insertWith (++) sid [entry]))
+  -- Register the ask (newest first) so a button tap can resolve it back to
+  -- the option label. An ask without an id can never be resolved — it is
+  -- not registered.
+  unless (T.null askId) $ do
+    seqNo <- atomically $ do
+      n <- readTVar (paNext pendingAsks)
+      writeTVar (paNext pendingAsks) (n + 1)
+      pure n
+    let entry = PendingAsk { paAskId = askId, paOptions = opts, paSeq = seqNo }
+    atomically (modifyTVar' (paStore pendingAsks) (Map.insertWith (++) sid [entry]))
 
 -- | Send a plain text message via the HTTP API. Resolves the conversation's
 -- session (creating one if it doesn't exist yet).
 sendPlain
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
+  -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key text = do
-  sid <- resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key
+sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text = do
+  sid <- resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eResult <- httpSend mgr apiBase sid text
+  eResult <- cccSendMessage cfg mgr apiBase sid text
   case eResult of
     Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
     Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -880,44 +1245,139 @@ sendPlain cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTa
 -- | Send a slash command via the HTTP API.
 sendSlash
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
+  -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
 sendSlash = sendPlain  -- same mechanism; the gateway routes slash commands
 
--- | Handle /new: create a new session via HTTP, update the session map.
+-- | What a successful @/new@ produced, in the shape the reply needs.
+data NewOutcome = NewOutcome
+  { noSid         :: Text
+  , noRebindError :: Maybe Text
+  , noOldSid      :: Maybe Text
+  , noProvider    :: Maybe Text
+  , noModel       :: Maybe Text
+  }
+
+-- | Handle /new: mint a fresh session and make it the conversation's
+-- focused session.
+--
+-- Exactly ONE mint happens per @/new@:
+--
+--   * the conversation already has a session ⇒ @POST \/api\/sessions\/:id\/new@
+--     ('cccRebindNew'), which mints AND rebinds the tab in one call;
+--   * no prior session ⇒ @POST \/api\/sessions\/new@ ('cccNewSession').
+--
+-- Minting on both paths would create two sessions and reproduce the exact
+-- orphan-session bug this work exists to fix.
+--
+-- The arguments are the CLI's (@-p\/--provider@, @-m\/--model@,
+-- @-r\/--repo@), parsed by the shared 'parseNewArgs' so chat and CLI accept
+-- the same flags. Message order: rebind warning, then repo failure, then the
+-- confirmation.
 handleNewSession
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
+  -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleNewSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key _args = do
+handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key args = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eSid <- httpNewSession mgr apiBase (A.object [])
-  case eSid of
+      na = parseNewArgs args
+  mPrior <- sessionLookup sessions key
+  eOutcome <- case mPrior of
+    Just oldSid -> do
+      -- Absent provider/model inherit the old session's (the gateway applies
+      -- that); the channel is this channel's label, so the new session stays
+      -- attributable to the medium it was created from.
+      eRes <- cccRebindNew cfg mgr apiBase oldSid
+        (rebindBody (naProvider na) (naModel na) (Just (ccLabel chan)))
+      pure $ fmap (\res -> NewOutcome
+        { noSid         = nsrSessionId res
+        , noRebindError = nsrRebindError res
+        , noOldSid      = Just (sessionIdText oldSid)
+        , noProvider    = Just (nsrProvider res)
+        , noModel       = Just (nsrModel res)
+        }) eRes
+    Nothing -> do
+      eSid <- cccNewSession cfg mgr apiBase (mintBody (naProvider na) (naModel na))
+      pure $ fmap (\sidText -> NewOutcome
+        { noSid         = sidText
+        , noRebindError = Nothing
+        , noOldSid      = Nothing
+        , noProvider    = Nothing
+        , noModel       = Nothing
+        }) eSid
+  case eOutcome of
     Left e -> ccSend chan ("new session failed: " <> e)
-    Right sidText -> case mkSessionId sidText of
+    Right out -> case mkSessionId (noSid out) of
       Left _ -> ccSend chan "new session failed: invalid session id"
       Right sid -> do
         sessionInsert sessions key sid
-        -- Ensure a WS connection exists for this conversation.
-        ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
-        ccSend chan ("new session " <> sessionIdText sid)
+        -- Re-target the conversation's WS connection on BOTH paths: without
+        -- this the new session's replies and asks are filtered out (WU-5).
+        ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid
+        -- A rebind failure is a warning, not a failure: the session exists.
+        for_ (noRebindError out) $ \e ->
+          ccSend chan ("warning: /new tab rebind failed: " <> e)
+        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na)
+        for_ mRepoErr $ \e -> ccSend chan ("repo setup failed: " <> e)
+        ccSend chan (newConfirmation out)
+
+-- | The @/new@ confirmation line: the shared renderer names the old session
+-- and the resume hint when there was one; a first @/new@ has nothing to name.
+newConfirmation :: NewOutcome -> Text
+newConfirmation out = case (noOldSid out, noProvider out, noModel out) of
+  (Just oldSid, Just prov, Just model) ->
+    renderNewSessionConfirmation (noSid out) prov model oldSid
+  _ -> "new session " <> noSid out
+
+-- | Run @-r@ after a successful @/new@: resolve a registered repo id to its
+-- URL, then dispatch SETUP_REPO on the NEW session. 'Nothing' when no @-r@
+-- was given or the clone succeeded (success is silent).
+setupRepoFor
+  :: ChatChannelConfig -> Manager -> Text -> SessionId -> Maybe Text
+  -> IO (Maybe Text)
+setupRepoFor cfg mgr apiBase sid mRepo = case mRepo of
+  Nothing  -> pure Nothing
+  Just raw -> do
+    url <- resolveRepoArg cfg mgr apiBase raw
+    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url)
+    pure (either Just (const Nothing) eRes)
+
+-- | Resolve a @-r@ value to a git URL: an exact match on a registered repo id
+-- (after trimming) resolves to that repo's @url@; anything else — and a
+-- failed @GET \/api\/repos@ — is used verbatim (never an error).
+resolveRepoArg :: ChatChannelConfig -> Manager -> Text -> Text -> IO Text
+resolveRepoArg cfg mgr apiBase raw = do
+  eRepos <- cccGetRepos cfg mgr apiBase
+  pure $ case eRepos of
+    Right repos | Just url <- lookupRepoUrl (T.strip raw) repos -> url
+    _ -> raw
+
+-- | Find a registered repo's URL by exact id match.
+lookupRepoUrl :: Text -> [Value] -> Maybe Text
+lookupRepoUrl rid repos = listToMaybe
+  [ url
+  | A.Object o <- repos
+  , Just (A.String i) <- [KeyMap.lookup (Key.fromText "id") o]
+  , i == rid
+  , Just (A.String url) <- [KeyMap.lookup (Key.fromText "url") o]
+  ]
 
 -- | Resolve the conversation's session. If the conversation has no session
 -- yet, create one via the HTTP API.
 resolveSession
-  :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey (WsClient, StreamingState))
-  -> PendingAsks -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  :: ChatChannel c => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
+  -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
   -> ConversationKey
   -> IO SessionId
-resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState thinkingTabs key = do
+resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key = do
   mSid <- sessionLookup sessions key
   case mSid of
     Just sid -> pure sid
@@ -929,7 +1389,7 @@ resolveSession cfg chan sessions wsConns pendingAsks tabTracker watchState think
         Right sidText -> case mkSessionId sidText of
           Right sid -> do
             sessionInsert sessions key sid
-            ensureWsConn cfg chan wsConns pendingAsks tabTracker watchState thinkingTabs key sid
+            ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid
             pure sid
           Left _ -> fallbackSid
         Left _ -> fallbackSid
@@ -956,41 +1416,156 @@ sendLastReply cfg chan sid = do
 -- silently dropped (stale button tap).
 handleCallback
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionMap -> PendingAsks
+  => ChatChannelConfig -> c -> SessionMap -> PendingAsks -> BgSessions
   -> ConversationKey -> MessageSource -> Text
   -> IO ()
-handleCallback cfg chan sessions pendingAsks key _src cbData = do
+handleCallback cfg chan sessions pendingAsks bgSessions key _src cbData = do
   case parseCallbackData cbData of
     Nothing -> pure ()  -- not a valid callback_data format
     Just (prefix, idx) -> do
-      mSid <- sessionLookup sessions key
-      case mSid of
-        Nothing -> pure ()
-        Just sid -> do
-          asksMap <- readTVarIO pendingAsks
-          case Map.lookup sid asksMap of
+      -- Only asks owned by this conversation are answerable: its focused
+      -- session, or one of its own background sessions. A tap in another
+      -- conversation can never resolve them.
+      sids <- answerableSids sessions bgSessions key
+      asksMap <- readTVarIO (paStore pendingAsks)
+      let matches =
+            [ (sid, ask)
+            | sid <- sids
+            , Just asks <- [Map.lookup sid asksMap]
+            , ask <- asks
+            , T.isPrefixOf prefix (paAskId ask)
+            ]
+      case matches of
+        [] -> pure ()
+        ((sid, ask) : _) ->
+          case atIndex (paOptions ask) idx of
             Nothing -> pure ()
-            Just asks ->
-              case [ a | a <- asks, T.isPrefixOf prefix (paAskId a) ] of
-                (ask : _) ->
-                  case atIndex (paOptions ask) idx of
-                    Nothing -> pure ()
-                    Just opt -> do
-                      let apiBase = gcApiBase (cccGateway cfg)
-                          mgr = cccHttpManager cfg
-                      -- Answer the question via the HTTP API.
-                      _ <- httpAnswerQuestion mgr apiBase sid (paAskId ask) (qoLabel opt) "once"
-                      -- Acknowledge the callback (dismiss spinner).
-                      -- We don't have the callback_query_id here (it's in
-                      -- the InboundMessage but not passed through). The
-                      -- ccAnswerCallback method needs it. For now, skip
-                      -- the callback ack — the button still works, the
-                      -- spinner just persists a bit longer.
-                      -- Send a confirmation to the chat.
-                      ccSend chan ("✓ " <> qoLabel opt)
-                      let remaining = filter (not . T.isPrefixOf prefix . paAskId) asks
-                      atomically (modifyTVar' pendingAsks (Map.insert sid remaining))
-                [] -> pure ()
+            Just opt -> answerAsk cfg chan pendingAsks sid (paAskId ask) (qoLabel opt)
+
+-- | The sessions whose pending asks a conversation may answer: its focused
+-- session (when it has one) plus its own background sessions.
+answerableSids :: SessionMap -> BgSessions -> ConversationKey -> IO [SessionId]
+answerableSids sessions bgSessions key = do
+  mFocused <- sessionLookup sessions key
+  bgSids <- map bgSid <$> bgSessionsFor bgSessions key
+  pure (maybe [] pure mFocused <> bgSids)
+
+-- | Answer a pending ask by id, then dequeue it and confirm on the channel.
+-- The answer goes to the ask's own session (a background session's ask is
+-- owned by that session, not by the conversation's).
+--
+-- A transport/HTTP failure leaves the ask pending so the operator can retry.
+-- A @200 {"accepted": false}@ response means the question was already
+-- answered, cancelled, or unknown: it is resolved either way, so the ask is
+-- dequeued, but the answer is not claimed as accepted.
+answerAsk
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> SessionId -> Text -> Text -> IO ()
+answerAsk cfg chan pendingAsks sid askId answer = do
+  let apiBase = gcApiBase (cccGateway cfg)
+      mgr = cccHttpManager cfg
+  eRes <- cccAnswerQuestion cfg mgr apiBase sid askId answer
+  case eRes of
+    Left e -> ccSend chan ("answer failed: " <> e)
+    Right accepted -> do
+      forgetAsk pendingAsks sid askId
+      ccSend chan
+        (if accepted
+           then "✓ " <> answer
+           else "question was already resolved; answer not accepted")
+
+-- | Remove one pending ask (by id) from a session's list.
+forgetAsk :: PendingAsks -> SessionId -> Text -> IO ()
+forgetAsk pendingAsks sid askId = atomically $ do
+  let tv = paStore pendingAsks
+  m <- readTVar tv
+  case Map.lookup sid m of
+    Nothing -> pure ()
+    Just asks ->
+      case filter ((/= askId) . paAskId) asks of
+        []    -> writeTVar tv (Map.delete sid m)
+        kept  -> writeTVar tv (Map.insert sid kept m)
+
+-- | Drop every pending ask whose id starts with @prefix@, across sessions.
+-- Driven by @ask_resolved@: a question answered from the web (or cancelled,
+-- or timed out) must stop being answerable -- and must stop accumulating in
+-- the pending map.
+forgetAskByPrefix :: PendingAsks -> Text -> IO ()
+forgetAskByPrefix pendingAsks prefix
+  | T.null prefix = pure ()
+  | otherwise = atomically (modifyTVar' (paStore pendingAsks) (Map.mapMaybe keep))
+  where
+    keep asks = case filter (not . T.isPrefixOf prefix . paAskId) asks of
+      []   -> Nothing
+      kept -> Just kept
+
+-- | Answer a pending ask belonging to one of this conversation's background
+-- sessions with an inbound plain-text message. Returns 'True' when the
+-- message was consumed as an answer (so it must NOT be routed to the
+-- focused session).
+--
+-- A numeric body (1-based) selects the corresponding option label; any other
+-- body is delivered verbatim -- which is what the confirmation gate needs
+-- (@y@/@yes@ approve once, anything else rejects). The oldest pending ask
+-- wins: bg sessions are scanned in creation order, and each session's list
+-- is newest-first ('handleAsk' prepends), so the oldest ask for a session is
+-- its last element.
+answerPendingBgAsk
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> BgSessions -> ConversationKey -> Text
+  -> IO Bool
+answerPendingBgAsk cfg chan pendingAsks bgSessions key body = do
+  bg <- bgSessionsFor bgSessions key
+  asksMap <- readTVarIO (paStore pendingAsks)
+  -- Per session the earliest-registered ask is the list tail ('handleAsk'
+  -- prepends); across sessions 'paSeq' orders them, which session order
+  -- cannot.
+  let candidates =
+        [ (bgSid sess, ask)
+        | sess <- bg
+        , Just asks <- [Map.lookup (bgSid sess) asksMap]
+        , Just ask <- [earliestRegistered asks]
+        ]
+  case oldestAcross candidates of
+    Nothing -> pure False
+    Just (sid, ask) -> do
+      answerAsk cfg chan pendingAsks sid (paAskId ask) (resolveAnswer (paOptions ask) body)
+      pure True
+
+-- | The earliest-registered ask of all candidates (ties keep list order).
+oldestAcross :: [(SessionId, PendingAsk)] -> Maybe (SessionId, PendingAsk)
+oldestAcross = foldl' pick Nothing
+  where
+    pick Nothing x = Just x
+    pick (Just best) x
+      | paSeq (snd x) < paSeq (snd best) = Just x
+      | otherwise                        = Just best
+
+-- | The earliest-registered ask in one session's list (ties keep list order).
+earliestRegistered :: [PendingAsk] -> Maybe PendingAsk
+earliestRegistered = foldl' pick Nothing
+  where
+    pick Nothing ask = Just ask
+    pick (Just best) ask
+      | paSeq ask < paSeq best = Just ask
+      | otherwise              = Just best
+
+-- | Resolve an inbound text body against a question's options: a 1-based
+-- numeric body selects that option's label, anything else is the answer
+-- verbatim.
+resolveAnswer :: [QuestionOption] -> Text -> Text
+resolveAnswer opts body
+  | Just opt <- numericOption opts body = qoLabel opt
+  | otherwise                          = body
+
+-- | The option a 1-based numeric body selects, if any.
+numericOption :: [QuestionOption] -> Text -> Maybe QuestionOption
+numericOption opts body
+  | T.null t || T.length t > 6 || not (T.all isDigit t) = Nothing
+  | otherwise = atIndex opts (T.foldl' step 0 t - 1)
+  where
+    t = T.strip body
+    step acc c = acc * 10 + (fromEnum c - fromEnum '0')
 
 -- | Handle a @lists@ WS event: compare the new tab list with the last known
 -- one for this conversation. If the focused session's tab was removed (closed),
@@ -1225,3 +1800,21 @@ lastAssistantText entries =
 asText :: Value -> Maybe Text
 asText (A.String t) = Just t
 asText _ = Nothing
+
+-- | Handle @\/tab list@: render the tab list from @GET \/api\/lists@, one
+-- message per tab (@no tabs@ when empty), then report any fetch failure.
+--
+-- Rendered client-side rather than through the gateway's @\/send@ because the
+-- registry's @\/tab list@ cannot see the broker's thinking set (so no
+-- @busy@\/@idle@) and its format carries no repo.
+handleTabList :: ChatChannel c => ChatChannelConfig -> c -> IO ()
+handleTabList cfg chan = do
+  let mgr = cccHttpManager cfg
+      apiBase = gcApiBase (cccGateway cfg)
+  eLists <- cccGetLists cfg mgr apiBase
+  case eLists of
+    Left e -> ccSend chan ("tab list failed: " <> e)
+    Right lj ->
+      case tabListRows lj of
+        []   -> ccSend chan "no tabs"
+        rows -> mapM_ (ccSend chan . renderTabListRow) rows

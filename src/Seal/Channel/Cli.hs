@@ -46,6 +46,7 @@ import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), resolveSessionProvider)
+import Seal.Command.Registry (mintTabSession)
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
@@ -54,7 +55,7 @@ import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
 import qualified Seal.Core.TurnEngine as TurnEngine
-import Seal.Core.Types (SessionId, OpName (..), mkSessionId)
+import Seal.Core.Types (SessionId, OpName (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
@@ -65,6 +66,7 @@ import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption, mkHostKeyAdoption)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Routing.Route qualified
 import Seal.Session.ExecCache (newSessionExecCache)
@@ -81,7 +83,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection
-  , newSession, resolveDefaultAgent )
+  , newSession, resolveDefaultAgent, saveSessionMeta )
 import Seal.Types.App (runApp)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
@@ -145,8 +147,8 @@ runCliTui
   :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
   -> AskReplyStore -> SealLogger -> HarnessRegistry -> TmuxRunner
-  -> SessionAbortRegistry -> IO ()
-runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg = do
+  -> SessionAbortRegistry -> SessionRepeatRegistry -> IO ()
+runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg repeatReg = do
   approvals <- newApprovalCache
   replies <- newReplyRegistry
   locks <- newSessionLocks
@@ -229,6 +231,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
@@ -240,6 +243,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
               , tdOnIdleCompletion = Nothing
+              , tdOnTurnEnd = Nothing
               }
             bgAdapter = TurnAdapter
               { taCaps          = bgCaps
@@ -285,6 +289,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
@@ -296,6 +301,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
               , tdOnIdleCompletion = Nothing
+              , tdOnTurnEnd = Nothing
               }
         TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
@@ -316,6 +322,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdReplies      = replies
               , tdLocks        = locks
               , tdAbortReg     = abortReg
+              , tdRepeatReg    = repeatReg
               , tdTabsHandle   = tabsH
               , tdLogger       = logger
               , tdIsRemote     = isRemote
@@ -327,6 +334,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdResolveProviderOverride = Nothing
               , tdMkWorkerStubDepth = 2
               , tdOnIdleCompletion = Nothing
+              , tdOnTurnEnd = Nothing
               }
             adapter = TurnAdapter
               { taCaps          = caps
@@ -380,7 +388,10 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
                 Right (Seal.Routing.Route.Inject idx payload) -> liftIO $ do
                   _ <- focusTabH th idx
                   plainHandler payload
-                Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
+                Right (Seal.Routing.Route.TabCommand tsc) ->
+                  liftIO (handleTabCommand paths caps th
+                            (mintTabSession paths (loadRuntimeConfig (prConfigPath pr)) (bAgentDefs backends))
+                            tsc)
                 Right Seal.Routing.Route.CurrentTab -> liftIO $ do
                   active <- readIORef (srActive sr)
                   tl <- snapshotTabs th
@@ -409,18 +420,22 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
 -- which session the next message goes to (the CLI uses 'srActive' for that).
 -- The inbox-driven channels ('runChannelLoop') intercept @\/tab focus@ and
 -- update the cursor there.
-handleTabCommand :: ChannelCaps -> TabsHandle -> TabSlashCommand -> IO ()
-handleTabCommand caps tabsH = \case
+handleTabCommand :: SealPaths -> ChannelCaps -> TabsHandle -> IO SessionMeta
+                 -> TabSlashCommand -> IO ()
+handleTabCommand paths caps tabsH mint = \case
   TabListCmd -> do
     tl <- snapshotTabs tabsH
     if tabCount tl == 0
       then ccSend caps "no tabs"
       else mapM_ (ccSend caps . renderTab) (tlTabs tl)
   TabNewCmd _mKind -> do
-    r <- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing
+    meta <- mint
+    r <- insertTabH tabsH (BoundSession (smId meta)) KindProvider Nothing
     case r of
       Left e  -> ccSend caps ("tab new failed: " <> e)
-      Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")
+      Right i -> do
+        saveSessionMeta paths meta
+        ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")
   TabCloseCmd idx force -> do
     r <- removeTabH tabsH idx
     case r of
@@ -441,11 +456,6 @@ handleTabCommand caps tabsH = \case
     case r of
       Left e  -> ccSend caps ("rename failed: " <> e)
       Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar idx) <> " renamed to " <> name)
-  where
-    placeholderSid = case mkSessionId "tab-session" of
-      Right s -> s
-      Left _  -> error "placeholder session id"
-
 -- | Render one tab as a single line: @<index>  <kind>  [label]@.
 renderTab :: Tab -> Text
 renderTab t =

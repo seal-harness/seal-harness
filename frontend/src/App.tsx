@@ -23,6 +23,7 @@ import {
   setSessionDescription,
   setSessionAgent,
   setSessionPrompt,
+  setSessionSealFrontMatter,
   fetchDefaultAgent,
   closeTab,
   dismissTab,
@@ -268,6 +269,15 @@ export default function App() {
   // agents re-broadcast (which would clobber an explicit user choice).
   const prevDefaultRef = useRef<string | null>(null)
   const [customPromptFile, setCustomPromptFile] = useState<{ name: string; content: string } | null>(null)
+  // The "Add Seal Harness front matter" toggle's state for the focused
+  // session. The backend owns the truth (session.json); this mirrors it so
+  // the checkbox reflects the current setting immediately on toggle.
+  const [sealFrontMatter, setSealFrontMatter] = useState(true)
+  // Optimistic override for the front-matter toggle, keyed by session id.
+  // Without it, a lists frame that was already in flight when the user
+  // clicked would carry the pre-toggle value and snap the checkbox back.
+  // The override wins until the server's value for that session arrives.
+  const [frontMatterOverrides, setFrontMatterOverrides] = useState<Map<string, boolean>>(() => new Map())
 
   // Optimistic strip: hide an archived session from the sidebar immediately.
   const [archivedOptimistically, setArchivedOptimistically] = useState<Set<string>>(() => new Set())
@@ -345,11 +355,11 @@ export default function App() {
   // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
   // fetch on every tab click). The `loading` flag and `refresh` action
   // are exposed by the stream hook.
- const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest } = useTranscriptStream(currentSessionId)
+ const { entries: streamEntries, pendingQuestions, loading, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest, status: streamStatus, lastError: streamError, reconnectAttempts: streamReconnectAttempts, reconnectNow: streamReconnectNow } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
-  const { send, sending, resetSending } = useSendMessage(currentSessionId, refresh)
+  const { send, sending, resetSending } = useSendMessage(currentSessionId)
 
   // ── Pending optimistic message + slash bubbles ────────────────────────
   const [pendingMessage, setPendingMessage] = useState<string | null>(null)
@@ -472,6 +482,23 @@ export default function App() {
       // arrives a moment later).
       setSelectedAgent(null)
     }
+  }, [currentSessionId])
+
+  // Apply a change to the "Add Seal Harness front matter" toggle: persist
+  // it to the session (PUT /api/sessions/:id/seal-front-matter) and update
+  // the local state so the checkbox responds immediately. The setting
+  // takes effect on the next turn — the system prompt is resolved per turn.
+  const handleSealFrontMatterChange = useCallback((enabled: boolean) => {
+    setSealFrontMatter(enabled)
+    if (!currentSessionId) return
+    // Record the choice as an override so an in-flight lists frame
+    // carrying the pre-toggle value doesn't snap the checkbox back.
+    setFrontMatterOverrides((prev) => {
+      const next = new Map(prev)
+      next.set(currentSessionId, enabled)
+      return next
+    })
+    void setSessionSealFrontMatter(currentSessionId, enabled)
   }, [currentSessionId])
 
   const syncPath = useCallback((id: string | null) => {
@@ -932,6 +959,36 @@ export default function App() {
       : { ...base, description: override.length > 0 ? override : null }
   }, [sessions, archivedSessions, tabSessions, currentSessionId, descriptionOverrides])
 
+  // Sync the front-matter toggle from the focused session's persisted
+  // value. A session that predates the toggle (or whose field the server
+  // omits) reports the default: front matter ON.
+  useEffect(() => {
+    if (!selectedSession) return
+    const override = frontMatterOverrides.get(selectedSession.id)
+    if (override !== undefined) {
+      // The user's choice hasn't been confirmed by the server yet.
+      setSealFrontMatter(override)
+      return
+    }
+    setSealFrontMatter(selectedSession.sealFrontMatter !== false)
+  }, [selectedSession, frontMatterOverrides])
+
+  // Drop the override once the server reports the session's persisted
+  // value matches what the user chose (the toggle was applied).
+  useEffect(() => {
+    if (!selectedSession) return
+    const override = frontMatterOverrides.get(selectedSession.id)
+    if (override === undefined) return
+    if (selectedSession.sealFrontMatter === override) {
+      setFrontMatterOverrides((prev) => {
+        if (!prev.has(selectedSession.id)) return prev
+        const next = new Map(prev)
+        next.delete(selectedSession.id)
+        return next
+      })
+    }
+  }, [selectedSession, frontMatterOverrides])
+
   // Value shown in the input-row model dropdown. For a provider session, the
   // default is the most-recent transcript `_te_model`; a user override takes
   // precedence. `null` ⇒ the dropdown is suppressed (harness sessions, a
@@ -1003,6 +1060,10 @@ export default function App() {
             <ChatArea
               selectedAgent={displayAgent ?? DEFAULT_AGENT}
               selectedSession={selectedSession}
+              streamStatus={streamStatus}
+              streamError={streamError}
+              streamReconnectAttempts={streamReconnectAttempts}
+              onStreamReconnect={streamReconnectNow}
               onSetDescription={handleSetDescription}
               messages={messages}
               loading={loading}
@@ -1023,6 +1084,8 @@ export default function App() {
               onAgentChange={handleAgentChange}
               customPromptFile={customPromptFile}
               onCustomPromptFile={handleCustomPromptFile}
+              sealFrontMatter={sealFrontMatter}
+              onSealFrontMatterChange={handleSealFrontMatterChange}
               newTabFocusTick={newTabFocusTick}
               selectedId={selectedId}
               onBranch={selectedSession?.runtime.startsWith('session:') ? handleBranch : undefined}
