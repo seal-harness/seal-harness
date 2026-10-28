@@ -56,6 +56,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Builder qualified as BSB
 import Data.Char (isAsciiLower, isAsciiUpper, isSpace)
 import Data.Foldable (toList)
+import Data.Map.Strict qualified as Map
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
@@ -438,11 +439,12 @@ buildTestEnv tmp mode mRepo opts = do
   uiState <- newUiStateHandle paths
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
 
   let rt = vaultRt
       pr = ProviderRuntime
         { prConfigPath = configRoot </> "config.toml", prVault = rt
-        , prManager = mgr, prCallCounter = cntRef }
+        , prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
 
   -- Provider resolve stub.
   let resolveStub :: SessionMeta -> IO (Either Text (SomeProvider, ModelId))

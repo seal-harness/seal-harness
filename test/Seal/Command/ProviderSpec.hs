@@ -47,9 +47,10 @@ mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath   -- unused by /provider
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
 
 runProv :: ProviderRuntime -> [String] -> ChannelCaps -> IO ()
 runProv pr argv caps =

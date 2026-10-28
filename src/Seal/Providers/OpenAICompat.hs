@@ -30,6 +30,12 @@ module Seal.Providers.OpenAICompat
   ( OpenAICompatSpec (..)
   , OpenAICompat (..)
   , mkOpenAICompat
+  , ContentStyle (..)
+  , WireFormat (..)
+  , parseContentStyle
+  , wantsStringContent
+  , effectiveWireFormat
+  , wireBody
   , encodeRequest
   , decodeResponse
   , mapFinishReason
@@ -42,13 +48,17 @@ module Seal.Providers.OpenAICompat
 
 import Control.Exception (try)
 import Control.Monad (when)
-import Data.Aeson (Value (Null), eitherDecode, encode)
+import Data.Aeson (Value (Array, Null, Object, String), eitherDecode, encode, toJSON)
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.CaseInsensitive qualified as CI
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (isControl, isDigit, isSpace)
+import Data.IORef (IORef, atomicModifyIORef', readIORef)
 import Data.List (nub)
-import Data.Maybe (listToMaybe)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -122,14 +132,24 @@ data OpenAICompat = OpenAICompat
   , oacBaseUrl :: !Text
   , oacModel   :: !ModelId
   , oacManager :: !Manager
+  , oacContentStyle :: !ContentStyle
+    -- ^ The instance's configured policy; 'StyleAuto' downgrades on the
+    -- strict-server 400, the pinned styles never change format.
+  , oacContentMemo :: !(IORef (Map Text WireFormat))
+    -- ^ Process-lifetime memory of observed downgrades, keyed by canonical
+    -- base URL. Lives above resolution (the provider value is rebuilt every
+    -- turn), owned by the caller — 'Seal.Command.Provider.ProviderRuntime'.
   }
 
--- | Build an 'OpenAICompat' with an externally-owned 'Manager'. 'Nothing' for
--- the key means the request carries no @authorization@ header (keyless
--- endpoints); whether a key is *required* is a resolution-time policy in
--- 'Seal.Providers.Registry'.
-mkOpenAICompat :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenAICompatSpec -> OpenAICompat
-mkOpenAICompat mgr key base model spec = OpenAICompat spec key base model mgr
+-- | Build an 'OpenAICompat' with an externally-owned 'Manager' and memo.
+-- 'Nothing' for the key means the request carries no @authorization@ header
+-- (keyless endpoints); whether a key is *required* is a resolution-time policy
+-- in 'Seal.Providers.Registry'.
+mkOpenAICompat
+  :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenAICompatSpec
+  -> ContentStyle -> IORef (Map Text WireFormat) -> OpenAICompat
+mkOpenAICompat mgr key base model spec =
+  OpenAICompat spec key base model mgr
 
 -- Base URL handling ---------------------------------------------------------
 
@@ -206,12 +226,11 @@ chatUrl base = stripTrailingSlashes base <> "/chat/completions"
 
 -- | Build the OpenAI-compatible chat-completion request from our shape. The
 -- system prompt becomes a leading 'Chat.System' message; 'CbThinking' blocks
--- are dropped (no OpenAI equivalent); 'CbToolUse' becomes the assistant's
--- @tool_calls@; 'CbToolResult' becomes a 'Chat.Tool' role message carrying
--- the matching @tool_call_id@.
+-- are dropped (no OpenAI equivalent); the conversation maps through
+-- 'convoOpenAi' (which enforces OpenAI's tool-call ordering rules).
 encodeRequest :: CompletionRequest -> Chat.CreateChatCompletion
 encodeRequest cr = Chat._CreateChatCompletion
-  { Chat.messages = V.fromList (systemMsgs <> concatMap msgOpenAi (crMessages cr))
+  { Chat.messages = V.fromList (systemMsgs <> convoOpenAi (crMessages cr))
   , Chat.model = OAM.Model (modelIdText (crModel cr))
   , Chat.max_completion_tokens = Just (fromIntegral (crMaxTokens cr))
   , Chat.tools = toolsVec
@@ -238,37 +257,56 @@ encodeRequest cr = Chat._CreateChatCompletion
             }
         )
 
--- | Map a single Seal 'Message' to one or more OpenAI messages. A Seal
--- assistant message that mixes text + tool calls + tool results splits into a
--- single 'Chat.Assistant' message (text + tool_calls) plus one 'Chat.Tool'
--- message per 'CbToolResult'. (OpenAI has no per-tool-result container; each
--- result is its own @tool@-role message keyed by @tool_call_id@.)
-msgOpenAi :: Message -> [Chat.Message (V.Vector Chat.Content)]
-msgOpenAi (Message role blocks) =
-  let textContents   = [ txt t     | CbText t <- blocks ]
-      toolCallVec    = [ mkToolCall i n inp
-                       | CbToolUse (ToolCallId i) (OpName n) inp <- blocks ]
-      toolResultMsgs = [ Chat.Tool
-                          { Chat.content = V.singleton (txt (joinParts parts))
-                          , Chat.tool_call_id = i
-                          }
-                       | CbToolResult (ToolCallId i) parts _ <- blocks ]
-      mainMsg = case role of
-        User -> Chat.User
-          { Chat.content = V.fromList textContents
-          , Chat.name = Nothing
-          }
-        Assistant -> Chat.Assistant
+-- | Map the Seal conversation onto OpenAI's message rules. The agent loop
+-- records an assistant's tool uses and their results in *separate* messages
+-- (the results in a following user message, mirroring the Anthropic shape),
+-- while OpenAI requires every assistant tool call to be followed immediately
+-- by its @tool@-role result. So each assistant message emits its results
+-- right after itself, pulled from the whole conversation and ordered to match
+-- the assistant's @tool_calls@:
+--
+-- * a user message whose blocks are all results disappears (it was the
+--   results container; a container that also carried text still emits that
+--   text as a user message);
+-- * a call with no recorded result anywhere (an interrupted or turn-capped
+--   call) gets a placeholder result, so the conversation the server
+--   validates is well-formed instead of a hard 400.
+convoOpenAi :: [Message] -> [Chat.Message (V.Vector Chat.Content)]
+convoOpenAi msgs = concatMap emitMsg msgs
+  where
+    -- First result recorded per call id wins; a duplicate is ignored.
+    recorded = foldl' addMsgResults Map.empty msgs
+    addMsgResults acc (Message _ blocks) =
+      foldl' addResult acc [ b | b@CbToolResult{} <- blocks ]
+    addResult acc (CbToolResult (ToolCallId i) parts _) =
+      Map.insertWith (\_ old -> old) i parts acc
+    addResult acc _ = acc
+    emitMsg (Message role blocks) = case role of
+      User
+        | null textContents -> []
+        | otherwise ->
+            [ Chat.User { Chat.content = V.fromList textContents, Chat.name = Nothing } ]
+      Assistant -> mainMsg : [ resultMsg i | CbToolUse (ToolCallId i) _ _ <- blocks ]
+      where
+        textContents = [ txt t | CbText t <- blocks ]
+        mainMsg = Chat.Assistant
           { Chat.assistant_content =
               if null textContents then Nothing else Just (V.fromList textContents)
-          , Chat.tool_calls =
-              if null toolCallVec then Nothing else Just (V.fromList toolCallVec)
+          , Chat.tool_calls = case toolCallVec of
+              []  -> Nothing
+              tcs -> Just (V.fromList tcs)
           , Chat.refusal = Nothing
           , Chat.name = Nothing
           , Chat.assistant_audio = Nothing
           }
-  in mainMsg : toolResultMsgs
-  where
+        toolCallVec =
+          [ mkToolCall i n inp | CbToolUse (ToolCallId i) (OpName n) inp <- blocks ]
+    resultMsg i = Chat.Tool
+      { Chat.content =
+          V.singleton (txt (joinParts (Map.findWithDefault [TrpText noResultText] i recorded)))
+      , Chat.tool_call_id = i
+      }
+    noResultText = "(no result was recorded for this tool call)"
     mkToolCall i n inp =
       OATC.ToolCall_Function
         { OATC.id = i
@@ -280,6 +318,110 @@ msgOpenAi (Message role blocks) =
     joinParts []     = ""
     joinParts (p:ps) = T.intercalate "\n" (map partText (p:ps))
     partText (TrpText t) = t
+
+-- Content wire format ---------------------------------------------------------
+
+-- | The configured policy for how message content goes on the wire, per
+-- provider instance. 'StyleAuto' sends the library-normal content-part
+-- arrays and downgrades to plain strings only when the server proves it
+-- requires them; 'StyleParts' and 'StyleString' pin one shape.
+data ContentStyle
+  = StyleAuto
+  | StyleParts
+  | StyleString
+  deriving stock (Eq, Show)
+
+-- | The shape a single request's message content actually takes.
+data WireFormat
+  = WireParts
+    -- ^ the @openai@ package's default: @content@ as an array of
+    -- @{\"type\":\"text\",...}@ parts
+  | WireString
+    -- ^ plain-string @content@, the maximally-compatible form
+  deriving stock (Eq, Show)
+
+-- | Parse a 'ContentStyle' from its TOML keyword. Case-sensitive on exactly
+-- @auto@ / @parts@ / @string@; 'Nothing' for anything else.
+parseContentStyle :: Text -> Maybe ContentStyle
+parseContentStyle t
+  | t == "auto"   = Just StyleAuto
+  | t == "parts"  = Just StyleParts
+  | t == "string" = Just StyleString
+  | otherwise     = Nothing
+
+-- | Does an HTTP 400 body indicate a server that deserializes @content@ as
+-- a plain string and rejects our content-part arrays? Matches the distinctive
+-- serde error (the phrasing Magnitude and other Rust servers emit), and
+-- requires the pointer to mention @messages@ so a tools-shape error never
+-- triggers the string downgrade. Deliberately narrow; the @content_style@
+-- override covers servers with different phrasing.
+wantsStringContent :: Text -> Bool
+wantsStringContent body =
+  ("invalid type: sequence, expected a string" `T.isInfixOf` body)
+    && ("messages" `T.isInfixOf` body)
+
+-- | The wire format for a call under a policy: fixed styles never consult the
+-- memo; 'StyleAuto' starts at 'WireParts' and follows the memo entry for the
+-- provider's canonical base URL once a downgrade has been observed.
+effectiveWireFormat
+  :: ContentStyle -> IORef (Map Text WireFormat) -> Text -> IO WireFormat
+effectiveWireFormat style memo baseUrl = case style of
+  StyleParts  -> pure WireParts
+  StyleString -> pure WireString
+  StyleAuto   -> fromMaybe WireParts . Map.lookup baseUrl <$> readIORef memo
+
+-- | Remember that this base URL requires plain-string content, so later
+-- requests skip the failed probe.
+memoizeStringContent :: IORef (Map Text WireFormat) -> Text -> IO ()
+memoizeStringContent memo baseUrl =
+  atomicModifyIORef' memo (\m -> (Map.insert baseUrl WireString m, ()))
+
+-- | Encode the request body in the given wire format: 'WireParts' is the
+-- @openai@ package's own encoding; 'WireString' collapses text-only content
+-- arrays into the plain strings strict servers require.
+wireBody :: WireFormat -> Chat.CreateChatCompletion -> BL.ByteString
+wireBody WireParts req  = encode req
+wireBody WireString req = encode (compactMessages (toJSON req))
+
+-- Wire encoding ---------------------------------------------------------------
+
+-- | Collapse each message's text content-parts array into the plain string a
+-- strict server requires (used by 'wireBody' 'WireString'). The @openai@
+-- package's types force content into the array shape — fine for
+-- api.openai.com, which accepts both, but many self-hosted servers
+-- (llama.cpp, TGI, ...) only accept plain-string @content@.
+
+-- | Rewrite each message of the request object with
+-- 'compactMessageContent'. Anything without a @messages@ array passes through
+-- unchanged.
+compactMessages :: Value -> Value
+compactMessages (Object o) =
+  case KM.lookup "messages" o of
+    Just (Array msgs) -> Object (KM.insert "messages" (Array (V.map compactMessageContent msgs)) o)
+    _                 -> Object o
+compactMessages v = v
+
+-- | Collapse a message's @content@ array into a plain string when every part
+-- is a text part (the only kind we emit). Multiple text blocks join with a
+-- newline, mirroring 'joinParts'; an empty array becomes the empty string;
+-- missing or non-array content is left untouched.
+compactMessageContent :: Value -> Value
+compactMessageContent (Object mo) =
+  case KM.lookup "content" mo of
+    Just (Array parts)
+      | Just txts <- traverse textPart (V.toList parts) ->
+          Object (KM.insert "content" (String (T.intercalate "\n" txts)) mo)
+    _ -> Object mo
+compactMessageContent v = v
+
+-- | The text of a @{\"type\":\"text\"}@ content part; 'Nothing' for any other
+-- shape.
+textPart :: Value -> Maybe Text
+textPart (Object po) =
+  case (KM.lookup "type" po, KM.lookup "text" po) of
+    (Just (String "text"), Just (String t)) -> Just t
+    _                                       -> Nothing
+textPart _ = Nothing
 
 -- Pure response mapping -----------------------------------------------------
 
@@ -358,35 +500,62 @@ chatHeaders mkey spec =
 -- | POST @<baseUrl>/chat/completions@ then decode the response.
 --
 -- * The URL and the body are both built inside the 'try', so a base URL the
---   request parser rejects yields a 'Left' instead of an escaping exception.
+-- request parser rejects yields a 'Left' instead of an escaping exception.
 -- * Redirects are **refused** (@redirectCount = 0@): following one would
---   re-send the @authorization@ header to an attacker-chosen @Location@.
+-- re-send the @authorization@ header to an attacker-chosen @Location@.
+-- * Under 'StyleAuto' the request goes out in the library-normal
+-- content-parts format; if the server answers 400 with the strict-server
+-- signature ('wantsStringContent'), the identical request is retried once
+-- with plain-string content and the downgrade is memoized per base URL, so
+-- later requests skip the failed probe. A failed retry surfaces its own
+-- error. Pinned styles never change format.
 -- * Non-2xx -> 'httpErrorText'; a transport error -> a 'Left' string whose
---   wording stays compatible with 'Seal.Agent.Loop.isTransientError'.
+-- wording stays compatible with 'Seal.Agent.Loop.isTransientError'.
 sendChatCompletion
   :: Manager -> OpenAICompatSpec -> Text -> Maybe ApiKey
+  -> ContentStyle -> IORef (Map Text WireFormat)
   -> Chat.CreateChatCompletion -> IO (Either Text CompletionResponse)
-sendChatCompletion mgr spec baseUrl mkey req = do
-  result <- try @HttpException $ do
-    initReq <- parseRequest (T.unpack ("POST " <> chatUrl baseUrl))
-    let httpReq = initReq
-          { requestBody = RequestBodyLBS (encode req)
-          , requestHeaders = chatHeaders mkey spec
-          , redirectCount = 0
-          , shouldStripHeaderOnRedirect = const True
-          }
-    httpLbs httpReq mgr
-  case result of
-    Left e -> pure (Left (exceptionText spec e))
-    Right resp ->
-      let code = statusCode (responseStatus resp)
-      in if code >= 200 && code <= 299
-           then case eitherDecode (responseBody resp) of
-                  Left e    -> pure (Left (unreadableText spec (T.pack e)))
-                  Right obj -> pure (decodeResponse spec obj)
-           else pure (Left (httpErrorText spec code
-                             (TE.decodeUtf8With TEE.lenientDecode
-                               (BL.toStrict (responseBody resp)))))
+sendChatCompletion mgr spec baseUrl mkey style memo req = do
+  fmt <- effectiveWireFormat style memo baseUrl
+  first' <- post fmt
+  case first' of
+    Left e -> pure (Left e)
+    Right resp
+      | ok resp        -> pure (decodeOk resp)
+      | downgrade fmt resp -> do
+          memoizeStringContent memo baseUrl
+          second <- post WireString
+          pure $ case second of
+            Left e -> Left e
+            Right resp2
+              | ok resp2    -> decodeOk resp2
+              | otherwise   -> Left (errorText resp2)
+      | otherwise      -> pure (Left (errorText resp))
+  where
+    post fmt = do
+      attempted <- try @HttpException $ do
+        initReq <- parseRequest (T.unpack ("POST " <> chatUrl baseUrl))
+        let httpReq = initReq
+              { requestBody = RequestBodyLBS (wireBody fmt req)
+              , requestHeaders = chatHeaders mkey spec
+              , redirectCount = 0
+              , shouldStripHeaderOnRedirect = const True
+              }
+        httpLbs httpReq mgr
+      pure (either (Left . exceptionText spec) Right attempted)
+    ok resp = let code = statusCode (responseStatus resp)
+              in code >= 200 && code <= 299
+    bodyText resp = TE.decodeUtf8With TEE.lenientDecode
+                      (BL.toStrict (responseBody resp))
+    errorText resp = httpErrorText spec (statusCode (responseStatus resp)) (bodyText resp)
+    decodeOk resp = case eitherDecode (responseBody resp) of
+      Left e    -> Left (unreadableText spec (T.pack e))
+      Right obj -> decodeResponse spec obj
+    downgrade fmt resp =
+      style == StyleAuto
+        && fmt == WireParts
+        && statusCode (responseStatus resp) == 400
+        && wantsStringContent (bodyText resp)
 
 -- | Render a transport-level 'HttpException': a refused redirect is its own,
 -- non-transient message; everything else is the retry-compatible transport
@@ -427,14 +596,14 @@ httpErrorText spec code body
                <> " — this endpoint requires an API key; set one in the"
                <> " Providers view or run /provider add " <> i
   | code == 404 =
-      n <> " API returned HTTP 404 — check the base URL path (it may be missing"
+      n <> " returned HTTP 404 — check the base URL path (it may be missing"
         <> " /v1) or the model id: " <> clean
   | code == 429 =
       n <> " rate limit (HTTP 429) — wait a moment and retry, or switch models"
         <> " with /model use"
   | code >= 300 && code <= 399 = redirectText spec (Just code)
   | otherwise =
-      n <> " API returned HTTP " <> codeTxt <> ": " <> clean
+      n <> " returned HTTP " <> codeTxt <> ": " <> clean
   where
     n = ocsDisplayName spec
     i = ocsId spec
@@ -464,7 +633,8 @@ instance Provider OpenAICompat where
                      <> " <model-id>"))
     | otherwise =
         sendChatCompletion (oacManager prov) (oacSpec prov) (oacBaseUrl prov)
-                           (oacApiKey prov) (encodeRequest cr)
+                           (oacApiKey prov) (oacContentStyle prov) (oacContentMemo prov)
+                           (encodeRequest cr)
     where
       oacDisplayName = ocsDisplayName (oacSpec prov)
 

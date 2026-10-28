@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Providers.RegistrySpec (spec) where
 
+import Data.Either (isLeft)
 import Data.Maybe (isJust)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map.Strict qualified as Map
@@ -15,7 +16,7 @@ import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
   ( CompletionResponse (..), Provider (..), SomeProvider (..)
   , StopReason (..), Usage (..) )
-import Seal.Providers.OpenAICompat (OpenAICompatSpec (..))
+import Seal.Providers.OpenAICompat (ContentStyle (..), OpenAICompatSpec (..), WireFormat (..))
 import Seal.Providers.Registry
   ( catalogProblems
   , completeSome
@@ -69,6 +70,10 @@ counter :: IORef Int
 counter = unsafePerformIO (newIORef 0)
 {-# NOINLINE counter #-}
 
+contentMemo :: IORef (Map.Map T.Text WireFormat)
+contentMemo = unsafePerformIO (newIORef Map.empty)
+{-# NOINLINE contentMemo #-}
+
 -- | A synthetic preset row: built-in URL, key required. Lets the catalog seam
 -- be exercised without shipping a preset (step 3).
 presetSpec :: OpenAICompatSpec
@@ -104,7 +109,7 @@ specMain = describe "Seal.Providers.Registry" $ do
 
 -- | A section in the config map.
 sec :: Maybe T.Text -> Maybe T.Text -> Maybe T.Text -> ProviderConfig
-sec ty url model = ProviderConfig { pcType = ty, pcBaseUrl = url, pcDefaultModel = model }
+sec ty url model = ProviderConfig { pcType = ty, pcBaseUrl = url, pcDefaultModel = model, pcContentStyle = Nothing }
 
 cfgWith :: [(T.Text, ProviderConfig)] -> RuntimeConfig
 cfgWith xs = defaultRuntimeConfig { rcProviders = Map.fromList xs }
@@ -150,6 +155,32 @@ instanceSpec = describe "providerInstances (#273)" $ do
         o = [ r | r <- rows, piName r == "ollama" ]
     map (fmap typeId . piType) o `shouldBe` [Just "ollama"]
     map piProblem o `shouldBe` [Nothing]
+
+  it "parses content_style into the row, defaulting an absent value to auto" $ do
+    let cfg = cfgWith
+          [ ("magnitude", ProviderConfig { pcType = Just "openai"
+                                         , pcBaseUrl = Nothing
+                                         , pcDefaultModel = Nothing
+                                         , pcContentStyle = Just "string" })
+          , ("work", sec (Just "openai") Nothing Nothing)
+          ]
+        rows = providerInstances cfg
+        m = [ r | r <- rows, piName r == "magnitude" ]
+        w = [ r | r <- rows, piName r == "work" ]
+    map piContentStyle m `shouldBe` [Right StyleString]
+    map piProblem m `shouldBe` [Nothing]
+    map piContentStyle w `shouldBe` [Right StyleAuto]
+
+  it "reports an invalid content_style as a problem row" $ do
+    let rows = providerInstances (cfgWith
+          [ ("groq", ProviderConfig { pcType = Just "openai"
+                                    , pcBaseUrl = Nothing
+                                    , pcDefaultModel = Nothing
+                                    , pcContentStyle = Just "sometimes" }) ])
+        g = [ r | r <- rows, piName r == "groq" ]
+    map piContentStyle g `shouldSatisfy` all isLeft
+    map piProblem g
+      `shouldSatisfy` all (maybe False ("content_style must be one of" `T.isInfixOf`))
 
   it "reports a present-but-unknown type instead of falling back" $ do
     let rows = providerInstances (cfgWith [("anthropic", sec (Just "anthorpic") Nothing Nothing)])
@@ -335,7 +366,7 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
       mapM_ (\n -> do
         _ <- instanceAuthStatus (Just spy) cfg (instOf cfg n)
         _ <- configuredInstances (Just spy) cfg
-        _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg n) (ModelId "m") counter
+        _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg n) (ModelId "m") counter contentMemo
         pure ()) ["we ird", "typo", "anthropic"]
       gets <- readIORef entries
       gets `shouldSatisfy` all (T.isInfixOf "OPENROUTER_API_KEY")
@@ -343,12 +374,22 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
   describe "resolveInstance" $ do
     it "resolves a keyless generic instance with no vault at all" $ do
       let cfg = cfgWith [("local", sec (Just "openai") (Just "http://127.0.0.1:9/v1") Nothing)]
-      shouldResolve =<< resolveInstance Nothing mgrRef cfg (instOf cfg "local") (ModelId "m") counter
+      shouldResolve =<< resolveInstance Nothing mgrRef cfg (instOf cfg "local") (ModelId "m") counter contentMemo
     it "refuses a problem row with its problem text" $ do
       let cfg = cfgWith [("typo", sec (Just "anthorpic") Nothing Nothing)]
-      r <- resolveInstance Nothing mgrRef cfg (instOf cfg "typo") (ModelId "m") counter
+      r <- resolveInstance Nothing mgrRef cfg (instOf cfg "typo") (ModelId "m") counter contentMemo
       case r of
         Left e  -> e `shouldSatisfy` ("is misconfigured" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left"
+    it "refuses an invalid content_style row with its problem text" $ do
+      let cfg = cfgWith
+            [ ("groq", ProviderConfig { pcType = Just "openai"
+                                      , pcBaseUrl = Nothing
+                                      , pcDefaultModel = Nothing
+                                      , pcContentStyle = Just "sometimes" }) ]
+      r <- resolveInstance Nothing mgrRef cfg (instOf cfg "groq") (ModelId "m") counter contentMemo
+      case r of
+        Left e  -> e `shouldSatisfy` ("content_style must be one of" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left"
     it "reads each instance's own key (keyed generic row)" $ do
       let cfg = cfgWith
@@ -358,8 +399,8 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
       entries <- newIORef []
       vh <- makeFakeVault [("PROVIDER_APIKEY_A", "sk-a")]
       let spy = recordingVault vh entries
-      _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg "a") (ModelId "m") counter
-      _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg "b") (ModelId "m") counter
+      _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg "a") (ModelId "m") counter contentMemo
+      _ <- resolveInstance (Just spy) mgrRef cfg (instOf cfg "b") (ModelId "m") counter contentMemo
       gets <- readIORef entries
       gets `shouldSatisfy` elem "get:PROVIDER_APIKEY_A"
 
@@ -370,7 +411,7 @@ instanceBehaviourSpec = describe "provider instances (#273 WU-2)" $ do
       entries <- newIORef []
       vh <- makeFakeVault [("PROVIDER_OAUTH_WORK", "{}")]
       let spy = recordingVault vh entries
-      _ <- resolveInstance (Just spy) mgrRef cfg work (ModelId "m") counter
+      _ <- resolveInstance (Just spy) mgrRef cfg work (ModelId "m") counter contentMemo
       gets <- readIORef entries
       gets `shouldSatisfy` elem "get:PROVIDER_OAUTH_WORK"
       gets `shouldNotSatisfy` elem "get:ANTHROPIC_OAUTH_TOKENS"

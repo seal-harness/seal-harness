@@ -27,6 +27,7 @@ module Seal.Command.Provider
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
 import Data.IORef (IORef, readIORef)
+import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -54,7 +55,7 @@ import Seal.Providers.Name
   ( apiKeyNameFor, checkNameForType, mkProviderName, providerNameExample
   , providerNameRule )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
-import Seal.Providers.OpenAICompat (OpenAICompatSpec (..), validateBaseUrl)
+import Seal.Providers.OpenAICompat (OpenAICompatSpec (..), WireFormat (..), validateBaseUrl)
 import Seal.Providers.Registry
   ( ProviderCredentials (..), ProviderInstance (..), ProviderType (..)
   , completeSome, findInstance, instanceAuthStatus, instanceCredentials
@@ -92,12 +93,16 @@ formatTestResult label = \case
 -- The @prCallCounter@ is a process-lifetime monotonic counter shared across
 -- every Ollama provider instance built by 'resolveInstance': Ollama responses
 -- carry no tool-call ids, so Seal synthesizes @call_<i>@ and the counter must
--- outlive any single provider value.
+-- outlive any single provider value. The @prContentMemo@ is the same pattern
+-- for the OpenAI-compat content-format downgrade: 'resolveInstance' rebuilds
+-- provider values every turn, so the observed per-endpoint wire format must
+-- live here to survive across turns.
 data ProviderRuntime = ProviderRuntime
   { prConfigPath  :: FilePath
   , prVault       :: VaultRuntime
   , prManager     :: Manager
   , prCallCounter :: IORef Int
+  , prContentMemo :: IORef (Map Text WireFormat)
   }
 
 providerCommandSpec :: ProviderRuntime -> CommandSpec
@@ -525,7 +530,7 @@ testCmd pr name = commandAction $ \caps ->
     let n = piName inst
         model = fromMaybe (ModelId "") (resolveDefaultModelFor cfg n)
     mh <- readIORef (vrHandleRef (prVault pr))
-    eProv <- resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr)
+    eProv <- resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr) (prContentMemo pr)
     case eProv of
       Left e   -> ccSend caps (formatTestResult n (Left e))
       Right sp -> do
@@ -593,7 +598,7 @@ resolveSessionProvider pr meta = do
     Nothing -> pure (Left (unknownSessionProviderMsg cfg raw))
     Just inst -> do
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr) (prContentMemo pr))
 
 -- | Resolve a provider+model from an explicit instance name (for AGENT_START,
 -- which builds a fresh AgentEnv from a def rather than the active session).
@@ -606,7 +611,7 @@ resolveDefProvider pr name model = do
     Nothing -> pure (Left (unknownAgentDefProviderMsg cfg name))
     Just inst -> do
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveInstance mh (prManager pr) cfg inst model (prCallCounter pr) (prContentMemo pr))
 
 -- | The "unknown provider in session" message, with rename guidance when the
 -- id is a legacy one.

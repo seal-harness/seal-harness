@@ -3,6 +3,7 @@ module Seal.Command.ModelSpec (spec) where
 
 import Control.Monad (void)
 import Data.Either (fromRight)
+import Data.Map.Strict qualified as Map
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
@@ -52,9 +53,10 @@ mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
 
 runModel :: ProviderRuntime -> SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runModel pr sr argv caps =
@@ -87,6 +89,7 @@ mkPRWithOllama cfgPath vh port = do
   ref <- newIORef (Just vh)
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
       baseUrl = "http://localhost:" <> T.pack (show port)
@@ -97,6 +100,7 @@ mkPRWithOllama cfgPath vh port = do
     , prVault       = vrt
     , prManager     = mgr
     , prCallCounter = cntRef
+    , prContentMemo = memoRef
     }
 
 spec_main :: Spec

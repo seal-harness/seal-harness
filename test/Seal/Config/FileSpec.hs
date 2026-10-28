@@ -314,6 +314,34 @@ spec = describe "Seal.Config.File" $ do
     it "has an empty provider map when [providers] is absent" $
       providerDefaultModel defaultRuntimeConfig "ollama" `shouldBe` Nothing
 
+    it "parses content_style in [providers.<label>]" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[providers.magnitude]"
+          , "type = \"openai\""
+          , "content_style = \"string\""
+          ]
+        Right cfg <- loadRuntimeConfig path
+        (pcContentStyle <$> Map.lookup "magnitude" (rcProviders cfg))
+          `shouldBe` Just (Just "string")
+
+    it "content_style is Nothing when the key is absent" $
+      pcContentStyle emptyProviderConfig `shouldBe` Nothing
+
+    it "round-trips content_style through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = upsertProvider "work"
+                     (const ProviderConfig { pcBaseUrl = Just "https://h/v1"
+                                           , pcDefaultModel = Nothing
+                                           , pcType = Just "openai"
+                                           , pcContentStyle = Just "parts" })
+                     defaultRuntimeConfig
+        saveRuntimeConfig path cfg
+        Right back <- loadRuntimeConfig path
+        rcProviders back `shouldBe` rcProviders cfg
+
     it "upsertProvider updates one field without clobbering the other" $ do
       let c1 = upsertProvider "ollama" (\p -> p { pcBaseUrl = Just "http://h:1" }) defaultRuntimeConfig
           c2 = upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "m" }) c1
@@ -326,7 +354,8 @@ spec = describe "Seal.Config.File" $ do
             cfg  = upsertProvider "work"
                      (const ProviderConfig { pcBaseUrl = Just "https://groq.example/v1"
                                            , pcDefaultModel = Just "llama-3.3-70b"
-                                           , pcType = Just "openai" })
+                                           , pcType = Just "openai"
+                                           , pcContentStyle = Nothing })
                      defaultRuntimeConfig
         saveRuntimeConfig path cfg
         raw <- TIO.readFile path
@@ -373,7 +402,8 @@ spec = describe "Seal.Config.File" $ do
             cfg  = upsertProvider "openai"
                      (\_ -> ProviderConfig (Just "qwen2.5-7b-instruct")
                                           (Just "http://localhost:8000/v1")
-                                          (Just "openai"))
+                                          (Just "openai")
+                                          Nothing)
                      defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
@@ -383,7 +413,7 @@ spec = describe "Seal.Config.File" $ do
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434") Nothing)) defaultRuntimeConfig
+            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434") Nothing Nothing)) defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg

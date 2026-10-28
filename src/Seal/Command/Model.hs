@@ -213,7 +213,7 @@ reportProviderQuiet pr caps cfg inst = do
   let lbl   = piName inst
       dm = maybe "(none)" modelIdText (resolveDefaultModelFor cfg lbl)
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr)
+  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr) (prContentMemo pr)
   eModels <- case eProv of
     Left _    -> pure (Left "unresolved")
     Right sp -> listSome sp
@@ -232,7 +232,7 @@ reportProviderLoud
 reportProviderLoud pr caps cfg inst = do
   let lbl = piName inst
   mh <- readIORef (vrHandleRef (prVault pr))
-  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr)
+  eProv <- resolveInstance mh (prManager pr) cfg inst (fallbackModelFor inst) (prCallCounter pr) (prContentMemo pr)
   case eProv of
     Left e   -> ccSend caps ("could not list " <> lbl <> " models: " <> e)
     Right sp -> do

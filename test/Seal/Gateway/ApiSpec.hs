@@ -4936,9 +4936,10 @@ spec_main = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
@@ -5092,10 +5093,11 @@ spec_main = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
@@ -5219,9 +5221,10 @@ spec_main = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
@@ -5347,9 +5350,10 @@ spec_main = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps

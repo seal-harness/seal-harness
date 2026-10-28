@@ -12,6 +12,7 @@ import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -148,11 +149,13 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
             }
   mgr <- newTlsManager
   callCounter <- newIORef 0
+  contentMemo <- newIORef Map.empty
   let pr = ProviderRuntime
             { prConfigPath  = cfgPath
             , prVault       = rt
             , prManager     = mgr
             , prCallCounter = callCounter
+            , prContentMemo = contentMemo
             }
       cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot

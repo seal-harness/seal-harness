@@ -55,6 +55,7 @@ import Control.Monad (void, filterM)
 import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -74,7 +75,8 @@ import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
 import Seal.Providers.Name
   ( ProviderName, apiKeyNameFor, mkProviderName, oauthKeyNameFor )
 import Seal.Providers.OpenAICompat
-  ( OpenAICompatSpec (..), mkOpenAICompat, validateBaseUrl )
+  ( OpenAICompatSpec (..), ContentStyle (..), WireFormat (..)
+  , mkOpenAICompat, parseContentStyle, validateBaseUrl )
 import Seal.Security.Secrets (ApiKey, mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -217,7 +219,11 @@ data ProviderInstance = ProviderInstance
   , piType       :: !(Maybe ProviderType)
     -- ^ 'Nothing' ⇒ unresolvable (unknown or missing type); see 'piProblem'.
   , piConfig     :: !ProviderConfig
-    -- ^ That instance's own @base_url@ / @default_model@.
+    -- ^ That instance's own @base_url@ / @default_model@ / @content_style@.
+  , piContentStyle :: !(Either Text ContentStyle)
+    -- ^ Parsed from @content_style@ ('Right' 'StyleAuto' when absent);
+    -- 'Left' carries the problem text for an invalid value and the row is
+    -- surfaced with a problem and refused at resolution.
   , piProblem    :: !(Maybe Text)
     -- ^ Human-readable reason the row is unusable; surfaced, never fatal.
   , piHasSection :: !Bool
@@ -242,16 +248,17 @@ providerInstances cfg = typeRows <> extraRows
     rowForType t =
       let n = typeId t
       in case Map.lookup n provs of
-           Just sec -> rowFromSection n sec
-           Nothing  -> ProviderInstance
-             { piName       = n
-             , piNameValid  = either (const Nothing) Just (mkProviderName n)
-             , piTypeId     = Nothing
-             , piType       = Just t
-             , piConfig     = emptyProviderConfig
-             , piProblem    = Nothing
-             , piHasSection = False
-             }
+            Just sec -> rowFromSection n sec
+            Nothing  -> ProviderInstance
+              { piName       = n
+              , piNameValid  = either (const Nothing) Just (mkProviderName n)
+              , piTypeId     = Nothing
+              , piType       = Just t
+              , piConfig     = emptyProviderConfig
+              , piContentStyle = Right StyleAuto
+              , piProblem    = Nothing
+              , piHasSection = False
+              }
 
     rowFromSection n sec =
       let mRawType =
@@ -276,13 +283,22 @@ providerInstances cfg = typeRows <> extraRows
                   Just ("section named \"" <> n <> "\" is not a "
                           <> typeId t <> " instance")
             _ -> Nothing
+          styleE = case pcContentStyle sec of
+            Nothing -> Right StyleAuto
+            Just raw -> maybe
+              (Left ("content_style must be one of: auto, parts, string — got \""
+                       <> raw <> "\""))
+              Right (parseContentStyle raw)
+          styleProblem = either Just (const Nothing) styleE
       in ProviderInstance
            { piName       = n
            , piNameValid  = either (const Nothing) Just (mkProviderName n)
            , piTypeId     = mRawType
            , piType       = mType
            , piConfig     = sec
+           , piContentStyle = styleE
            , piProblem    = nameProblem <|> typeProblem <|> mismatchProblem
+                             <|> styleProblem
            , piHasSection = True
            }
 
@@ -588,20 +604,21 @@ buildOAuthSession _inst mgr vh oauthKey = do
 -- all come from the same 'ProviderInstance'.
 resolveInstance
   :: Maybe VaultHandle -> Manager -> RuntimeConfig -> ProviderInstance -> ModelId
-  -> IORef Int -> IO (Either Text SomeProvider)
-resolveInstance mvh mgr cfg inst model callCounter =
+  -> IORef Int -> IORef (Map Text WireFormat) -> IO (Either Text SomeProvider)
+resolveInstance mvh mgr cfg inst model callCounter contentMemo =
   case instanceCredentials inst of
     Nothing -> pure (Left (misconfiguredMsg inst))
     Just creds -> case piType inst of
       Nothing -> pure (Left (misconfiguredMsg inst))
-      Just t -> do
-        case providerBaseUrlForInstance cfg inst of
+      Just t -> case piContentStyle inst of
+        Left e -> pure (Left e)
+        Right style -> case providerBaseUrlForInstance cfg inst of
           Left e -> pure (Left e)
           Right baseUrl -> case providerFamily t of
             AnthropicFamily -> resolveAnthropicInstance mvh mgr inst creds model
             OllamaFamily -> resolveOllamaInstance mvh mgr baseUrl creds model callCounter
             OpenAIFamily -> case openAICompatSpecFor t of
-              Just spec -> resolveOpenAIInstance mvh mgr baseUrl creds model spec
+              Just spec -> resolveOpenAIInstance mvh mgr baseUrl creds model spec style contentMemo
               Nothing   -> pure (Left (misconfiguredMsg inst))
 
 resolveAnthropicInstance
@@ -639,21 +656,23 @@ resolveOllamaInstance mvh mgr baseUrl creds model callCounter
 
 resolveOpenAIInstance
   :: Maybe VaultHandle -> Manager -> Text -> ProviderCredentials -> ModelId
-  -> OpenAICompatSpec -> IO (Either Text SomeProvider)
-resolveOpenAIInstance mvh mgr baseUrl creds model spec
+  -> OpenAICompatSpec -> ContentStyle -> IORef (Map Text WireFormat)
+  -> IO (Either Text SomeProvider)
+resolveOpenAIInstance mvh mgr baseUrl creds model spec style contentMemo
   | ocsKeyRequired spec = case mvh of
       Nothing -> pure (Left (keyNoVaultMsg spec))
       Just vh -> do
         eKey <- vhGet vh (pcApiKeyName creds)
         case eKey of
           Right kb                  -> pure (Right (SomeProvider
-            (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model spec)))
+            (mkOpenAICompat mgr (Just (mkApiKey kb)) baseUrl model spec style contentMemo)))
           Left VaultLocked          -> pure (Left (keyLockedMsg spec))
           Left (VaultKeyNotFound _) -> pure (Left (keyMissingMsg spec))
           Left e                    -> pure (Left (vaultErrText e))
   | otherwise = do
       mKey <- readKeyIfAny mvh (pcApiKeyName creds)
-      pure (Right (SomeProvider (mkOpenAICompat mgr mKey baseUrl model spec)))
+      pure (Right (SomeProvider
+        (mkOpenAICompat mgr mKey baseUrl model spec style contentMemo)))
 
 -- | A provider instance's default model: its own @default_model@ if set, else
 -- its type's built-in default. 'Nothing' when the instance or its type is

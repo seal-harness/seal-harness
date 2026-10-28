@@ -268,10 +268,11 @@ mkSendDepsWith paths resolveStub = do
   vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   execCache <- newSessionExecCache
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt

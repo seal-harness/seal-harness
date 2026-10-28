@@ -181,6 +181,11 @@ data ProviderConfig = ProviderConfig
     -- opcode may touch it (see AGENTS.md §Security). A provider whose catalog
     -- row carries a built-in base URL ignores this value; only the generic
     -- OpenAI-compatible row (and Ollama) read it.
+  , pcContentStyle :: Maybe Text
+    -- ^ The message-content wire format policy (@auto@ / @parts@ /
+    -- @string@) for OpenAI-compatible instances; absent decodes as
+    -- 'Nothing' and resolves to auto. Read by the OpenAI-compatible
+    -- family only — other families ignore it.
   } deriving stock (Eq, Show)
 
 -- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is
@@ -260,7 +265,7 @@ data EmbeddingConfig = EmbeddingConfig
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
-emptyProviderConfig = ProviderConfig Nothing Nothing Nothing
+emptyProviderConfig = ProviderConfig Nothing Nothing Nothing Nothing
 
 -- | The @[web]@ section: web tool configuration. Every field is optional;
 -- a missing key decodes as 'Nothing' and the resolved default applies at
@@ -479,6 +484,7 @@ providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
   <*> Toml.dioptional (Toml.text "type")          .= pcType
+  <*> Toml.dioptional (Toml.text "content_style") .= pcContentStyle
 
 -- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
 -- field is optional at the TOML layer; a missing key decodes as 'Nothing'
