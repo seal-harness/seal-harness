@@ -40,7 +40,16 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
     if (spec.validationError) return
     setSubmitting(true)
     setRepoWarning(null)
-    const res = await createBareSession({ provider: spec.provider, model: spec.model.trim() })
+    const body: { provider?: string; model?: string; agent?: string; allowed_secrets?: string[] } = {
+      provider: spec.provider,
+      model: spec.model.trim(),
+    }
+    // Include allowed_secrets when not all are selected (same logic as
+    // NewTabComposer.buildBody). Omit = all secrets (backward compat).
+    if (spec.availableSecrets.length > 0 && spec.allowedSecrets.size < spec.availableSecrets.length) {
+      body.allowed_secrets = Array.from(spec.allowedSecrets)
+    }
+    const res = await createBareSession(body)
     if (res) {
       // If the user entered a repo URL, dispatch SETUP_REPO into the
       // session's transcript (audited — visible in the chat, not a silent
@@ -143,6 +152,55 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
             testId="ns-repo-list"
           />
         </Row>
+
+        {/* Secrets allow-list — same UI as NewTabComposer */}
+        {spec.secretsError ? (
+          <div data-testid="ns-secrets-vault-warning"
+               style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+            Secret selection unavailable — the vault may be locked.
+            The session will have access to all secrets.
+          </div>
+        ) : spec.availableSecrets.length > 0 ? (
+          <div data-testid="ns-secrets-section"
+               style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <label style={labelStyle}>Secrets</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" className="btn btn-ghost"
+                  style={{ padding: '2px 8px', fontSize: 11, borderRadius: 'var(--radius-sm)' }}
+                  onClick={() => spec.setAllowedSecrets(new Set(spec.availableSecrets))}>
+                  Select all
+                </button>
+                <button type="button" className="btn btn-ghost"
+                  style={{ padding: '2px 8px', fontSize: 11, borderRadius: 'var(--radius-sm)' }}
+                  onClick={() => spec.setAllowedSecrets(new Set())}>
+                  Deselect all
+                </button>
+              </div>
+            </div>
+            <div style={{ maxHeight: 160, overflowY: 'auto',
+                         border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                         padding: '4px 8px' }}>
+              {spec.availableSecrets.map((name) => (
+                <label key={name}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6,
+                           fontSize: 13, padding: '2px 0', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={spec.allowedSecrets.has(name)}
+                    onChange={(e) => {
+                      const next = new Set(spec.allowedSecrets)
+                      if (e.target.checked) { next.add(name) } else { next.delete(name) }
+                      spec.setAllowedSecrets(next)
+                    }} />
+                  {name}
+                </label>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+              The session can only read, write, and delete the selected
+              secrets. It cannot create or access secrets outside this list.
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {spec.validationError && (

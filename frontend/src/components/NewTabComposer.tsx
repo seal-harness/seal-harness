@@ -251,6 +251,64 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               />
             </Row>
           )}
+
+          {/* Secrets allow-list — only shown when the vault has secrets
+              and the fetch succeeded. When all are selected (the default),
+              no restriction is applied (field omitted from the request body).
+              When the fetch fails (vault locked), show a warning instead. */}
+          {spec.secretsError ? (
+            <div data-testid="secrets-vault-warning"
+                 style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+              Secret selection unavailable — the vault may be locked.
+              The session will have access to all secrets.
+            </div>
+          ) : spec.availableSecrets.length > 0 ? (
+            <div data-testid="secrets-section"
+                 style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <label style={labelStyle}>Secrets</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button type="button" className="btn btn-ghost"
+                    style={{ padding: '2px 8px', fontSize: 11, borderRadius: 'var(--radius-sm)' }}
+                    onClick={() => spec.setAllowedSecrets(new Set(spec.availableSecrets))}>
+                    Select all
+                  </button>
+                  <button type="button" className="btn btn-ghost"
+                    style={{ padding: '2px 8px', fontSize: 11, borderRadius: 'var(--radius-sm)' }}
+                    onClick={() => spec.setAllowedSecrets(new Set())}>
+                    Deselect all
+                  </button>
+                </div>
+              </div>
+              <div style={{
+                maxHeight: 160, overflowY: 'auto',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                padding: '4px 8px',
+              }}>
+                {spec.availableSecrets.map((name) => (
+                  <label key={name}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6,
+                             fontSize: 13, padding: '2px 0', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={spec.allowedSecrets.has(name)}
+                      onChange={(e) => {
+                        const next = new Set(spec.allowedSecrets)
+                        if (e.target.checked) next.add(name)
+                        else next.delete(name)
+                        spec.setAllowedSecrets(next)
+                      }}
+                    />
+                    {name}
+                  </label>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                The session can only read, write, and delete the selected
+                secrets. It cannot create or access secrets outside this list.
+              </div>
+            </div>
+          ) : null}
         </div>
       )}
 

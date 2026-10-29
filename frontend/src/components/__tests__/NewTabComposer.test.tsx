@@ -58,6 +58,10 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     discoverableWindows: [],
     discoveryError: false,
     scanDiscoverable: vi.fn(async () => {}),
+    availableSecrets: [],
+    secretsError: false,
+    allowedSecrets: new Set<string>(),
+    setAllowedSecrets: vi.fn(),
     validationError: null,
     buildBody: vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })),
     persistOnSubmit: vi.fn(),
@@ -84,6 +88,47 @@ describe('NewTabComposer — provider kind', () => {
     // The agent field was removed from the new-tab composer (the agent is
     // chosen later on the SessionSetup screen).
     expect(screen.queryByLabelText('Agent')).toBeNull()
+  })
+
+  // ── Secrets allow-list ───────────────────────────────────────────────
+  it('renders the secrets section when availableSecrets is non-empty', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ availableSecrets: ['TOKEN', 'API_KEY'] })}
+        onSubmit={() => {}} onCancel={() => {}} />
+    )
+    expect(screen.getByTestId('secrets-section')).toBeTruthy()
+    expect(screen.getByText('TOKEN')).toBeTruthy()
+    expect(screen.getByText('API_KEY')).toBeTruthy()
+  })
+
+  it('hides the secrets section when no secrets are available', () => {
+    render(<NewTabComposer spec={makeSpec({ availableSecrets: [] })} onSubmit={() => {}} onCancel={() => {}} />)
+    expect(screen.queryByTestId('secrets-section')).toBeNull()
+  })
+
+  it('shows vault-locked warning when secretsError is true', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ secretsError: true, availableSecrets: [] })}
+        onSubmit={() => {}} onCancel={() => {}} />
+    )
+    expect(screen.getByTestId('secrets-vault-warning')).toBeTruthy()
+    expect(screen.queryByTestId('secrets-section')).toBeNull()
+  })
+
+  it('toggling a checkbox calls setAllowedSecrets', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ availableSecrets: ['A', 'B'], allowedSecrets: new Set(['A']) })}
+        onSubmit={() => {}} onCancel={() => {}} />
+    )
+    const checkboxes = screen.getAllByRole('checkbox')
+    // checkbox for 'B' is unchecked — clicking it should call setAllowedSecrets
+    const checkboxB = checkboxes.find((cb) => cb.getAttribute('type') === 'checkbox' && cb.nextSibling?.textContent === 'B')
+    expect(checkboxB).toBeTruthy()
+    checkboxB!.click()
+    expect(screen.getByLabelText('A')).toBeTruthy()
   })
 
   it('shows all supported providers, marking unconfigured ones as disabled', () => {
