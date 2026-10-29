@@ -859,7 +859,7 @@ spec = describe "Seal.ISA.Integration" $ do
               , vrConfigPath = tmpDir </> "config" </> "config.toml"
               , vrHandleRef = ref
               }
-            op = secretManageOp rt caps
+            op = secretManageOp rt Nothing caps
             reg = Registry.mkRegistry [op]
         r <- runTestApp (dispatchOne reg (OpName "SECRET_MANAGE")
                           (object ["action" .= ("get" :: Text), "name" .= ("TOKEN" :: Text)]))

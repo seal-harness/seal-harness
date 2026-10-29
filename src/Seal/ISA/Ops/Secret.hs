@@ -16,14 +16,20 @@ module Seal.ISA.Ops.Secret
   , vaultPutByName
   , vaultDeleteByName
   , vaultListNames
+  , filterSecretList
+  , isSecretAllowed
+  , isValidSecretName
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
+import Data.Char (isAlphaNum)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -56,6 +62,29 @@ parseSecretAction v =
       "list"   -> Right SecretList
       other    -> Left ("unknown secret action: " <> other)
     Nothing -> Left "missing or invalid action field"
+
+-- ---------------------------------------------------------------------------
+-- Pure helpers (allow-list + name validation)
+-- ---------------------------------------------------------------------------
+
+-- | Filter a list of secret names to only those in the allow-list.
+-- 'Nothing' returns the input unchanged (no restriction);
+-- @Just allowed@ keeps only keys present in the set.
+filterSecretList :: Maybe (Set Text) -> [Text] -> [Text]
+filterSecretList Nothing xs = xs
+filterSecretList (Just allowed) xs = filter (`Set.member` allowed) xs
+
+-- | Check whether a secret name is allowed by the allow-list.
+-- 'Nothing' returns 'True' (no restriction); @Just allowed@ checks
+-- 'Set.member'.
+isSecretAllowed :: Maybe (Set Text) -> Text -> Bool
+isSecretAllowed Nothing _ = True
+isSecretAllowed (Just allowed) name = name `Set.member` allowed
+
+-- | Validate a secret name: non-empty, and every character is
+-- alphanumeric, underscore, or hyphen.
+isValidSecretName :: Text -> Bool
+isValidSecretName t = not (T.null t) && T.all (\c -> isAlphaNum c || c == '_' || c == '-') t
 
 -- ---------------------------------------------------------------------------
 -- Field extractors
@@ -129,35 +158,45 @@ vaultListNames rt = do
 -- Authorization
 -- ---------------------------------------------------------------------------
 
-authorizeGet :: Value -> Either Text ()
-authorizeGet v =
-  maybe (Left "get requires {name:string}") (const (Right ())) (nameField v)
+authorizeGet :: Maybe (Set Text) -> Value -> Either Text ()
+authorizeGet allowed v =
+  case nameField v of
+    Nothing -> Left "get requires {name:string}"
+    Just name -> if not (isSecretAllowed allowed name)
+      then Left "secret not available in this session"
+      else Right ()
 
-authorizePut :: Value -> Either Text ()
-authorizePut v =
+authorizePut :: Maybe (Set Text) -> Value -> Either Text ()
+authorizePut allowed v =
   case nameField v of
     Nothing -> Left "put requires {name:string}"
-    Just _ -> case valueField v of
-      Nothing -> Left "put requires {value:string}"
-      Just val | T.null val -> Left "put requires non-empty value"
-               | otherwise  -> Right ()
+    Just name -> if not (isSecretAllowed allowed name)
+      then Left "secret not available in this session"
+      else case valueField v of
+        Nothing -> Left "put requires {value:string}"
+        Just val | T.null val -> Left "put requires non-empty value"
+                 | otherwise  -> Right ()
 
-authorizeDelete :: Value -> Either Text ()
-authorizeDelete v =
-  maybe (Left "delete requires {name:string}") (const (Right ())) (nameField v)
+authorizeDelete :: Maybe (Set Text) -> Value -> Either Text ()
+authorizeDelete allowed v =
+  case nameField v of
+    Nothing -> Left "delete requires {name:string}"
+    Just name -> if not (isSecretAllowed allowed name)
+      then Left "secret not available in this session"
+      else Right ()
 
 authorizeList :: Value -> Either Text ()
 authorizeList _ = Right ()
 
 -- | Authorize gate for SECRET_MANAGE — dispatches per-action validation.
-authorizeManage :: Value -> Either Text ()
-authorizeManage v =
+authorizeManage :: Maybe (Set Text) -> Value -> Either Text ()
+authorizeManage allowed v =
   case parseSecretAction v of
     Left e        -> Left e
     Right action  -> case action of
-      SecretGet    -> authorizeGet v
-      SecretPut    -> authorizePut v
-      SecretDelete -> authorizeDelete v
+      SecretGet    -> authorizeGet allowed v
+      SecretPut    -> authorizePut allowed v
+      SecretDelete -> authorizeDelete allowed v
       SecretList   -> authorizeList v
 
 -- ---------------------------------------------------------------------------
@@ -203,18 +242,20 @@ handleDelete rt caps v = do
         Right _ ->
           OpResult [TrpText "deleted"] False (object ["name" .= key])
 
-handleList :: VaultRuntime -> Value -> App OpResult
-handleList rt _v = do
+handleList :: VaultRuntime -> Maybe (Set Text) -> Value -> App OpResult
+handleList rt allowed _v = do
   result <- liftIO (vaultListNames rt)
   pure $ case result of
     Left err ->
       OpResult [TrpText err] True (object ["count" .= (0 :: Int)])
-    Right [] ->
-      OpResult [TrpText "No secrets."] False (object ["count" .= (0 :: Int)])
-    Right keys -> do
-      let rendered = T.intercalate "\n" keys
-            <> "\n---\n" <> T.pack (show (length keys)) <> " secrets"
-      OpResult [TrpText rendered] False (object ["count" .= length keys])
+    Right rawKeys ->
+      let keys = filterSecretList allowed rawKeys
+      in case keys of
+        [] -> OpResult [TrpText "No secrets."] False (object ["count" .= (0 :: Int)])
+        _  -> OpResult
+                [TrpText (T.intercalate "\n" keys <> "\n---\n" <> T.pack (show (length keys)) <> " secrets")]
+                False
+                (object ["count" .= length keys])
 
 -- ---------------------------------------------------------------------------
 -- Consolidated opcode: SECRET_MANAGE
@@ -224,8 +265,8 @@ handleList rt _v = do
 -- The @action@ field discriminates between @get@, @put@, @delete@, and
 -- @list@. The @delete@ action ALWAYS prompts the human operator for
 -- approval before proceeding — it is a blocking opcode.
-secretManageOp :: VaultRuntime -> ChannelCaps -> Opcode
-secretManageOp rt caps = TrustedOpcode
+secretManageOp :: VaultRuntime -> Maybe (Set Text) -> ChannelCaps -> Opcode
+secretManageOp rt allowed caps = TrustedOpcode
   { toName = OpName "SECRET_MANAGE"
   , toTrust = Trusted
   , toDesc = "Manage vault secrets. Use action to select: get (fetch a secret value by key name), put (create or update a secret — upsert), delete (remove a secret — ALWAYS prompts for human approval), list (enumerate key names only)."
@@ -249,7 +290,7 @@ secretManageOp rt caps = TrustedOpcode
       , "required" .= (["action"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = authorizeManage
+  , toAuthorize = authorizeManage allowed
   , toBlocking = True
   , toRun = \_ v ->
       case parseSecretAction v of
@@ -258,5 +299,5 @@ secretManageOp rt caps = TrustedOpcode
           SecretGet    -> handleGet rt v
           SecretPut    -> handlePut rt v
           SecretDelete -> handleDelete rt caps v
-          SecretList   -> handleList rt v
+          SecretList   -> handleList rt allowed v
   }

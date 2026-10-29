@@ -282,7 +282,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretManageOp rt caps
+      , secretManageOp rt Nothing caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -1357,7 +1357,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
       baseOps =
         [ showHumanOp childCaps
         , askHumanOp childCaps
-        , secretManageOp (tdVault td) childCaps
+        , secretManageOp (tdVault td) Nothing childCaps
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
        , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
