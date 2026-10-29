@@ -1,0 +1,67 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | The channel enumeration: the closed set of channels the runtime knows
+<span class="lineno">    5 </span>-- about, plus an 'Other' escape hatch for future channels. The lowercase
+<span class="lineno">    6 </span>-- tag from 'channelKindToText' is the value the transcript's @_te_metadata@
+<span class="lineno">    7 </span>-- @channel@ field carries.
+<span class="lineno">    8 </span>module Seal.Core.ChannelKind
+<span class="lineno">    9 </span>  ( ChannelKind (..)
+<span class="lineno">   10 </span>  , channelKindToText
+<span class="lineno">   11 </span>  , channelKindFromText
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   15 </span>import Data.Text (Text)
+<span class="lineno">   16 </span>import Data.Text qualified as T
+<span class="lineno">   17 </span>import GHC.Generics (Generic)
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>data ChannelKind
+<span class="lineno">   20 </span>  = Cli | Web | Signal | Telegram | Background | Other
+<span class="lineno">   21 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Bounded</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   22 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>-- | The lowercase tag for the transcript's metadata field.
+<span class="lineno">   25 </span>channelKindToText :: ChannelKind -&gt; Text
+<span class="lineno">   26 </span><span class="decl"><span class="istickedoff">channelKindToText = \case</span>
+<span class="lineno">   27 </span><span class="spaces">  </span><span class="istickedoff">Cli        -&gt; &quot;cli&quot;</span>
+<span class="lineno">   28 </span><span class="spaces">  </span><span class="istickedoff">Web        -&gt; &quot;web&quot;</span>
+<span class="lineno">   29 </span><span class="spaces">  </span><span class="istickedoff">Signal     -&gt; &quot;signal&quot;</span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">Telegram   -&gt; &quot;telegram&quot;</span>
+<span class="lineno">   31 </span><span class="spaces">  </span><span class="istickedoff">Background -&gt; &quot;background&quot;</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="istickedoff">Other      -&gt; &quot;other&quot;</span></span>
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | Inverse of 'channelKindToText', case-insensitive. 'Nothing' for unknown
+<span class="lineno">   35 </span>-- tags (the caller decides whether to fall back to 'Other' or reject).
+<span class="lineno">   36 </span>channelKindFromText :: Text -&gt; Maybe ChannelKind
+<span class="lineno">   37 </span><span class="decl"><span class="istickedoff">channelKindFromText t = case T.toCaseFold t of</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">&quot;cli&quot;        -&gt; Just Cli</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">&quot;web&quot;        -&gt; Just Web</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">&quot;signal&quot;     -&gt; Just Signal</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">&quot;telegram&quot;   -&gt; Just Telegram</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">&quot;background&quot; -&gt; Just Background</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">&quot;other&quot;      -&gt; Just Other</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">_            -&gt; Nothing</span></span>
+
+</pre>
+</body>
+</html>

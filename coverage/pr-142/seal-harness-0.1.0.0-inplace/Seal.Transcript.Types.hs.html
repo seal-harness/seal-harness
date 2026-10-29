@@ -1,0 +1,72 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The append-only audit-entry model. Integrity comes from the append-only
+<span class="lineno">    2 </span>-- handle plus keeping untrusted actions off the box that holds the log — not
+<span class="lineno">    3 </span>-- from a hash chain. 'encodeEntryRaw' guarantees the on-disk JSONL line is the
+<span class="lineno">    4 </span>-- canonical encoding, so a future &quot;view raw&quot; hides nothing.
+<span class="lineno">    5 </span>module Seal.Transcript.Types
+<span class="lineno">    6 </span>  ( Direction (..)
+<span class="lineno">    7 </span>  , TranscriptEntry (..)
+<span class="lineno">    8 </span>  , encodeEntryRaw
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Data.Aeson (FromJSON, ToJSON, Value)
+<span class="lineno">   12 </span>import Data.Aeson qualified as A
+<span class="lineno">   13 </span>import Data.ByteString (ByteString)
+<span class="lineno">   14 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   15 </span>import Data.Map.Strict (Map)
+<span class="lineno">   16 </span>import Data.Text (Text)
+<span class="lineno">   17 </span>import Data.Time (UTCTime)
+<span class="lineno">   18 </span>import GHC.Generics (Generic)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Core.Types (ModelId)
+<span class="lineno">   21 </span>import Seal.Util.AesonUtils (stripPrefixToJSON, stripPrefixParseJSON)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>data Direction = Request | Response
+<span class="lineno">   24 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON Direction</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   27 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON Direction</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>-- | JSON keys (via 'stripPrefixToJSON'): @teId@→@id@, @teTimestamp@→@timestamp@,
+<span class="lineno">   30 </span>-- @teModel@→@model@, @teDirection@→@direction@, @tePayload@→@payload@,
+<span class="lineno">   31 </span>-- @teDurationMs@→@durationMs@, @teCorrelation@→@correlation@, @teMeta@→@meta@.
+<span class="lineno">   32 </span>data TranscriptEntry = TranscriptEntry
+<span class="lineno">   33 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">teId</span></span></span> :: Text
+<span class="lineno">   34 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">teTimestamp</span></span></span> :: UTCTime
+<span class="lineno">   35 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">teModel</span></span></span> :: Maybe ModelId
+<span class="lineno">   36 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">teDirection</span></span></span> :: Direction
+<span class="lineno">   37 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tePayload</span></span></span> :: Value
+<span class="lineno">   38 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">teDurationMs</span></span></span> :: Maybe Int
+<span class="lineno">   39 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">teCorrelation</span></span></span> :: Maybe Text
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">teMeta</span></span></span> :: Map Text Value
+<span class="lineno">   41 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON TranscriptEntry</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   44 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON TranscriptEntry</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | One JSONL line: the canonical aeson encoding, strict, no trailing newline.
+<span class="lineno">   47 </span>-- The daemon appends the newline when writing.
+<span class="lineno">   48 </span>encodeEntryRaw :: TranscriptEntry -&gt; ByteString
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">encodeEntryRaw = BL.toStrict . A.encode</span></span>
+
+</pre>
+</body>
+</html>

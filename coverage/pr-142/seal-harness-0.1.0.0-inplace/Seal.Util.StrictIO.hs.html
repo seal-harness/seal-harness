@@ -1,0 +1,68 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | Strict, resource-safe file-reading helpers built on @conduit@ + @resourcet@.
+<span class="lineno">    2 </span>--
+<span class="lineno">    3 </span>-- The lazy 'Data.ByteString.Lazy.readFile' / 'Data.Text.IO.readFile' helpers
+<span class="lineno">    4 </span>-- keep the file handle open until the lazy structure is fully consumed, which
+<span class="lineno">    5 </span>-- is GC-dependent. The 'Seal.Gateway.ListsSnapshot.buildListsSnapshot' hot
+<span class="lineno">    6 </span>-- path reads hundreds of small files per request (111 sessions × multiple
+<span class="lineno">    7 </span>-- files each) and the lazy handles pile up faster than the GC reclaims them,
+<span class="lineno">    8 </span>-- hitting the OS soft FD limit ('EMFILE' / @resource exhausted (Too many
+<span class="lineno">    9 </span>-- open files)@).
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- @conduit@'s 'sourceFile' opens the handle inside a 'ResourceT' scope, so the
+<span class="lineno">   12 </span>-- handle is released as soon as 'runConduitRes' returns — regardless of when
+<span class="lineno">   13 </span>-- (or whether) the resulting lazy 'ByteString' is forced. The bytes are
+<span class="lineno">   14 </span>-- materialized eagerly by 'sinkLazy' before the 'ResourceT' closes the handle,
+<span class="lineno">   15 </span>-- so the decode sees the full file with the fd already released.
+<span class="lineno">   16 </span>module Seal.Util.StrictIO
+<span class="lineno">   17 </span>  ( readFileStrict
+<span class="lineno">   18 </span>  , readFileTextStrict
+<span class="lineno">   19 </span>  , decodeFileStrict
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Conduit ( runConduitRes, sinkLazy, sourceFile, (.|) )
+<span class="lineno">   23 </span>import Data.Aeson (FromJSON, decode)
+<span class="lineno">   24 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   25 </span>import Data.Text (Text)
+<span class="lineno">   26 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | Read a file strictly into a lazy 'ByteString', closing the underlying
+<span class="lineno">   29 </span>-- handle before the helper returns. The handle is acquired and released by
+<span class="lineno">   30 </span>-- the 'ResourceT' scope of 'runConduitRes'; the bytes are materialized by
+<span class="lineno">   31 </span>-- 'sinkLazy' before the scope exits. Callers 'doesFileExist'-guard the path
+<span class="lineno">   32 </span>-- first (the lazy variants they replace did the same).
+<span class="lineno">   33 </span>readFileStrict :: FilePath -&gt; IO BL.ByteString
+<span class="lineno">   34 </span><span class="decl"><span class="istickedoff">readFileStrict path = runConduitRes (sourceFile path .| sinkLazy)</span></span>
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | Read a file strictly as 'Text' by reading bytes strictly then decoding.
+<span class="lineno">   37 </span>-- The handle is closed before the decode runs.
+<span class="lineno">   38 </span>readFileTextStrict :: FilePath -&gt; IO Text
+<span class="lineno">   39 </span><span class="decl"><span class="istickedoff">readFileTextStrict path = TE.decodeUtf8 . BL.toStrict &lt;$&gt; readFileStrict path</span></span>
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | Read and decode a JSON file strictly. The handle is closed before the
+<span class="lineno">   42 </span>-- decode runs. Returns 'Nothing' on a decode failure (the caller is
+<span class="lineno">   43 </span>-- expected to 'doesFileExist'-guard the path first).
+<span class="lineno">   44 </span>decodeFileStrict :: FromJSON a =&gt; FilePath -&gt; IO (Maybe a)
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">decodeFileStrict path = decode &lt;$&gt; readFileStrict path</span></span>
+
+</pre>
+</body>
+</html>

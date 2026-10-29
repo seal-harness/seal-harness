@@ -1,0 +1,217 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | No-progress repeat detection for session reads (session-read hardening
+<span class="lineno">    3 </span>-- WU4).
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The incident (session 20261022-174851-823): the agent re-issued
+<span class="lineno">    6 </span>-- increasingly large IDENTICAL @SESSION_MANAGE@ reads, each embedding the
+<span class="lineno">    7 </span>-- previous tool result verbatim — a no-progress feedback loop nothing
+<span class="lineno">    8 </span>-- detected. This module gives the agent loop a per-session sliding window
+<span class="lineno">    9 </span>-- of canonical call keys so a no-progress loop becomes observable and
+<span class="lineno">   10 </span>-- interruptible:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- * 1st occurrence — 'RvAllow' (unchanged behavior);
+<span class="lineno">   13 </span>-- * 2nd–3rd — 'RvWarn' (dispatch proceeds; 'repeatWarnNote' is prepended
+<span class="lineno">   14 </span>--   to the result parts so the model sees the signal);
+<span class="lineno">   15 </span>-- * ≥4th — 'RvBlock' (the opcode is never dispatched; an actionable error
+<span class="lineno">   16 </span>--   is synthesized).
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- Detection is call-order based (not wall-clock), scoped to 'repeatScope'
+<span class="lineno">   19 </span>-- (@SESSION_MANAGE@ + @SESSION_GET@ only), and enabled by default. The
+<span class="lineno">   20 </span>-- registry is process-lifetime: created once per process at the same
+<span class="lineno">   21 </span>-- origination sites as 'Seal.Tools.Exec.Abort.SessionAbortRegistry' and
+<span class="lineno">   22 </span>-- keyed by 'SessionId', so the window survives across turns and requests.
+<span class="lineno">   23 </span>-- Bounded memory: each session's window holds at most
+<span class="lineno">   24 </span>-- 'repeatWindowCapacity' canonical keys; the registry mirrors the abort
+<span class="lineno">   25 </span>-- registry's map-growth policy (no cap — entries are per live session).
+<span class="lineno">   26 </span>--
+<span class="lineno">   27 </span>-- Security: the 'RepeatTrack' and 'SessionRepeatRegistry' constructors are
+<span class="lineno">   28 </span>-- NOT exported (mirrors 'Seal.Tools.Exec.Abort'). Tracks are obtained from
+<span class="lineno">   29 </span>-- 'newRepeatTrack' or 'lookupOrCreateRepeatTrack' only.
+<span class="lineno">   30 </span>module Seal.ISA.RepeatDetect
+<span class="lineno">   31 </span>  ( -- * Verdicts
+<span class="lineno">   32 </span>    RepeatVerdict (..)
+<span class="lineno">   33 </span>    -- * Per-session sliding window
+<span class="lineno">   34 </span>  , RepeatTrack
+<span class="lineno">   35 </span>  , newRepeatTrack
+<span class="lineno">   36 </span>  , recordCall
+<span class="lineno">   37 </span>    -- * Process-lifetime registry
+<span class="lineno">   38 </span>  , SessionRepeatRegistry
+<span class="lineno">   39 </span>  , newSessionRepeatRegistry
+<span class="lineno">   40 </span>  , lookupOrCreateRepeatTrack
+<span class="lineno">   41 </span>    -- * Scope + loop-facing messages
+<span class="lineno">   42 </span>  , repeatScope
+<span class="lineno">   43 </span>  , repeatWarnNote
+<span class="lineno">   44 </span>  , repeatBlockedMessage
+<span class="lineno">   45 </span>    -- * Pure core (property-testable)
+<span class="lineno">   46 </span>  , repeatWindowCapacity
+<span class="lineno">   47 </span>  , canonicalKey
+<span class="lineno">   48 </span>  , stepWindow
+<span class="lineno">   49 </span>  , windowVerdict
+<span class="lineno">   50 </span>  ) where
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>import Control.Concurrent.STM
+<span class="lineno">   53 </span>  ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar )
+<span class="lineno">   54 </span>import Data.Aeson (Value)
+<span class="lineno">   55 </span>import Data.Aeson qualified as A
+<span class="lineno">   56 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   57 </span>import Data.Map.Strict (Map)
+<span class="lineno">   58 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   59 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   60 </span>import Data.Set (Set)
+<span class="lineno">   61 </span>import Data.Set qualified as Set
+<span class="lineno">   62 </span>import Data.Text (Text)
+<span class="lineno">   63 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   64 </span>import Data.Text.Encoding.Error (lenientDecode)
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>import Seal.Core.Types (OpName (..), SessionId)
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | The repeat detector's verdict for one in-scope call.
+<span class="lineno">   69 </span>data RepeatVerdict
+<span class="lineno">   70 </span>  = RvAllow
+<span class="lineno">   71 </span>    -- ^ First occurrence of the canonical key within the window. Dispatch
+<span class="lineno">   72 </span>    -- unchanged.
+<span class="lineno">   73 </span>  | RvWarn
+<span class="lineno">   74 </span>    -- ^ 2nd–3rd occurrence within the window. The call is dispatched
+<span class="lineno">   75 </span>    -- normally; 'repeatWarnNote' is prepended to the result parts so the
+<span class="lineno">   76 </span>    -- model sees the no-progress signal.
+<span class="lineno">   77 </span>  | RvBlock
+<span class="lineno">   78 </span>    -- ^ ≥4th occurrence within the window. The opcode is never dispatched;
+<span class="lineno">   79 </span>    -- 'repeatBlockedMessage' is synthesized as an error result so the
+<span class="lineno">   80 </span>    -- model can correct course.
+<span class="lineno">   81 </span>  deriving (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | Sliding-window capacity: the number of most-recent canonical call keys
+<span class="lineno">   84 </span>-- retained per session. 'repeatWindowCapacity' intervening calls evict the
+<span class="lineno">   85 </span>-- oldest entry, making an old key \&quot;fresh\&quot; again (detection is
+<span class="lineno">   86 </span>-- call-order based, not permanent).
+<span class="lineno">   87 </span>repeatWindowCapacity :: Int
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">repeatWindowCapacity = 16</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | Opcodes subject to repeat detection: session reads only (the incident
+<span class="lineno">   91 </span>-- loop was a session read). Ops outside this set are untracked — zero
+<span class="lineno">   92 </span>-- behavior change.
+<span class="lineno">   93 </span>repeatScope :: Set OpName
+<span class="lineno">   94 </span><span class="decl"><span class="istickedoff">repeatScope = Set.fromList [OpName &quot;SESSION_MANAGE&quot;, OpName &quot;SESSION_GET&quot;]</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | The note prepended to a warned call's tool-result parts (model-visible
+<span class="lineno">   97 </span>-- only; nothing content-bearing is added to recorded metadata).
+<span class="lineno">   98 </span>repeatWarnNote :: Text
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">repeatWarnNote =</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">&quot;[note: repeated identical session read — no new information expected]&quot;</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>-- | The synthesized error for a blocked call. Actionable: names the opcode
+<span class="lineno">  103 </span>-- and tells the model what to do instead of re-issuing the identical call.
+<span class="lineno">  104 </span>repeatBlockedMessage :: OpName -&gt; Text
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">repeatBlockedMessage (OpName name) =</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">&quot;blocked: repeated identical &quot; &lt;&gt; name</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot; call — refine the request or move on; no new information is expected from repeating it&quot;</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Canonical identity of a call: the opcode name, a NUL separator, and the
+<span class="lineno">  110 </span>-- aeson-encoded input as 'Text'. JSON output escapes control characters, so
+<span class="lineno">  111 </span>-- a raw NUL cannot appear in either half — the pair injectively encodes as
+<span class="lineno">  112 </span>-- one 'Text'. The decode is lenient so the function is total
+<span class="lineno">  113 </span>-- (aeson output is always valid UTF-8; leniency is belt-and-braces).
+<span class="lineno">  114 </span>canonicalKey :: OpName -&gt; Value -&gt; Text
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">canonicalKey (OpName name) input =</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">name &lt;&gt; &quot;\0&quot;</span>
+<span class="lineno">  117 </span><span class="spaces">       </span><span class="istickedoff">&lt;&gt; TE.decodeUtf8With <span class="nottickedoff">lenientDecode</span> (BL.toStrict (A.encode input))</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Push a canonical key onto the window (most recent first), evicting
+<span class="lineno">  120 </span>-- beyond 'repeatWindowCapacity'. Bounded: the result holds at most
+<span class="lineno">  121 </span>-- 'repeatWindowCapacity' entries, so 'recordCall' is O(window) per call.
+<span class="lineno">  122 </span>stepWindow :: Text -&gt; [Text] -&gt; [Text]
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">stepWindow key window = take repeatWindowCapacity (key : window)</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | Verdict for a canonical key against the window AFTER the push (the
+<span class="lineno">  126 </span>-- key itself included): 1 occurrence → 'RvAllow', 2–3 → 'RvWarn', ≥4 →
+<span class="lineno">  127 </span>-- 'RvBlock' (maintainer-confirmed thresholds, 2026-10-22).
+<span class="lineno">  128 </span>windowVerdict :: Text -&gt; [Text] -&gt; RepeatVerdict
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">windowVerdict key windowAfterPush = case countIn key windowAfterPush of</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">n | n &gt;= 4    -&gt; RvBlock</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">| n &gt;= 2    -&gt; RvWarn</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; RvAllow</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | Count a key's occurrences in a window (bounded: callers pass windows
+<span class="lineno">  135 </span>-- of at most 'repeatWindowCapacity' entries).
+<span class="lineno">  136 </span>countIn :: Text -&gt; [Text] -&gt; Int
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">countIn key = length . filter (== key)</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Per-session sliding window of the last 'repeatWindowCapacity' canonical
+<span class="lineno">  140 </span>-- call keys (most recent first). The constructor is NOT exported — tracks
+<span class="lineno">  141 </span>-- are obtained from 'newRepeatTrack' or 'lookupOrCreateRepeatTrack'.
+<span class="lineno">  142 </span>newtype RepeatTrack = RepeatTrack (TVar [Text])
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Build a fresh, empty track.
+<span class="lineno">  145 </span>newRepeatTrack :: IO RepeatTrack
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">newRepeatTrack = RepeatTrack &lt;$&gt; newTVarIO []</span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | Record a call and return its verdict. Pushes the canonical key onto the
+<span class="lineno">  149 </span>-- session's sliding window (evicting beyond 'repeatWindowCapacity'), then
+<span class="lineno">  150 </span>-- counts the key's occurrences in the updated window. O(window) per call,
+<span class="lineno">  151 </span>-- exception-free (the window is bounded; the JSON encoding is total). The
+<span class="lineno">  152 </span>-- agent loop calls this for opcodes in 'repeatScope' only — out-of-scope
+<span class="lineno">  153 </span>-- opcodes are never recorded.
+<span class="lineno">  154 </span>recordCall :: RepeatTrack -&gt; OpName -&gt; Value -&gt; IO RepeatVerdict
+<span class="lineno">  155 </span><span class="decl"><span class="istickedoff">recordCall (RepeatTrack tv) name input = do</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">let key = canonicalKey name input</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">window &lt;- atomically $ do</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">old &lt;- readTVar tv</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">let new = stepWindow key old</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">writeTVar tv new</span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">pure new</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">pure (windowVerdict key window)</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | Process-lifetime repeat registry (mirrors
+<span class="lineno">  165 </span>-- 'Seal.Tools.Exec.Abort.SessionAbortRegistry'). Maps each 'SessionId' to
+<span class="lineno">  166 </span>-- its 'RepeatTrack', lazily created on first lookup via atomic
+<span class="lineno">  167 </span>-- insert-if-absent STM. Created ONCE per process at the same origination
+<span class="lineno">  168 </span>-- sites as the abort registry — a per-request registry would silently
+<span class="lineno">  169 </span>-- reset the cross-turn window. The constructor is NOT exported.
+<span class="lineno">  170 </span>newtype SessionRepeatRegistry = SessionRepeatRegistry (TVar (Map SessionId RepeatTrack))
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | Build a new empty registry.
+<span class="lineno">  173 </span>newSessionRepeatRegistry :: IO SessionRepeatRegistry
+<span class="lineno">  174 </span><span class="decl"><span class="istickedoff">newSessionRepeatRegistry = SessionRepeatRegistry &lt;$&gt; newTVarIO Map.empty</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>-- | Look up the 'RepeatTrack' for a session, creating it on first use. The
+<span class="lineno">  177 </span>-- insert-if-absent is atomic via STM, so two concurrent lookups for a new
+<span class="lineno">  178 </span>-- session yield the same track (no duplicate creation). The SAME track is
+<span class="lineno">  179 </span>-- returned for the same sid across calls and turns — this is what makes
+<span class="lineno">  180 </span>-- the window process-lifetime state.
+<span class="lineno">  181 </span>lookupOrCreateRepeatTrack :: SessionRepeatRegistry -&gt; SessionId -&gt; IO RepeatTrack
+<span class="lineno">  182 </span><span class="decl"><span class="istickedoff">lookupOrCreateRepeatTrack (SessionRepeatRegistry tv) sid = do</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="istickedoff">m &lt;- readTVarIO tv</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup sid m of</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">Just track -&gt; pure track</span>
+<span class="lineno">  186 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">track &lt;- newRepeatTrack</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">m' &lt;- readTVar tv</span>
+<span class="lineno">  190 </span><span class="spaces">        </span><span class="istickedoff">-- insertIfAbsent semantics: if another thread won the race, use</span>
+<span class="lineno">  191 </span><span class="spaces">        </span><span class="istickedoff">-- its track; otherwise insert ours.</span>
+<span class="lineno">  192 </span><span class="spaces">        </span><span class="istickedoff">let track' = fromMaybe track (Map.lookup sid m')</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">writeTVar tv (Map.insert sid track' m')</span>
+<span class="lineno">  194 </span><span class="spaces">        </span><span class="istickedoff">pure track'</span></span>
+
+</pre>
+</body>
+</html>

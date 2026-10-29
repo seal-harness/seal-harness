@@ -1,0 +1,216 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Top-level TUI entry: path resolution -&gt; config -&gt; vault -&gt; registry -&gt; loop.
+<span class="lineno">    3 </span>module Seal.Tui (runTui) where
+<span class="lineno">    4 </span>
+<span class="lineno">    5 </span>import Data.IORef (newIORef, readIORef, writeIORef)
+<span class="lineno">    6 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">    7 </span>import qualified Data.Text as T
+<span class="lineno">    8 </span>
+<span class="lineno">    9 </span>import Network.HTTP.Client.TLS (newTlsManager)
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
+<span class="lineno">   12 </span>import Seal.Logging.Logger (SealLogger)
+<span class="lineno">   13 </span>import Seal.Command.Channel
+<span class="lineno">   14 </span>  ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
+<span class="lineno">   15 </span>  , mkRealTelegramBotApi, mkRealVaultStore )
+<span class="lineno">   16 </span>import Seal.Command.New (NewDeps (..), newCommandSpec)
+<span class="lineno">   17 </span>import Seal.Command.Provider (ProviderRuntime (..))
+<span class="lineno">   18 </span>import Seal.Command.Model (mkModelTranscriptWriter)
+<span class="lineno">   19 </span>import Seal.Command.Stop (mkStopTranscriptWriter)
+<span class="lineno">   20 </span>import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
+<span class="lineno">   21 </span>import Seal.Command.Spec (mkRegistry)
+<span class="lineno">   22 </span>import Seal.Command.Tab (noTabCloseNotifier)
+<span class="lineno">   23 </span>import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
+<span class="lineno">   24 </span>import Seal.Config.Migrate (migrateSecurityConfig)
+<span class="lineno">   25 </span>import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
+<span class="lineno">   26 </span>import Seal.Config.Paths
+<span class="lineno">   27 </span>  ( SealPaths (..)
+<span class="lineno">   28 </span>  , configFilePath
+<span class="lineno">   29 </span>  , ensureSealDirs
+<span class="lineno">   30 </span>  , getSealPaths
+<span class="lineno">   31 </span>  , reposFilePath
+<span class="lineno">   32 </span>  , securityFilePath
+<span class="lineno">   33 </span>  , vaultFilePath
+<span class="lineno">   34 </span>  )
+<span class="lineno">   35 </span>import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+<span class="lineno">   36 </span>import Seal.Handles.AskReply (newAskReplyStore)
+<span class="lineno">   37 </span>import Seal.Ingest (emptyChain)
+<span class="lineno">   38 </span>import Seal.Security.Policy (AutonomyLevel)
+<span class="lineno">   39 </span>import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+<span class="lineno">   40 </span>import Seal.SourceControl.Registry (mkRepoRegistryHandle)
+<span class="lineno">   41 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   42 </span>import Seal.Session.Store (SessionRuntime (..), initSession)
+<span class="lineno">   43 </span>import Seal.Tabs (newTabsHandle, insertTabH)
+<span class="lineno">   44 </span>import Seal.Tabs.Types (TabRef (..))
+<span class="lineno">   45 </span>import Seal.Handles.Tab (TabKind (..))
+<span class="lineno">   46 </span>import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+<span class="lineno">   47 </span>import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+<span class="lineno">   48 </span>import Seal.Vault.Commands (VaultRuntime (..))
+<span class="lineno">   49 </span>import Seal.Harness.Registry (newHarnessRegistry)
+<span class="lineno">   50 </span>import Seal.Harness.Tmux (mkRealTmuxRunner)
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | Open the vault if both recipient and identity are configured.
+<span class="lineno">   53 </span>-- Failures print a warning and return 'Nothing' so the TUI still starts;
+<span class="lineno">   54 </span>-- vault commands will direct the user to run @\/vault setup@.
+<span class="lineno">   55 </span>tryOpenVault :: SealPaths -&gt; SecurityConfig -&gt; IO (Maybe VaultHandle)
+<span class="lineno">   56 </span><span class="decl"><span class="nottickedoff">tryOpenVault paths cfg =</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="nottickedoff">case (scVaultRecipient cfg, scVaultIdentity cfg) of</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="nottickedoff">(Just _, Just _) -&gt;</span>
+<span class="lineno">   59 </span><span class="spaces">      </span><span class="nottickedoff">resolveEncryptor cfg &gt;&gt;= \case</span>
+<span class="lineno">   60 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">   61 </span><span class="spaces">          </span><span class="nottickedoff">putStrLn (&quot;Warning: vault not available: &quot; &lt;&gt; show err)</span>
+<span class="lineno">   62 </span><span class="spaces">          </span><span class="nottickedoff">pure Nothing</span>
+<span class="lineno">   63 </span><span class="spaces">        </span><span class="nottickedoff">Right enc -&gt; do</span>
+<span class="lineno">   64 </span><span class="spaces">          </span><span class="nottickedoff">-- Honor vault_path from config if set; fall back to the default.</span>
+<span class="lineno">   65 </span><span class="spaces">          </span><span class="nottickedoff">-- setupCmd and rekeyExisting in Seal.Vault.Commands replicate this</span>
+<span class="lineno">   66 </span><span class="spaces">          </span><span class="nottickedoff">-- same expression so all three stay in sync.</span>
+<span class="lineno">   67 </span><span class="spaces">          </span><span class="nottickedoff">let vcfg = VaultConfig</span>
+<span class="lineno">   68 </span><span class="spaces">                </span><span class="nottickedoff">{ vcPath    = maybe (vaultFilePath paths) T.unpack</span>
+<span class="lineno">   69 </span><span class="spaces">                                    </span><span class="nottickedoff">(scVaultPath cfg)</span>
+<span class="lineno">   70 </span><span class="spaces">                </span><span class="nottickedoff">, vcKeyType = fromMaybe &quot;x25519&quot; (scVaultKeyType cfg)</span>
+<span class="lineno">   71 </span><span class="spaces">                </span><span class="nottickedoff">, vcUnlock  = parseUnlockMode (scVaultUnlock cfg)</span>
+<span class="lineno">   72 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">   73 </span><span class="spaces">          </span><span class="nottickedoff">Just &lt;$&gt; openVault vcfg enc</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; pure Nothing</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Full TUI wiring. The autonomy level threads through to 'mkSessionAgentEnv'
+<span class="lineno">   77 </span>-- so 'Supervised' (the default) prompts before running Untrusted opcodes.
+<span class="lineno">   78 </span>runTui :: AutonomyLevel -&gt; SealLogger -&gt; IO ()
+<span class="lineno">   79 </span><span class="decl"><span class="nottickedoff">runTui autonomy logger = do</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="nottickedoff">paths &lt;- getSealPaths</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="nottickedoff">ensureSealDirs paths</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="nottickedoff">migrateSecurityConfig paths</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="nottickedoff">let cfgPath = configFilePath paths</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="nottickedoff">cfg &lt;- loadRuntimeConfig cfgPath &gt;&gt;= \case</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="nottickedoff">putStrLn (&quot;Warning: could not load config: &quot; &lt;&gt; T.unpack err)</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultRuntimeConfig</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="nottickedoff">secCfg &lt;- loadSecurityConfig (securityFilePath paths) &gt;&gt;= \case</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="nottickedoff">putStrLn (&quot;Warning: could not load security config: &quot; &lt;&gt; T.unpack err)</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultSecurityConfig</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="nottickedoff">mHandle &lt;- tryOpenVault paths secCfg</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="nottickedoff">ref     &lt;- newIORef mHandle</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="nottickedoff">let rt = VaultRuntime</span>
+<span class="lineno">   97 </span><span class="spaces">            </span><span class="nottickedoff">{ vrPaths      = paths</span>
+<span class="lineno">   98 </span><span class="spaces">            </span><span class="nottickedoff">, vrConfigPath = cfgPath</span>
+<span class="lineno">   99 </span><span class="spaces">            </span><span class="nottickedoff">, vrHandleRef  = ref</span>
+<span class="lineno">  100 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="nottickedoff">-- A dedicated manager for the /provider test round-trip. (M2 consolidates</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="nottickedoff">-- this with the chat provider's manager when the startup hardcode is removed.)</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="nottickedoff">mgr &lt;- newTlsManager</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="nottickedoff">callCounter &lt;- newIORef 0</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="nottickedoff">let pr = ProviderRuntime</span>
+<span class="lineno">  106 </span><span class="spaces">            </span><span class="nottickedoff">{ prConfigPath  = cfgPath</span>
+<span class="lineno">  107 </span><span class="spaces">            </span><span class="nottickedoff">, prVault       = rt</span>
+<span class="lineno">  108 </span><span class="spaces">            </span><span class="nottickedoff">, prManager     = mgr</span>
+<span class="lineno">  109 </span><span class="spaces">            </span><span class="nottickedoff">, prCallCounter = callCounter</span>
+<span class="lineno">  110 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="nottickedoff">-- The config directory is a git repo (versioning + audit for the</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="nottickedoff">-- evolutionary stores: skills, agent-defs, memory live as Markdown files</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="nottickedoff">-- under config/skills, config/agents, config/memory). ensureConfigRepo</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="nottickedoff">-- runs `git init` + an initial empty commit if needed; idempotent.</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="nottickedoff">let cfgRoot = spConfig paths</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="nottickedoff">ensureConfigRepo cfgRoot</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="nottickedoff">let repo = openConfigRepo cfgRoot</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="nottickedoff">-- The evolutionary-store backends are disk-backed (Markdown + git), created</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="nottickedoff">-- once and shared between the @\/skill@ \/ @\/agent@ command specs</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="nottickedoff">-- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="nottickedoff">-- Built before initSession so the default agent can be resolved from disk.</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="nottickedoff">backends &lt;- newBackends cfgRoot repo</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="nottickedoff">tabsH   &lt;- newTabsHandle</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="nottickedoff">cli &lt;- mkRealSignalCli</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="nottickedoff">tgApi &lt;- mkRealTelegramBotApi</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="nottickedoff">vaultStore &lt;- mkRealVaultStore mHandle</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="nottickedoff">let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli</span>
+<span class="lineno">  128 </span><span class="spaces">                                 </span><span class="nottickedoff">, crTelegramBotApi = tgApi</span>
+<span class="lineno">  129 </span><span class="spaces">                                 </span><span class="nottickedoff">, crVaultStore = vaultStore }</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="nottickedoff">-- Every launch starts a fresh session (resume is a follow-on milestone).</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="nottickedoff">-- The default agent (if set in config) is bound here: its id persists in</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="nottickedoff">-- smAgent and its non-empty provider/model override the config defaults.</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="nottickedoff">sessionMeta &lt;- initSession paths cfg (bAgentDefs backends)</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="nottickedoff">activeRef   &lt;- newIORef sessionMeta</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="nottickedoff">let sr = SessionRuntime</span>
+<span class="lineno">  136 </span><span class="spaces">             </span><span class="nottickedoff">{ srPaths      = paths</span>
+<span class="lineno">  137 </span><span class="spaces">             </span><span class="nottickedoff">, srConfigPath = cfgPath</span>
+<span class="lineno">  138 </span><span class="spaces">             </span><span class="nottickedoff">, srActive     = activeRef</span>
+<span class="lineno">  139 </span><span class="spaces">             </span><span class="nottickedoff">}</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="nottickedoff">-- The /bg command is wired inside runCliTui (it needs the ISA registry +</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="nottickedoff">-- transcript handle that are constructed there). The AskReplyStore is the</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="nottickedoff">-- async bridge for /bg confirmation prompts: a forked /bg turn's ccPrompt</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="nottickedoff">-- routes through askHuman, and the CLI loop delivers the next input line</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="nottickedoff">-- as the answer via deliverNextAnswerAny. 0 = block indefinitely.</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="nottickedoff">askReply &lt;- newAskReplyStore 0</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="nottickedoff">repoReg &lt;- mkRepoRegistryHandle (reposFilePath paths)</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="nottickedoff">abortReg &lt;- newSessionAbortRegistry</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="nottickedoff">-- The /new command: mints a fresh session and inserts a new tab into</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="nottickedoff">-- the TabsHandle. The ndInsertTab closure reads the old sid from</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="nottickedoff">-- srActive BEFORE swapping, inserts a new tab bound to the new session,</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="nottickedoff">-- then writes the new meta to srActive, and returns the old sid so the</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="nottickedoff">-- confirmation line can name it. No repo setup in the standalone CLI</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="nottickedoff">-- (no dispatcher wired). The repo registry is wired so @-r@ can resolve</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="nottickedoff">-- registered repo IDs to URLs.</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="nottickedoff">let newDeps = NewDeps</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="nottickedoff">{ ndPaths = paths</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="nottickedoff">, ndCfg = pure cfg</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="nottickedoff">, ndAgentDefs = backends</span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="nottickedoff">, ndChannelLabel = &quot;cli&quot;</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="nottickedoff">, ndOldMeta = readIORef activeRef</span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="nottickedoff">, ndInsertTab = \_caps newMeta -&gt; do</span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="nottickedoff">oldMeta &lt;- readIORef activeRef</span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="nottickedoff">let oldSid = smId oldMeta</span>
+<span class="lineno">  164 </span><span class="spaces">            </span><span class="nottickedoff">_ &lt;- insertTabH tabsH (BoundSession (smId newMeta)) KindProvider Nothing</span>
+<span class="lineno">  165 </span><span class="spaces">            </span><span class="nottickedoff">writeIORef activeRef newMeta</span>
+<span class="lineno">  166 </span><span class="spaces">            </span><span class="nottickedoff">pure oldSid</span>
+<span class="lineno">  167 </span><span class="spaces">        </span><span class="nottickedoff">, ndSetupRepo = Nothing</span>
+<span class="lineno">  168 </span><span class="spaces">        </span><span class="nottickedoff">, ndRepoReg = Just repoReg</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="nottickedoff">let coreDeps = CoreCommandDeps</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="nottickedoff">{ ccdVault       = rt</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="nottickedoff">, ccdProvider    = pr</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="nottickedoff">, ccdSession     = sr</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAgentDefs   = bAgentDefs backends</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="nottickedoff">, ccdCfgPath     = cfgPath</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="nottickedoff">, ccdPaths       = paths</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabs        = tabsH</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabCloseNotifier = noTabCloseNotifier</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAbortReg    = abortReg</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="nottickedoff">, ccdStopWriter  = mkStopTranscriptWriter paths Nothing</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="nottickedoff">, ccdModelWriter = mkModelTranscriptWriter paths Nothing</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoReg     = repoReg</span>
+<span class="lineno">  183 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoSeam    = Nothing</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="nottickedoff">registry = mkRegistry</span>
+<span class="lineno">  186 </span><span class="spaces">        </span><span class="nottickedoff">( coreCommandSpecs coreDeps</span>
+<span class="lineno">  187 </span><span class="spaces">          </span><span class="nottickedoff">&lt;&gt; [ channelCommandSpec channelRt</span>
+<span class="lineno">  188 </span><span class="spaces">             </span><span class="nottickedoff">, newCommandSpec newDeps</span>
+<span class="lineno">  189 </span><span class="spaces">             </span><span class="nottickedoff">]</span>
+<span class="lineno">  190 </span><span class="spaces">        </span><span class="nottickedoff">)</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">harnessReg &lt;- newHarnessRegistry</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="nottickedoff">tmuxRunner &lt;- mkRealTmuxRunner</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="nottickedoff">runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg</span></span>
+
+</pre>
+</body>
+</html>

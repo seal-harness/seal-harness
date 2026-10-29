@@ -1,0 +1,459 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | HTTP client for the gateway API. All calls go through @http-client@
+<span class="lineno">    3 </span>-- and return @Either Text a@ — errors are text, never thrown. The chat
+<span class="lineno">    4 </span>-- channel loop uses these to send messages, list tabs, create sessions,
+<span class="lineno">    5 </span>-- answer questions, and fetch transcripts.
+<span class="lineno">    6 </span>module Seal.Channels.Chat.HttpClient
+<span class="lineno">    7 </span>  ( -- * Send a message
+<span class="lineno">    8 </span>    httpSend
+<span class="lineno">    9 </span>  , SendResult (..)
+<span class="lineno">   10 </span>  , parseSendResult
+<span class="lineno">   11 </span>    -- * Tabs
+<span class="lineno">   12 </span>  , httpGetTabs
+<span class="lineno">   13 </span>  , TabJson (..)
+<span class="lineno">   14 </span>  , ListsJson (..)
+<span class="lineno">   15 </span>    -- * Sessions list
+<span class="lineno">   16 </span>  , httpGetSessions
+<span class="lineno">   17 </span>    -- * Sessions
+<span class="lineno">   18 </span>  , httpNewSession
+<span class="lineno">   19 </span>  , httpRebindNew
+<span class="lineno">   20 </span>  , NewSessionResult (..)
+<span class="lineno">   21 </span>  , parseNewSessionResult
+<span class="lineno">   22 </span>  , rebindBody
+<span class="lineno">   23 </span>  , mintBody
+<span class="lineno">   24 </span>  , httpSetupRepo
+<span class="lineno">   25 </span>  , setupRepoBody
+<span class="lineno">   26 </span>  , httpGetRepos
+<span class="lineno">   27 </span>  , httpGetTranscript
+<span class="lineno">   28 </span>  , httpStopSession
+<span class="lineno">   29 </span>  , httpGetLists
+<span class="lineno">   30 </span>    -- * Slash-command registry
+<span class="lineno">   31 </span>  , httpGetCommands
+<span class="lineno">   32 </span>  , CommandJson (..)
+<span class="lineno">   33 </span>    -- * Questions (ASK_HUMAN)
+<span class="lineno">   34 </span>  , httpAnswerQuestion
+<span class="lineno">   35 </span>  , answerBodyJson
+<span class="lineno">   36 </span>  , httpCancelQuestion
+<span class="lineno">   37 </span>    -- * Helpers
+<span class="lineno">   38 </span>  , parseJsonBody
+<span class="lineno">   39 </span>  , parseErrorBody
+<span class="lineno">   40 </span>  ) where
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>import Control.Exception (try)
+<span class="lineno">   43 </span>import Data.Aeson (Value, (.=))
+<span class="lineno">   44 </span>import Data.Aeson qualified as A
+<span class="lineno">   45 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   46 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   47 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   48 </span>import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+<span class="lineno">   49 </span>import Data.Text (Text)
+<span class="lineno">   50 </span>import Data.Text qualified as T
+<span class="lineno">   51 </span>import Network.HTTP.Client
+<span class="lineno">   52 </span>  (Manager, Request (..), Response, HttpException, httpLbs,
+<span class="lineno">   53 </span>   parseRequest, RequestBody (..), responseBody, responseStatus)
+<span class="lineno">   54 </span>import Network.HTTP.Types (Method, statusCode, methodPost, methodGet)
+<span class="lineno">   55 </span>import Seal.Gateway.Types.Core (SessionId, sessionIdText)
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | The result of a @POST /api/sessions/:id/send@ call.
+<span class="lineno">   58 </span>data SendResult = SendResult
+<span class="lineno">   59 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">srKind</span></span></span>      :: Text       -- ^ @&quot;assistant&quot;@, @&quot;slash&quot;@, or @&quot;error&quot;@
+<span class="lineno">   60 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">srResponse</span></span></span>  :: Text       -- ^ the response text (slash output or empty)
+<span class="lineno">   61 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srSessionId</span></span></span> :: Maybe Text -- ^ new session id (from @\/new@)
+<span class="lineno">   62 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">srError</span></span></span>     :: Maybe Text -- ^ error message (when kind is @&quot;error&quot;@)
+<span class="lineno">   63 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Parse the JSON response from @POST /api/sessions/:id/send@.
+<span class="lineno">   66 </span>parseSendResult :: BL.ByteString -&gt; Either Text SendResult
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">parseSendResult body =</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;failed to parse send response JSON&quot;</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object o) -&gt;</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">Right SendResult</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="istickedoff">{ srKind = fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;kind&quot;) o)</span>
+<span class="lineno">   73 </span><span class="spaces">        </span><span class="istickedoff">, srResponse = fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;response&quot;) o)</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">, srSessionId = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;session_id&quot;) o</span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">, srError = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;error&quot;) o</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">Just _ -&gt; <span class="nottickedoff">Left &quot;send response is not a JSON object&quot;</span></span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | A tab from @GET /api/tabs@.
+<span class="lineno">   80 </span>data TabJson = TabJson
+<span class="lineno">   81 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tjIndex</span></span></span>     :: Int          -- ^ positional index (0-based)
+<span class="lineno">   82 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tjSessionId</span></span></span> :: Maybe Text   -- ^ session id (Nothing for harness tabs)
+<span class="lineno">   83 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tjKind</span></span></span>      :: Text         -- ^ tab kind wire string
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tjLabel</span></span></span>     :: Maybe Text   -- ^ optional user-set label
+<span class="lineno">   85 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tjStatus</span></span></span>    :: Maybe Text   -- ^ harness liveness: @&quot;running&quot;@ | @&quot;idle&quot;@ | @&quot;exited&quot;@
+<span class="lineno">   86 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   87 </span>
+<span class="lineno">   88 </span>-- | The @GET /api/lists@ snapshot, restricted to what @/tab list@ needs: the
+<span class="lineno">   89 </span>-- tabs, the session info of every tab-bound session (for @\&lt;repo\&gt;@ and
+<span class="lineno">   90 </span>-- @\&lt;name\&gt;@), and the set of sessions currently thinking (for @busy@).
+<span class="lineno">   91 </span>data ListsJson = ListsJson
+<span class="lineno">   92 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ljTabs</span></span></span>               :: [TabJson]
+<span class="lineno">   93 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ljTabSessions</span></span></span>        :: [Value]
+<span class="lineno">   94 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ljThinkingSessionIds</span></span></span> :: [Text]
+<span class="lineno">   95 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   96 </span>
+<span class="lineno">   97 </span>-- | @POST /api/sessions/:id/send@ — send a message to a session.
+<span class="lineno">   98 </span>httpSend :: Manager -&gt; Text -&gt; SessionId -&gt; Text -&gt; IO (Either Text SendResult)
+<span class="lineno">   99 </span><span class="decl"><span class="nottickedoff">httpSend mgr apiBase sid message = do</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid) &lt;&gt; &quot;/send&quot;</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost (Just (A.object [&quot;message&quot; .= message])) &gt;&gt;= \case</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="nottickedoff">Right body -&gt; pure (parseSendResult body)</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | @GET /api/tabs@ — list all tabs.
+<span class="lineno">  106 </span>httpGetTabs :: Manager -&gt; Text -&gt; IO (Either Text [TabJson])
+<span class="lineno">  107 </span><span class="decl"><span class="istickedoff">httpGetTabs mgr apiBase = do</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/tabs&quot;</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">doRequest mgr url <span class="nottickedoff">methodGet</span> Nothing &gt;&gt;= \case</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">Right body -&gt; <span class="nottickedoff">pure (parseTabsBody body)</span></span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | @GET /api/sessions@ — list all sessions (the recent, non-archived
+<span class="lineno">  114 </span>-- sessions). Returns the raw JSON array (each element is a session info
+<span class="lineno">  115 </span>-- object with @id@, @description@, @autoSummary@, @firstMessageSnippet@,
+<span class="lineno">  116 </span>-- @agent@, etc.).
+<span class="lineno">  117 </span>httpGetSessions :: Manager -&gt; Text -&gt; IO (Either Text [Value])
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">httpGetSessions mgr apiBase = do</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">doRequest mgr url <span class="nottickedoff">methodGet</span> Nothing &gt;&gt;= \case</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">Right body -&gt;</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case A.decode body :: Maybe [Value] of</span></span>
+<span class="lineno">  124 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just vs -&gt; pure (Right vs)</span></span>
+<span class="lineno">  125 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure (Left &quot;failed to parse sessions JSON array&quot;)</span></span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | @GET /api/lists@ — the partitioned snapshot. Carries what @GET /api/tabs@
+<span class="lineno">  128 </span>-- cannot: @thinkingSessionIds@ (the only source of the @busy@ state) and
+<span class="lineno">  129 </span>-- @tabSessions@ (the session metadata behind each tab).
+<span class="lineno">  130 </span>httpGetLists :: Manager -&gt; Text -&gt; IO (Either Text ListsJson)
+<span class="lineno">  131 </span><span class="decl"><span class="nottickedoff">httpGetLists mgr apiBase = do</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/lists&quot;</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodGet Nothing &gt;&gt;= \case</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="nottickedoff">Right body -&gt; pure (parseListsBody body)</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | One entry of the gateway's slash-command menu: the canonical command name
+<span class="lineno">  138 </span>-- (no leading slash, aliases are never listed) and its one-line synopsis.
+<span class="lineno">  139 </span>data CommandJson = CommandJson
+<span class="lineno">  140 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cjName</span></span></span>     :: Text
+<span class="lineno">  141 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjSynopsis</span></span></span> :: Text
+<span class="lineno">  142 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | @GET /api/commands@ — the slash-command menu the chat channels render as
+<span class="lineno">  145 </span>-- @\/help@ (and register as the platform's command menu). Malformed entries
+<span class="lineno">  146 </span>-- are skipped rather than failing the whole list.
+<span class="lineno">  147 </span>httpGetCommands :: Manager -&gt; Text -&gt; IO (Either Text [CommandJson])
+<span class="lineno">  148 </span><span class="decl"><span class="nottickedoff">httpGetCommands mgr apiBase = do</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/commands&quot;</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodGet Nothing &gt;&gt;= \case</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="nottickedoff">Right body -&gt; case A.decode body :: Maybe [Value] of</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="nottickedoff">Just vs -&gt; pure (Right (mapMaybe parseCommandJson vs))</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="nottickedoff">Nothing -&gt; pure (Left &quot;failed to parse commands JSON array&quot;)</span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- | Parse one @\/api\/commands@ entry.
+<span class="lineno">  157 </span>parseCommandJson :: Value -&gt; Maybe CommandJson
+<span class="lineno">  158 </span><span class="decl"><span class="nottickedoff">parseCommandJson (A.Object o) = do</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">n &lt;- asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;name&quot;) o</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="nottickedoff">let syn = fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;synopsis&quot;) o)</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">pure (CommandJson n syn)</span>
+<span class="lineno">  162 </span><span class="spaces"></span><span class="nottickedoff">parseCommandJson _ = Nothing</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | @POST /api/sessions/new@ — create a new session.
+<span class="lineno">  165 </span>httpNewSession :: Manager -&gt; Text -&gt; Value -&gt; IO (Either Text Text)
+<span class="lineno">  166 </span><span class="decl"><span class="nottickedoff">httpNewSession mgr apiBase body = do</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/new&quot;</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost (Just body) &gt;&gt;= \case</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="nottickedoff">Right respBody -&gt; pure (extractSessionId respBody)</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | The parsed body of @POST \/api\/sessions\/:id\/new@: the minted session
+<span class="lineno">  173 </span>-- plus the rebind outcome. 'nsrRebindError' carries the gateway's raw
+<span class="lineno">  174 </span>-- @rebind_error@ (the tab could not be rebound — the new session exists
+<span class="lineno">  175 </span>-- regardless); 'nsrTabIndex' is 'Nothing' when no tab was bound to the old
+<span class="lineno">  176 </span>-- session.
+<span class="lineno">  177 </span>data NewSessionResult = NewSessionResult
+<span class="lineno">  178 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">nsrSessionId</span></span></span>   :: Text
+<span class="lineno">  179 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">nsrTabIndex</span></span></span>    :: Maybe Int
+<span class="lineno">  180 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">nsrRebound</span></span></span>     :: Bool
+<span class="lineno">  181 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nsrRebindError</span></span></span> :: Maybe Text
+<span class="lineno">  182 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nsrProvider</span></span></span>    :: Text
+<span class="lineno">  183 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nsrModel</span></span></span>       :: Text
+<span class="lineno">  184 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- | @POST /api/sessions/:id/new@ — mint a fresh session and rebind the tab
+<span class="lineno">  187 </span>-- bound to @sid@ (if any) in one call. One mint, one rebind: the caller must
+<span class="lineno">  188 </span>-- NOT also call 'httpNewSession' for the same @/new@.
+<span class="lineno">  189 </span>httpRebindNew :: Manager -&gt; Text -&gt; SessionId -&gt; Value -&gt; IO (Either Text NewSessionResult)
+<span class="lineno">  190 </span><span class="decl"><span class="nottickedoff">httpRebindNew mgr apiBase sid body = do</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid) &lt;&gt; &quot;/new&quot;</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost (Just body) &gt;&gt;= \case</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="nottickedoff">Right respBody -&gt; pure (parseNewSessionResult respBody)</span></span>
+<span class="lineno">  195 </span>
+<span class="lineno">  196 </span>-- | The request body for @POST \/api\/sessions\/:id\/new@. Absent overrides
+<span class="lineno">  197 </span>-- are omitted entirely — never sent as JSON @null@.
+<span class="lineno">  198 </span>rebindBody :: Maybe Text -&gt; Maybe Text -&gt; Maybe Text -&gt; Value
+<span class="lineno">  199 </span><span class="decl"><span class="istickedoff">rebindBody mProvider mModel mChannel = A.object (catMaybes</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">[ (&quot;provider&quot; .=) &lt;$&gt; mProvider</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;model&quot; .=) &lt;$&gt; mModel</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;channel&quot; .=) &lt;$&gt; mChannel</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">])</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>-- | The request body for @POST \/api\/sessions\/new@ on the @\/new@ path
+<span class="lineno">  206 </span>-- (no prior session): provider\/model overrides only. The gateway labels
+<span class="lineno">  207 </span>-- such a session @&quot;web&quot;@.
+<span class="lineno">  208 </span>mintBody :: Maybe Text -&gt; Maybe Text -&gt; Value
+<span class="lineno">  209 </span><span class="decl"><span class="istickedoff">mintBody mProvider mModel = A.object (catMaybes</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">[ (&quot;provider&quot; .=) &lt;$&gt; mProvider</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;model&quot; .=) &lt;$&gt; mModel</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">])</span></span>
+<span class="lineno">  213 </span>
+<span class="lineno">  214 </span>-- | The request body of @POST \/api\/sessions\/:id\/setup-repo@.
+<span class="lineno">  215 </span>setupRepoBody :: Text -&gt; Value
+<span class="lineno">  216 </span><span class="decl"><span class="istickedoff">setupRepoBody url = A.object [&quot;url&quot; .= url]</span></span>
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>-- | @POST /api/sessions/:id/setup-repo@ — clone a repo into the session's
+<span class="lineno">  219 </span>-- workdir before the first turn. Errors carry the gateway's @error@ text
+<span class="lineno">  220 </span>-- when it sent one (e.g. @clone failed: …@), so @repo setup failed: …@ names
+<span class="lineno">  221 </span>-- the real reason.
+<span class="lineno">  222 </span>httpSetupRepo :: Manager -&gt; Text -&gt; SessionId -&gt; Value -&gt; IO (Either Text ())
+<span class="lineno">  223 </span><span class="decl"><span class="nottickedoff">httpSetupRepo mgr apiBase sid body = do</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid) &lt;&gt; &quot;/setup-repo&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost (Just body) &gt;&gt;= \case</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="nottickedoff">Left e  -&gt; pure (Left e)</span>
+<span class="lineno">  227 </span><span class="spaces">    </span><span class="nottickedoff">Right _ -&gt; pure (Right ())</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | @GET /api/repos@ — the registered repos. Each element carries @id@ and
+<span class="lineno">  230 </span>-- @url@ (plus credential metadata this client ignores).
+<span class="lineno">  231 </span>httpGetRepos :: Manager -&gt; Text -&gt; IO (Either Text [Value])
+<span class="lineno">  232 </span><span class="decl"><span class="nottickedoff">httpGetRepos mgr apiBase = do</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/repos&quot;</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodGet Nothing &gt;&gt;= \case</span>
+<span class="lineno">  235 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="nottickedoff">Right body -&gt; case A.decode body :: Maybe [Value] of</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="nottickedoff">Just vs -&gt; pure (Right vs)</span>
+<span class="lineno">  238 </span><span class="spaces">      </span><span class="nottickedoff">Nothing -&gt; pure (Left &quot;failed to parse repos JSON array&quot;)</span></span>
+<span class="lineno">  239 </span>
+<span class="lineno">  240 </span>-- | Parse the @POST \/api\/sessions\/:id\/new@ response body.
+<span class="lineno">  241 </span>parseNewSessionResult :: BL.ByteString -&gt; Either Text NewSessionResult
+<span class="lineno">  242 </span><span class="decl"><span class="istickedoff">parseNewSessionResult body =</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object o) -&gt;</span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="istickedoff">case asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;session_id&quot;) o of</span>
+<span class="lineno">  246 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; Left &quot;new-session response missing 'session_id' field&quot;</span>
+<span class="lineno">  247 </span><span class="spaces">        </span><span class="istickedoff">Just sid</span>
+<span class="lineno">  248 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null sid</span> -&gt; <span class="nottickedoff">Left &quot;new-session response has an empty 'session_id'&quot;</span></span>
+<span class="lineno">  249 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>  -&gt; Right NewSessionResult</span>
+<span class="lineno">  250 </span><span class="spaces">              </span><span class="istickedoff">{ nsrSessionId   = sid</span>
+<span class="lineno">  251 </span><span class="spaces">              </span><span class="istickedoff">, nsrTabIndex    = asInt =&lt;&lt; KeyMap.lookup (Key.fromText &quot;tab_index&quot;) o</span>
+<span class="lineno">  252 </span><span class="spaces">              </span><span class="istickedoff">, nsrRebound     = fromMaybe <span class="nottickedoff">False</span></span>
+<span class="lineno">  253 </span><span class="spaces">                                   </span><span class="istickedoff">(asBool =&lt;&lt; KeyMap.lookup (Key.fromText &quot;rebound&quot;) o)</span>
+<span class="lineno">  254 </span><span class="spaces">              </span><span class="istickedoff">, nsrRebindError = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;rebind_error&quot;) o</span>
+<span class="lineno">  255 </span><span class="spaces">              </span><span class="istickedoff">, nsrProvider    = fromMaybe <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  256 </span><span class="spaces">                                   </span><span class="istickedoff">(asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;provider&quot;) o)</span>
+<span class="lineno">  257 </span><span class="spaces">              </span><span class="istickedoff">, nsrModel       = fromMaybe <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  258 </span><span class="spaces">                                   </span><span class="istickedoff">(asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;model&quot;) o)</span>
+<span class="lineno">  259 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  260 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; Left &quot;new-session response is not a JSON object&quot;</span>
+<span class="lineno">  261 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;failed to parse new-session response JSON&quot;</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">asInt (A.Number n) = Just (round n)</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">asInt _            = Nothing</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">asBool (A.Bool b)  = Just b</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">asBool _           = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  267 </span>
+<span class="lineno">  268 </span>-- | @GET /api/sessions/:id/transcript@ — get the transcript as a JSON array.
+<span class="lineno">  269 </span>httpGetTranscript :: Manager -&gt; Text -&gt; SessionId -&gt; IO (Either Text [Value])
+<span class="lineno">  270 </span><span class="decl"><span class="istickedoff">httpGetTranscript mgr apiBase sid = do</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid) &lt;&gt; &quot;/transcript&quot;</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">doRequest mgr url <span class="nottickedoff">methodGet</span> Nothing &gt;&gt;= \case</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">Right body -&gt;</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case A.decode body :: Maybe [Value] of</span></span>
+<span class="lineno">  276 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just vs -&gt; pure (Right vs)</span></span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure (Left &quot;failed to parse transcript JSON array&quot;)</span></span></span>
+<span class="lineno">  278 </span>
+<span class="lineno">  279 </span>-- | @POST /api/sessions/:id/stop@ — abort the session's in-flight turn.
+<span class="lineno">  280 </span>httpStopSession :: Manager -&gt; Text -&gt; SessionId -&gt; IO (Either Text ())
+<span class="lineno">  281 </span><span class="decl"><span class="nottickedoff">httpStopSession mgr apiBase sid = do</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid) &lt;&gt; &quot;/stop&quot;</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost Nothing &gt;&gt;= \case</span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="nottickedoff">Right _ -&gt; pure (Right ())</span></span>
+<span class="lineno">  286 </span>
+<span class="lineno">  287 </span>-- | @POST /api/sessions/:id/questions/:qid/answer@ — answer a pending
+<span class="lineno">  288 </span>-- ASK_HUMAN question (or the confirmation gate) with free text.
+<span class="lineno">  289 </span>--
+<span class="lineno">  290 </span>-- The body carries an @answer@ and nothing else: the server's parser rejects
+<span class="lineno">  291 </span>-- a body that carries both @answer@ and @scope@ with 400 (&quot;ambiguous: send
+<span class="lineno">  292 </span>-- either {scope} or {answer}, not both&quot;, 'parseAnswerBody'). The
+<span class="lineno">  293 </span>-- confirmation gate parses the text itself — @y@/@yes@ approve once,
+<span class="lineno">  294 </span>-- anything else rejects — so one shape serves both ask kinds.
+<span class="lineno">  295 </span>--
+<span class="lineno">  296 </span>-- The endpoint answers @200 {ok:true, accepted:&lt;bool&gt;}@; @accepted:false@
+<span class="lineno">  297 </span>-- means the question was already answered, cancelled, or unknown, which is
+<span class="lineno">  298 </span>-- a resolution but not an accepted answer.
+<span class="lineno">  299 </span>httpAnswerQuestion :: Manager -&gt; Text -&gt; SessionId -&gt; Text -&gt; Text -&gt; IO (Either Text Bool)
+<span class="lineno">  300 </span><span class="decl"><span class="nottickedoff">httpAnswerQuestion mgr apiBase sid qid answer = do</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid)</span>
+<span class="lineno">  302 </span><span class="spaces">            </span><span class="nottickedoff">&lt;&gt; &quot;/questions/&quot; &lt;&gt; T.unpack qid &lt;&gt; &quot;/answer&quot;</span>
+<span class="lineno">  303 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost (Just (answerBodyJson answer)) &gt;&gt;= \case</span>
+<span class="lineno">  304 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  305 </span><span class="spaces">    </span><span class="nottickedoff">Right body -&gt; pure (Right (acceptedFrom body))</span></span>
+<span class="lineno">  306 </span>
+<span class="lineno">  307 </span>-- | Read the @accepted@ flag from an answer response. Absent/malformed
+<span class="lineno">  308 </span>-- (e.g. a server that predates the flag) counts as accepted.
+<span class="lineno">  309 </span>acceptedFrom :: BL.ByteString -&gt; Bool
+<span class="lineno">  310 </span><span class="decl"><span class="nottickedoff">acceptedFrom body =</span>
+<span class="lineno">  311 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  312 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object o) -&gt; case KeyMap.lookup (Key.fromText &quot;accepted&quot;) o of</span>
+<span class="lineno">  313 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Bool b) -&gt; b</span>
+<span class="lineno">  314 </span><span class="spaces">      </span><span class="nottickedoff">_               -&gt; True</span>
+<span class="lineno">  315 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; True</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>-- | The request body for answering a pending question: the answer only.
+<span class="lineno">  318 </span>-- Pure and exported so the wire shape is pinned by a test.
+<span class="lineno">  319 </span>answerBodyJson :: Text -&gt; Value
+<span class="lineno">  320 </span><span class="decl"><span class="istickedoff">answerBodyJson answer = A.object [&quot;answer&quot; .= answer]</span></span>
+<span class="lineno">  321 </span>
+<span class="lineno">  322 </span>-- | @POST /api/sessions/:id/questions/:qid/cancel@ — cancel a pending
+<span class="lineno">  323 </span>-- ASK_HUMAN question.
+<span class="lineno">  324 </span>httpCancelQuestion :: Manager -&gt; Text -&gt; SessionId -&gt; Text -&gt; IO (Either Text ())
+<span class="lineno">  325 </span><span class="decl"><span class="nottickedoff">httpCancelQuestion mgr apiBase sid qid = do</span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack apiBase &lt;&gt; &quot;/sessions/&quot; &lt;&gt; T.unpack (sessionIdText sid)</span>
+<span class="lineno">  327 </span><span class="spaces">            </span><span class="nottickedoff">&lt;&gt; &quot;/questions/&quot; &lt;&gt; T.unpack qid &lt;&gt; &quot;/cancel&quot;</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="nottickedoff">doRequest mgr url methodPost Nothing &gt;&gt;= \case</span>
+<span class="lineno">  329 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  330 </span><span class="spaces">    </span><span class="nottickedoff">Right _ -&gt; pure (Right ())</span></span>
+<span class="lineno">  331 </span>
+<span class="lineno">  332 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  333 </span>-- Helpers
+<span class="lineno">  334 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- | Parse a JSON body into a 'Value'. Returns 'Left' on parse failure.
+<span class="lineno">  337 </span>parseJsonBody :: BL.ByteString -&gt; Either Text Value
+<span class="lineno">  338 </span><span class="decl"><span class="istickedoff">parseJsonBody body =</span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="istickedoff">Just v  -&gt; Right v</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;failed to parse JSON&quot;</span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>-- | Perform an HTTP request with a method, optional JSON body, and return
+<span class="lineno">  344 </span>-- the response body on success (2xx). Returns 'Left' on network or HTTP
+<span class="lineno">  345 </span>-- errors.
+<span class="lineno">  346 </span>doRequest :: Manager -&gt; String -&gt; Method -&gt; Maybe Value -&gt; IO (Either Text BL.ByteString)
+<span class="lineno">  347 </span><span class="decl"><span class="istickedoff">doRequest mgr url m mBody = do</span>
+<span class="lineno">  348 </span><span class="spaces">  </span><span class="istickedoff">eReq &lt;- try (parseRequest url) :: IO (Either HttpException Request)</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">case eReq of</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure (Left (&quot;invalid URL: &quot; &lt;&gt; T.pack url))</span></span>
+<span class="lineno">  351 </span><span class="spaces">    </span><span class="istickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  352 </span><span class="spaces">      </span><span class="istickedoff">let req1 = req0 { method = <span class="nottickedoff">m</span> }</span>
+<span class="lineno">  353 </span><span class="spaces">          </span><span class="istickedoff">req2 = case mBody of</span>
+<span class="lineno">  354 </span><span class="spaces">            </span><span class="istickedoff">Just bodyVal -&gt;</span>
+<span class="lineno">  355 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">req1 { requestBody = RequestBodyLBS (A.encode bodyVal)</span></span>
+<span class="lineno">  356 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">, requestHeaders = [(&quot;content-type&quot;, &quot;application/json&quot;)]</span></span>
+<span class="lineno">  357 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  358 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; req1</span>
+<span class="lineno">  359 </span><span class="spaces">      </span><span class="istickedoff">eResp &lt;- try (httpLbs req2 mgr) :: IO (Either HttpException (Response BL.ByteString))</span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff">case eResp of</span>
+<span class="lineno">  361 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; pure (Left &quot;HTTP request failed&quot;)</span>
+<span class="lineno">  362 </span><span class="spaces">        </span><span class="istickedoff">Right resp -&gt;</span>
+<span class="lineno">  363 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let code = statusCode (responseStatus resp)</span></span>
+<span class="lineno">  364 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">in if code &gt;= 200 &amp;&amp; code &lt;= 299</span></span>
+<span class="lineno">  365 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">then pure (Right (responseBody resp))</span></span>
+<span class="lineno">  366 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">else pure (Left (parseErrorBody code (responseBody resp)))</span></span></span>
+<span class="lineno">  367 </span>
+<span class="lineno">  368 </span>-- | The text of a failed HTTP response. Prefers the gateway's
+<span class="lineno">  369 </span>-- @{\&quot;error\&quot;: \&quot;…\&quot;}@ shape ('errJson' in 'Seal.Gateway.API') so callers can
+<span class="lineno">  370 </span>-- surface the real reason (e.g. @clone failed: …@); falls back to
+<span class="lineno">  371 </span>-- @HTTP \&lt;code\&gt;@ for a non-JSON or shapeless body (a proxy, a plain-text
+<span class="lineno">  372 </span>-- 5xx).
+<span class="lineno">  373 </span>parseErrorBody :: Int -&gt; BL.ByteString -&gt; Text
+<span class="lineno">  374 </span><span class="decl"><span class="istickedoff">parseErrorBody code body =</span>
+<span class="lineno">  375 </span><span class="spaces">  </span><span class="istickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  376 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object o) -&gt; case asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;error&quot;) o of</span>
+<span class="lineno">  377 </span><span class="spaces">      </span><span class="istickedoff">Just msg | not (T.null msg) -&gt; msg</span>
+<span class="lineno">  378 </span><span class="spaces">      </span><span class="istickedoff">_                           -&gt; fallback</span>
+<span class="lineno">  379 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; fallback</span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">fallback = &quot;HTTP &quot; &lt;&gt; T.pack (show code)</span></span>
+<span class="lineno">  382 </span>
+<span class="lineno">  383 </span>-- | Extract the @id@ field from a session info JSON object.
+<span class="lineno">  384 </span>extractSessionId :: BL.ByteString -&gt; Either Text Text
+<span class="lineno">  385 </span><span class="decl"><span class="nottickedoff">extractSessionId body =</span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  387 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object o) -&gt;</span>
+<span class="lineno">  388 </span><span class="spaces">      </span><span class="nottickedoff">case asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;session_id&quot;) o of</span>
+<span class="lineno">  389 </span><span class="spaces">        </span><span class="nottickedoff">Just sid -&gt; Right sid</span>
+<span class="lineno">  390 </span><span class="spaces">        </span><span class="nottickedoff">Nothing  -&gt; Left &quot;session response missing 'session_id' field&quot;</span>
+<span class="lineno">  391 </span><span class="spaces">    </span><span class="nottickedoff">Just _ -&gt; Left &quot;session response is not a JSON object&quot;</span>
+<span class="lineno">  392 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; Left &quot;failed to parse session response JSON&quot;</span></span>
+<span class="lineno">  393 </span>
+<span class="lineno">  394 </span>-- | Parse the @GET /api/lists@ response body.
+<span class="lineno">  395 </span>parseListsBody :: BL.ByteString -&gt; Either Text ListsJson
+<span class="lineno">  396 </span><span class="decl"><span class="nottickedoff">parseListsBody body =</span>
+<span class="lineno">  397 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode body :: Maybe Value of</span>
+<span class="lineno">  398 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object o) -&gt; do</span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="nottickedoff">tabs &lt;- case KeyMap.lookup (Key.fromText &quot;tabs&quot;) o of</span>
+<span class="lineno">  400 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.Array arr) -&gt; traverse parseTabJson (foldr (:) [] arr)</span>
+<span class="lineno">  401 </span><span class="spaces">        </span><span class="nottickedoff">_                  -&gt; Left &quot;lists response missing 'tabs' array&quot;</span>
+<span class="lineno">  402 </span><span class="spaces">      </span><span class="nottickedoff">let arrOf k = case KeyMap.lookup (Key.fromText k) o of</span>
+<span class="lineno">  403 </span><span class="spaces">            </span><span class="nottickedoff">Just (A.Array arr) -&gt; foldr (:) [] arr</span>
+<span class="lineno">  404 </span><span class="spaces">            </span><span class="nottickedoff">_                  -&gt; []</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="nottickedoff">pure ListsJson</span>
+<span class="lineno">  406 </span><span class="spaces">        </span><span class="nottickedoff">{ ljTabs               = tabs</span>
+<span class="lineno">  407 </span><span class="spaces">        </span><span class="nottickedoff">, ljTabSessions        = arrOf &quot;tabSessions&quot;</span>
+<span class="lineno">  408 </span><span class="spaces">        </span><span class="nottickedoff">, ljThinkingSessionIds = mapMaybe asText (arrOf &quot;thinkingSessionIds&quot;)</span>
+<span class="lineno">  409 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  410 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; Left &quot;failed to parse lists response JSON object&quot;</span></span>
+<span class="lineno">  411 </span>
+<span class="lineno">  412 </span>-- | Parse the @GET /api/tabs@ response body.
+<span class="lineno">  413 </span>parseTabsBody :: BL.ByteString -&gt; Either Text [TabJson]
+<span class="lineno">  414 </span><span class="decl"><span class="nottickedoff">parseTabsBody body =</span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode body :: Maybe [Value] of</span>
+<span class="lineno">  416 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; Left &quot;failed to parse tabs JSON array&quot;</span>
+<span class="lineno">  417 </span><span class="spaces">    </span><span class="nottickedoff">Just vs -&gt; traverse parseTabJson vs</span></span>
+<span class="lineno">  418 </span>
+<span class="lineno">  419 </span>-- | Parse one tab JSON object.
+<span class="lineno">  420 </span>parseTabJson :: Value -&gt; Either Text TabJson
+<span class="lineno">  421 </span><span class="decl"><span class="nottickedoff">parseTabJson (A.Object o) =</span>
+<span class="lineno">  422 </span><span class="spaces">  </span><span class="nottickedoff">Right TabJson</span>
+<span class="lineno">  423 </span><span class="spaces">    </span><span class="nottickedoff">{ tjIndex = case KeyMap.lookup (Key.fromText &quot;index&quot;) o of</span>
+<span class="lineno">  424 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.Number n) -&gt; round n</span>
+<span class="lineno">  425 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; 0</span>
+<span class="lineno">  426 </span><span class="spaces">    </span><span class="nottickedoff">, tjSessionId = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;session_id&quot;) o</span>
+<span class="lineno">  427 </span><span class="spaces">    </span><span class="nottickedoff">, tjKind = fromMaybe &quot;&quot; (asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;kind&quot;) o)</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="nottickedoff">, tjLabel = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;label&quot;) o</span>
+<span class="lineno">  429 </span><span class="spaces">    </span><span class="nottickedoff">, tjStatus = asText =&lt;&lt; KeyMap.lookup (Key.fromText &quot;status&quot;) o</span>
+<span class="lineno">  430 </span><span class="spaces">    </span><span class="nottickedoff">}</span>
+<span class="lineno">  431 </span><span class="spaces"></span><span class="nottickedoff">parseTabJson _ = Left &quot;tab is not a JSON object&quot;</span></span>
+<span class="lineno">  432 </span>
+<span class="lineno">  433 </span>-- | Extract text from a JSON string value.
+<span class="lineno">  434 </span>asText :: Value -&gt; Maybe Text
+<span class="lineno">  435 </span><span class="decl"><span class="istickedoff">asText (A.String t) = Just t</span>
+<span class="lineno">  436 </span><span class="spaces"></span><span class="istickedoff">asText _ = Nothing</span></span>
+
+</pre>
+</body>
+</html>
