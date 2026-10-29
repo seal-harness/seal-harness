@@ -740,7 +740,14 @@ reconEntryToFrontend idx te =
          -- single pass and should be <10ms.
          , "payload"   .= payloadJson
          , "harness"   .= (Nothing :: Maybe Text)
-         , "model"     .= (Nothing :: Maybe Text)
+         -- The model that generated this entry's messages, stamped by
+         -- 'Seal.Transcript.Reconstruct.toEntry' from the effective
+         -- envelope at that turn. The web frontend labels each LLM
+         -- message with it, so the transcript view attributes a reply to
+         -- the model that produced it instead of showing a constant
+         -- "Assistant". Null for entries that have no model (non-LLM
+         -- events, and legacy lines that never recorded one).
+         , "model"     .= teModel te
          , "channel"   .= mChannel
         , "internal"  .= mInternal
          -- The `raw` field carries the full rewritten payload with tool
