@@ -179,7 +179,8 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
-              , smCreatedAt = now, smLastActive = now }
+              , smCreatedAt = now, smLastActive = now
+              , smAllowedSecrets = Nothing }
         saveSessionMeta paths parentMeta
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing

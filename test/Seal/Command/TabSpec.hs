@@ -47,6 +47,7 @@ stubMeta = SessionMeta
   , smRepoUrl = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
+  , smAllowedSecrets = Nothing
   }
 
 stubMint :: IO SessionMeta
@@ -390,6 +391,7 @@ metaWithDescription sid mDesc = SessionMeta
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
   , smCreatedAt = testTime, smLastActive = testTime
+  , smAllowedSecrets = Nothing
   }
   where
     testTime = UTCTime (fromGregorian 2026 1 1) 0

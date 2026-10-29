@@ -95,7 +95,8 @@ newSessionMeta _paths provider model channel mAgent = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
-    , smCreatedAt = now, smLastActive = now }
+    , smCreatedAt = now, smLastActive = now
+    , smAllowedSecrets = Nothing }
 
 -- | Create a fresh session directory + session.json for the given selection.
 newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta

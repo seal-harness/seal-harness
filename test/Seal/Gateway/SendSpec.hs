@@ -100,6 +100,7 @@ stubMint = pure SessionMeta
   , smRepoUrl = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
+  , smAllowedSecrets = Nothing
   }
 
 mkSid s = case mkSessionId (T.pack s) of
@@ -259,7 +260,7 @@ mkSendDepsWith paths resolveStub = do
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
   testRepeatReg <- newSessionRepeatRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime Nothing
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -316,7 +317,7 @@ seedSessionChannel :: SealPaths -> Text -> SessionId -> IO ()
 seedSessionChannel paths channel sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime Nothing
   saveSessionMeta paths meta
 
 -- | Seed a session.json on disk for the given sid (channel @web@).
@@ -861,7 +862,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime Nothing
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -949,7 +950,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime Nothing
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -988,7 +989,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime Nothing
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -1627,7 +1628,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let td = (mkWebTurnDeps deps)
               { tdOnTurnEnd = Just (\_ ->
                   sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime Nothing
         done <- newEmptyMVar
         _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -1716,6 +1717,6 @@ runWithRecordedHook deps sid = do
   let td = (mkWebTurnDeps deps)
         { tdOnTurnEnd = Just (\_ ->
             sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime Nothing
   outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
   pure (outcome, hookRef)

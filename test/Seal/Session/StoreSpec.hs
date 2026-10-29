@@ -73,7 +73,8 @@ spec = describe "Seal.Session.Store" $ do
                 , smDescription = Nothing
                 , smSealFrontMatter = True
                 , smRepoUrl = Nothing
-                , smCreatedAt = aTime, smLastActive = la }
+                , smCreatedAt = aTime, smLastActive = la
+                , smAllowedSecrets = Nothing }
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })
         -- a corrupt session dir is skipped
@@ -97,7 +98,8 @@ spec = describe "Seal.Session.Store" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
-              , smCreatedAt = aTime, smLastActive = aTime }
+              , smCreatedAt = aTime, smLastActive = aTime
+              , smAllowedSecrets = Nothing }
         saveChildSessionMeta paths parent child childMeta
         let childMetaPath = agentSessionDir paths parent child </> "session.json"
         exists <- doesFileExist childMetaPath
@@ -119,7 +121,8 @@ spec = describe "Seal.Session.Store" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
-              , smCreatedAt = aTime, smLastActive = aTime }
+              , smCreatedAt = aTime, smLastActive = aTime
+              , smAllowedSecrets = Nothing }
         saveChildSessionMeta paths parent child childMeta
         metas <- listSessions paths
         any ((== child) . smId) metas `shouldBe` False

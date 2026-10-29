@@ -122,7 +122,8 @@ seedMeta sid t mDesc = SessionMeta
   , smDescription = mDesc
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
-  , smCreatedAt = t, smLastActive = t }
+  , smCreatedAt = t, smLastActive = t
+  , smAllowedSecrets = Nothing }
 
 -- | The snippet content of every rendered @  snippet: @ line in a search
 -- result.

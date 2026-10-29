@@ -1325,7 +1325,8 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
-      , smCreatedAt = tnow, smLastActive = tnow }
+      , smCreatedAt = tnow, smLastActive = tnow
+      , smAllowedSecrets = Nothing }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
 -- @adTools@ allow-list is ENFORCED (intersection with the base ops), the
