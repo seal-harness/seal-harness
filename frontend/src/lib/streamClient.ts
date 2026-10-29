@@ -9,11 +9,16 @@
  * with the most recent entry id as `since` on reconnect so the server can
  * replay missed entries.
  *
- * A heartbeat watchdog force-closes and reconnects when no message (data
- * frame or server ping) arrives within HEARTBEAT_TIMEOUT_MS. The server
- * sends pings every 30s, so 90s of silence means the connection is dead
- * (half-open NAT, sleep/wake, etc.) — the browser won't detect this on
- * its own.
+ * A heartbeat watchdog force-closes and reconnects when no message arrives
+ * within HEARTBEAT_TIMEOUT_MS. The server sends an application-level
+ * `{"type": "heartbeat"}` data frame every 30s, so 90s of silence means the
+ * connection is dead (half-open NAT, sleep/wake, etc.) — the browser won't
+ * detect this on its own.
+ *
+ * NOTE: the server's WebSocket PING frames do NOT count as messages. The
+ * browser answers them below the JS API, so `onmessage` never fires for
+ * them. Relying on them (as this client used to) tore down healthy idle
+ * connections every 90s — a visible redraw in the transcript view.
  *
  * Exposes `createStreamClient(url)` as a factory for tests so each test can
  * spin up a fresh instance; production uses the `streamClient()` singleton.
@@ -342,6 +347,13 @@ class StreamClientImpl implements StreamClient {
     switch (event.type) {
       case 'hello':
         this._lastServerStartedAt = event.serverStartedAt
+        break
+      case 'heartbeat':
+        // Application-level keep-alive. The watchdog was already reset by
+        // handleMessage(); do NOT notify any listener — a heartbeat carries
+        // no state, and waking React on it would re-render the transcript
+        // for nothing (the exact periodic redraw this frame exists to
+        // prevent).
         break
       case 'entry': {
         this.lastEntryId = event.entry.id

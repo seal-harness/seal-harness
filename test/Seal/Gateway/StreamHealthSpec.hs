@@ -49,6 +49,7 @@ mkGuard = do
     , sgGlobalCap = 10
     , sgTabsHandle = tabsH
     , sgPaths = fakePaths
+    , sgHeartbeatSeconds = 3600
     }
 
 -- | The WS middleware mounted on an HTTP application — the production

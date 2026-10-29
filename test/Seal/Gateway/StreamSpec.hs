@@ -14,7 +14,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Network.HTTP.Types (status404)
 import Network.Wai (Application, responseLBS)
 import Network.Wai.Handler.Warp (run)
-import Network.WebSockets (ClientApp, runClient, receiveData, ConnectionException)
+import Network.WebSockets (ClientApp, Connection, runClient, receiveData, ConnectionException)
 import Test.Hspec
 
 import Seal.Config.Paths (SealPaths(..))
@@ -70,12 +70,28 @@ jsonField :: T.Text -> A.Value -> Maybe A.Value
 jsonField key (A.Object o) = KeyMap.lookup (Key.fromText key) o
 jsonField _ _ = Nothing
 
+-- | Read frames until one of them is an application-level heartbeat (the
+-- @hello@ and initial @lists@ frames precede it), or give up after
+-- @maxFrames@. Returns the heartbeat frame when one arrives.
+firstHeartbeat :: Connection -> Int -> IO (Maybe A.Value)
+firstHeartbeat conn = go
+  where
+    go :: Int -> IO (Maybe A.Value)
+    go 0 = pure Nothing
+    go n = do
+      raw <- receiveData conn :: IO BL.ByteString
+      case A.decode raw :: Maybe A.Value of
+        Just v
+          | jsonField "type" v == Just (A.String "heartbeat") -> pure (Just v)
+          | otherwise -> go (n - 1)
+        Nothing -> go (n - 1)
+
 spec :: Spec
 spec = describe "Seal.Gateway.Stream" $ do
   it "a client connects and receives hello with protocolVersion + serverStartedAt" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
     withStreamServer guard broker $ \_port conn -> do
       hello <- receiveData conn :: IO BL.ByteString
       case A.decode hello :: Maybe A.Value of
@@ -92,7 +108,7 @@ spec = describe "Seal.Gateway.Stream" $ do
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
     withStreamServer guard broker $ \_port conn -> do
       _hello <- receiveData conn :: IO BL.ByteString
       _lists <- receiveData conn :: IO BL.ByteString
@@ -102,6 +118,23 @@ spec = describe "Seal.Gateway.Stream" $ do
       case A.decode msg :: Maybe A.Value of
         Just _ -> pure ()
         Nothing -> error "expected an event JSON"
+
+  it "sends an application-level heartbeat frame so an idle connection is visibly alive" $ do
+    -- Protocol-level PING frames (withPingThread) are answered by the
+    -- browser's WebSocket implementation and NEVER surface to
+    -- `WebSocket.onmessage`. A JS client therefore cannot observe them, and
+    -- would treat a healthy idle connection as dead — the frontend's 90s
+    -- watchdog force-reconnects, which the transcript view shows as a
+    -- periodic redraw (connection banner + re-render). The data-level
+    -- heartbeat below is the frame the browser CAN observe.
+    broker <- newStreamBroker 10
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 1 }
+    withStreamServer guard broker $ \_port conn -> do
+      frame <- firstHeartbeat conn 6
+      case frame of
+        Just v -> jsonField "type" v `shouldBe` Just (A.String "heartbeat")
+        Nothing -> expectationFailure "expected a {\"type\":\"heartbeat\"} frame"
 
   it "FocusOp parses the since field" $ do
     let msg = A.encode (object ["op" .= ("focus" :: T.Text), "sessionId" .= ("sess-1" :: T.Text), "since" .= ("entry-5" :: T.Text)])

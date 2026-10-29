@@ -13,6 +13,10 @@
 -- @entry@ events, then sends a @replay-end@ event so the client transitions
 -- from @replaying@ back to @live@. This closes the gap: entries broadcast
 -- while the WS was disconnected are no longer permanently lost.
+--
+-- Every connection also carries two keep-alives at the same interval: a
+-- protocol-level PING (invisible to browser JavaScript) and an
+-- application-level @heartbeat@ data frame (see 'heartbeatLoop').
 module Seal.Gateway.Stream
   ( streamMiddleware
   , StreamGuard (..)
@@ -30,6 +34,8 @@ module Seal.Gateway.Stream
   , sendErrorFrame
   ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (concurrently_)
 import Control.Exception (SomeException, catch)
 import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
@@ -106,6 +112,14 @@ data StreamGuard = StreamGuard
   , sgGlobalCap :: Int
   , sgTabsHandle :: TabsHandle
   , sgPaths :: SealPaths
+  -- | Interval in SECONDS for the connection keep-alives: the protocol-level
+  -- PING ('withPingThread') and the application-level @{"type":"heartbeat"}@
+  -- data frame. The protocol ping keeps intermediaries and dead-peer
+  -- detection honest; the data frame is the only one a browser's JavaScript
+  -- can observe (see 'heartbeatLoop'). Production uses 30s — comfortably
+  -- inside the frontend's 90s watchdog. Tests override it to keep the suite
+  -- fast, or raise it to keep heartbeat frames out of unrelated assertions.
+  , sgHeartbeatSeconds :: Int
   }
 
 -- | The WebSocket stream endpoint, as a WAI middleware.
@@ -202,7 +216,14 @@ streamApp guard broker pending = do
       -- Without this, the snapshot is broadcast to zero subscribers, the
       -- frontend never flips wsLive, and REST /api/lists polling stays on.
       broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
-      withPingThread conn 30 (pure ()) $ do
+      -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
+      -- so intermediaries and dead-peer detection stay honest, and the
+      -- application-level heartbeat frame ('heartbeatLoop') because that is
+      -- the only one a browser's JavaScript can observe. The heartbeat is
+      -- cancelled as soon as the reader loop ends (peer closed), so it never
+      -- outlives the connection.
+      let hbSeconds = sgHeartbeatSeconds guard
+      withPingThread conn hbSeconds (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
               case A.decode msg :: Maybe ClientMessage of
@@ -220,7 +241,30 @@ streamApp guard broker pending = do
                 Just (CmRequestEntries reqOp) ->
                   handleRequestEntries conn (sgPaths guard) reqOp
                 Nothing -> sendErrorFrame conn "unknown op"
-        readerLoop `catch` \(_e :: SomeException) -> pure ()
+        concurrently_
+          (heartbeatLoop conn hbSeconds)
+          (readerLoop `catch` \(_e :: SomeException) -> pure ())
+
+-- | Push a content-free @{"type":"heartbeat"}@ frame every
+-- @intervalSeconds@ for as long as the connection lives.
+--
+-- WebSocket PING frames ('withPingThread') are answered below the browser's
+-- JavaScript API: `WebSocket.onmessage` never fires for them. A client that
+-- watches data frames — as ours does — therefore cannot distinguish a
+-- healthy idle connection from a dead one, and tears it down once its
+-- watchdog expires. On the web that showed up as a periodic redraw of the
+-- transcript view: the "reconnecting" banner appearing, the chat
+-- re-rendering, and the sidebar refreshing, roughly every 90 seconds of
+-- idleness. This frame is the keep-alive the browser can actually observe.
+-- It carries no state, so clients must not re-render on it.
+--
+-- A failed send (peer went away) is swallowed: the reader loop notices the
+-- closed connection promptly and cancels this thread.
+heartbeatLoop :: Connection -> Int -> IO ()
+heartbeatLoop conn intervalSeconds = forever $ do
+  threadDelay (max 1 intervalSeconds * 1_000_000)
+  sendTextData conn (A.encode (object [ "type" .= ("heartbeat" :: Text) ]))
+    `catch` \(_e :: SomeException) -> pure ()
 
 -- | Replay transcript entries after the given entry id, then send a
 -- @replay-end@ event so the client transitions from @replaying@ to @live@.

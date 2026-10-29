@@ -24,6 +24,20 @@ export interface EntryEvent {
   entry: TranscriptEntry
 }
 
+/** Application-level keep-alive, sent by the server every 30s.
+ *
+ *  WebSocket PING frames are invisible to browser JavaScript: the browser
+ *  answers them below the JS API and `onmessage` never fires. A client that
+ *  watched only for data frames therefore could not tell a healthy idle
+ *  connection from a dead one, and tore down a perfectly good connection
+ *  every 90s (heartbeat watchdog) — which the transcript view showed as a
+ *  periodic redraw: the connection banner appearing, then the whole chat
+ *  re-rendering. This frame is what keeps the watchdog fed. It carries no
+ *  state: consumers must NOT re-render on it. */
+export interface HeartbeatEvent {
+  type: 'heartbeat'
+}
+
 /** Emitted when a streaming entry's payload grows. The entry already exists in
  *  the transcript (same id); consumers should replace it in place. */
 export interface EntryUpdateEvent {
@@ -160,6 +174,7 @@ export interface EntriesChunkEvent {
 
 export type ServerEvent =
   | HelloEvent
+  | HeartbeatEvent
   | EntryEvent
   | EntryUpdateEvent
   | ActivityEnvelope
