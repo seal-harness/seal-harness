@@ -35,7 +35,7 @@ import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
   , TranscriptTimings (..)
-  , readTranscriptEntriesTimed, ReadLimit (..)
+  , readTranscriptEntries, readTranscriptEntriesTimed, ReadLimit (..)
   , ttEntryCount
   , reconEntryToFrontend
   , renderServerTiming
@@ -228,6 +228,62 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
       case reconEntryToFrontend 0 (mkModelTe Nothing) of
         Just val -> frontendField "model" val `shouldBe` Just Null
         Nothing  -> expectationFailure "expected Just (entry surfaces), got Nothing"
+
+  -- ── model attribution, end to end ────────────────────────────────────
+  --
+  -- The unit tests above pin 'reconEntryToFrontend' in isolation; this one
+  -- drives the exact function the HTTP @/transcript@ handler and the WS
+  -- broadcast use, over a real @conversation.jsonl@ + @entries.jsonl@
+  -- pair, so the whole read → fold → rewrite path is covered.
+  describe "model attribution end to end" $ do
+    it "a session's LLM entries carry the model on the wire" $
+      withSystemTempDirectory "seal-transcript" $ \dir -> do
+        let paths = SealPaths dir (dir </> "config") (dir </> "state")
+                               (dir </> "keys") (dir </> "cache")
+            sid = case mkSessionId "test-session" of
+                    Right s -> s
+                    Left _  -> error "bad sid"
+            sdir = dir </> "state" </> "sessions" </> "test-session"
+            convPath = sdir </> "conversation.jsonl"
+            entriesPath = sdir </> "entries.jsonl"
+            idxPath = sdir </> "conversation.idx"
+            mkEntry kind convLen mEnvelope = Entries.EntryRecord
+              { Entries.erId = ""
+              , Entries.erTimestamp = sampleTime
+              , Entries.erKind = kind
+              , Entries.erConvLen = convLen
+              , Entries.erEnvelope = mEnvelope
+              , Entries.erUsage = Nothing
+              , Entries.erStop = Nothing
+              , Entries.erDurationMs = Nothing
+              , Entries.erHarness = Nothing
+              , Entries.erCorrelation = Nothing
+              , Entries.erMeta = Map.empty
+              }
+            entries =
+              [ mkEntry Entries.EKRequest 1
+                  (Just Entries.emptyEnvelopeDelta
+                    { Entries.edModel = Just (ModelId "claude-sonnet-4-5") })
+              , mkEntry Entries.EKResponse 2 Nothing
+              ]
+            convMsgs = [ PC.Message PC.User [CbText "hi"]
+                       , PC.Message PC.Assistant [CbText "hello"]
+                       ]
+        createDirectoryIfMissing True sdir
+        BS.writeFile convPath
+          (BS.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") convMsgs))
+        BS.writeFile entriesPath
+          (BS.concat (map (\e -> encodeEntryRecordRaw e <> "\n") entries))
+        _ <- buildIndex convPath idxPath
+        frontend <- readTranscriptEntries paths "test-model" "2026-01-01T00:00:00.000Z" sid
+        let responseModels =
+              [ KeyMap.lookup (Key.fromString "model") o
+              | Object o <- frontend
+              , KeyMap.lookup (Key.fromString "direction") o == Just (String "response")
+              ]
+        -- The response is the LLM message the user sees labelled; it must
+        -- name the model that generated it, not be null.
+        responseModels `shouldBe` [Just (String "claude-sonnet-4-5")]
 
   -- ── tools rewriting in request entries ──────────────────────────────
 
