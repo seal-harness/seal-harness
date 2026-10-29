@@ -36,6 +36,7 @@ import Data.Aeson (Value (..), object, (.=))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (Message (..), ToolChoice (..), ToolDefinition (..))
@@ -115,13 +116,13 @@ reconstruct conv = go 0 Nothing
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools msgs
-              entry = toEntry e Request (Just (envModel env)) payload
+              entry = toEntry e Request (modelOf env) payload
           in entry : go end (Just env) es
         EKResponse ->
           let end = erConvLen e
               msgs = take (end - start) (drop start conv)
               payload = responsePayload mEnv msgs e
-              entry = toEntry e Response (envModel <$> mEnv) payload
+              entry = toEntry e Response (mEnv >>= modelOf) payload
           in entry : go end mEnv es
         EKHarness ->
           -- A harness entry (opcode invocation) adds no conversation lines
@@ -152,6 +153,19 @@ effectiveAtE e mEnv =
 -- | A neutral baseline envelope used when no prior envelope exists.
 defaultEnv :: Envelope
 defaultEnv = Envelope (ModelId "") Nothing [] ToolAuto 0
+
+-- | The model to attribute to an entry: the envelope's model, or 'Nothing'
+-- when the envelope carries no model.
+--
+-- A request written without an envelope delta reconstructs against
+-- 'defaultEnv', whose model is the empty string. The frontend uses this
+-- value as the message label, so an empty label must never be emitted —
+-- 'Nothing' lets the frontend fall back to its own label instead.
+modelOf :: Envelope -> Maybe ModelId
+modelOf env = case envModel env of
+  m@(ModelId t)
+    | not (T.null t) -> Just m
+    | otherwise      -> Nothing
 
 -- | Build the old 'Request' payload: a 'CompletionRequest'-shaped JSON object
 -- carrying the model, system, tools, toolChoice, maxTokens, and the message
@@ -277,14 +291,14 @@ reconstructStreaming convPath idxPath entries = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request (Just (envModel env)) payload
+              entry = toEntry e Request (modelOf env) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response (envModel <$> mEnv) payload
+              entry = toEntry e Response (mEnv >>= modelOf) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
@@ -375,14 +389,14 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request (Just (envModel env)) payload
+              entry = toEntry e Request (modelOf env) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response (envModel <$> mEnv) payload
+              entry = toEntry e Response (mEnv >>= modelOf) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do

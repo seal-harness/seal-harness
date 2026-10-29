@@ -358,6 +358,23 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
           teModel c `shouldBe` Nothing
         other -> expectationFailure ("expected 2 entries, got " ++ show (length other))
 
+    it "does not attribute a blank model when the envelope carries none" $ do
+      -- A request written with no envelope delta reconstructs against the
+      -- neutral baseline, whose model is the empty string. The frontend
+      -- uses this value as the message label, so an empty label must never
+      -- be emitted — 'Nothing' lets it use its own fallback instead.
+      let conv = [ Message User [CbText "a"]
+                 , Message Assistant [CbText "b"]
+                 ]
+          entries = [ (reqEntry emptyEnvelopeDelta 1) { erEnvelope = Nothing }
+                    , respEntry 2
+                    ]
+      case reconstruct conv entries of
+        [req, resp] -> do
+          teModel req `shouldBe` Nothing
+          teModel resp `shouldBe` Nothing
+        other -> expectationFailure ("expected 2 entries, got " ++ show (length other))
+
   -- ------------------------------------------------------------------
   -- Streaming reconstruction equivalence
   -- ------------------------------------------------------------------
