@@ -301,6 +301,64 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
       other -> expectationFailure ("expected 1 entry, got " ++ show (length other))
 
   -- ------------------------------------------------------------------
+  -- Model attribution
+  -- ------------------------------------------------------------------
+  --
+  -- The web transcript view labels each LLM message with the model that
+  -- generated it (e.g. "claude-sonnet-4-5"), not the useless constant
+  -- "Assistant". The label is the frontend entry's top-level @model@
+  -- field, which 'Seal.Gateway.Transcript.reconEntryToFrontend' fills
+  -- from 'teModel'. Reconstruction is the only place that knows the
+  -- effective envelope per turn, so it must stamp the model onto every
+  -- request/response entry. A response carries the model of the request
+  -- that produced it.
+  describe "model attribution" $ do
+    it "stamps the effective model onto request and response entries" $ do
+      let conv = [ Message User [CbText "hi"]
+                 , Message Assistant [CbText "hello"]
+                 ]
+          entries =
+            [ reqEntry emptyEnvelopeDelta { edModel = Just (ModelId "claude-sonnet-4-5") } 1
+            , respEntry 2
+            ]
+      case reconstruct conv entries of
+        [req, resp] -> do
+          teModel req `shouldBe` Just (ModelId "claude-sonnet-4-5")
+          -- The response is attributed to the model in effect at its
+          -- paired request (the response entry carries no envelope).
+          teModel resp `shouldBe` Just (ModelId "claude-sonnet-4-5")
+        other -> expectationFailure ("expected 2 entries, got " ++ show (length other))
+
+    it "follows a mid-session model change per entry" $ do
+      let conv = [ Message User [CbText "a"]
+                 , Message Assistant [CbText "b"]
+                 , Message User [CbText "c"]
+                 , Message Assistant [CbText "d"]
+                 ]
+          entries =
+            [ reqEntry emptyEnvelopeDelta { edModel = Just (ModelId "model-one") } 1
+            , respEntry 2
+            , reqEntry emptyEnvelopeDelta { edModel = Just (ModelId "model-two") } 3
+            , respEntry 4
+            ]
+      case reconstruct conv entries of
+        [req1, resp1, req2, resp2] -> do
+          teModel req1 `shouldBe` Just (ModelId "model-one")
+          teModel resp1 `shouldBe` Just (ModelId "model-one")
+          teModel req2 `shouldBe` Just (ModelId "model-two")
+          teModel resp2 `shouldBe` Just (ModelId "model-two")
+        other -> expectationFailure ("expected 4 entries, got " ++ show (length other))
+
+    it "leaves harness and compaction entries without a model" $ do
+      -- Opcode-invocation and compaction entries are not LLM messages;
+      -- attributing them to a model would be a lie.
+      case reconstruct [] [harnessEntry 0, compactionEntry 1] of
+        [h, c] -> do
+          teModel h `shouldBe` Nothing
+          teModel c `shouldBe` Nothing
+        other -> expectationFailure ("expected 2 entries, got " ++ show (length other))
+
+  -- ------------------------------------------------------------------
   -- Streaming reconstruction equivalence
   -- ------------------------------------------------------------------
 

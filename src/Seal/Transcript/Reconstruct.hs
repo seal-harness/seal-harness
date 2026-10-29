@@ -13,6 +13,9 @@
 -- * the left-folded effective envelope at @i@ (model / system / tools /
 --   toolChoice / maxTokens), wrapped into a 'CompletionRequest'-shaped
 --   'Value';
+-- * @teModel@ = the effective envelope's model at @i@ (the model that
+--   generated the entry's messages — the web transcript view labels each
+--   LLM message with it);
 -- * the same direction + meta as the stored entry.
 --
 -- A 'Response' entry is reconstructed by re-inserting the assistant content
@@ -112,13 +115,13 @@ reconstruct conv = go 0 Nothing
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools msgs
-              entry = toEntry e Request payload
+              entry = toEntry e Request (Just (envModel env)) payload
           in entry : go end (Just env) es
         EKResponse ->
           let end = erConvLen e
               msgs = take (end - start) (drop start conv)
               payload = responsePayload mEnv msgs e
-              entry = toEntry e Response payload
+              entry = toEntry e Response (envModel <$> mEnv) payload
           in entry : go end mEnv es
         EKHarness ->
           -- A harness entry (opcode invocation) adds no conversation lines
@@ -128,10 +131,10 @@ reconstruct conv = go 0 Nothing
           -- @take end (drop 0 conv)@ return the ENTIRE conversation, which
           -- the frontend renders as one giant duplicate response row.
           let payload = harnessPayload (take (erConvLen e) (drop start conv)) e
-              entry = toEntry e Request payload
+              entry = toEntry e Request Nothing payload
           in entry : go start mEnv es
         EKCompaction ->
-          let entry = toEntry e Request Null
+          let entry = toEntry e Request Nothing Null
           in entry : go (erConvLen e) mEnv es
 
 -- | The effective envelope at a request entry. The first request has no
@@ -220,18 +223,21 @@ harnessPayload msgs e =
          , "approval" .= approvalVal
          ]
 
--- | Lift an 'EntryRecord' into a 'TranscriptEntry' with the given direction
--- and payload. The id, timestamp, duration, correlation, and meta are
--- carried over; the model is 'Nothing' (the dispatcher's opcode-invocation
--- entries set teModel = Nothing; the loop's provider entries set it from the
--- envelope — but the reconstructed old-format entry keeps teModel = Nothing
--- to match the existing dispatch path; the response payload carries the
--- model separately).
-toEntry :: EntryRecord -> Direction -> Value -> TranscriptEntry
-toEntry e dir payload = TranscriptEntry
+-- | Lift an 'EntryRecord' into a 'TranscriptEntry' with the given direction,
+-- model, and payload. The id, timestamp, duration, correlation, and meta are
+-- carried over.
+--
+-- The @model@ is the model that generated (or, for a request, was asked to
+-- generate) the entry's messages, taken from the effective envelope at that
+-- turn. It reaches the web transcript view as the frontend entry's top-level
+-- @model@ field, which labels each LLM message with the model that produced
+-- it instead of a fixed "Assistant". Opcode-invocation ('EKHarness') and
+-- compaction entries are not LLM messages, so they carry 'Nothing'.
+toEntry :: EntryRecord -> Direction -> Maybe ModelId -> Value -> TranscriptEntry
+toEntry e dir model payload = TranscriptEntry
   { teId = erId e
   , teTimestamp = erTimestamp e
-  , teModel = Nothing
+  , teModel = model
   , teDirection = dir
   , tePayload = payload
   , teDurationMs = erDurationMs e
@@ -271,24 +277,24 @@ reconstructStreaming convPath idxPath entries = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request payload
+              entry = toEntry e Request (Just (envModel env)) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response payload
+              entry = toEntry e Response (envModel <$> mEnv) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
           eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
           let payload = harnessPayload (msgsFromEither eMsgs) e
-              entry = toEntry e Request payload
+              entry = toEntry e Request Nothing payload
           rest <- go hs lc start mEnv es
           pure (entry : rest)
         EKCompaction -> do
-          let entry = toEntry e Request Null
+          let entry = toEntry e Request Nothing Null
           rest <- go hs lc (erConvLen e) mEnv es
           pure (entry : rest)
 
@@ -369,24 +375,24 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request payload
+              entry = toEntry e Request (Just (envModel env)) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response payload
+              entry = toEntry e Response (envModel <$> mEnv) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
           eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
           let payload = harnessPayload (msgsFromEither eMsgs) e
-              entry = toEntry e Request payload
+              entry = toEntry e Request Nothing payload
           rest <- go hs lc start mEnv es
           pure (entry : rest)
         EKCompaction -> do
-          let entry = toEntry e Request Null
+          let entry = toEntry e Request Nothing Null
           rest <- go hs lc (erConvLen e) mEnv es
           pure (entry : rest)
 

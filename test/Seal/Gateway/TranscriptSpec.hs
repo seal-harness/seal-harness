@@ -31,7 +31,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (mkSessionId)
+import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
   , TranscriptTimings (..)
@@ -190,6 +190,44 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               other -> expectationFailure ("expected 'payload' object in frontend entry, got " ++ show other)
           _ -> expectationFailure "expected object value"
       Nothing -> expectationFailure "expected Just (approval entry surfaces), got Nothing"
+
+  -- ── model attribution ───────────────────────────────────────────────
+  --
+  -- The transcript view labels each LLM message with the model that
+  -- generated it. The label is the frontend entry's top-level @model@
+  -- field, so it must carry the model recorded on the transcript entry
+  -- (stamped by 'Seal.Transcript.Reconstruct'), not a hardcoded null —
+  -- which the frontend renders as "Assistant".
+  describe "model attribution" $ do
+    let mkModelTe model = TranscriptEntry
+          { teId = "r"
+          , teTimestamp = sampleTime
+          , teModel = model
+          , teDirection = Response
+          , tePayload = object
+              [ "content" .= ([] :: [Value])
+              , "model"   .= ("payload-model" :: Text)
+              ]
+          , teDurationMs = Nothing
+          , teCorrelation = Nothing
+          , teMeta = Map.empty
+          }
+        frontendField k val = case val of
+          Object o -> KeyMap.lookup (Key.fromString k) o
+          _        -> Nothing
+
+    it "surfaces the entry's model as the frontend 'model' field" $
+      case reconEntryToFrontend 0 (mkModelTe (Just (ModelId "claude-sonnet-4-5"))) of
+        Just val -> frontendField "model" val `shouldBe` Just (String "claude-sonnet-4-5")
+        Nothing  -> expectationFailure "expected Just (entry surfaces), got Nothing"
+
+    it "surfaces null when the entry carries no model" $
+      -- Old on-disk entries and non-LLM events carry no model. The
+      -- frontend then falls back to its own label rather than being
+      -- handed a bogus one.
+      case reconEntryToFrontend 0 (mkModelTe Nothing) of
+        Just val -> frontendField "model" val `shouldBe` Just Null
+        Nothing  -> expectationFailure "expected Just (entry surfaces), got Nothing"
 
   -- ── tools rewriting in request entries ──────────────────────────────
 
