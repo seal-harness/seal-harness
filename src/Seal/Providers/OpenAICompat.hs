@@ -48,7 +48,9 @@ module Seal.Providers.OpenAICompat
 
 import Control.Exception (try)
 import Control.Monad (when)
-import Data.Aeson (Value (Array, Null, Object, String), eitherDecode, encode, toJSON)
+import Data.Aeson
+  ( Value (Array, Null, Object, String), eitherDecode, encode, object, toJSON
+  , (.=) )
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.CaseInsensitive qualified as CI
@@ -93,6 +95,7 @@ import Seal.Providers.Class
   , ToolDefinition (ToolDefinition)
   , ToolResultPart (TrpText)
   , Usage (Usage, uInput, uOutput)
+  , stubSchema
   )
 import Seal.Security.Secrets (ApiKey, withApiKey)
 
@@ -248,14 +251,33 @@ encodeRequest cr = Chat._CreateChatCompletion
       ToolNone  -> Just OAT.ToolChoiceNone
 
     toolDef (ToolDefinition (OpName n) d sch) =
+      -- Strict OpenAI-compatible servers (Magnitude) REQUIRE the parameters
+      -- field outright, so a stub tool cannot omit it the way
+      -- 'Seal.Providers.Anthropic.encTool' and 'Seal.Providers.Ollama.encTool'
+      -- do. Instead the stub travels inline with a discovery hint in its
+      -- JSON Schema description: the field is always present, the schema
+      -- stays tiny, and the model is pointed at OPCODE_DESCRIBE for the
+      -- real arguments instead of being shown an empty object it may
+      -- faithfully call with no arguments.
       OAT.Tool_Function
         ( OAT.Function
             { OAT.description = Just d
             , OAT.name = n
-            , OAT.parameters = Just sch
+            , OAT.parameters = Just (if sch == stubSchema then onDemandHintSchema else sch)
             , OAT.strict = Nothing
             }
         )
+
+-- | The wire form of a stub-schema tool for OpenAI-compatible servers: the
+-- plain stub with the on-demand discovery instruction in the JSON Schema
+-- @description@ keyword (see 'stubSchema').
+onDemandHintSchema :: Value
+onDemandHintSchema = object
+  [ "type" .= ("object" :: Text)
+  , "description" .= ("This tool's arguments are not shown here (on-demand"
+      <> " schemas). Call OPCODE_DESCRIBE with this tool's name to fetch its"
+      <> " real input schema before calling it." :: Text)
+  ]
 
 -- | Map the Seal conversation onto OpenAI's message rules. The agent loop
 -- records an assistant's tool uses and their results in *separate* messages

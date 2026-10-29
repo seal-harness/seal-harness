@@ -47,7 +47,7 @@ import Seal.Core.Types (ModelId (ModelId), OpName (OpName), ToolCallId (ToolCall
 import Seal.Providers.Class
   ( CompletionRequest (..), CompletionResponse (..), ContentBlock (..)
   , Message (..), Provider (..), Role (..), StopReason (..), ToolChoice (..)
-  , ToolResultPart (..), Usage (..), textMsg )
+  , ToolDefinition (..), ToolResultPart (..), Usage (..), stubSchema, textMsg )
 import Seal.Providers.OpenAICompat
   ( ContentStyle (..), OpenAICompatSpec (..), WireFormat (..), chatHeaders
   , chatUrl, decodeResponse, effectiveWireFormat, encodeRequest
@@ -352,6 +352,39 @@ pureSpec = describe "Seal.Providers.OpenAICompat" $ do
           valAt "content" userMsg `shouldBe` Just (String "hello")
         other -> expectationFailure ("messages: " <> show other)
 
+    it "sends stub tools with a parameters object carrying the on-demand hint (both wire formats)" $ do
+      let tool = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
+          req = encodeRequest minimalReq { crTools = [tool] }
+      mapM_ (\fmt -> case arrAt "tools" (bodyObject (wireBody fmt req)) of
+               Just [toolObj] -> do
+                 let mFn = valAt "function" toolObj
+                 mFn `shouldSatisfy` isJust
+                 case mFn >>= valAt "parameters" of
+                   Just (Object ps) -> do
+                     valAt "type" (Object ps) `shouldBe` Just (String "object")
+                     case valAt "description" (Object ps) of
+                       Just (String hint) ->
+                         hint `shouldSatisfy` ("OPCODE_DESCRIBE" `T.isInfixOf`)
+                       other -> expectationFailure ("hint: " <> show other)
+                   other -> expectationFailure ("parameters: " <> show other)
+               other -> expectationFailure ("tools: " <> show other))
+            [WireParts, WireString]
+
+    it "keeps a tool's parameters verbatim when it has a real schema" $ do
+      let sch = object
+            [ "type" .= ("object" :: Text)
+            , "properties" .= object ["path" .= object ["type" .= ("string" :: Text)]]
+            , "required" .= ["path" :: Text]
+            ]
+          tool = ToolDefinition (OpName "FILE_READ") "read a file" sch
+          cr = minimalReq { crTools = [tool] }
+      case arrAt "tools" (reqObject cr) of
+        Just [toolObj] -> do
+          let mFn = valAt "function" toolObj
+          mFn `shouldSatisfy` isJust
+          (mFn >>= valAt "parameters") `shouldBe` Just sch
+        other -> expectationFailure ("tools: " <> show other)
+
   describe "mapFinishReason" $
     it "maps stop / tool_calls / tool_use / length / unknown" $ do
       mapFinishReason "stop"           `shouldBe` StopEnd
@@ -594,6 +627,31 @@ ordering400 badId = encode (object
     ]
   ])
 
+-- | The strict-server 400 for a function tool whose @parameters@ field is
+-- absent (Magnitude's verbatim wording — its deserializer requires the field).
+missingParams400 :: Int -> BL.ByteString
+missingParams400 i = encode (object
+  [ "error" .= object
+    [ "message" .= ("Failed to deserialize the JSON body into the target type: tools["
+                      <> T.pack (show i)
+                      <> "].function: missing field `parameters` at line 1 column 36963" :: Text)
+    , "type" .= ("invalid_request_error" :: Text)
+    , "code" .= ("invalid_request" :: Text)
+    ]
+  ])
+
+-- | The index of the first function tool whose @parameters@ field is absent
+-- ('Nothing' when every tool carries one).
+missingToolParameters :: KM.KeyMap Value -> Maybe Int
+missingToolParameters o = case arrAt "tools" o of
+  Nothing -> Nothing
+  Just tools -> go 0 tools
+  where
+    go _ [] = Nothing
+    go i (t : ts) = case valAt "function" t >>= valAt "parameters" of
+      Just _ -> go (i + 1) ts
+      Nothing -> Just i
+
 -- | The first assistant tool-call id in the message list whose result does
 -- not immediately follow its assistant message ('Nothing' when the
 -- conversation satisfies the strict-server ordering rule).
@@ -632,9 +690,12 @@ strictApp posts bodies req respond = do
   if S.isInfixOf "\"content\":[" bs
     then respond (responseLBS status400 [] serde400)
     else case eitherDecode body :: Either String Value of
-      Right (Object o) -> case arrAt "messages" o >>= firstUncoveredCall of
-        Just badId -> respond (responseLBS status400 [] (ordering400 badId))
-        Nothing    -> respond (responseLBS status200 [] cannedBody)
+      Right (Object o)
+        | Just i <- missingToolParameters o ->
+            respond (responseLBS status400 [] (missingParams400 i))
+        | otherwise -> case arrAt "messages" o >>= firstUncoveredCall of
+            Just badId -> respond (responseLBS status400 [] (ordering400 badId))
+            Nothing    -> respond (responseLBS status200 [] cannedBody)
       _ -> respond (responseLBS status200 [] cannedBody)
 
 -- | Run a warp mock on an ephemeral loopback port, recording the last request.
@@ -862,6 +923,29 @@ wireSpec = describe "wire behaviour (loopback warp mock)" $ do
               other -> expectationFailure ("messages shape: " <> show other)
             other -> expectationFailure ("messages: " <> show other)
           other -> expectationFailure ("undecodable body: " <> show other)
+        [] -> expectationFailure "no request bodies recorded"
+
+  it "carries stub-tool parameters end to end against a server that requires them" $ do
+    posts <- newIORef (0 :: Int)
+    bodies <- newIORef []
+    mgr <- newTlsManager
+    memo <- newIORef Map.empty
+    testWithApplication (pure (strictApp posts bodies)) $ \port -> do
+      let base = loopbackBase port "/v1"
+          prov = mkOpenAICompat mgr Nothing base (ModelId "acme-large") genericSpec StyleAuto memo
+          tool = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
+      r <- complete prov minimalReq { crSystem = Just "s", crTools = [tool] }
+      r `shouldSatisfy` isRight
+      readIORef posts >>= (`shouldBe` 2)  -- parts probe + string retry, tool shape valid both times
+      bs <- readIORef bodies
+      case reverse bs of
+        (final : _) -> case eitherDecode final :: Either String Value of
+          Right (Object o) -> case arrAt "tools" o of
+            Just [toolObj] ->
+              (valAt "function" toolObj >>= valAt "parameters")
+                `shouldSatisfy` isJust
+            other -> expectationFailure ("tools: " <> show other)
+          other -> expectationFailure ("undecodable final body: " <> show other)
         [] -> expectationFailure "no request bodies recorded"
 
 -- ── Suite ───────────────────────────────────────────────────────────────────
