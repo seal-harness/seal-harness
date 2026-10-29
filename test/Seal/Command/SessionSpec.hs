@@ -92,7 +92,7 @@ spec = describe "Seal.Command.Session" $ do
     it "list shows saved sessions" $
       withSystemTempDirectory "seal-sess" $ \root -> do
         sr <- mkSR root (meta "20260701-000000-000")
-        _  <- newSession (srPaths sr) "anthropic" "claude-opus-4-8" "cli" Nothing
+        _  <- newSession (srPaths sr) "anthropic" "claude-opus-4-8" "cli" Nothing Nothing
         (fc, caps) <- makeFakeCaps []
         runSess sr ["list"] caps
         sent <- getSent fc

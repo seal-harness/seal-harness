@@ -339,7 +339,7 @@ handleNew paths v = do
       model = fromMaybe "claude-sonnet-4-20250514" (textField v "model")
       channel = fromMaybe "api" (textField v "channel")
       mDesc = textField v "description"
-  meta <- liftIO (newSession paths provider model channel Nothing)
+  meta <- liftIO (newSession paths provider model channel Nothing Nothing)
   let meta' = case mDesc of
         Just d | not (T.null (T.strip d)) -> meta { smDescription = Just d }
         _ -> meta

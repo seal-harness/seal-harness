@@ -651,6 +651,60 @@ spec = describe "Seal.Gateway.API" $ do
     metaExplicit <- postSessionNewMeta (A.object [ "headless" .= False ])
     smChannel metaExplicit `shouldBe` "web"
 
+  -- ── allowed_secrets parsing (WU-4) ────────────────────────────────
+  it "POST /api/sessions/new without allowed_secrets → smAllowedSecrets is Nothing" $ do
+    meta <- postSessionNewMeta (A.object [ "provider" .= ("anthropic" :: T.Text) ])
+    smAllowedSecrets meta `shouldBe` Nothing
+
+  it "POST /api/sessions/new with allowed_secrets:null → smAllowedSecrets is Nothing" $ do
+    meta <- postSessionNewMeta (A.object [ "allowed_secrets" .= A.Null ])
+    smAllowedSecrets meta `shouldBe` Nothing
+
+  it "POST /api/sessions/new with allowed_secrets:[] → smAllowedSecrets is Just empty" $ do
+    meta <- postSessionNewMeta (A.object [ "allowed_secrets" .= A.Array mempty ])
+    smAllowedSecrets meta `shouldBe` Just Set.empty
+
+  it "POST /api/sessions/new with allowed_secrets:[\"a\",\"b\"] → Just (Set.fromList [\"a\",\"b\"])" $ do
+    meta <- postSessionNewMeta (A.object
+      [ "allowed_secrets" .= A.Array (V.fromList [ A.String "a", A.String "b" ]) ])
+    smAllowedSecrets meta `shouldBe` Just (Set.fromList ["a", "b"])
+
+  it "POST /api/sessions/new with an invalid secret name → 400" $ do
+    app <- mkApp
+    req <- testPost ["api", "sessions", "new"]
+      (A.encode (A.object
+        [ "allowed_secrets" .= A.Array (V.fromList [ A.String "bad name!" ]) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/sessions/new with a non-string allowed_secrets entry → 400" $ do
+    app <- mkApp
+    req <- testPost ["api", "sessions", "new"]
+      (A.encode (A.object
+        [ "allowed_secrets" .= A.Array (V.fromList [ A.Number 42 ]) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/tabs/new {kind:resume} ignores allowed_secrets and returns 200" $ do
+    app <- mkApp
+    -- Create a bare session first.
+    (_, newBody) <- runAppBody app =<< testPost ["api", "sessions", "new"]
+      (A.encode (A.object []))
+    sid <- case A.decode newBody :: Maybe A.Value of
+      Just (A.Object o) -> case lookupK "session_id" o of
+        Just (A.String t) -> pure t
+        _                 -> error "sessions/new response had no session_id"
+      _ -> error "sessions/new returned a non-object"
+    -- Resume with allowed_secrets — the field should be ignored (the
+    -- session already exists, so allowed_secrets has no effect).
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("resume" :: T.Text)
+        , "session_id" .= sid
+        , "allowed_secrets" .= A.Array (V.fromList [ A.String "foo" ]) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 200
+
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "99999999-000000-000", "new"] (A.encode (A.object []))
@@ -707,7 +761,7 @@ spec = describe "Seal.Gateway.API" $ do
   describe "POST /api/sessions/:id/new (WU-6)" $ do
     it "honours provider/model/channel overrides (D2)" $
       withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
-        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing
+        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing Nothing
         -- Bind a tab so the real rebind path is exercised (not the
         -- no-tab path).
         _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
@@ -737,7 +791,7 @@ spec = describe "Seal.Gateway.API" $ do
         let oldAgent = case mkAgentDefId "old-agent" of
               Right x -> x
               Left _  -> error "old agent id"
-        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent)
+        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent) Nothing
         _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
         threadDelay 5000
         req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
@@ -757,7 +811,7 @@ spec = describe "Seal.Gateway.API" $ do
 
     it "returns tab_index null + rebound false when no tab is bound" $
       withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
-        oldMeta <- newSession paths "anthropic" "m" "web" Nothing
+        oldMeta <- newSession paths "anthropic" "m" "web" Nothing Nothing
         threadDelay 5000
         req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
           (A.encode (A.object []))

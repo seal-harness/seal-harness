@@ -48,7 +48,7 @@ spec = describe "Seal.Session.Store" $ do
     it "creates a 0700 dir with a 0600 session.json carrying the selection" $
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
-        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
         doesFileExist (sessionMetaPath paths (smId m)) >>= (`shouldBe` True)
@@ -156,7 +156,7 @@ spec = describe "Seal.Session.Store" $ do
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
         backend <- Def.noneBackend
-        m <- initSession paths defaultRuntimeConfig backend
+        m <- initSession paths defaultRuntimeConfig backend Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
         smChannel m  `shouldBe` "cli"
@@ -175,7 +175,7 @@ spec = describe "Seal.Session.Store" $ do
           "---\nid: worker\nname: worker\nprovider: ollama\nmodel: llama3\ntools: all\ncreated_at: 2026-07-01T00:00:00Z\nupdated_at: 2026-07-01T00:00:00Z\nsession: s1\n---\nbe brief\n"
         backend <- Def.markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
         let cfg = defaultRuntimeConfig { rcDefaultAgent = Just "worker" }
-        m <- initSession paths cfg backend
+        m <- initSession paths cfg backend Nothing
         smAgent m `shouldBe` Just aid
         smProvider m `shouldBe` "ollama"
         smModel m    `shouldBe` "llama3"
@@ -185,7 +185,7 @@ spec = describe "Seal.Session.Store" $ do
         let paths = mkPaths root
         backend <- Def.noneBackend
         let cfg = defaultRuntimeConfig { rcDefaultAgent = Just "missing" }
-        m <- initSession paths cfg backend
+        m <- initSession paths cfg backend Nothing
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
@@ -194,7 +194,7 @@ spec = describe "Seal.Session.Store" $ do
     it "persists the front-matter flag to session.json" $
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
-        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing Nothing
         -- The default is ON (front matter injected).
         smSealFrontMatter m `shouldBe` True
         ok <- updateSessionSealFrontMatter paths (smId m) False
@@ -205,7 +205,7 @@ spec = describe "Seal.Session.Store" $ do
     it "can turn the front matter back on" $
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
-        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing Nothing
         _ <- updateSessionSealFrontMatter paths (smId m) False
         ok <- updateSessionSealFrontMatter paths (smId m) True
         ok `shouldBe` True

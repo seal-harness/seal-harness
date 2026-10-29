@@ -34,7 +34,7 @@ import Data.Aeson (Value)
 import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.Set (member, fromList)
+import Data.Set (Set, member, fromList)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -274,15 +274,17 @@ buildSessionRegistry
   -> Maybe Manager
   -> ChannelCaps
   -> Bool
+  -> Maybe (Set Text)
   -> ISA.Registry
 buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring harnessReg tmuxRunner httpManager caps onDemand =
+                     startWiring harnessReg tmuxRunner httpManager caps onDemand
+                     mAllowedSecrets =
   reg
   where
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretManageOp rt Nothing caps
+      , secretManageOp rt mAllowedSecrets caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -740,6 +742,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
+                 (smAllowedSecrets meta')
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
@@ -1107,6 +1110,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
+                  (mMeta >>= smAllowedSecrets)
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
     res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
