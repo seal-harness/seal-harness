@@ -1348,6 +1348,12 @@ buildChildRegistryAdapter
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
 buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
+  -- Load the child's session meta (persisted by writeChildMeta moments
+  -- earlier) to inherit the parent's smAllowedSecrets. This is the
+  -- single source of truth — the child's session.json carries the
+  -- restriction for both live runs and resume.
+  mChildMeta <- loadSessionMeta (tdPaths td) childSid
+  let mAllowedSecrets = mChildMeta >>= smAllowedSecrets
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
@@ -1361,7 +1367,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
       baseOps =
         [ showHumanOp childCaps
         , askHumanOp childCaps
-        , secretManageOp (tdVault td) Nothing childCaps
+        , secretManageOp (tdVault td) mAllowedSecrets childCaps
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
        , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
