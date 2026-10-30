@@ -220,6 +220,49 @@ From a running frontend, start a session with the `/new` command:
 Provider credentials are read from the vault (set them with
 `seal vault save`). Resume old sessions with `/session` and `/tab`.
 
+## Web Access Control (passkeys)
+
+`seal serve` exposes the whole agent surface — sending messages (which the
+agent executes), every transcript, every slash command — over HTTP and
+WebSocket. Access control is configured once, in `~/.seal/security.toml`:
+
+```toml
+[access_control]
+# "passkey" (require a passkey) | "none" (run open — an explicit waiver)
+mode = "passkey"
+
+# Optional: only needed when a TLS reverse proxy fronts the gateway.
+# origin = "https://seal.example.com"
+# rp_id  = "seal.example.com"
+```
+
+Three states:
+
+| `security.toml` | Gateway behaviour |
+|---|---|
+| no `[access_control]` table | **unconfigured** — the API is closed; the first browser visit shows a setup screen |
+| `mode = "none"` | **open** — runs with no authentication (for a host only reachable over a VPN) |
+| `mode = "passkey"` | **passkey** — every request needs a passkey-backed session |
+
+The setup screen offers two choices: register a passkey, or explicitly waive
+access control (which writes `mode = "none"`). Both require the one-time setup
+code that `seal serve` prints on stderr — and writes to
+`~/.seal/state/setup-code` when it is not attached to a terminal — so a remote
+client can neither enroll nor waive before you do.
+
+Passkeys need a **secure context**: `http://localhost`, or HTTPS. To protect a
+gateway reached over a VPN, put a TLS reverse proxy in front of it and set
+`origin` / `rp_id` to the proxy's URL.
+
+```bash
+seal access-control status      # mode, resolved origin, enrolled credentials
+seal access-control reset --yes # delete the [access_control] table (lost passkey)
+```
+
+`reset` is the terminal-only escape hatch: no opcode and no HTTP route can
+change access-control settings. The agent runs as the same uid and can read
+`~/.seal/`, so passkeys defend the **network** — not a compromised agent.
+
 ## Development
 
 Everything runs through the **Nix flake dev shell** — never install GHC,

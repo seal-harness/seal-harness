@@ -2,8 +2,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The security-critical, boot-only configuration that lives in
 -- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
--- the agent/operator-tunable 'RuntimeConfig'). This file is read once at boot
--- and never re-read; it is not exposed via any opcode or the HTTP Gateway.
+-- the agent/operator-tunable 'RuntimeConfig'). No opcode can reach this module.
+--
+-- It is re-read in one narrow case only: 'updateAccessControlSection', which
+-- rewrites the @[access_control]@ table when the operator enrolls a passkey,
+-- waives the requirement, or manages credentials from the authenticated web
+-- UI. That writer's callback sees only 'AccessControlFileConfig', so it
+-- physically cannot express a change to any other section — the type split
+-- (design §4 Approach E) keeps its guarantee.
 --
 -- Moving @untrusted_execution@ and the vault settings here means a future
 -- @CONFIG_UPDATE@ opcode (which operates on 'RuntimeConfig') and the Gateway's
@@ -16,6 +22,13 @@ module Seal.Config.Security
   ( SecurityConfig (..)
   , UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..)
+  , AccessControlFileConfig (..)
+  , CredentialFileConfig (..)
+  , accessControlCodec
+  , normalizeAccessControlTable
+  , updateAccessControlSection
+  , clearAccessControlSection
+  , writeSecretFile
   , defaultSecurityConfig
   , securityConfigCodec
   , loadSecurityConfig
@@ -25,12 +38,20 @@ module Seal.Config.Security
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (bracketOnError)
+import Data.HashMap.Strict qualified as HashMap
 import Data.Maybe (fromMaybe)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
 import System.IO.Unsafe (unsafePerformIO)
+import System.IO (hClose)
 import System.Posix.Files (setFileMode)
+import System.Posix.IO
+  ( OpenFileFlags (creat, nofollow, trunc), OpenMode (WriteOnly), closeFd
+  , defaultFileFlags, fdToHandle, openFd )
 import Validation (Validation (..))
 
 import Toml ((.=))
@@ -61,6 +82,11 @@ data SecurityConfig = SecurityConfig
     -- execution). Absent means @mode=local@ (default). @mode=remote@
     -- fail-closes at call time when the remote block is absent or
     -- unreachable (boot still succeeds).
+  , scAccessControl :: Maybe AccessControlFileConfig
+    -- ^ Optional @[access_control]@ section. Absent means *unconfigured*: the
+    -- gateway serves only the setup screen until the operator enrolls a
+    -- passkey or explicitly waives (design §4). This is the ONE section the
+    -- gateway may write, via 'updateAccessControlSection'.
   } deriving stock (Eq, Show)
 
 -- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
@@ -88,6 +114,91 @@ data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
   , uerfcWorkspace  :: Maybe Text
   } deriving stock (Eq, Show)
 
+-- | The @[access_control]@ section (design §4). @mode@ is @\"passkey\"@ or
+-- @\"none\"@; the section being absent means *unconfigured*, which is not the
+-- same as @none@ — unconfigured closes the API and shows the setup screen,
+-- whereas @none@ is the operator's explicit waiver.
+--
+-- @origin@/@rp_id@ are only needed when the browser reaches the gateway
+-- through a TLS reverse proxy; otherwise the origin is derived from
+-- @[gateway]@ at boot ('Seal.Security.AccessControl.resolveAccessControl').
+data AccessControlFileConfig = AccessControlFileConfig
+  { acfcMode        :: Maybe Text
+    -- ^ Optional. Absent means "passkey" when credentials are present and
+    -- "unconfigured" otherwise. Only @\"none\"@ can open the gateway, and it
+    -- has to be written out — an open gateway is never inferred.
+  , acfcOrigin      :: Maybe Text
+  , acfcRpId        :: Maybe Text
+  , acfcCredentials :: Map Text CredentialFileConfig
+    -- ^ Keyed by the base64url credential id (a valid TOML bare key).
+  } deriving stock (Eq, Show)
+
+-- | One @[access_control.credentials.\<id\>]@ table.
+data CredentialFileConfig = CredentialFileConfig
+  { cfcPublicKey :: Text
+    -- ^ Base64url of the 64-byte uncompressed @x || y@ P-256 point.
+  , cfcSignCount :: Int
+  , cfcLabel     :: Text
+  , cfcCreatedAt :: Text
+    -- ^ ISO-8601. Kept as text here and parsed on resolution, so a malformed
+    -- value is a boot-time error rather than a decode-time surprise.
+  , cfcRpId      :: Text
+  } deriving stock (Eq, Show)
+
+-- | Bidirectional codec for the @[access_control]@ section.
+accessControlCodec :: Toml.TomlCodec AccessControlFileConfig
+accessControlCodec = AccessControlFileConfig
+  <$> Toml.dioptional (Toml.text "mode") .= acfcMode
+  <*> Toml.dioptional (Toml.text "origin") .= acfcOrigin
+  <*> Toml.dioptional (Toml.text "rp_id") .= acfcRpId
+  <*> Toml.tableMap Toml._KeyText (Toml.table credentialCodec) "credentials"
+        .= acfcCredentials
+
+-- | Codec for one credential table.
+credentialCodec :: Toml.TomlCodec CredentialFileConfig
+credentialCodec = CredentialFileConfig
+  <$> Toml.text "public_key" .= cfcPublicKey
+  <*> Toml.int "sign_count" .= cfcSignCount
+  <*> Toml.text "label" .= cfcLabel
+  <*> Toml.text "created_at" .= cfcCreatedAt
+  <*> Toml.text "rp_id" .= cfcRpId
+
+-- | Make the implicit @access_control@ node explicit before decoding.
+--
+-- tomland's 'Toml.tableMap' looks the section up under its @[access_control]@
+-- header, so an idiomatic hand-written file containing only
+-- @[access_control.credentials.\<id\>]@ sub-tables decodes as an EMPTY map
+-- (learnings 2026-08-02 §4). Mirrors
+-- 'Seal.SourceControl.Repo.normalizeReposTable'.
+normalizeAccessControlTable :: Toml.TOML -> Toml.TOML
+normalizeAccessControlTable t =
+  t { Toml.tomlTables = HashMap.adjust fixAccessControl "access_control" (Toml.tomlTables t) }
+  where
+    -- Two levels are implicit in an idiomatic file: `access_control` and the
+    -- `credentials` table beneath it. Both must be made explicit, or the
+    -- nested `Toml.tableMap` lookup silently yields an empty map and the
+    -- operator's passkeys disappear.
+    fixAccessControl tree = fixChildIn "credentials" (fixNode "access_control" tree)
+
+    fixChildIn child tree = case tree of
+      Toml.Branch pref mv children ->
+        Toml.Branch pref mv (HashMap.adjust (fixNode child) child children)
+      Toml.Leaf pref v ->
+        Toml.Leaf pref v { Toml.tomlTables =
+                             HashMap.adjust (fixNode child) child (Toml.tomlTables v) }
+
+-- | Collapse whatever implicit path the parser produced under @root@ into a
+-- single explicit table node named @root@.
+fixNode :: Toml.Piece -> Toml.PrefixTree Toml.TOML -> Toml.PrefixTree Toml.TOML
+fixNode root tree = case tree of
+  Toml.Branch pref Nothing children ->
+    Toml.Leaf pref (mempty { Toml.tomlTables = children })
+  Toml.Branch _ (Just _) _ -> tree
+  Toml.Leaf (_ Toml.:|| []) _ -> tree
+  Toml.Leaf (_ Toml.:|| (p : ps)) v ->
+    Toml.Leaf (root Toml.:|| [])
+      (mempty { Toml.tomlTables = Toml.single (p Toml.:|| ps) v })
+
 -- | Starting state: all fields absent.
 defaultSecurityConfig :: SecurityConfig
 defaultSecurityConfig = SecurityConfig
@@ -97,6 +208,7 @@ defaultSecurityConfig = SecurityConfig
   , scVaultUnlock    = Nothing
   , scVaultKeyType   = Nothing
   , scUntrustedExec  = Nothing
+  , scAccessControl  = Nothing
   }
 
 -- ---------------------------------------------------------------------------
@@ -112,6 +224,8 @@ securityConfigCodec = SecurityConfig
   <*> Toml.dioptional (Toml.text "vault_unlock")    .= scVaultUnlock
   <*> Toml.dioptional (Toml.text "vault_key_type")  .= scVaultKeyType
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= scUntrustedExec
+  <*> Toml.dioptional (Toml.table accessControlCodec "access_control")
+        .= scAccessControl
 
 -- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
 untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
@@ -149,20 +263,40 @@ loadSecurityConfig path = do
       contents <- TIO.readFile path
       pure $ case Toml.parse contents of
         Left err   -> Left (Toml.unTomlParseError err)
-        Right toml -> case Toml.runTomlCodec securityConfigCodec toml of
+        Right toml -> case Toml.runTomlCodec securityConfigCodec
+                           (normalizeAccessControlTable toml) of
           Success cfg  -> Right cfg
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
--- | Save @cfg@ to @path@ atomically: write @.tmp@, chmod 0600, rename over
--- @path@. The file is chmod-restricted because @security.toml@ carries the
--- vault recipient/identity (security-critical, agent-immutable).
+-- | Save @cfg@ to @path@ atomically.
+--
+-- The temp file is created with mode @0600@ at creation time (not chmod'ed
+-- afterwards), so there is never a window in which the vault recipient or a
+-- passkey public key is world-readable. It is then renamed over @path@, which
+-- is atomic on every filesystem this project supports.
 saveSecurityConfig :: FilePath -> SecurityConfig -> IO ()
 saveSecurityConfig path cfg = do
   let encoded = Toml.encode securityConfigCodec cfg
       tmp     = path <> ".tmp"
-  TIO.writeFile tmp encoded
-  setFileMode tmp 0o600
+  writeSecretFile tmp encoded
   renameFile tmp path
+
+-- | Write a text file whose permissions are restricted from the moment it
+-- exists: @0600@ is applied at creation (via @openFd@'s @creat@ mode) and again
+-- afterwards to defeat a permissive umask, so there is never a window in which
+-- the contents are world-readable. Used for @security.toml@ and for the
+-- per-boot setup code.
+writeSecretFile :: FilePath -> Text -> IO ()
+writeSecretFile path contents =
+  bracketOnError
+    (openFd path WriteOnly defaultFileFlags
+       { trunc = True, creat = Just 0o600, nofollow = True })
+    closeFd
+                 (\fd -> do
+                     h <- fdToHandle fd
+                     TIO.hPutStr h contents
+                     hClose h
+                     setFileMode path 0o600)
 
 -- | Process-wide lock serializing security config writes (design V7).
 {-# NOINLINE securityWriteLock #-}
@@ -181,6 +315,62 @@ updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
   case result of
     Left err  -> pure (Left err)
     Right cfg -> saveSecurityConfig path (f cfg) >> pure (Right ())
+
+-- | The ONLY writer of @security.toml@ reachable from the gateway.
+--
+-- It loads the file, applies @f@ to the @[access_control]@ section alone, and
+-- re-encodes. The callback's type is @AccessControlFileConfig ->
+-- AccessControlFileConfig@, so no value the gateway can build will ever name a
+-- vault or @untrusted_execution@ field: rewriting those is a compile error,
+-- exactly as the 'RuntimeConfig' split intends.
+--
+-- The write is verified before it is committed: the freshly encoded document
+-- is decoded again and compared with the intended section, so a codec change
+-- that silently drops a field surfaces as @Left@ instead of as data loss.
+-- Serialized behind 'securityWriteLock' (the same lock the vault commands use
+-- for lost-update protection).
+updateAccessControlSection
+  :: FilePath
+  -> (AccessControlFileConfig -> AccessControlFileConfig)
+  -> IO (Either Text AccessControlFileConfig)
+updateAccessControlSection path f = withMVar securityWriteLock $ \_ -> do
+  loaded <- loadSecurityConfig path
+  case loaded of
+    Left err -> pure (Left err)
+    Right cfg -> do
+      let updated = f (fromMaybe emptyAccessControl (scAccessControl cfg))
+          newCfg = cfg { scAccessControl = Just updated }
+          encoded = Toml.encode securityConfigCodec newCfg
+      case reDecode encoded of
+        Just roundTripped
+          | scAccessControl roundTripped == Just updated ->
+              saveSecurityConfig path newCfg >> pure (Right updated)
+        _ -> pure (Left "refusing to write security.toml: the encoded document does not round-trip the new [access_control] section")
+  where
+    reDecode encoded = case Toml.parse encoded of
+      Left _     -> Nothing
+      Right toml -> case Toml.runTomlCodec securityConfigCodec toml of
+        Success c -> Just c
+        Failure _ -> Nothing
+
+-- | Remove the @[access_control]@ table entirely, returning the gateway to the
+-- unconfigured state. Reachable only from the @seal access-control reset@ CLI
+-- command (the human-driven path); no opcode and no HTTP route can call it.
+clearAccessControlSection :: FilePath -> IO (Either Text ())
+clearAccessControlSection path = withMVar securityWriteLock $ \_ -> do
+  loaded <- loadSecurityConfig path
+  case loaded of
+    Left err  -> pure (Left err)
+    Right cfg -> saveSecurityConfig path (cfg { scAccessControl = Nothing }) >> pure (Right ())
+
+-- | The section a first write starts from when the file has none.
+emptyAccessControl :: AccessControlFileConfig
+emptyAccessControl = AccessControlFileConfig
+  { acfcMode = Just "none"
+  , acfcOrigin = Nothing
+  , acfcRpId = Nothing
+  , acfcCredentials = Map.empty
+  }
 
 -- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the
 -- typed 'UntrustedExecConfig' the dispatcher consumes. Returns

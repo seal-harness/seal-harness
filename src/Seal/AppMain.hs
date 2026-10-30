@@ -18,6 +18,7 @@ import Seal.Types.Command
 import Seal.Types.Env
 import Seal.Types.App
 import qualified Seal.Tui
+import qualified Seal.Command.AccessControl
 import qualified Seal.Command.Serve
 import qualified Seal.Gateway.OpenApi
 
@@ -43,6 +44,7 @@ dispatch cfg =
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
       CommandServe autonomy mStaticDir -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir logger)
+      CommandAccessControl action -> liftIO (Seal.Command.AccessControl.runAccessControl action)
       CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 
 -- | Map the process arguments so that an empty argument list behaves as if

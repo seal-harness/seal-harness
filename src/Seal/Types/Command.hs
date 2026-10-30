@@ -1,5 +1,6 @@
 module Seal.Types.Command
   ( Command(..)
+  , AccessControlAction(..)
   , pCommand
   ) where
 
@@ -18,7 +19,15 @@ data Command
   = CommandNoOp
   | CommandTui AutonomyLevel
   | CommandServe AutonomyLevel (Maybe FilePath)
+  | CommandAccessControl AccessControlAction
   | CommandGenOpenApi
+  deriving (Eq, Show)
+
+-- | The @seal access-control@ subcommands. Both are human-driven admin actions
+-- against @~\/.seal\/security.toml@; neither is an opcode.
+data AccessControlAction
+  = AcStatus
+  | AcReset
   deriving (Eq, Show)
 
 pCommand :: Parser Command
@@ -27,8 +36,30 @@ pCommand = hsubparser
                          (progDesc "Start the interactive terminal UI (TUI)"))
   <> command "serve" (info (CommandServe <$> pAutonomy <*> pStaticDir)
                             (progDesc "Run the web gateway server"))
+  <> command "access-control"
+       (info (pAccessControl <**> helper)
+             (progDesc "Inspect or reset passkey access control (security.toml)"))
   <> command "gen-openapi" (info (pure CommandGenOpenApi)
                                   (progDesc "Print the OpenAPI 3.1 spec (JSON) to stdout"))
+
+-- | @access-control status@ | @access-control reset --yes@.
+pAccessControl :: Parser Command
+pAccessControl = CommandAccessControl <$> hsubparser
+  (  command "status"
+       (info (pure AcStatus)
+             (progDesc "Print the access-control mode, origin and enrolled credentials"))
+  <> command "reset"
+       (info (AcReset <$ pResetConfirm)
+             (progDesc "Remove [access_control] so you can re-enroll (requires --yes)"))
+  )
+
+-- | @--yes@ is mandatory: resetting access control hands the gateway to anyone
+-- who can reach it until setup completes again.
+pResetConfirm :: Parser AccessControlAction
+pResetConfirm = flag' AcReset
+  ( long "yes"
+ <> help "Confirm removing the access_control section (anyone who can reach the gateway can re-enroll)"
+  )
 
 -- | @--yolo@ sets 'Full' autonomy (bypass the untrusted-opcode approval
 -- gate); absent defaults to 'Supervised'.

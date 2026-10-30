@@ -48,9 +48,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
+import Network.HTTP.Types (status401)
 import Network.Wai
-  ( Application )
-import Network.Wai.Handler.WebSockets (websocketsOr)
+  ( Application, responseLBS )
+import Network.Wai.Handler.WebSockets (isWebSocketsReq, websocketsOr)
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
   , withPingThread, sendClose, Connection, defaultConnectionOptions )
@@ -64,6 +65,8 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
 import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso, ReadLimit (..))
+import Seal.Gateway.AccessControl
+  ( AccessControlHandle, AuthDecision (..), accessControlAuthorize )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -120,6 +123,11 @@ data StreamGuard = StreamGuard
   -- inside the frontend's 90s watchdog. Tests override it to keep the suite
   -- fast, or raise it to keep heartbeat frames out of unrelated assertions.
   , sgHeartbeatSeconds :: Int
+  -- | The access-control handle, when the gateway has one. A handshake is
+  -- rejected before the upgrade when 'accessControlAuthorize' says no, so a
+  -- browser without a session never gets a live transcript stream (design §7
+  -- "WebSocket"). 'Nothing' (tests, access control unwired) skips the check.
+  , sgAccessControl :: Maybe AccessControlHandle
   }
 
 -- | The WebSocket stream endpoint, as a WAI middleware.
@@ -139,8 +147,22 @@ streamMiddleware
   -> StreamBroker
   -> Application
   -> Application
-streamMiddleware guard broker =
-  websocketsOr defaultConnectionOptions (streamApp guard broker)
+streamMiddleware guard broker backup = \req respond ->
+  if isWebSocketsReq req
+    then case sgAccessControl guard of
+      Nothing -> wsApp req respond
+      Just access -> do
+        decision <- accessControlAuthorize access req
+        if decision == AuthAllow
+          then wsApp req respond
+          else do
+            globalLogIO InfoS "[ws] rejected handshake: access control"
+            respond (responseLBS status401
+                      [("Content-Type", "application/json"), ("Cache-Control", "no-store")]
+                      "{\"error\":\"a passkey session is required\",\"code\":\"unauthenticated\"}")
+    else backup req respond
+  where
+    wsApp = websocketsOr defaultConnectionOptions (streamApp guard broker) backup
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.

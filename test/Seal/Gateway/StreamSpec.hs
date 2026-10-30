@@ -91,7 +91,7 @@ spec = describe "Seal.Gateway.Stream" $ do
   it "a client connects and receives hello with protocolVersion + serverStartedAt" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
     withStreamServer guard broker $ \_port conn -> do
       hello <- receiveData conn :: IO BL.ByteString
       case A.decode hello :: Maybe A.Value of
@@ -108,7 +108,7 @@ spec = describe "Seal.Gateway.Stream" $ do
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
     withStreamServer guard broker $ \_port conn -> do
       _hello <- receiveData conn :: IO BL.ByteString
       _lists <- receiveData conn :: IO BL.ByteString
@@ -129,7 +129,7 @@ spec = describe "Seal.Gateway.Stream" $ do
     -- heartbeat below is the frame the browser CAN observe.
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 1 }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 1, sgAccessControl = Nothing }
     withStreamServer guard broker $ \_port conn -> do
       frame <- firstHeartbeat conn 6
       case frame of
