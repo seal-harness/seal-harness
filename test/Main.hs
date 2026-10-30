@@ -91,6 +91,7 @@ import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.CapabilityScopingWorkdirFsFailSpec
 import qualified Seal.Vault.BackendSpec
 import qualified Seal.Vault.CommandsSpec
+import qualified Seal.Vault.AccessSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
@@ -288,6 +289,7 @@ specs = do
   Seal.CapabilityScopingWorkdirFsFailSpec.spec
   Seal.Vault.BackendSpec.spec
   Seal.Vault.CommandsSpec.spec
+  Seal.Vault.AccessSpec.spec
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
