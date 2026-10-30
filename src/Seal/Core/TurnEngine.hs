@@ -742,7 +742,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
-                 (smAllowedSecrets meta')
+                 (Just (smAllowedSecrets meta'))
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
@@ -1110,7 +1110,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
-                  (mMeta >>= smAllowedSecrets)
+                  (smAllowedSecrets <$> mMeta)
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
     res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
@@ -1330,7 +1330,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
       , smCreatedAt = tnow, smLastActive = tnow
-      , smAllowedSecrets = Nothing }
+      , smAllowedSecrets = mempty }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
 -- @adTools@ allow-list is ENFORCED (intersection with the base ops), the
@@ -1353,7 +1353,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
   -- single source of truth — the child's session.json carries the
   -- restriction for both live runs and resume.
   mChildMeta <- loadSessionMeta (tdPaths td) childSid
-  let mAllowedSecrets = mChildMeta >>= smAllowedSecrets
+  let mAllowedSecrets = smAllowedSecrets <$> mChildMeta
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))

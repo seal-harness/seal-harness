@@ -65,7 +65,7 @@ data SessionMeta = SessionMeta
     -- so the sidebar can show the repo name without scanning the workdir.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
-  , smAllowedSecrets :: !(Maybe (Set Text))
+  , smAllowedSecrets :: !(Set Text)
     -- ^ The set of vault secret names the session is permitted to access
     -- (populated by @SECRET_MANAGE@ enforcement). 'Nothing' means the
     -- session has no explicit allow-list — the default behavior depends
@@ -107,4 +107,4 @@ instance FromJSON SessionMeta where
     <*> o .:? "repo_url"
     <*> o .:  "created_at"
     <*> o .:  "last_active"
-    <*> o .:? "allowed_secrets"
+    <*> o .:? "allowed_secrets" .!= mempty

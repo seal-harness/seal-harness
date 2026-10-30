@@ -60,7 +60,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing t t Nothing
+  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing t t mempty
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.

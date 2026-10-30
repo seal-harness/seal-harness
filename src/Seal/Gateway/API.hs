@@ -822,27 +822,27 @@ parseAgentField _ = Nothing
 
 -- | Parse the optional @allowed_secrets@ field from a request body.
 --
--- * Absent or @null@ → 'Right Nothing' (all secrets allowed, backward compat).
+-- * Absent or @null@ → 'Right mempty' (all secrets allowed, backward compat).
 -- * @[]@ → @'Right' ('Just' Set.empty)@ (no secrets allowed).
 -- * @["a","b"]@ → @'Right' ('Just' (Set.fromList ["a","b"]))@.
 -- * Any entry that is not a string or fails 'isValidSecretName' → 'Left' error
 --   (the caller surfaces a 400).
-parseAllowedSecrets :: A.Value -> Either Text (Maybe (Set Text))
+parseAllowedSecrets :: A.Value -> Either Text (Set Text)
 parseAllowedSecrets (A.Object o) =
   case KeyMap.lookup (Key.fromText "allowed_secrets") o of
-    Nothing         -> Right Nothing
-    Just A.Null     -> Right Nothing
+    Nothing         -> Right mempty
+    Just A.Null     -> Right mempty
     Just (A.Array arr) -> do
       names <- traverse toText (V.toList arr)
       let invalid = filter (not . isValidSecretName) names
       case invalid of
         (x:_) -> Left ("invalid secret name: " <> x)
-        []    -> Right (Just (Set.fromList names))
+        []    -> Right (Set.fromList names)
     Just _          -> Left "allowed_secrets must be an array"
   where
     toText (A.String t) = Right t
     toText _            = Left "allowed_secrets entries must be strings"
-parseAllowedSecrets _ = Right Nothing
+parseAllowedSecrets _ = Right mempty
 
 -- | Handle POST /api/tabs/new.
 handleTabNew :: ApiDeps -> A.Value -> IO Response
@@ -2001,9 +2001,9 @@ parseCredentialObj co = do
     Nothing           -> Left "credential.vault_key is required"
   mUsername <- case KeyMap.lookup (Key.fromText "username") co of
     Just (A.String t) -> Right (Just t)
-    Just A.Null       -> Right Nothing
+    Just A.Null       -> Right mempty
     Just _            -> Left "credential.username must be a string"
-    Nothing           -> Right Nothing
+    Nothing           -> Right mempty
   parseCredentialKind kind vaultKey mUsername
 
 -- | Fail with @err@ when the predicate is @False@, otherwise pass through.

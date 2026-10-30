@@ -24,7 +24,7 @@ sampleMeta =
        , smSealFrontMatter = True
        , smRepoUrl = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime
-       , smAllowedSecrets = Nothing }
+       , smAllowedSecrets = mempty }
 
 spec :: Spec
 spec = describe "Seal.Session.Meta" $ do
@@ -142,13 +142,13 @@ spec = describe "Seal.Session.Meta" $ do
     fmap smParent (decode (encode m)) `shouldBe` Just (Just sid)
 
   -- ── smAllowedSecrets ──────────────────────────────────────────
-  it "toJSON includes allowed_secrets as null when Nothing" $ do
-    let m = sampleMeta { smAllowedSecrets = Nothing }
+  it "toJSON includes allowed_secrets as empty array when mempty" $ do
+    let m = sampleMeta { smAllowedSecrets = mempty }
         v = encode m
-    decode v `shouldBe` Just m  -- round-trip preserves Nothing
+    decode v `shouldBe` Just m  -- round-trip preserves mempty
 
-  it "toJSON includes allowed_secrets as array when Just" $ do
-    let m = sampleMeta { smAllowedSecrets = Just (Set.fromList ["a", "b"]) }
+  it "toJSON includes allowed_secrets as array when non-empty" $ do
+    let m = sampleMeta { smAllowedSecrets = Set.fromList ["a", "b"] }
         v = encode m
     decode v `shouldBe` Just m
 
@@ -161,18 +161,18 @@ spec = describe "Seal.Session.Meta" $ do
               , "last_active" .= sampleTime
               , "allowed_secrets" .= (["a", "b"] :: [String])
               ]
-    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just (Just (Set.fromList ["a", "b"]))
+    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just (Set.fromList ["a", "b"])
 
-  it "fromJSON defaults smAllowedSecrets to Nothing when field absent" $ do
+  it "fromJSON defaults smAllowedSecrets to mempty when field absent" $ do
     let j = object
               [ "id" .= ("20260701-120000-042" :: String)
               , "provider" .= ("anthropic" :: String)
               , "model" .= ("claude-opus-4-8" :: String)
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
-    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just Nothing
+    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just mempty
 
-  it "fromJSON defaults smAllowedSecrets to Nothing when field is null" $ do
+  it "fromJSON defaults smAllowedSecrets to mempty when field is null" $ do
     let j = object
               [ "id" .= ("20260701-120000-042" :: String)
               , "provider" .= ("anthropic" :: String)
@@ -181,9 +181,9 @@ spec = describe "Seal.Session.Meta" $ do
               , "last_active" .= sampleTime
               , "allowed_secrets" .= (Nothing :: Maybe [String])
               ]
-    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just Nothing
+    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just mempty
 
-  it "fromJSON parses Just Set.empty from []" $ do
+  it "fromJSON parses Set.empty from []" $ do
     let j = object
               [ "id" .= ("20260701-120000-042" :: String)
               , "provider" .= ("anthropic" :: String)
@@ -192,8 +192,8 @@ spec = describe "Seal.Session.Meta" $ do
               , "last_active" .= sampleTime
               , "allowed_secrets" .= ([] :: [String])
               ]
-    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just (Just Set.empty)
+    fmap smAllowedSecrets (decode (encode j)) `shouldBe` Just Set.empty
 
-  it "round-trip: encode . decode == id (with Just set)" $ do
-    let m = sampleMeta { smAllowedSecrets = Just (Set.fromList ["a", "b"]) }
+  it "round-trip: encode . decode == id (with non-empty set)" $ do
+    let m = sampleMeta { smAllowedSecrets = Set.fromList ["a", "b"] }
     decode (encode m) `shouldBe` Just m

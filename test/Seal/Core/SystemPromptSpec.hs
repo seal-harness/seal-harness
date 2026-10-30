@@ -46,7 +46,7 @@ metaWith frontMatter =
        , smSealFrontMatter = frontMatter
        , smRepoUrl = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime
-       , smAllowedSecrets = Nothing }
+       , smAllowedSecrets = mempty }
 
 -- | An agent def whose system prompt is a distinctive marker, so the test
 -- can assert the agent's prompt IS (and IS ONLY) in the result.

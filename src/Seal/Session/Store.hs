@@ -83,7 +83,7 @@ formatSessionId t =
 -- without writing anything to disk. Used by channels that want an
 -- in-memory active session without polluting the sessions list — the
 -- session is only persisted when the user actually sends a message.
-newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Maybe (Set Text) -> IO SessionMeta
+newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Set Text -> IO SessionMeta
 newSessionMeta _paths provider model channel mAgent mAllowedSecrets = do
   now <- getCurrentTime
   sid <- case mkSessionId (formatSessionId now) of
@@ -100,7 +100,7 @@ newSessionMeta _paths provider model channel mAgent mAllowedSecrets = do
     , smAllowedSecrets = mAllowedSecrets }
 
 -- | Create a fresh session directory + session.json for the given selection.
-newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Maybe (Set Text) -> IO SessionMeta
+newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Set Text -> IO SessionMeta
 newSession paths provider model channel mAgent mAllowedSecrets = do
   meta <- newSessionMeta paths provider model channel mAgent mAllowedSecrets
   saveSessionMeta paths meta
@@ -277,7 +277,7 @@ resolveDefaultAgent backend cfg =
 -- If @default_agent@ is set and the def exists, its id is persisted in
 -- 'smAgent' and its non-empty provider/model override the config defaults
 -- (PureClaw @resolveOverride@ precedence: frontmatter > config > default).
-initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Maybe (Set Text) -> IO SessionMeta
+initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Set Text -> IO SessionMeta
 initSession paths cfg backend mAllowedSecrets = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
@@ -290,7 +290,7 @@ initSession paths cfg backend mAllowedSecrets = do
 -- active-session ref has a valid meta (provider/model fallbacks) without
 -- polluting the sessions list. The session is persisted only when the user
 -- actually sends the first message (which writes the transcript).
-initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Maybe (Set Text) -> IO SessionMeta
+initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Set Text -> IO SessionMeta
 initSessionMeta paths cfg backend mAllowedSecrets = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg

@@ -183,7 +183,7 @@ resolveRepoUrlMaybe deps raw =
 -- up. Shared by the registry path (CLI/web) and the loop-level inbox path.
 mintNewSessionWith :: NewArgs -> SessionMeta -> NewDeps -> IO SessionMeta
 mintNewSessionWith args oldMeta deps =
-  newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta) Nothing
+  newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta) mempty
   where
     provider = fromMaybe (smProvider oldMeta) (naProvider args)
     model    = fromMaybe (smModel oldMeta) (naModel args)
@@ -198,7 +198,7 @@ mintNewSession args deps = do
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe (fromMaybe cfgProv mProv) (naProvider args)
       model    = fromMaybe (fromMaybe cfgModel mModel) (naModel args)
-  newSession (ndPaths deps) provider model (ndChannelLabel deps) mAgent Nothing
+  newSession (ndPaths deps) provider model (ndChannelLabel deps) mAgent mempty
 
 -- | Render the one-line confirmation. Names the old session + resume hint
 -- so the safety net (old session kept on disk) is user-visible, per

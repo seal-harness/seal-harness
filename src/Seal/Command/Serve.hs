@@ -218,7 +218,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- only lands on disk when the user sends the first message (the web send
   -- handler writes the transcript to the session dir). This avoids
   -- polluting the sessions list with an empty session on every `seal serve`.
-  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends) Nothing
+  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends) mempty
   activeRef   <- newIORef sessionMeta
   broker <- newStreamBroker 1024
   -- Build the shared ChannelDeps early so the reply registry + write locks

@@ -135,4 +135,4 @@ coreCommandSpecs d =
 mintTabSession :: SealPaths -> IO (Either Text RuntimeConfig) -> AgentDefBackend -> IO SessionMeta
 mintTabSession paths loadCfg backend = do
   eCfg <- loadCfg
-  initSessionMeta paths (fromRight defaultRuntimeConfig eCfg) backend Nothing
+  initSessionMeta paths (fromRight defaultRuntimeConfig eCfg) backend mempty
