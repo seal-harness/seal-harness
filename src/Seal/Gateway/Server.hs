@@ -286,7 +286,8 @@ runGateway logger cfg failClosedOnNonLoopback deps guard broker = do
 --
 -- Warp's default request timeout is 30s, which would tear down an idle
 -- WebSocket connection (the stream is idle between transcript events).
--- The WS server sends a ping every 30s (see 'withPingThread'), so the
+-- The WS server sends keep-alives every 30s — a protocol PING (see
+-- 'withPingThread') plus an application-level heartbeat frame — so the
 -- timeout is raised well above that: a connection silent for two minutes
 -- is genuinely dead. HTTP requests are unaffected in practice (the
 -- gateway answers in milliseconds).

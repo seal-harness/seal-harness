@@ -125,6 +125,7 @@ decodeServerEvent bs = A.decode bs >>= parseServerEvent
 -- establishes the contract.
 data ServerEvent
   = SeHello Text Text          -- ^ @hello@: protocolVersion + serverStartedAt
+  | SeHeartbeat                -- ^ @heartbeat@: application-level keep-alive, carries no state
   | SeEntry SessionId Value    -- ^ @entry@: a complete transcript entry
   | SeEntryUpdate SessionId Value  -- ^ @entry-update@: a streaming entry update
   | SeActivity SessionId Value     -- ^ @activity@: a per-session activity signal
@@ -182,6 +183,7 @@ parseServerEvent (A.Object o) =
       "hello" -> SeHello
         <$> (asText =<< KeyMap.lookup (Key.fromText "protocolVersion") o)
         <*> (asText =<< KeyMap.lookup (Key.fromText "serverStartedAt") o)
+      "heartbeat" -> Just SeHeartbeat
       "entry" -> SeEntry
         <$> (asSessionId =<< KeyMap.lookup (Key.fromText "sessionId") o)
         <*> pure (fromMaybe A.Null (KeyMap.lookup (Key.fromText "entry") o))

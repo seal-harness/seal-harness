@@ -389,6 +389,40 @@ describe('streamClient', () => {
     expect(client.status).toBe('reconnecting')
   })
 
+  it('keeps an idle connection alive when the server sends heartbeat frames', async () => {
+    // Browsers never surface protocol-level PING frames to JavaScript, so
+    // the server also emits `{"type":"heartbeat"}` data frames every 30s.
+    // Without them the watchdog tears down a healthy idle connection, and
+    // the UI shows it as a periodic redraw.
+    ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+    // Three heartbeat periods: 90s of idleness, each frame resetting the
+    // watchdog before it can fire.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      ref.socket!.simulateMessage({ type: 'heartbeat' })
+    }
+    await Promise.resolve()
+    expect(client.status).toBe('live')
+    expect(ref.instances).toHaveLength(1)
+  })
+
+  it('a heartbeat frame wakes no listener (no UI churn)', async () => {
+    ref.socket!.simulateOpen()
+    const statuses: string[] = []
+    const entries: unknown[] = []
+    const lists: unknown[] = []
+    client.onStatusChange((s) => statuses.push(s))
+    client.onEntry((e) => entries.push(e))
+    client.onLists((l) => lists.push(l))
+    ref.socket!.simulateMessage({ type: 'heartbeat' })
+    // Nothing to apply: a keep-alive must not re-render the transcript.
+    expect(statuses).toEqual([])
+    expect(entries).toEqual([])
+    expect(lists).toEqual([])
+    expect(client.status).toBe('live')
+  })
+
   it('transitions from replaying to live on replay-end event', () => {
     ref.socket!.simulateOpen()
     client.focus('sess-1', 'entry-3')

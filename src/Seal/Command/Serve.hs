@@ -389,7 +389,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
-      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
+      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths, sgHeartbeatSeconds = 30 }
   -- The WS server shares the HTTP listener, so it is up as soon as the
   -- HTTP server is. Record that in the health state the /api/health
   -- endpoint publishes.
