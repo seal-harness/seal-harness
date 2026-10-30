@@ -531,6 +531,38 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.getByTestId('tab-kind-idle-read')).toBeTruthy()
   })
 
+  it('renders an OpenAI API badge for an openai tab', () => {
+    localStorage.setItem('seal.tabLineFields', '["provider"]')
+    const tabs = [
+      makeTab({ index: 0, kind: 'session:openai', session_id: 'read' }),
+    ]
+    const tabSessions = [makeSession({ id: 'read', description: 'oc tab', runtime: 'session:openai' })]
+    const sessionActivity = {
+      read: { harness: 'idle' as const, unread: 0, lastEntryAt: '2024-06-01T00:00:00.000Z', seenAt: '2024-06-02T00:00:00.000Z', toolCall: null },
+    }
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        sessionActivity={sessionActivity}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The badge is "O" (OpenAI API), not the "?" unknown fallback.
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('O')
+  })
+
   it('sorts Active Tabs: Idle Unread → Idle Read → Thinking (newest user msg first within bucket)', () => {
     // Pin the second-line config so the sort assertions are independent of
     // the default field selection.

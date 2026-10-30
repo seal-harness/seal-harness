@@ -64,7 +64,6 @@ import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
 import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
 import Seal.Providers.Class (ToolResultPart (..))
-import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..))
@@ -259,7 +258,6 @@ mkVaultDeps vr tmp = do
         , adAdoptConsent    = Just CcWeb
         , adAgentDefs       = adb
         , adSkills          = skills
-        , adProviders       = pure knownProviders
         , adUiState         = uiState
         , adSend            = Nothing
         , adDefaultAgent    = pure Nothing

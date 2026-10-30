@@ -3,6 +3,7 @@ module Seal.Command.SessionSpec (spec) where
 
 import Control.Monad (void)
 import Data.Either (fromRight)
+import Data.Map.Strict qualified as Map
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -46,9 +47,10 @@ mkPR cfgPath = do
   ref <- newIORef Nothing
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
 
 runSess :: SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runSess sr argv caps =

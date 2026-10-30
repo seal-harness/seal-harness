@@ -1,3 +1,7 @@
+> **Superseded** by `docs/superpowers/specs/2026-10-19-provider-families-design.md`
+> and `docs/superpowers/plans/2026-10-19-provider-families-plan.md` — the generic
+> provider is now `openai` and `openrouter` is a fixed-URL provider. Kept for history.
+
 # Implementation Plan: OpenRouter Provider — Finish `complete`
 
 > Supersedes the WU-001..WU-003 skeleton plan. WU-001 (skeleton) and WU-002

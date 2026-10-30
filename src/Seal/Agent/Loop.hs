@@ -7,6 +7,7 @@ module Seal.Agent.Loop
   , defaultMaxTokens
   , aggregateStreamEvents
   , stripToolCallXml, findAllInvokeCalls
+  , isTransientError
   ) where
 
 import Control.Exception (SomeException, catch)

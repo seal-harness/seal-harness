@@ -21,13 +21,16 @@ module Seal.Gateway.ListsSnapshot
 
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Either (fromRight)
 
 import Control.Concurrent.Async (mapConcurrently)
 
-import Seal.Config.Paths (SealPaths)
+import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Paths (SealPaths, configFilePath)
 import Seal.Gateway.Types.Core (SessionId, sessionIdText)
 import Seal.Gateway.Types.ListsSnapshot (ListsSnapshotWire (..))
 import Seal.Gateway.SessionJson (sessionInfoJsonWithSnippet, tabToJson)
+import Seal.Providers.Registry (instanceTypeIdFor)
 import Seal.Session.Store (listArchivedSessions, listSessions)
 import Seal.Tabs (snapshotTabs, TabsHandle)
 import Seal.Tabs.Partition (PartitionedSessions (..), partitionSessions)
@@ -40,6 +43,10 @@ import Seal.Tabs.Types (tlTabs)
 -- its sidebar (the live activity stream only carries forward from here).
 buildListsSnapshot :: TabsHandle -> SealPaths -> Set SessionId -> IO ListsSnapshotWire
 buildListsSnapshot tabsH paths thinkingSids = do
+  -- One config load per snapshot (design §10.10): derive each session's
+  -- providerType from its stored provider name without a second load.
+  eCfg <- loadRuntimeConfig (configFilePath paths)
+  let providerTypeFor = instanceTypeIdFor (fromRight defaultRuntimeConfig eCfg)
   tl <- snapshotTabs tabsH
   let tabsJson = map tabToJson (tlTabs tl)
   recent   <- listSessions paths
@@ -50,9 +57,9 @@ buildListsSnapshot tabsH paths thinkingSids = do
   -- I/O into ~0.6s of 16-way concurrent I/O. 'mapConcurrently' spawns one
   -- thread per session; for the expected single-user scale (hundreds, not
   -- millions) this is fine — the OS scheduler handles the concurrency.
-  recentJson   <- mapConcurrently (sessionInfoJsonWithSnippet paths) (psRecentSessions ps)
-  archivedJson <- mapConcurrently (sessionInfoJsonWithSnippet paths) (psArchivedSessions ps)
-  tabbedJson   <- mapConcurrently (sessionInfoJsonWithSnippet paths) (psTabSessions ps)
+  recentJson   <- mapConcurrently (sessionInfoJsonWithSnippet paths providerTypeFor) (psRecentSessions ps)
+  archivedJson <- mapConcurrently (sessionInfoJsonWithSnippet paths providerTypeFor) (psArchivedSessions ps)
+  tabbedJson   <- mapConcurrently (sessionInfoJsonWithSnippet paths providerTypeFor) (psTabSessions ps)
   pure ListsSnapshotWire
     { lswTabs = tabsJson
     , lswRecentSessions = recentJson
