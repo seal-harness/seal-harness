@@ -32,6 +32,7 @@ import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Vault.Commands
+import Seal.Vault.Access (vaultAccess, unrestrictedVaultAccess)
 
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
@@ -88,51 +89,51 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
   -- -----------------------------------------------------------------------
 
   describe "filterSecretList" $ do
-    it "Nothing returns input unchanged" $
-      filterSecretList Nothing ["a", "b", "c"] `shouldBe` ["a", "b", "c"]
+    it "empty set filters out everything" $
+      filterSecretList Set.empty ["a", "b", "c"] `shouldBe` ([] :: [Text])
 
-    it "Just allowed filters to only keys in the set" $ do
+    it "allowed filters to only keys in the set" $ do
       let allowed = Set.fromList ["a", "c"]
-      filterSecretList (Just allowed) ["a", "b", "c", "d"] `shouldBe` ["a", "c"]
+      filterSecretList allowed ["a", "b", "c", "d"] `shouldBe` ["a", "c"]
 
-    it "Just empty-set filters out everything" $
-      filterSecretList (Just Set.empty) ["a", "b"] `shouldBe` ([] :: [Text])
+    it "empty set filters out everything" $
+      filterSecretList Set.empty ["a", "b"] `shouldBe` ([] :: [Text])
 
-    it "Nothing on empty list returns empty list" $
-      filterSecretList Nothing ([] :: [Text]) `shouldBe` []
+    it "empty set on empty list returns empty list" $
+      filterSecretList Set.empty ([] :: [Text]) `shouldBe` []
 
     it "preserves order of the original list" $ do
       let allowed = Set.fromList ["x", "y"]
-      filterSecretList (Just allowed) ["y", "z", "x"] `shouldBe` ["y", "x"]
+      filterSecretList allowed ["y", "z", "x"] `shouldBe` ["y", "x"]
 
-    prop "Nothing is identity" $ \(xs :: [Text]) ->
-      filterSecretList Nothing xs == xs
+    prop "empty set filters out everything" $ \(xs :: [Text]) ->
+      null (filterSecretList Set.empty xs)
 
-    prop "Just allowed keeps only members, preserving order" $ \(xs :: [Text]) (allowed :: Set Text) ->
-      filterSecretList (Just allowed) xs == filter (`Set.member` allowed) xs
+    prop "allowed keeps only members, preserving order" $ \(xs :: [Text]) (allowed :: Set Text) ->
+      filterSecretList allowed xs == filter (`Set.member` allowed) xs
 
   describe "isSecretAllowed" $ do
-    it "Nothing returns True for any key" $ do
-      isSecretAllowed Nothing "anything" `shouldBe` True
-      isSecretAllowed Nothing "" `shouldBe` True
+    it "empty set returns False for any key" $ do
+      isSecretAllowed Set.empty "anything" `shouldBe` False
+      isSecretAllowed Set.empty "" `shouldBe` False
 
-    it "Just allowed returns True for members" $ do
+    it "allowed returns True for members" $ do
       let allowed = Set.fromList ["TOKEN", "API_KEY"]
-      isSecretAllowed (Just allowed) "TOKEN" `shouldBe` True
-      isSecretAllowed (Just allowed) "API_KEY" `shouldBe` True
+      isSecretAllowed allowed "TOKEN" `shouldBe` True
+      isSecretAllowed allowed "API_KEY" `shouldBe` True
 
-    it "Just allowed returns False for non-members" $ do
+    it "allowed returns False for non-members" $ do
       let allowed = Set.fromList ["TOKEN"]
-      isSecretAllowed (Just allowed) "SECRET" `shouldBe` False
+      isSecretAllowed allowed "SECRET" `shouldBe` False
 
-    it "Just empty-set returns False for everything" $
-      isSecretAllowed (Just Set.empty) "any" `shouldBe` False
+    it "empty set returns False for everything" $
+      isSecretAllowed Set.empty "any" `shouldBe` False
 
-    prop "Nothing always True" $ \(k :: Text) ->
-      isSecretAllowed Nothing k
+    prop "empty set always False" $ \(k :: Text) ->
+      not (isSecretAllowed Set.empty k)
 
-    prop "Just allowed is Set.member" $ \(k :: Text) (allowed :: Set Text) ->
-      isSecretAllowed (Just allowed) k == Set.member k allowed
+    prop "allowed is Set.member" $ \(k :: Text) (allowed :: Set Text) ->
+      isSecretAllowed allowed k == Set.member k allowed
 
   describe "isValidSecretName" $ do
     it "accepts alphanumeric names" $ do
@@ -175,7 +176,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-op" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("get" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -189,7 +191,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-op-missing" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("get" :: String)
           , "name"   .= ("NOPE" :: String)
@@ -207,7 +210,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-put" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        let va = vaultAccess rt (Set.fromList ["API_KEY"])
+            op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("API_KEY" :: String)
@@ -223,7 +227,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-put-update" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "old-value"))
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         _ <- runTestApp (opRun op localBackend (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -236,7 +241,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-put-empty" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("KEY" :: String)
@@ -255,7 +261,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-delete-yes" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps ["once"]
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("delete" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -268,7 +275,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-delete-no" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps ["rejected"]
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("delete" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -281,14 +289,16 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-secret-delete-blocking" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps ["once"]
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         opBlocking op `shouldBe` True
 
     it "does NOT delete when the human sends an empty response" $
       withSystemTempDirectory "seal-secret-delete-empty" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps [""]
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("delete" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -308,7 +318,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         _ <- vhPut h "API_KEY" "sk-xyz"
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("list" :: String)
           ]))
@@ -329,7 +340,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-auth" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object ["action" .= ("bogus" :: String)]) of
           Left _  -> pure ()
           Right _ -> expectationFailure "expected authorize to reject unknown action"
@@ -338,7 +350,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-auth" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object ["action" .= ("get" :: String)]) of
           Left _  -> pure ()
           Right _ -> expectationFailure "expected authorize to reject get without name"
@@ -347,7 +360,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-auth" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("KEY" :: String)
@@ -359,7 +373,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-auth" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object ["action" .= ("delete" :: String)]) of
           Left _  -> pure ()
           Right _ -> expectationFailure "expected authorize to reject delete without name"
@@ -368,7 +383,8 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-auth" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         case opAuthorize op (object ["action" .= ("list" :: String)]) of
           Left e  -> expectationFailure ("expected authorize to accept list: " <> T.unpack e)
           Right _ -> pure ()
@@ -387,7 +403,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-allow-get-ok" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["TOKEN"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["TOKEN"])) caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("get" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -399,7 +415,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-allow-get-deny" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["OTHER"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["OTHER"])) caps
         case opAuthorize op (object
           [ "action" .= ("get" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -417,7 +433,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
         _ <- vhPut h "API_KEY" "sk-xyz"
         _ <- vhPut h "DB_PASSWORD" "hunter2"
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["TOKEN", "API_KEY"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["TOKEN", "API_KEY"])) caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("list" :: String)
           ]))
@@ -428,12 +444,13 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
         T.isInfixOf "DB_PASSWORD" text `shouldBe` False
         orRecorded r `shouldBe` object ["count" .= (2 :: Int)]
 
-    it "list with Nothing allow-list shows all keys (backward compat)" $
+    it "list with unrestricted access shows all keys" $
       withSystemTempDirectory "seal-allow-list-none" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         _ <- vhPut h "API_KEY" "sk-xyz"
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("list" :: String)
           ]))
@@ -448,7 +465,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         _ <- vhPut h "API_KEY" "sk-xyz"
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["NONEXISTENT"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["NONEXISTENT"])) caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("list" :: String)
           ]))
@@ -464,7 +481,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-allow-put-deny" $ \tmpDir -> do
         (rt, _) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["OTHER"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["OTHER"])) caps
         case opAuthorize op (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -477,7 +494,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-allow-put-ok" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir Nothing
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["API_KEY"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["API_KEY"])) caps
         r <- runTestApp (opRun op localBackend (object
           [ "action" .= ("put" :: String)
           , "name"   .= ("API_KEY" :: String)
@@ -498,7 +515,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
         -- ccPrompt will return "" (denial). But we're testing the
         -- authorize gate, which runs before toRun/prompt.
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt (Just (Set.fromList ["OTHER"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["OTHER"])) caps
         case opAuthorize op (object
           [ "action" .= ("delete" :: String)
           , "name"   .= ("TOKEN" :: String)
@@ -510,7 +527,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
       withSystemTempDirectory "seal-allow-delete-prompt" $ \tmpDir -> do
         (rt, h) <- withVaultRuntime tmpDir (Just ("TOKEN", "s3cr3t"))
         (_fc, caps) <- makeFakeCaps ["rejected"]
-        let op = secretManageOp rt (Just (Set.fromList ["TOKEN"])) caps
+        let op = secretManageOp (vaultAccess rt (Set.fromList ["TOKEN"])) caps
         -- authorize should pass (key is allowed)
         case opAuthorize op (object
           [ "action" .= ("delete" :: String)
@@ -528,17 +545,19 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
             result `shouldBe` Right "s3cr3t"
 
     -- ---------------------------------------------------------------------
-    -- Nothing allow-list backward compat (all ops behave as before)
+    -- unrestricted access backward compat (all ops behave as before)
     -- ---------------------------------------------------------------------
 
-    it "Nothing allow-list: get authorize accepts any key" $
+    it "allowed key: get authorize accepts key in allow-list" $
       withSystemTempDirectory "seal-none-auth" $ \tmpDir -> do
-        (rt, _) <- withVaultRuntime tmpDir Nothing
+        (rt, _) <- withVaultRuntime tmpDir (Just ("KNOWN", "val"))
         (_fc, caps) <- makeFakeCaps []
-        let op = secretManageOp rt Nothing caps
+        let va = vaultAccess rt (Set.fromList ["KNOWN"])
+            op = secretManageOp va caps
         case opAuthorize op (object
           [ "action" .= ("get" :: String)
-          , "name"   .= ("ANYTHING" :: String)
+          , "name"   .= ("KNOWN" :: String)
           ]) of
-          Left e  -> expectationFailure ("expected authorize to accept with Nothing: " <> T.unpack e)
+          Left e  -> expectationFailure ("expected authorize to accept allowed key: " <> T.unpack e)
           Right _ -> pure ()
+

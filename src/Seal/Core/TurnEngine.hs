@@ -164,6 +164,7 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
+import Seal.Vault.Access (vaultAccess)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
@@ -274,7 +275,7 @@ buildSessionRegistry
   -> Maybe Manager
   -> ChannelCaps
   -> Bool
-  -> Maybe (Set Text)
+  -> Set Text
   -> ISA.Registry
 buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                      startWiring harnessReg tmuxRunner httpManager caps onDemand
@@ -284,7 +285,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretManageOp rt mAllowedSecrets caps
+      , secretManageOp (vaultAccess rt mAllowedSecrets) caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -742,7 +743,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
-                 (Just (smAllowedSecrets meta'))
+                 (smAllowedSecrets meta')
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
@@ -1110,7 +1111,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
-                  (smAllowedSecrets <$> mMeta)
+                  (maybe mempty smAllowedSecrets mMeta)
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
     res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
@@ -1353,7 +1354,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
   -- single source of truth — the child's session.json carries the
   -- restriction for both live runs and resume.
   mChildMeta <- loadSessionMeta (tdPaths td) childSid
-  let mAllowedSecrets = smAllowedSecrets <$> mChildMeta
+  let mAllowedSecrets = maybe mempty smAllowedSecrets mChildMeta
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
@@ -1367,7 +1368,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
       baseOps =
         [ showHumanOp childCaps
         , askHumanOp childCaps
-        , secretManageOp (tdVault td) mAllowedSecrets childCaps
+        , secretManageOp (vaultAccess (tdVault td) mAllowedSecrets) childCaps
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
        , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))

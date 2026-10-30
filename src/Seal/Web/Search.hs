@@ -43,6 +43,7 @@ import Seal.ISA.Opcode
 import Seal.ISA.Ops.Secret (vaultGetByName)
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Vault.Commands (VaultRuntime)
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.SearXngSetup (ensureSearXng)
 
 -- | Which search backend to use. 'ProviderParallel' is the zero-config
@@ -177,7 +178,8 @@ dispatchSearch mgr cfg q = case wscProvider cfg of
 resolveApiKey :: WebSearchConfig -> IO (Maybe Text)
 resolveApiKey cfg = case (wscVault cfg, wscAuthKey cfg) of
   (Just rt, Just keyName) -> do
-    eVal <- vaultGetByName rt keyName
+    va <- unrestrictedVaultAccess rt
+    eVal <- vaultGetByName va keyName
     pure (either (const Nothing) Just eVal)
   _ -> pure Nothing
 

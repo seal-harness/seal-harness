@@ -98,6 +98,7 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.Fetch (WebFetchConfig (..), webFetchOp)
 import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (ProviderParallel))
 
@@ -859,7 +860,8 @@ spec = describe "Seal.ISA.Integration" $ do
               , vrConfigPath = tmpDir </> "config" </> "config.toml"
               , vrHandleRef = ref
               }
-            op = secretManageOp rt Nothing caps
+        va <- unrestrictedVaultAccess rt
+        let op = secretManageOp va caps
             reg = Registry.mkRegistry [op]
         r <- runTestApp (dispatchOne reg (OpName "SECRET_MANAGE")
                           (object ["action" .= ("get" :: Text), "name" .= ("TOKEN" :: Text)]))
