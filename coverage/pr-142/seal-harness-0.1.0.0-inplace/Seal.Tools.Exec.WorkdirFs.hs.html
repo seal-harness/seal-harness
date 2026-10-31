@@ -1,0 +1,810 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | A local/remote-agnostic, SafePath-confined filesystem vocabulary for
+<span class="lineno">    3 </span>-- workspace-derived discovery (agent defs, skills). The constructor is
+<span class="lineno">    4 </span>-- NOT exported; the three smart constructors ('mkLocalWorkdirFs',
+<span class="lineno">    5 </span>-- 'mkInMemWorkdirFs', 'mkWorkdirFsStub') are the only way to obtain one.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The local arm reads via 'System.Directory' / 'Data.Text.IO'; every path
+<span class="lineno">    8 </span>-- is run through 'mkSafePath' (anchored at the workdir root) first. The
+<span class="lineno">    9 </span>-- in-memory stub arm resolves 'SymlinkTarget' chains (depth-bounded) and
+<span class="lineno">   10 </span>-- re-checks containment on the resolved path so the symlink-escape test
+<span class="lineno">   11 </span>-- is non-vacuous. The fail-closed stub yields 'Left WfsStub' / 'False' /
+<span class="lineno">   12 </span>-- 'Right []' for every method.
+<span class="lineno">   13 </span>module Seal.Tools.Exec.WorkdirFs
+<span class="lineno">   14 </span>  ( WorkdirFs (..)
+<span class="lineno">   15 </span>  , WorkdirFsErr (..)
+<span class="lineno">   16 </span>  , SnapshotEntry (..)
+<span class="lineno">   17 </span>  , WorkspaceSnapshot (..)
+<span class="lineno">   18 </span>  , mkLocalWorkdirFs
+<span class="lineno">   19 </span>  , mkRemoteWorkdirFs
+<span class="lineno">   20 </span>  , mkInMemWorkdirFs
+<span class="lineno">   21 </span>  , mkWorkdirFsStub
+<span class="lineno">   22 </span>  , StubEntry (..)
+<span class="lineno">   23 </span>  , snapshotMaxDepth
+<span class="lineno">   24 </span>  , maxSnapshotEntries
+<span class="lineno">   25 </span>    -- * Snapshot accessors (pure; consumed by the discovery scanners)
+<span class="lineno">   26 </span>  , snapIsDirectoryAt
+<span class="lineno">   27 </span>  , snapIsFileAt
+<span class="lineno">   28 </span>  , snapTopDirs
+<span class="lineno">   29 </span>  , snapChildDirsAt
+<span class="lineno">   30 </span>  , snapChildFilesAt
+<span class="lineno">   31 </span>  ) where
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>import Control.Exception (IOException, try)
+<span class="lineno">   34 </span>import Data.Char (isDigit, isSpace)
+<span class="lineno">   35 </span>import Data.Char qualified as Char
+<span class="lineno">   36 </span>import Data.Either (fromRight)
+<span class="lineno">   37 </span>import Data.List (sort, sortOn)
+<span class="lineno">   38 </span>import Data.Map.Strict (Map)
+<span class="lineno">   39 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   40 </span>import Data.Maybe (mapMaybe)
+<span class="lineno">   41 </span>import Data.Set qualified as Set
+<span class="lineno">   42 </span>import Data.Text (Text)
+<span class="lineno">   43 </span>import Data.Text qualified as T
+<span class="lineno">   44 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   45 </span>import Data.Time (UTCTime (..))
+<span class="lineno">   46 </span>import Data.Time.Calendar (fromGregorian)
+<span class="lineno">   47 </span>import Data.Time.Clock (secondsToDiffTime)
+<span class="lineno">   48 </span>import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+<span class="lineno">   49 </span>import System.Directory
+<span class="lineno">   50 </span>  ( doesDirectoryExist, doesFileExist, getFileSize, getModificationTime
+<span class="lineno">   51 </span>  , listDirectory, pathIsSymbolicLink
+<span class="lineno">   52 </span>  )
+<span class="lineno">   53 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>import Seal.Security.Path
+<span class="lineno">   56 </span>  ( PathError (..), WorkspaceRoot (..), getSafePath, mkSafePath
+<span class="lineno">   57 </span>  , mkSafePathRemote
+<span class="lineno">   58 </span>  )
+<span class="lineno">   59 </span>import Seal.Tools.Args (mkShellCommand)
+<span class="lineno">   60 </span>import Seal.Tools.Exec.Types (RemotePath, SshConfig, getRemotePath, mkRemotePath)
+<span class="lineno">   61 </span>import Seal.Tools.Exec.UIO (runUIOWithEnv, uioShellExec)
+<span class="lineno">   62 </span>import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+<span class="lineno">   63 </span>import Seal.Tools.Exec.UntrustedIO (UntrustedErr (..), shellQuote)
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | A local/remote-agnostic, SafePath-confined filesystem vocabulary for
+<span class="lineno">   66 </span>-- workspace-derived discovery. Each field is an IO action; the smart
+<span class="lineno">   67 </span>-- constructors wire the local, in-memory-stub, or fail-closed-stub arm.
+<span class="lineno">   68 </span>data WorkdirFs = WorkdirFs
+<span class="lineno">   69 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsReadFile</span></span></span>            :: RemotePath -&gt; IO (Either WorkdirFsErr Text)
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsDoesFileExist</span></span></span>       :: RemotePath -&gt; IO Bool
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsDoesDirectoryExist</span></span></span>  :: RemotePath -&gt; IO Bool
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsListDirectory</span></span></span>       :: RemotePath -&gt; IO (Either WorkdirFsErr [Text])
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsFileSize</span></span></span>            :: RemotePath -&gt; IO (Either WorkdirFsErr Integer)
+<span class="lineno">   74 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsModificationTime</span></span></span>    :: RemotePath -&gt; IO (Either WorkdirFsErr UTCTime)
+<span class="lineno">   75 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfsSnapshot</span></span></span>            :: IO (Either WorkdirFsErr WorkspaceSnapshot)
+<span class="lineno">   76 </span>    -- ^ A depth-limited structural snapshot of the whole workspace in ONE
+<span class="lineno">   77 </span>    -- operation (one SSH round trip on the remote arm). Enumerates regular
+<span class="lineno">   78 </span>    -- directories + files only — symlinks are never followed and never
+<span class="lineno">   79 </span>    -- appear as structure. Consumed by the discovery scanners
+<span class="lineno">   80 </span>    -- (&quot;Seal.Agent.Def.Workdir&quot;, &quot;Seal.Skills.Backend&quot;) to replace the
+<span class="lineno">   81 </span>    -- per-probe round trips; file CONTENT is still read via 'wfsReadFile'
+<span class="lineno">   82 </span>    -- (the symlink-containment chokepoint).
+<span class="lineno">   83 </span>  }
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | One entry of a 'WorkspaceSnapshot'. @snapRelPath@ is a @\/@-separated
+<span class="lineno">   86 </span>-- path relative to the workspace root (@@&quot;repo\/.agents&quot;@@) — no leading
+<span class="lineno">   87 </span>-- @.\/@, no @.@ component, root itself not included.
+<span class="lineno">   88 </span>data SnapshotEntry = SnapshotEntry
+<span class="lineno">   89 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">snapRelPath</span></span></span> :: !Text
+<span class="lineno">   90 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">snapIsDir</span></span></span>   :: !Bool
+<span class="lineno">   91 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | A depth-limited structural snapshot of the workspace: every regular
+<span class="lineno">   94 </span>-- directory + file at depth ≤ 'snapshotMaxDepth', sorted by 'snapRelPath'.
+<span class="lineno">   95 </span>newtype WorkspaceSnapshot = WorkspaceSnapshot
+<span class="lineno">   96 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">snapEntries</span></span></span> :: [SnapshotEntry]
+<span class="lineno">   97 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | The maximum path depth (components below the workspace root) the
+<span class="lineno">  100 </span>-- snapshot enumerates. Covers every convention location the discovery
+<span class="lineno">  101 </span>-- scanners need structurally: @\&lt;repo\&gt;\/.agents\/agents\/\&lt;id\&gt;\/@ (depth 4,
+<span class="lineno">  102 </span>-- protocol sub-agent dirs), @\&lt;repo\&gt;\/\&lt;conv\&gt;\/\&lt;group\&gt;\/@ (depth 4, grouped
+<span class="lineno">  103 </span>-- skills). File CONTENTS are never part of the snapshot.
+<span class="lineno">  104 </span>snapshotMaxDepth :: Int
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">snapshotMaxDepth = 4</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | The maximum number of entries a snapshot may carry before it is
+<span class="lineno">  108 </span>-- rejected with 'WfsOversize' (a runaway tree must not be silently
+<span class="lineno">  109 </span>-- truncated into wrong discovery results).
+<span class="lineno">  110 </span>maxSnapshotEntries :: Int
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">maxSnapshotEntries = 8192</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | The output marker separating the @find -type d@ section from the
+<span class="lineno">  114 </span>-- @find -type f@ section of the remote snapshot command. A find line can
+<span class="lineno">  115 </span>-- never collide with it (every find line starts with @./@).
+<span class="lineno">  116 </span>snapshotFilesMarker :: Text
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">snapshotFilesMarker = &quot;__SEAL_FILES__&quot;</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | The error ADT for 'WorkdirFs' methods. Pinned for exhaustive
+<span class="lineno">  120 </span>-- pattern-match under @-Wall -Werror@.
+<span class="lineno">  121 </span>data WorkdirFsErr
+<span class="lineno">  122 </span>  = WfsPath !PathError
+<span class="lineno">  123 </span>  | WfsNotFound
+<span class="lineno">  124 </span>  | WfsOversize
+<span class="lineno">  125 </span>  | WfsIo !Text
+<span class="lineno">  126 </span>  | WfsExec !Text
+<span class="lineno">  127 </span>  | WfsStub
+<span class="lineno">  128 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>-- | An entry in the in-memory stub's seeded map. Models files, symlink
+<span class="lineno">  131 </span>-- chains, directories, and missing paths so the symlink-escape test is
+<span class="lineno">  132 </span>-- non-vacuous.
+<span class="lineno">  133 </span>data StubEntry
+<span class="lineno">  134 </span>  = FileContent Text
+<span class="lineno">  135 </span>  | SymlinkTarget RemotePath
+<span class="lineno">  136 </span>  | Directory [Text]
+<span class="lineno">  137 </span>  | Missing
+<span class="lineno">  138 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | The per-file character limit applied after a successful read. Matches
+<span class="lineno">  141 </span>-- 'defaultSectionCharLimit' in &quot;Seal.Agent.Def.Backend&quot;.
+<span class="lineno">  142 </span>defaultSectionCharLimit :: Int
+<span class="lineno">  143 </span><span class="decl"><span class="istickedoff">defaultSectionCharLimit = 65536</span></span>
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | Truncate a body to @limit@ characters, appending the exact truncation
+<span class="lineno">  146 </span>-- marker. Strings at or under the limit are returned as-is. Matches
+<span class="lineno">  147 </span>-- 'truncateSection' in &quot;Seal.Agent.Def.Backend&quot;.
+<span class="lineno">  148 </span>truncateSection :: Int -&gt; Text -&gt; Text
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">truncateSection limit txt</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">T.length txt &lt;= limit</span> = txt</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> =</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">T.take limit txt</span></span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;\n[...truncated at &quot; &lt;&gt; T.pack (show limit) &lt;&gt; &quot; chars...]&quot;</span></span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  156 </span>-- Local arm
+<span class="lineno">  157 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- | The local arm. Reads via 'System.Directory' / 'Data.Text.IO'; every
+<span class="lineno">  160 </span>-- path is run through 'mkSafePath' (anchored at the workdir root) first.
+<span class="lineno">  161 </span>-- The @Int@ is the operator scan-byte ceiling, captured at construction.
+<span class="lineno">  162 </span>mkLocalWorkdirFs :: WorkspaceRoot -&gt; Int -&gt; WorkdirFs
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">mkLocalWorkdirFs wsRoot ceilingBytes = WorkdirFs</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile = \rp -&gt; do</span>
+<span class="lineno">  165 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  168 </span><span class="spaces">        </span><span class="istickedoff">Left (PathDoesNotExist _) -&gt; pure (Left WfsNotFound)</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; pure (Left (WfsPath pe))</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; readLocalBounded (getSafePath sp) ceilingBytes</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist = \rp -&gt; do</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; pure False</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; doesFileExist (getSafePath sp)</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist = \rp -&gt; do</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; pure False</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; doesDirectoryExist (getSafePath sp)</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory = \rp -&gt; do</span>
+<span class="lineno">  184 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  186 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="istickedoff">Left (PathDoesNotExist _) -&gt; pure (Right [])</span>
+<span class="lineno">  188 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  190 </span><span class="spaces">          </span><span class="istickedoff">exists &lt;- doesDirectoryExist (getSafePath sp)</span>
+<span class="lineno">  191 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  192 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure (Right [])</span></span>
+<span class="lineno">  193 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  194 </span><span class="spaces">              </span><span class="istickedoff">eNames &lt;- try (listDirectory (getSafePath sp))</span>
+<span class="lineno">  195 </span><span class="spaces">                        </span><span class="istickedoff">:: IO (Either IOException [FilePath])</span>
+<span class="lineno">  196 </span><span class="spaces">              </span><span class="istickedoff">pure $ case eNames of</span>
+<span class="lineno">  197 </span><span class="spaces">                </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">Left (WfsIo (T.pack (show ioErr)))</span></span>
+<span class="lineno">  198 </span><span class="spaces">                </span><span class="istickedoff">Right names -&gt; Right (map T.pack names)</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">, wfsFileSize = \rp -&gt; do</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  201 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  203 </span><span class="spaces">        </span><span class="istickedoff">Left (PathDoesNotExist _) -&gt; <span class="nottickedoff">pure (Left WfsNotFound)</span></span>
+<span class="lineno">  204 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  206 </span><span class="spaces">          </span><span class="istickedoff">eSize &lt;- try (getFileSize (getSafePath sp))</span>
+<span class="lineno">  207 </span><span class="spaces">                    </span><span class="istickedoff">:: IO (Either IOException Integer)</span>
+<span class="lineno">  208 </span><span class="spaces">          </span><span class="istickedoff">pure $ case eSize of</span>
+<span class="lineno">  209 </span><span class="spaces">            </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Left WfsNotFound</span></span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="istickedoff">Right size -&gt; Right size</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">, wfsModificationTime = \rp -&gt; do</span>
+<span class="lineno">  212 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">eSafe &lt;- mkSafePath wsRoot rel</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">case eSafe of</span>
+<span class="lineno">  215 </span><span class="spaces">        </span><span class="istickedoff">Left (PathDoesNotExist _) -&gt; pure (Left <span class="nottickedoff">WfsNotFound</span>)</span>
+<span class="lineno">  216 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  217 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; do</span>
+<span class="lineno">  218 </span><span class="spaces">          </span><span class="istickedoff">eMtime &lt;- try (getModificationTime (getSafePath sp))</span>
+<span class="lineno">  219 </span><span class="spaces">                     </span><span class="istickedoff">:: IO (Either IOException UTCTime)</span>
+<span class="lineno">  220 </span><span class="spaces">          </span><span class="istickedoff">pure $ case eMtime of</span>
+<span class="lineno">  221 </span><span class="spaces">            </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Left WfsNotFound</span></span>
+<span class="lineno">  222 </span><span class="spaces">            </span><span class="istickedoff">Right mtime -&gt; Right mtime</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, wfsSnapshot = localSnapshot wsRoot</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  225 </span>
+<span class="lineno">  226 </span>-- | The depth-limited structural walk for the local arm ('wfsSnapshot').
+<span class="lineno">  227 </span>-- Enumerates regular dirs + files only; symlinks are skipped entirely
+<span class="lineno">  228 </span>-- (never followed — mirrors the remote @find -P@ semantics so both arms
+<span class="lineno">  229 </span>-- agree on structure). Depth- and count-bounded.
+<span class="lineno">  230 </span>localSnapshot :: WorkspaceRoot -&gt; IO (Either WorkdirFsErr WorkspaceSnapshot)
+<span class="lineno">  231 </span><span class="decl"><span class="istickedoff">localSnapshot wsRoot = do</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">entries &lt;- walkDir root &quot;&quot; snapshotMaxDepth</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="istickedoff">pure $!</span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">if <span class="tickonlyfalse">length entries &gt; maxSnapshotEntries</span></span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">then <span class="nottickedoff">Left WfsOversize</span></span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">else Right (WorkspaceSnapshot (sortOn snapRelPath entries))</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  238 </span><span class="spaces">    </span><span class="istickedoff">root = case wsRoot of WorkspaceRoot p -&gt; p</span>
+<span class="lineno">  239 </span><span class="spaces">    </span><span class="istickedoff">walkDir :: FilePath -&gt; Text -&gt; Int -&gt; IO [SnapshotEntry]</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">walkDir dir relPrefix remaining</span>
+<span class="lineno">  241 </span><span class="spaces">      </span><span class="istickedoff">| remaining &lt;= 0 = pure []</span>
+<span class="lineno">  242 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  243 </span><span class="spaces">          </span><span class="istickedoff">eNames &lt;- try (listDirectory dir) :: IO (Either IOException [FilePath])</span>
+<span class="lineno">  244 </span><span class="spaces">          </span><span class="istickedoff">case eNames of</span>
+<span class="lineno">  245 </span><span class="spaces">            </span><span class="istickedoff">Left _     -&gt; pure []   -- unreadable subtree: fail-soft</span>
+<span class="lineno">  246 </span><span class="spaces">            </span><span class="istickedoff">Right names -&gt; concat &lt;$&gt; mapM step (sort names)</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  248 </span><span class="spaces">        </span><span class="istickedoff">step name = do</span>
+<span class="lineno">  249 </span><span class="spaces">          </span><span class="istickedoff">let childRel = if T.null relPrefix</span>
+<span class="lineno">  250 </span><span class="spaces">                           </span><span class="istickedoff">then T.pack name</span>
+<span class="lineno">  251 </span><span class="spaces">                           </span><span class="istickedoff">else relPrefix &lt;&gt; &quot;/&quot; &lt;&gt; T.pack name</span>
+<span class="lineno">  252 </span><span class="spaces">              </span><span class="istickedoff">fsPath = dir &lt;/&gt; name</span>
+<span class="lineno">  253 </span><span class="spaces">          </span><span class="istickedoff">eLink &lt;- try (pathIsSymbolicLink fsPath)</span>
+<span class="lineno">  254 </span><span class="spaces">                     </span><span class="istickedoff">:: IO (Either IOException Bool)</span>
+<span class="lineno">  255 </span><span class="spaces">          </span><span class="istickedoff">if fromRight <span class="nottickedoff">True</span> eLink</span>
+<span class="lineno">  256 </span><span class="spaces">            </span><span class="istickedoff">then pure []   -- symlink (or vanished): never followed</span>
+<span class="lineno">  257 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  258 </span><span class="spaces">              </span><span class="istickedoff">isDir &lt;- doesDirectoryExist fsPath</span>
+<span class="lineno">  259 </span><span class="spaces">              </span><span class="istickedoff">if isDir</span>
+<span class="lineno">  260 </span><span class="spaces">                </span><span class="istickedoff">then do</span>
+<span class="lineno">  261 </span><span class="spaces">                  </span><span class="istickedoff">sub &lt;- walkDir fsPath childRel (remaining - 1)</span>
+<span class="lineno">  262 </span><span class="spaces">                  </span><span class="istickedoff">pure (SnapshotEntry childRel True : sub)</span>
+<span class="lineno">  263 </span><span class="spaces">                </span><span class="istickedoff">else do</span>
+<span class="lineno">  264 </span><span class="spaces">                  </span><span class="istickedoff">isFile &lt;- doesFileExist fsPath</span>
+<span class="lineno">  265 </span><span class="spaces">                  </span><span class="istickedoff">pure [SnapshotEntry childRel False | <span class="tickonlytrue">isFile</span>]</span></span>
+<span class="lineno">  266 </span>
+<span class="lineno">  267 </span>-- | Stat-first (reject 'WfsOversize' if &gt; ceiling), then read + decode to
+<span class="lineno">  268 </span>-- 'Text', truncate to 'defaultSectionCharLimit'. Returns 'WfsNotFound' if
+<span class="lineno">  269 </span>-- the file is missing.
+<span class="lineno">  270 </span>readLocalBounded :: FilePath -&gt; Int -&gt; IO (Either WorkdirFsErr Text)
+<span class="lineno">  271 </span><span class="decl"><span class="istickedoff">readLocalBounded path ceilingBytes = do</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">eSize &lt;- try (getFileSize path) :: IO (Either IOException Integer)</span>
+<span class="lineno">  273 </span><span class="spaces">  </span><span class="istickedoff">case eSize of</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure (Left WfsNotFound)</span></span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">Right size</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">| size &gt; fromIntegral ceilingBytes -&gt; pure (Left WfsOversize)</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; do</span>
+<span class="lineno">  278 </span><span class="spaces">          </span><span class="istickedoff">eTxt &lt;- try (TIO.readFile path) :: IO (Either IOException Text)</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="istickedoff">pure $ case eTxt of</span>
+<span class="lineno">  280 </span><span class="spaces">            </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">Left (WfsIo (T.pack (show ioErr)))</span></span>
+<span class="lineno">  281 </span><span class="spaces">            </span><span class="istickedoff">Right txt -&gt;</span>
+<span class="lineno">  282 </span><span class="spaces">              </span><span class="istickedoff">let trimmed = T.dropWhileEnd Char.isSpace txt</span>
+<span class="lineno">  283 </span><span class="spaces">              </span><span class="istickedoff">in if T.null (T.strip trimmed)</span>
+<span class="lineno">  284 </span><span class="spaces">                   </span><span class="istickedoff">then Left WfsNotFound</span>
+<span class="lineno">  285 </span><span class="spaces">                   </span><span class="istickedoff">else Right (truncateSection defaultSectionCharLimit trimmed)</span></span>
+<span class="lineno">  286 </span>
+<span class="lineno">  287 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  288 </span>-- Remote arm
+<span class="lineno">  289 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- | The remote arm. Reads via SSH through 'UIO'\'s 'uioShellExec' (the shared
+<span class="lineno">  292 </span>-- 'RemoteRunner' lives in the 'UIOEnv'). Every path is run through
+<span class="lineno">  293 </span>-- 'mkSafePathRemote' (anchored at the remote workspace root) BEFORE any
+<span class="lineno">  294 </span>-- shell-exec call. 'wfsReadFile'/'wfsListDirectory'/'wfsFileSize'/
+<span class="lineno">  295 </span>-- 'wfsModificationTime' additionally run @realpath -f -- &lt;abspath&gt;@ on the
+<span class="lineno">  296 </span>-- remote OS and re-check containment on the resolved path, so a symlink
+<span class="lineno">  297 </span>-- escaping the workspace is rejected before any content is read or any
+<span class="lineno">  298 </span>-- directory is listed. The @Int@ is the operator scan-byte ceiling,
+<span class="lineno">  299 </span>-- captured at construction.
+<span class="lineno">  300 </span>mkRemoteWorkdirFs :: UIOEnv -&gt; SshConfig -&gt; WorkspaceRoot -&gt; Int -&gt; WorkdirFs
+<span class="lineno">  301 </span><span class="decl"><span class="istickedoff">mkRemoteWorkdirFs uioEnv sshCfg wsRoot ceilingBytes = WorkdirFs</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile = \rp -&gt; do</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  304 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  305 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; pure (Left (WfsPath pe))</span>
+<span class="lineno">  306 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; remoteReadFile uioEnv <span class="nottickedoff">sshCfg</span> wsRoot ceilingBytes (getSafePath sp)</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist = \rp -&gt; do</span>
+<span class="lineno">  308 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  310 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; remoteTestFlag uioEnv <span class="nottickedoff">sshCfg</span> &quot;-f&quot; (getSafePath sp)</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist = \rp -&gt; do</span>
+<span class="lineno">  313 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  314 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  315 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  316 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; remoteTestFlag uioEnv <span class="nottickedoff">sshCfg</span> &quot;-d&quot; (getSafePath sp)</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory = \rp -&gt; do</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  320 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  321 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt; remoteListDirectory uioEnv <span class="nottickedoff">sshCfg</span> wsRoot (getSafePath sp)</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">, wfsFileSize = \rp -&gt; do</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  325 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  326 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt;</span>
+<span class="lineno">  327 </span><span class="spaces">          </span><span class="istickedoff">remoteStatRechecked uioEnv <span class="nottickedoff">sshCfg</span> wsRoot &quot;%s&quot; <span class="nottickedoff">&quot;%z&quot;</span> (getSafePath sp) &gt;&gt;= \case</span>
+<span class="lineno">  328 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  329 </span><span class="spaces">            </span><span class="istickedoff">Right txt -&gt; case parseInteger txt of</span>
+<span class="lineno">  330 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left (WfsIo &quot;stat size: non-numeric stdout&quot;))</span></span>
+<span class="lineno">  331 </span><span class="spaces">              </span><span class="istickedoff">Just n  -&gt; pure (Right n)</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">, wfsModificationTime = \rp -&gt; do</span>
+<span class="lineno">  333 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  334 </span><span class="spaces">      </span><span class="istickedoff">case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  335 </span><span class="spaces">        </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  336 </span><span class="spaces">        </span><span class="istickedoff">Right sp -&gt;</span>
+<span class="lineno">  337 </span><span class="spaces">          </span><span class="istickedoff">remoteStatRechecked uioEnv <span class="nottickedoff">sshCfg</span> wsRoot &quot;%Y&quot; <span class="nottickedoff">&quot;%m&quot;</span> (getSafePath sp) &gt;&gt;= \case</span>
+<span class="lineno">  338 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  339 </span><span class="spaces">            </span><span class="istickedoff">Right txt -&gt; case parseInteger txt of</span>
+<span class="lineno">  340 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left (WfsIo &quot;stat mtime: non-numeric stdout&quot;))</span></span>
+<span class="lineno">  341 </span><span class="spaces">              </span><span class="istickedoff">Just n  -&gt; pure (Right <span class="nottickedoff">(posixSecondsToUTCTime (fromIntegral n))</span>)</span>
+<span class="lineno">  342 </span><span class="spaces">  </span><span class="istickedoff">, wfsSnapshot = remoteSnapshot uioEnv ceilingBytes</span>
+<span class="lineno">  343 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  344 </span>
+<span class="lineno">  345 </span>-- | The depth-limited structural snapshot for the remote arm
+<span class="lineno">  346 </span>-- ('wfsSnapshot'): ONE shell command runs two @find@ passes (directories,
+<span class="lineno">  347 </span>-- then files) over the workspace root, separated by a marker line, with
+<span class="lineno">  348 </span>-- the total output bounded by @head -c &lt;ceiling&gt;@.
+<span class="lineno">  349 </span>--
+<span class="lineno">  350 </span>-- /Portability/: @-maxdepth@ is not POSIX but is supported by GNU findutils,
+<span class="lineno">  351 </span>-- BSD find, macOS find, and busybox — same de-facto-universal status as the
+<span class="lineno">  352 </span>-- @readlink -f@ choice above. Symlinks are never followed (the default
+<span class="lineno">  353 </span>-- @-P@ mode matches neither @-type d@ nor @-type f@), so an escaping symlink
+<span class="lineno">  354 </span>-- can never contribute structure. Names containing newlines cannot be
+<span class="lineno">  355 </span>-- represented in the line-based output — the same limitation as the
+<span class="lineno">  356 </span>-- line-splitting of @ls -1@ elsewhere in this module.
+<span class="lineno">  357 </span>remoteSnapshot :: UIOEnv -&gt; Int -&gt; IO (Either WorkdirFsErr WorkspaceSnapshot)
+<span class="lineno">  358 </span><span class="decl"><span class="istickedoff">remoteSnapshot uioEnv ceilingBytes = do</span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">let cmd = T.pack $</span>
+<span class="lineno">  360 </span><span class="spaces">        </span><span class="istickedoff">&quot;{ find . -maxdepth &quot; &lt;&gt; show snapshotMaxDepth &lt;&gt; &quot; -type d -print;&quot;</span>
+<span class="lineno">  361 </span><span class="spaces">          </span><span class="istickedoff">&lt;&gt; &quot; printf '\\n&quot; &lt;&gt; T.unpack snapshotFilesMarker &lt;&gt; &quot;\\n';&quot;</span>
+<span class="lineno">  362 </span><span class="spaces">          </span><span class="istickedoff">&lt;&gt; &quot; find . -maxdepth &quot; &lt;&gt; show snapshotMaxDepth &lt;&gt; &quot; -type f -print; }&quot;</span>
+<span class="lineno">  363 </span><span class="spaces">          </span><span class="istickedoff">&lt;&gt; &quot; 2&gt;/dev/null | head -c &quot; &lt;&gt; show ceilingBytes</span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- remoteExecText uioEnv cmd</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  366 </span><span class="spaces">    </span><span class="istickedoff">Left e  -&gt; Left e</span>
+<span class="lineno">  367 </span><span class="spaces">    </span><span class="istickedoff">Right out -&gt; fmap WorkspaceSnapshot (parseSnapshotOutput ceilingBytes out)</span></span>
+<span class="lineno">  368 </span>
+<span class="lineno">  369 </span>-- | Parse the remote snapshot output: @find -type d@ lines (@./@-prefixed),
+<span class="lineno">  370 </span>-- the 'snapshotFilesMarker' line, then @find -type f@ lines. Output at or
+<span class="lineno">  371 </span>-- over the byte ceiling is treated as truncated ('WfsOversize' — a silently
+<span class="lineno">  372 </span>-- truncated tree would yield wrong discovery results); a missing marker is
+<span class="lineno">  373 </span>-- malformed output ('WfsIo'). The @.@ root line and any non-@./@ line are
+<span class="lineno">  374 </span>-- skipped. Entries are sorted by path.
+<span class="lineno">  375 </span>parseSnapshotOutput :: Int -&gt; Text -&gt; Either WorkdirFsErr [SnapshotEntry]
+<span class="lineno">  376 </span><span class="decl"><span class="istickedoff">parseSnapshotOutput ceilingBytes out</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">| T.length out &gt;= ceilingBytes = Left WfsOversize</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case break (== snapshotFilesMarker) (T.lines out) of</span>
+<span class="lineno">  379 </span><span class="spaces">      </span><span class="istickedoff">(dirLines, _marker : fileLines) -&gt; do</span>
+<span class="lineno">  380 </span><span class="spaces">        </span><span class="istickedoff">let entries =</span>
+<span class="lineno">  381 </span><span class="spaces">              </span><span class="istickedoff">mapMaybe pathEntry dirLines  -- dirs</span>
+<span class="lineno">  382 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt;</span>
+<span class="lineno">  383 </span><span class="spaces">              </span><span class="istickedoff">[ SnapshotEntry p False | Just p &lt;- map pathLine fileLines ]</span>
+<span class="lineno">  384 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlyfalse">length entries &gt; maxSnapshotEntries</span></span>
+<span class="lineno">  385 </span><span class="spaces">          </span><span class="istickedoff">then <span class="nottickedoff">Left WfsOversize</span></span>
+<span class="lineno">  386 </span><span class="spaces">          </span><span class="istickedoff">else Right (sortOn snapRelPath entries)</span>
+<span class="lineno">  387 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Left (WfsIo &quot;snapshot output missing files marker&quot;)</span>
+<span class="lineno">  388 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  389 </span><span class="spaces">    </span><span class="istickedoff">-- A find output line &quot;./a/b&quot; → the relative path &quot;a/b&quot;. The bare &quot;.&quot;</span>
+<span class="lineno">  390 </span><span class="spaces">    </span><span class="istickedoff">-- root line and anything unexpected are skipped.</span>
+<span class="lineno">  391 </span><span class="spaces">    </span><span class="istickedoff">pathLine :: Text -&gt; Maybe Text</span>
+<span class="lineno">  392 </span><span class="spaces">    </span><span class="istickedoff">pathLine ln =</span>
+<span class="lineno">  393 </span><span class="spaces">      </span><span class="istickedoff">case T.stripPrefix &quot;./&quot; ln of</span>
+<span class="lineno">  394 </span><span class="spaces">        </span><span class="istickedoff">Just rest | <span class="tickonlytrue">not (T.null rest)</span> -&gt; Just rest</span>
+<span class="lineno">  395 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  396 </span><span class="spaces">    </span><span class="istickedoff">pathEntry :: Text -&gt; Maybe SnapshotEntry</span>
+<span class="lineno">  397 </span><span class="spaces">    </span><span class="istickedoff">pathEntry ln = SnapshotEntry &lt;$&gt; pathLine ln &lt;*&gt; pure True</span></span>
+<span class="lineno">  398 </span>
+<span class="lineno">  399 </span>-- | Run a remote shell command (a 'Text' command string) via 'uioShellExec'
+<span class="lineno">  400 </span>-- in the shared 'UIOEnv'. The command runs with no cwd override (the paths
+<span class="lineno">  401 </span>-- are absolute, SafePath-validated). Lifts the 'UntrustedErr' to a
+<span class="lineno">  402 </span>-- 'WorkdirFsErr'.
+<span class="lineno">  403 </span>--
+<span class="lineno">  404 </span>-- /Portability/: the remote commands in this module avoid GNU-coreutils-
+<span class="lineno">  405 </span>-- only flags so they work on both GNU/Linux and BSD/macOS remotes:
+<span class="lineno">  406 </span>--   * @readlink -f --@ (not @realpath -f --@, which is GNU-only).
+<span class="lineno">  407 </span>--   * @test -&lt;flag&gt; &lt;path&gt;@ (no @--@; the shell-builtin @test@ on zsh/BSD
+<span class="lineno">  408 </span>--     rejects @--@). Safe because every path passed here is absolute
+<span class="lineno">  409 </span>--     (starts with @/@, from 'mkSafePathRemote' + the workspace root), so
+<span class="lineno">  410 </span>--     it can never be mistaken for a @test@ flag.
+<span class="lineno">  411 </span>--   * @head -c &lt;n&gt; --@ for bounded reads (portable).
+<span class="lineno">  412 </span>--   * @ls -1 --@ for directory listings (portable).
+<span class="lineno">  413 </span>remoteExecText :: UIOEnv -&gt; Text -&gt; IO (Either WorkdirFsErr Text)
+<span class="lineno">  414 </span><span class="decl"><span class="istickedoff">remoteExecText uioEnv cmdText =</span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="istickedoff">case mkShellCommand cmdText of</span>
+<span class="lineno">  416 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left (WfsIo e))</span></span>
+<span class="lineno">  417 </span><span class="spaces">    </span><span class="istickedoff">Right cmd -&gt;</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff">runUIOWithEnv uioEnv (uioShellExec cmd Nothing) &gt;&gt;= \case</span>
+<span class="lineno">  419 </span><span class="spaces">        </span><span class="istickedoff">Left (UePath pe) -&gt; <span class="nottickedoff">pure (Left (WfsPath pe))</span></span>
+<span class="lineno">  420 </span><span class="spaces">        </span><span class="istickedoff">Left (UeExec _)  -&gt; pure (Left (WfsExec &quot;remote shell exec failed&quot;))</span>
+<span class="lineno">  421 </span><span class="spaces">        </span><span class="istickedoff">Left (UeIo msg)  -&gt; <span class="nottickedoff">pure (Left (WfsIo msg))</span></span>
+<span class="lineno">  422 </span><span class="spaces">        </span><span class="istickedoff">Left (UeBounded n) -&gt; <span class="nottickedoff">pure (Left (WfsIo (&quot;bounded: &quot; &lt;&gt; T.pack (show n))))</span></span>
+<span class="lineno">  423 </span><span class="spaces">        </span><span class="istickedoff">Right out -&gt; pure (Right out)</span></span>
+<span class="lineno">  424 </span>
+<span class="lineno">  425 </span>-- | Resolve a remote absolute path with @readlink -f -- &lt;abspath&gt;@, then
+<span class="lineno">  426 </span>-- re-check lexical containment of the resolved path against the workspace
+<span class="lineno">  427 </span>-- root. @readlink -f@ is used instead of GNU-only @realpath -f@ so the
+<span class="lineno">  428 </span>-- command works on BSD/macOS remotes as well as GNU/Linux. Returns:
+<span class="lineno">  429 </span>--
+<span class="lineno">  430 </span>--   * @Right (Just resolved)@ — the resolved absolute path, contained.
+<span class="lineno">  431 </span>--   * @Right Nothing@ — the path is missing on the remote (@readlink -f@
+<span class="lineno">  432 </span>--     exits non-zero for a non-existent / unresolvable path on both GNU
+<span class="lineno">  433 </span>--     and BSD).
+<span class="lineno">  434 </span>--   * @Left err@ — exec failure, OR the resolved path escapes the workspace
+<span class="lineno">  435 </span>--     root ('WfsPath').
+<span class="lineno">  436 </span>remoteRealpathRecheck
+<span class="lineno">  437 </span>  :: UIOEnv -&gt; SshConfig -&gt; WorkspaceRoot -&gt; FilePath
+<span class="lineno">  438 </span>  -&gt; IO (Either WorkdirFsErr (Maybe FilePath))
+<span class="lineno">  439 </span><span class="decl"><span class="istickedoff">remoteRealpathRecheck uioEnv _sshCfg wsRoot absPath = do</span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="istickedoff">let cmd = T.pack (&quot;readlink -f -- &quot; &lt;&gt; shellQuote absPath)</span>
+<span class="lineno">  441 </span><span class="spaces">  </span><span class="istickedoff">remoteExecText uioEnv cmd &gt;&gt;= \case</span>
+<span class="lineno">  442 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  443 </span><span class="spaces">    </span><span class="istickedoff">Right out</span>
+<span class="lineno">  444 </span><span class="spaces">      </span><span class="istickedoff">| T.null (T.strip out) -&gt; pure (Right Nothing)</span>
+<span class="lineno">  445 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">  446 </span><span class="spaces">          </span><span class="istickedoff">let resolved = T.unpack (T.strip out)</span>
+<span class="lineno">  447 </span><span class="spaces">          </span><span class="istickedoff">in case mkSafePathRemote wsRoot resolved of</span>
+<span class="lineno">  448 </span><span class="spaces">               </span><span class="istickedoff">Left pe -&gt; pure (Left (WfsPath pe))</span>
+<span class="lineno">  449 </span><span class="spaces">               </span><span class="istickedoff">Right _ -&gt; pure (Right (Just resolved))</span></span>
+<span class="lineno">  450 </span>
+<span class="lineno">  451 </span>-- | @wfsReadFile@ on the remote arm: @readlink -f@ → re-check containment →
+<span class="lineno">  452 </span>-- bounded read via @head -c &lt;ceil&gt; --@ → raw 'Text'. A missing path's
+<span class="lineno">  453 </span>-- @readlink -f@ failure yields 'WfsNotFound'. The byte cap (@head -c@)
+<span class="lineno">  454 </span>-- replaces a prior @stat -c %s@ oversize pre-check (which was GNU-only and
+<span class="lineno">  455 </span>-- broke on BSD/macOS remotes); @head -c@ is portable and still bounds the
+<span class="lineno">  456 </span>-- read to at most @ceilingBytes@, so an oversize file is read partially
+<span class="lineno">  457 </span>-- rather than rejected outright — acceptable for discovery (the section
+<span class="lineno">  458 </span>-- truncation downstream caps content regardless).
+<span class="lineno">  459 </span>remoteReadFile
+<span class="lineno">  460 </span>  :: UIOEnv -&gt; SshConfig -&gt; WorkspaceRoot -&gt; Int -&gt; FilePath
+<span class="lineno">  461 </span>  -&gt; IO (Either WorkdirFsErr Text)
+<span class="lineno">  462 </span><span class="decl"><span class="istickedoff">remoteReadFile uioEnv sshCfg wsRoot ceilingBytes absPath =</span>
+<span class="lineno">  463 </span><span class="spaces">  </span><span class="istickedoff">remoteRealpathRecheck uioEnv <span class="nottickedoff">sshCfg</span> wsRoot absPath &gt;&gt;= \case</span>
+<span class="lineno">  464 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  465 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing -&gt; pure (Left WfsNotFound)</span>
+<span class="lineno">  466 </span><span class="spaces">    </span><span class="istickedoff">Right (Just resolved) -&gt; do</span>
+<span class="lineno">  467 </span><span class="spaces">      </span><span class="istickedoff">readRes &lt;- remoteExecText uioEnv</span>
+<span class="lineno">  468 </span><span class="spaces">        </span><span class="istickedoff">(T.pack ( &quot;head -c &quot; &lt;&gt; show ceilingBytes &lt;&gt; &quot; -- &quot;</span>
+<span class="lineno">  469 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; shellQuote resolved))</span>
+<span class="lineno">  470 </span><span class="spaces">      </span><span class="istickedoff">case readRes of</span>
+<span class="lineno">  471 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  472 </span><span class="spaces">        </span><span class="istickedoff">Right raw -&gt;</span>
+<span class="lineno">  473 </span><span class="spaces">          </span><span class="istickedoff">let trimmed = T.dropWhileEnd Char.isSpace raw</span>
+<span class="lineno">  474 </span><span class="spaces">          </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null (T.strip trimmed)</span></span>
+<span class="lineno">  475 </span><span class="spaces">               </span><span class="istickedoff">then <span class="nottickedoff">pure (Left WfsNotFound)</span></span>
+<span class="lineno">  476 </span><span class="spaces">               </span><span class="istickedoff">else pure (Right (truncateSection defaultSectionCharLimit trimmed))</span></span>
+<span class="lineno">  477 </span>
+<span class="lineno">  478 </span>-- | @wfsDoesFileExist@ / @wfsDoesDirectoryExist@ on the remote arm:
+<span class="lineno">  479 </span>-- @test -&lt;flag&gt; &lt;abspath&gt;@ → parse stdout. Exempt from the @readlink -f@
+<span class="lineno">  480 </span>-- re-check (1-bit bool, no target identity). The path is NOT preceded by
+<span class="lineno">  481 </span>-- @--@ because the shell-builtin @test@ on zsh/BSD rejects @--@; this is
+<span class="lineno">  482 </span>-- safe because every path here is absolute (starts with @/@ via
+<span class="lineno">  483 </span>-- 'mkSafePathRemote' + the workspace root) and 'shellQuote'-d, so it
+<span class="lineno">  484 </span>-- cannot be parsed as a @test@ flag.
+<span class="lineno">  485 </span>remoteTestFlag :: UIOEnv -&gt; SshConfig -&gt; String -&gt; FilePath -&gt; IO Bool
+<span class="lineno">  486 </span><span class="decl"><span class="istickedoff">remoteTestFlag uioEnv _sshCfg flag absPath = do</span>
+<span class="lineno">  487 </span><span class="spaces">  </span><span class="istickedoff">let cmd = T.pack (&quot;test &quot; &lt;&gt; flag &lt;&gt; &quot; &quot; &lt;&gt; shellQuote absPath</span>
+<span class="lineno">  488 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; &quot; &amp;&amp; echo y&quot;)</span>
+<span class="lineno">  489 </span><span class="spaces">  </span><span class="istickedoff">remoteExecText uioEnv cmd &gt;&gt;= \case</span>
+<span class="lineno">  490 </span><span class="spaces">    </span><span class="istickedoff">Right out -&gt; pure (T.strip out == &quot;y&quot;)</span>
+<span class="lineno">  491 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure False</span></span></span>
+<span class="lineno">  492 </span>
+<span class="lineno">  493 </span>-- | @wfsListDirectory@ on the remote arm: @readlink -f@ → re-check
+<span class="lineno">  494 </span>-- containment → @ls -1 -- &lt;resolved&gt;@ → split lines. A missing path's
+<span class="lineno">  495 </span>-- @readlink -f@ failure (or a missing dir) yields @Right []@ (fail-soft-to-
+<span class="lineno">  496 </span>-- empty).
+<span class="lineno">  497 </span>remoteListDirectory
+<span class="lineno">  498 </span>  :: UIOEnv -&gt; SshConfig -&gt; WorkspaceRoot -&gt; FilePath
+<span class="lineno">  499 </span>  -&gt; IO (Either WorkdirFsErr [Text])
+<span class="lineno">  500 </span><span class="decl"><span class="istickedoff">remoteListDirectory uioEnv sshCfg wsRoot absPath =</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="istickedoff">remoteRealpathRecheck uioEnv <span class="nottickedoff">sshCfg</span> wsRoot absPath &gt;&gt;= \case</span>
+<span class="lineno">  502 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  503 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing -&gt; pure (Right [])</span>
+<span class="lineno">  504 </span><span class="spaces">    </span><span class="istickedoff">Right (Just resolved) -&gt; do</span>
+<span class="lineno">  505 </span><span class="spaces">      </span><span class="istickedoff">lsRes &lt;- remoteExecText uioEnv</span>
+<span class="lineno">  506 </span><span class="spaces">                 </span><span class="istickedoff">(T.pack (&quot;ls -1 -- &quot; &lt;&gt; shellQuote resolved))</span>
+<span class="lineno">  507 </span><span class="spaces">      </span><span class="istickedoff">case lsRes of</span>
+<span class="lineno">  508 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  509 </span><span class="spaces">        </span><span class="istickedoff">Right out -&gt; pure (Right (filter (not . T.null) (T.lines out)))</span></span>
+<span class="lineno">  510 </span>
+<span class="lineno">  511 </span>-- | A portable remote @stat@ for one numeric field. Tries GNU
+<span class="lineno">  512 </span>-- @stat -c &lt;fmt&gt; --@ first; on a non-numeric / empty result (the BSD
+<span class="lineno">  513 </span>-- @stat@ rejects @-c@), retries with BSD @stat -f &lt;fmt&gt;@ (no @--@, which
+<span class="lineno">  514 </span>-- BSD @stat@ also rejects). Returns the raw stdout 'Text' on success.
+<span class="lineno">  515 </span>-- A missing path's @readlink -f@ failure yields 'WfsNotFound'.
+<span class="lineno">  516 </span>remoteStatRechecked
+<span class="lineno">  517 </span>  :: UIOEnv -&gt; SshConfig -&gt; WorkspaceRoot -&gt; String -&gt; String -&gt; FilePath
+<span class="lineno">  518 </span>  -&gt; IO (Either WorkdirFsErr Text)
+<span class="lineno">  519 </span><span class="decl"><span class="istickedoff">remoteStatRechecked uioEnv sshCfg wsRoot gnuFmt bsdFmt absPath =</span>
+<span class="lineno">  520 </span><span class="spaces">  </span><span class="istickedoff">remoteRealpathRecheck uioEnv <span class="nottickedoff">sshCfg</span> wsRoot absPath &gt;&gt;= \case</span>
+<span class="lineno">  521 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  522 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing -&gt; <span class="nottickedoff">pure (Left WfsNotFound)</span></span>
+<span class="lineno">  523 </span><span class="spaces">    </span><span class="istickedoff">Right (Just resolved) -&gt; do</span>
+<span class="lineno">  524 </span><span class="spaces">      </span><span class="istickedoff">gnuRes &lt;- remoteExecText uioEnv</span>
+<span class="lineno">  525 </span><span class="spaces">                  </span><span class="istickedoff">(T.pack (&quot;stat -c &quot; &lt;&gt; gnuFmt &lt;&gt; &quot; -- &quot; &lt;&gt; shellQuote resolved))</span>
+<span class="lineno">  526 </span><span class="spaces">      </span><span class="istickedoff">case gnuRes of</span>
+<span class="lineno">  527 </span><span class="spaces">        </span><span class="istickedoff">Right out</span>
+<span class="lineno">  528 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">not (T.null (T.strip out))</span></span>
+<span class="lineno">  529 </span><span class="spaces">          </span><span class="istickedoff">, <span class="tickonlytrue">T.all isDigit (T.strip (T.dropWhile isSpace out))</span> -&gt; pure (Right out)</span>
+<span class="lineno">  530 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  531 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">bsdRes &lt;- remoteExecText uioEnv</span></span>
+<span class="lineno">  532 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">(T.pack (&quot;stat -f&quot; &lt;&gt; bsdFmt &lt;&gt; &quot; &quot; &lt;&gt; shellQuote resolved))</span></span>
+<span class="lineno">  533 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case bsdRes of</span></span>
+<span class="lineno">  534 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left e -&gt; pure (Left e)</span></span>
+<span class="lineno">  535 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right out -&gt; pure (Right out)</span></span></span>
+<span class="lineno">  536 </span>
+<span class="lineno">  537 </span>-- | Parse a non-negative integer from 'Text' stdout (the output of
+<span class="lineno">  538 </span>-- @stat -c %s@ / @stat -c %Y@). Total — returns 'Nothing' on any
+<span class="lineno">  539 </span>-- non-numeric input (including negative or empty).
+<span class="lineno">  540 </span>parseInteger :: Text -&gt; Maybe Integer
+<span class="lineno">  541 </span><span class="decl"><span class="istickedoff">parseInteger txt =</span>
+<span class="lineno">  542 </span><span class="spaces">  </span><span class="istickedoff">let t = T.dropWhile isSpace (T.strip txt)</span>
+<span class="lineno">  543 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlytrue">not (T.null t) &amp;&amp; T.all isDigit t</span></span>
+<span class="lineno">  544 </span><span class="spaces">       </span><span class="istickedoff">then Just (read (T.unpack t))</span>
+<span class="lineno">  545 </span><span class="spaces">       </span><span class="istickedoff">else <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  546 </span>
+<span class="lineno">  547 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  548 </span>-- In-memory stub arm
+<span class="lineno">  549 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  550 </span>
+<span class="lineno">  551 </span>-- | The maximum symlink-chain depth the in-memory stub will resolve before
+<span class="lineno">  552 </span>-- rejecting with 'WfsIo'. Bounds against symlink loops.
+<span class="lineno">  553 </span>maxSymlinkDepth :: Int
+<span class="lineno">  554 </span><span class="decl"><span class="istickedoff">maxSymlinkDepth = 16</span></span>
+<span class="lineno">  555 </span>
+<span class="lineno">  556 </span>-- | The in-memory stub. The stub's 'wfsReadFile' resolves 'SymlinkTarget'
+<span class="lineno">  557 </span>-- chains (depth-bounded), re-checks containment on the resolved path, and
+<span class="lineno">  558 </span>-- rejects on escape — mirroring the real remote arm's @realpath@ logic so
+<span class="lineno">  559 </span>-- the symlink-escape test is non-vacuous.
+<span class="lineno">  560 </span>mkInMemWorkdirFs :: Map RemotePath StubEntry -&gt; WorkdirFs
+<span class="lineno">  561 </span><span class="decl"><span class="istickedoff">mkInMemWorkdirFs seed = WorkdirFs</span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile = pure . stubReadFile seed</span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist = pure . stubDoesFileExist seed</span>
+<span class="lineno">  564 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist = pure . stubDoesDirectoryExist seed</span>
+<span class="lineno">  565 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory = pure . stubListDirectory seed</span>
+<span class="lineno">  566 </span><span class="spaces">  </span><span class="istickedoff">, wfsFileSize = pure . stubFileSize seed</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">, wfsModificationTime = <span class="nottickedoff">\_ -&gt; pure (Right epochZero)</span></span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">, wfsSnapshot = pure (stubSnapshot seed)</span>
+<span class="lineno">  569 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  570 </span>
+<span class="lineno">  571 </span>-- | Derive the structural snapshot from the in-memory seed ('wfsSnapshot'
+<span class="lineno">  572 </span>-- on the stub arm). Mirrors the real arms' semantics:
+<span class="lineno">  573 </span>--
+<span class="lineno">  574 </span>--   * 'Directory' entries become dir entries; their listed children are
+<span class="lineno">  575 </span>--     classified by seed lookup — 'FileContent' or an absent key ⇒ file,
+<span class="lineno">  576 </span>--     another 'Directory' ⇒ dir (recursed), 'Missing' or 'SymlinkTarget'
+<span class="lineno">  577 </span>--     ⇒ skipped (structure never follows symlinks).
+<span class="lineno">  578 </span>--   * Depth- and count-bounded like the local/remote arms.
+<span class="lineno">  579 </span>stubSnapshot :: Map RemotePath StubEntry -&gt; Either WorkdirFsErr WorkspaceSnapshot
+<span class="lineno">  580 </span><span class="decl"><span class="istickedoff">stubSnapshot seed =</span>
+<span class="lineno">  581 </span><span class="spaces">  </span><span class="istickedoff">let rootNames = case Map.lookup (stubKey &quot;.&quot;) seed of</span>
+<span class="lineno">  582 </span><span class="spaces">        </span><span class="istickedoff">Just (Directory ns) -&gt; sort ns</span>
+<span class="lineno">  583 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; let comps = sort [ firstComp (getRemotePath k)</span>
+<span class="lineno">  584 </span><span class="spaces">                              </span><span class="istickedoff">| k &lt;- Map.keys seed, <span class="tickonlytrue">getRemotePath k /= &quot;.&quot;</span> ]</span>
+<span class="lineno">  585 </span><span class="spaces">             </span><span class="istickedoff">in Set.toAscList (Set.fromList comps)   -- sorted-dedup</span>
+<span class="lineno">  586 </span><span class="spaces">      </span><span class="istickedoff">walk prefix names remaining</span>
+<span class="lineno">  587 </span><span class="spaces">        </span><span class="istickedoff">| remaining &lt;= 0 = []</span>
+<span class="lineno">  588 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = concatMap (step prefix remaining) names</span>
+<span class="lineno">  589 </span><span class="spaces">      </span><span class="istickedoff">step prefix remaining name =</span>
+<span class="lineno">  590 </span><span class="spaces">        </span><span class="istickedoff">let childRel = joinRel prefix name</span>
+<span class="lineno">  591 </span><span class="spaces">        </span><span class="istickedoff">in case Map.lookup (stubKey childRel) seed of</span>
+<span class="lineno">  592 </span><span class="spaces">             </span><span class="istickedoff">Just (Directory ns) -&gt;</span>
+<span class="lineno">  593 </span><span class="spaces">               </span><span class="istickedoff">SnapshotEntry childRel True : walk childRel (sort ns) (remaining - 1)</span>
+<span class="lineno">  594 </span><span class="spaces">             </span><span class="istickedoff">Just Missing -&gt; []</span>
+<span class="lineno">  595 </span><span class="spaces">             </span><span class="istickedoff">Just (SymlinkTarget _) -&gt; []   -- structure never follows symlinks</span>
+<span class="lineno">  596 </span><span class="spaces">             </span><span class="istickedoff">Just (FileContent _) -&gt; [SnapshotEntry childRel False]</span>
+<span class="lineno">  597 </span><span class="spaces">             </span><span class="istickedoff">Nothing -&gt; [SnapshotEntry childRel False]  -- implicit child = file</span>
+<span class="lineno">  598 </span><span class="spaces">      </span><span class="istickedoff">entries = walk &quot;&quot; rootNames snapshotMaxDepth</span>
+<span class="lineno">  599 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlyfalse">length entries &gt; maxSnapshotEntries</span></span>
+<span class="lineno">  600 </span><span class="spaces">       </span><span class="istickedoff">then <span class="nottickedoff">Left WfsOversize</span></span>
+<span class="lineno">  601 </span><span class="spaces">       </span><span class="istickedoff">else Right (WorkspaceSnapshot (sortOn snapRelPath entries))</span>
+<span class="lineno">  602 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  603 </span><span class="spaces">    </span><span class="istickedoff">stubKey t = case mkRemotePath t of</span>
+<span class="lineno">  604 </span><span class="spaces">      </span><span class="istickedoff">Right k  -&gt; k</span>
+<span class="lineno">  605 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">error (&quot;stubSnapshot: invalid seeded path: &quot; &lt;&gt; T.unpack err</span></span>
+<span class="lineno">  606 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;: &quot; &lt;&gt; T.unpack t)</span></span>
+<span class="lineno">  607 </span><span class="spaces">    </span><span class="istickedoff">firstComp = T.takeWhile (/= '/')</span>
+<span class="lineno">  608 </span><span class="spaces">    </span><span class="istickedoff">joinRel prefix name</span>
+<span class="lineno">  609 </span><span class="spaces">      </span><span class="istickedoff">| T.null prefix = name</span>
+<span class="lineno">  610 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>     = prefix &lt;&gt; &quot;/&quot; &lt;&gt; name</span></span>
+<span class="lineno">  611 </span>
+<span class="lineno">  612 </span>-- | Resolve a 'RemotePath' through 'SymlinkTarget' chains, re-checking
+<span class="lineno">  613 </span>-- containment on the resolved path at each step. Returns 'Right' with the
+<span class="lineno">  614 </span>-- final 'RemotePath' pointing at a non-symlink entry, or 'Left' on
+<span class="lineno">  615 </span>-- escape / loop / missing.
+<span class="lineno">  616 </span>resolveSymlinkChain
+<span class="lineno">  617 </span>  :: Map RemotePath StubEntry
+<span class="lineno">  618 </span>  -&gt; RemotePath
+<span class="lineno">  619 </span>  -&gt; Either WorkdirFsErr StubEntry
+<span class="lineno">  620 </span><span class="decl"><span class="istickedoff">resolveSymlinkChain seed = go 0</span>
+<span class="lineno">  621 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  622 </span><span class="spaces">    </span><span class="istickedoff">go depth rp</span>
+<span class="lineno">  623 </span><span class="spaces">      </span><span class="istickedoff">| depth &gt; maxSymlinkDepth = Left (WfsIo &quot;symlink chain too deep&quot;)</span>
+<span class="lineno">  624 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case Map.lookup rp seed of</span>
+<span class="lineno">  625 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; Left WfsNotFound</span>
+<span class="lineno">  626 </span><span class="spaces">          </span><span class="istickedoff">Just Missing -&gt; Left <span class="nottickedoff">WfsNotFound</span></span>
+<span class="lineno">  627 </span><span class="spaces">          </span><span class="istickedoff">Just (SymlinkTarget target) -&gt;</span>
+<span class="lineno">  628 </span><span class="spaces">            </span><span class="istickedoff">case checkContainment target of</span>
+<span class="lineno">  629 </span><span class="spaces">              </span><span class="istickedoff">Left pe -&gt; Left (WfsPath pe)</span>
+<span class="lineno">  630 </span><span class="spaces">              </span><span class="istickedoff">Right _ -&gt; go (depth + 1) target</span>
+<span class="lineno">  631 </span><span class="spaces">          </span><span class="istickedoff">Just entry -&gt; Right entry</span></span>
+<span class="lineno">  632 </span>
+<span class="lineno">  633 </span>-- | Lexical containment check on a 'RemotePath' against the stub's
+<span class="lineno">  634 </span>-- workspace root (@\/workspace@). Mirrors 'mkSafePathRemote' — a path
+<span class="lineno">  635 </span>-- that lexically escapes the root (e.g. @\/etc\/shadow@, @..\/passwd@) is
+<span class="lineno">  636 </span>-- rejected.
+<span class="lineno">  637 </span>checkContainment :: RemotePath -&gt; Either PathError ()
+<span class="lineno">  638 </span><span class="decl"><span class="istickedoff">checkContainment rp =</span>
+<span class="lineno">  639 </span><span class="spaces">  </span><span class="istickedoff">case mkSafePathRemote stubWorkspaceRoot (T.unpack (getRemotePath rp)) of</span>
+<span class="lineno">  640 </span><span class="spaces">    </span><span class="istickedoff">Left pe -&gt; Left pe</span>
+<span class="lineno">  641 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  642 </span>
+<span class="lineno">  643 </span>-- | The stub's workspace root. A fixed absolute path so that relative
+<span class="lineno">  644 </span>-- seeded keys (e.g. @agents.md@) anchor under it and absolute escaping
+<span class="lineno">  645 </span>-- paths (e.g. @\/etc\/shadow@) are rejected by 'mkSafePathRemote'.
+<span class="lineno">  646 </span>stubWorkspaceRoot :: WorkspaceRoot
+<span class="lineno">  647 </span><span class="decl"><span class="istickedoff">stubWorkspaceRoot = WorkspaceRoot &quot;/workspace&quot;</span></span>
+<span class="lineno">  648 </span>
+<span class="lineno">  649 </span>-- | Read a file from the in-memory stub. Resolves symlinks, re-checks
+<span class="lineno">  650 </span>-- containment, returns the (truncated) content.
+<span class="lineno">  651 </span>stubReadFile :: Map RemotePath StubEntry -&gt; RemotePath -&gt; Either WorkdirFsErr Text
+<span class="lineno">  652 </span><span class="decl"><span class="istickedoff">stubReadFile seed rp = case checkContainment rp of</span>
+<span class="lineno">  653 </span><span class="spaces">  </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">Left (WfsPath pe)</span></span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; case resolveSymlinkChain seed rp of</span>
+<span class="lineno">  655 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; Left e</span>
+<span class="lineno">  656 </span><span class="spaces">      </span><span class="istickedoff">Right (FileContent txt) -&gt;</span>
+<span class="lineno">  657 </span><span class="spaces">        </span><span class="istickedoff">let trimmed = T.dropWhileEnd Char.isSpace txt</span>
+<span class="lineno">  658 </span><span class="spaces">        </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null (T.strip trimmed)</span></span>
+<span class="lineno">  659 </span><span class="spaces">             </span><span class="istickedoff">then <span class="nottickedoff">Left WfsNotFound</span></span>
+<span class="lineno">  660 </span><span class="spaces">             </span><span class="istickedoff">else Right (truncateSection defaultSectionCharLimit trimmed)</span>
+<span class="lineno">  661 </span><span class="spaces">      </span><span class="istickedoff">Right (Directory _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;is a directory&quot;)</span></span>
+<span class="lineno">  662 </span><span class="spaces">      </span><span class="istickedoff">Right Missing -&gt; <span class="nottickedoff">Left WfsNotFound</span></span>
+<span class="lineno">  663 </span><span class="spaces">      </span><span class="istickedoff">Right (SymlinkTarget _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;unresolved symlink&quot;)</span></span></span>
+<span class="lineno">  664 </span>
+<span class="lineno">  665 </span>-- | Existence check for a file in the in-memory stub. Resolves symlinks.
+<span class="lineno">  666 </span>stubDoesFileExist :: Map RemotePath StubEntry -&gt; RemotePath -&gt; Bool
+<span class="lineno">  667 </span><span class="decl"><span class="istickedoff">stubDoesFileExist seed rp = case checkContainment rp of</span>
+<span class="lineno">  668 </span><span class="spaces">  </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  669 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; case resolveSymlinkChain seed rp of</span>
+<span class="lineno">  670 </span><span class="spaces">      </span><span class="istickedoff">Right (FileContent _) -&gt; True</span>
+<span class="lineno">  671 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; False</span></span>
+<span class="lineno">  672 </span>
+<span class="lineno">  673 </span>-- | Existence check for a directory in the in-memory stub. Does NOT
+<span class="lineno">  674 </span>-- resolve symlinks (a 'SymlinkTarget' is not a directory in the stub
+<span class="lineno">  675 </span>-- model).
+<span class="lineno">  676 </span>stubDoesDirectoryExist :: Map RemotePath StubEntry -&gt; RemotePath -&gt; Bool
+<span class="lineno">  677 </span><span class="decl"><span class="istickedoff">stubDoesDirectoryExist seed rp = case checkContainment rp of</span>
+<span class="lineno">  678 </span><span class="spaces">  </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  679 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; case Map.lookup rp seed of</span>
+<span class="lineno">  680 </span><span class="spaces">      </span><span class="istickedoff">Just (Directory _) -&gt; True</span>
+<span class="lineno">  681 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  682 </span>
+<span class="lineno">  683 </span>-- | List the immediate children of a directory in the in-memory stub.
+<span class="lineno">  684 </span>-- Returns @Right []@ on a missing directory (fail-soft-to-empty).
+<span class="lineno">  685 </span>stubListDirectory :: Map RemotePath StubEntry -&gt; RemotePath -&gt; Either WorkdirFsErr [Text]
+<span class="lineno">  686 </span><span class="decl"><span class="istickedoff">stubListDirectory seed rp = case checkContainment rp of</span>
+<span class="lineno">  687 </span><span class="spaces">  </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">Left (WfsPath pe)</span></span>
+<span class="lineno">  688 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; case Map.lookup rp seed of</span>
+<span class="lineno">  689 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; Right []</span>
+<span class="lineno">  690 </span><span class="spaces">      </span><span class="istickedoff">Just Missing -&gt; <span class="nottickedoff">Right []</span></span>
+<span class="lineno">  691 </span><span class="spaces">      </span><span class="istickedoff">Just (Directory names) -&gt; Right names</span>
+<span class="lineno">  692 </span><span class="spaces">      </span><span class="istickedoff">Just (FileContent _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;not a directory&quot;)</span></span>
+<span class="lineno">  693 </span><span class="spaces">      </span><span class="istickedoff">Just (SymlinkTarget _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;not a directory&quot;)</span></span></span>
+<span class="lineno">  694 </span>
+<span class="lineno">  695 </span>-- | File size in the in-memory stub (byte length of the 'FileContent').
+<span class="lineno">  696 </span>stubFileSize :: Map RemotePath StubEntry -&gt; RemotePath -&gt; Either WorkdirFsErr Integer
+<span class="lineno">  697 </span><span class="decl"><span class="istickedoff">stubFileSize seed rp = case checkContainment rp of</span>
+<span class="lineno">  698 </span><span class="spaces">  </span><span class="istickedoff">Left pe -&gt; <span class="nottickedoff">Left (WfsPath pe)</span></span>
+<span class="lineno">  699 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; case resolveSymlinkChain seed rp of</span>
+<span class="lineno">  700 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  701 </span><span class="spaces">      </span><span class="istickedoff">Right (FileContent txt) -&gt; Right (fromIntegral (T.length txt))</span>
+<span class="lineno">  702 </span><span class="spaces">      </span><span class="istickedoff">Right (Directory _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;is a directory&quot;)</span></span>
+<span class="lineno">  703 </span><span class="spaces">      </span><span class="istickedoff">Right Missing -&gt; <span class="nottickedoff">Left WfsNotFound</span></span>
+<span class="lineno">  704 </span><span class="spaces">      </span><span class="istickedoff">Right (SymlinkTarget _) -&gt; <span class="nottickedoff">Left (WfsIo &quot;unresolved symlink&quot;)</span></span></span>
+<span class="lineno">  705 </span>
+<span class="lineno">  706 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  707 </span>-- Fail-closed stub
+<span class="lineno">  708 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  709 </span>
+<span class="lineno">  710 </span>-- | The fail-closed stub. Every read yields 'Left WfsStub', every
+<span class="lineno">  711 </span>-- existence check yields 'False', 'wfsListDirectory' yields 'Right []'.
+<span class="lineno">  712 </span>mkWorkdirFsStub :: WorkdirFs
+<span class="lineno">  713 </span><span class="decl"><span class="istickedoff">mkWorkdirFsStub = WorkdirFs</span>
+<span class="lineno">  714 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile = \_ -&gt; pure (Left WfsStub)</span>
+<span class="lineno">  715 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist = \_ -&gt; pure False</span>
+<span class="lineno">  716 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist = \_ -&gt; pure False</span>
+<span class="lineno">  717 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory = \_ -&gt; pure (Right [])</span>
+<span class="lineno">  718 </span><span class="spaces">  </span><span class="istickedoff">, wfsFileSize = \_ -&gt; pure (Left WfsStub)</span>
+<span class="lineno">  719 </span><span class="spaces">  </span><span class="istickedoff">, wfsModificationTime = \_ -&gt; pure (Left WfsStub)</span>
+<span class="lineno">  720 </span><span class="spaces">  </span><span class="istickedoff">, wfsSnapshot = pure (Left WfsStub)</span>
+<span class="lineno">  721 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  722 </span>
+<span class="lineno">  723 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  724 </span>-- Snapshot accessors (pure; consumed by the discovery scanners)
+<span class="lineno">  725 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  726 </span>
+<span class="lineno">  727 </span>-- | The workspace root-relative path of a direct child of @base@
+<span class="lineno">  728 </span>-- (@&quot;&quot;@ = the root itself).
+<span class="lineno">  729 </span>snapJoin :: Text -&gt; Text -&gt; Text
+<span class="lineno">  730 </span><span class="decl"><span class="istickedoff">snapJoin base name</span>
+<span class="lineno">  731 </span><span class="spaces">  </span><span class="istickedoff">| T.null base = name</span>
+<span class="lineno">  732 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   = base &lt;&gt; &quot;/&quot; &lt;&gt; name</span></span>
+<span class="lineno">  733 </span>
+<span class="lineno">  734 </span>-- | Does @path@ exist in the snapshot as a directory? Convention dirs are
+<span class="lineno">  735 </span>-- dot-dirs reached by DIRECT path (e.g. @@repo/.agents@@), so lookups are
+<span class="lineno">  736 </span>-- unfiltered.
+<span class="lineno">  737 </span>snapIsDirectoryAt :: WorkspaceSnapshot -&gt; Text -&gt; Bool
+<span class="lineno">  738 </span><span class="decl"><span class="istickedoff">snapIsDirectoryAt snap path =</span>
+<span class="lineno">  739 </span><span class="spaces">  </span><span class="istickedoff">any (\e -&gt; snapRelPath e == path &amp;&amp; snapIsDir e) (snapEntries snap)</span></span>
+<span class="lineno">  740 </span>
+<span class="lineno">  741 </span>-- | Does @path@ exist in the snapshot as a regular file?
+<span class="lineno">  742 </span>snapIsFileAt :: WorkspaceSnapshot -&gt; Text -&gt; Bool
+<span class="lineno">  743 </span><span class="decl"><span class="istickedoff">snapIsFileAt snap path =</span>
+<span class="lineno">  744 </span><span class="spaces">  </span><span class="istickedoff">any (\e -&gt; snapRelPath e == path &amp;&amp; not (snapIsDir e)) (snapEntries snap)</span></span>
+<span class="lineno">  745 </span>
+<span class="lineno">  746 </span>-- | The immediate child NAMES (both kinds) of @base@ whose basename is
+<span class="lineno">  747 </span>-- visible (non-hidden — parity with @ls -1@). Sorted.
+<span class="lineno">  748 </span>snapChildNamesAt :: WorkspaceSnapshot -&gt; Text -&gt; [Text]
+<span class="lineno">  749 </span><span class="decl"><span class="istickedoff">snapChildNamesAt snap base =</span>
+<span class="lineno">  750 </span><span class="spaces">  </span><span class="istickedoff">sort</span>
+<span class="lineno">  751 </span><span class="spaces">    </span><span class="istickedoff">[ name</span>
+<span class="lineno">  752 </span><span class="spaces">    </span><span class="istickedoff">| e &lt;- snapEntries snap</span>
+<span class="lineno">  753 </span><span class="spaces">    </span><span class="istickedoff">, let rel = snapRelPath e</span>
+<span class="lineno">  754 </span><span class="spaces">    </span><span class="istickedoff">, T.isPrefixOf prefix rel</span>
+<span class="lineno">  755 </span><span class="spaces">    </span><span class="istickedoff">, <span class="tickonlytrue">T.length rel &gt; T.length prefix</span></span>
+<span class="lineno">  756 </span><span class="spaces">    </span><span class="istickedoff">, let name = T.drop (T.length prefix) rel</span>
+<span class="lineno">  757 </span><span class="spaces">    </span><span class="istickedoff">, not (T.isInfixOf &quot;/&quot; name)</span>
+<span class="lineno">  758 </span><span class="spaces">    </span><span class="istickedoff">, <span class="tickonlytrue">not (&quot;.&quot; `T.isPrefixOf` name)</span></span>
+<span class="lineno">  759 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">  760 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  761 </span><span class="spaces">    </span><span class="istickedoff">prefix = if T.null base then &quot;&quot; else base &lt;&gt; &quot;/&quot;</span></span>
+<span class="lineno">  762 </span>
+<span class="lineno">  763 </span>-- | The immediate visible child DIRECTORIES of @base@, as full relative
+<span class="lineno">  764 </span>-- paths, sorted. Hidden children are excluded (parity with @ls -1@).
+<span class="lineno">  765 </span>snapChildDirsAt :: WorkspaceSnapshot -&gt; Text -&gt; [Text]
+<span class="lineno">  766 </span><span class="decl"><span class="istickedoff">snapChildDirsAt snap base =</span>
+<span class="lineno">  767 </span><span class="spaces">  </span><span class="istickedoff">[ snapJoin base n | n &lt;- snapChildNamesAt snap base, <span class="tickonlytrue">snapIsDirectoryAt snap (snapJoin base n)</span> ]</span></span>
+<span class="lineno">  768 </span>
+<span class="lineno">  769 </span>-- | The immediate visible child FILES of @base@, as full relative paths,
+<span class="lineno">  770 </span>-- sorted. Hidden children are excluded (parity with @ls -1@).
+<span class="lineno">  771 </span>snapChildFilesAt :: WorkspaceSnapshot -&gt; Text -&gt; [Text]
+<span class="lineno">  772 </span><span class="decl"><span class="istickedoff">snapChildFilesAt snap base =</span>
+<span class="lineno">  773 </span><span class="spaces">  </span><span class="istickedoff">[ <span class="nottickedoff">snapJoin base n</span> | n &lt;- snapChildNamesAt snap base, <span class="tickonlyfalse">snapIsFileAt snap (snapJoin base n)</span> ]</span></span>
+<span class="lineno">  774 </span>
+<span class="lineno">  775 </span>-- | The top-level visible directories of the snapshot (the cloned repo
+<span class="lineno">  776 </span>-- names), sorted.
+<span class="lineno">  777 </span>snapTopDirs :: WorkspaceSnapshot -&gt; [Text]
+<span class="lineno">  778 </span><span class="decl"><span class="istickedoff">snapTopDirs snap = snapChildDirsAt snap &quot;&quot;</span></span>
+<span class="lineno">  779 </span>
+<span class="lineno">  780 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  781 </span>-- Internal helpers
+<span class="lineno">  782 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  783 </span>
+<span class="lineno">  784 </span>-- | The epoch zero timestamp, used as a fallback for the in-memory stub's
+<span class="lineno">  785 </span>-- 'wfsModificationTime' (which has no real mtime).
+<span class="lineno">  786 </span>epochZero :: UTCTime
+<span class="lineno">  787 </span><span class="decl"><span class="nottickedoff">epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)</span></span>
+
+</pre>
+</body>
+</html>

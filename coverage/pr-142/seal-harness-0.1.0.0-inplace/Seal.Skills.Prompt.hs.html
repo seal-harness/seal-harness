@@ -1,0 +1,141 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | System-prompt construction for skills. This module renders the
+<span class="lineno">    3 </span>-- @\&lt;available_skills\&gt;@ catalog — a grouped listing of every skill's id +
+<span class="lineno">    4 </span>-- description — and appends it to the resolved system prompt so the model
+<span class="lineno">    5 </span>-- discovers and uses skills. The catalog is built from 'sbList' (the
+<span class="lineno">    6 </span>-- unioned backend: user ⊕ builtin, and later workdir ⊕ user ⊕ builtin),
+<span class="lineno">    7 </span>-- grouped by 'skGroup', and truncated to a token-safe budget.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The catalog is /teaching/, not enforcement: it tells the model which
+<span class="lineno">   10 </span>-- skills exist and that it should call @SKILL_LOAD@ to read one. It does
+<span class="lineno">   11 </span>-- not auto-load skill bodies (only the operator-configured @autoload@ id
+<span class="lineno">   12 </span>-- is auto-injected, via 'Seal.Skills.Autoload').
+<span class="lineno">   13 </span>module Seal.Skills.Prompt
+<span class="lineno">   14 </span>  ( availableSkillsBlock
+<span class="lineno">   15 </span>  , injectAvailableSkills
+<span class="lineno">   16 </span>  , availableSkillsBudget
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.List (groupBy, sortOn)
+<span class="lineno">   20 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Seal.Skills.Backend (SkillBackend (..))
+<span class="lineno">   25 </span>import Seal.Skills.Types (Skill (..), skillIdText)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- | A soft character budget for the whole @\&lt;available_skills\&gt;@ block.
+<span class="lineno">   28 </span>-- Keeps the catalog token-safe even when a deployment has many skills;
+<span class="lineno">   29 </span>-- once the budget is exhausted, the block is truncated with a count of the
+<span class="lineno">   30 </span>-- remaining skills. Large enough that a typical deployment's full catalog
+<span class="lineno">   31 </span>-- fits intact.
+<span class="lineno">   32 </span>availableSkillsBudget :: Int
+<span class="lineno">   33 </span><span class="decl"><span class="istickedoff">availableSkillsBudget = 4096</span></span>
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | Render the @\&lt;available_skills\&gt;@ catalog from a list of skills.
+<span class="lineno">   36 </span>-- Skills are grouped by 'skGroup' (a header per group; ungrouped skills
+<span class="lineno">   37 </span>-- fall under a default \&quot;Skills\&quot; header), each entry is
+<span class="lineno">   38 </span>-- @\- \&lt;id\&gt;: \&lt;description\&gt;@, and the whole block is wrapped in
+<span class="lineno">   39 </span>-- @\&lt;available_skills\&gt;@ \/ @\&lt;\/available_skills\&gt;@ tags. Returns the
+<span class="lineno">   40 </span>-- empty 'Text' when the list is empty (the caller skips injection in that
+<span class="lineno">   41 </span>-- case so no empty tags are emitted). The block is truncated to
+<span class="lineno">   42 </span>-- 'availableSkillsBudget' characters with a tail count when exceeded.
+<span class="lineno">   43 </span>--
+<span class="lineno">   44 </span>-- The block ends with a one-line note nudging the model to load a skill's
+<span class="lineno">   45 </span>-- full body via @SKILL_LOAD@ before relying on it.
+<span class="lineno">   46 </span>availableSkillsBlock :: [Skill] -&gt; Text
+<span class="lineno">   47 </span><span class="decl"><span class="istickedoff">availableSkillsBlock [] = &quot;&quot;</span>
+<span class="lineno">   48 </span><span class="spaces"></span><span class="istickedoff">availableSkillsBlock skills =</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">truncateBlock availableSkillsBudget (fullBlock skills)</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | The untruncated catalog block.
+<span class="lineno">   52 </span>fullBlock :: [Skill] -&gt; Text
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">fullBlock skills =</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">&quot;&lt;available_skills&gt;\n&quot;</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; T.intercalate &quot;\n\n&quot; (map renderGroup grouped)</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n\nCall SKILL_LOAD with an id to read a skill's full body before relying on it.&quot;</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;\n&lt;/available_skills&gt;&quot;</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">-- Sort by (group, id) then group by group. Ungrouped (Nothing) sorts</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">-- first under a generic header; grouped skills follow in alphabetical</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">-- group order.</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">sorted = sortOn (\s -&gt; (groupKey s, skillIdText (skId s))) skills</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">grouped = groupBy (\a b -&gt; groupKey a == groupKey b) sorted</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">groupKey s = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (skGroup s)</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | Render one group's section: a header line (the group name, or
+<span class="lineno">   67 </span>-- \&quot;Skills\&quot; for the ungrouped section) followed by the @\- id: desc@
+<span class="lineno">   68 </span>-- lines for each skill in the group.
+<span class="lineno">   69 </span>renderGroup :: [Skill] -&gt; Text
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">renderGroup [] = <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">   71 </span><span class="spaces"></span><span class="istickedoff">renderGroup group@(s:_) =</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">header &lt;&gt; &quot;\n&quot; &lt;&gt; T.intercalate &quot;\n&quot; [ &quot;- &quot; &lt;&gt; skillIdText (skId x) &lt;&gt; &quot;: &quot; &lt;&gt; desc x | x &lt;- group ]</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">header = case skGroup s of</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">Just g  -&gt; &quot;## &quot; &lt;&gt; g</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; &quot;## Skills&quot;</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">desc x = let d = skDescription x in if T.null d then &quot;(no description)&quot; else d</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Truncate @block@ to @budget@ characters, appending a tail notice with
+<span class="lineno">   80 </span>-- the number of characters elided when truncation occurs. Strings at or
+<span class="lineno">   81 </span>-- under the budget are returned as-is. Truncation happens on a character
+<span class="lineno">   82 </span>-- boundary (Haskell 'Text' is Unicode-correct).
+<span class="lineno">   83 </span>truncateBlock :: Int -&gt; Text -&gt; Text
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">truncateBlock budget block</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">| T.length block &lt;= budget = block</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">T.take budget block</span>
+<span class="lineno">   88 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;\n[...catalog truncated at &quot;</span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; T.pack (show budget)</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; chars; &quot;</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; T.pack (show (T.length block - budget))</span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; more chars elided...]&quot;</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Append the @\&lt;available_skills\&gt;@ catalog to the resolved system
+<span class="lineno">   95 </span>-- prompt. Calls 'sbList' on the backend, renders the block, and appends it
+<span class="lineno">   96 </span>-- after any existing prompt. Returns the prompt unchanged (no catalog)
+<span class="lineno">   97 </span>-- when the backend lists no skills, so no empty tags are ever emitted.
+<span class="lineno">   98 </span>--
+<span class="lineno">   99 </span>-- The catalog is appended /after/ the auto-loaded skill body (the caller
+<span class="lineno">  100 </span>-- runs 'Seal.Skills.Autoload.injectAutoloadSkill' first, then this). This
+<span class="lineno">  101 </span>-- ordering keeps the stable identity prefix first, the auto-loaded
+<span class="lineno">  102 </span>-- orientation next, and the dynamic catalog last — so prefix-cache hits
+<span class="lineno">  103 </span>-- are maximized and the most volatile content is at the tail.
+<span class="lineno">  104 </span>injectAvailableSkills
+<span class="lineno">  105 </span>  :: SkillBackend
+<span class="lineno">  106 </span>  -- ^ The skill store (typically the unioned backend).
+<span class="lineno">  107 </span>  -&gt; Maybe Text
+<span class="lineno">  108 </span>  -- ^ The resolved system prompt so far (base + autoload body, or
+<span class="lineno">  109 </span>  -- 'Nothing' when no agent is bound and no autoload skill injected).
+<span class="lineno">  110 </span>  -&gt; IO (Maybe Text)
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">injectAvailableSkills backend mPrompt = do</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">skills &lt;- sbList backend</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">let block = availableSkillsBlock skills</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">if T.null block</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">then pure mPrompt</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">else pure (Just (case mPrompt of</span>
+<span class="lineno">  117 </span><span class="spaces">                        </span><span class="istickedoff">Nothing  -&gt; block</span>
+<span class="lineno">  118 </span><span class="spaces">                        </span><span class="istickedoff">Just base -&gt; base &lt;&gt; &quot;\n\n&quot; &lt;&gt; block))</span></span>
+
+</pre>
+</body>
+</html>

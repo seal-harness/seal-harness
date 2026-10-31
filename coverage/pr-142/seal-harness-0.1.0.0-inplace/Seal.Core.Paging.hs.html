@@ -1,0 +1,102 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The Dynamic Retrieval page-sizer and a generic 'paginate'.
+<span class="lineno">    2 </span>--
+<span class="lineno">    3 </span>-- File- and ISA-agnostic. The sizer computes a page size as
+<span class="lineno">    4 </span>-- @clamp floor ceiling (round (coeff * sqrt total))@, with a per-call
+<span class="lineno">    5 </span>-- explicit limit overriding the computed size (clamped to
+<span class="lineno">    6 </span>-- @[1, ppCeiling]@ so a caller can never request an unbounded window).
+<span class="lineno">    7 </span>module Seal.Core.Paging
+<span class="lineno">    8 </span>  ( PageParams (..)
+<span class="lineno">    9 </span>  , Page (..)
+<span class="lineno">   10 </span>  , clamp
+<span class="lineno">   11 </span>  , pageSize
+<span class="lineno">   12 </span>  , windowSize
+<span class="lineno">   13 </span>  , paginate
+<span class="lineno">   14 </span>  , defaultPageParams
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>-- | Sizer parameters. Invariants: @1 &lt;= ppFloor &lt;= ppCeiling@ and
+<span class="lineno">   18 </span>-- @ppCoeff &gt;= 0@.
+<span class="lineno">   19 </span>data PageParams = PageParams
+<span class="lineno">   20 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ppFloor</span></span></span>   :: !Int   -- ^ minimum page size (invariant: @1 &lt;= ppFloor &lt;= ppCeiling@)
+<span class="lineno">   21 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ppCeiling</span></span></span> :: !Int   -- ^ maximum page size
+<span class="lineno">   22 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ppCoeff</span></span></span>   :: !Double -- ^ @A@ in @round(A * sqrt total)@ (invariant: @&gt;= 0@)
+<span class="lineno">   23 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>-- | A page of results plus the metadata a model needs to page forward.
+<span class="lineno">   26 </span>data Page a = Page
+<span class="lineno">   27 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">pgItems</span></span></span>   :: [a]   -- ^ the windowed items, in input order
+<span class="lineno">   28 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgOffset</span></span></span>  :: !Int  -- ^ 0-based offset this page starts at (clamped to @[0,total]@)
+<span class="lineno">   29 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgTotal</span></span></span>   :: !Int  -- ^ total item count (== length of the input list)
+<span class="lineno">   30 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgHasMore</span></span></span> :: !Bool -- ^ @pgOffset + length pgItems &lt; pgTotal@
+<span class="lineno">   31 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | @clamp lo hi x = max lo (min hi x)@. Value last, matching
+<span class="lineno">   34 </span>-- @Data.Ord.clamp (lo,hi) x@.
+<span class="lineno">   35 </span>clamp :: Int -&gt; Int -&gt; Int -&gt; Int
+<span class="lineno">   36 </span><span class="decl"><span class="istickedoff">clamp lo hi x = max lo (min hi x)</span></span>
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | @pageSize params total = clamp ppFloor ppCeiling (round (ppCoeff * sqrt total))@.
+<span class="lineno">   39 </span>-- Result is always within @[ppFloor, ppCeiling]@.
+<span class="lineno">   40 </span>pageSize :: PageParams -&gt; Int -&gt; Int
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">pageSize (PageParams floor' ceiling' coeff) total =</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">clamp floor' ceiling' (round (coeff * sqrt (fromIntegral total :: Double)))</span></span>
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | The single source of truth for &quot;how many items to return&quot;, shared by
+<span class="lineno">   45 </span>-- 'paginate' (list path) and 'Seal.Text.LineFile.readLineWindow'
+<span class="lineno">   46 </span>-- (streaming path) so they cannot drift.
+<span class="lineno">   47 </span>--
+<span class="lineno">   48 </span>-- @windowSize params total mLimit = maybe (pageSize params total) (clamp 1 ppCeiling) mLimit@
+<span class="lineno">   49 </span>windowSize :: PageParams -&gt; Int -&gt; Maybe Int -&gt; Int
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">windowSize params@(PageParams _ ceiling' _) total mLimit =</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">case mLimit of</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">Nothing  -&gt; pageSize params total</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">Just lim -&gt; clamp 1 ceiling' lim</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | @paginate params offset mLimit items@, where @total = length items@.
+<span class="lineno">   56 </span>--
+<span class="lineno">   57 </span>--   * @offset'  = clamp 0 total offset@
+<span class="lineno">   58 </span>--   * @size     = windowSize params total mLimit@
+<span class="lineno">   59 </span>--   * @window   = take size (drop offset' items)@
+<span class="lineno">   60 </span>paginate :: PageParams -&gt; Int -&gt; Maybe Int -&gt; [a] -&gt; Page a
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">paginate params offset mLimit items =</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">let total   = length items</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">offset' = clamp 0 total offset</span>
+<span class="lineno">   64 </span><span class="spaces">      </span><span class="istickedoff">size    = windowSize params total mLimit</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">window  = take size (drop offset' items)</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">in Page</span>
+<span class="lineno">   67 </span><span class="spaces">       </span><span class="istickedoff">{ pgItems   = window</span>
+<span class="lineno">   68 </span><span class="spaces">       </span><span class="istickedoff">, pgOffset  = offset'</span>
+<span class="lineno">   69 </span><span class="spaces">       </span><span class="istickedoff">, pgTotal   = total</span>
+<span class="lineno">   70 </span><span class="spaces">       </span><span class="istickedoff">, pgHasMore = offset' + length window &lt; total</span>
+<span class="lineno">   71 </span><span class="spaces">       </span><span class="istickedoff">}</span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | 'PageParams' used everywhere in this milestone.
+<span class="lineno">   74 </span>-- @PageParams { ppFloor = 500, ppCeiling = 2000, ppCoeff = 0.0 }@.
+<span class="lineno">   75 </span>-- A flat 500-line default (matching Hermes' read_file), with a 2000-line
+<span class="lineno">   76 </span>-- hard ceiling. @ppCoeff = 0@ means @pageSize = clamp 500 2000 0 = 500@
+<span class="lineno">   77 </span>-- regardless of total line count — no dynamic sqrt scaling.
+<span class="lineno">   78 </span>defaultPageParams :: PageParams
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">defaultPageParams = PageParams { ppFloor = 500, ppCeiling = 2000, ppCoeff = 0.0 }</span></span>
+
+</pre>
+</body>
+</html>

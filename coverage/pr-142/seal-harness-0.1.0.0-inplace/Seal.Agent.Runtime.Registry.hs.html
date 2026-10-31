@@ -1,0 +1,211 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The in-process agent runtime registry. Tracks live subagent instances
+<span class="lineno">    3 </span>-- spawned by AGENT_START so the parent (or operator) can list them, read
+<span class="lineno">    4 </span>-- status, and interrupt by id.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- The registry is keyed by 'SubagentId' (def-id + random suffix), so multiple
+<span class="lineno">    7 </span>-- concurrent children of the same def don't collide. Each 'AgentInstance'
+<span class="lineno">    8 </span>-- binds a 'SubagentId' to its def id, fresh 'SessionId', status, the forked
+<span class="lineno">    9 </span>-- worker's 'ThreadId' (for interrupt), and the parent's delegation depth.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Scope: in-process instances only — no tmux/harness integration (that is
+<span class="lineno">   12 </span>-- the separate Phase 3 Harnesses group, a different concern). Lifecycle ops
+<span class="lineno">   13 </span>-- (@AGENT_INSTANCES@ / @AGENT_START@ / @AGENT_STATUS@ / @AGENT_STOP@ /
+<span class="lineno">   14 </span>-- @AGENT_INTERRUPT@) are Trusted (not Audited) because running an instance is
+<span class="lineno">   15 </span>-- harness-internal, not an evolutionary mutation.
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- 'startAgent' takes the worker action @IO ()@ as a parameter so the
+<span class="lineno">   18 </span>-- registry is testable without dragging in 'Seal.Agent.Loop.runTurn' /
+<span class="lineno">   19 </span>-- 'Seal.Types.Env'. The 'Seal.ISA.Ops.Agent' opcode builds the worker from a
+<span class="lineno">   20 </span>-- fresh 'AgentEnv' over a def's provider/model/system/tools and passes it in.
+<span class="lineno">   21 </span>module Seal.Agent.Runtime.Registry
+<span class="lineno">   22 </span>  ( AgentStatus (..)
+<span class="lineno">   23 </span>  , AgentInstance (..)
+<span class="lineno">   24 </span>  , AgentRuntime
+<span class="lineno">   25 </span>  , newAgentRuntime
+<span class="lineno">   26 </span>  , startAgent
+<span class="lineno">   27 </span>  , registerCompletedAgent
+<span class="lineno">   28 </span>  , stopAgent
+<span class="lineno">   29 </span>  , interruptAgent
+<span class="lineno">   30 </span>  , listAgents
+<span class="lineno">   31 </span>  , agentStatus
+<span class="lineno">   32 </span>  , agentInstanceBySubagentId
+<span class="lineno">   33 </span>  ) where
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+<span class="lineno">   36 </span>import Control.Concurrent.STM
+<span class="lineno">   37 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   38 </span>import Data.Map.Strict (Map)
+<span class="lineno">   39 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   40 </span>import Data.Maybe (isJust)
+<span class="lineno">   41 </span>import Data.Text (Text)
+<span class="lineno">   42 </span>import Data.Text qualified as T
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>import Seal.Agent.Def.Types (AgentDefId)
+<span class="lineno">   45 </span>import Seal.Agent.Runtime.Delegation (SubagentId (..))
+<span class="lineno">   46 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | The lifecycle status of a running agent instance. 'Crashed' carries the
+<span class="lineno">   49 </span>-- exception message; 'Interrupted' means the parent/operator requested a
+<span class="lineno">   50 </span>-- stop via 'interruptAgent' (sets a flag the worker polls between turns).
+<span class="lineno">   51 </span>data AgentStatus = Starting | Running | Idle | Stopped | Interrupted | Crashed Text
+<span class="lineno">   52 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | One running agent instance, bound to a definition, a fresh session, and
+<span class="lineno">   55 </span>-- a subagent id (the registry key).
+<span class="lineno">   56 </span>data AgentInstance = AgentInstance
+<span class="lineno">   57 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">aiId</span></span></span>         :: AgentDefId
+<span class="lineno">   58 </span>    -- ^ The def the child was spawned from (for display / lookup).
+<span class="lineno">   59 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiSubagentId</span></span></span> :: SubagentId
+<span class="lineno">   60 </span>    -- ^ The registry key (def-id + random suffix). Unique per spawn.
+<span class="lineno">   61 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">aiSession</span></span></span>    :: SessionId
+<span class="lineno">   62 </span>    -- ^ The fresh session the child runs under.
+<span class="lineno">   63 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiStatus</span></span></span>     :: AgentStatus
+<span class="lineno">   64 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiThreadId</span></span></span>   :: ThreadId
+<span class="lineno">   65 </span>    -- ^ The forked worker thread (killed on stop / interrupt).
+<span class="lineno">   66 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">aiDepth</span></span></span>      :: Int
+<span class="lineno">   67 </span>    -- ^ The parent's delegation depth (0 = top-level parent). The child's
+<span class="lineno">   68 </span>    -- depth is @aiDepth + 1@; checked against @max_spawn_depth@ before
+<span class="lineno">   69 </span>    -- spawning.
+<span class="lineno">   70 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>-- | The STM-backed registry of running instances, keyed by 'SubagentId'. No
+<span class="lineno">   73 </span>-- two running instances share a subagent id: 'startAgent' generates a fresh
+<span class="lineno">   74 </span>-- one per spawn. 'stopAgent' removes the entry.
+<span class="lineno">   75 </span>newtype AgentRuntime = AgentRuntime (TVar (Map SubagentId AgentInstance))
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Build an empty runtime.
+<span class="lineno">   78 </span>newAgentRuntime :: IO AgentRuntime
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">newAgentRuntime = AgentRuntime &lt;$&gt; newTVarIO Map.empty</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Start a new agent instance bound to the given def id + fresh session +
+<span class="lineno">   82 </span>-- subagent id. The worker action is forked; its 'ThreadId' is recorded.
+<span class="lineno">   83 </span>-- Returns @Left err@ if an instance is already running for this subagent id
+<span class="lineno">   84 </span>-- (shouldn't happen since subagent ids are freshly minted, but the check is
+<span class="lineno">   85 </span>-- race-safe). The worker's status transitions to 'Running' once the fork
+<span class="lineno">   86 </span>-- succeeds, or 'Crashed' on exception.
+<span class="lineno">   87 </span>startAgent :: AgentRuntime -&gt; AgentDefId -&gt; SubagentId -&gt; SessionId -&gt; Int -&gt; IO () -&gt; IO (Either Text AgentInstance)
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">startAgent (AgentRuntime tv) aid subagentId session depth worker = do</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">tid &lt;- forkIO (runWorker tv subagentId worker)</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">mInst &lt;- atomically $ do</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">insts &lt;- readTVar tv</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">if <span class="tickonlyfalse">Map.member subagentId insts</span></span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">then <span class="nottickedoff">pure Nothing</span>  -- lost the race; shouldn't happen with random ids</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">else do</span>
+<span class="lineno">   95 </span><span class="spaces">        </span><span class="istickedoff">let inst = AgentInstance aid <span class="nottickedoff">subagentId</span> <span class="nottickedoff">session</span> Running tid <span class="nottickedoff">depth</span></span>
+<span class="lineno">   96 </span><span class="spaces">        </span><span class="istickedoff">writeTVar tv (Map.insert subagentId inst insts)</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">pure (Just <span class="nottickedoff">inst</span>)</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">case mInst of</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">Just inst -&gt; pure (Right <span class="nottickedoff">inst</span>)</span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">Nothing   -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">killThread tid</span></span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (Left &quot;agent already running for this subagent id&quot;)</span></span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Register a synchronously-completed child in the runtime registry. The
+<span class="lineno">  105 </span>-- synchronous delegation model runs the worker to completion BEFORE this is
+<span class="lineno">  106 </span>-- called (the 'ChildResult' payload IS the post-hoc record), so the instance
+<span class="lineno">  107 </span>-- is recorded with status 'Stopped' (the child has already finished) and the
+<span class="lineno">  108 </span>-- @ThreadId@ of the registering thread (the parent's). This makes the child
+<span class="lineno">  109 </span>-- visible to 'AGENT_INSTANCES' / 'AGENT_STATUS' / 'AGENT_STOP' after the
+<span class="lineno">  110 </span>-- synchronous run completes. 'AGENT_STOP' removes it; 'AGENT_INTERRUPT'
+<span class="lineno">  111 </span>-- flips its status to 'Interrupted' (a no-op for an already-stopped child,
+<span class="lineno">  112 </span>-- but harmless). Idempotent: re-registering the same subagent id overwrites
+<span class="lineno">  113 </span>-- the prior entry (the second registration wins).
+<span class="lineno">  114 </span>registerCompletedAgent
+<span class="lineno">  115 </span>  :: AgentRuntime -&gt; AgentDefId -&gt; SubagentId -&gt; SessionId -&gt; Int -&gt; IO ()
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">registerCompletedAgent (AgentRuntime tv) aid subagentId session depth = do</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">tid &lt;- myThreadId</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="istickedoff">insts &lt;- readTVar tv</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">let inst = AgentInstance aid subagentId <span class="nottickedoff">session</span> Stopped <span class="nottickedoff">tid</span> <span class="nottickedoff">depth</span></span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">writeTVar tv (Map.insert subagentId inst insts)</span></span>
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | Run the worker action, transitioning the instance to 'Crashed' on
+<span class="lineno">  124 </span>-- exception. A normal completion leaves the status as 'Running' until the
+<span class="lineno">  125 </span>-- registry's 'stopAgent' is called (the worker is the child turn; reaching
+<span class="lineno">  126 </span>-- its end without exception is a clean completion that the orchestrator
+<span class="lineno">  127 </span>-- observes via 'runDelegate').
+<span class="lineno">  128 </span>runWorker :: TVar (Map SubagentId AgentInstance) -&gt; SubagentId -&gt; IO () -&gt; IO ()
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">runWorker tv subagentId worker =</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">catch worker $ \(e :: SomeException) -&gt;</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">atomically (modifyTVar' tv (Map.adjust (\i -&gt; i { aiStatus = Crashed <span class="nottickedoff">(T.pack (show e))</span> }) subagentId))</span></span>
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>-- | Stop a running agent instance: kill the thread, remove the entry.
+<span class="lineno">  134 </span>-- Idempotent (stopping a non-running subagent id is a success with a
+<span class="lineno">  135 </span>-- \&quot;not running\&quot; message, not an error). Always leaves the registry without
+<span class="lineno">  136 </span>-- an entry for this subagent id, so a fresh 'startAgent' can proceed.
+<span class="lineno">  137 </span>stopAgent :: AgentRuntime -&gt; SubagentId -&gt; IO (Either Text ())
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">stopAgent (AgentRuntime tv) subagentId = do</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">mInst &lt;- atomically $ do</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">insts &lt;- readTVar tv</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup subagentId insts of</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">Just i  -&gt; do</span>
+<span class="lineno">  144 </span><span class="spaces">        </span><span class="istickedoff">writeTVar tv (Map.delete subagentId insts)</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff">pure (Just i)</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">case mInst of</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Right ())</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">Just i  -&gt; do</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">killThread (aiThreadId i)</span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">(Right ())</span></span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Request that a single running subagent stop at its next iteration
+<span class="lineno">  153 </span>-- boundary. Does NOT hard-kill the worker thread (Haskell can't safely); sets
+<span class="lineno">  154 </span>-- the instance's status to 'Interrupted' so the worker (which polls its
+<span class="lineno">  155 </span>-- 'crhInterrupted' hook between turns) can exit cleanly. Returns 'True' if a
+<span class="lineno">  156 </span>-- matching subagent was found.
+<span class="lineno">  157 </span>--
+<span class="lineno">  158 </span>-- The worker-builder is responsible for polling the 'crhInterrupted' IORef
+<span class="lineno">  159 </span>-- between turn iterations and returning 'CerInterrupted' when it flips. The
+<span class="lineno">  160 </span>-- registry cannot force the worker to stop — only the worker can decide to
+<span class="lineno">  161 </span>-- exit. 'interruptAgent' /sets the flag and the status/; the worker /observes
+<span class="lineno">  162 </span>-- the flag/.
+<span class="lineno">  163 </span>interruptAgent :: AgentRuntime -&gt; SubagentId -&gt; IO Bool
+<span class="lineno">  164 </span><span class="decl"><span class="istickedoff">interruptAgent (AgentRuntime tv) subagentId = do</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">mInst &lt;- atomically $ do</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">insts &lt;- readTVar tv</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup subagentId insts of</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">Just i  -&gt; do</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="istickedoff">let i' = i { aiStatus = Interrupted }</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="istickedoff">writeTVar tv (Map.insert subagentId i' insts)</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">pure (Just <span class="nottickedoff">i'</span>)</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">pure (isJust mInst)</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | Snapshot all running instances.
+<span class="lineno">  176 </span>listAgents :: AgentRuntime -&gt; IO [AgentInstance]
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">listAgents (AgentRuntime tv) = Map.elems &lt;$&gt; readTVarIO tv</span></span>
+<span class="lineno">  178 </span>
+<span class="lineno">  179 </span>-- | Read one instance's status. @Nothing@ if not running.
+<span class="lineno">  180 </span>agentStatus :: AgentRuntime -&gt; SubagentId -&gt; IO (Maybe AgentStatus)
+<span class="lineno">  181 </span><span class="decl"><span class="istickedoff">agentStatus (AgentRuntime tv) subagentId =</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">fmap aiStatus . Map.lookup subagentId &lt;$&gt; readTVarIO tv</span></span>
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | Look up a full instance by subagent id (for the opcode to read its def
+<span class="lineno">  185 </span>-- id, session id, depth, etc.).
+<span class="lineno">  186 </span>agentInstanceBySubagentId :: AgentRuntime -&gt; SubagentId -&gt; IO (Maybe AgentInstance)
+<span class="lineno">  187 </span><span class="decl"><span class="nottickedoff">agentInstanceBySubagentId (AgentRuntime tv) subagentId =</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">Map.lookup subagentId &lt;$&gt; readTVarIO tv</span></span>
+
+</pre>
+</body>
+</html>

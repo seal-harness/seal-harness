@@ -1,0 +1,176 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The IO-level three-way race + retry wrapper for tool-call timeout/abort.
+<span class="lineno">    2 </span>--
+<span class="lineno">    3 </span>-- This module is the core of the tool-call-timeout-abort-retry mechanism.
+<span class="lineno">    4 </span>-- It is IO-level (no 'App'/'Env' dependency) — the 'App'→'IO' bridge is at
+<span class="lineno">    5 </span>-- the dispatch call site (design Blocker Resolution #1): the dispatcher
+<span class="lineno">    6 </span>-- captures the 'Env' via 'ask', then re-enters 'App' inside the worker
+<span class="lineno">    7 </span>-- thread via @runApp env (uoRun ...)@. The wrapper itself never imports
+<span class="lineno">    8 </span>-- 'Seal.Types.App' — this keeps the race logic testable without a full
+<span class="lineno">    9 </span>-- 'AppEnv'.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- = The three-way race (worker vs timeout vs abort-poll)
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- Per-attempt, three 'IO' actions race (via nested 'race'):
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- @
+<span class="lineno">   16 </span>-- (worker vs timeoutDelay) vs waitForAbort pollInterval
+<span class="lineno">   17 </span>-- @
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- Nesting order: abort wins over timeout (user intent &gt; resource limit). On
+<span class="lineno">   20 </span>-- the worker winning: return the result. On timeout: 'cancel' the worker
+<span class="lineno">   21 </span>-- (which triggers the 'withManagedProcess' bracket cleanup → process-group
+<span class="lineno">   22 </span>-- kill), return 'ToolTimeout'. On abort: 'cancel' the worker, return
+<span class="lineno">   23 </span>-- 'ToolAborted'.
+<span class="lineno">   24 </span>--
+<span class="lineno">   25 </span>-- = Retry logic
+<span class="lineno">   26 </span>--
+<span class="lineno">   27 </span>-- Retry only on 'ToolTimeout' and 'ToolIOError' (transient). Do NOT retry on
+<span class="lineno">   28 </span>-- 'ToolAborted' (user cancelled — respect immediately) or on 'Right'
+<span class="lineno">   29 </span>-- results (success is success, even if the opcode returned a semantic error
+<span class="lineno">   30 </span>-- — that's not a transport failure). Up to 'ttcRetryMax' attempts,
+<span class="lineno">   31 </span>-- exponential backoff via 'computeRetryDelay'. The loop checks 'isAborted'
+<span class="lineno">   32 </span>-- BEFORE sleeping and AFTER sleeping (before the next attempt) so an abort
+<span class="lineno">   33 </span>-- during the retry sleep is detected promptly (design PM question).
+<span class="lineno">   34 </span>module Seal.Tools.Exec.Timeout
+<span class="lineno">   35 </span>  ( runWithTimeoutAbortRetry
+<span class="lineno">   36 </span>  ) where
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>import Control.Concurrent (threadDelay)
+<span class="lineno">   39 </span>import Control.Concurrent.Async
+<span class="lineno">   40 </span>  ( Async, async, cancel, race, wait, waitCatch )
+<span class="lineno">   41 </span>import Control.Exception (IOException, try)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>import Seal.Tools.Exec.Abort (AbortFlag, isAborted)
+<span class="lineno">   44 </span>import Seal.Tools.Timeout
+<span class="lineno">   45 </span>  ( Microseconds (..), ToolError (..), ToolTimeoutConfig
+<span class="lineno">   46 </span>  , computeRetryDelay, shouldRetry, ttcAbortPollMicros, ttcRetryMax
+<span class="lineno">   47 </span>  )
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Run an IO action with timeout + abort + retry protection.
+<span class="lineno">   50 </span>--
+<span class="lineno">   51 </span>--   * @cfg@ — the timeout/retry config (default, max, retry count, backoff).
+<span class="lineno">   52 </span>--   * @flag@ — the session abort flag (polled during the race).
+<span class="lineno">   53 </span>--   * @timeout@ — the per-call timeout (microseconds, already clamped by
+<span class="lineno">   54 </span>--     'Seal.Tools.Timeout.extractPerCallTimeout').
+<span class="lineno">   55 </span>--   * @action@ — the opcode action, bridged from 'App' at the call site
+<span class="lineno">   56 </span>--     (via @runApp env (...)@). Returns 'Either ToolError a' — 'Right' for
+<span class="lineno">   57 </span>--     success (including semantic errors), 'Left' for transport failures.
+<span class="lineno">   58 </span>--
+<span class="lineno">   59 </span>-- Returns 'Right a' on success, 'Left ToolError' on timeout/abort/IO-failure
+<span class="lineno">   60 </span>-- (wrapped in 'ToolRetriesExhausted' after 'ttcRetryMax' attempts).
+<span class="lineno">   61 </span>runWithTimeoutAbortRetry
+<span class="lineno">   62 </span>  :: forall a
+<span class="lineno">   63 </span>   . ToolTimeoutConfig
+<span class="lineno">   64 </span>  -&gt; AbortFlag
+<span class="lineno">   65 </span>  -&gt; Microseconds
+<span class="lineno">   66 </span>  -&gt; IO (Either ToolError a)
+<span class="lineno">   67 </span>  -&gt; IO (Either ToolError a)
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">runWithTimeoutAbortRetry cfg flag (Microseconds timeoutUs) action = go 0</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">go :: Int -&gt; IO (Either ToolError a)</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">go attempt = do</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">-- Check-before-attempt: if already aborted, return immediately.</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">aborted &lt;- isAborted flag</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">if aborted</span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">then pure (Left ToolAborted)</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">   77 </span><span class="spaces">          </span><span class="istickedoff">-- Run the three-way race: worker vs timeout vs abort-poll.</span>
+<span class="lineno">   78 </span><span class="spaces">          </span><span class="istickedoff">result &lt;- raceThreeWay cfg flag timeoutUs action</span>
+<span class="lineno">   79 </span><span class="spaces">          </span><span class="istickedoff">case result of</span>
+<span class="lineno">   80 </span><span class="spaces">            </span><span class="istickedoff">Right _ -&gt; pure result  -- success (or semantic error) — return immediately, no retry</span>
+<span class="lineno">   81 </span><span class="spaces">            </span><span class="istickedoff">Left err</span>
+<span class="lineno">   82 </span><span class="spaces">              </span><span class="istickedoff">| not (shouldRetry err) -&gt; pure result  -- ToolAborted or already-exhausted</span>
+<span class="lineno">   83 </span><span class="spaces">              </span><span class="istickedoff">| attempt + 1 &gt;= ttcRetryMax cfg -&gt;</span>
+<span class="lineno">   84 </span><span class="spaces">                  </span><span class="istickedoff">-- Exhausted retries.</span>
+<span class="lineno">   85 </span><span class="spaces">                  </span><span class="istickedoff">pure (Left (ToolRetriesExhausted err))</span>
+<span class="lineno">   86 </span><span class="spaces">              </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; do</span>
+<span class="lineno">   87 </span><span class="spaces">                  </span><span class="istickedoff">-- Check-before-sleep: abort during the sleep window?</span>
+<span class="lineno">   88 </span><span class="spaces">                  </span><span class="istickedoff">preSleep &lt;- isAborted flag</span>
+<span class="lineno">   89 </span><span class="spaces">                  </span><span class="istickedoff">if <span class="tickonlyfalse">preSleep</span></span>
+<span class="lineno">   90 </span><span class="spaces">                    </span><span class="istickedoff">then <span class="nottickedoff">pure (Left ToolAborted)</span></span>
+<span class="lineno">   91 </span><span class="spaces">                    </span><span class="istickedoff">else do</span>
+<span class="lineno">   92 </span><span class="spaces">                      </span><span class="istickedoff">let Microseconds delayUs = computeRetryDelay cfg attempt</span>
+<span class="lineno">   93 </span><span class="spaces">                      </span><span class="istickedoff">threadDelay delayUs</span>
+<span class="lineno">   94 </span><span class="spaces">                      </span><span class="istickedoff">-- Check-after-sleep: abort during the sleep?</span>
+<span class="lineno">   95 </span><span class="spaces">                      </span><span class="istickedoff">postSleep &lt;- isAborted flag</span>
+<span class="lineno">   96 </span><span class="spaces">                      </span><span class="istickedoff">if postSleep</span>
+<span class="lineno">   97 </span><span class="spaces">                        </span><span class="istickedoff">then pure (Left ToolAborted)</span>
+<span class="lineno">   98 </span><span class="spaces">                        </span><span class="istickedoff">else go (attempt + 1)</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | The three-way race: worker vs timeout vs abort-poll.
+<span class="lineno">  101 </span>--
+<span class="lineno">  102 </span>-- Nesting: @(worker-vs-timeout) vs abort-poll@. Abort wins over timeout
+<span class="lineno">  103 </span>-- (user intent &gt; resource limit). On the worker winning: return its
+<span class="lineno">  104 </span>-- result. On timeout: the worker async is cancelled (triggering the
+<span class="lineno">  105 </span>-- 'withManagedProcess' bracket cleanup → process-group kill) and we return
+<span class="lineno">  106 </span>-- 'ToolTimeout'. On abort: the worker async is cancelled and we return
+<span class="lineno">  107 </span>-- 'ToolAborted'.
+<span class="lineno">  108 </span>raceThreeWay
+<span class="lineno">  109 </span>  :: forall a
+<span class="lineno">  110 </span>   . ToolTimeoutConfig
+<span class="lineno">  111 </span>  -&gt; AbortFlag
+<span class="lineno">  112 </span>  -&gt; Int  -- ^ timeout (microseconds)
+<span class="lineno">  113 </span>  -&gt; IO (Either ToolError a)
+<span class="lineno">  114 </span>  -&gt; IO (Either ToolError a)
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">raceThreeWay cfg flag timeoutUs action = do</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">worker &lt;- async action</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">-- Outer race: (worker-vs-timeout) vs abort-poll.</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">-- `race a b` returns Left if `a` wins, Right if `b` wins.</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">outer &lt;- race</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">(race (wait worker) (threadDelay timeoutUs))  -- inner: Left=worker, Right=timeout</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">(abortPoll (ttcAbortPollMicros cfg))</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">case outer of</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">-- Inner race (worker-vs-timeout) won first.</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">Left inner -&gt; case inner of</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">Left r -&gt; pure r  -- worker completed: return its result</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">-- Timeout: cancel the worker (bracket cleanup → process-group kill),</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">-- wait for cleanup to finish (bounded by reapBounded's 1s),</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">-- return ToolTimeout (seconds for display).</span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="istickedoff">cancelWorker worker</span>
+<span class="lineno">  131 </span><span class="spaces">        </span><span class="istickedoff">pure (Left (ToolTimeout <span class="nottickedoff">(timeoutUs `div` 1_000_000)</span>))</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">-- Abort-poll won first: cancel the worker, return ToolAborted.</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">Right _aborted -&gt; do</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="istickedoff">cancelWorker worker</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">pure (Left ToolAborted)</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">-- The abort-poll: loop checking isAborted every @pollUs@ microseconds.</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">-- Returns True when aborted (so the outer race's Right branch fires).</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">abortPoll :: Int -&gt; IO Bool</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">abortPoll pollUs = do</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">let loop = do</span>
+<span class="lineno">  142 </span><span class="spaces">            </span><span class="istickedoff">a &lt;- isAborted flag</span>
+<span class="lineno">  143 </span><span class="spaces">            </span><span class="istickedoff">if a then pure <span class="nottickedoff">True</span> else do threadDelay pollUs; loop</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">loop</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Cancel a worker async + wait for its bracket cleanup to finish. The
+<span class="lineno">  147 </span>-- cleanup (killProcessGroup + bounded reap) is bounded, so this returns
+<span class="lineno">  148 </span>-- promptly; the @try@ swallows any async-exception IO errors.
+<span class="lineno">  149 </span>cancelWorker :: Async a -&gt; IO ()
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">cancelWorker worker = do</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">cancel worker</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- try @IOException (waitCatch worker)</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+
+</pre>
+</body>
+</html>

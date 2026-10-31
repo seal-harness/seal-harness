@@ -1,0 +1,557 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Ollama provider (local host or Ollama Cloud). One provider; local vs cloud
+<span class="lineno">    3 </span>-- is the configured base URL plus whether an API key is present. JSON mapping is
+<span class="lineno">    4 </span>-- pure ('encodeRequest' / 'decodeResponse'); 'complete' adds the HTTP round-trip
+<span class="lineno">    5 </span>-- and supplies the optional bearer key via the CPS 'withApiKey' accessor so the
+<span class="lineno">    6 </span>-- key bytes only ever live on the request header inside the continuation.
+<span class="lineno">    7 </span>-- Non-streaming. Ollama tool-calls carry no id, so ids are synthesized on decode
+<span class="lineno">    8 </span>-- (&quot;call_&lt;i&gt;&quot;) and dropped on encode (Ollama matches tool results by order).
+<span class="lineno">    9 </span>module Seal.Providers.Ollama
+<span class="lineno">   10 </span>  ( Ollama (..)
+<span class="lineno">   11 </span>  , mkOllama
+<span class="lineno">   12 </span>  , defaultOllamaBaseUrl
+<span class="lineno">   13 </span>  , ollamaNeedsKey
+<span class="lineno">   14 </span>  , chatUrl
+<span class="lineno">   15 </span>  , tagsUrl
+<span class="lineno">   16 </span>  , ollamaHeaders
+<span class="lineno">   17 </span>  , ollamaErrorText
+<span class="lineno">   18 </span>  , unreachableMsg
+<span class="lineno">   19 </span>  , ollamaHttpExceptionMsg
+<span class="lineno">   20 </span>  , encodeRequest
+<span class="lineno">   21 </span>  , encodeStreamRequest
+<span class="lineno">   22 </span>  , decodeResponse
+<span class="lineno">   23 </span>  , decodeStreamChunk
+<span class="lineno">   24 </span>  , StreamChunkState (..)
+<span class="lineno">   25 </span>  , initialStreamChunkState
+<span class="lineno">   26 </span>  , countToolCalls
+<span class="lineno">   27 </span>  , claimToolCallIds
+<span class="lineno">   28 </span>  ) where
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Control.Exception (try)
+<span class="lineno">   31 </span>import Control.Monad (void, unless)
+<span class="lineno">   32 </span>import Data.Aeson
+<span class="lineno">   33 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   34 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   35 </span>import Data.Aeson.Types (Parser, parseEither)
+<span class="lineno">   36 </span>import Data.ByteString (ByteString)
+<span class="lineno">   37 </span>import Data.ByteString qualified as BS
+<span class="lineno">   38 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   39 </span>import Data.IORef (IORef, atomicModifyIORef')
+<span class="lineno">   40 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   41 </span>import Data.Text (Text)
+<span class="lineno">   42 </span>import Data.Text qualified as T
+<span class="lineno">   43 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   44 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   45 </span>import Data.Vector qualified as V
+<span class="lineno">   46 </span>import Network.HTTP.Client
+<span class="lineno">   47 </span>import Network.HTTP.Types (statusCode)
+<span class="lineno">   48 </span>import Network.HTTP.Types.Header (RequestHeaders)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
+<span class="lineno">   51 </span>import Seal.Providers.Class
+<span class="lineno">   52 </span>import Seal.Security.Secrets (ApiKey, withApiKey)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | Response timeout for Ollama @/api/chat@ requests, in microseconds.
+<span class="lineno">   55 </span>-- The 'newTlsManager' default is 90 seconds, which is too short for
+<span class="lineno">   56 </span>-- non-streaming requests to remote models proxied through the local Ollama
+<span class="lineno">   57 </span>-- daemon (e.g. @glm-5.2:cloud@): with a large context (49k+ input tokens)
+<span class="lineno">   58 </span>-- the model can take 74+ seconds to generate the full response before
+<span class="lineno">   59 </span>-- returning it in one shot. A 5-minute timeout gives generous headroom for
+<span class="lineno">   60 </span>-- large-context non-streaming generation. This is a per-request override
+<span class="lineno">   61 </span>-- (the manager's default is not changed, so other HTTP clients in the
+<span class="lineno">   62 </span>-- process keep their own timeouts).
+<span class="lineno">   63 </span>ollamaResponseTimeoutMicro :: Int
+<span class="lineno">   64 </span><span class="decl"><span class="nottickedoff">ollamaResponseTimeoutMicro = 300_000_000</span></span>  -- 5 minutes
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- Data type ----------------------------------------------------------------
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>data Ollama = Ollama
+<span class="lineno">   69 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">olModel</span></span></span>   :: ModelId
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">olManager</span></span></span> :: Manager
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">olBaseUrl</span></span></span> :: Text          -- e.g. &quot;http://localhost:11434&quot; | &quot;https://ollama.com&quot;
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">olApiKey</span></span></span>  :: Maybe ApiKey  -- Nothing = local (no auth); Just = cloud (Bearer)
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">olCallCounter</span></span></span> :: IORef Int -- ^ monotonic counter for unique tool-call ids.
+<span class="lineno">   74 </span>                               --   Shared across turns — the caller owns it
+<span class="lineno">   75 </span>                               --   so ids stay unique across a whole session
+<span class="lineno">   76 </span>                               --   (not just within one provider instance).
+<span class="lineno">   77 </span>  }
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Build an 'Ollama' using an externally-owned counter. The counter must be
+<span class="lineno">   80 </span>--   shared across every 'Ollama' built for the same process (typically held in
+<span class="lineno">   81 </span>--   'ProviderRuntime') so tool-call ids never repeat across turns. The model
+<span class="lineno">   82 </span>--   field is filled in by the caller.
+<span class="lineno">   83 </span>mkOllama :: Manager -&gt; Text -&gt; Maybe ApiKey -&gt; ModelId -&gt; IORef Int -&gt; IO Ollama
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">mkOllama mgr base mKey model counter =</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">pure (Ollama <span class="nottickedoff">model</span> mgr base mKey counter)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- URL + headers ------------------------------------------------------------
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>defaultOllamaBaseUrl :: Text
+<span class="lineno">   90 </span><span class="decl"><span class="istickedoff">defaultOllamaBaseUrl = &quot;http://localhost:11434&quot;</span></span>
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | Does this Ollama base URL require an API key? Only the Ollama Cloud direct
+<span class="lineno">   93 </span>-- API (@ollama.com@) does; a local or custom-host daemon needs none. A local
+<span class="lineno">   94 </span>-- daemon that proxies @*:cloud@ models still needs no Seal-held key (the daemon
+<span class="lineno">   95 </span>-- authenticates to the cloud itself).
+<span class="lineno">   96 </span>ollamaNeedsKey :: Text -&gt; Bool
+<span class="lineno">   97 </span><span class="decl"><span class="istickedoff">ollamaNeedsKey base = &quot;ollama.com&quot; `T.isInfixOf` base</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>stripTrailingSlash :: Text -&gt; Text
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">stripTrailingSlash t = fromMaybe t (T.stripSuffix &quot;/&quot; t)</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>chatUrl :: Text -&gt; Text
+<span class="lineno">  103 </span><span class="decl"><span class="istickedoff">chatUrl base = stripTrailingSlash base &lt;&gt; &quot;/api/chat&quot;</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>tagsUrl :: Text -&gt; Text
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">tagsUrl base = stripTrailingSlash base &lt;&gt; &quot;/api/tags&quot;</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | Local: content-type only. Cloud: add a bearer authorization header.
+<span class="lineno">  109 </span>ollamaHeaders :: Maybe ByteString -&gt; RequestHeaders
+<span class="lineno">  110 </span><span class="decl"><span class="istickedoff">ollamaHeaders mKey =</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">(&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">: [ (&quot;authorization&quot;, &quot;Bearer &quot; &lt;&gt; kb) | Just kb &lt;- [mKey] ]</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- Pure request mapping -----------------------------------------------------
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>encodeRequest :: CompletionRequest -&gt; Value
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">encodeRequest cr = object $</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;model&quot;    .= crModel cr</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">, &quot;stream&quot;   .= False</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">, &quot;messages&quot; .= (systemMsgs &lt;&gt; concatMap encMsg (crMessages cr))</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">, &quot;options&quot;  .= object [&quot;num_predict&quot; .= crMaxTokens cr]</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; [&quot;tools&quot; .= map encTool (crTools cr) | not (null (crTools cr))]</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">systemMsgs =</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">maybe []</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">(\s -&gt; [object [&quot;role&quot; .= (&quot;system&quot; :: Text), &quot;content&quot; .= s]])</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">(crSystem cr)</span></span>
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>-- | Like 'encodeRequest' but with @&quot;stream&quot; .= True@. Used by 'streamComplete'
+<span class="lineno">  131 </span>-- for the streaming HTTP request.
+<span class="lineno">  132 </span>encodeStreamRequest :: CompletionRequest -&gt; Value
+<span class="lineno">  133 </span><span class="decl"><span class="nottickedoff">encodeStreamRequest cr =</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="nottickedoff">case encodeRequest cr of</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="nottickedoff">Object o -&gt; Object (KeyMap.insert &quot;stream&quot; (Bool True) o)</span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="nottickedoff">other    -&gt; other</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | Flatten one provider-agnostic message into zero or more Ollama messages.
+<span class="lineno">  139 </span>-- A User message becomes a &quot;user&quot; message (its text, if any) followed by one
+<span class="lineno">  140 </span>-- &quot;tool&quot; message per tool-result block. An Assistant message becomes one
+<span class="lineno">  141 </span>-- &quot;assistant&quot; message carrying its text and any tool_calls.
+<span class="lineno">  142 </span>encMsg :: Message -&gt; [Value]
+<span class="lineno">  143 </span><span class="decl"><span class="istickedoff">encMsg (Message User blocks) =</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">let texts = [t | CbText t &lt;- blocks]</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">userMsg =</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">[ object [&quot;role&quot; .= (&quot;user&quot; :: Text), &quot;content&quot; .= T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> texts]</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">| not (null texts) ]</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">toolMsgs =</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff">[ object [&quot;role&quot; .= (&quot;tool&quot; :: Text), &quot;content&quot; .= renderToolContent isErr parts]</span>
+<span class="lineno">  150 </span><span class="spaces">        </span><span class="istickedoff">| CbToolResult _ parts isErr &lt;- blocks ]</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">in userMsg &lt;&gt; toolMsgs</span>
+<span class="lineno">  152 </span><span class="spaces"></span><span class="istickedoff">encMsg (Message Assistant blocks) =</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">let content = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> [<span class="nottickedoff">t</span> | CbText t &lt;- blocks]</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">toolCalls =</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">[ object [&quot;function&quot; .= object [&quot;name&quot; .= n, &quot;arguments&quot; .= inp]]</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">| CbToolUse _ (OpName n) inp &lt;- blocks ]</span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff">tc = [&quot;tool_calls&quot; .= toolCalls | <span class="tickonlytrue">not (null toolCalls)</span>]</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">in [object ([&quot;role&quot; .= (&quot;assistant&quot; :: Text), &quot;content&quot; .= content] &lt;&gt; tc)]</span></span>
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>-- | Ollama's tool role carries no structured error flag, so an errored result
+<span class="lineno">  161 </span>-- is marked in-band: its text is prefixed so the model can see the call failed.
+<span class="lineno">  162 </span>renderToolContent :: Bool -&gt; [ToolResultPart] -&gt; Text
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">renderToolContent isErr parts =</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">let body = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> [t | TrpText t &lt;- parts]</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">in if isErr then &quot;[tool error] &quot; &lt;&gt; body else body</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>encTool :: ToolDefinition -&gt; Value
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">encTool (ToolDefinition (OpName n) d sch) =</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">-- Omit parameters entirely when it's the on-demand stub (OpenAI/Ollama's</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">-- parameters field is optional). Keeps the stub tools at zero schema-token</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">-- cost; the model retrieves a tool's real schema via OPCODE_DESCRIBE.</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">if sch == stubSchema</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">then object</span>
+<span class="lineno">  174 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;function&quot; :: Text)</span>
+<span class="lineno">  175 </span><span class="spaces">           </span><span class="istickedoff">, &quot;function&quot; .= object [&quot;name&quot; .= n, &quot;description&quot; .= d]</span>
+<span class="lineno">  176 </span><span class="spaces">           </span><span class="istickedoff">]</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">else object</span>
+<span class="lineno">  178 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;function&quot; :: Text)</span>
+<span class="lineno">  179 </span><span class="spaces">           </span><span class="istickedoff">, &quot;function&quot; .= object [&quot;name&quot; .= n, &quot;description&quot; .= d, &quot;parameters&quot; .= sch]</span>
+<span class="lineno">  180 </span><span class="spaces">           </span><span class="istickedoff">]</span></span>
+<span class="lineno">  181 </span>
+<span class="lineno">  182 </span>-- Pure response mapping ----------------------------------------------------
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>decodeResponse :: Value -&gt; Either Text CompletionResponse
+<span class="lineno">  185 </span><span class="decl"><span class="istickedoff">decodeResponse = decodeResponseFrom 0</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>-- | Like 'decodeResponse' but starts tool-call ids at the given index so
+<span class="lineno">  188 </span>-- multiple responses in the same conversation get globally unique ids
+<span class="lineno">  189 </span>-- (Ollama tool calls carry no id).
+<span class="lineno">  190 </span>decodeResponseFrom :: Int -&gt; Value -&gt; Either Text CompletionResponse
+<span class="lineno">  191 </span><span class="decl"><span class="istickedoff">decodeResponseFrom start = mapLeft <span class="nottickedoff">T.pack</span> . parseEither (parseRespFrom start)</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">where mapLeft f = either <span class="nottickedoff">(Left . f)</span> Right</span></span>
+<span class="lineno">  193 </span>
+<span class="lineno">  194 </span>parseRespFrom :: Int -&gt; Value -&gt; Parser CompletionResponse
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">parseRespFrom start = withObject <span class="nottickedoff">&quot;ollama response&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">msg        &lt;- o .: &quot;message&quot;</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">content    &lt;- msg .:? &quot;content&quot; .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">rawCalls   &lt;- msg .:? &quot;tool_calls&quot; .!= ([] :: [Value])</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">toolBlocks &lt;- traverse parseToolCall (zip [start ..] rawCalls)</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">doneReason &lt;- o .:? &quot;done_reason&quot;</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">promptTok  &lt;- o .:? &quot;prompt_eval_count&quot; .!= 0</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">evalTok    &lt;- o .:? &quot;eval_count&quot; .!= 0</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">let textBlocks = [CbText content | not (T.null content)]</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">blocks     = textBlocks &lt;&gt; toolBlocks</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">stop       = if not (null toolBlocks) then StopToolUse else stopFromDone doneReason</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">pure (CompletionResponse blocks stop (Usage promptTok evalTok))</span></span>
+<span class="lineno">  207 </span>
+<span class="lineno">  208 </span>-- | Ollama tool calls carry no id; synthesize a stable &quot;call_&lt;i&gt;&quot; per index.
+<span class="lineno">  209 </span>parseToolCall :: (Int, Value) -&gt; Parser ContentBlock
+<span class="lineno">  210 </span><span class="decl"><span class="istickedoff">parseToolCall (i, v) = flip (withObject <span class="nottickedoff">&quot;tool_call&quot;</span>) v $ \o -&gt; do</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">fn   &lt;- o .: &quot;function&quot;</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">name &lt;- fn .: &quot;name&quot;</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">args &lt;- fn .:? &quot;arguments&quot; .!= object []</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">pure (CbToolUse (ToolCallId (&quot;call_&quot; &lt;&gt; T.pack (show i))) (OpName name) args)</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>stopFromDone :: Maybe Text -&gt; StopReason
+<span class="lineno">  217 </span><span class="decl"><span class="istickedoff">stopFromDone (Just &quot;length&quot;) = StopMaxTokens</span>
+<span class="lineno">  218 </span><span class="spaces"></span><span class="istickedoff">stopFromDone (Just &quot;stop&quot;)   = StopEnd</span>
+<span class="lineno">  219 </span><span class="spaces"></span><span class="istickedoff">stopFromDone Nothing         = StopEnd</span>
+<span class="lineno">  220 </span><span class="spaces"></span><span class="istickedoff">stopFromDone (Just other)    = <span class="nottickedoff">StopOther other</span></span></span>
+<span class="lineno">  221 </span>
+<span class="lineno">  222 </span>-- Streaming chunk decoding --------------------------------------------------
+<span class="lineno">  223 </span>
+<span class="lineno">  224 </span>-- | Accumulator state for decoding Ollama streaming NDJSON chunks into
+<span class="lineno">  225 </span>-- 'StreamEvent's. Ollama streams one JSON object per line; each carries
+<span class="lineno">  226 </span>-- incremental @message.content@ (text deltas) and, when the model emits tool
+<span class="lineno">  227 </span>-- calls, a complete @tool_calls@ array in a single chunk (Ollama does not
+<span class="lineno">  228 </span>-- stream tool-call arguments incrementally — the whole array appears at
+<span class="lineno">  229 </span>-- once). The state tracks which tool ids have already been emitted so we
+<span class="lineno">  230 </span>-- only fire 'StreamToolStart'/'StreamToolEnd' once per tool.
+<span class="lineno">  231 </span>data StreamChunkState = StreamChunkState
+<span class="lineno">  232 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">scsToolIndex</span></span></span> :: Int
+<span class="lineno">  233 </span>    -- ^ The next tool-call index to assign (Ollama tool calls carry no id;
+<span class="lineno">  234 </span>    -- we synthesize @call_\&lt;i\&gt;@ sequentially, matching the non-streaming path).
+<span class="lineno">  235 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scsSeenToolIds</span></span></span> :: [ToolCallId]
+<span class="lineno">  236 </span>    -- ^ Tool ids already emitted via 'StreamToolStart'/'StreamToolEnd', so
+<span class="lineno">  237 </span>    -- we don't re-emit them if the same chunk is processed twice or if
+<span class="lineno">  238 </span>    -- subsequent chunks repeat the tool_calls array.
+<span class="lineno">  239 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scsSawTools</span></span></span> :: Bool
+<span class="lineno">  240 </span>    -- ^ True once any tool call was emitted during this stream. Ollama's
+<span class="lineno">  241 </span>    -- @done_reason@ for a tool-call response is still @&quot;stop&quot;@ (which maps
+<span class="lineno">  242 </span>    -- to 'StopEnd'), but the non-streaming path overrides the stop reason
+<span class="lineno">  243 </span>    -- to 'StopToolUse' when tool blocks are present (see 'parseRespFrom').
+<span class="lineno">  244 </span>    -- This flag lets the streaming path do the same override in the
+<span class="lineno">  245 </span>    -- 'StreamDone' chunk so the transcript's stop reason is accurate.
+<span class="lineno">  246 </span>  }
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>-- | Initial streaming state (no tools seen yet).
+<span class="lineno">  249 </span>initialStreamChunkState :: StreamChunkState
+<span class="lineno">  250 </span><span class="decl"><span class="istickedoff">initialStreamChunkState = StreamChunkState <span class="nottickedoff">0</span> [] <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | Decode one Ollama streaming NDJSON chunk into zero or more 'StreamEvent's,
+<span class="lineno">  253 </span>-- threading the accumulator state. A single chunk can carry:
+<span class="lineno">  254 </span>--
+<span class="lineno">  255 </span>--   * @message.content@ (a text delta) → 'StreamTextChunk'
+<span class="lineno">  256 </span>--   * @message.tool_calls@ (complete tool calls) → 'StreamToolStart' +
+<span class="lineno">  257 </span>--     'StreamToolEnd' per tool (Ollama emits these as complete objects, not
+<span class="lineno">  258 </span>--     incremental deltas)
+<span class="lineno">  259 </span>--   * @done == true@ → 'StreamDone' with stop reason + usage
+<span class="lineno">  260 </span>--
+<span class="lineno">  261 </span>-- Returns the updated state alongside the events.
+<span class="lineno">  262 </span>decodeStreamChunk
+<span class="lineno">  263 </span>  :: StreamChunkState -&gt; Value -&gt; Either Text (StreamChunkState, [StreamEvent])
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">decodeStreamChunk st = mapLeft <span class="nottickedoff">T.pack</span> . parseEither (parseStreamChunk st)</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">where mapLeft f = either <span class="nottickedoff">(Left . f)</span> Right</span></span>
+<span class="lineno">  266 </span>
+<span class="lineno">  267 </span>parseStreamChunk :: StreamChunkState -&gt; Value -&gt; Parser (StreamChunkState, [StreamEvent])
+<span class="lineno">  268 </span><span class="decl"><span class="istickedoff">parseStreamChunk st = withObject <span class="nottickedoff">&quot;ollama stream chunk&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">done &lt;- o .:? &quot;done&quot; .!= False</span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">if done</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">then do</span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">doneReason &lt;- o .:? &quot;done_reason&quot;</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">promptTok  &lt;- o .:? &quot;prompt_eval_count&quot; .!= <span class="nottickedoff">0</span></span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">evalTok    &lt;- o .:? &quot;eval_count&quot; .!= <span class="nottickedoff">0</span></span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">let rawStop = stopFromDone doneReason</span>
+<span class="lineno">  276 </span><span class="spaces">          </span><span class="istickedoff">-- Override StopEnd → StopToolUse when tools were emitted during</span>
+<span class="lineno">  277 </span><span class="spaces">          </span><span class="istickedoff">-- this stream (Ollama reports done_reason=&quot;stop&quot; even for</span>
+<span class="lineno">  278 </span><span class="spaces">          </span><span class="istickedoff">-- tool-call responses; the non-streaming path does the same</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="istickedoff">-- override in parseRespFrom).</span>
+<span class="lineno">  280 </span><span class="spaces">          </span><span class="istickedoff">stop = if <span class="tickonlytrue">scsSawTools st &amp;&amp; rawStop == StopEnd</span> then StopToolUse else <span class="nottickedoff">rawStop</span></span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="istickedoff">pure (<span class="nottickedoff">st</span>, [StreamDone stop <span class="nottickedoff">(Usage promptTok evalTok)</span>])</span>
+<span class="lineno">  282 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">msgVal &lt;- o .:? &quot;message&quot; .!= <span class="nottickedoff">object []</span></span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">(content, rawCalls) &lt;- parseMsgFields msgVal</span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="istickedoff">let textEvents = [<span class="nottickedoff">StreamTextChunk content</span> | <span class="tickonlyfalse">not (T.null content)</span>]</span>
+<span class="lineno">  286 </span><span class="spaces">          </span><span class="istickedoff">(st', toolEvents) = foldl processTool (st, []) rawCalls</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">pure (st', textEvents &lt;&gt; toolEvents)</span>
+<span class="lineno">  288 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">processTool (s, evs) rawCall = case parseEither parseToolCallRaw rawCall of</span>
+<span class="lineno">  290 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">(s, evs)</span></span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">Right (mTcid, name, args) -&gt;</span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="istickedoff">let <span class="nottickedoff">tcid = fromMaybe (ToolCallId (&quot;call_&quot; &lt;&gt; T.pack (show (scsToolIndex s)))) mTcid</span></span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff">in if <span class="tickonlyfalse"><span class="nottickedoff">tcid</span> `elem` scsSeenToolIds s</span></span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">then <span class="nottickedoff">(s, evs)</span>  -- already emitted; skip duplicate</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">else</span>
+<span class="lineno">  296 </span><span class="spaces">            </span><span class="istickedoff">let s' = s { scsToolIndex = <span class="nottickedoff">scsToolIndex s + 1</span></span>
+<span class="lineno">  297 </span><span class="spaces">                       </span><span class="istickedoff">, scsSeenToolIds = <span class="nottickedoff">tcid : scsSeenToolIds s</span></span>
+<span class="lineno">  298 </span><span class="spaces">                       </span><span class="istickedoff">, scsSawTools = True</span>
+<span class="lineno">  299 </span><span class="spaces">                       </span><span class="istickedoff">}</span>
+<span class="lineno">  300 </span><span class="spaces">            </span><span class="istickedoff">in (s', evs &lt;&gt; [StreamToolStart <span class="nottickedoff">tcid</span> <span class="nottickedoff">name</span>, StreamToolEnd <span class="nottickedoff">tcid</span> <span class="nottickedoff">name</span> <span class="nottickedoff">args</span>])</span></span>
+<span class="lineno">  301 </span>
+<span class="lineno">  302 </span>parseMsgFields :: Value -&gt; Parser (Text, [Value])
+<span class="lineno">  303 </span><span class="decl"><span class="istickedoff">parseMsgFields = withObject <span class="nottickedoff">&quot;stream message&quot;</span> $ \msg -&gt; do</span>
+<span class="lineno">  304 </span><span class="spaces">  </span><span class="istickedoff">content &lt;- msg .:? &quot;content&quot; .!= <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="istickedoff">rawCalls &lt;- msg .:? &quot;tool_calls&quot; .!= <span class="nottickedoff">([] :: [Value])</span></span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="istickedoff">pure (content, rawCalls)</span></span>
+<span class="lineno">  307 </span>
+<span class="lineno">  308 </span>parseToolCallRaw :: Value -&gt; Parser (Maybe ToolCallId, OpName, Value)
+<span class="lineno">  309 </span><span class="decl"><span class="istickedoff">parseToolCallRaw = withObject <span class="nottickedoff">&quot;tool_call&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  310 </span><span class="spaces">  </span><span class="istickedoff">fn   &lt;- o .: &quot;function&quot;</span>
+<span class="lineno">  311 </span><span class="spaces">  </span><span class="istickedoff">name &lt;- fn .: &quot;name&quot;</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">args &lt;- fn .:? &quot;arguments&quot; .!= <span class="nottickedoff">object []</span></span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">mId  &lt;- o .:? &quot;id&quot; .!= <span class="nottickedoff">(&quot;&quot; :: Text)</span></span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">mTcid = if T.null mId then Nothing else Just (ToolCallId mId)</span></span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">pure (<span class="nottickedoff">mTcid</span>, <span class="nottickedoff">OpName name</span>, <span class="nottickedoff">args</span>)</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>-- Error rendering ----------------------------------------------------------
+<span class="lineno">  318 </span>
+<span class="lineno">  319 </span>-- | Render a non-2xx Ollama response, key-safely (the body carries no secret).
+<span class="lineno">  320 </span>ollamaErrorText :: Int -&gt; Text -&gt; Text
+<span class="lineno">  321 </span><span class="decl"><span class="istickedoff">ollamaErrorText 401 _ =</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">&quot;Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama&quot;</span>
+<span class="lineno">  323 </span><span class="spaces"></span><span class="istickedoff">ollamaErrorText code body =</span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">&quot;Ollama API returned HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; body</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | Transport failure (connection refused is the common &quot;not running&quot; case).
+<span class="lineno">  327 </span>-- The base URL is not secret.
+<span class="lineno">  328 </span>unreachableMsg :: Text -&gt; Text
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">unreachableMsg base =</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">&quot;could not reach Ollama at &quot; &lt;&gt; base</span>
+<span class="lineno">  331 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot; — is it running and the URL correct? (try: ollama serve)&quot;</span></span>
+<span class="lineno">  332 </span>
+<span class="lineno">  333 </span>-- | Render an 'HttpException' as a user-facing error. A response timeout
+<span class="lineno">  334 </span>-- (the model took longer than 'ollamaResponseTimeoutMicro' to generate)
+<span class="lineno">  335 </span>-- gets a distinct message so the user knows the daemon is running but the
+<span class="lineno">  336 </span>-- model was too slow — not that the daemon is down. Other transport errors
+<span class="lineno">  337 </span>-- (connection refused, etc.) use the generic 'unreachableMsg'.
+<span class="lineno">  338 </span>ollamaHttpExceptionMsg :: Text -&gt; HttpException -&gt; Text
+<span class="lineno">  339 </span><span class="decl"><span class="nottickedoff">ollamaHttpExceptionMsg base = \case</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="nottickedoff">HttpExceptionRequest _ ResponseTimeout -&gt;</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="nottickedoff">&quot;Ollama response timed out after &quot;</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="nottickedoff">&lt;&gt; T.pack (show (ollamaResponseTimeoutMicro `div` 1_000_000))</span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="nottickedoff">&lt;&gt; &quot;s — the model (likely a remote/cloud model with a large context) \</span>
+<span class="lineno">  344 </span><span class="spaces">         </span><span class="nottickedoff">\took too long to respond. Try reducing the conversation context, \</span>
+<span class="lineno">  345 </span><span class="spaces">         </span><span class="nottickedoff">\switching to a faster/local model, or send \&quot;continue\&quot; to retry.&quot;</span>
+<span class="lineno">  346 </span><span class="spaces">  </span><span class="nottickedoff">_ -&gt; unreachableMsg base</span></span>
+<span class="lineno">  347 </span>
+<span class="lineno">  348 </span>-- HTTP round-trip ----------------------------------------------------------
+<span class="lineno">  349 </span>
+<span class="lineno">  350 </span>-- | POST {base}/api/chat with the given headers; decode, or return a key-safe
+<span class="lineno">  351 </span>-- transport / HTTP-status error.
+<span class="lineno">  352 </span>sendChat
+<span class="lineno">  353 </span>  :: Ollama -&gt; RequestHeaders -&gt; CompletionRequest
+<span class="lineno">  354 </span>  -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  355 </span><span class="decl"><span class="nottickedoff">sendChat o hdrs cr = do</span>
+<span class="lineno">  356 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- try $ do</span>
+<span class="lineno">  357 </span><span class="spaces">    </span><span class="nottickedoff">initReq &lt;- parseRequest (T.unpack (&quot;POST &quot; &lt;&gt; chatUrl (olBaseUrl o)))</span>
+<span class="lineno">  358 </span><span class="spaces">    </span><span class="nottickedoff">let req = initReq</span>
+<span class="lineno">  359 </span><span class="spaces">          </span><span class="nottickedoff">{ requestBody     = RequestBodyLBS (encode (encodeRequest cr))</span>
+<span class="lineno">  360 </span><span class="spaces">          </span><span class="nottickedoff">, requestHeaders  = hdrs</span>
+<span class="lineno">  361 </span><span class="spaces">          </span><span class="nottickedoff">, responseTimeout  = responseTimeoutMicro ollamaResponseTimeoutMicro</span>
+<span class="lineno">  362 </span><span class="spaces">          </span><span class="nottickedoff">}</span>
+<span class="lineno">  363 </span><span class="spaces">    </span><span class="nottickedoff">httpLbs req (olManager o)</span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  365 </span><span class="spaces">    </span><span class="nottickedoff">Left (e :: HttpException) -&gt; pure (Left (ollamaHttpExceptionMsg (olBaseUrl o) e))</span>
+<span class="lineno">  366 </span><span class="spaces">    </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  368 </span><span class="spaces">      </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="nottickedoff">then case eitherDecode (responseBody resp) of</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="nottickedoff">Left e  -&gt; pure (Left (T.pack e))</span>
+<span class="lineno">  371 </span><span class="spaces">          </span><span class="nottickedoff">Right v -&gt; do</span>
+<span class="lineno">  372 </span><span class="spaces">            </span><span class="nottickedoff">startIdx &lt;- claimToolCallIds (olCallCounter o) (countToolCalls v)</span>
+<span class="lineno">  373 </span><span class="spaces">            </span><span class="nottickedoff">pure (decodeResponseFrom startIdx v)</span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="nottickedoff">else pure $ Left $ ollamaErrorText code</span>
+<span class="lineno">  375 </span><span class="spaces">          </span><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>-- | Count how many tool_calls appear in the response (to advance the counter).
+<span class="lineno">  378 </span>countToolCalls :: Value -&gt; Int
+<span class="lineno">  379 </span><span class="decl"><span class="nottickedoff">countToolCalls v = case v of</span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="nottickedoff">Object o -&gt; case KeyMap.lookup (Key.fromString &quot;message&quot;) o of</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="nottickedoff">Just (Object msg) -&gt; case KeyMap.lookup (Key.fromString &quot;tool_calls&quot;) msg of</span>
+<span class="lineno">  382 </span><span class="spaces">      </span><span class="nottickedoff">Just (Array arr) -&gt; V.length arr</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; 0</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; 0</span>
+<span class="lineno">  385 </span><span class="spaces">  </span><span class="nottickedoff">_ -&gt; 0</span></span>
+<span class="lineno">  386 </span>
+<span class="lineno">  387 </span>-- | Atomically claim @n@ contiguous tool-call ids, returning the inclusive
+<span class="lineno">  388 </span>-- start of the claimed range. 'atomicModifyIORef'' advances the counter by
+<span class="lineno">  389 </span>-- @n@ and returns the previous value in one CAS, so concurrent callers can
+<span class="lineno">  390 </span>-- never overlap (the read-then-advance pattern raced here: two threads both
+<span class="lineno">  391 </span>-- read 0 before either advanced, both emitted &quot;call_0&quot;). Claiming 0 is a
+<span class="lineno">  392 </span>-- no-op read. Exposed for the concurrency test in 'OllamaSpec'.
+<span class="lineno">  393 </span>claimToolCallIds :: IORef Int -&gt; Int -&gt; IO Int
+<span class="lineno">  394 </span><span class="decl"><span class="istickedoff">claimToolCallIds counter n = atomicModifyIORef' counter (\i -&gt; (i + n, i))</span></span>
+<span class="lineno">  395 </span>
+<span class="lineno">  396 </span>-- | GET {base}/api/tags → the installed model names.
+<span class="lineno">  397 </span>listTags :: Manager -&gt; Text -&gt; RequestHeaders -&gt; IO (Either Text [ModelId])
+<span class="lineno">  398 </span><span class="decl"><span class="istickedoff">listTags mgr base hdrs = do</span>
+<span class="lineno">  399 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- try $ do</span>
+<span class="lineno">  400 </span><span class="spaces">    </span><span class="istickedoff">initReq &lt;- parseRequest (T.unpack (&quot;GET &quot; &lt;&gt; tagsUrl base))</span>
+<span class="lineno">  401 </span><span class="spaces">    </span><span class="istickedoff">httpLbs initReq { requestHeaders = hdrs } mgr</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="istickedoff">Left (e :: HttpException) -&gt; pure (Left <span class="nottickedoff">(ollamaHttpExceptionMsg base e)</span>)</span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">Right resp -&gt; do</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="istickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlytrue">code &gt;= 200 &amp;&amp; code &lt;= 299</span></span>
+<span class="lineno">  407 </span><span class="spaces">        </span><span class="istickedoff">then pure $ case eitherDecode (responseBody resp) of</span>
+<span class="lineno">  408 </span><span class="spaces">          </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">Left (T.pack e)</span></span>
+<span class="lineno">  409 </span><span class="spaces">          </span><span class="istickedoff">Right v -&gt; parseTags v</span>
+<span class="lineno">  410 </span><span class="spaces">        </span><span class="istickedoff">else <span class="nottickedoff">pure $ Left $ ollamaErrorText code</span></span>
+<span class="lineno">  411 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))</span></span></span>
+<span class="lineno">  412 </span>
+<span class="lineno">  413 </span>parseTags :: Value -&gt; Either Text [ModelId]
+<span class="lineno">  414 </span><span class="decl"><span class="istickedoff">parseTags = mapLeft <span class="nottickedoff">T.pack</span> . parseEither p</span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  416 </span><span class="spaces">    </span><span class="istickedoff">mapLeft f = either <span class="nottickedoff">(Left . f)</span> Right</span>
+<span class="lineno">  417 </span><span class="spaces">    </span><span class="istickedoff">p = withObject <span class="nottickedoff">&quot;tags&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff">models &lt;- o .:? &quot;models&quot; .!= <span class="nottickedoff">([] :: [Value])</span></span>
+<span class="lineno">  419 </span><span class="spaces">      </span><span class="istickedoff">traverse (withObject <span class="nottickedoff">&quot;model&quot;</span> (\m -&gt; ModelId &lt;$&gt; m .: &quot;name&quot;)) models</span></span>
+<span class="lineno">  420 </span>
+<span class="lineno">  421 </span>-- Provider instance --------------------------------------------------------
+<span class="lineno">  422 </span>
+<span class="lineno">  423 </span>instance Provider Ollama where
+<span class="lineno">  424 </span>  <span class="decl"><span class="istickedoff">listModels o = withHeaders o (listTags (olManager o) (olBaseUrl o))</span></span>
+<span class="lineno">  425 </span>  <span class="decl"><span class="nottickedoff">complete o cr =</span>
+<span class="lineno">  426 </span><span class="spaces">    </span><span class="nottickedoff">withHeaders o (\hdrs -&gt; sendChat o hdrs cr)</span></span>
+<span class="lineno">  427 </span>  <span class="decl"><span class="nottickedoff">streamComplete o cr k =</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="nottickedoff">withHeaders o (\hdrs -&gt; sendChatStream o hdrs cr k)</span></span>
+<span class="lineno">  429 </span>
+<span class="lineno">  430 </span>-- | POST {base}/api/chat with @stream:true@ and stream NDJSON chunks to the
+<span class="lineno">  431 </span>-- callback. Uses 'withResponse' (incremental body reading) instead of
+<span class="lineno">  432 </span>-- 'httpLbs' (whole body), so the first chunk arrives as soon as the model
+<span class="lineno">  433 </span>-- starts generating — avoiding the 90s response timeout that plagued
+<span class="lineno">  434 </span>-- non-streaming requests to remote/cloud models.
+<span class="lineno">  435 </span>sendChatStream
+<span class="lineno">  436 </span>  :: Ollama -&gt; RequestHeaders -&gt; CompletionRequest
+<span class="lineno">  437 </span>  -&gt; (StreamEvent -&gt; IO Bool)
+<span class="lineno">  438 </span>  -&gt; IO (Either Text StreamOutcome)
+<span class="lineno">  439 </span><span class="decl"><span class="nottickedoff">sendChatStream o hdrs cr k = do</span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- try $ do</span>
+<span class="lineno">  441 </span><span class="spaces">    </span><span class="nottickedoff">initReq &lt;- parseRequest (T.unpack (&quot;POST &quot; &lt;&gt; chatUrl (olBaseUrl o)))</span>
+<span class="lineno">  442 </span><span class="spaces">    </span><span class="nottickedoff">let req = initReq</span>
+<span class="lineno">  443 </span><span class="spaces">          </span><span class="nottickedoff">{ requestBody     = RequestBodyLBS (encode (encodeStreamRequest cr))</span>
+<span class="lineno">  444 </span><span class="spaces">          </span><span class="nottickedoff">, requestHeaders  = hdrs</span>
+<span class="lineno">  445 </span><span class="spaces">          </span><span class="nottickedoff">, responseTimeout  = responseTimeoutMicro ollamaResponseTimeoutMicro</span>
+<span class="lineno">  446 </span><span class="spaces">          </span><span class="nottickedoff">}</span>
+<span class="lineno">  447 </span><span class="spaces">    </span><span class="nottickedoff">withResponse req (olManager o) $ \resp -&gt; do</span>
+<span class="lineno">  448 </span><span class="spaces">      </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  449 </span><span class="spaces">      </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  450 </span><span class="spaces">        </span><span class="nottickedoff">then streamBody (responseBody resp)</span>
+<span class="lineno">  451 </span><span class="spaces">        </span><span class="nottickedoff">else do</span>
+<span class="lineno">  452 </span><span class="spaces">          </span><span class="nottickedoff">-- Non-2xx: read the body for the error message and return it</span>
+<span class="lineno">  453 </span><span class="spaces">          </span><span class="nottickedoff">-- directly (not via an exception).</span>
+<span class="lineno">  454 </span><span class="spaces">          </span><span class="nottickedoff">body &lt;- brReadSome (responseBody resp) 4096</span>
+<span class="lineno">  455 </span><span class="spaces">          </span><span class="nottickedoff">let errTxt = ollamaErrorText code</span>
+<span class="lineno">  456 </span><span class="spaces">                </span><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode (BL.toStrict body))</span>
+<span class="lineno">  457 </span><span class="spaces">          </span><span class="nottickedoff">pure (Left errTxt)</span>
+<span class="lineno">  458 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  459 </span><span class="spaces">    </span><span class="nottickedoff">Left (e :: HttpException) -&gt; pure (Left (ollamaHttpExceptionMsg (olBaseUrl o) e))</span>
+<span class="lineno">  460 </span><span class="spaces">    </span><span class="nottickedoff">Right inner -&gt; pure inner</span>
+<span class="lineno">  461 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  462 </span><span class="spaces">    </span><span class="nottickedoff">-- Read the response body chunk by chunk, decode each line as a JSON</span>
+<span class="lineno">  463 </span><span class="spaces">    </span><span class="nottickedoff">-- chunk, emit StreamEvents to the callback. Returns False immediately if</span>
+<span class="lineno">  464 </span><span class="spaces">    </span><span class="nottickedoff">-- the callback returns False (abort). Accumulates the final stop+usage</span>
+<span class="lineno">  465 </span><span class="spaces">    </span><span class="nottickedoff">-- from the StreamDone event.</span>
+<span class="lineno">  466 </span><span class="spaces">    </span><span class="nottickedoff">streamBody body = go BS.empty initialStreamChunkState</span>
+<span class="lineno">  467 </span><span class="spaces">      </span><span class="nottickedoff">where</span>
+<span class="lineno">  468 </span><span class="spaces">        </span><span class="nottickedoff">go buf st' = do</span>
+<span class="lineno">  469 </span><span class="spaces">          </span><span class="nottickedoff">chunk &lt;- brRead body</span>
+<span class="lineno">  470 </span><span class="spaces">          </span><span class="nottickedoff">if BS.null chunk</span>
+<span class="lineno">  471 </span><span class="spaces">            </span><span class="nottickedoff">then -- Stream ended without a done chunk; flush any remaining</span>
+<span class="lineno">  472 </span><span class="spaces">                 </span><span class="nottickedoff">-- buffer as a text chunk and treat as a clean stop.</span>
+<span class="lineno">  473 </span><span class="spaces">                 </span><span class="nottickedoff">do unless (BS.null buf) $</span>
+<span class="lineno">  474 </span><span class="spaces">                      </span><span class="nottickedoff">do (_, events) &lt;- processBuffer buf st'</span>
+<span class="lineno">  475 </span><span class="spaces">                         </span><span class="nottickedoff">void (emitEvents events)</span>
+<span class="lineno">  476 </span><span class="spaces">                    </span><span class="nottickedoff">pure (Right (StreamOutcome StopEnd (Usage 0 0)))</span>
+<span class="lineno">  477 </span><span class="spaces">            </span><span class="nottickedoff">else do</span>
+<span class="lineno">  478 </span><span class="spaces">              </span><span class="nottickedoff">let combined = buf &lt;&gt; chunk</span>
+<span class="lineno">  479 </span><span class="spaces">                  </span><span class="nottickedoff">ls = BS.split 10 combined  -- split on '\n'</span>
+<span class="lineno">  480 </span><span class="spaces">              </span><span class="nottickedoff">if BS.null (last ls)</span>
+<span class="lineno">  481 </span><span class="spaces">                </span><span class="nottickedoff">then do</span>
+<span class="lineno">  482 </span><span class="spaces">                  </span><span class="nottickedoff">-- trailing newline → all complete lines</span>
+<span class="lineno">  483 </span><span class="spaces">                  </span><span class="nottickedoff">let lines' = filter (not . BS.null) (init ls)</span>
+<span class="lineno">  484 </span><span class="spaces">                  </span><span class="nottickedoff">mOut &lt;- processLines st' lines'</span>
+<span class="lineno">  485 </span><span class="spaces">                  </span><span class="nottickedoff">case mOut of</span>
+<span class="lineno">  486 </span><span class="spaces">                    </span><span class="nottickedoff">Just outcome -&gt; pure (Right outcome)</span>
+<span class="lineno">  487 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; go BS.empty st'</span>
+<span class="lineno">  488 </span><span class="spaces">                </span><span class="nottickedoff">else do</span>
+<span class="lineno">  489 </span><span class="spaces">                  </span><span class="nottickedoff">-- no trailing newline → last element is a partial line</span>
+<span class="lineno">  490 </span><span class="spaces">                  </span><span class="nottickedoff">let lines' = filter (not . BS.null) (init ls)</span>
+<span class="lineno">  491 </span><span class="spaces">                      </span><span class="nottickedoff">partial = last ls</span>
+<span class="lineno">  492 </span><span class="spaces">                  </span><span class="nottickedoff">mOut &lt;- processLines st' lines'</span>
+<span class="lineno">  493 </span><span class="spaces">                  </span><span class="nottickedoff">case mOut of</span>
+<span class="lineno">  494 </span><span class="spaces">                    </span><span class="nottickedoff">Just outcome -&gt; pure (Right outcome)</span>
+<span class="lineno">  495 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; go partial st'</span>
+<span class="lineno">  496 </span><span class="spaces">    </span><span class="nottickedoff">-- Decode a batch of complete lines, threading state. Returns Just</span>
+<span class="lineno">  497 </span><span class="spaces">    </span><span class="nottickedoff">-- outcome if a StreamDone was encountered (or the callback aborted),</span>
+<span class="lineno">  498 </span><span class="spaces">    </span><span class="nottickedoff">-- Nothing to continue reading.</span>
+<span class="lineno">  499 </span><span class="spaces">    </span><span class="nottickedoff">processLines _ [] = pure Nothing</span>
+<span class="lineno">  500 </span><span class="spaces">    </span><span class="nottickedoff">processLines st' (l:ls) =</span>
+<span class="lineno">  501 </span><span class="spaces">      </span><span class="nottickedoff">case eitherDecodeStrict l of</span>
+<span class="lineno">  502 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; processLines st' ls  -- skip malformed line</span>
+<span class="lineno">  503 </span><span class="spaces">        </span><span class="nottickedoff">Right v -&gt; case decodeStreamChunk st' v of</span>
+<span class="lineno">  504 </span><span class="spaces">          </span><span class="nottickedoff">Left _ -&gt; processLines st' ls</span>
+<span class="lineno">  505 </span><span class="spaces">          </span><span class="nottickedoff">Right (st'', events) -&gt; do</span>
+<span class="lineno">  506 </span><span class="spaces">            </span><span class="nottickedoff">mOut &lt;- emitEvents events</span>
+<span class="lineno">  507 </span><span class="spaces">            </span><span class="nottickedoff">case mOut of</span>
+<span class="lineno">  508 </span><span class="spaces">              </span><span class="nottickedoff">Just outcome -&gt; pure (Just outcome)</span>
+<span class="lineno">  509 </span><span class="spaces">              </span><span class="nottickedoff">Nothing -&gt; processLines st'' ls</span>
+<span class="lineno">  510 </span><span class="spaces">    </span><span class="nottickedoff">-- Emit events to the callback; return Just outcome if StreamDone or</span>
+<span class="lineno">  511 </span><span class="spaces">    </span><span class="nottickedoff">-- callback returned False (abort → treat as clean stop).</span>
+<span class="lineno">  512 </span><span class="spaces">    </span><span class="nottickedoff">emitEvents [] = pure Nothing</span>
+<span class="lineno">  513 </span><span class="spaces">    </span><span class="nottickedoff">emitEvents (e:es) = do</span>
+<span class="lineno">  514 </span><span class="spaces">      </span><span class="nottickedoff">continue &lt;- k e</span>
+<span class="lineno">  515 </span><span class="spaces">      </span><span class="nottickedoff">if not continue</span>
+<span class="lineno">  516 </span><span class="spaces">        </span><span class="nottickedoff">then pure (Just (StreamOutcome StopEnd (Usage 0 0)))</span>
+<span class="lineno">  517 </span><span class="spaces">        </span><span class="nottickedoff">else case e of</span>
+<span class="lineno">  518 </span><span class="spaces">          </span><span class="nottickedoff">StreamDone stop usage -&gt; pure (Just (StreamOutcome stop usage))</span>
+<span class="lineno">  519 </span><span class="spaces">          </span><span class="nottickedoff">_ -&gt; emitEvents es</span>
+<span class="lineno">  520 </span><span class="spaces">    </span><span class="nottickedoff">-- Process a raw buffer (used for the final flush when the stream ends</span>
+<span class="lineno">  521 </span><span class="spaces">    </span><span class="nottickedoff">-- without a newline). Returns (state, events).</span>
+<span class="lineno">  522 </span><span class="spaces">    </span><span class="nottickedoff">processBuffer buf st' =</span>
+<span class="lineno">  523 </span><span class="spaces">      </span><span class="nottickedoff">case eitherDecodeStrict buf of</span>
+<span class="lineno">  524 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; pure (st', [])</span>
+<span class="lineno">  525 </span><span class="spaces">        </span><span class="nottickedoff">Right v -&gt; case decodeStreamChunk st' v of</span>
+<span class="lineno">  526 </span><span class="spaces">          </span><span class="nottickedoff">Left _ -&gt; pure (st', [])</span>
+<span class="lineno">  527 </span><span class="spaces">          </span><span class="nottickedoff">Right r -&gt; pure r</span></span>
+<span class="lineno">  528 </span>
+<span class="lineno">  529 </span>-- | Run @k@ with request headers built from the optional key; the key bytes
+<span class="lineno">  530 </span>-- live only inside the 'withApiKey' continuation.
+<span class="lineno">  531 </span>withHeaders :: Ollama -&gt; (RequestHeaders -&gt; IO r) -&gt; IO r
+<span class="lineno">  532 </span><span class="decl"><span class="istickedoff">withHeaders o k = case olApiKey o of</span>
+<span class="lineno">  533 </span><span class="spaces">  </span><span class="istickedoff">Nothing  -&gt; k (ollamaHeaders Nothing)</span>
+<span class="lineno">  534 </span><span class="spaces">  </span><span class="istickedoff">Just key -&gt; <span class="nottickedoff">withApiKey key (k . ollamaHeaders . Just)</span></span></span>
+
+</pre>
+</body>
+</html>

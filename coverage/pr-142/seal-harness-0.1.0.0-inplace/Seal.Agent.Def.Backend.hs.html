@@ -1,0 +1,403 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The agent-definition store backend. Disk is canonical. Two on-disk
+<span class="lineno">    3 </span>-- schemes are discovered:
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- 1. **FlatScheme** — one Markdown file per def at @agents\/\&lt;id\&gt;.md@,
+<span class="lineno">    6 </span>--    frontmatter (id\/name\/provider\/model\/tools\/timestamps\/session) +
+<span class="lineno">    7 </span>--    body = system prompt. 'AGENT_DEF_CREATE' \/ 'AGENT_DEF_UPDATE' write
+<span class="lineno">    8 </span>--    this form. This is the model-authored channel.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- 2. **DirScheme** (PureClaw-compatible) — a subdirectory per agent at
+<span class="lineno">   11 </span>--    @agents\/\&lt;id\&gt;\/@, with optional TOML frontmatter on @AGENTS.md@
+<span class="lineno">   12 </span>--    (model\/provider\/tools) and the system prompt composed by reading
+<span class="lineno">   13 </span>--    bootstrap files (@SOUL.md@, @USER.md@, @AGENTS.md@ body,
+<span class="lineno">   14 </span>--    @MEMORY.md@, @IDENTITY.md@, @TOOLS.md@, @BOOTSTRAP.md@) in fixed
+<span class="lineno">   15 </span>--    order with @--- SOUL ---@-style section markers. This is the
+<span class="lineno">   16 </span>--    human-authored channel — drop a directory under @agents\/@ and it
+<span class="lineno">   17 </span>--    is discovered.
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- **Conflict policy**: if both @agents\/\&lt;id\&gt;.md@ and @agents\/\&lt;id\&gt;\/@
+<span class="lineno">   20 </span>-- exist, the flat file wins (it carries provenance and is the
+<span class="lineno">   21 </span>-- model-authored form). The backend emits a warning on collision rather
+<span class="lineno">   22 </span>-- than silently deduplicating.
+<span class="lineno">   23 </span>--
+<span class="lineno">   24 </span>-- **Directories are a one-time import path**: the first
+<span class="lineno">   25 </span>-- 'AGENT_DEF_CREATE' \/ 'AGENT_DEF_UPDATE' for a DirScheme agent writes
+<span class="lineno">   26 </span>-- @agents\/\&lt;id\&gt;.md@ (taking the composed prompt as the flat body),
+<span class="lineno">   27 </span>-- after which the flat file takes precedence. The user can delete the
+<span class="lineno">   28 </span>-- original directory at their leisure.
+<span class="lineno">   29 </span>--
+<span class="lineno">   30 </span>-- 'markdownAgentDefBackend' reads by enumerating the directory (both
+<span class="lineno">   31 </span>-- schemes) and writes by atomic file replace + auto-commit.
+<span class="lineno">   32 </span>-- 'noneBackend' (in-memory) is kept for tests.
+<span class="lineno">   33 </span>--
+<span class="lineno">   34 </span>-- The git repo is the versioning + audit layer; model-authored writes
+<span class="lineno">   35 </span>-- (@AGENT_DEF_CREATE@ \/ @AGENT_DEF_UPDATE@, which are Trusted file writes)
+<span class="lineno">   36 </span>-- auto-commit.
+<span class="lineno">   37 </span>--
+<span class="lineno">   38 </span>-- The /workdir-scoped/ discovery backend (for @.agents\/@ discovery from
+<span class="lineno">   39 </span>-- cloned repos) lives in &quot;Seal.Agent.Def.Workdir&quot; and is re-exported here.
+<span class="lineno">   40 </span>-- That module has NO direct @System.Directory@\/@Data.Text.IO@ access —
+<span class="lineno">   41 </span>-- every workspace read goes through the 'WorkdirFs' handle (§3.6). This
+<span class="lineno">   42 </span>-- module (the user store) is local-FS by design (§3.9).
+<span class="lineno">   43 </span>module Seal.Agent.Def.Backend
+<span class="lineno">   44 </span>  ( -- * Backend record (re-exported from Seal.Agent.Def.Workdir)
+<span class="lineno">   45 </span>    AgentDefBackend (..)
+<span class="lineno">   46 </span>  , noneBackend
+<span class="lineno">   47 </span>  , unionAgentDefBackend
+<span class="lineno">   48 </span>    -- * User store (local-FS, §3.9)
+<span class="lineno">   49 </span>  , markdownAgentDefBackend
+<span class="lineno">   50 </span>    -- * Workdir-scoped discovery (re-exported from Seal.Agent.Def.Workdir)
+<span class="lineno">   51 </span>  , workdirAgentDefBackend
+<span class="lineno">   52 </span>  , staticAgentDefBackend
+<span class="lineno">   53 </span>    -- * Codecs + DirScheme helpers (re-exported from Seal.Agent.Def.Workdir)
+<span class="lineno">   54 </span>  , encodeAgentDef
+<span class="lineno">   55 </span>  , decodeAgentDef
+<span class="lineno">   56 </span>  , composeDirSystemPrompt
+<span class="lineno">   57 </span>  , defaultSectionCharLimit
+<span class="lineno">   58 </span>  , maxBootstrapFileBytes
+<span class="lineno">   59 </span>  , DirAgentConfig (..)
+<span class="lineno">   60 </span>  , defaultDirAgentConfig
+<span class="lineno">   61 </span>  , dirAgentConfigCodec
+<span class="lineno">   62 </span>  , parseDirAgentConfig
+<span class="lineno">   63 </span>  , deriveAgentsMdId
+<span class="lineno">   64 </span>  ) where
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>import Control.Monad (filterM, forM, forM_, when)
+<span class="lineno">   67 </span>import Data.IORef
+<span class="lineno">   68 </span>import Data.List (sortOn)
+<span class="lineno">   69 </span>import Data.Map.Strict (Map)
+<span class="lineno">   70 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   71 </span>import Data.Maybe (catMaybes, fromMaybe, isJust)
+<span class="lineno">   72 </span>import Data.Set qualified as Set
+<span class="lineno">   73 </span>import Data.Text (Text)
+<span class="lineno">   74 </span>import Data.Text qualified as T
+<span class="lineno">   75 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   76 </span>import System.Directory
+<span class="lineno">   77 </span>  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory
+<span class="lineno">   78 </span>  , removeFile, renameFile )
+<span class="lineno">   79 </span>import System.FilePath (takeDirectory, (&lt;/&gt;), (&lt;.&gt;))
+<span class="lineno">   80 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>import Seal.Agent.Def.Types
+<span class="lineno">   83 </span>  ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
+<span class="lineno">   84 </span>  )
+<span class="lineno">   85 </span>import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+<span class="lineno">   86 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   87 </span>import Seal.Text.LineFile (maxScanBytes)
+<span class="lineno">   88 </span>import Seal.Tools.Exec.WorkdirFs (WorkdirFs, mkLocalWorkdirFs)
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>import Seal.Agent.Def.Workdir
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | The agent-definition store capability. Each operation is IO; 'adbList'
+<span class="lineno">   93 </span>-- returns all defs sorted by id. (Defined in &quot;Seal.Agent.Def.Workdir&quot; to
+<span class="lineno">   94 </span>-- avoid an import cycle; re-exported here.)
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
+<span class="lineno">   97 </span>noneBackend :: IO AgentDefBackend
+<span class="lineno">   98 </span><span class="decl"><span class="istickedoff">noneBackend = do</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">ref &lt;- newIORef (Map.empty :: Map AgentDefId AgentDef)</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">pure AgentDefBackend</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">{ adbRead   = \aid -&gt; Map.lookup aid &lt;$&gt; readIORef ref</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">, adbUpdate = \d -&gt; modifyIORef' ref (Map.insert (adId d) d)</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">, adbList   = Map.elems &lt;$&gt; readIORef ref</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">, adbDelete = modifyIORef' ref . Map.delete</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | The Markdown backend. Discovers both flat @agents\/\&lt;id\&gt;.md@ files and
+<span class="lineno">  108 </span>-- PureClaw-style @agents\/\&lt;id\&gt;\/@ subdirectories. Writes are atomic
+<span class="lineno">  109 </span>-- (tmp → chmod 0600 → rename) and auto-committed to the config git repo.
+<span class="lineno">  110 </span>-- Malformed files / dirs are skipped.
+<span class="lineno">  111 </span>markdownAgentDefBackend :: FilePath -&gt; ConfigRepo -&gt; IO AgentDefBackend
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">markdownAgentDefBackend dir repo = pure AgentDefBackend</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">{ adbRead   = readAgentDef dir</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">, adbUpdate = writeAgentDef dir repo</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">, adbList   = listAgentDefs dir</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">, adbDelete = deleteAgentDef dir repo</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  120 </span>-- FlatScheme (user store)
+<span class="lineno">  121 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | The filename for a def in the flat layout: @\&lt;id\&gt;.md@.
+<span class="lineno">  124 </span>defFile :: FilePath -&gt; AgentDefId -&gt; FilePath
+<span class="lineno">  125 </span><span class="decl"><span class="istickedoff">defFile dir aid = dir &lt;/&gt; T.unpack (agentDefIdText aid) &lt;.&gt; &quot;md&quot;</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | The directory for a def: @agents\/\&lt;id\&gt;@.
+<span class="lineno">  128 </span>defDir :: FilePath -&gt; AgentDefId -&gt; FilePath
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">defDir dir aid = dir &lt;/&gt; T.unpack (agentDefIdText aid)</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | The full path for a def write, honoring its group. A grouped def lives
+<span class="lineno">  132 </span>-- at @\&lt;root\&gt;\/\&lt;group\&gt;\/\&lt;id\&gt;.md@; an ungrouped def (or one whose group
+<span class="lineno">  133 </span>-- is empty) lives at @\&lt;root\&gt;\/\&lt;id\&gt;.md@ (back-compat with the flat
+<span class="lineno">  134 </span>-- layout). The group directory is created on write. Mirrors
+<span class="lineno">  135 </span>-- 'Seal.Skills.Backend.skillPath'.
+<span class="lineno">  136 </span>defPath :: FilePath -&gt; AgentDef -&gt; FilePath
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">defPath root d =</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">case adGroup d of</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">Just g | <span class="tickonlytrue">not (T.null (T.strip g))</span> -&gt;</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">root &lt;/&gt; T.unpack (T.strip g) &lt;/&gt; T.unpack (agentDefIdText (adId d)) &lt;.&gt; &quot;md&quot;</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; defFile root (adId d)</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Write one def to disk (atomic) and auto-commit. Honors 'adGroup': a
+<span class="lineno">  144 </span>-- grouped def is written under @\&lt;root\&gt;\/\&lt;group\&gt;\/\&lt;id\&gt;.md@ (the group
+<span class="lineno">  145 </span>-- directory is created if absent); an ungrouped def is written flat at
+<span class="lineno">  146 </span>-- @\&lt;root\&gt;\/\&lt;id\&gt;.md@. The git commit path is relative to the config repo
+<span class="lineno">  147 </span>-- root and encodes the group when present.
+<span class="lineno">  148 </span>writeAgentDef :: FilePath -&gt; ConfigRepo -&gt; AgentDef -&gt; IO ()
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">writeAgentDef dir repo d = do</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">let path = defPath dir d</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">tmp  = path &lt;.&gt; &quot;tmp&quot;</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">parent = takeDirectory path</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True parent</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">TIO.writeFile tmp (encodeAgentDef d)</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">let rel = &quot;agents&quot; &lt;/&gt; case adGroup d of</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="istickedoff">Just g | <span class="tickonlytrue">not (T.null (T.strip g))</span> -&gt;</span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">T.unpack (T.strip g) &lt;/&gt; (T.unpack (agentDefIdText (adId d)) &lt;.&gt; &quot;md&quot;)</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; T.unpack (agentDefIdText (adId d)) &lt;.&gt; &quot;md&quot;</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: AGENT_DEF write &quot; &lt;&gt; agentDefIdText (adId d))</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | Delete one def file and auto-commit. Idempotent (no-op if the file is
+<span class="lineno">  165 </span>-- absent). Searches both the grouped and flat layouts: a def written under
+<span class="lineno">  166 </span>-- a group is deleted from its group directory; a flat-layout def is deleted
+<span class="lineno">  167 </span>-- from the root. If a file exists in both, both are removed. Does NOT remove
+<span class="lineno">  168 </span>-- PureClaw-style subdirectories (a directory is a human-authored import
+<span class="lineno">  169 </span>-- path; the model does not delete those).
+<span class="lineno">  170 </span>deleteAgentDef :: FilePath -&gt; ConfigRepo -&gt; AgentDefId -&gt; IO ()
+<span class="lineno">  171 </span><span class="decl"><span class="istickedoff">deleteAgentDef dir repo aid = do</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">let base = T.unpack (agentDefIdText aid) &lt;.&gt; &quot;md&quot;</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">groups &lt;- listGroupSubdirs dir</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">let groupedPaths = [ dir &lt;/&gt; T.unpack g &lt;/&gt; base | g &lt;- groups ]</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">flatPath     = defFile dir aid</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">candidates &lt;- filterM doesFileExist (groupedPaths ++ [flatPath])</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">forM_ candidates $ \path -&gt; do</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">removeFile path</span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">let rel = &quot;agents&quot; &lt;/&gt; fromMaybe <span class="nottickedoff">base</span> (stripRoot dir path)</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: AGENT_DEF delete &quot; &lt;&gt; agentDefIdText aid)</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">stripRoot r p =</span>
+<span class="lineno">  184 </span><span class="spaces">      </span><span class="istickedoff">let r' = dropTrailingSlash r</span>
+<span class="lineno">  185 </span><span class="spaces">          </span><span class="istickedoff">p' = dropTrailingSlash p</span>
+<span class="lineno">  186 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlytrue">r' `isPrefixPath` p'</span></span>
+<span class="lineno">  187 </span><span class="spaces">           </span><span class="istickedoff">then Just (drop (length r' + 1) p')</span>
+<span class="lineno">  188 </span><span class="spaces">           </span><span class="istickedoff">else <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">dropTrailingSlash = reverse . dropWhile (== '/') . reverse</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">isPrefixPath pre s = take (length pre) s == pre</span></span>
+<span class="lineno">  191 </span>
+<span class="lineno">  192 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  193 </span>-- Hybrid discovery (flat + dir) — user store, local-FS
+<span class="lineno">  194 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  195 </span>
+<span class="lineno">  196 </span>-- | The local 'WorkdirFs' anchored at the user store's agents directory.
+<span class="lineno">  197 </span>-- The DirScheme reads ('loadDirAgentDef' et al.) live in
+<span class="lineno">  198 </span>-- &quot;Seal.Agent.Def.Workdir&quot; and operate over 'WorkdirFs'; the user store
+<span class="lineno">  199 </span>-- constructs a local-arm 'WorkdirFs' at its @dir@ so the DirScheme reads
+<span class="lineno">  200 </span>-- share the single confined code path (§3.6) while remaining local-FS
+<span class="lineno">  201 </span>-- (§3.9).
+<span class="lineno">  202 </span>userDirFs :: FilePath -&gt; WorkdirFs
+<span class="lineno">  203 </span><span class="decl"><span class="istickedoff">userDirFs dir = mkLocalWorkdirFs (WorkspaceRoot dir) maxScanBytes</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>-- | Read one def by id. Probes, in order: the native grouped layout
+<span class="lineno">  206 </span>-- (@\&lt;group\&gt;\/\&lt;id\&gt;.md@) for each group subdirectory, then the flat
+<span class="lineno">  207 </span>-- layout (@\&lt;id\&gt;.md@). On the flat path, the DirScheme
+<span class="lineno">  208 </span>-- (@agents\/\&lt;id\&gt;\/@) is the fallback when the flat file is absent. The
+<span class="lineno">  209 </span>-- returned def's 'adGroup' is filled from the parent directory when the
+<span class="lineno">  210 </span>-- frontmatter omitted it (the common case), so a grouped file reads back
+<span class="lineno">  211 </span>-- as grouped regardless of whether its frontmatter redundantly declares a
+<span class="lineno">  212 </span>-- group. Returns 'Nothing' if no candidate exists. Mirrors
+<span class="lineno">  213 </span>-- 'Seal.Skills.Backend.readSkill'.
+<span class="lineno">  214 </span>readAgentDef :: FilePath -&gt; AgentDefId -&gt; IO (Maybe AgentDef)
+<span class="lineno">  215 </span><span class="decl"><span class="istickedoff">readAgentDef dir aid = do</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">let flatPath = defFile dir aid</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">groups &lt;- listGroupSubdirs dir</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">let base = T.unpack (agentDefIdText aid) &lt;.&gt; &quot;md&quot;</span>
+<span class="lineno">  219 </span><span class="spaces">      </span><span class="istickedoff">groupedPaths = [ (<span class="nottickedoff">g</span>, dir &lt;/&gt; T.unpack g &lt;/&gt; base) | g &lt;- groups ]</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">mGrouped &lt;- firstMatchGrouped groupedPaths</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">case mGrouped of</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">Just d  -&gt; pure (Just d)</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">flatExists &lt;- doesFileExist flatPath</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">if flatExists</span>
+<span class="lineno">  226 </span><span class="spaces">        </span><span class="istickedoff">then do</span>
+<span class="lineno">  227 </span><span class="spaces">          </span><span class="istickedoff">-- Conflict check: warn if a directory also exists.</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="istickedoff">let dirPath = defDir dir aid</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="istickedoff">dirExists &lt;- doesDirectoryExist dirPath</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="istickedoff">when dirExists $</span>
+<span class="lineno">  231 </span><span class="spaces">            </span><span class="istickedoff">putStrLn (&quot;warning: agent def &quot; &lt;&gt; T.unpack (agentDefIdText aid)</span>
+<span class="lineno">  232 </span><span class="spaces">                      </span><span class="istickedoff">&lt;&gt; &quot; has both a flat file and a directory; flat file takes precedence&quot;)</span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff">content &lt;- TIO.readFile flatPath</span>
+<span class="lineno">  234 </span><span class="spaces">          </span><span class="istickedoff">pure (decodeAgentDef content)</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">else loadDirAgentDef (userDirFs dir) aid</span></span>
+<span class="lineno">  236 </span>
+<span class="lineno">  237 </span>-- | Enumerate all defs in the directory (flat + grouped + DirScheme),
+<span class="lineno">  238 </span>-- sorted by id. Malformed flat files and malformed dirs are skipped. On
+<span class="lineno">  239 </span>-- flat/dir collision for the same id, the flat file wins and the dir is
+<span class="lineno">  240 </span>-- dropped. Grouped @.md@ files one directory down are stamped with their
+<span class="lineno">  241 </span>-- group. A subdirectory is classified as a *group* when it contains at
+<span class="lineno">  242 </span>-- least one @.md@ file that decodes as an 'AgentDef' (has an @id@
+<span class="lineno">  243 </span>-- frontmatter); otherwise it is treated as a DirScheme
+<span class="lineno">  244 </span>-- (@agents\/\&lt;id\&gt;\/@ with bootstrap files). Mirrors
+<span class="lineno">  245 </span>-- 'Seal.Skills.Backend.listSkills'.
+<span class="lineno">  246 </span>listAgentDefs :: FilePath -&gt; IO [AgentDef]
+<span class="lineno">  247 </span><span class="decl"><span class="istickedoff">listAgentDefs dir = do</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist dir</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  250 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- listDirectory dir</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">flatDefs &lt;- collectFlat dir entries</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">(groupDirs, dirSchemeDirs) &lt;- classifySubdirs dir entries</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">groupedDefs &lt;- collectGrouped dir groupDirs</span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">groupSet = Set.fromList groupDirs</span></span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">dirDefs  &lt;- collectDirs dir dirSchemeDirs (map adId (flatDefs ++ groupedDefs)) <span class="nottickedoff">groupSet</span></span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="istickedoff">pure (sortOn (agentDefIdText . adId) (flatDefs ++ groupedDefs ++ dirDefs))</span></span>
+<span class="lineno">  259 </span>
+<span class="lineno">  260 </span>-- | Classify immediate subdirectories of @dir@ into group dirs (contain at
+<span class="lineno">  261 </span>-- least one decodable flat def @.md@) and DirScheme dirs (everything else
+<span class="lineno">  262 </span>-- with a valid agent-def id). Hidden dirs are skipped.
+<span class="lineno">  263 </span>classifySubdirs :: FilePath -&gt; [FilePath] -&gt; IO ([Text], [FilePath])
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">classifySubdirs dir entries = do</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">let visible = [e | e &lt;- entries, <span class="tickonlytrue">not (T.isPrefixOf &quot;.&quot; (T.pack e))</span>]</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">isDirBools &lt;- mapM (\e -&gt; doesDirectoryExist (dir &lt;/&gt; e)) visible</span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="istickedoff">let dirNames = [e | (e, b) &lt;- zip visible isDirBools, b]</span>
+<span class="lineno">  268 </span><span class="spaces">  </span><span class="istickedoff">go dirNames ([], [])</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">go [] acc = pure acc</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">go (e:es) (gs, ds) = do</span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">let gDir = dir &lt;/&gt; e</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">subEntries &lt;- listDirectory gDir</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">let mdFiles = [f | f &lt;- subEntries, <span class="tickonlytrue">&quot;.md&quot; `T.isSuffixOf` T.pack f</span>]</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">decoded &lt;- mapM (\f -&gt; decodeAgentDef &lt;$&gt; TIO.readFile (gDir &lt;/&gt; f)) mdFiles</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">if any isJust decoded</span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff">then go es (T.pack e : gs, ds)</span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="istickedoff">else go es (gs, e : ds)</span></span>
+<span class="lineno">  279 </span>
+<span class="lineno">  280 </span>-- | Decode all flat @.md@ files in the directory (top-level only).
+<span class="lineno">  281 </span>collectFlat :: FilePath -&gt; [FilePath] -&gt; IO [AgentDef]
+<span class="lineno">  282 </span><span class="decl"><span class="istickedoff">collectFlat dir entries = do</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">let mdFiles = [e | e &lt;- entries, &quot;.md&quot; `T.isSuffixOf` T.pack e]</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">defs &lt;- forM mdFiles $ \e -&gt; do</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">content &lt;- TIO.readFile (dir &lt;/&gt; e)</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">pure (decodeAgentDef content)</span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="istickedoff">pure (catMaybes defs)</span></span>
+<span class="lineno">  288 </span>
+<span class="lineno">  289 </span>-- | Decode all @.md@ files one directory down (grouped layout), stamping
+<span class="lineno">  290 </span>-- 'adGroup' from the parent directory when the frontmatter omitted it.
+<span class="lineno">  291 </span>collectGrouped :: FilePath -&gt; [Text] -&gt; IO [AgentDef]
+<span class="lineno">  292 </span><span class="decl"><span class="istickedoff">collectGrouped dir groups = do</span>
+<span class="lineno">  293 </span><span class="spaces">  </span><span class="istickedoff">results &lt;- forM groups $ \g -&gt; do</span>
+<span class="lineno">  294 </span><span class="spaces">    </span><span class="istickedoff">let gDir = dir &lt;/&gt; T.unpack g</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">entries &lt;- listDirectory gDir</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">let mdFiles = [e | e &lt;- entries, <span class="tickonlytrue">&quot;.md&quot; `T.isSuffixOf` T.pack e</span>]</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">forM mdFiles $ \e -&gt; do</span>
+<span class="lineno">  298 </span><span class="spaces">      </span><span class="istickedoff">content &lt;- TIO.readFile (gDir &lt;/&gt; e)</span>
+<span class="lineno">  299 </span><span class="spaces">      </span><span class="istickedoff">pure (stampGroup g (decodeAgentDef content))</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">pure (concatMap catMaybes results)</span></span>
+<span class="lineno">  301 </span>
+<span class="lineno">  302 </span>-- | Load DirScheme defs from subdirectories, skipping ids already
+<span class="lineno">  303 </span>-- provided by the flat or grouped scheme (flat/grouped wins on conflict).
+<span class="lineno">  304 </span>-- Emits a warning per collision. @dirSchemeDirs@ is the pre-classified list
+<span class="lineno">  305 </span>-- of DirScheme candidate subdirectory names.
+<span class="lineno">  306 </span>collectDirs :: FilePath -&gt; [FilePath] -&gt; [AgentDefId] -&gt; Set.Set Text -&gt; IO [AgentDef]
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">collectDirs dir dirSchemeDirs flatIds _groupSet = do</span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">let flatIdTexts = Set.fromList (map agentDefIdText flatIds)</span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">defs &lt;- forM dirSchemeDirs $ \e -&gt; do</span>
+<span class="lineno">  310 </span><span class="spaces">    </span><span class="istickedoff">case mkAgentDefId (T.pack e) of</span>
+<span class="lineno">  311 </span><span class="spaces">      </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">Right aid -&gt; do</span>
+<span class="lineno">  313 </span><span class="spaces">        </span><span class="istickedoff">if agentDefIdText aid `Set.member` flatIdTexts</span>
+<span class="lineno">  314 </span><span class="spaces">          </span><span class="istickedoff">then do</span>
+<span class="lineno">  315 </span><span class="spaces">            </span><span class="istickedoff">putStrLn (&quot;warning: agent def &quot; &lt;&gt; e</span>
+<span class="lineno">  316 </span><span class="spaces">                      </span><span class="istickedoff">&lt;&gt; &quot; has both a flat file and a directory; flat file takes precedence&quot;)</span>
+<span class="lineno">  317 </span><span class="spaces">            </span><span class="istickedoff">pure Nothing  -- skip the dir def; flat wins</span>
+<span class="lineno">  318 </span><span class="spaces">          </span><span class="istickedoff">else loadDirAgentDef (userDirFs dir) aid</span>
+<span class="lineno">  319 </span><span class="spaces">  </span><span class="istickedoff">pure (catMaybes defs)</span></span>
+<span class="lineno">  320 </span>
+<span class="lineno">  321 </span>-- | Enumerate the immediate sub-directories of @dir@ (non-recursive, no
+<span class="lineno">  322 </span>-- hidden dirs), sorted for deterministic output. Returns the visible
+<span class="lineno">  323 </span>-- sub-directory names as 'Text'. Missing @dir@ yields @[]@. Mirrors
+<span class="lineno">  324 </span>-- 'Seal.Skills.Backend.listSubdirs' but on local 'FilePath'.
+<span class="lineno">  325 </span>listGroupSubdirs :: FilePath -&gt; IO [Text]
+<span class="lineno">  326 </span><span class="decl"><span class="istickedoff">listGroupSubdirs dir = do</span>
+<span class="lineno">  327 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist dir</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  329 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  330 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  331 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- listDirectory dir</span>
+<span class="lineno">  332 </span><span class="spaces">      </span><span class="istickedoff">let visible = [e | e &lt;- entries, <span class="tickonlytrue">not (T.isPrefixOf &quot;.&quot; (T.pack e))</span>]</span>
+<span class="lineno">  333 </span><span class="spaces">      </span><span class="istickedoff">ds &lt;- filterM (\e -&gt; doesDirectoryExist (dir &lt;/&gt; e)) (sortOn id visible)</span>
+<span class="lineno">  334 </span><span class="spaces">      </span><span class="istickedoff">pure (map T.pack ds)</span></span>
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- | Stamp 'adGroup' from the parent directory when the frontmatter omitted
+<span class="lineno">  337 </span>-- it. Mirrors 'Seal.Skills.Backend.readAndStampGroup' / 'stampGroup'.
+<span class="lineno">  338 </span>stampGroup :: Text -&gt; Maybe AgentDef -&gt; Maybe AgentDef
+<span class="lineno">  339 </span><span class="decl"><span class="istickedoff">stampGroup g (Just d) = case adGroup d of</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">Just _  -&gt; Just d</span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; Just d { adGroup = Just g }</span>
+<span class="lineno">  342 </span><span class="spaces"></span><span class="istickedoff">stampGroup _ Nothing = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  343 </span>
+<span class="lineno">  344 </span>-- | Read the first grouped @.md@ file that decodes, stamping its group.
+<span class="lineno">  345 </span>-- Short-circuits on the first match.
+<span class="lineno">  346 </span>firstMatchGrouped :: [(Text, FilePath)] -&gt; IO (Maybe AgentDef)
+<span class="lineno">  347 </span><span class="decl"><span class="istickedoff">firstMatchGrouped []       = pure Nothing</span>
+<span class="lineno">  348 </span><span class="spaces"></span><span class="istickedoff">firstMatchGrouped ((g, p):ps) = do</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist p</span>
+<span class="lineno">  350 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  351 </span><span class="spaces">    </span><span class="istickedoff">then firstMatchGrouped ps</span>
+<span class="lineno">  352 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">content &lt;- TIO.readFile p</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="istickedoff">case stampGroup <span class="nottickedoff">g</span> (decodeAgentDef content) of</span>
+<span class="lineno">  355 </span><span class="spaces">        </span><span class="istickedoff">Just d  -&gt; pure (Just d)</span>
+<span class="lineno">  356 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">firstMatchGrouped ps</span></span></span>
+<span class="lineno">  357 </span>
+<span class="lineno">  358 </span>-- | A union of a workdir 'AgentDefBackend' (repo-local agent defs) and a
+<span class="lineno">  359 </span>-- user 'AgentDefBackend' (the on-disk @~/.seal/config/agents/@ store).
+<span class="lineno">  360 </span>-- Workdir-wins on id collisions: workdir shadows user. Reads check
+<span class="lineno">  361 </span>-- workdir first, then user. Listing merges both with workdir winning on
+<span class="lineno">  362 </span>-- collision. Writes go to the /user/ backend only (repo-local defs are
+<span class="lineno">  363 </span>-- immutable from the model's perspective).
+<span class="lineno">  364 </span>unionAgentDefBackend :: AgentDefBackend -&gt; AgentDefBackend -&gt; AgentDefBackend
+<span class="lineno">  365 </span><span class="decl"><span class="istickedoff">unionAgentDefBackend workdir user = AgentDefBackend</span>
+<span class="lineno">  366 </span><span class="spaces">    </span><span class="istickedoff">{ adbRead   = \aid -&gt; do</span>
+<span class="lineno">  367 </span><span class="spaces">        </span><span class="istickedoff">mWd &lt;- adbRead workdir aid</span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="istickedoff">case mWd of</span>
+<span class="lineno">  369 </span><span class="spaces">          </span><span class="istickedoff">Just d  -&gt; pure (Just d)</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; adbRead user aid</span>
+<span class="lineno">  371 </span><span class="spaces">    </span><span class="istickedoff">, adbUpdate = adbUpdate user</span>
+<span class="lineno">  372 </span><span class="spaces">    </span><span class="istickedoff">, adbList   = do</span>
+<span class="lineno">  373 </span><span class="spaces">        </span><span class="istickedoff">wdDefs  &lt;- adbList workdir</span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="istickedoff">userDefs &lt;- adbList user</span>
+<span class="lineno">  375 </span><span class="spaces">        </span><span class="istickedoff">let wdMap   = Map.fromList [(adId d, d) | d &lt;- wdDefs]</span>
+<span class="lineno">  376 </span><span class="spaces">            </span><span class="istickedoff">userMap = Map.fromList [(adId d, d) | d &lt;- userDefs]</span>
+<span class="lineno">  377 </span><span class="spaces">            </span><span class="istickedoff">merged  = Map.union wdMap userMap</span>
+<span class="lineno">  378 </span><span class="spaces">        </span><span class="istickedoff">pure (Map.elems merged)</span>
+<span class="lineno">  379 </span><span class="spaces">    </span><span class="istickedoff">, adbDelete = adbDelete user</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>
