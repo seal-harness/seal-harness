@@ -18,7 +18,7 @@ import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Config.Paths (SealPaths, configFilePath, getSealPaths, securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), clearAccessControlSection
-  , loadSecurityConfig )
+  , loadSecurityConfig, WriteMode (..) )
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Security.AccessControl
   ( ResolvedAccessControl (..), resolveAccessControl )
@@ -70,9 +70,14 @@ status paths = do
 
 -- | Remove the @[access_control]@ table, returning the gateway to the setup
 -- screen.
+--
+-- 'DropCredentials' is correct here and nowhere else on this path: @reset@ is
+-- CLI-only and @--yes@ is mandatory, so a human decided to destroy the
+-- credential tables rather than be blocked by them. Every other writer keeps
+-- 'PreserveCredentials' and is refused instead.
 reset :: SealPaths -> IO ()
 reset paths = do
-  result <- clearAccessControlSection (securityFilePath paths)
+  result <- clearAccessControlSection (securityFilePath paths) DropCredentials
   case result of
     Left err -> TIO.putStrLn ("Could not reset access control: " <> err)
     Right () -> do

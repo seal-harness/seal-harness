@@ -26,6 +26,7 @@ import Seal.Config.Security
   , saveSecurityConfig
   , securityConfigCodec
   , updateAccessControlSection
+  , WriteMode (PreserveCredentials)
   )
 import Seal.Security.AccessControl
   ( BootDecision (..), CredentialAvailability (..), ResolvedAccessControl (..)
@@ -72,7 +73,8 @@ spec = describe "Seal.Config.Security access_control" $ do
     it "round-trips the default config through the file" $
       withSystemTempDirectory "seal-ac" $ \dir -> do
         let path = dir </> "security.toml"
-        saveSecurityConfig path defaultSecurityConfig
+        saveSecurityConfig path defaultSecurityConfig PreserveCredentials
+          `shouldReturn` Right ()
         loadSecurityConfig path `shouldReturn` Right defaultSecurityConfig
 
   describe "updateAccessControlSection" $
@@ -84,7 +86,7 @@ spec = describe "Seal.Config.Security access_control" $ do
               , scVaultIdentity = Just "/keys/id.txt"
               , scVaultUnlock = Just "on_demand"
               }
-        saveSecurityConfig path initial
+        saveSecurityConfig path initial PreserveCredentials `shouldReturn` Right ()
         result <- updateAccessControlSection path (const sampleSection)
         case result of
           Left e -> expectationFailure ("write failed: " <> T.unpack e)

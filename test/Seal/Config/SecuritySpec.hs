@@ -2,6 +2,7 @@
 module Seal.Config.SecuritySpec (spec) where
 
 import Data.Bits ((.&.))
+import Data.ByteString qualified as BSC
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -17,7 +18,7 @@ import Test.QuickCheck (Gen, elements, forAll, oneof)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , hasLegacyLayout, loadSecurityConfig, saveSecurityConfig
+  , WriteMode (..), hasLegacyLayout, loadSecurityConfig, saveSecurityConfig
   , untrustedExecConfigFromSecurity )
 
 spec :: Spec
@@ -82,28 +83,28 @@ spec = describe "Seal.Config.Security" $ do
               , scUntrustedExec  = Nothing
               , scAccessControl  = Nothing
               }
-        saveSecurityConfig path cfg
+        saveSecurityConfig path cfg PreserveCredentials `shouldReturn` Right ()
         result <- loadSecurityConfig path
         result `shouldBe` Right cfg
 
     it "round-trips defaultSecurityConfig (all Nothing)" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
-        saveSecurityConfig path defaultSecurityConfig
+        saveSecurityConfig path defaultSecurityConfig PreserveCredentials `shouldReturn` Right ()
         result <- loadSecurityConfig path
         result `shouldBe` Right defaultSecurityConfig
 
     it "leaves no leftover .tmp file after save" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
-        saveSecurityConfig path defaultSecurityConfig
+        saveSecurityConfig path defaultSecurityConfig PreserveCredentials `shouldReturn` Right ()
         leftover <- doesFileExist (path <> ".tmp")
         leftover `shouldBe` False
 
     it "writes security.toml with mode 0600" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
-        saveSecurityConfig path defaultSecurityConfig
+        saveSecurityConfig path defaultSecurityConfig PreserveCredentials `shouldReturn` Right ()
         stat <- getFileStatus path
         (fileMode stat .&. 0o777) `shouldBe` 0o600
 
@@ -184,7 +185,7 @@ spec = describe "Seal.Config.Security" $ do
                       })
                   })
               }
-        saveSecurityConfig path cfg
+        saveSecurityConfig path cfg PreserveCredentials `shouldReturn` Right ()
         result <- loadSecurityConfig path
         case result of
           Left err -> expectationFailure ("reload failed: " <> T.unpack err)
@@ -215,6 +216,45 @@ spec = describe "Seal.Config.Security" $ do
 
     it "is false for an unparseable file (that is a different refusal)" $
       hasLegacyLayout "[access_control.credentials.AA\npublic_key = " `shouldBe` False
+
+  -- Design §10. The refusal lives in saveSecurityConfig, the one function every
+  -- writer funnels through, so no current or future caller can forget it. It
+  -- reads the file as it is on disk: the caller has already decoded the
+  -- document, and decoding is precisely what loses a legacy table.
+  describe "saveSecurityConfig WriteMode" $ do
+    it "PreserveCredentials refuses a legacy credential table, leaving the bytes alone" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path headerSpellingFixture
+        original <- BSC.readFile path
+        refused <- saveSecurityConfig path defaultSecurityConfig PreserveCredentials
+        refused `shouldSatisfy` mentionsMigrate
+        BSC.readFile path `shouldReturn` original
+
+    it "PreserveCredentials refuses the dotted-key spelling too" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path dottedKeyFixture
+        original <- BSC.readFile path
+        refused <- saveSecurityConfig path defaultSecurityConfig PreserveCredentials
+        refused `shouldSatisfy` mentionsMigrate
+        BSC.readFile path `shouldReturn` original
+
+    it "DropCredentials is the --yes-gated exemption and does write" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path headerSpellingFixture
+        saveSecurityConfig path defaultSecurityConfig DropCredentials
+          `shouldReturn` Right ()
+        loadSecurityConfig path `shouldReturn` Right defaultSecurityConfig
+
+    it "PreserveCredentials writes normally when there is nothing to preserve" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "vault_recipient = \"age1abc\"\n"
+        saveSecurityConfig path defaultSecurityConfig PreserveCredentials
+          `shouldReturn` Right ()
+        loadSecurityConfig path `shouldReturn` Right defaultSecurityConfig
 
   describe "untrustedExecConfigFromSecurity" $ do
 
@@ -281,3 +321,9 @@ dottedKeyFixture = T.unlines
     , "mode = \"passkey\""
     ]
     <> legacyCredentialLines ("credentials." <> legacyCredentialId <> ".") )
+
+-- | The refusal must name the command that fixes it, or the operator is told
+-- "no" with no way forward.
+mentionsMigrate :: Either Text () -> Bool
+mentionsMigrate (Left msg) = "migrate-credentials" `T.isInfixOf` msg
+mentionsMigrate (Right ()) = False

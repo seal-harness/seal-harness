@@ -30,6 +30,7 @@ module Seal.Config.Security
   , fixNode
   , hasLegacyLayout
   , tomlKeyPaths
+  , WriteMode (..)
   , updateAccessControlSection
   , clearAccessControlSection
   , writeSecretFile
@@ -50,6 +51,7 @@ import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
 import System.IO.Unsafe (unsafePerformIO)
@@ -345,18 +347,54 @@ loadSecurityConfig path = do
           Success cfg  -> Right cfg
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
+-- | Whether a write is allowed to discard the pre-split credential tables.
+--
+-- A credential table in @security.toml@ is only ever a leftover from the
+-- layout before credentials moved to @credentials.toml@, and rewriting the
+-- document without migrating it first destroys it: the next boot then reads as
+-- unconfigured and every enrolled passkey is gone. So the exemption is a
+-- value, not a convention — the two callers that may pass 'DropCredentials'
+-- are @migrate-credentials@ and @reset --yes@, both CLI-only and both
+-- @--yes@-gated.
+data WriteMode = PreserveCredentials | DropCredentials
+  deriving stock (Eq, Show)
+
 -- | Save @cfg@ to @path@ atomically.
 --
 -- The temp file is created with mode @0600@ at creation time (not chmod'ed
 -- afterwards), so there is never a window in which the vault recipient or a
 -- passkey public key is world-readable. It is then renamed over @path@, which
 -- is atomic on every filesystem this project supports.
-saveSecurityConfig :: FilePath -> SecurityConfig -> IO ()
-saveSecurityConfig path cfg = do
-  let encoded = Toml.encode securityConfigCodec cfg
-      tmp     = path <> ".tmp"
-  writeSecretFile tmp encoded
-  renameFile tmp path
+--
+-- Every writer funnels through here, so this is where the credential-preserving
+-- refusal lives. It reads the document /as it is on disk/, not the value being
+-- written: the caller has already decoded it, and decoding is exactly what
+-- loses a legacy table it does not understand.
+saveSecurityConfig :: FilePath -> SecurityConfig -> WriteMode -> IO (Either Text ())
+saveSecurityConfig path cfg mode = do
+  refusal <- legacyCredentialRefusal path mode
+  case refusal of
+    Just err -> pure (Left err)
+    Nothing  -> do
+      let encoded = Toml.encode securityConfigCodec cfg
+          tmp     = path <> ".tmp"
+      writeSecretFile tmp encoded
+      renameFile tmp path
+      pure (Right ())
+
+legacyCredentialRefusal :: FilePath -> WriteMode -> IO (Maybe Text)
+legacyCredentialRefusal _    DropCredentials   = pure Nothing
+legacyCredentialRefusal path PreserveCredentials = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- TIO.readFile path
+      pure $ if hasLegacyLayout raw
+        then Just ("refusing to rewrite " <> T.pack path <> ": it still holds the "
+                    <> "pre-split [access_control.credentials] tables. Run "
+                    <> "`seal access-control migrate-credentials` first.")
+        else Nothing
 
 -- | Write a text file whose permissions are restricted from the moment it
 -- exists: @0600@ is applied at creation (via @openFd@'s @creat@ mode) and again
@@ -398,7 +436,7 @@ updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
   result <- loadSecurityConfig path
   case result of
     Left err  -> pure (Left err)
-    Right cfg -> saveSecurityConfig path (f cfg) >> pure (Right ())
+    Right cfg -> saveSecurityConfig path (f cfg) PreserveCredentials
 
 -- | The ONLY writer of @security.toml@ reachable from the gateway.
 --
@@ -428,7 +466,10 @@ updateAccessControlSection path f = withMVar securityWriteLock $ \_ -> do
       case reDecode encoded of
         Just roundTripped
           | scAccessControl roundTripped == Just updated ->
-              saveSecurityConfig path newCfg >> pure (Right updated)
+              -- The section writer never discards credentials: enrollment
+              -- moves them out, it does not drop them.
+              fmap (>> Right updated)
+                (saveSecurityConfig path newCfg PreserveCredentials)
         _ -> pure (Left "refusing to write security.toml: the encoded document does not round-trip the new [access_control] section")
   where
     reDecode encoded = case Toml.parse encoded of
@@ -440,12 +481,12 @@ updateAccessControlSection path f = withMVar securityWriteLock $ \_ -> do
 -- | Remove the @[access_control]@ table entirely, returning the gateway to the
 -- unconfigured state. Reachable only from the @seal access-control reset@ CLI
 -- command (the human-driven path); no opcode and no HTTP route can call it.
-clearAccessControlSection :: FilePath -> IO (Either Text ())
-clearAccessControlSection path = withMVar securityWriteLock $ \_ -> do
+clearAccessControlSection :: FilePath -> WriteMode -> IO (Either Text ())
+clearAccessControlSection path mode = withMVar securityWriteLock $ \_ -> do
   loaded <- loadSecurityConfig path
   case loaded of
     Left err  -> pure (Left err)
-    Right cfg -> saveSecurityConfig path (cfg { scAccessControl = Nothing }) >> pure (Right ())
+    Right cfg -> saveSecurityConfig path (cfg { scAccessControl = Nothing }) mode
 
 -- | The section a first write starts from when the file has none.
 emptyAccessControl :: AccessControlFileConfig

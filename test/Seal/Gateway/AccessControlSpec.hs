@@ -48,7 +48,8 @@ import Data.ByteArray (convert)
 import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
-  , defaultSecurityConfig, loadSecurityConfig, saveSecurityConfig )
+  , WriteMode (PreserveCredentials), defaultSecurityConfig, loadSecurityConfig
+  , saveSecurityConfig )
 import Seal.Gateway.AccessControl
 import Seal.Gateway.Config (defaultGatewayConfig)
 import Seal.Security.WebAuthn.Types (AccessMode (..))
@@ -382,7 +383,8 @@ writeSection :: SealPaths -> AccessControlFileConfig -> IO ()
 writeSection paths section = do
   createDirectoryIfMissing True (spConfig paths)
   saveSecurityConfig (securityFilePath paths)
-    defaultSecurityConfig { scAccessControl = Just section }
+    defaultSecurityConfig { scAccessControl = Just section } PreserveCredentials
+    `shouldReturn` Right ()
 
 readSection :: SealPaths -> IO (Maybe AccessControlFileConfig)
 readSection paths = do
