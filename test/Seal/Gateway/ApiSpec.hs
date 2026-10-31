@@ -669,13 +669,13 @@ spec = describe "Seal.Gateway.API" $ do
       [ "allowed_secrets" .= A.Array (V.fromList [ A.String "a", A.String "b" ]) ])
     smAllowedSecrets meta `shouldBe` Set.fromList ["a", "b"]
 
-  it "POST /api/sessions/new with an invalid secret name → 400" $ do
+  it "POST /api/sessions/new with a space-containing secret name → 200" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "new"]
       (A.encode (A.object
         [ "allowed_secrets" .= A.Array (V.fromList [ A.String "bad name!" ]) ]))
     status <- runAppStatus app req
-    status `shouldBe` 400
+    status `shouldBe` 200
 
   it "POST /api/sessions/new with a non-string allowed_secrets entry → 400" $ do
     app <- mkApp

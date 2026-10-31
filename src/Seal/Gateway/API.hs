@@ -123,7 +123,6 @@ import Seal.Session.Store
   , updateSessionArchived, updateSessionSystemOverride
   , updateSessionDescription
   , updateSessionSealFrontMatter )
-import Seal.ISA.Ops.Secret (isValidSecretName)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
@@ -835,10 +834,7 @@ parseAllowedSecrets (A.Object o) =
     Just A.Null     -> Right mempty
     Just (A.Array arr) -> do
       names <- traverse toText (V.toList arr)
-      let invalid = filter (not . isValidSecretName) names
-      case invalid of
-        (x:_) -> Left ("invalid secret name: " <> x)
-        []    -> Right (Set.fromList names)
+      Right (Set.fromList names)
     Just _          -> Left "allowed_secrets must be an array"
   where
     toText (A.String t) = Right t

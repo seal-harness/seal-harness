@@ -59,6 +59,7 @@ import Data.Foldable (toList)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
@@ -111,6 +112,7 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.Vault.Access (unrestrictedVaultAccess, vaAllowedSet)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder, ChildWorkerOutcome (..)
@@ -737,11 +739,16 @@ buildRemoteSecurityConfig tmp user mKeyfilePath =
 -- | Create a provider tab via POST /api/tabs/new. Returns the session id.
 callApiNewTab :: ApiTestEnv -> Text -> Text -> IO Text
 callApiNewTab env provider model = do
+  -- Read all vault keys so test sessions get unrestricted vault access
+  -- (same as before the VaultAccess change). Test-only.
+  va <- unrestrictedVaultAccess (adVault (ateDeps env))
+  let secretKeys = Set.toList (vaAllowedSet va)
   req <- testPost ["api", "tabs", "new"]
     (A.encode (A.object
       [ "kind" .= ("provider" :: Text)
       , "provider" .= provider
       , "model" .= model
+      , "allowed_secrets" .= secretKeys
       ]))
   (st, body) <- runAppBody (ateApp env) req
   if st /= 200
