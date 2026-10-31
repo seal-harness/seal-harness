@@ -2,6 +2,7 @@
 module Seal.Config.SecuritySpec (spec) where
 
 import Data.Bits ((.&.))
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist)
@@ -16,7 +17,8 @@ import Test.QuickCheck (Gen, elements, forAll, oneof)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , loadSecurityConfig, saveSecurityConfig, untrustedExecConfigFromSecurity )
+  , hasLegacyLayout, loadSecurityConfig, saveSecurityConfig
+  , untrustedExecConfigFromSecurity )
 
 spec :: Spec
 spec = describe "Seal.Config.Security" $ do
@@ -188,6 +190,32 @@ spec = describe "Seal.Config.Security" $ do
           Left err -> expectationFailure ("reload failed: " <> T.unpack err)
           Right back -> scUntrustedExec back `shouldBe` scUntrustedExec cfg
 
+  -- Design §10. The pre-split layout put credentials inside security.toml.
+  -- Once the store moves out, a write that rewrites security.toml without
+  -- noticing would drop every credential — silently, on a document whose next
+  -- boot then reads as unconfigured. Detection has to decode, not grep: the
+  -- same document has a second spelling (dotted keys under [access_control])
+  -- that a substring scan for "[access_control.credentials." misses entirely.
+  describe "hasLegacyLayout" $ do
+    it "detects the [access_control.credentials.<id>] header spelling" $
+      hasLegacyLayout headerSpellingFixture `shouldBe` True
+
+    it "detects the dotted-key spelling under [access_control]" $
+      hasLegacyLayout dottedKeyFixture `shouldBe` True
+
+    it "is false for a file whose credentials already live elsewhere" $
+      hasLegacyLayout (T.unlines
+        [ "[access_control]"
+        , "mode = \"passkey\""
+        , "origin = \"https://seal.example.com\""
+        ]) `shouldBe` False
+
+    it "is false for a file with no [access_control] section at all" $
+      hasLegacyLayout "vault_recipient = \"age1abc\"\n" `shouldBe` False
+
+    it "is false for an unparseable file (that is a different refusal)" $
+      hasLegacyLayout "[access_control.credentials.AA\npublic_key = " `shouldBe` False
+
   describe "untrustedExecConfigFromSecurity" $ do
 
     it "returns Nothing when the section is absent" $ do
@@ -226,3 +254,30 @@ genSecurityConfig = do
     , scUntrustedExec  = uefc
     , scAccessControl  = Nothing
     }
+
+-- | One legacy credential, in the shape the pre-split file used.
+legacyCredentialLines :: Text -> [Text]
+legacyCredentialLines prefix =
+  [ prefix <> "public_key = \"" <> T.replicate 86 "A" <> "\""
+  , prefix <> "sign_count = 0"
+  , prefix <> "label = \"laptop\""
+  , prefix <> "created_at = \"2026-10-30T14:00:00Z\""
+  , prefix <> "rp_id = \"localhost\""
+  ]
+
+legacyCredentialId :: Text
+legacyCredentialId = T.replicate 22 "A"
+
+headerSpellingFixture :: Text
+headerSpellingFixture = T.unlines
+  ([ "[access_control.credentials." <> legacyCredentialId <> "]" ]
+    <> legacyCredentialLines "")
+
+-- | The same document written with dotted keys under @[access_control]@: no
+-- @[access_control.credentials.@ substring appears anywhere in it.
+dottedKeyFixture :: Text
+dottedKeyFixture = T.unlines
+  ( [ "[access_control]"
+    , "mode = \"passkey\""
+    ]
+    <> legacyCredentialLines ("credentials." <> legacyCredentialId <> ".") )

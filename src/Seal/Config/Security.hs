@@ -28,6 +28,8 @@ module Seal.Config.Security
   , credentialCodec
   , normalizeAccessControlTable
   , fixNode
+  , hasLegacyLayout
+  , tomlKeyPaths
   , updateAccessControlSection
   , clearAccessControlSection
   , writeSecretFile
@@ -43,6 +45,7 @@ module Seal.Config.Security
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (bracketOnError)
 import Data.HashMap.Strict qualified as HashMap
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -172,6 +175,70 @@ credentialCodec = CredentialFileConfig
   <*> Toml.text "created_at" .= cfcCreatedAt
   <*> Toml.text "rp_id" .= cfcRpId
   <*> Toml.dioptional (Toml.text "added_via") .= cfcAddedVia
+
+-- | Every key path in a parsed document, as a list of pieces.
+--
+-- The three shapes tomland produces all have to be walked, or a path
+-- comparison silently misses one of them:
+--
+-- * an explicit table header — a prefix-tree 'Toml.Branch' whose prefix /is/
+--   the path;
+-- * a table's own keys — a 'Toml.TOML' payload reached through a
+--   'Toml.Branch' or 'Toml.Leaf';
+-- * a /dotted key/ — which tomland does NOT expand into nested tables. It
+--   keeps the whole path in one 'Toml.tomlPairs' key, so
+--   @credentials.\<id\>.public_key@ under @[access_control]@ arrives as the
+--   single pair key @(\"credentials\" :| [\"\<id\>\",\"public_key\"])@ and no
+--   prefix tree ever holds a @credentials@ node. This is why the check below
+--   cannot be a codec.
+tomlKeyPaths :: Toml.TOML -> [[Toml.Piece]]
+tomlKeyPaths = go []
+  where
+    go prefix toml =
+         [ prefix <> keyPieces key
+         | key <- HashMap.keys (Toml.tomlPairs toml) ]
+      <> concatMap nodePaths (HashMap.elems (Toml.tomlTables toml))
+
+    -- A node's own prefix is the authoritative absolute path: an implicit
+    -- table header arrives as one multi-piece prefix under a single-piece
+    -- map key, so the map key alone loses path segments.
+    nodePaths tree = case tree of
+      Toml.Branch pref mValue children ->
+           [keyPieces pref]
+        <> maybe [] (go (keyPieces pref)) mValue
+        <> concatMap nodePaths (HashMap.elems children)
+      Toml.Leaf pref value -> [keyPieces pref] <> go (keyPieces pref) value
+
+    keyPieces = NonEmpty.toList . Toml.unKey
+
+-- | Does this raw @security.toml@ still carry the pre-split credential tables?
+--
+-- Once the store moved to @credentials.toml@, a write that rewrites
+-- @security.toml@ without noticing the old tables would drop every credential —
+-- silently, on a document whose next boot then reads as unconfigured.
+--
+-- Detection walks the parsed key paths, it does not grep the text. A substring
+-- scan for @[access_control.credentials.@ misses the dotted-key spelling of the
+-- same document (@[access_control]@ plus @credentials.\<id\>.public_key = …@),
+-- and — as 'tomlKeyPaths' explains — so does anything that goes through the
+-- prefix tree, which is why this is not a codec either.
+--
+-- An unparseable document answers 'False': it is refused earlier, as
+-- @BrSecurityUnparseable@, so it can never reach the writer this guard protects.
+--
+-- Detection is not reading. Decoding the credentials back out for
+-- @migrate-credentials@ is a separate concern, and it must handle the
+-- dotted-key spelling too: 'normalizeAccessControlTable' only makes
+-- /prefix-tree/ nodes explicit, so a dotted-key file currently decodes to an
+-- empty credential map. A migration that reads through the codec alone would
+-- therefore move nothing and then report success.
+hasLegacyLayout :: Text -> Bool
+hasLegacyLayout raw = case Toml.parse raw of
+  Left _     -> False
+  Right toml -> any isCredentialPath (tomlKeyPaths toml)
+  where
+    isCredentialPath (p1 : p2 : _) = p1 == "access_control" && p2 == "credentials"
+    isCredentialPath _             = False
 
 -- | Make the implicit @access_control@ node explicit before decoding.
 --
