@@ -35,8 +35,9 @@ import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
 import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
 
-import Seal.Agent.Runtime.Registry (AgentRuntime)
+import Seal.Agent.Runtime.Registry (AgentRuntime, hasRunningChildren)
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
+import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Channels.Cursor
   ( newPersistingCursorStore, seedCursorStore )
 import Seal.Channels.Cursor.Persist (loadCursorMap)
@@ -400,12 +401,20 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   writeIORef wsHealthRef (StreamHealth "up" (gcPort gwCfg))
   logIO logger InfoS ("WS stream server mounted on the same port ("
     <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))) <> ")")
-  -- Periodically clear stale "thinking" sessions (safety net for sessions
-  -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
-  -- every 5 minutes; clears sessions thinking longer than 30 minutes.
+  -- Periodically clear stale "thinking" sessions (a safety net for a turn
+  -- that died without its bracket cleanup broadcasting idle). Runs every 5
+  -- minutes and clears only sessions that have been SILENT for 30 minutes
+  -- — every entry/tool-call broadcast refreshes the session's stamp — and
+  -- are not busy (no turn in flight, no running background children). A
+  -- long turn that is still producing output is never cleared: reporting
+  -- it idle mid-turn mis-sorts the sidebar, drops the chat channels'
+  -- /watch state, and closes a /bg connection.
   _ <- forkIO $ forever $ do
     threadDelay (5 * 60 * 1_000_000)
-    void (reconcileStaleThinking broker (30 * 60))
+    void (reconcileStaleThinking broker
+            (\sid -> (||) <$> sessionTurnInFlight (sdLocks sendDeps) sid
+                          <*> hasRunningChildren (bRuntime backends) sid)
+            (30 * 60))
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The channels connect to the gateway as clients (HTTP + WS)
