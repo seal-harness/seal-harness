@@ -27,6 +27,7 @@
 module Seal.Config.Credentials
   ( CredentialsFile (..)
   , credentialsCodec
+  , normalizeCredentialsTable
   , decodeCredentials
   , encodeCredentials
   , loadCredentials
@@ -34,6 +35,7 @@ module Seal.Config.Credentials
   ) where
 
 import Data.ByteString qualified as BS
+import Data.HashMap.Strict qualified as HashMap
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
@@ -47,7 +49,7 @@ import Validation (Validation (..))
 import Toml ((.=))
 import Toml qualified
 
-import Seal.Config.Security (CredentialFileConfig, credentialCodec)
+import Seal.Config.Security (CredentialFileConfig, credentialCodec, fixNode)
 
 -- | The decoded @credentials.toml@: a format version plus the credential map
 -- keyed by base64url credential id.
@@ -70,6 +72,22 @@ credentialsCodec = CredentialsFile
   <*> Toml.tableMap Toml._KeyText (Toml.table credentialCodec) "credentials"
         .= crdCredentials
 
+-- | Make the implicit @credentials@ node explicit before decoding.
+--
+-- tomland's 'Toml.tableMap' looks the table up under its @[credentials]@
+-- header, so an operator-written file that carries only @[credentials.\<id\>]@
+-- sub-tables leaves that node implicit in the prefix tree and the lookup
+-- yields an EMPTY map (learnings 2026-10-30 §4). An empty store is not a parse
+-- error, so without this the operator's passkeys disappear silently — the
+-- worst failure mode available here, because the file still "loads".
+--
+-- A file written by 'saveCredentials' already has the explicit header and
+-- passes through unchanged.
+normalizeCredentialsTable :: Toml.TOML -> Toml.TOML
+normalizeCredentialsTable toml =
+  toml { Toml.tomlTables =
+           HashMap.adjust (fixNode "credentials") "credentials" (Toml.tomlTables toml) }
+
 -- | Render a 'CredentialsFile' as TOML.
 encodeCredentials :: CredentialsFile -> Text
 encodeCredentials = Toml.encode credentialsCodec
@@ -78,7 +96,8 @@ encodeCredentials = Toml.encode credentialsCodec
 decodeCredentials :: Text -> Either Text CredentialsFile
 decodeCredentials raw = case Toml.parse raw of
   Left err -> Left (Toml.unTomlParseError err)
-  Right toml -> case Toml.runTomlCodec credentialsCodec toml of
+  Right toml -> case Toml.runTomlCodec credentialsCodec
+                       (normalizeCredentialsTable toml) of
     Success file -> Right file
     Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 

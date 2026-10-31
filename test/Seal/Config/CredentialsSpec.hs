@@ -5,6 +5,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 
@@ -27,6 +28,27 @@ spec = describe "Seal.Config.Credentials" $ do
         saveCredentials path (CredentialsFile 1 creds)
         loaded <- loadCredentials path
         pure (loaded == Right (Just (CredentialsFile 1 creds)))
+
+  describe "loadCredentials" $ do
+    -- The bug class this pins: an operator writes the file by hand in the
+    -- idiomatic TOML style — a bare `version` key plus `[credentials.<id>]`
+    -- tables, no explicit `[credentials]` header. tomland leaves the
+    -- `credentials` node implicit, the tableMap lookup finds nothing, and the
+    -- store decodes as EMPTY. An empty store is not a parse error, so it
+    -- would sail through and the operator's passkeys would vanish.
+    it "decodes a hand-written [credentials.<id>]-only file" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+        TIO.writeFile path idiomaticFixture
+        loadCredentials path `shouldReturn`
+          Right (Just (CredentialsFile 1 (Map.singleton idiomaticId idiomaticCredential)))
+
+    it "decodes a file that carries an explicit [credentials] header" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+        TIO.writeFile path explicitHeaderFixture
+        loadCredentials path `shouldReturn`
+          Right (Just (CredentialsFile 1 (Map.singleton idiomaticId idiomaticCredential)))
 
 -- | A credential map with the key shape the real store uses: a base64url
 -- credential id (a valid TOML bare key) mapped to one credential table.
@@ -91,3 +113,50 @@ genTimestamp = do
 
 genAddedVia :: Gen Text
 genAddedVia = elements ["cli_token", "cli_window", "assertion", "legacy"]
+
+-- | A hand-written store in the idiomatic style: a bare @version@ key and one
+-- @[credentials.\<id\>]@ table, with no explicit @[credentials]@ header. No
+-- encoder produces this, which is exactly why it needs a test — the encoder
+-- always writes the header and so hides the implicit-node bug.
+idiomaticFixture :: Text
+idiomaticFixture = T.unlines
+  [ "version = 1"
+  , ""
+  , "[credentials." <> idiomaticId <> "]"
+  , "public_key = \"" <> T.replicate 86 "A" <> "\""
+  , "sign_count = 0"
+  , "label = \"laptop\""
+  , "created_at = \"2026-10-30T14:00:00Z\""
+  , "rp_id = \"localhost\""
+  , "added_via = \"cli_token\""
+  ]
+
+-- | The same content with the explicit @[credentials]@ header the encoder
+-- emits. Both spellings must decode to the same value.
+explicitHeaderFixture :: Text
+explicitHeaderFixture = T.unlines
+  [ "version = 1"
+  , ""
+  , "[credentials]"
+  , ""
+  , "[credentials." <> idiomaticId <> "]"
+  , "public_key = \"" <> T.replicate 86 "A" <> "\""
+  , "sign_count = 0"
+  , "label = \"laptop\""
+  , "created_at = \"2026-10-30T14:00:00Z\""
+  , "rp_id = \"localhost\""
+  , "added_via = \"cli_token\""
+  ]
+
+idiomaticId :: Text
+idiomaticId = T.replicate 22 "A"
+
+idiomaticCredential :: CredentialFileConfig
+idiomaticCredential = CredentialFileConfig
+  { cfcPublicKey = T.replicate 86 "A"
+  , cfcSignCount = 0
+  , cfcLabel     = "laptop"
+  , cfcCreatedAt = "2026-10-30T14:00:00Z"
+  , cfcRpId      = "localhost"
+  , cfcAddedVia  = Just "cli_token"
+  }
