@@ -30,7 +30,7 @@ import Seal.Config.Security
   )
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), canonicalOriginFor, credentialAvailability
-  , credentialFromFile, credentialToFile, parseIsoTime )
+  , credentialFromFile, credentialToFile, parseIsoTime, rpMismatch )
 import Seal.Security.WebAuthn.Types
   ( CosePublicKey (..), Credential (..) )
 
@@ -134,6 +134,29 @@ spec = describe "Seal.Config.Security access_control" $ do
     it "is Usable when no rpId could be resolved (wildcard bind)" $
       credentialAvailability Nothing (Map.fromList [("a", mkCredential "a" "anywhere")])
         `shouldBe` Usable
+
+  -- Design §14 / §1.6. The quantifier is the whole point: "some credential
+  -- differs" is vacuously false on an empty store and permanently true once the
+  -- origin changes, so the flag never cleared and every boot minted a grant.
+  describe "rpMismatch" $ do
+    it "is false with zero credentials" $ do
+      rpMismatch (Just "localhost") Map.empty `shouldBe` False
+
+    it "is false when any credential is usable here" $ do
+      rpMismatch (Just "localhost")
+        (Map.fromList [("a", mkCredential "a" "old.example.com")
+                      ,("b", mkCredential "b" "localhost")])
+        `shouldBe` False
+
+    it "is true only when every credential is orphaned" $ do
+      rpMismatch (Just "localhost")
+        (Map.fromList [("a", mkCredential "a" "old.example.com")
+                      ,("b", mkCredential "b" "older.example.com")])
+        `shouldBe` True
+
+    it "is false when no rpId could be resolved" $ do
+      rpMismatch Nothing (Map.fromList [("a", mkCredential "a" "anywhere")])
+        `shouldBe` False
 
   describe "credentialFromFile" $ do
     it "accepts a well-formed credential" $

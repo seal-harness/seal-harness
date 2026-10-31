@@ -21,6 +21,7 @@ module Seal.Security.AccessControl
   , formatIsoTime
   , CredentialAvailability (..)
   , credentialAvailability
+  , rpMismatch
   ) where
 
 import Data.ByteString qualified as BS
@@ -157,6 +158,17 @@ credentialAvailability Nothing  _                      = Usable
 credentialAvailability (Just rp) creds
   | any ((== rp) . credRpId) (Map.elems creds) = Usable
   | otherwise                                  = UnusableOnly
+
+-- | @rp_mismatch@: every enrolled credential was created for a different rpId,
+-- so none of them can authenticate here.
+--
+-- Derived, never stored. The stored-boolean version used the quantifier "some
+-- credential differs", which is vacuous on an empty store and permanently true
+-- once the operator changes @origin@ — so it never cleared, and every boot
+-- minted another grant (design §1.6). Deriving it from the map makes "stale"
+-- unrepresentable: there is nothing to forget to update.
+rpMismatch :: Maybe Text -> Map Text Credential -> Bool
+rpMismatch rpId creds = credentialAvailability rpId creds == UnusableOnly
 
 -- ---------------------------------------------------------------------------
 -- Credential (de)serialisation

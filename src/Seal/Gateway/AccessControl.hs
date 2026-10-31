@@ -62,7 +62,7 @@ import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..)
   , updateAccessControlSection )
-import Seal.Security.AccessControl (credentialToFile)
+import Seal.Security.AccessControl (credentialToFile, rpMismatch)
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
 import Seal.Security.WebAuthn
   ( AssertionInput (..), RegistrationInput (..), RegistrationResult (..)
@@ -103,7 +103,6 @@ data AccessControlState = AccessControlState
   , acsServiceHash       :: !Text
   , acsOrigin            :: !(Maybe Text)
   , acsRpId              :: !(Maybe Text)
-  , acsRpMismatch        :: !Bool
   , acsChallengeTokens   :: !Double
   , acsChallengeRefillAt :: !UTCTime
   , acsFailures          :: !Int
@@ -173,11 +172,6 @@ newAccessControlHandle paths plan = do
   let creds = bpCreds plan
       mOrigin = bpOrigin plan
       mRpId = bpRpId plan
-      -- No usable credential for this rpId: every enrolled passkey was created
-      -- for a different one. Derived from the map, never assigned (design §14)
-      -- — the old code hardcoded this to False after a registration, so it
-      -- never cleared.
-      rpMismatch = any (\c -> Just (credRpId c) /= mRpId) (Map.elems creds)
   mCode <- case bpMintGrant plan of
     Just _  -> Just <$> generateToken 16
     Nothing -> pure Nothing
@@ -192,7 +186,6 @@ newAccessControlHandle paths plan = do
     , acsServiceHash = tokenKey serviceToken
     , acsOrigin = mOrigin
     , acsRpId = mRpId
-    , acsRpMismatch = rpMismatch
     , acsChallengeTokens = challengeBurst
     , acsChallengeRefillAt = now
     , acsFailures = 0
@@ -287,15 +280,16 @@ accessControlStatusJson :: AccessControlHandle -> Request -> IO Value
 accessControlStatusJson h req = do
   now <- getCurrentTime
   st <- withMVar (achState h) pure
-  let authenticated = acsMode st == AccessOpen
+  let mismatch s = rpMismatch (acsRpId s) (acsCredentials s)
+      authenticated = acsMode st == AccessOpen
         || sessionValid now st (sessionKeyFromRequest req)
   pure $ object
     [ "state" .= authStatusState st
     , "authenticated" .= authenticated
     , "origin" .= acsOrigin st
     , "rp_id" .= acsRpId st
-    , "rp_mismatch" .= acsRpMismatch st
-    , "setup_required" .= (acsMode st == AccessUnconfigured || acsRpMismatch st)
+    , "rp_mismatch" .= mismatch st
+    , "setup_required" .= (acsMode st == AccessUnconfigured || mismatch st)
     , "credentials" .= Map.size (acsCredentials st)
     ]
 
@@ -557,7 +551,7 @@ withSessionAuthorization
   -> IO (Either AuthErr a)
 withSessionAuthorization h req action = do
   st <- withMVar (achState h) pure
-  if acsMode st == AccessPasskey && not (acsRpMismatch st)
+  if acsMode st == AccessPasskey && not (rpMismatch (acsRpId st) (acsCredentials st))
     then do
       now <- getCurrentTime
       if sessionValid now st (sessionKeyFromRequest req)
@@ -715,9 +709,6 @@ persistRegistration h isAdd result now = do
                       , acsCredentials = creds'
                       , acsSetupCode = Nothing
                       , acsSetupHash = Nothing
-                      -- recomputed from the map, never assigned
-                      , acsRpMismatch = any (\c -> Just (credRpId c) /= acsRpId s)
-                                              (Map.elems creds')
                       }
           clearSetupCodeFile h
           token <- mintSession h

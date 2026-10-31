@@ -28,7 +28,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Network.HTTP.Types (Header, Status, methodGet, methodPost)
+import Network.HTTP.Types (Header, Status, methodDelete, methodGet, methodPost)
 import Network.HTTP.Types.Header (hSetCookie)
 import Network.Wai
   ( Application, Request, Response, defaultRequest, pathInfo
@@ -89,6 +89,46 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         accessControlCredentialCount (naHandle na) `shouldReturn` 1
         (st, _, _) <- runApp (gated na) (getReq ["api", "sessions"])
         st `shouldBe` status401'
+
+  -- Design §14 / §2.2. The flag has no storage to go stale: it is computed
+  -- from the credential map on every read. This asserts the flip inside one
+  -- handle lifetime, which a stored-and-assigned flag gets wrong (the old code
+  -- hardcoded it to False on registration and never touched it on deletion).
+  describe "rp_mismatch is derived" $ do
+    it "flips to true once the last usable credential is deleted, with no restart" $
+      withHome Nothing $ \paths -> do
+        let usable = (BS.replicate 16 0x11, BS.replicate 64 0x02)
+            store  = Map.union orphanCred passkeyCreds
+            openSection' = passkeySection { acfcMode = Just "none" }
+        -- Open mode so the DELETE is authorized without a session; the flag is
+        -- a function of the map either way.
+        na <- bootHandle paths (Just openSection') store
+        (_, _, statusBefore) <- runApp (gated na) (getReq ["api", "auth", "status"])
+        jsonField statusBefore "rp_mismatch" `shouldBe` Just (Bool False)
+
+        -- Open mode still authorizes credential admin with the setup code
+        -- (CredentialAdmin = AdminOpen arrives with the endpoint work).
+        code <- setupCodeOf na
+        (st, _, _) <- runApp (gated na)
+          (deleteReq ["api", "auth", "credentials", b64 (fst usable)]
+                     [("X-Seal-Setup-Token", code)])
+        st `shouldBe` status200'
+
+        (_, _, statusAfter) <- runApp (gated na) (getReq ["api", "auth", "status"])
+        jsonField statusAfter "rp_mismatch" `shouldBe` Just (Bool True)
+        jsonField statusAfter "setup_required" `shouldBe` Just (Bool True)
+
+    it "stays false while a usable credential remains" $
+      withHome Nothing $ \paths -> do
+        let store = Map.union orphanCred passkeyCreds
+        na <- bootHandle paths (Just passkeySection { acfcMode = Just "none" }) store
+        code <- setupCodeOf na
+        (st, _, _) <- runApp (gated na)
+          (deleteReq ["api", "auth", "credentials", b64 (BS.replicate 16 0x77)]
+                     [("X-Seal-Setup-Token", code)])
+        st `shouldBe` status200'
+        (_, _, statusAfter) <- runApp (gated na) (getReq ["api", "auth", "status"])
+        jsonField statusAfter "rp_mismatch" `shouldBe` Just (Bool False)
 
   describe "unconfigured" $ do
     it "closes the API" $ withHome Nothing $ \paths -> do
@@ -391,6 +431,9 @@ postReq = postReqWith
 postReqWith :: [Text] -> [(Text, Text)] -> Request
 postReqWith segs hs = (getReqWith segs hs) { requestMethod = methodPost }
 
+deleteReq :: [Text] -> [(Text, Text)] -> Request
+deleteReq segs hs = (getReqWith segs hs) { requestMethod = methodDelete }
+
 -- | A one-shot request body: the chunk source yields the payload, then an empty
 -- chunk, exactly as a real WAI server does.
 postJson :: [Text] -> Value -> IO Request
@@ -457,6 +500,18 @@ passkeySection = AccessControlFileConfig
 -- credentials.toml now, so a fixture is a section /and/ a store.
 passkeyCreds :: Map.Map Text CredentialFileConfig
 passkeyCreds = credMap (BS.replicate 16 0x11) (BS.replicate 64 0x02)
+
+-- | A credential created for a different rpId: enrolled, but unable to sign in
+-- here. ('credMap' hardcodes @rp_id = localhost@, which is usable.)
+orphanCred :: Map.Map Text CredentialFileConfig
+orphanCred = Map.singleton (b64 (BS.replicate 16 0x77)) CredentialFileConfig
+  { cfcPublicKey = b64 (BS.replicate 64 0x04)
+  , cfcSignCount = 0
+  , cfcLabel = "old key"
+  , cfcCreatedAt = "2026-10-30T14:00:00Z"
+  , cfcRpId = "old.example.com"
+  , cfcAddedVia = Just "cli_token"
+  }
 
 -- | The runtime form of 'credMap', which is what a boot plan carries.
 runtimeCreds :: ByteString -> ByteString -> Map.Map Text Credential
