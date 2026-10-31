@@ -6,6 +6,7 @@ module Seal.Config.Paths
   , configFilePath
   , vaultFilePath
   , securityFilePath
+  , credentialsFilePath
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
@@ -121,6 +122,18 @@ vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
 -- vault settings). Mode 0600, owned by the harness user.
 securityFilePath :: SealPaths -> FilePath
 securityFilePath paths = spHome paths </> "security.toml"
+
+-- | Absolute path to the gateway-owned credential store:
+-- @\<home\>\/credentials.toml@.
+--
+-- A sibling of @security.toml@ (not under @config\/@) for the same reason:
+-- the git-versioned @config\/@ tree must not be able to resurrect a stale
+-- credential or a stale credential count. The file is created @0600@ and is
+-- written only by 'Seal.Config.Credentials'. No opcode may read or write it —
+-- it is agent-immutable security state, like everything else in
+-- @~\/.seal\/@.
+credentialsFilePath :: SealPaths -> FilePath
+credentialsFilePath paths = spHome paths </> "credentials.toml"
 
 -- | Absolute path to the source-control repo registry TOML file:
 -- @\<config\>\/repos.toml@.

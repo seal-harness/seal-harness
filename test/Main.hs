@@ -88,6 +88,7 @@ import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
 import qualified Seal.Command.NewSpec
+import qualified Seal.Config.CredentialsSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.SecuritySpec
@@ -290,6 +291,7 @@ specs = do
   Seal.Command.SpecSpec.spec
   Seal.Command.TabSpec.spec
   Seal.Command.NewSpec.spec
+  Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.SecuritySpec.spec

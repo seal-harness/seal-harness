@@ -12,7 +12,7 @@ import Test.Hspec
 import Seal.Config.Paths
   ( SealPaths (..)
   , resolveSealHome, getSealPaths, ensureSealDirs
-  , configFilePath, vaultFilePath
+  , configFilePath, vaultFilePath, securityFilePath, credentialsFilePath
   , reposFilePath, repoCloneStateDir
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionConversationIndexPath, sessionEntriesPath, sessionRequestsPath
@@ -99,6 +99,13 @@ spec = describe "Seal.Config.Paths" $ do
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           vaultFilePath paths `shouldBe` tmp </> "config" </> "vault" </> "vault.age"
+
+    it "securityFilePath returns credentials.toml's sibling security.toml" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          securityFilePath paths `shouldBe` tmp </> "security.toml"
+          credentialsFilePath paths `shouldBe` tmp </> "credentials.toml"
 
     it "reposFilePath returns config/repos.toml" $
       withSystemTempDirectory "seal-home" $ \tmp ->

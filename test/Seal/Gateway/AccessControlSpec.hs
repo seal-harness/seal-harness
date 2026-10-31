@@ -404,6 +404,7 @@ credMap credId key64 = Map.singleton (b64 credId) CredentialFileConfig
   , cfcLabel = "test key"
   , cfcCreatedAt = "2026-10-30T14:00:00Z"
   , cfcRpId = "localhost"
+  , cfcAddedVia = Nothing
   }
 
 pointBytes :: Point -> ByteString

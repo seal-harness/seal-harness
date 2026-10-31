@@ -235,6 +235,7 @@ credentialToFile cred = CredentialFileConfig
   , cfcLabel     = credLabel cred
   , cfcCreatedAt = formatIsoTime (credCreatedAt cred)
   , cfcRpId      = credRpId cred
+  , cfcAddedVia  = Nothing
   }
   where
     unCose (CosePublicKey b) = b

@@ -232,6 +232,7 @@ sampleCredential = CredentialFileConfig
   , cfcLabel = "laptop"
   , cfcCreatedAt = "2026-10-30T14:00:00Z"
   , cfcRpId = "localhost"
+  , cfcAddedVia = Nothing
   }
 
 sampleSection :: AccessControlFileConfig

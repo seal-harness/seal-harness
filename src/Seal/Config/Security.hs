@@ -25,7 +25,9 @@ module Seal.Config.Security
   , AccessControlFileConfig (..)
   , CredentialFileConfig (..)
   , accessControlCodec
+  , credentialCodec
   , normalizeAccessControlTable
+  , fixNode
   , updateAccessControlSection
   , clearAccessControlSection
   , writeSecretFile
@@ -143,6 +145,12 @@ data CredentialFileConfig = CredentialFileConfig
     -- ^ ISO-8601. Kept as text here and parsed on resolution, so a malformed
     -- value is a boot-time error rather than a decode-time surprise.
   , cfcRpId      :: Text
+  , cfcAddedVia  :: Maybe Text
+    -- ^ How the credential was enrolled: @\"cli_token\"@ | @\"cli_window\"@ |
+    -- @\"assertion\"@ | @\"legacy\"@. Shares its vocabulary with the grant's
+    -- @minted_via@ plus @legacy@. Absent or unrecognised reads as
+    -- @\"legacy\"@ — the safe label, since it claims nothing about the
+    -- authority that created the credential.
   } deriving stock (Eq, Show)
 
 -- | Bidirectional codec for the @[access_control]@ section.
@@ -162,6 +170,7 @@ credentialCodec = CredentialFileConfig
   <*> Toml.text "label" .= cfcLabel
   <*> Toml.text "created_at" .= cfcCreatedAt
   <*> Toml.text "rp_id" .= cfcRpId
+  <*> Toml.dioptional (Toml.text "added_via") .= cfcAddedVia
 
 -- | Make the implicit @access_control@ node explicit before decoding.
 --

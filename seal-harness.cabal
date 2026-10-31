@@ -175,6 +175,7 @@ library
         Seal.Command.Registry
         Seal.Command.Spec
         Seal.Command.Channel
+        Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
         Seal.Config.Paths
@@ -527,6 +528,7 @@ test-suite tests
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
         Seal.Command.NewSpec
+        Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
         Seal.Config.SecurityAccessControlSpec
