@@ -39,6 +39,7 @@ mkMeta s =
     , smRepoUrl = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime
+    , smAllowedSecrets = mempty
     }
 
 insert :: TabRef -> TabKind -> TabList -> TabList

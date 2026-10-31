@@ -143,6 +143,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smRepoUrl = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
+              , smAllowedSecrets = mempty
               }
             ctx = ctxFromSession meta
         let logger' = withChannelContext logger ctx
@@ -170,6 +171,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smRepoUrl = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
+              , smAllowedSecrets = mempty
               }
             ctx = ctxFromSession meta
         let logger' = withChannelContext logger ctx
@@ -202,6 +204,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smRepoUrl = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
+            , smAllowedSecrets = mempty
             }
           ctx = ctxFromSession meta
       ccChannelKind ctx `shouldBe` Just Telegram
@@ -228,6 +231,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smRepoUrl = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
+            , smAllowedSecrets = mempty
             }
           ctx = ctxFromSession meta
       ccConversationIdHash ctx `shouldBe` Nothing

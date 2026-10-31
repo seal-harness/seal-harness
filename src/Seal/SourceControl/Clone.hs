@@ -66,7 +66,6 @@ import Control.Exception (bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
-import Data.IORef (readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -78,7 +77,6 @@ import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
 
 import Seal.Git.Repo (readProcessBinaryCwdEnv)
-import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..)
@@ -90,7 +88,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
                                       , sahStart) )
-import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
+import Seal.Vault.Access (VaultAccess, vaGet, noVaultAccess)
 
 ----------------------------------------------------------------------------
 -- Errors
@@ -232,7 +230,7 @@ sshToHttps url
 --   keyfiles (@~\/.seal\/state\/repos\/keys\/\<repo-id\>@). The encrypted
 --   keyfile lives only on the harness disk (ciphertext).
 data CloneDeps = CloneDeps
-  { cdVault           :: VaultRuntime
+  { cdVault           :: VaultAccess
   , cdRepoReg         :: RepoRegistryHandle
   , cdSshAgent        :: SshAgentHandle
   , cdAgentRegistry   :: AgentRegistryHandle
@@ -260,7 +258,7 @@ data CloneDeps = CloneDeps
 -- never touch the Git credential surface.
 stubCloneDeps :: CloneDeps
 stubCloneDeps = CloneDeps
-  { cdVault = error "stubCloneDeps: cdVault (non-Git opcode must not access)"
+  { cdVault = noVaultAccess (error "stubCloneDeps: cdVault (non-Git opcode must not access)")
   , cdRepoReg = error "stubCloneDeps: cdRepoReg (non-Git opcode must not access)"
   , cdSshAgent = error "stubCloneDeps: cdSshAgent (non-Git opcode must not access)"
   , cdAgentRegistry = error "stubCloneDeps: cdAgentRegistry (non-Git opcode must not access)"
@@ -368,14 +366,10 @@ resolveCloneTarget deps repo =
     Left e -> pure (Left e)
     Right plan -> case plan of
       ClonePlanExtraHeader httpsUrl vaultKey -> do
-        eVault <- resolveVaultHandle deps
-        case eVault of
-          Left e -> pure (Left e)
-          Right vault -> do
-            mtoken <- vhGet vault vaultKey
-            case mtoken of
-              Left ve -> pure (Left (CloneVaultError ve))
-              Right tokenBytes -> do
+        mtoken <- vaGet (cdVault deps) vaultKey
+        case mtoken of
+          Left ve -> pure (Left (CloneVaultError ve))
+          Right tokenBytes -> do
                 let header = renderPatHeader repo tokenBytes
                     gitConfigParams = "'http.extraHeader=" <> header <> "'"
                     envExtras = [ ("GIT_TERMINAL_PROMPT", "0")
@@ -395,15 +389,11 @@ resolveCloneTarget deps repo =
         -- The encrypted keyfile path: <keyfilesDir>/<repo-id>.
         let keyfilePath = cdKeyfilesDir deps </> keyfileBaseName repo
             vaultKey = cVaultKey (srCredential repo)
-        eVault <- resolveVaultHandle deps
-        case eVault of
-          Left e -> pure (Left e)
-          Right vault -> do
-            -- Fetch the passphrase from the vault (decrypts the keyfile).
-            mpass <- vhGet vault vaultKey
-            case mpass of
-              Left ve -> pure (Left (CloneVaultError ve))
-              Right passphrase -> do
+        -- Fetch the passphrase from the vault (decrypts the keyfile).
+        mpass <- vaGet (cdVault deps) vaultKey
+        case mpass of
+          Left ve -> pure (Left (CloneVaultError ve))
+          Right passphrase -> do
                 -- One-agent-per-repo: look up the persistent registry by
                 -- vault key. If a live agent is cached (in this process or
                 -- persisted from a prior seal process), reuse it — the key
@@ -526,20 +516,6 @@ startAndLoadAgent deps vaultKey keyfilePath passphrase = do
 -- @\<cdKeyfilesDir\>\/\<repo-id\>@.
 keyfileBaseName :: SourceRepo -> FilePath
 keyfileBaseName repo = T.unpack (repoIdText (srId repo))
-
--- | Resolve the live 'VaultHandle' from the 'VaultRuntime' (mirrors
--- @secretManageOp@'s pattern at @Seal.ISA.Ops.Secret:73@). Fail-closed to
--- 'CloneVaultError VaultLocked' if the vault is unconfigured/locked (the
--- 'IORef' holds 'Nothing'). This is the W3 evolution: @cdVault@ is now
--- 'VaultRuntime' (not the raw 'VaultHandle') so the opcode can be built once
--- at startup and the vault-locked state is surfaced per-op at run time
--- (rather than crashing at startup or silently using a stale handle).
-resolveVaultHandle :: CloneDeps -> IO (Either CloneError VaultHandle)
-resolveVaultHandle deps = do
-  mh <- readIORef (vrHandleRef (cdVault deps))
-  pure $ case mh of
-    Nothing -> Left (CloneVaultError VaultLocked)
-    Just h  -> Right h
 
 -- | Render the @http.extraHeader@ value for a PAT/MachineUser: @Authorization:
 -- Basic \<base64(user:token)\>@. For 'CredPat' the "user" is

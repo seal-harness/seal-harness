@@ -36,6 +36,7 @@ import Data.List (sortOn)
 import Control.Applicative ((<|>))
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Ord (Down (..))
+import Data.Set (Set)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time
@@ -82,8 +83,8 @@ formatSessionId t =
 -- without writing anything to disk. Used by channels that want an
 -- in-memory active session without polluting the sessions list — the
 -- session is only persisted when the user actually sends a message.
-newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
-newSessionMeta _paths provider model channel mAgent = do
+newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Set Text -> IO SessionMeta
+newSessionMeta _paths provider model channel mAgent mAllowedSecrets = do
   now <- getCurrentTime
   sid <- case mkSessionId (formatSessionId now) of
     Right s -> pure s
@@ -95,12 +96,13 @@ newSessionMeta _paths provider model channel mAgent = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
-    , smCreatedAt = now, smLastActive = now }
+    , smCreatedAt = now, smLastActive = now
+    , smAllowedSecrets = mAllowedSecrets }
 
 -- | Create a fresh session directory + session.json for the given selection.
-newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
-newSession paths provider model channel mAgent = do
-  meta <- newSessionMeta paths provider model channel mAgent
+newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Set Text -> IO SessionMeta
+newSession paths provider model channel mAgent mAllowedSecrets = do
+  meta <- newSessionMeta paths provider model channel mAgent mAllowedSecrets
   saveSessionMeta paths meta
   pure meta
 
@@ -275,26 +277,26 @@ resolveDefaultAgent backend cfg =
 -- If @default_agent@ is set and the def exists, its id is persisted in
 -- 'smAgent' and its non-empty provider/model override the config defaults
 -- (PureClaw @resolveOverride@ precedence: frontmatter > config > default).
-initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
-initSession paths cfg backend = do
+initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Set Text -> IO SessionMeta
+initSession paths cfg backend mAllowedSecrets = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
-  newSession paths provider model "cli" mAgent
+  newSession paths provider model "cli" mAgent mAllowedSecrets
 
 -- | Build an in-memory 'SessionMeta' from the config defaults, on the @web@
 -- channel, WITHOUT persisting to disk. The web gateway uses this so the
 -- active-session ref has a valid meta (provider/model fallbacks) without
 -- polluting the sessions list. The session is persisted only when the user
 -- actually sends the first message (which writes the transcript).
-initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
-initSessionMeta paths cfg backend = do
+initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Set Text -> IO SessionMeta
+initSessionMeta paths cfg backend mAllowedSecrets = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
-  newSessionMeta paths provider model "web" mAgent
+  newSessionMeta paths provider model "web" mAgent mAllowedSecrets
 
 -- | Update the bound agent for an existing session. Loads the current
 -- 'SessionMeta' from disk, replaces 'smAgent' (Nothing when the supplied id

@@ -54,7 +54,7 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.TestHelpers.FakeVault
-  ( makeFakeVaultRuntime, makeLockedVaultRuntime )
+  ( makeFakeVaultRuntime, makeLockedVaultRuntime, fakeVaultAccess )
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Types
   ( ExecError (..), SshConfig (..), getRemotePath, mkRemotePath, mkSshHost
@@ -157,7 +157,7 @@ mkPatDeps repos isRemote = do
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-ghspec-pat"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
@@ -173,7 +173,7 @@ mkMachineUserDeps repos isRemote = do
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-ghspec-mu"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
@@ -195,7 +195,7 @@ mkDeployKeyDeps repos isRemote keyfilesDir = do
   agentCallsRef <- newIORef []
   let agent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = agent
     , cdAgentRegistry = agentRegH
@@ -212,7 +212,7 @@ mkLockedVaultDeps repos isRemote = do
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-ghspec-locked"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
@@ -225,11 +225,11 @@ mkLockedVaultDeps repos isRemote = do
 -- references is absent — 'vhGet' returns 'VaultKeyNotFound').
 mkMissingKeyDeps :: [SourceRepo] -> Bool -> IO CloneDeps
 mkMissingKeyDeps repos isRemote = do
-  vault <- makeFakeVaultRuntime []  -- unlocked, but no keys
+  vault <- makeFakeVaultRuntime []
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-ghspec-missing"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH

@@ -25,7 +25,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, fakeVaultAccess)
 import Seal.Tools.Ssh.Agent (SshAgentEnv (..), mkFakeSshAgentHandle)
 
 -- | A pure description of a fixture workspace. Seeded into both arms:
@@ -70,7 +70,7 @@ stubCloneDeps = do
   let agent = mkFakeSshAgentHandle agentRef
         (SshAgentEnv "/tmp/seal-fake-sock" "0")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
     , cdAgentRegistry = agentReg

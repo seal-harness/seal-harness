@@ -11,6 +11,7 @@ module Seal.Session.Meta
 
 import Data.Aeson
   ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=) )
+import Data.Set (Set)
 import Data.Text (Text)
 import Data.Time (UTCTime)
 
@@ -64,6 +65,13 @@ data SessionMeta = SessionMeta
     -- so the sidebar can show the repo name without scanning the workdir.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
+  , smAllowedSecrets :: !(Set Text)
+    -- ^ The set of vault secret names the session is permitted to access
+    -- (populated by @SECRET_MANAGE@ enforcement). 'Nothing' means the
+    -- session has no explicit allow-list — the default behavior depends
+    -- on the enforcement policy in effect. 'Just' a set (possibly empty)
+    -- means only those named secrets may be read. Persisted to
+    -- @session.json@ so the restriction survives restarts.
   } deriving stock (Eq, Show)
 
 instance ToJSON SessionMeta where
@@ -81,6 +89,7 @@ instance ToJSON SessionMeta where
     , "repo_url"    .= smRepoUrl m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
+    , "allowed_secrets" .= smAllowedSecrets m
     ]
 
 instance FromJSON SessionMeta where
@@ -98,3 +107,4 @@ instance FromJSON SessionMeta where
     <*> o .:? "repo_url"
     <*> o .:  "created_at"
     <*> o .:  "last_active"
+    <*> o .:? "allowed_secrets" .!= mempty

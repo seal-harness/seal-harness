@@ -371,6 +371,7 @@ writeChildMeta deps childSid = do
     , smRepoUrl = Nothing
     , smCreatedAt = now
     , smLastActive = now
+    , smAllowedSecrets = maybe mempty smAllowedSecrets mParent
     }
 
 -- | Load the parent session's 'SessionMeta', if readable. Local mirror of

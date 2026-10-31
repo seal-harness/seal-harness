@@ -7,6 +7,7 @@ module Seal.TestHelpers.FakeVault
   , makeFakeVaultRuntime
   , makeLockedVaultRuntime
   , vaultRuntimeFromHandle
+  , fakeVaultAccess
   , fakeLockedVaultRuntime
   ) where
 
@@ -16,10 +17,17 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Set qualified as Set
 
 import Seal.Security.Vault (VaultHandle (..), VaultStatus (..))
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (VaultAccess, vaultAccess)
+
+-- | Create a VaultAccess from a VaultRuntime with the given keys.
+-- Pure (no IO) — for tests that know the keys upfront.
+fakeVaultAccess :: VaultRuntime -> [Text] -> VaultAccess
+fakeVaultAccess rt keys = vaultAccess rt (Set.fromList keys)
 
 -- | An unlocked vault seeded with the given name→value pairs.
 makeFakeVault :: [(Text, ByteString)] -> IO VaultHandle

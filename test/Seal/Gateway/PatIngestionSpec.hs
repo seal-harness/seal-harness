@@ -86,6 +86,7 @@ import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), mkRemoteUntrustedIOStub)
 import Seal.Tools.Ssh.Agent (SshAgentEnv (..), mkFakeSshAgentHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.UiState (newUiStateHandle)
 
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
@@ -149,10 +150,11 @@ ghFakeUio seen remoteUrl finalOutput =
 -- injection is identical on both planes).
 mkPatCloneDeps :: VaultRuntime -> RepoRegistryHandle -> IO CloneDeps
 mkPatCloneDeps vr repoReg = do
+  va <- unrestrictedVaultAccess vr
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-patingestion-agentreg"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vr
+    { cdVault = va
     , cdRepoReg = repoReg
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
@@ -232,8 +234,8 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing
-       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True mempty
+       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
 
 -- | Build 'ApiDeps' with a REAL 'mkRepoRegistryHandle' (writing to a real
 -- @repos.toml@ in the temp dir) + an UNLOCKED fake in-memory vault. The

@@ -135,7 +135,7 @@ runTui autonomy logger = do
   -- Every launch starts a fresh session (resume is a follow-on milestone).
   -- The default agent (if set in config) is bound here: its id persists in
   -- smAgent and its non-empty provider/model override the config defaults.
-  sessionMeta <- initSession paths cfg (bAgentDefs backends)
+  sessionMeta <- initSession paths cfg (bAgentDefs backends) mempty
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime
              { srPaths      = paths

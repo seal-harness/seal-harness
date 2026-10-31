@@ -47,6 +47,7 @@ stubMeta = SessionMeta
   , smRepoUrl = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
+  , smAllowedSecrets = mempty
   }
 
 stubMint :: IO SessionMeta
@@ -202,7 +203,7 @@ spec = describe "Seal.Command.Tab" $ do
           reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier stubMint]
       (ref, caps) <- recordingCaps
       let sid = mkSid "no-desc"
-      saveSessionMeta paths (metaWithDescription sid Nothing)
+      saveSessionMeta paths (metaWithDescription sid mempty)
       _ <- insertTabH h (BoundSession sid) KindProvider Nothing
       case parseSlash reg "/tab list" of
         ParsedAction act -> runCommand act caps
@@ -390,6 +391,7 @@ metaWithDescription sid mDesc = SessionMeta
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
   , smCreatedAt = testTime, smLastActive = testTime
+  , smAllowedSecrets = mempty
   }
   where
     testTime = UTCTime (fromGregorian 2026 1 1) 0

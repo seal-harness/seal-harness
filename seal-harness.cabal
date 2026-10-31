@@ -244,6 +244,7 @@ library
         Seal.Types.Env
         Seal.Vault.Backend
         Seal.Vault.Commands
+        Seal.Vault.Access
         Seal.Agent.Env
         Seal.Agent.Loop
         Seal.Agent.ContextTruncation
@@ -590,6 +591,7 @@ test-suite tests
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
+        Seal.Vault.AccessSpec
         Seal.Agent.LoopSpec
         Seal.Agent.ContextTruncationSpec
         Seal.ISA.DispatchSpec

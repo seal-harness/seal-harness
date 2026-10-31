@@ -122,7 +122,8 @@ seedMeta sid t mDesc = SessionMeta
   , smDescription = mDesc
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
-  , smCreatedAt = t, smLastActive = t }
+  , smCreatedAt = t, smLastActive = t
+  , smAllowedSecrets = mempty }
 
 -- | The snippet content of every rendered @  snippet: @ line in a search
 -- result.
@@ -183,7 +184,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "lists existing sessions with id, provider, model" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let op = sessionListOp paths
         r <- runTestApp (opRun op localBackend (object []))
         orIsError r `shouldBe` False
@@ -221,7 +222,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "finds sessions by description match" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
         let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("auth" :: Text)]))
@@ -233,7 +234,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "finds sessions by first user message snippet" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
@@ -248,7 +249,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "does not match non-existent query" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
         let op = sessionSearchOp paths inMemorySessionSearchBackend [callerSessionId]
         r <- runTestApp (opRun op localBackend (object ["query" .= ("kubernetes" :: Text)]))
@@ -275,7 +276,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "returns transcript entries for a session with conversation" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
@@ -295,7 +296,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "paginates with offset" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "msg0"
           , assistantMsg "msg1"
@@ -323,7 +324,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "defaults to back-to-front (last messages first)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "msg0"
           , assistantMsg "msg1"
@@ -351,7 +352,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "back-to-front paginates from the end with offset" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "msg0"
           , assistantMsg "msg1"
@@ -382,7 +383,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "back-to-front renders messages in chronological order within window" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "alpha"
           , assistantMsg "beta"
@@ -408,7 +409,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "returns metadata header for the session" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "my test session" })
         seedConversation paths (smId meta) [ userMsg "hi" ]
         let op = sessionGetOp paths [callerSessionId]
@@ -423,7 +424,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "orRecorded never contains transcript content" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "secret-value-123"
           ]
@@ -478,7 +479,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "lists existing sessions" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-          _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          _ <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend (object ["action" .= ("list" :: Text)]))
           orIsError r `shouldBe` False
@@ -492,7 +493,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "finds sessions by description match" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
           let op = sessionManageOp paths inMemorySessionSearchBackend [callerSessionId]
           r <- runTestApp (opRun op localBackend
@@ -513,7 +514,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "returns transcript entries for a session with conversation" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           seedConversation paths (smId meta)
             [ userMsg "Hello world"
             , assistantMsg "Hi there"
@@ -534,7 +535,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
       it "respects order=back-to-front" $ do
         withSystemTempDirectory "seal-session-spec" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           seedConversation paths (smId meta)
             [ userMsg "msg0"
             , assistantMsg "msg1"
@@ -599,7 +600,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_MANAGE get on the current session is refused" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
@@ -621,7 +622,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_GET (legacy) on the current session is refused" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
@@ -639,7 +640,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "a child agent reading its own transcript is refused" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-005"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "child hello world"
@@ -659,7 +660,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "get on a different session still succeeds" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Hello world"
           , assistantMsg "Hi there"
@@ -678,7 +679,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "records self-read refusals in orRecorded without transcript content" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "secret-value-123"
           ]
@@ -698,7 +699,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_MANAGE get on an ancestor (parent) is refused" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         -- Re-save the parent meta under the fixed parent sid so the
         -- guard target has a readable session.
         saveSessionMeta paths (meta { smId = lineageParentSid })
@@ -723,7 +724,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_GET (legacy) on an ancestor (root) is refused" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smId = lineageRootSid })
         seedConversation paths lineageRootSid
           [ userMsg "root secret work"
@@ -741,7 +742,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "an op with a lineage still reads unrelated sessions" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "unrelated hello world"
           ]
@@ -756,7 +757,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "records ancestor-read refusals in orRecorded without transcript content" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smId = lineageParentSid })
         seedConversation paths lineageParentSid
           [ userMsg "ancestor-secret-value-123"
@@ -776,17 +777,17 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let paths = mkPaths tmp
         -- The parent and the root as top-level sessions matching the
         -- query by description.
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths
           (parentMeta { smId = lineageParentSid
                       , smDescription = Just "needle parent session" })
         threadDelay 2000
-        rootMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        rootMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths
           (rootMeta { smId = lineageRootSid
                     , smDescription = Just "needle root session" })
         threadDelay 2000
-        unrelatedMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        unrelatedMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths
           (unrelatedMeta { smDescription = Just "needle unrelated session" })
         -- A child transcript nested under the parent, matching the query
@@ -858,7 +859,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         -- A backend-matched top-level session: the in-memory backend's
         -- snippet for this would be ~200 chars before the render clamp.
         let longConvSid = fixedSessionId "20260303-140000-300"
-        saveSessionMeta paths (seedMeta longConvSid now Nothing)
+        saveSessionMeta paths (seedMeta longConvSid now mempty)
         seedConversation paths longConvSid [ userMsg longText ]
         -- A description-matched session: the description is the snippet
         -- fallback, unbounded before the render clamp.
@@ -890,7 +891,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_MANAGE search does not include the current session in results" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
@@ -913,7 +914,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_SEARCH (legacy) does not include the current session in results" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
@@ -931,13 +932,13 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "search finds other sessions while excluding the current session" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        currentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        currentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         -- Session ids are millisecond-resolution timestamps; two
         -- back-to-back newSession calls can mint the same id (a
         -- pre-existing flake). Sleep past the boundary so the ids
         -- are guaranteed distinct.
         threadDelay 2000
-        otherMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        otherMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId currentMeta)
           [ userMsg "database connection pool question" ]
         seedConversation paths (smId otherMeta)
@@ -961,7 +962,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "a child agent's own transcript is excluded from search results" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-006"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "debug the subagent database pool"
@@ -983,7 +984,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_GET returns the child's messages for a child session id" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-001"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "child hello world"
@@ -1004,7 +1005,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_SEARCH finds child transcript content" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-002"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "debug the subagent grpc pool"
@@ -1023,7 +1024,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_LIST with include_children=true shows the child with attribution" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-003"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "child work"
@@ -1042,7 +1043,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "SESSION_LIST without include_children omits child sessions" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-004"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "child work"
@@ -1063,7 +1064,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "reads the same window via conversation.idx as via the whole-file path" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "msg0"
           , assistantMsg "msg1"
@@ -1112,7 +1113,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "uses the idx line count as total when the index is present" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "ok alpha"
           , "{not a json message line"
@@ -1139,7 +1140,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "bounds the rendered page to the byte budget on a large transcript (idx path)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let bigMsgs =
               [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
                   <> T.replicate 1200 "x")
@@ -1170,7 +1171,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "bounds the rendered page to the byte budget without an index (fallback)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let bigMsgs =
               [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
                   <> T.replicate 1200 "x")
@@ -1194,7 +1195,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "truncates a single huge message to the per-message cap with a visible marker" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let bigText = "permsg-head-marker "
                       <> T.replicate 10000 "0123456789"
                       <> " permsg-tail-marker-xyzzy"
@@ -1219,7 +1220,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "reads a child session window identically via conversation.idx" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-007"
         seedChildConversation paths (smId parentMeta) childSid
           [ userMsg "child alpha"
@@ -1248,7 +1249,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "caps an oversized session-meta header to the header byte budget" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths
           (meta { smDescription = Just (T.replicate 65536 "d") })
         seedConversation paths (smId meta)
@@ -1280,7 +1281,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "leaves a short session description header whole (no marker, not truncated)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths
           (meta { smDescription = Just "short description" })
         seedConversation paths (smId meta) [ userMsg "tiny body alpha" ]
@@ -1305,7 +1306,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "redacts SECRET_MANAGE tool results in a foreign session (SESSION_MANAGE get)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "before the secret"
           , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
@@ -1331,7 +1332,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "renders non-secret op tool results verbatim" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ toolUseMsg (ToolCallId "call-b") "BIN_EXEC"
           , toolResultMsgFor (ToolCallId "call-b") "harmless tool output"
@@ -1349,7 +1350,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "redacts a result whose tool-use message is outside the window (pre-window margin)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "margin0"
           , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
@@ -1381,7 +1382,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "redacts a margin-supplied secret via the conversation.idx ranged path" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "margin0"
           , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
@@ -1409,7 +1410,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "redacts secret results on the child-resolution branch" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-011"
         seedChildConversation paths (smId parentMeta) childSid
           [ toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
@@ -1435,7 +1436,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "centers the window on around_index with true global #N indices (idx path)" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         _ <- buildIndex (sessionConversationPath paths (smId meta))
                         (sessionConversationIndexPath paths (smId meta))
@@ -1480,7 +1481,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "overrides offset when both are present" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1506,7 +1507,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "defaults to limit 20 in around mode" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 30)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1533,7 +1534,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "clamps a negative around_index to a window from the transcript start" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1561,7 +1562,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "clamps an around_index beyond the end to a window ending at the tail" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1589,7 +1590,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "anchors near the tail end the window at the newest message" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1612,7 +1613,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "covers the whole transcript when the around window spans it" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta) (numberedMsgs 12)
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
@@ -1636,7 +1637,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "returns the empty-transcript message without error for an around read" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let op = sessionGetOp paths [callerSessionId]
         r <- runTestApp (opRun op localBackend
           (object
@@ -1651,7 +1652,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "applies the byte budget to around windows" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let bigMsgs =
               [ toolResultMsg ("budget payload " <> T.pack (show i) <> " "
                   <> T.replicate 5900 "x")
@@ -1682,7 +1683,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "redacts margin-adjacent secrets in around windows" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "margin0"
           , toolUseMsg (ToolCallId "call-1") "SECRET_MANAGE"
@@ -1715,7 +1716,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "refuses an around_index read of a lineage member with the same refusal" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smId = lineageParentSid })
         seedConversation paths lineageParentSid
           [ userMsg "parent secret work"
@@ -1741,7 +1742,7 @@ spec = describe "Seal.ISA.Ops.Session" $ do
     it "supports around_index on the child-resolution branch" $ do
       withSystemTempDirectory "seal-session-spec" $ \tmp -> do
         let paths = mkPaths tmp
-        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        parentMeta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         let childSid = fixedSessionId "20260101-120000-012"
         seedChildConversation paths (smId parentMeta) childSid (numberedMsgs 6)
         let op = sessionGetOp paths [callerSessionId]

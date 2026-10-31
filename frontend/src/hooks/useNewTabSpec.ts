@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
+import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, useSecrets, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
@@ -73,6 +73,15 @@ export interface NewTabSpec {
   discoveryError: boolean
   scanDiscoverable: () => Promise<void>
 
+  // Secrets (allow-list selection)
+  /** Secret key names available in the vault (fetched from /api/secrets). */
+  availableSecrets: string[]
+  /** True when the secrets fetch failed (vault locked/unconfigured). */
+  secretsError: boolean
+  /** Set of selected secret names. Empty = no vault access (fail-closed). */
+  allowedSecrets: Set<string>
+  setAllowedSecrets: (s: Set<string>) => void
+
   // Computed
   validationError: string | null
   /** Build the flat POST /api/tabs/new body (T10's CreateTabBody shape). */
@@ -106,6 +115,11 @@ export function useNewTabSpec(): NewTabSpec {
   // repo" suggestions alongside the persisted history. The hook re-fetches
   // on the `repos-changed` WS invalidation frame (same as the Repos tab).
   const { repos: registeredRepos, refresh: refreshRepos } = useRepos()
+  // Vault secrets for the allow-list selection. `useSecrets` fetches
+  // from /api/secrets; `secretsError` indicates a locked/unconfigured
+  // vault (the UI shows a warning in that case).
+  const { secrets: availableSecrets, error: secretsError } = useSecrets()
+  const [allowedSecrets, setAllowedSecrets] = useState<Set<string>>(new Set())
   // When lastOptions restores a provider+model, the model-fetch effect
   // would normally clobber the restored model with the provider's default.
   // `pendingRestoreModel` holds the restored model id so the fetch effect
@@ -263,7 +277,11 @@ export function useNewTabSpec(): NewTabSpec {
 
   const buildBody = useCallback((): CreateTabBody => {
     if (kind === 'provider') {
-      return { kind: 'provider', provider, model: model.trim() }
+      const body: CreateTabBody = { kind: 'provider', provider, model: model.trim() }
+      // Always send allowed_secrets. Empty array = no vault access
+      // (fail-closed default). The backend parses [] as Set.empty.
+      body.allowed_secrets = Array.from(allowedSecrets)
+      return body
     }
     if (kind === 'harness') {
       // Seal's T10 takes a flat `kind: 'harness'` + harness_id. The harness
@@ -278,7 +296,7 @@ export function useNewTabSpec(): NewTabSpec {
     // adoptWindow directly with the session/window/windowIndex). Return a
     // sentinel the caller will not send.
     return { kind: 'attach', harness_id: attachSession }
-  }, [kind, provider, model, flavour, customBinary, attachSession])
+  }, [kind, provider, model, flavour, customBinary, attachSession, availableSecrets, allowedSecrets])
 
   // Persist the current form selection + record the custom model (if any).
   // Best-effort; failures are swallowed (the UI still works within the
@@ -335,6 +353,8 @@ export function useNewTabSpec(): NewTabSpec {
     attachWindowIndex, setAttachWindowIndex,
     attachManual, setAttachManual,
     discoverableWindows, discoveryError, scanDiscoverable,
+    availableSecrets, secretsError,
+    allowedSecrets, setAllowedSecrets,
     validationError,
     buildBody,
     persistOnSubmit,

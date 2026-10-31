@@ -190,6 +190,7 @@ vaultErrText = \case
   VaultAlreadyExists  -> "vault already exists"
   VaultKeyNotFound k  -> "no such secret: " <> k
   VaultBackendError t -> "backend error: " <> t
+  VaultAccessDenied k -> "secret not available in this session: " <> k
 
 -- | The set of providers that are *configured* (have a usable credential or
 -- are usable keyless). A provider appears in @/provider list@ and in the

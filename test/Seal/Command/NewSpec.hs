@@ -74,6 +74,7 @@ spec = describe "Seal.Command.New" $ do
         , smRepoUrl = Nothing
         , smCreatedAt = error "unused"
         , smLastActive = error "unused"
+        , smAllowedSecrets = mempty
         }
       oldSid = mkSid "20260701-000000-000"
       line = renderNewConfirmation newMeta oldSid

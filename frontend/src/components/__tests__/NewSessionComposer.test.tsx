@@ -49,6 +49,10 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     discoverableWindows: [],
     discoveryError: false,
     scanDiscoverable: vi.fn(async () => {}),
+    availableSecrets: [],
+    secretsError: false,
+    allowedSecrets: new Set<string>(),
+    setAllowedSecrets: vi.fn(),
     validationError: null,
     buildBody: vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })),
     persistOnSubmit: vi.fn(),
@@ -84,7 +88,7 @@ describe('NewSessionComposer', () => {
     render(<NewSessionComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
     fireEvent.click(screen.getByLabelText('Submit new session'))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' }))
-    expect(createBareSession).toHaveBeenCalledWith({ provider: 'anthropic', model: 'claude-sonnet-4' })
+    expect(createBareSession).toHaveBeenCalledWith({ provider: 'anthropic', model: 'claude-sonnet-4', allowed_secrets: [] })
   })
 
   it('persists the form selection on submit', async () => {
