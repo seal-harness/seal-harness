@@ -31,6 +31,7 @@ module Seal.Config.Security
   , updateAccessControlSection
   , clearAccessControlSection
   , writeSecretFile
+  , securityWriteLock
   , defaultSecurityConfig
   , securityConfigCodec
   , loadSecurityConfig
@@ -308,6 +309,13 @@ writeSecretFile path contents =
                      setFileMode path 0o600)
 
 -- | Process-wide lock serializing security config writes (design V7).
+--
+-- Exported because the credential store shares it: a credential write and a
+-- @security.toml@ write must not interleave (an enrollment raises the mode and
+-- writes a credential as one operation — design §6.1). It is
+-- /non-reentrant/: a caller that already holds it must use the unlocked
+-- primitives, never a writer that takes it. 'Seal.Config.Credentials'\\'s
+-- writers take it; nothing else may call them from inside it.
 {-# NOINLINE securityWriteLock #-}
 securityWriteLock :: MVar ()
 securityWriteLock = unsafePerformIO (newMVar ())

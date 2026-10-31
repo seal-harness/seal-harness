@@ -1,13 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Config.CredentialsSpec (spec) where
 
+import Data.Bits ((.&.))
+import Data.ByteString qualified as BS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Files (fileMode, getFileStatus)
 
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
@@ -15,7 +19,8 @@ import Test.QuickCheck
   ( Arbitrary (..), Gen, chooseInt, elements, ioProperty, listOf, oneof, vectorOf )
 
 import Seal.Config.Credentials
-  ( CredentialsFile (..), loadCredentials, saveCredentials )
+  ( CredentialsFile (..), createCredentialsFile, loadCredentials, saveCredentials
+  , updateCredentialsFile )
 import Seal.Config.Security (CredentialFileConfig (..))
 
 spec :: Spec
@@ -49,6 +54,61 @@ spec = describe "Seal.Config.Credentials" $ do
         TIO.writeFile path explicitHeaderFixture
         loadCredentials path `shouldReturn`
           Right (Just (CredentialsFile 1 (Map.singleton idiomaticId idiomaticCredential)))
+
+  describe "createCredentialsFile" $ do
+    it "creates a store that did not exist, mode 0600" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+        createCredentialsFile path idiomaticCreds `shouldReturn` Right ()
+        loadCredentials path `shouldReturn`
+          Right (Just (CredentialsFile 1 idiomaticCreds))
+        stat <- getFileStatus path
+        (fileMode stat .&. 0o777) `shouldBe` 0o600
+
+  describe "createCredentialsFile / updateCredentialsFile refusals" $ do
+    -- Each refusal must leave the bytes on disk exactly as they were. A guard
+    -- that reports failure after writing is worse than no guard: the operator
+    -- believes the store is untouched and it is not.
+    it "create refuses an existing file, update refuses a missing one, both refuse an empty result" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+
+        -- (1) update refuses a missing file, and must not create one.
+        updateCredentialsFile path Right
+          `shouldRefuseWith` "does not exist"
+        doesFileExist path `shouldReturn` False
+
+        -- (2) create refuses an existing file, byte for byte.
+        createCredentialsFile path idiomaticCreds `shouldReturn` Right ()
+        original <- BS.readFile path
+        createCredentialsFile path otherCreds
+          `shouldRefuseWith` "already exists"
+        BS.readFile path `shouldReturn` original
+
+        -- (3) an empty result is refused in both directions.
+        createCredentialsFile path Map.empty
+          `shouldRefuseWith` "empty"
+        updateCredentialsFile path (const (Right Map.empty))
+          `shouldRefuseWith` "empty"
+        BS.readFile path `shouldReturn` original
+
+    it "refuses when the callback rejects the change" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+        createCredentialsFile path idiomaticCreds `shouldReturn` Right ()
+        original <- BS.readFile path
+        updateCredentialsFile path (const (Left "the last usable credential cannot be removed"))
+          `shouldRefuseWith` "last usable credential"
+        BS.readFile path `shouldReturn` original
+
+    it "keeps the format version and the entries it did not touch" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let path = dir </> "credentials.toml"
+            both = Map.fromList [(idiomaticId, idiomaticCredential), (otherId, otherCredential)]
+        createCredentialsFile path idiomaticCreds `shouldReturn` Right ()
+        updateCredentialsFile path (Right . Map.insert otherId otherCredential)
+          `shouldReturn` Right ()
+        loadCredentials path `shouldReturn` Right (Just (CredentialsFile 1 both))
 
 -- | A credential map with the key shape the real store uses: a base64url
 -- credential id (a valid TOML bare key) mapped to one credential table.
@@ -160,3 +220,22 @@ idiomaticCredential = CredentialFileConfig
   , cfcRpId      = "localhost"
   , cfcAddedVia  = Just "cli_token"
   }
+
+idiomaticCreds :: Map Text CredentialFileConfig
+idiomaticCreds = Map.singleton idiomaticId idiomaticCredential
+
+otherId :: Text
+otherId = T.replicate 22 "B"
+
+otherCredential :: CredentialFileConfig
+otherCredential = idiomaticCredential { cfcLabel = "desktop" }
+
+otherCreds :: Map Text CredentialFileConfig
+otherCreds = Map.singleton otherId otherCredential
+
+-- | Assert the action refuses, with a message mentioning @needle@.
+shouldRefuseWith :: Show a => IO (Either Text a) -> Text -> Expectation
+shouldRefuseWith action needle = action >>= \case
+  Left msg -> msg `shouldSatisfy` T.isInfixOf needle
+  Right ok -> expectationFailure
+    ("expected a refusal mentioning " <> show needle <> ", got Right " <> show ok)
