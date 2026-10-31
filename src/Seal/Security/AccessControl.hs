@@ -24,6 +24,8 @@ module Seal.Security.AccessControl
   , credentialToFile
   , parseIsoTime
   , formatIsoTime
+  , CredentialAvailability (..)
+  , credentialAvailability
   ) where
 
 import Data.ByteString qualified as BS
@@ -191,6 +193,43 @@ bootDecisionMessage :: BootDecision -> Maybe Text
 bootDecisionMessage decision = case decision of
   BdStart    -> Nothing
   BdRefuse m -> Just m
+
+-- ---------------------------------------------------------------------------
+-- Credential availability
+-- ---------------------------------------------------------------------------
+
+-- | What the enrolled credentials can actually do on /this/ boot.
+--
+-- Three values, not a boolean, because the three states call for three
+-- different responses and conflating them is the bug this type removes:
+-- "some credential differs" never clears, so it mints a grant on every boot
+-- and never stops.
+data CredentialAvailability
+  = NoCredentials
+    -- ^ Nothing enrolled: the bootstrap state. A CLI-minted grant is the only
+    -- authority (design §5 invariant 3).
+  | UnusableOnly
+    -- ^ Credentials exist, but none was created for this rpId — the operator
+    -- changed @origin@/@rp_id@, or the gateway is reached under a different
+    -- name. This is @rp_mismatch@. A CLI-minted grant is the only authority:
+    -- deliberately not the loopback window, since this is the state an
+    -- attacker who can change @origin@/@rp_id@ would aim to create (§7.2).
+  | Usable
+    -- ^ At least one credential can authenticate here.
+  deriving stock (Eq, Show)
+
+-- | Classify a credential map against the boot-resolved rpId.
+--
+-- A 'Nothing' rpId means no origin could be resolved (a wildcard bind with no
+-- explicit @origin@), so there is no name to call a credential unusable — every
+-- credential counts as usable, which is also what the last-usable-credential
+-- deletion guard relies on (design §9.4).
+credentialAvailability :: Maybe Text -> Map Text Credential -> CredentialAvailability
+credentialAvailability _        creds | Map.null creds = NoCredentials
+credentialAvailability Nothing  _                      = Usable
+credentialAvailability (Just rp) creds
+  | any ((== rp) . credRpId) (Map.elems creds) = Usable
+  | otherwise                                  = UnusableOnly
 
 -- ---------------------------------------------------------------------------
 -- Credential (de)serialisation

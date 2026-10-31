@@ -10,6 +10,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Time (UTCTime)
 import Test.Hspec
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -27,9 +28,11 @@ import Seal.Config.Security
   , updateAccessControlSection
   )
 import Seal.Security.AccessControl
-  ( BootDecision (..), ResolvedAccessControl (..), bootDecision
-  , canonicalOriginFor, credentialFromFile, credentialToFile, resolveAccessControl )
-import Seal.Security.WebAuthn.Types (AccessMode (..))
+  ( BootDecision (..), CredentialAvailability (..), ResolvedAccessControl (..)
+  , bootDecision, canonicalOriginFor, credentialAvailability, credentialFromFile
+  , credentialToFile, parseIsoTime, resolveAccessControl )
+import Seal.Security.WebAuthn.Types
+  ( AccessMode (..), CosePublicKey (..), Credential (..) )
 
 spec :: Spec
 spec = describe "Seal.Config.Security access_control" $ do
@@ -99,6 +102,39 @@ spec = describe "Seal.Config.Security access_control" $ do
         writeFile path "this is not toml [[["
         result <- updateAccessControlSection path (const sampleSection)
         result `shouldSatisfy` isLeft
+
+  -- Design §7.2. The three-valued answer is what stops rp_mismatch being a
+  -- boolean: "no credential enrolled" (bootstrap, mint a grant) and "every
+  -- credential is orphaned" (rp_mismatch, mint a grant) must not be conflated
+  -- with "some credential differs", which never clears.
+  describe "credentialAvailability" $ do
+    it "is NoCredentials with an empty store" $
+      credentialAvailability (Just "localhost") Map.empty `shouldBe` NoCredentials
+
+    it "is NoCredentials with an empty store and no resolved rpId" $
+      credentialAvailability Nothing Map.empty `shouldBe` NoCredentials
+
+    it "is UnusableOnly when every credential was created for another rpId" $
+      credentialAvailability (Just "localhost")
+        (Map.fromList [("a", mkCredential "a" "old.example.com")
+                      ,("b", mkCredential "b" "old.example.com")])
+        `shouldBe` UnusableOnly
+
+    it "is Usable when one credential matches and the rest are orphaned" $
+      credentialAvailability (Just "localhost")
+        (Map.fromList [("a", mkCredential "a" "old.example.com")
+                      ,("b", mkCredential "b" "localhost")])
+        `shouldBe` Usable
+
+    it "is Usable when every credential matches" $
+      credentialAvailability (Just "localhost")
+        (Map.fromList [("a", mkCredential "a" "localhost")
+                      ,("b", mkCredential "b" "localhost")])
+        `shouldBe` Usable
+
+    it "is Usable when no rpId could be resolved (wildcard bind)" $
+      credentialAvailability Nothing (Map.fromList [("a", mkCredential "a" "anywhere")])
+        `shouldBe` Usable
 
   describe "credentialFromFile" $ do
     it "accepts a well-formed credential" $
@@ -224,6 +260,24 @@ credIdText = TE.decodeUtf8 (B64Url.encodeUnpadded (BS.replicate 16 0x03))
 
 key64 :: Text
 key64 = TE.decodeUtf8 (B64Url.encodeUnpadded (BS.replicate 64 0x02))
+
+-- | A credential created for @rp@, for the availability cases. Only @credRpId@
+-- and the id matter to 'credentialAvailability'; the rest is filler that still
+-- has to be well-typed.
+mkCredential :: Text -> Text -> Credential
+mkCredential cid rp = Credential
+  { credId        = TE.encodeUtf8 cid
+  , credPublicKey = CosePublicKey (BS.replicate 64 0x01)
+  , credSignCount = 0
+  , credLabel     = "test"
+  , credCreatedAt = fixtureTime
+  , credRpId      = rp
+  }
+
+fixtureTime :: UTCTime
+fixtureTime = case parseIsoTime "2026-10-30T14:00:00Z" of
+  Just t  -> t
+  Nothing -> error "the fixture timestamp must parse"
 
 sampleCredential :: CredentialFileConfig
 sampleCredential = CredentialFileConfig
