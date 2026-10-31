@@ -100,6 +100,21 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         jsonField body "challenge" `shouldSatisfy` isNonEmptyValue
         jsonField body "attestation" `shouldBe` Just (String "none")
 
+    -- Regression guard for the browser contract: the SPA lowercases every code
+    -- it submits (`normaliseCode`, auth.ts:58-59, applied to both typed input
+    -- and `#setup=` fragments). `generateToken` emits lowercase hex, so the
+    -- lowercased form is what must match. If that formatter ever changes case,
+    -- this test is what catches it.
+    it "accepts the setup code lowercased, as the browser sends it" $
+      withHome Nothing $ \paths -> do
+        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        code <- setupCodeOf na
+        (st, _, body) <- runApp (gated na)
+          (postReq ["api", "auth", "register", "options"]
+                   [("X-Seal-Setup-Token", T.toLower code)])
+        st `shouldBe` status200'
+        jsonField body "challenge" `shouldSatisfy` isNonEmptyValue
+
   describe "status payload" $ do
     it "reports the three states with the UI's vocabulary" $ do
       -- unconfigured
