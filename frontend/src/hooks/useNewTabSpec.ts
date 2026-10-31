@@ -78,7 +78,7 @@ export interface NewTabSpec {
   availableSecrets: string[]
   /** True when the secrets fetch failed (vault locked/unconfigured). */
   secretsError: boolean
-  /** Set of selected secret names. All selected = no restriction. */
+  /** Set of selected secret names. Empty = no vault access (fail-closed). */
   allowedSecrets: Set<string>
   setAllowedSecrets: (s: Set<string>) => void
 
@@ -278,15 +278,9 @@ export function useNewTabSpec(): NewTabSpec {
   const buildBody = useCallback((): CreateTabBody => {
     if (kind === 'provider') {
       const body: CreateTabBody = { kind: 'provider', provider, model: model.trim() }
-      // Include allowed_secrets only when the user has deselected any
-      // secrets (i.e. the selection is not "all"). When all are selected
-      // (or no secrets exist), omit the field — the backend treats
-      // absent as Nothing (all secrets, backward compat). When none are
-      // selected, send an empty array — the backend treats [] as
-      // Just Set.empty (no secrets).
-      if (availableSecrets.length > 0 && allowedSecrets.size < availableSecrets.length) {
-        body.allowed_secrets = Array.from(allowedSecrets)
-      }
+      // Always send allowed_secrets. Empty array = no vault access
+      // (fail-closed default). The backend parses [] as Set.empty.
+      body.allowed_secrets = Array.from(allowedSecrets)
       return body
     }
     if (kind === 'harness') {

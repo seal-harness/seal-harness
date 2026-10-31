@@ -41,7 +41,7 @@ describe('useNewTabSpec', () => {
     const { result } = renderHook(() => useNewTabSpec())
     await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
     const body = result.current.buildBody()
-    expect(body).toEqual({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })
+    expect(body).toEqual({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4', allowed_secrets: [] })
   })
 
   it('buildBody produces {kind:"harness", harness_id:flavour} for kind=harness', async () => {

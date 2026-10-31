@@ -88,7 +88,7 @@ describe('NewSessionComposer', () => {
     render(<NewSessionComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
     fireEvent.click(screen.getByLabelText('Submit new session'))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' }))
-    expect(createBareSession).toHaveBeenCalledWith({ provider: 'anthropic', model: 'claude-sonnet-4' })
+    expect(createBareSession).toHaveBeenCalledWith({ provider: 'anthropic', model: 'claude-sonnet-4', allowed_secrets: [] })
   })
 
   it('persists the form selection on submit', async () => {

@@ -260,11 +260,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
             <div data-testid="secrets-vault-warning"
                  style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>
               Secret selection unavailable — the vault may be locked.
-              The session will have access to all secrets.
+              The session will have no vault access.
             </div>
           ) : spec.availableSecrets.length > 0 ? (
             <div data-testid="secrets-section"
                  style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {spec.allowedSecrets.size === 0 && (
+                  <div data-testid="secrets-zero-warning"
+                       style={{ fontSize: 12, color: 'var(--needs-input)', lineHeight: 1.4 }}>
+                    No secrets selected — the session will have no vault access.
+                  </div>
+                )}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <label style={labelStyle}>Secrets</label>
                 <div style={{ display: 'flex', gap: 8 }}>
