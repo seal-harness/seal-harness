@@ -34,7 +34,7 @@ import Data.Aeson (Value)
 import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.Set (Set, member, fromList)
+import Data.Set (member, fromList)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -260,7 +260,7 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
 -- Replaces 'Seal.Gateway.Send.buildWebRegistry',
 -- 'Seal.Channel.Cli.cliIsaReg'.
 buildSessionRegistry
-  :: VaultRuntime
+  :: VaultAccess
   -> SealPaths
   -> Clone.CloneDeps
   -> Backends
@@ -275,17 +275,15 @@ buildSessionRegistry
   -> Maybe Manager
   -> ChannelCaps
   -> Bool
-  -> Set Text
   -> ISA.Registry
-buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring harnessReg tmuxRunner httpManager caps onDemand
-                     mAllowedSecrets =
+buildSessionRegistry va paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
+                     startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretManageOp (vaultAccess rt mAllowedSecrets) caps
+      , secretManageOp va caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -350,7 +348,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
       , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault       = Just (vaultAccess rt mAllowedSecrets)
+      , wscVault       = Just va
       , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
       }
     webFetchCfg = WebFetchConfig
@@ -741,10 +739,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
-      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
+      isaReg = buildSessionRegistry turnVA paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
-                 (smAllowedSecrets meta')
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
@@ -1110,10 +1107,9 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
-        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+        isaReg = buildSessionRegistry callVA (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
-                  (maybe mempty smAllowedSecrets mMeta)
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
     res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
