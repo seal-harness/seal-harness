@@ -14,6 +14,7 @@ import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
+import qualified Seal.Gateway.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
@@ -61,6 +62,9 @@ import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
+import qualified Seal.Security.WebAuthnSpec
+import qualified Seal.Security.WebAuthn.CborSpec
+import qualified Seal.Security.WebAuthn.DerSpec
 import qualified Seal.Security.PathSpec
 import qualified Seal.Security.SecretsSpec
 import qualified Seal.Security.Vault.AgeSpec
@@ -87,6 +91,7 @@ import qualified Seal.Command.NewSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.SecuritySpec
+import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.CapabilityScopingWorkdirFsFailSpec
 import qualified Seal.Vault.BackendSpec
@@ -211,6 +216,7 @@ specs = do
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
+  Seal.Gateway.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
@@ -258,6 +264,9 @@ specs = do
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
+  Seal.Security.WebAuthnSpec.spec
+  Seal.Security.WebAuthn.CborSpec.spec
+  Seal.Security.WebAuthn.DerSpec.spec
   Seal.Security.PathSpec.spec
   Seal.Security.SecretsSpec.spec
   Seal.Security.Vault.AgeSpec.spec
@@ -284,6 +293,7 @@ specs = do
   Seal.Config.FileSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.SecuritySpec.spec
+  Seal.Config.SecurityAccessControlSpec.spec
   Seal.Config.SecurityScopingFailSpec.spec
   Seal.CapabilityScopingWorkdirFsFailSpec.spec
   Seal.Vault.BackendSpec.spec

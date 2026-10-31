@@ -169,6 +169,7 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
+        Seal.Command.AccessControl
         Seal.Command.Call
         Seal.Command.New
         Seal.Command.Registry
@@ -198,8 +199,13 @@ library
          Seal.Security.Command
          Seal.Security.Crypto
          Seal.Security.Path
+        Seal.Security.AccessControl
          Seal.Security.Policy
          Seal.Security.Secrets
+        Seal.Security.WebAuthn
+        Seal.Security.WebAuthn.Cbor
+        Seal.Security.WebAuthn.Der
+        Seal.Security.WebAuthn.Types
          Seal.Security.Vault
          Seal.Security.Vault.Age
          Seal.Text.LineFile
@@ -225,7 +231,8 @@ library
         Seal.Media.Image
         Seal.Media.Tts
          Seal.Gateway.Config
-          Seal.Gateway.API
+          Seal.Gateway.AccessControl
+        Seal.Gateway.API
          Seal.Gateway.Embedded
          Seal.Gateway.Route
          Seal.Gateway.Send
@@ -314,7 +321,7 @@ library
       , haskeline
       , katip
       , lens
-      , memory
+      , ram
       , mtl
       , optparse-applicative
       , stm
@@ -377,6 +384,9 @@ test-suite tests
       , containers
       , directory
       , filepath
+      , crypton
+      , ram
+      , file-embed
        , hspec
       , hspec-core
        , http-client
@@ -417,7 +427,8 @@ test-suite tests
         Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
-        Seal.Gateway.ApiRouteSpec
+        Seal.Gateway.AccessControlSpec
+       Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
@@ -518,7 +529,8 @@ test-suite tests
         Seal.Command.NewSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
-        Seal.Config.SecuritySpec
+        Seal.Config.SecurityAccessControlSpec
+       Seal.Config.SecuritySpec
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
@@ -527,6 +539,10 @@ test-suite tests
         Seal.Security.CommandSpec
         Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
+       Seal.Security.WebAuthnSpec
+       Seal.Security.WebAuthn.CborSpec
+       Seal.Security.WebAuthn.DerSpec
+       Seal.Security.WebAuthnSpecFixture
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec

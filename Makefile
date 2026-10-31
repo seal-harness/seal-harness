@@ -11,7 +11,7 @@ NIX := nix develop --command
 ARGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help build test lint check run tui ghci clean shell frontend-install
+.PHONY: help build test lint check run tui ghci clean shell frontend-install frontend-test
 
 help: ## List the available targets
 	@echo "seal-harness — make targets:"
@@ -32,10 +32,13 @@ test: ## Run the test suite
 lint: ## Run hlint over src/ and test/ (must report: No hints)
 	$(NIX) hlint src/ test/
 
-check: build test lint ## Build, test, and lint — the full local gate (what CI runs)
+check: build test lint frontend-test ## Build, test, lint, and run the frontend suite — the full local gate
 
 run: ## Run the seal executable; pass flags via ARGS="..." (e.g. make run ARGS="--help")
 	$(NIX) cabal run -v0 seal -- $(ARGS)
+
+frontend-test: ## Run the frontend unit tests (vitest)
+	@cd frontend && npm test
 
 frontend-install: ## Install frontend npm dependencies if missing
 	@cd frontend && [ -d node_modules ] || npm install

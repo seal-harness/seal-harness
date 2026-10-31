@@ -16,7 +16,9 @@ import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.Directory (doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.FilePath ((</>))
+import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
 
 import Katip (Severity (..), ls)
 
@@ -57,9 +59,15 @@ import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Security
+  ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig
+  , untrustedExecConfigFromSecurity, writeSecretFile )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Security.WebAuthn.Types (AccessMode (..))
+import Seal.Gateway.AccessControl
+  ( NewAccess (..), accessControlCredentialCount, accessControlMode
+  , newAccessControlHandle )
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -137,9 +145,26 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      logIO logger WarningS ("could not load security config: " <> ls err)
-      pure defaultSecurityConfig
+      -- Fail closed. Degrading an unparseable security.toml to the defaults
+      -- would silently reopen the access-control enrollment window on every
+      -- boot, so the gateway refuses to start and prints the diagnostics.
+      logIO logger ErrorS ("could not load security config: " <> ls err)
+      ioError (userError ("security.toml could not be parsed; refusing to start. "
+                          <> T.unpack err))
     Right c  -> pure c
+  -- Access control is resolved ONCE here, before any channel is forked or any
+  -- port is bound, so the refuse-to-start matrix (design §10) runs first.
+  let gwCfgForAccess = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
+  let gwCfgAccess = case mCliStaticDir of
+        Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
+        Nothing  -> gwCfgForAccess
+  access <- newAccessControlHandle paths gwCfgAccess (scAccessControl secCfg)
+  case naRefusal access of
+    Just reason -> do
+      logIO logger ErrorS ("access control: " <> ls reason)
+      ioError (userError (T.unpack reason))
+    Nothing -> pure ()
+  printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
@@ -338,10 +363,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
           -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg0 = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
-      gwCfg  = case mCliStaticDir of
-        Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
-        Nothing  -> gwCfg0
+  let gwCfg = gwCfgAccess
   -- The WS stream server's liveness, published through /api/health. The
   -- ref is created BEFORE the ApiDeps that reads it and is filled in by
   -- the WS server thread once it has attempted its bind. Reporting the
@@ -393,7 +415,14 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
-      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths, sgHeartbeatSeconds = 30 }
+      guard = StreamGuard
+        { sgAllowedOrigins = origins
+        , sgGlobalCap = 1024
+        , sgTabsHandle = tabsH
+        , sgPaths = paths
+        , sgHeartbeatSeconds = 30
+        , sgAccessControl = Just (naHandle access)
+        }
   -- The WS server shares the HTTP listener, so it is up as soon as the
   -- HTTP server is. Record that in the health state the /api/health
   -- endpoint publishes.
@@ -418,7 +447,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   let isRemote = case scUntrustedExec secCfg of
         Just uefc -> uefcMode uefc == "remote"
         Nothing   -> False
-  runGateway logger gwCfg isRemote deps guard broker
+  runGateway logger (Just (naHandle access)) gwCfg isRemote deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -583,3 +612,58 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
                      1000000
                       transport
                       (\chan -> runChatChannel chanCfg chan watchState)))
+
+
+-- ---------------------------------------------------------------------------
+-- Access-control boot banner
+-- ---------------------------------------------------------------------------
+
+-- | Tell the operator, on **stderr**, what state access control is in and (when
+-- one exists) the one-time setup code.
+--
+-- stderr, not 'logIO': the logger writes to @seal.log@, which the agent can
+-- read, and the setup code authorises enrollment and waiver. When stderr is not
+-- a TTY (@launchd@, @systemd@, a pipe) the code is also written to
+-- @~\/.seal\/state\/setup-code@ at mode 0600 so a daemon operator is never
+-- locked out of setup.
+printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
+printAccessControlBanner paths access = do
+  mode <- accessControlMode (naHandle access)
+  count <- accessControlCredentialCount (naHandle access)
+  let urlFor suffix = case naOrigin access of
+        Just origin -> Just (origin <> suffix)
+        Nothing     -> Nothing
+  case mode of
+    AccessUnconfigured -> do
+      hPutStrLn stderr "Access control is NOT configured — the API is closed until setup completes."
+      case (urlFor "/#setup=", naSetupCode access) of
+        (Just base, Just code) -> do
+          hPutStrLn stderr ("  Open  " <> T.unpack base <> T.unpack code)
+          hPutStrLn stderr ("  Or    enter the setup code " <> T.unpack code <> " on the setup screen")
+        _ -> hPutStrLn stderr "  Open the web UI to choose a passkey or waive access control."
+      hPutStrLn stderr "  Lost a passkey? Run `seal access-control reset --yes`."
+      writeSetupCodeFile paths (naSetupCode access)
+    AccessOpen -> do
+      hPutStrLn stderr "Access control is OFF — anyone who can reach this address has full control."
+      hPutStrLn stderr "  (explicitly waived by [access_control] mode = \"none\" in ~/.seal/security.toml)"
+      case (urlFor "/#setup=", naSetupCode access) of
+        (Just base, Just code) ->
+          hPutStrLn stderr ("  To turn it on: open " <> T.unpack base <> T.unpack code
+                              <> " and enroll a passkey")
+        _ -> pure ()
+      writeSetupCodeFile paths (naSetupCode access)
+    AccessPasskey ->
+      hPutStrLn stderr ("Access control: passkey (" <> show count <> " credential(s) enrolled)")
+
+-- | Persist the setup code for non-interactive launches only.
+writeSetupCodeFile :: SealPaths -> Maybe T.Text -> IO ()
+writeSetupCodeFile _ Nothing = pure ()
+writeSetupCodeFile paths (Just code) = do
+  interactive <- hIsTerminalDevice stderr
+  if interactive
+    then pure ()
+    else do
+      let dir = spState paths
+          path = dir </> "setup-code"
+      createDirectoryIfMissing True dir
+      writeSecretFile path code

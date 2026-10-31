@@ -30,6 +30,7 @@ spec = describe "Seal.Config.Security" $ do
         , scVaultUnlock    = Nothing
         , scVaultKeyType   = Nothing
         , scUntrustedExec  = Nothing
+        , scAccessControl  = Nothing
         }
 
   describe "loadSecurityConfig" $ do
@@ -77,6 +78,7 @@ spec = describe "Seal.Config.Security" $ do
               , scVaultUnlock    = Just "on_demand"
               , scVaultKeyType   = Just "x25519"
               , scUntrustedExec  = Nothing
+              , scAccessControl  = Nothing
               }
         saveSecurityConfig path cfg
         result <- loadSecurityConfig path
@@ -222,4 +224,5 @@ genSecurityConfig = do
     , scVaultUnlock    = Nothing
     , scVaultKeyType   = Nothing
     , scUntrustedExec  = uefc
+    , scAccessControl  = Nothing
     }
