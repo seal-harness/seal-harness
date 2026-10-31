@@ -94,6 +94,7 @@ import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.UiState (newUiStateHandle)
 
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
@@ -431,8 +432,9 @@ mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> S
 mkRepoTestSeam rt repoRegH agentRegH paths = do
   pure RepoTestSeam
     { rtsLsRemote  = \repo -> do
+        va <- unrestrictedVaultAccess rt
         let deps = Clone.CloneDeps
-              { Clone.cdVault = rt
+              { Clone.cdVault = va
               , Clone.cdRepoReg = repoRegH
               , Clone.cdSshAgent = mkRealSshAgentHandle
               , Clone.cdAgentRegistry = agentRegH

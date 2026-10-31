@@ -115,6 +115,7 @@ import Seal.SourceControl.Registry
 import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
@@ -1134,8 +1135,9 @@ handleSessionDescription deps sid body =
 -- compile-time-embedded.
 cloneDepsForApiDeps :: ApiDeps -> IO CloneDeps
 cloneDepsForApiDeps deps = do
+  va <- unrestrictedVaultAccess (adVault deps)
   pure CloneDeps
-    { Clone.cdVault = adVault deps
+    { Clone.cdVault = va
     , Clone.cdRepoReg = adRepoRegistry deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
     , Clone.cdAgentRegistry = adAgentRegistry deps

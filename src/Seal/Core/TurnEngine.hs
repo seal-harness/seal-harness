@@ -164,7 +164,7 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
-import Seal.Vault.Access (vaultAccess)
+import Seal.Vault.Access (VaultAccess, vaultAccess, noVaultAccess)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
@@ -685,7 +685,8 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-  cloneDeps <- mkCloneDepsTurn td
+      turnVA = vaultAccess (tdVault td) (smAllowedSecrets meta)
+  cloneDeps <- mkCloneDepsTurn td turnVA
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                  (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -904,10 +905,10 @@ recordPreamble tHandle model mSystem isaReg = do
 -- | Build 'Clone.CloneDeps' from a 'TurnDeps' (the in-scope vault runtime +
 -- repo registry handle + paths). The ssh-agent is real (production:
 -- 'mkRealSshAgentHandle'); the pinned host keys are compile-time-embedded.
-mkCloneDepsTurn :: TurnDeps -> IO Clone.CloneDeps
-mkCloneDepsTurn td = do
+mkCloneDepsTurn :: TurnDeps -> VaultAccess -> IO Clone.CloneDeps
+mkCloneDepsTurn td va = do
   pure Clone.CloneDeps
-    { Clone.cdVault = tdVault td
+    { Clone.cdVault = va
     , Clone.cdRepoReg = tdRepoReg td
     , Clone.cdSshAgent = mkRealSshAgentHandle
     , Clone.cdAgentRegistry = tdAgentReg td
@@ -1053,7 +1054,7 @@ sessionSkillBackend :: TurnDeps -> SessionId -> IO Skill.SkillBackend
 sessionSkillBackend td sid = do
   let paths = tdPaths td
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
-  cloneDeps <- mkCloneDepsTurn td
+  cloneDeps <- mkCloneDepsTurn td (noVaultAccess (tdVault td))
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                  (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -1090,7 +1091,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
     eSecCfg <- loadSecurityConfig (securityFilePath paths)
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-    cloneDeps <- mkCloneDepsTurn td
+        callVA = vaultAccess (tdVault td) (maybe mempty smAllowedSecrets mMeta)
+    cloneDeps <- mkCloneDepsTurn td callVA
     exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                    (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                    eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -1269,7 +1271,9 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
     , dwdParentLineage = parentLineage
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
-        childCloneDeps <- mkCloneDepsTurn td
+        mChildMeta <- loadSessionMeta (tdPaths td) childSid
+        let childVA = vaultAccess (tdVault td) (maybe mempty smAllowedSecrets mChildMeta)
+        childCloneDeps <- mkCloneDepsTurn td childVA
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
         -- WU-4: when anchoring (mAnchor = Just _), reuse the PARENT's
         -- cached SessionExec (same workdir, same UIOEnv) so the child
@@ -1355,7 +1359,8 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
   -- restriction for both live runs and resume.
   mChildMeta <- loadSessionMeta (tdPaths td) childSid
   let mAllowedSecrets = maybe mempty smAllowedSecrets mChildMeta
-  childCloneDeps <- mkCloneDepsTurn td
+      childVA = vaultAccess (tdVault td) mAllowedSecrets
+  childCloneDeps <- mkCloneDepsTurn td childVA
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
                       (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)

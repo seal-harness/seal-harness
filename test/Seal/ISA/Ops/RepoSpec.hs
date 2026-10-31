@@ -19,7 +19,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, fakeVaultAccess)
 import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
 import Seal.Tools.Exec.UntrustedIO qualified as UIORec
 import Seal.Tools.Args (mkShellCommand)
@@ -63,7 +63,7 @@ mkTestCloneDeps keyfilesDir = do
   agentRegH <- mkAgentRegistryHandle keyfilesDir
   let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
     , cdAgentRegistry = agentRegH

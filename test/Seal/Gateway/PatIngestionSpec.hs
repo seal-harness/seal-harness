@@ -86,6 +86,7 @@ import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), mkRemoteUntrustedIOStub)
 import Seal.Tools.Ssh.Agent (SshAgentEnv (..), mkFakeSshAgentHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.UiState (newUiStateHandle)
 
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
@@ -149,10 +150,11 @@ ghFakeUio seen remoteUrl finalOutput =
 -- injection is identical on both planes).
 mkPatCloneDeps :: VaultRuntime -> RepoRegistryHandle -> IO CloneDeps
 mkPatCloneDeps vr repoReg = do
+  va <- unrestrictedVaultAccess vr
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-patingestion-agentreg"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vr
+    { cdVault = va
     , cdRepoReg = repoReg
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
