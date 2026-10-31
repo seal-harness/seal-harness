@@ -50,8 +50,6 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.Functor ((<&>))
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (fromMaybe)
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -139,8 +137,6 @@ data AccessControlFileConfig = AccessControlFileConfig
     -- has to be written out — an open gateway is never inferred.
   , acfcOrigin      :: Maybe Text
   , acfcRpId        :: Maybe Text
-  , acfcCredentials :: Map Text CredentialFileConfig
-    -- ^ Keyed by the base64url credential id (a valid TOML bare key).
   } deriving stock (Eq, Show)
 
 -- | One @[access_control.credentials.\<id\>]@ table.
@@ -167,8 +163,6 @@ accessControlCodec = AccessControlFileConfig
   <$> Toml.dioptional (Toml.text "mode") .= acfcMode
   <*> Toml.dioptional (Toml.text "origin") .= acfcOrigin
   <*> Toml.dioptional (Toml.text "rp_id") .= acfcRpId
-  <*> Toml.tableMap Toml._KeyText (Toml.table credentialCodec) "credentials"
-        .= acfcCredentials
 
 -- | Codec for one credential table.
 credentialCodec :: Toml.TomlCodec CredentialFileConfig
@@ -563,12 +557,18 @@ clearAccessControlSection path mode = withMVar securityWriteLock $ \_ -> do
     Right cfg -> saveSecurityConfig path (cfg { scAccessControl = Nothing }) mode
 
 -- | The section a first write starts from when the file has none.
+--
+-- 'acfcMode' is deliberately 'Nothing', not @Just \"none\"@. Any write to a
+-- section-less file would otherwise record an /implicit/ waiver, and invariant
+-- 1 says absence never means off: an open gateway has to be written out by a
+-- human. With 'Nothing', the write leaves the mode unstated, and boot resolves
+-- it from whether credentials exist — @passkey@ if they do, @unconfigured@ if
+-- they do not.
 emptyAccessControl :: AccessControlFileConfig
 emptyAccessControl = AccessControlFileConfig
-  { acfcMode = Just "none"
+  { acfcMode = Nothing
   , acfcOrigin = Nothing
   , acfcRpId = Nothing
-  , acfcCredentials = Map.empty
   }
 
 -- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the

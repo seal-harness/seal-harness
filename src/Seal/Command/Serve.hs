@@ -59,6 +59,8 @@ import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.BootPlan
+  ( BindCoordinates (..), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity, writeSecretFile )
@@ -158,12 +160,16 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   let gwCfgAccess = case mCliStaticDir of
         Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
         Nothing  -> gwCfgForAccess
-  access <- newAccessControlHandle paths gwCfgAccess (scAccessControl secCfg)
-  case naRefusal access of
-    Just reason -> do
+  -- The §10 matrix runs here, before any channel is forked or port bound.
+  bootInputs <- preflight paths
+  let planResult = bootInputs >>= bootPlan (BindCoordinates (gcHost gwCfgAccess)
+                                                             (gcPort gwCfgAccess))
+  access <- case planResult of
+    Left refusal -> do
+      let reason = bootRefusalMessage refusal
       logIO logger ErrorS ("access control: " <> ls reason)
       ioError (userError (T.unpack reason))
-    Nothing -> pure ()
+    Right plan -> newAccessControlHandle paths plan
   printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle

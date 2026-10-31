@@ -1,24 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Resolving @[access_control]@ into the values the gateway actually uses —
--- and deciding whether the gateway may start at all.
+-- | The pure pieces of access-control configuration: coordinates, credential
+-- (de)serialisation, and how many credentials can actually authenticate here.
 --
--- Two jobs, both pure:
+-- The origin and rpId are resolved **once, at boot**, never from a request
+-- header: a request-derived origin would make the WebAuthn origin check
+-- vacuous, because whoever can rebind a hostname to the port controls both
+-- sides of the comparison (design §3).
 --
--- * 'resolveAccessControl' turns the file section plus the bind coordinates
---   into a 'ResolvedAccessControl'. The origin and rpId are resolved **once,
---   here**, never from a request header: a request-derived origin would make
---   the WebAuthn origin check vacuous, because whoever can rebind a hostname to
---   the port controls both sides of the comparison (design §3).
--- * 'bootDecision' is the §10 matrix as a function, so "may this boot?" is
---   testable without starting a server.
+-- Deciding whether the gateway may start, and in which mode, lives in
+-- "Seal.Config.BootPlan" — one function for the whole §10 table, so there is no
+-- second copy of "what does an absent mode mean" to drift from it.
 module Seal.Security.AccessControl
-  ( ResolvedAccessControl (..)
-  , resolveAccessControl
-  , resolveCoordinates
+  ( resolveCoordinates
   , canonicalOriginFor
-  , BootDecision (..)
-  , bootDecision
-  , bootDecisionMessage
   , isLoopbackHost
   , isWildcardHost
   , credentialFromFile
@@ -44,63 +38,8 @@ import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..) )
 import Seal.Security.WebAuthn (normalizeOrigin)
 import Seal.Security.WebAuthn.Types
-  ( AccessMode (..), CosePublicKey (..), Credential (..), parseAccessMode )
+  ( AccessMode (..), CosePublicKey (..), Credential (..) )
 
--- | Everything the runtime needs to know about access control, resolved once
--- at boot.
-data ResolvedAccessControl = ResolvedAccessControl
-  { racMode        :: AccessMode
-  , racOrigin      :: Maybe Text
-    -- ^ Canonical origin (@scheme:\/\/host[:port]@). 'Nothing' only for an
-    -- @open@ gateway on a wildcard bind, where no single origin exists.
-  , racRpId        :: Maybe Text
-  , racCredentials :: Map Text Credential
-    -- ^ Keyed by base64url credential id.
-  } deriving stock (Eq, Show)
-
--- | Resolve the section against the bind coordinates.
---
--- @Left@ means the file is unusable (a bad mode, a bad rpId, a malformed
--- credential); the caller must refuse to start rather than guess.
-resolveAccessControl
-  :: Text          -- ^ bind host (@[gateway] host@)
-  -> Int           -- ^ bind port
-  -> Maybe AccessControlFileConfig
-  -> Either Text ResolvedAccessControl
-resolveAccessControl bindHost bindPort mSection = case mSection of
-  Nothing -> do
-    -- Unconfigured still resolves an origin: the setup screen has to be able
-    -- to run a WebAuthn ceremony, which needs an rpId. A wildcard bind has no
-    -- derivable origin (the UI then explains that `origin` must be set).
-    origin <- resolveOrigin bindHost bindPort (isWildcardHost bindHost) Nothing AccessUnconfigured
-    rpId <- resolveRpId origin Nothing
-    Right (ResolvedAccessControl AccessUnconfigured origin rpId Map.empty)
-  Just section -> do
-    creds <- traverse credentialFromFile (Map.toList (acfcCredentials section))
-    let credMap = Map.fromList creds
-    mode <- case acfcMode section of
-      Just raw -> parseAccessMode raw
-      -- No mode line: credentials mean "passkey"; no credentials mean
-      -- "still awaiting setup". "none" is never inferred.
-      Nothing | Map.null credMap -> Right AccessUnconfigured
-              | otherwise        -> Right AccessPasskey
-    let wildcard = isWildcardHost bindHost
-        -- A "passkey" file with no credentials cannot authenticate anybody, so
-        -- it is treated as still awaiting setup; 'bootDecision' refuses it.
-        effectiveMode = case mode of
-          AccessPasskey | Map.null credMap -> AccessUnconfigured
-          other                            -> other
-    origin <- resolveOrigin bindHost bindPort wildcard (acfcOrigin section) mode
-    rpId <- resolveRpId origin (acfcRpId section)
-    Right ResolvedAccessControl
-      { racMode = effectiveMode
-      , racOrigin = origin
-      , racRpId = rpId
-      , racCredentials = credMap
-      }
-
--- | Origin precedence: an explicit @origin@ wins; otherwise it is derived from
--- the bind address.
 -- | Resolve @origin@ and @rp_id@ for an already-decided mode.
 --
 -- Split out of 'resolveAccessControl' so the boot plan can resolve the pair
@@ -181,37 +120,6 @@ splitHostPort' authority =
       | T.null port -> (authority, Nothing)
       | T.all isDigit port -> (T.dropEnd 1 withColon, Just port)
       | otherwise -> (authority, Nothing)
-
--- ---------------------------------------------------------------------------
--- Boot decision
--- ---------------------------------------------------------------------------
-
--- | Whether the gateway may start, and why not when it may not.
-data BootDecision = BdStart | BdRefuse Text
-  deriving stock (Eq, Show)
-
--- | The design §10 matrix. The arguments are exactly the facts that decide it,
--- so the table cannot drift from its tests.
-bootDecision :: AccessMode -> Bool -> Bool -> Int -> BootDecision
-bootDecision mode loopback originIsHttps credentialCount = case mode of
-  AccessUnconfigured -> BdStart
-  AccessOpen         -> BdStart
-  AccessPasskey
-    | credentialCount <= 0 ->
-        BdRefuse "access_control.mode is \"passkey\" but no passkeys are enrolled. \
-                 \Run `seal access-control reset --yes` and enroll again, or set \
-                 \mode = \"none\" to run without access control."
-    | not loopback && not originIsHttps ->
-        BdRefuse "access_control.mode is \"passkey\" but the gateway is bound to a \
-                 \non-loopback address over plain HTTP, so the session cookie would \
-                 \travel in the clear. Run behind a TLS reverse proxy and set \
-                 \[access_control] origin to its https:// URL, or set mode = \"none\"."
-    | otherwise -> BdStart
-
-bootDecisionMessage :: BootDecision -> Maybe Text
-bootDecisionMessage decision = case decision of
-  BdStart    -> Nothing
-  BdRefuse m -> Just m
 
 -- ---------------------------------------------------------------------------
 -- Credential availability

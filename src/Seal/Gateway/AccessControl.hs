@@ -55,14 +55,14 @@ import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestHeaders, requestMethod, responseLBS )
 
-import Seal.Config.Paths (SealPaths (..), securityFilePath)
+import Seal.Config.BootPlan (BootPlan (..))
+import Seal.Config.Credentials
+  ( createCredentialsFile, loadCredentials, updateCredentialsFile )
+import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..)
   , updateAccessControlSection )
-import Seal.Gateway.Config (GatewayConfig (..))
-import Seal.Security.AccessControl
-  ( BootDecision (..), ResolvedAccessControl (..), bootDecision
-  , bootDecisionMessage, credentialToFile, isLoopbackHost, resolveAccessControl )
+import Seal.Security.AccessControl (credentialToFile)
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
 import Seal.Security.WebAuthn
   ( AssertionInput (..), RegistrationInput (..), RegistrationResult (..)
@@ -122,8 +122,6 @@ data NewAccess = NewAccess
   , naSetupCode    :: Maybe Text
   , naServiceToken :: Text
   , naOrigin       :: Maybe Text
-  , naRefusal      :: Maybe Text
-    -- ^ Set when the configuration forbids starting (design §10).
   }
 
 -- | The gate's verdict.
@@ -161,60 +159,46 @@ maxAuthBody = 64 * 1024
 -- Construction
 -- ---------------------------------------------------------------------------
 
--- | Build the handle from the boot configuration: resolve the section, apply
--- the §10 boot matrix, mint the setup code when one is warranted (unconfigured,
--- open, or an orphaned-rpId boot) and always mint the in-process service token
--- for the Signal/Telegram bridges.
-newAccessControlHandle
-  :: SealPaths
-  -> GatewayConfig
-  -> Maybe AccessControlFileConfig
-  -> IO NewAccess
-newAccessControlHandle paths gwCfg mSection = do
+-- | Build the handle from an already-decided 'BootPlan'.
+--
+-- The plan is the whole input on purpose: the handle never reads
+-- @security.toml@ or @credentials.toml@ again, so editing either file under a
+-- running gateway cannot change what it trusts. Minting follows
+-- 'bpMintGrant' — nothing is minted when a usable credential exists, because
+-- there is already an authority the operator can present.
+newAccessControlHandle :: SealPaths -> BootPlan -> IO NewAccess
+newAccessControlHandle paths plan = do
   serviceToken <- generateToken 32
-  case resolveAccessControl (gcHost gwCfg) (gcPort gwCfg) mSection of
-    Left err -> do
-      handle <- mkHandle AccessUnconfigured Map.empty Nothing Nothing Nothing serviceToken False
-      pure (NewAccess handle Nothing serviceToken Nothing (Just err))
-    Right resolved -> do
-      let mode = racMode resolved
-          creds = racCredentials resolved
-          httpsOrigin = maybe False ("https://" `T.isPrefixOf`) (racOrigin resolved)
-          decision = bootDecision mode (isLoopbackHost (gcHost gwCfg)) httpsOrigin
-                                   (Map.size creds)
-      case decision of
-        BdRefuse msg -> do
-          handle <- mkHandle mode creds (racOrigin resolved) (racRpId resolved) Nothing serviceToken False
-          pure (NewAccess handle Nothing serviceToken (racOrigin resolved)
-                  (Just (fromMaybe msg (bootDecisionMessage decision))))
-        BdStart -> do
-          let rpMismatch = any (\c -> Just (credRpId c) /= racRpId resolved)
-                               (Map.elems creds)
-              needsCode = mode /= AccessPasskey || rpMismatch
-          mCode <- if needsCode then Just <$> generateToken 16 else pure Nothing
-          handle <- mkHandle mode creds (racOrigin resolved) (racRpId resolved) mCode serviceToken rpMismatch
-          pure (NewAccess handle mCode serviceToken (racOrigin resolved) Nothing)
-  where
-    mkHandle mode creds mOrigin mRpId mCode serviceToken rpMismatch = do
-      now <- getCurrentTime
-      st <- newMVar AccessControlState
-        { acsMode = mode
-        , acsCredentials = creds
-        , acsChallenges = Map.empty
-        , acsSessions = Map.empty
-        , acsSetupCode = mCode
-        , acsSetupHash = tokenKey <$> mCode
-        , acsServiceToken = serviceToken
-        , acsServiceHash = tokenKey serviceToken
-        , acsOrigin = mOrigin
-        , acsRpId = mRpId
-        , acsRpMismatch = rpMismatch
-        , acsChallengeTokens = challengeBurst
-        , acsChallengeRefillAt = now
-        , acsFailures = 0
-        , acsRetryAfter = now
-        }
-      pure (AccessControlHandle st paths)
+  now <- getCurrentTime
+  let creds = bpCreds plan
+      mOrigin = bpOrigin plan
+      mRpId = bpRpId plan
+      -- No usable credential for this rpId: every enrolled passkey was created
+      -- for a different one. Derived from the map, never assigned (design §14)
+      -- — the old code hardcoded this to False after a registration, so it
+      -- never cleared.
+      rpMismatch = any (\c -> Just (credRpId c) /= mRpId) (Map.elems creds)
+  mCode <- case bpMintGrant plan of
+    Just _  -> Just <$> generateToken 16
+    Nothing -> pure Nothing
+  st <- newMVar AccessControlState
+    { acsMode = bpMode plan
+    , acsCredentials = creds
+    , acsChallenges = Map.empty
+    , acsSessions = Map.empty
+    , acsSetupCode = mCode
+    , acsSetupHash = tokenKey <$> mCode
+    , acsServiceToken = serviceToken
+    , acsServiceHash = tokenKey serviceToken
+    , acsOrigin = mOrigin
+    , acsRpId = mRpId
+    , acsRpMismatch = rpMismatch
+    , acsChallengeTokens = challengeBurst
+    , acsChallengeRefillAt = now
+    , acsFailures = 0
+    , acsRetryAfter = now
+    }
+  pure (NewAccess (AccessControlHandle st paths) mCode serviceToken mOrigin)
 
 -- | Accessors for the boot banner and for tests.
 accessControlMode :: AccessControlHandle -> IO AccessMode
@@ -704,39 +688,61 @@ persistRegistration
 persistRegistration h isAdd result now = do
   st <- withMVar (achState h) pure
   let rawId = TE.decodeUtf8 (B64Url.encodeUnpadded (rrCredentialId result))
-      label = "passkey"
       cred = Credential
         { credId = rrCredentialId result
         , credPublicKey = rrPublicKey result
         , credSignCount = rrSignCount result
-        , credLabel = label
+        , credLabel = "passkey"
         , credCreatedAt = now
         , credRpId = fromMaybeText (acsRpId st)
         }
-  written <- updateAccessControlSection (securityFilePath (achPaths h)) $ \cfg ->
-    cfg { acfcMode = Just "passkey"
-        , acfcCredentials = Map.insert rawId (credentialToFile cred)
-                                      (acfcCredentials cfg)
-        }
-  case written of
+  -- Mode first, credential second (design §6.1). A crash between the two leaves
+  -- passkey mode with no credentials, which resolves to the loud, grant-gated
+  -- bootstrap. The other order would leave a credential on a still-open
+  -- gateway: silent non-enforcement.
+  raised <- updateAccessControlSection (securityFilePath (achPaths h))
+              (\cfg -> cfg { acfcMode = Just "passkey" })
+  case raised of
     Left err -> pure (Left (AuthErr status500 "write_failed" err))
     Right _ -> do
-      modifyMVar_ (achState h) $ \s ->
-        pure s { acsMode = AccessPasskey
-               , acsCredentials = Map.insert rawId cred (acsCredentials s)
-               , acsSetupCode = Nothing
-               , acsSetupHash = Nothing
-               , acsRpMismatch = False
-               }
-      clearSetupCodeFile h
-      token <- mintSession h
-      cookie <- sessionCookie h token
-      pure (Right ( object
-        [ "ok" .= True
-        , "credential" .= rawId
-        , "added" .= isAdd
-        ]
-        , [cookie] ))
+      written <- upsertCredential (achPaths h) rawId (credentialToFile cred)
+      case written of
+        Left err -> pure (Left (AuthErr status500 "write_failed" err))
+        Right () -> do
+          modifyMVar_ (achState h) $ \s ->
+            let creds' = Map.insert rawId cred (acsCredentials s)
+            in pure s { acsMode = AccessPasskey
+                      , acsCredentials = creds'
+                      , acsSetupCode = Nothing
+                      , acsSetupHash = Nothing
+                      -- recomputed from the map, never assigned
+                      , acsRpMismatch = any (\c -> Just (credRpId c) /= acsRpId s)
+                                              (Map.elems creds')
+                      }
+          clearSetupCodeFile h
+          token <- mintSession h
+          cookie <- sessionCookie h token
+          pure (Right ( object
+            [ "ok" .= True
+            , "credential" .= rawId
+            , "added" .= isAdd
+            ]
+            , [cookie] ))
+
+-- | Add or replace one credential in @credentials.toml@.
+--
+-- Creates the store when it does not exist (the first enrollment) and updates
+-- it otherwise. 'updateCredentialsFile' refuses a missing file on purpose, so
+-- the absent case is its own branch rather than a read-then-write that could
+-- race another process creating the file in between.
+upsertCredential :: SealPaths -> Text -> CredentialFileConfig -> IO (Either Text ())
+upsertCredential paths rawId cfg = do
+  let path = credentialsFilePath paths
+  existing <- loadCredentials path
+  case existing of
+    Right Nothing -> createCredentialsFile path (Map.singleton rawId cfg)
+    _             -> updateCredentialsFile path (Right . Map.insert rawId cfg)
+
 
 loginVerify :: AccessControlHandle -> Request -> IO (Either AuthErr (Value, [Header]))
 loginVerify h req = do
@@ -788,13 +794,20 @@ loginVerify h req = do
                                 then pure (Left (AuthErr status400 "sign_count_regression"
                                            "this assertion was already used"))
                                 else do
-                                  persistSignCount h claimedId newCount
-                                  resetBackoff h
-                                  token <- mintSession h
-                                  cookie <- sessionCookie h token
-                                  pure (Right ( object
-                                    ["ok" .= True, "credential" .= claimedId]
-                                    , [cookie] ))
+                                  -- Persist, then mint. A counter that did not
+                                  -- reach disk must not produce a session: the
+                                  -- next boot would accept a replay of the
+                                  -- assertion we just used.
+                                  persisted <- persistSignCount h claimedId newCount
+                                  case persisted of
+                                    Left err -> pure (Left (AuthErr status500 "write_failed" err))
+                                    Right () -> do
+                                      resetBackoff h
+                                      token <- mintSession h
+                                      cookie <- sessionCookie h token
+                                      pure (Right ( object
+                                        ["ok" .= True, "credential" .= claimedId]
+                                        , [cookie] ))
                         _ -> pure (Left (AuthErr status400 "origin_mismatch"
                                     "this gateway has no origin configured"))
             Left e -> pure (Left e)
@@ -810,16 +823,14 @@ claimSignCount h rawId expected newCount =
                                        (acsCredentials st) }, True)
       _ -> pure (st, False)
 
-persistSignCount :: AccessControlHandle -> Text -> Int -> IO ()
+persistSignCount :: AccessControlHandle -> Text -> Int -> IO (Either Text ())
 persistSignCount h rawId newCount = do
   st <- withMVar (achState h) pure
-  case Map.lookup rawId (acsCredentials st) of
-    Nothing -> pure ()
-    Just _cred -> do
-      _ <- updateAccessControlSection (securityFilePath (achPaths h)) $ \cfg ->
-        cfg { acfcCredentials = Map.adjust (\c -> c { cfcSignCount = newCount })
-                                           rawId (acfcCredentials cfg) }
-      pure ()
+  if Map.member rawId (acsCredentials st)
+    then updateCredentialsFile (credentialsFilePath (achPaths h))
+           (Right . Map.adjust (\c -> c { cfcSignCount = newCount }) rawId)
+    else pure (Right ())
+
 
 -- | Exponential backoff on failed verifications: 250 ms doubling to a 2 s cap,
 -- reset by any success. It delays; it never denies permanently, so it cannot be
@@ -880,21 +891,20 @@ listCredentials h _req = do
 
 deleteCredential :: AccessControlHandle -> Text -> IO (Either AuthErr Value)
 deleteCredential h cid = do
-  st <- withMVar (achState h) pure
-  if acsMode st == AccessPasskey
-       && Map.size (acsCredentials st) <= 1
-       && Map.member cid (acsCredentials st)
-    then pure (Left (AuthErr status409 "last_credential"
-               "that is the only passkey; add another before removing it"))
-    else do
-      written <- updateAccessControlSection (securityFilePath (achPaths h)) $ \cfg ->
-        cfg { acfcCredentials = Map.delete cid (acfcCredentials cfg) }
-      case written of
-        Left err -> pure (Left (AuthErr status500 "write_failed" err))
-        Right _ -> do
-          modifyMVar_ (achState h) $ \s ->
-            pure s { acsCredentials = Map.delete cid (acsCredentials s) }
-          pure (Right (object ["ok" .= True, "removed" .= cid]))
+  -- The guard runs inside the writer, on the freshly loaded map, so two
+  -- concurrent deletes cannot each see "one other credential remains" and both
+  -- proceed. A read-then-write in the handler could.
+  written <- updateCredentialsFile (credentialsFilePath (achPaths h)) $ \creds ->
+    if Map.size creds <= 1 && Map.member cid creds
+      then Left "that is the only passkey; add another before removing it"
+      else Right (Map.delete cid creds)
+  case written of
+    Left err -> pure (Left (AuthErr status409 "last_credential" err))
+    Right () -> do
+      modifyMVar_ (achState h) $ \s ->
+        pure s { acsCredentials = Map.delete cid (acsCredentials s) }
+      pure (Right (object ["ok" .= True, "removed" .= cid]))
+
 
 -- | The setup code has been spent, so the non-interactive copy on disk (written
 -- by `seal serve` when stderr is not a TTY) must go too.

@@ -22,18 +22,17 @@ import Seal.Config.Security
   , CredentialFileConfig (..)
   , SecurityConfig (..)
   , defaultSecurityConfig
-  , loadSecurityConfig
+  , hasLegacyLayout, loadSecurityConfig
   , saveSecurityConfig
   , securityConfigCodec
   , updateAccessControlSection
   , WriteMode (PreserveCredentials)
   )
 import Seal.Security.AccessControl
-  ( BootDecision (..), CredentialAvailability (..), ResolvedAccessControl (..)
-  , bootDecision, canonicalOriginFor, credentialAvailability, credentialFromFile
-  , credentialToFile, parseIsoTime, resolveAccessControl )
+  ( CredentialAvailability (..), canonicalOriginFor, credentialAvailability
+  , credentialFromFile, credentialToFile, parseIsoTime )
 import Seal.Security.WebAuthn.Types
-  ( AccessMode (..), CosePublicKey (..), Credential (..) )
+  ( CosePublicKey (..), Credential (..) )
 
 spec :: Spec
 spec = describe "Seal.Config.Security access_control" $ do
@@ -47,10 +46,12 @@ spec = describe "Seal.Config.Security access_control" $ do
       let cfg = defaultSecurityConfig
       decodeSection (Toml.encode securityConfigCodec cfg) `shouldBe` Right Nothing
 
-    it "decodes an idiomatic credentials-only file (the tableMap gotcha)" $
-      -- No bare [access_control] header: exactly the shape a hand-written file
-      -- takes, and the shape tomland silently mis-decodes without
-      -- normalizeAccessControlTable.
+    it "decodes the section out of a credentials-only legacy file" $
+      -- The pre-split shape: no bare [access_control] header, only
+      -- [access_control.credentials.<id>] tables. The section itself must still
+      -- decode (mode/origin absent), and the document must be recognisable as
+      -- legacy — that recognition is what stops the next write dropping it
+      -- (see the hasLegacyLayout cases in Seal.Config.SecuritySpec).
       withSystemTempDirectory "seal-ac" $ \dir -> do
         let path = dir </> "security.toml"
             raw = T.unlines
@@ -62,40 +63,9 @@ spec = describe "Seal.Config.Security access_control" $ do
               , "rp_id = \"localhost\""
               ]
         writeFile path (T.unpack raw)
-        loaded <- loadSecurityConfig path
-        case loaded of
-          Left e -> expectationFailure ("load: " <> T.unpack e)
-          Right cfg -> do
-            let creds = maybe Map.empty acfcCredentials (scAccessControl cfg)
-            Map.keys creds `shouldBe` [credIdText]
-            fmap cfcLabel (Map.lookup credIdText creds) `shouldBe` Just "laptop"
-
-    it "decodes the dotted-key spelling of the credentials table" $
-      -- The second spelling of the same document: dotted keys under
-      -- [access_control]. tomland keeps each as ONE flat pair keyed by the
-      -- whole path, so it creates no `credentials` node at all and the codec
-      -- sees an empty map. Without expandDottedKeys this loads as "no passkeys
-      -- enrolled" — and migrate-credentials, which reads through this path,
-      -- would then move nothing and report success.
-      withSystemTempDirectory "seal-ac" $ \dir -> do
-        let path = dir </> "security.toml"
-            dotted field = "credentials." <> credIdText <> "." <> field
-            raw = T.unlines
-              [ "[access_control]"
-              , dotted "public_key" <> " = \"" <> key64 <> "\""
-              , dotted "sign_count" <> " = 0"
-              , dotted "label" <> " = \"laptop\""
-              , dotted "created_at" <> " = \"2026-10-30T14:00:00Z\""
-              , dotted "rp_id" <> " = \"localhost\""
-              ]
-        writeFile path (T.unpack raw)
-        loaded <- loadSecurityConfig path
-        case loaded of
-          Left e -> expectationFailure ("load: " <> T.unpack e)
-          Right cfg -> do
-            let creds = maybe Map.empty acfcCredentials (scAccessControl cfg)
-            Map.keys creds `shouldBe` [credIdText]
-            fmap cfcLabel (Map.lookup credIdText creds) `shouldBe` Just "laptop"
+        Right cfg <- loadSecurityConfig path
+        scAccessControl cfg `shouldBe` Just (AccessControlFileConfig Nothing Nothing Nothing)
+        hasLegacyLayout raw `shouldBe` True
 
     it "round-trips the default config through the file" $
       withSystemTempDirectory "seal-ac" $ \dir -> do
@@ -191,68 +161,6 @@ spec = describe "Seal.Config.Security access_control" $ do
         Left e -> expectationFailure (T.unpack e)
         Right (_, cred) -> credentialToFile cred `shouldBe` sampleCredential
 
-  describe "resolveAccessControl" $ do
-    it "is unconfigured when the section is absent, but still resolves an origin" $
-      resolveAccessControl "127.0.0.1" 8080 Nothing
-        `shouldBe` Right (ResolvedAccessControl AccessUnconfigured
-                            (Just "http://localhost:8080") (Just "localhost") Map.empty)
-
-    it "derives a localhost origin for a loopback bind" $
-      fmap racOrigin (resolveAccessControl "127.0.0.1" 8080 (Just openSection))
-        `shouldBe` Right (Just "http://localhost:8080")
-
-    it "derives the origin from the bind host when not loopback" $
-      fmap racOrigin (resolveAccessControl "10.1.2.3" 9000 (Just openSection))
-        `shouldBe` Right (Just "http://10.1.2.3:9000")
-
-    it "has no origin for an open gateway on a wildcard bind" $
-      resolveAccessControl "0.0.0.0" 8080 (Just openSection)
-        `shouldBe` Right (ResolvedAccessControl AccessOpen Nothing Nothing Map.empty)
-
-    it "refuses a wildcard bind with access control configured" $
-      resolveAccessControl "0.0.0.0" 8080 (Just passkeySection) `shouldSatisfy` isLeft
-
-    it "honours an explicit origin and derives the rpId from it" $
-      let section = openSection
-            { acfcOrigin = Just "https://seal.example.com"
-            , acfcRpId = Nothing
-            }
-      in do
-        fmap racOrigin (resolveAccessControl "127.0.0.1" 8080 (Just section))
-          `shouldBe` Right (Just "https://seal.example.com")
-        fmap racRpId (resolveAccessControl "127.0.0.1" 8080 (Just section))
-          `shouldBe` Right (Just "seal.example.com")
-
-    it "accepts an rp_id that is a suffix of the origin host" $
-      fmap racRpId
-        (resolveAccessControl "127.0.0.1" 8080
-          (Just openSection { acfcOrigin = Just "https://a.seal.example.com"
-                            , acfcRpId = Just "seal.example.com" }))
-        `shouldBe` Right (Just "seal.example.com")
-
-    it "rejects an rp_id that is unrelated to the origin host" $
-      resolveAccessControl "127.0.0.1" 8080
-        (Just openSection { acfcOrigin = Just "https://seal.example.com"
-                          , acfcRpId = Just "evil.example" })
-        `shouldSatisfy` isLeft
-
-    it "rejects an invalid mode rather than treating it as open" $
-      resolveAccessControl "127.0.0.1" 8080
-        (Just openSection { acfcMode = Just "off" })
-        `shouldSatisfy` isLeft
-
-    it "treats passkey-with-no-credentials as unconfigured" $
-      fmap racMode
-        (resolveAccessControl "127.0.0.1" 8080
-          (Just passkeySection { acfcCredentials = Map.empty }))
-        `shouldBe` Right AccessUnconfigured
-
-    it "resolves a passkey section with one credential" $ do
-      let cfg = resolveAccessControl "127.0.0.1" 8080 (Just passkeySection)
-      fmap racMode cfg `shouldBe` Right AccessPasskey
-      fmap (Map.size . racCredentials) cfg `shouldBe` Right 1
-      fmap racOrigin cfg `shouldBe` Right (Just "http://localhost:8080")
-
   describe "canonicalOriginFor" $ do
     it "canonicalises a loopback bind to localhost" $ do
       canonicalOriginFor "127.0.0.1" 8080 `shouldBe` "http://localhost:8080"
@@ -260,29 +168,7 @@ spec = describe "Seal.Config.Security access_control" $ do
     it "uses the bind host otherwise" $
       canonicalOriginFor "10.0.0.5" 8080 `shouldBe` "http://10.0.0.5:8080"
 
-  describe "bootDecision" $ do
-    it "always starts unconfigured and open" $ do
-      bootDecision AccessUnconfigured True True 0 `shouldBe` BdStart
-      bootDecision AccessUnconfigured False False 0 `shouldBe` BdStart
-      bootDecision AccessOpen False False 0 `shouldBe` BdStart
-
-    it "refuses passkey with no credentials" $
-      bootDecision AccessPasskey True True 0 `shouldSatisfy` isRefusal
-
-    it "refuses passkey on a non-loopback plain-http bind" $
-      bootDecision AccessPasskey False False 1 `shouldSatisfy` isRefusal
-
-    it "starts passkey on loopback" $
-      bootDecision AccessPasskey True False 1 `shouldBe` BdStart
-
-    it "starts passkey on a non-loopback bind behind https" $
-      bootDecision AccessPasskey False True 1 `shouldBe` BdStart
-
 -- Helpers ------------------------------------------------------------------
-
-isRefusal :: BootDecision -> Bool
-isRefusal (BdRefuse _) = True
-isRefusal BdStart      = False
 
 credIdText :: Text
 credIdText = TE.decodeUtf8 (B64Url.encodeUnpadded (BS.replicate 16 0x03))
@@ -323,19 +209,7 @@ sampleSection = AccessControlFileConfig
   { acfcMode = Just "passkey"
   , acfcOrigin = Nothing
   , acfcRpId = Nothing
-  , acfcCredentials = Map.fromList [(credIdText, sampleCredential)]
   }
-
-openSection :: AccessControlFileConfig
-openSection = AccessControlFileConfig
-  { acfcMode = Just "none"
-  , acfcOrigin = Nothing
-  , acfcRpId = Nothing
-  , acfcCredentials = Map.empty
-  }
-
-passkeySection :: AccessControlFileConfig
-passkeySection = sampleSection
 
 -- | Decode a whole-file encoding back to just the section.
 decodeSection :: Text -> Either Text (Maybe AccessControlFileConfig)

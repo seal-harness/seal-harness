@@ -9,6 +9,7 @@
 module Seal.Gateway.AccessControlSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (unless)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -45,25 +46,58 @@ import Crypto.PubKey.ECC.Generate (generate)
 import Crypto.PubKey.ECC.Types (CurveName (SEC_p256r1), Point (..), getCurveByName)
 import Data.ByteArray (convert)
 
-import Seal.Config.Paths (SealPaths (..), securityFilePath)
+import Seal.Config.BootPlan
+  ( BindCoordinates (..), BootInputs (..), BootPlan (..), CredentialsPresence (..)
+  , bootPlan )
+import Seal.Config.Credentials
+  ( CredentialsFile (..), credentialsVersion, saveCredentials )
+import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
   , WriteMode (PreserveCredentials), defaultSecurityConfig, loadSecurityConfig
   , saveSecurityConfig )
 import Seal.Gateway.AccessControl
-import Seal.Gateway.Config (defaultGatewayConfig)
-import Seal.Security.WebAuthn.Types (AccessMode (..))
+import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
+import Seal.Security.AccessControl (credentialFromFile)
+import Seal.Security.WebAuthn.Types (AccessMode (..), Credential)
 
 spec :: Spec
 spec = describe "Seal.Gateway.AccessControl" $ do
+  describe "the handle is built from its BootPlan" $ do
+    -- The property that makes a mid-flight edit of the store harmless: the
+    -- handle trusts the plan it was constructed with, so replacing
+    -- credentials.toml underneath a running gateway does not change what it
+    -- accepts. A handle that re-read the file would fail this.
+    it "serves a credential that is absent from disk, and ignores the file afterwards" $
+      withHome Nothing $ \paths -> do
+        let plan = BootPlan
+              { bpMode      = AccessPasskey
+              , bpOrigin    = Just "http://localhost:8787"
+              , bpRpId      = Just "localhost"
+              , bpCreds     = runtimeCreds (BS.replicate 16 0x11) (BS.replicate 64 0x02)
+              , bpMintGrant = Nothing
+              }
+        na <- newAccessControlHandle paths plan
+        -- No credentials.toml exists at all.
+        accessControlMode (naHandle na) `shouldReturn` AccessPasskey
+        accessControlCredentialCount (naHandle na) `shouldReturn` 1
+        -- Replace the store with a different credential; the handle must not
+        -- notice, in either direction.
+        saveCredentials (credentialsFilePath paths)
+          (CredentialsFile credentialsVersion
+             (credMap (BS.replicate 16 0x22) (BS.replicate 64 0x03)))
+        accessControlCredentialCount (naHandle na) `shouldReturn` 1
+        (st, _, _) <- runApp (gated na) (getReq ["api", "sessions"])
+        st `shouldBe` status401'
+
   describe "unconfigured" $ do
     it "closes the API" $ withHome Nothing $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+      na <- bootHandle paths Nothing Map.empty
       (st, _, _) <- runApp (gated na) (getReq ["api", "sessions"])
       st `shouldBe` status403'
 
     it "serves the status endpoint" $ withHome Nothing $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+      na <- bootHandle paths Nothing Map.empty
       (st, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
       st `shouldBe` status200'
       jsonField body "state" `shouldBe` Just (String "unconfigured")
@@ -71,21 +105,21 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
     it "lets the health probe and the static bundle through" $
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         (st1, _, _) <- runApp (gated na) (getReq ["api", "health"])
         st1 `shouldBe` status200'
         (st2, _, _) <- runApp (gated na) (getReq ["assets", "index.js"])
         st2 `shouldBe` status200'
 
     it "rejects enrollment without the setup code" $ withHome Nothing $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+      na <- bootHandle paths Nothing Map.empty
       (st, _, body) <- runApp (gated na)
         (postReq ["api", "auth", "register", "options"] [])
       st `shouldBe` status403'
       jsonField body "code" `shouldBe` Just (String "setup_code_required")
 
     it "rejects enrollment with a wrong setup code" $ withHome Nothing $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+      na <- bootHandle paths Nothing Map.empty
       (st, _, body) <- runApp (gated na)
         (postReq ["api", "auth", "register", "options"] [("X-Seal-Setup-Token", "nope")])
       st `shouldBe` status403'
@@ -93,7 +127,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
     it "returns registration options with the right setup code" $
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         code <- setupCodeOf na
         (st, _, body) <- runApp (gated na)
           (postReq ["api", "auth", "register", "options"] [("X-Seal-Setup-Token", code)])
@@ -108,7 +142,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
     -- this test is what catches it.
     it "accepts the setup code lowercased, as the browser sends it" $
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         code <- setupCodeOf na
         (st, _, body) <- runApp (gated na)
           (postReq ["api", "auth", "register", "options"]
@@ -120,12 +154,12 @@ spec = describe "Seal.Gateway.AccessControl" $ do
     it "reports the three states with the UI's vocabulary" $ do
       -- unconfigured
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
         jsonField body "state" `shouldBe` Just (String "unconfigured")
       -- open
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         code <- setupCodeOf na
         _ <- runApp (gated na) (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
         (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
@@ -134,7 +168,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         jsonField body "setup_required" `shouldBe` Just (Bool False)
       -- passkey
       withHome (Just passkeySection) $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig (Just passkeySection)
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
         (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
         jsonField body "state" `shouldBe` Just (String "passkey")
         jsonField body "authenticated" `shouldBe` Just (Bool False)
@@ -143,7 +177,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
   describe "waive" $ do
     it "records mode = none and opens the API" $ withHome Nothing $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+      na <- bootHandle paths Nothing Map.empty
       code <- setupCodeOf na
       (st, _, _) <- runApp (gated na)
         (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
@@ -156,7 +190,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
     it "is refused when a passkey is already configured" $
       withHome (Just passkeySection) $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig (Just passkeySection)
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
         let code = fromMaybe "" (naSetupCode na)
         (st, _, body) <- runApp (gated na)
           (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
@@ -165,14 +199,14 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
   describe "passkey mode" $ do
     it "rejects an unauthenticated API request" $ withHome (Just passkeySection) $ \paths -> do
-      na <- newAccessControlHandle paths defaultGatewayConfig (Just passkeySection)
+      na <- bootHandle paths (Just passkeySection) passkeyCreds
       (st, _, body) <- runApp (gated na) (getReq ["api", "sessions"])
       st `shouldBe` status401'
       jsonField body "code" `shouldBe` Just (String "unauthenticated")
 
     it "accepts the in-process service token on non-auth paths" $
       withHome (Just passkeySection) $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig (Just passkeySection)
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
         (st, _, _) <- runApp (gated na)
           (getReqWith ["api", "sessions"]
              [("Authorization", "Bearer " <> naServiceToken na)])
@@ -180,7 +214,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
     it "refuses the service token on auth paths" $
       withHome (Just passkeySection) $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig (Just passkeySection)
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
         (st, _, _) <- runApp (gated na)
           (getReqWith ["api", "auth", "credentials"]
              [("Authorization", "Bearer " <> naServiceToken na)])
@@ -196,10 +230,9 @@ spec = describe "Seal.Gateway.AccessControl" $ do
               { acfcMode = Just "passkey"
               , acfcOrigin = Nothing
               , acfcRpId = Nothing
-              , acfcCredentials = credMap credId key64
               }
         writeSection paths section
-        na <- newAccessControlHandle paths defaultGatewayConfig (Just section)
+        na <- bootHandle paths (Just section) (credMap credId key64)
         accessControlMode (naHandle na) `shouldReturn` AccessPasskey
 
         -- 2. Ask for login options and read the challenge we must sign.
@@ -263,7 +296,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
   describe "rate limiting" $
     it "returns 429 once the challenge budget is spent" $
       withHome Nothing $ \paths -> do
-        na <- newAccessControlHandle paths defaultGatewayConfig Nothing
+        na <- bootHandle paths Nothing Map.empty
         code <- setupCodeOf na
         statuses <- mapM (\_ -> do
             (st, _, _) <- runApp (gated na)
@@ -368,6 +401,28 @@ postJson segs body = do
         (c:cs) -> (cs, c)
   pure (setRequestBodyChunks nextChunk (postReq segs [("Content-Type", "application/json")]))
 
+-- | Build a handle the way @seal serve@ does: gather the boot inputs, run the
+-- §10 decision, then construct from the plan. Tests that want a handle in a
+-- particular state describe that state as (section, credential store) rather
+-- than reaching into the handle.
+bootHandle
+  :: SealPaths -> Maybe AccessControlFileConfig
+  -> Map.Map Text CredentialFileConfig -> IO NewAccess
+bootHandle paths mSection creds = do
+  -- A real boot plan naming credentials can only come from a store on disk, so
+  -- the fixture writes one. (The "plan without a store" case is covered
+  -- separately, because it is what proves the handle does not re-read.)
+  unless (Map.null creds) $
+    saveCredentials (credentialsFilePath paths)
+      (CredentialsFile credentialsVersion creds)
+  let coords = BindCoordinates (gcHost defaultGatewayConfig) (gcPort defaultGatewayConfig)
+      presence
+        | Map.null creds = CredentialsAbsent
+        | otherwise      = CredentialsPresent credentialsVersion creds
+  case bootPlan coords (BootInputs "" mSection presence) of
+    Left refusal -> fail ("boot plan refused: " <> show refusal)
+    Right plan   -> newAccessControlHandle paths plan
+
 withHome :: Maybe AccessControlFileConfig -> (SealPaths -> IO a) -> IO a
 withHome mSection action = withSystemTempDirectory "seal-ac-gw" $ \dir -> do
   let paths = SealPaths { spHome = dir
@@ -396,8 +451,19 @@ passkeySection = AccessControlFileConfig
   { acfcMode = Just "passkey"
   , acfcOrigin = Nothing
   , acfcRpId = Nothing
-  , acfcCredentials = credMap (BS.replicate 16 0x11) (BS.replicate 64 0x02)
   }
+
+-- | The credential the passkey fixtures hold. Credentials live in
+-- credentials.toml now, so a fixture is a section /and/ a store.
+passkeyCreds :: Map.Map Text CredentialFileConfig
+passkeyCreds = credMap (BS.replicate 16 0x11) (BS.replicate 64 0x02)
+
+-- | The runtime form of 'credMap', which is what a boot plan carries.
+runtimeCreds :: ByteString -> ByteString -> Map.Map Text Credential
+runtimeCreds credId key64 =
+  case traverse credentialFromFile (Map.toList (credMap credId key64)) of
+    Right kvs -> Map.fromList kvs
+    Left e    -> error ("fixture credential must decode: " <> T.unpack e)
 
 credMap :: ByteString -> ByteString -> Map.Map Text CredentialFileConfig
 credMap credId key64 = Map.singleton (b64 credId) CredentialFileConfig

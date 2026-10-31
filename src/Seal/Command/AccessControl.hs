@@ -16,12 +16,10 @@ import Data.Text.IO qualified as TIO
 
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Config.Paths (SealPaths, configFilePath, getSealPaths, securityFilePath)
-import Seal.Config.Security
-  ( AccessControlFileConfig (..), SecurityConfig (..), clearAccessControlSection
-  , loadSecurityConfig, WriteMode (..) )
+import Seal.Config.Security (WriteMode (..), clearAccessControlSection)
+import Seal.Config.BootPlan
+  ( BindCoordinates (..), BootPlan (..), bootPlan, bootRefusalMessage, preflight )
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
-import Seal.Security.AccessControl
-  ( ResolvedAccessControl (..), resolveAccessControl )
 import Seal.Security.WebAuthn.Types (AccessMode (..), Credential (..))
 import Seal.Types.Command (AccessControlAction (..))
 
@@ -38,34 +36,39 @@ runAccessControl action = do
 -- credentials (labels and counters — never key material).
 status :: SealPaths -> IO ()
 status paths = do
-  section <- loadSection paths
   gwCfg <- gatewayConfig paths
-  case resolveAccessControl (gcHost gwCfg) (gcPort gwCfg) section of
-    Left err -> do
-      TIO.putStrLn ("Access control: INVALID — " <> err)
-      TIO.putStrLn "  Fix [access_control] in ~/.seal/security.toml, or run `seal access-control reset --yes`."
-    Right resolved -> do
-      TIO.putStrLn ("Access control: " <> describe (racMode resolved))
-      case (racOrigin resolved, racRpId resolved) of
+  inputs <- preflight paths
+  let coords = BindCoordinates (gcHost gwCfg) (gcPort gwCfg)
+      decision = inputs >>= bootPlan coords
+  case decision of
+    Left refusal -> do
+      TIO.putStrLn ("Access control: INVALID — " <> bootRefusalMessage refusal)
+    Right plan -> do
+      TIO.putStrLn ("Access control: " <> describe (bpMode plan))
+      case (bpOrigin plan, bpRpId plan) of
         (Just origin, Just rpId) -> do
           TIO.putStrLn ("  origin: " <> origin)
           TIO.putStrLn ("  rp id:  " <> rpId)
         _ -> TIO.putStrLn "  (no origin resolved — set [access_control] origin for a wildcard bind)"
-      let creds = Map.toList (racCredentials resolved)
+      let creds = Map.toList (bpCreds plan)
       if null creds
         then TIO.putStrLn "  credentials: none enrolled"
         else do
           TIO.putStrLn ("  credentials: " <> T.pack (show (length creds)))
-          mapM_ printCred creds
+          mapM_ (printCred (bpRpId plan)) creds
+      TIO.putStrLn (case bpMintGrant plan of
+        Just _  -> "  enrollment: boot mints a token (run `seal access-control enroll`)"
+        Nothing -> "  enrollment: a usable passkey authorizes a new one")
   where
     describe mode = case mode of
       AccessPasskey      -> "passkey"
       AccessOpen         -> "none (explicitly waived — anyone who can reach the gateway has full control)"
       AccessUnconfigured -> "not configured (the gateway serves only the setup screen)"
 
-    printCred (credIdText, cred) = TIO.putStrLn
+    printCred rpId (credIdText, cred) = TIO.putStrLn
       ("    - " <> credIdText <> "  " <> credLabel cred
         <> "  rp_id=" <> credRpId cred
+        <> "  " <> (if Just (credRpId cred) == rpId then "usable" else "not usable here")
         <> "  sign_count=" <> T.pack (show (credSignCount cred)))
 
 -- | Remove the @[access_control]@ table, returning the gateway to the setup
@@ -86,13 +89,6 @@ reset paths = do
       TIO.putStrLn "  After restarting, open the web UI to enroll a passkey (or waive again)."
 
 -- ---------------------------------------------------------------------------
-
-loadSection :: SealPaths -> IO (Maybe AccessControlFileConfig)
-loadSection paths = do
-  loaded <- loadSecurityConfig (securityFilePath paths)
-  pure $ case loaded of
-    Left _    -> Nothing
-    Right cfg -> scAccessControl cfg
 
 gatewayConfig :: SealPaths -> IO GatewayConfig
 gatewayConfig paths = do

@@ -232,7 +232,6 @@ sectionWith origin mode = AccessControlFileConfig
   { acfcMode        = Just mode
   , acfcOrigin      = origin
   , acfcRpId        = Nothing
-  , acfcCredentials = Map.empty
   }
 
 legacyRaw :: Text
