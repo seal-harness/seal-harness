@@ -989,3 +989,16 @@ body {
   border-radius: var(--radius-md);
   font-size: 0.8rem;
 }
+
+.signout-button {
+  font: inherit;
+  font-size: 0.72rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.signout-button:hover { color: var(--text-primary); border-color: var(--text-faint); }
+.signout-button:disabled { opacity: 0.5; cursor: not-allowed; }

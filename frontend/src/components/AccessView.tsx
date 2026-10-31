@@ -3,11 +3,13 @@ import {
   createPasskey,
   fetchAuthStatus,
   listCredentials,
+  logout,
   removeCredential,
   verifyRegistration,
   type AuthStatus,
   type CredentialInfo,
 } from '../lib/auth'
+import { notifyAuthChanged } from '../lib/unauthorized'
 
 /**
  * The Access view (`/access`): the mode, the enrolled passkeys, and the two
@@ -150,6 +152,22 @@ export function AccessView() {
           <button className="agate-primary" disabled={busy} onClick={() => { void add() }}>
             {busy ? 'Waiting for your passkey…' : 'Add a passkey'}
           </button>
+          {status?.state === 'passkey' && status.authenticated && (
+            <button
+              className="agate-danger"
+              onClick={() => {
+                void (async () => {
+                  await logout()
+                  notifyAuthChanged()
+                  // Closes the already-authorised WebSocket and clears every
+                  // in-memory transcript — see SignOutButton.
+                  window.location.reload()
+                })()
+              }}
+            >
+              Sign out
+            </button>
+          )}
         </div>
       </div>
     </div>

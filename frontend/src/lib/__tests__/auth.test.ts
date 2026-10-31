@@ -7,7 +7,11 @@ import {
   normaliseCode,
   readSetupCodeFromHash,
 } from '../auth'
-import { installUnauthorizedInterceptor, UNAUTHORIZED_EVENT } from '../unauthorized'
+import {
+  AUTH_CHANGED_EVENT,
+  installUnauthorizedInterceptor,
+  notifyAuthChanged,
+} from '../unauthorized'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -62,20 +66,29 @@ describe('auth helpers', () => {
   })
 })
 
-describe('installUnauthorizedInterceptor', () => {
-  it('dispatches seal-unauthorized on a 401 and passes the response through', async () => {
+describe('auth-change notifications', () => {
+  it('dispatches seal-auth-changed on a 401 and passes the response through', async () => {
     const fakeFetch = vi.fn(async () => ({ status: 401, ok: false } as Response))
     vi.stubGlobal('fetch', fakeFetch)
 
     const seen: Event[] = []
     const listener = (e: Event) => seen.push(e)
-    window.addEventListener(UNAUTHORIZED_EVENT, listener)
+    window.addEventListener(AUTH_CHANGED_EVENT, listener)
 
     installUnauthorizedInterceptor()
     const res = await window.fetch('/api/lists')
     expect(res.status).toBe(401)
     expect(seen).toHaveLength(1)
 
-    window.removeEventListener(UNAUTHORIZED_EVENT, listener)
+    window.removeEventListener(AUTH_CHANGED_EVENT, listener)
+  })
+
+  it('lets an explicit sign-out raise the same event', () => {
+    const seen: Event[] = []
+    const listener = (e: Event) => seen.push(e)
+    window.addEventListener(AUTH_CHANGED_EVENT, listener)
+    notifyAuthChanged()
+    expect(seen).toHaveLength(1)
+    window.removeEventListener(AUTH_CHANGED_EVENT, listener)
   })
 })

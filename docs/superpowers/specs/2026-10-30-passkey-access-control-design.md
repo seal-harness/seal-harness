@@ -536,6 +536,12 @@ Explicit states and copy:
 - `challenge_expired` → retry once automatically. Other codes → the server's
   message.
 
+**Sign out** lives in the top bar (`SignOutButton`, rendered only when a
+passkey session is active) and in `/access`. It drops the session server-side,
+clears the cookie (`Max-Age=0`), and reloads the page — the reload is what
+closes the already-authorised WebSocket and clears every in-memory transcript.
+Without it a shared machine could not end a 24-hour session from the UI.
+
 `frontend/src/components/AccessView.tsx` (route `/access`, reachable from a
 lock icon in `TopBar`) lists credentials (label, sign count, created, rpId),
 offers "Add a passkey" (setup code required when the mode is `open`) and
@@ -679,7 +685,8 @@ They are loopback *network* clients, not in-process calls.
 13. CLI: `access-control status` reports mode/origin/labels; `reset --yes`
     removes the table and leaves the rest of `security.toml` intact.
 14. Frontend vitest: setup→enroll, setup→waive, login, insecure-context
-    fallback, origin-mismatch, `rp_mismatch` re-enroll, 401 → login.
+    fallback, origin-mismatch, `rp_mismatch` re-enroll, 401 → login, and
+    sign-out (logout called, cookie cleared, page reloaded).
 15. `ApiTestHarness`/e2e default to `mode = "none"`; `make check` (now
     build + test + lint + `frontend-test`) green.
 16. `README.md`, `CHANGELOG.md` (with the upgrade note) and a commented

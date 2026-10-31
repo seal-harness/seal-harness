@@ -221,7 +221,24 @@ spec = describe "Seal.Gateway.AccessControl" $ do
               (getReqWith ["api", "sessions"] [("Cookie", "seal_session=" <> c)])
             stAuth `shouldBe` status200'
 
-        -- 6. Replaying the same assertion is refused (counter consumed).
+        -- 6. Signing out clears the cookie and ends the session.
+        case mCookie of
+          Nothing -> expectationFailure "no session cookie"
+          Just c -> do
+            (stOut, outHeaders, _) <- runApp (gated na)
+              (postReqWith ["api", "auth", "logout"] [("Cookie", "seal_session=" <> c)])
+            stOut `shouldBe` status200'
+            let mSet = lookup hSetCookie outHeaders
+            mSet `shouldSatisfy` isJustText
+            case mSet of
+              Just raw -> TE.decodeUtf8 raw `shouldSatisfy` T.isInfixOf "Max-Age=0"
+              Nothing  -> pure ()
+            (stAfterOut, _, bodyAfterOut) <- runApp (gated na)
+              (getReqWith ["api", "sessions"] [("Cookie", "seal_session=" <> c)])
+            stAfterOut `shouldBe` status401'
+            jsonField bodyAfterOut "code" `shouldBe` Just (String "unauthenticated")
+
+        -- 7. Replaying the same assertion is refused (counter consumed).
         replayReq <- postJson ["api", "auth", "login", "verify"] body
         (stReplay, _, replayBody) <- runApp (gated na) replayReq
         stReplay `shouldBe` status400'
@@ -285,6 +302,10 @@ jsonField raw k = case A.decode raw of
   Just (Object o) -> KeyMap.lookup (Key.fromText k) o
   _               -> Nothing
 
+isJustText :: Maybe BS.ByteString -> Bool
+isJustText (Just _) = True
+isJustText Nothing  = False
+
 isNonEmptyString :: Maybe Text -> Bool
 isNonEmptyString (Just t) = not (T.null t)
 isNonEmptyString Nothing  = False
@@ -316,7 +337,10 @@ getReqWith segs hs = setRequestBodyChunks (pure BS.empty) defaultRequest
   }
 
 postReq :: [Text] -> [(Text, Text)] -> Request
-postReq segs hs = (getReqWith segs hs) { requestMethod = methodPost }
+postReq = postReqWith
+
+postReqWith :: [Text] -> [(Text, Text)] -> Request
+postReqWith segs hs = (getReqWith segs hs) { requestMethod = methodPost }
 
 -- | A one-shot request body: the chunk source yields the payload, then an empty
 -- chunk, exactly as a real WAI server does.

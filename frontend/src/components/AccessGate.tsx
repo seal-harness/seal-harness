@@ -14,6 +14,7 @@ import {
   type AccessState,
   type AuthStatus,
 } from '../lib/auth'
+import { AUTH_CHANGED_EVENT } from '../lib/unauthorized'
 
 /**
  * The gate that stands in front of the whole app.
@@ -27,7 +28,8 @@ import {
  * |                | banner                                              |
  * | `passkey`      | the login screen, or the app once authenticated     |
  *
- * A 401 from anywhere in the app dispatches `seal-unauthorized`; the gate then
+ * A 401 from anywhere in the app — and an explicit sign-out — dispatches
+ * `seal-auth-changed`; the gate then
  * re-fetches the status and re-applies the table above rather than assuming
  * "login" (after a `reset --yes` + restart the state is `unconfigured`, and no
  * further 401 will fire).
@@ -62,9 +64,9 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   }, [refresh])
 
   useEffect(() => {
-    const onUnauthorized = () => { void refresh() }
-    window.addEventListener('seal-unauthorized', onUnauthorized)
-    return () => window.removeEventListener('seal-unauthorized', onUnauthorized)
+    const onAuthChanged = () => { void refresh() }
+    window.addEventListener(AUTH_CHANGED_EVENT, onAuthChanged)
+    return () => window.removeEventListener(AUTH_CHANGED_EVENT, onAuthChanged)
   }, [refresh])
 
   const runCeremony = useCallback(

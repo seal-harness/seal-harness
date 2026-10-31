@@ -208,7 +208,7 @@ describe('AccessGate', () => {
     expect(screen.getByText(/registered for a different address/)).toBeInTheDocument()
   })
 
-  it('re-fetches the status and re-applies the render table on seal-unauthorized', async () => {
+  it('re-fetches the status and re-applies the render table when the session changes', async () => {
     status = { ...status, state: 'passkey', authenticated: true, credentials: 1 }
     renderGate()
     await screen.findByText('THE APP')
@@ -224,7 +224,7 @@ describe('AccessGate', () => {
       credentials: 0,
     }
     const before = statusCalls
-    window.dispatchEvent(new Event('seal-unauthorized'))
+    window.dispatchEvent(new Event('seal-auth-changed'))
     expect(await screen.findByText('Set up access control')).toBeInTheDocument()
     expect(statusCalls).toBeGreaterThan(before)
   })

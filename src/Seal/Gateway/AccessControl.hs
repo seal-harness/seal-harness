@@ -400,6 +400,15 @@ sessionCookie h token = do
       <> "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" <> T.pack (show sessionIdleSeconds)
       <> (if secure then "; Secure" else "")))
 
+-- | The @Set-Cookie@ that deletes the session cookie.
+clearedSessionCookie :: AccessControlHandle -> IO Header
+clearedSessionCookie h = do
+  st <- withMVar (achState h) pure
+  let secure = maybe False ("https://" `T.isPrefixOf`) (acsOrigin st)
+  pure ("Set-Cookie", TE.encodeUtf8
+    (cookieName <> "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+      <> (if secure then "; Secure" else "")))
+
 -- ---------------------------------------------------------------------------
 -- Challenge lifecycle
 -- ---------------------------------------------------------------------------
@@ -520,7 +529,11 @@ authApp h req respond =
 
     (m, ["api", "auth", "logout"]) | m == methodPost -> do
       logout h req
-      respond (authOk [] (object ["ok" .= True]))
+      -- Clearing the cookie (not just forgetting the session) matters: the
+      -- cookie is persistent (24 h idle), so a browser would otherwise keep
+      -- presenting a token the server ignores for the rest of the day.
+      cleared <- clearedSessionCookie h
+      respond (authOk [cleared] (object ["ok" .= True]))
 
     (m, ["api", "auth", "credentials"]) | m == methodGet -> do
       result <- withSessionAuthorization h req (listCredentials h)
