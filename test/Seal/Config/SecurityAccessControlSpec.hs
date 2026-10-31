@@ -70,6 +70,33 @@ spec = describe "Seal.Config.Security access_control" $ do
             Map.keys creds `shouldBe` [credIdText]
             fmap cfcLabel (Map.lookup credIdText creds) `shouldBe` Just "laptop"
 
+    it "decodes the dotted-key spelling of the credentials table" $
+      -- The second spelling of the same document: dotted keys under
+      -- [access_control]. tomland keeps each as ONE flat pair keyed by the
+      -- whole path, so it creates no `credentials` node at all and the codec
+      -- sees an empty map. Without expandDottedKeys this loads as "no passkeys
+      -- enrolled" — and migrate-credentials, which reads through this path,
+      -- would then move nothing and report success.
+      withSystemTempDirectory "seal-ac" $ \dir -> do
+        let path = dir </> "security.toml"
+            dotted field = "credentials." <> credIdText <> "." <> field
+            raw = T.unlines
+              [ "[access_control]"
+              , dotted "public_key" <> " = \"" <> key64 <> "\""
+              , dotted "sign_count" <> " = 0"
+              , dotted "label" <> " = \"laptop\""
+              , dotted "created_at" <> " = \"2026-10-30T14:00:00Z\""
+              , dotted "rp_id" <> " = \"localhost\""
+              ]
+        writeFile path (T.unpack raw)
+        loaded <- loadSecurityConfig path
+        case loaded of
+          Left e -> expectationFailure ("load: " <> T.unpack e)
+          Right cfg -> do
+            let creds = maybe Map.empty acfcCredentials (scAccessControl cfg)
+            Map.keys creds `shouldBe` [credIdText]
+            fmap cfcLabel (Map.lookup credIdText creds) `shouldBe` Just "laptop"
+
     it "round-trips the default config through the file" $
       withSystemTempDirectory "seal-ac" $ \dir -> do
         let path = dir </> "security.toml"

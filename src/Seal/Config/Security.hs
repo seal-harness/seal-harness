@@ -178,7 +178,13 @@ credentialCodec = CredentialFileConfig
   <*> Toml.text "rp_id" .= cfcRpId
   <*> Toml.dioptional (Toml.text "added_via") .= cfcAddedVia
 
--- | Every key path in a parsed document, as a list of pieces.
+-- | Every /value-bearing/ key path in a parsed document, as a list of pieces.
+--
+-- Table nodes are deliberately not emitted on their own. A table is a prefix
+-- of the paths underneath it, and whether it appears as a node or as a prefix
+-- depends only on spelling — a header or a dotted key. Emitting both would
+-- make "the document's data" mean two different things, and a rewrite that
+-- normalises a dotted key into a header would look like damage.
 --
 -- The three shapes tomland produces all have to be walked, or a path
 -- comparison silently misses one of them:
@@ -206,12 +212,73 @@ tomlKeyPaths = go []
     -- map key, so the map key alone loses path segments.
     nodePaths tree = case tree of
       Toml.Branch pref mValue children ->
-           [keyPieces pref]
-        <> maybe [] (go (keyPieces pref)) mValue
+           maybe [] (go (keyPieces pref)) mValue
         <> concatMap nodePaths (HashMap.elems children)
-      Toml.Leaf pref value -> [keyPieces pref] <> go (keyPieces pref) value
+      Toml.Leaf pref value -> go (keyPieces pref) value
 
-    keyPieces = NonEmpty.toList . Toml.unKey
+keyPieces :: Toml.Key -> [Toml.Piece]
+keyPieces = NonEmpty.toList . Toml.unKey
+
+-- | Expand dotted keys into nested tables.
+--
+-- tomland keeps a dotted key as one flat pair whose key carries the whole
+-- path: @untrusted_execution.mode = \"local\"@ becomes
+-- @(\"untrusted_execution\" :| [\"mode\"], …)@ in 'Toml.tomlPairs', and no
+-- @untrusted_execution@ node exists anywhere in the prefix tree. A codec looks
+-- up tables, so it finds nothing, decodes the section as absent — and the next
+-- write drops it. Silently: the document still parses, so nothing reports it.
+--
+-- Expanding first makes the document look the way the codec expects, so both
+-- spellings decode and re-encode identically. (tomland's own
+-- 'Toml.Type.TOML.insertKeyAnyVal' does not help: it stores the value at the
+-- full multi-piece key, which is exactly where it already was. The nesting has
+-- to be built.)
+expandDottedKeys :: Toml.TOML -> Toml.TOML
+expandDottedKeys toml = foldl' insert base dottedPaths
+  where
+    pairs       = HashMap.toList (Toml.tomlPairs toml)
+    dottedPaths = [(keyPieces key, value) | (key, value) <- pairs, isDotted key]
+    base = toml
+      { Toml.tomlPairs  = HashMap.fromList
+          [(key, value) | (key, value) <- pairs, not (isDotted key)]
+      , Toml.tomlTables = fmap expandNode (Toml.tomlTables toml)
+      }
+    insert acc (pieces, value) = insertDotted pieces value acc
+    isDotted key = case keyPieces key of
+      _ : _ : _ -> True
+      _         -> False
+
+    expandNode node = case node of
+      Toml.Branch pref mValue children ->
+        Toml.Branch pref (fmap expandDottedKeys mValue) (fmap expandNode children)
+      Toml.Leaf pref value -> Toml.Leaf pref (expandDottedKeys value)
+
+    -- Insert the value at the dotted path, creating the intermediate tables as
+    -- explicit 'Toml.Leaf' nodes — the form 'Toml.table' and 'Toml.tableMap'
+    -- look up. The payload type is tomland's GADT-indexed 'Toml.Value', so it
+    -- is inferred rather than named.
+    insertDotted [] _ target = target
+    insertDotted (piece : rest) value target = case rest of
+      [] -> target { Toml.tomlPairs = HashMap.insert (piece Toml.:|| []) value
+                                            (Toml.tomlPairs target) }
+      _  -> target
+        { Toml.tomlTables = HashMap.insert piece
+            (Toml.Leaf (piece Toml.:|| []) (insertDotted rest value (nodeValue existing)))
+            (Toml.tomlTables target) }
+      where
+        existing = HashMap.lookupDefault (Toml.Leaf (piece Toml.:|| []) mempty) piece
+                     (Toml.tomlTables target)
+
+    -- A node's own payload with any child nodes folded into it: the canonical
+    -- explicit form, and the one 'fixNode' produces.
+    nodeValue node = case node of
+      Toml.Leaf _ value -> value
+      Toml.Branch _ mValue children ->
+        maybe mempty (\value -> value { Toml.tomlTables = children }) mValue
+
+-- | Everything 'loadSecurityConfig' does to a parsed document before decoding.
+normalizeSecurityToml :: Toml.TOML -> Toml.TOML
+normalizeSecurityToml = normalizeAccessControlTable . expandDottedKeys
 
 -- | Does this raw @security.toml@ still carry the pre-split credential tables?
 --
@@ -343,7 +410,7 @@ loadSecurityConfig path = do
       pure $ case Toml.parse contents of
         Left err   -> Left (Toml.unTomlParseError err)
         Right toml -> case Toml.runTomlCodec securityConfigCodec
-                           (normalizeAccessControlTable toml) of
+                           (normalizeSecurityToml toml) of
           Success cfg  -> Right cfg
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
