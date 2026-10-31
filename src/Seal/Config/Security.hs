@@ -38,6 +38,7 @@ module Seal.Config.Security
   , defaultSecurityConfig
   , securityConfigCodec
   , loadSecurityConfig
+  , decodeSecurityConfig
   , saveSecurityConfig
   , updateSecurityConfig
   , untrustedExecConfigFromSecurity
@@ -46,6 +47,7 @@ module Seal.Config.Security
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (bracketOnError)
 import Data.HashMap.Strict qualified as HashMap
+import Data.Functor ((<&>))
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
@@ -395,8 +397,6 @@ untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
 -- ---------------------------------------------------------------------------
 
 -- | Load the security config file at @path@.
-
--- | Load the security config file at @path@.
 --
 -- * File absent  → @Right 'defaultSecurityConfig'@
 -- * Parse error  → @Left@ with the rendered tomland diagnostics
@@ -405,14 +405,21 @@ loadSecurityConfig path = do
   exists <- doesFileExist path
   if not exists
     then pure (Right defaultSecurityConfig)
-    else do
-      contents <- TIO.readFile path
-      pure $ case Toml.parse contents of
-        Left err   -> Left (Toml.unTomlParseError err)
-        Right toml -> case Toml.runTomlCodec securityConfigCodec
-                           (normalizeSecurityToml toml) of
-          Success cfg  -> Right cfg
-          Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
+    else TIO.readFile path <&> decodeSecurityConfig
+
+-- | Decode @security.toml@ from its text.
+--
+-- The I/O-free half of 'loadSecurityConfig', exported because the boot
+-- preflight needs the document as text (for the legacy-layout check) /and/ the
+-- decoded section at the same time, and reading the file twice could see two
+-- different documents.
+decodeSecurityConfig :: Text -> Either Text SecurityConfig
+decodeSecurityConfig contents = case Toml.parse contents of
+  Left err   -> Left (Toml.unTomlParseError err)
+  Right toml -> case Toml.runTomlCodec securityConfigCodec
+                     (normalizeSecurityToml toml) of
+    Success cfg  -> Right cfg
+    Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
 -- | Whether a write is allowed to discard the pre-split credential tables.
 --

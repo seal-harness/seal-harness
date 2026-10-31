@@ -34,6 +34,7 @@ module Seal.Config.Credentials
   , saveCredentials
   , createCredentialsFile
   , updateCredentialsFile
+  , credentialsVersion
   ) where
 
 import Control.Concurrent.MVar (withMVar)

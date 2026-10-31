@@ -175,6 +175,7 @@ library
         Seal.Command.Registry
         Seal.Command.Spec
         Seal.Command.Channel
+        Seal.Config.BootPlan
         Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
@@ -199,6 +200,7 @@ library
          Seal.Telegram.Config
          Seal.Security.Command
          Seal.Security.Crypto
+         Seal.Security.EnrollmentGrant
          Seal.Security.Path
         Seal.Security.AccessControl
          Seal.Security.Policy
@@ -528,6 +530,7 @@ test-suite tests
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
         Seal.Command.NewSpec
+        Seal.Config.BootPlanSpec
         Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec

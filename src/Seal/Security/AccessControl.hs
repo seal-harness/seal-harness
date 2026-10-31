@@ -14,6 +14,7 @@
 module Seal.Security.AccessControl
   ( ResolvedAccessControl (..)
   , resolveAccessControl
+  , resolveCoordinates
   , canonicalOriginFor
   , BootDecision (..)
   , bootDecision
@@ -100,6 +101,24 @@ resolveAccessControl bindHost bindPort mSection = case mSection of
 
 -- | Origin precedence: an explicit @origin@ wins; otherwise it is derived from
 -- the bind address.
+-- | Resolve @origin@ and @rp_id@ for an already-decided mode.
+--
+-- Split out of 'resolveAccessControl' so the boot plan can resolve the pair
+-- without also deciding the mode and decoding credentials: those two now live
+-- in 'Seal.Config.BootPlan.bootPlan', and having a second copy here is how the
+-- two would drift apart.
+resolveCoordinates
+  :: Text                       -- ^ bind host
+  -> Int                        -- ^ bind port
+  -> Maybe AccessControlFileConfig
+  -> AccessMode
+  -> Either Text (Maybe Text, Maybe Text)
+resolveCoordinates bindHost bindPort mSection mode = do
+  origin <- resolveOrigin bindHost bindPort (isWildcardHost bindHost)
+                          (mSection >>= acfcOrigin) mode
+  rpId <- resolveRpId origin (mSection >>= acfcRpId)
+  pure (origin, rpId)
+
 resolveOrigin
   :: Text -> Int -> Bool -> Maybe Text -> AccessMode -> Either Text (Maybe Text)
 resolveOrigin bindHost bindPort wildcard mOrigin mode = case mOrigin of
