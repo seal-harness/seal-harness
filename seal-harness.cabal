@@ -542,6 +542,7 @@ test-suite tests
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
+        Seal.Security.EnrollmentGrantSpec
         Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
        Seal.Security.WebAuthnSpec

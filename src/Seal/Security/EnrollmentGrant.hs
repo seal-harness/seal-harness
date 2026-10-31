@@ -15,9 +15,35 @@ module Seal.Security.EnrollmentGrant
   ( GrantSource (..)
   , grantSourceText
   , parseGrantSource
+  , GrantPhase (..)
+  , GrantId (..)
+  , ChallengeId (..)
+  , Grant (..)
+  , EnrollmentAuthority
+  , GrantDenied (..)
+  , findAuthority
+  , grantToJson
+  , grantFromJson
+  , grantBody
+  , grantBodyText
+  , tokenDigest
   ) where
 
+import Data.Aeson (Value, encode, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson.Types (Parser, parseMaybe)
+import Data.ByteString (ByteString)
+import Data.Maybe (isJust)
 import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Time (UTCTime)
+import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as LBS
+import Data.ByteString.Base64.URL qualified as B64Url
+
+import Seal.Security.Crypto (constantTimeEq, sha256Hash)
 
 -- | How a grant was minted — and, for an enrolled credential, how it was added
 -- (@added_via@ plus @legacy@, which no grant can produce).
@@ -55,3 +81,179 @@ parseGrantSource raw = case raw of
   "cli_window" -> Just CliWindow
   "assertion"  -> Just Assertion
   _            -> Nothing
+
+-- | Where a grant is in its lifecycle (design §7.3).
+--
+-- @Minted@ may be bound to exactly one challenge; @GrantBound@ records which,
+-- so a grant bound to challenge A cannot redeem B.
+data GrantPhase
+  = GrantMinted
+  | GrantBound !ChallengeId
+  deriving stock (Eq, Show)
+
+newtype GrantId = GrantId Text
+  deriving stock (Eq, Show)
+
+-- | The challenge text (the map key the gateway issues under), so the phase
+-- compares directly with what a verify request presents.
+newtype ChallengeId = ChallengeId Text
+  deriving stock (Eq, Show)
+
+-- | An outstanding enrollment grant.
+--
+-- @grTokenSha@ is the SHA-256 of the token the client will present — never the
+-- token itself, so a copy of the state directory does not hand over enrollment
+-- authority. It is 'Nothing' only for 'CliWindow', which presents no secret at
+-- all and is confined to a loopback-bound, credential-free bootstrap.
+data Grant = Grant
+  { grId        :: !GrantId
+  , grExpiresAt :: !UTCTime
+  , grSource    :: !GrantSource
+  , grPhase     :: !GrantPhase
+  , grTokenSha  :: !(Maybe ByteString)
+  } deriving stock (Eq, Show)
+
+-- | The authority a request proved it holds. Same vocabulary as
+-- 'GrantSource' by design: the resolver decides /whether/ a source is
+-- acceptable for this boot, not a second enum.
+type EnrollmentAuthority = GrantSource
+
+-- | Why enrollment authority was refused. The constructors select the HTTP
+-- status, the wire code and the UI branch, which is why this is an ADT and not
+-- @Either Text@.
+data GrantDenied
+  = GrantRequired
+    -- ^ No authority was presented and none may be inherited.
+  | StepUpRequired
+    -- ^ A session exists but presented no token: prove the device, then retry.
+  | GrantInvalid
+    -- ^ A token was presented and does not match a live grant.
+  deriving stock (Eq, Show)
+
+-- | Resolve the authority a request holds (design §7.2).
+--
+-- Order: a presented token is matched against the file grant's digest, then the
+-- session grant's digest — the latter only if the requesting session is the one
+-- the grant was minted for.
+--
+-- __The load-bearing rule__ (gate round 4, B-1): /authority is presented, not
+-- inherited/. An absent token is acceptable only for 'CliWindow', which by
+-- construction carries no secret. Rev 4 let 'Nothing' fall through to a
+-- session-held grant, so a stolen cookie could redeem the victim's live
+-- assertion grant merely by omitting the header. There is now no path from a
+-- cookie alone to enrollment authority.
+--
+-- This is a pure read: a mismatch never rebinds, consumes or extends anything,
+-- so a stale token cannot shadow a live grant and cannot be used to probe the
+-- grant's state.
+findAuthority
+  :: Maybe Text        -- ^ presented token (@X-Seal-Enroll-Token@)
+  -> Maybe Grant       -- ^ the file-backed grant
+  -> Maybe Grant       -- ^ the grant carried by the requesting session
+  -> Bool              -- ^ does the requesting session match that session grant?
+  -> Either GrantDenied Grant
+findAuthority presented fileGrant sessionGrant sessionMatches =
+  case presented of
+    -- A token was presented, so it must resolve. Nothing is inherited.
+    Just raw ->
+      case matchesToken raw fileGrant of
+        Just grant -> Right grant
+        -- The same token is tried against the session grant, and only when the
+        -- requesting session is the one it was minted for. A token that matches
+        -- neither is GrantInvalid: it must not inherit the session grant, which
+        -- would make a wrong token as good as an absent one.
+        Nothing -> case matchesToken raw (if sessionMatches then sessionGrant else Nothing) of
+          Just grant -> Right grant
+          Nothing    -> Left GrantInvalid
+    Nothing -> case fileGrant of
+      Just grant@Grant { grSource = CliWindow } -> Right grant
+      _ -> Left (if sessionMatches && isJust sessionGrant
+                   then StepUpRequired
+                   else GrantRequired)
+  where
+    matchesToken raw mGrant = mGrant >>= \grant ->
+      case grTokenSha grant of
+        Just digest | not (BS.null digest)
+                    , constantTimeEq digest (tokenDigest raw) -> Just grant
+        _ -> Nothing
+
+-- | SHA-256 of a token, as stored. The token itself is never persisted.
+tokenDigest :: Text -> ByteString
+tokenDigest = sha256Hash . TE.encodeUtf8
+
+--------------------------------------------------------------------------------
+-- JSON
+--------------------------------------------------------------------------------
+
+grantToJson :: Grant -> Value
+grantToJson grant = object
+  [ "grant_id" .= grantIdText (grId grant)
+  , "minted_via" .= grantSourceText (grSource grant)
+  , "expires_at" .= isoTime (grExpiresAt grant)
+  , "bound_challenge" .= boundChallenge
+  , "token_sha256" .= fmap base64Text (grTokenSha grant)
+  ]
+  where
+    boundChallenge = case grPhase grant of
+      GrantBound cid -> Just (challengeIdText cid)
+      GrantMinted    -> Nothing
+
+-- | Decode a stored grant.
+--
+-- Deliberately total in the permissive direction: an unreadable field is
+-- treated as /absent/, never as a boot refusal. Absent is never more
+-- permissive than present (design §7.3) — the caller deletes a grant it cannot
+-- read, and a missing grant is just "no authority".
+grantFromJson :: Value -> Maybe Grant
+grantFromJson = parseMaybe parseGrant
+
+parseGrant :: Value -> Parser Grant
+parseGrant = withObject "Grant" $ \o -> do
+  ident <- GrantId <$> o .: "grant_id"
+  source <- o .: "minted_via" >>= requireSource
+  expires <- o .: "expires_at" >>= requireTime
+  phase <- maybe GrantMinted (GrantBound . ChallengeId) <$> o .:? "bound_challenge"
+  digest <- (o .:? "token_sha256") >>= traverse requireDigest
+  -- CliWindow carries no secret; every other source must.
+  case (source, digest) of
+    (CliWindow, _)     -> pure (Grant ident expires source phase Nothing)
+    (_, Just d)        -> pure (Grant ident expires source phase (Just d))
+    (_, Nothing)       -> fail "a token-backed grant must carry token_sha256"
+  where
+    requireSource raw = case parseGrantSource raw of
+      Just source -> pure source
+      Nothing     -> fail ("unknown minted_via: " <> T.unpack raw)
+    requireTime raw = case parseIsoTimeMaybe raw of
+      Just t  -> pure t
+      Nothing -> fail ("unparseable expires_at: " <> T.unpack raw)
+    -- The digest is stored base64url, because JSON has no byte string.
+    requireDigest raw = case B64Url.decodeUnpadded (TE.encodeUtf8 raw) of
+      Left e   -> fail ("token_sha256 is not base64url: " <> e)
+      Right bs -> pure bs
+
+-- | The grant as one line of JSON, for the state file.
+grantBody :: Grant -> LBS.ByteString
+grantBody = encode . grantToJson
+
+grantBodyText :: Grant -> Text
+grantBodyText = TE.decodeUtf8 . LBS.toStrict . grantBody
+
+--------------------------------------------------------------------------------
+-- Rendering helpers
+--------------------------------------------------------------------------------
+
+grantIdText :: GrantId -> Text
+grantIdText (GrantId raw) = raw
+
+challengeIdText :: ChallengeId -> Text
+challengeIdText (ChallengeId raw) = raw
+
+base64Text :: ByteString -> Text
+base64Text = TE.decodeUtf8 . B64Url.encodeUnpadded
+
+isoTime :: UTCTime -> Text
+isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+parseIsoTimeMaybe :: Text -> Maybe UTCTime
+parseIsoTimeMaybe raw =
+  parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw)
