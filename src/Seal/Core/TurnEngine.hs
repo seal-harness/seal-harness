@@ -350,7 +350,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
       , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault       = Just rt
+      , wscVault       = Just (vaultAccess rt mAllowedSecrets)
       , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
       }
     webFetchCfg = WebFetchConfig
@@ -1413,7 +1413,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
         , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
         , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
-        , wscVault = Just (tdVault td)
+        , wscVault = Just childVA
         , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
         }
       -- §3.2 item 3 (design v4): the nested AGENT_START is ALWAYS PRESENT

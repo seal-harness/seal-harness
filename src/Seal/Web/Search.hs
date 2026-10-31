@@ -42,8 +42,7 @@ import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Secret (vaultGetByName)
 import Seal.Providers.Class (ToolResultPart (..))
-import Seal.Vault.Commands (VaultRuntime)
-import Seal.Vault.Access (unrestrictedVaultAccess)
+import Seal.Vault.Access (VaultAccess)
 import Seal.Web.SearXngSetup (ensureSearXng)
 
 -- | Which search backend to use. 'ProviderParallel' is the zero-config
@@ -104,7 +103,7 @@ data WebSearchConfig = WebSearchConfig
   , wscAllowList   :: [Text]           -- ^ allowed domains (empty = all allowed)
   , wscAuthKey     :: Maybe Text       -- ^ vault key reference for API key
   , wscMaxResults  :: Int              -- ^ max results to return (0 = provider default)
-  , wscVault       :: Maybe VaultRuntime  -- ^ vault for resolving API keys
+  , wscVault       :: Maybe VaultAccess  -- ^ gated vault for resolving API keys
   , wscSearXngUrl  :: Maybe Text       -- ^ SearXNG instance URL (Nothing = localhost:8888)
   }
 
@@ -177,8 +176,7 @@ dispatchSearch mgr cfg q = case wscProvider cfg of
 -- never appears in 'orRecorded' — it is injected only into the HTTP request.
 resolveApiKey :: WebSearchConfig -> IO (Maybe Text)
 resolveApiKey cfg = case (wscVault cfg, wscAuthKey cfg) of
-  (Just rt, Just keyName) -> do
-    va <- unrestrictedVaultAccess rt
+  (Just va, Just keyName) -> do
     eVal <- vaultGetByName va keyName
     pure (either (const Nothing) Just eVal)
   _ -> pure Nothing
