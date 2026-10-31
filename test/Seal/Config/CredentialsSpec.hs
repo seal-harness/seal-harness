@@ -19,9 +19,10 @@ import Test.QuickCheck
   ( Arbitrary (..), Gen, chooseInt, elements, ioProperty, listOf, oneof, vectorOf )
 
 import Seal.Config.Credentials
-  ( CredentialsFile (..), createCredentialsFile, loadCredentials, saveCredentials
+  ( CredentialsFile (..), MigrationOutcome (..), createCredentialsFile
+  , loadCredentials, migrateLegacyCredentials, saveCredentials
   , updateCredentialsFile )
-import Seal.Config.Security (CredentialFileConfig (..))
+import Seal.Config.Security (CredentialFileConfig (..), hasLegacyLayout)
 
 spec :: Spec
 spec = describe "Seal.Config.Credentials" $ do
@@ -109,6 +110,49 @@ spec = describe "Seal.Config.Credentials" $ do
         updateCredentialsFile path (Right . Map.insert otherId otherCredential)
           `shouldReturn` Right ()
         loadCredentials path `shouldReturn` Right (Just (CredentialsFile 1 both))
+
+  -- Design §16.10. The migration is the only thing standing between a
+  -- pre-split install and a boot refusal, so it has to move everything and
+  -- then remove the tables — or do neither.
+  describe "migrateLegacyCredentials" $ do
+    mapM_ migratesEveryCredential [(False, "header tables"), (True, "dotted keys")]
+
+    it "is idempotent: a second run has nothing to do" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath (legacySecurityFixture False)
+        migrateLegacyCredentials securityPath storePath False
+          `shouldReturn` Right (Migrated 2)
+        migrateLegacyCredentials securityPath storePath False
+          `shouldReturn` Right NothingToMigrate
+
+    it "never overwrites an existing store, even with --force" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath (legacySecurityFixture False)
+        createCredentialsFile storePath otherCreds `shouldReturn` Right ()
+        original <- BS.readFile storePath
+        -- Without --force: refused, nothing written.
+        migrateLegacyCredentials securityPath storePath False
+          `shouldRefuseWith` "already exists"
+        BS.readFile storePath `shouldReturn` original
+        -- With --force: the tables are dropped, the store is untouched.
+        migrateLegacyCredentials securityPath storePath True
+          `shouldReturn` Right (Migrated 2)
+        BS.readFile storePath `shouldReturn` original
+        raw <- TIO.readFile securityPath
+        hasLegacyLayout raw `shouldBe` False
+
+    it "does nothing when security.toml holds no credential tables" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath "[access_control]\nmode = \"passkey\"\n"
+        migrateLegacyCredentials securityPath storePath False
+          `shouldReturn` Right NothingToMigrate
+        doesFileExist storePath `shouldReturn` False
 
 -- | A credential map with the key shape the real store uses: a base64url
 -- credential id (a valid TOML bare key) mapped to one credential table.
@@ -232,6 +276,69 @@ otherCredential = idiomaticCredential { cfcLabel = "desktop" }
 
 otherCreds :: Map Text CredentialFileConfig
 otherCreds = Map.singleton otherId otherCredential
+
+
+legacyIdA, legacyIdB :: T.Text
+legacyIdA = T.replicate 22 "A"
+legacyIdB = T.replicate 22 "B"
+
+-- | A pre-split security.toml holding two credentials, written in one of the
+-- two spellings a hand-written file uses. Both spellings have to migrate: the
+-- dotted one is what a header-scanning migration would silently drop.
+legacySecurityFixture :: Bool -> T.Text
+legacySecurityFixture dotted = T.unlines $
+  [ "[access_control]"
+  , "mode = \"passkey\""
+  ] <> credentialLines legacyIdA "laptop" 3 <> credentialLines legacyIdB "desktop" 0
+  where
+    credentialLines :: T.Text -> T.Text -> Int -> [T.Text]
+    credentialLines ident label signCount
+      | dotted =
+          [ "credentials." <> ident <> ".public_key = \"" <> T.replicate 86 "A" <> "\""
+          , "credentials." <> ident <> ".sign_count = " <> T.pack (show signCount)
+          , "credentials." <> ident <> ".label = \"" <> label <> "\""
+          , "credentials." <> ident <> ".created_at = \"2026-10-30T14:00:00Z\""
+          , "credentials." <> ident <> ".rp_id = \"localhost\""
+          ]
+      | otherwise =
+          [ ""
+          , "[access_control.credentials." <> ident <> "]"
+          , "public_key = \"" <> T.replicate 86 "A" <> "\""
+          , "sign_count = " <> T.pack (show signCount)
+          , "label = \"" <> label <> "\""
+          , "created_at = \"2026-10-30T14:00:00Z\""
+          , "rp_id = \"localhost\""
+          ]
+
+-- | The named 1.10 behaviour, once per spelling: everything moves, the
+-- credentials are marked @legacy@, and the tables are gone afterwards so the
+-- next boot does not refuse with BrLegacyLayout.
+migratesEveryCredential :: (Bool, String) -> Spec
+migratesEveryCredential (dotted, spelling) =
+  it ("moves every credential, marks it legacy, and removes the table (" <> spelling <> ")") $
+    withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+      let securityPath = dir </> "security.toml"
+          storePath    = dir </> "credentials.toml"
+      TIO.writeFile securityPath (legacySecurityFixture dotted)
+      migrateLegacyCredentials securityPath storePath False
+        `shouldReturn` Right (Migrated 2)
+      loaded <- loadCredentials storePath
+      case loaded of
+        Left err -> expectationFailure ("store: " <> T.unpack err)
+        Right Nothing -> expectationFailure "store was not created"
+        Right (Just file) -> do
+          crdVersion file `shouldBe` 1
+          Map.keys (crdCredentials file) `shouldBe` [legacyIdA, legacyIdB]
+          fmap cfcLabel (Map.lookup legacyIdA (crdCredentials file)) `shouldBe` Just "laptop"
+          fmap cfcSignCount (Map.lookup legacyIdA (crdCredentials file)) `shouldBe` Just 3
+          fmap cfcCreatedAt (Map.lookup legacyIdB (crdCredentials file))
+            `shouldBe` Just "2026-10-30T14:00:00Z"
+          fmap cfcRpId (Map.lookup legacyIdB (crdCredentials file))
+            `shouldBe` Just "localhost"
+          fmap cfcAddedVia (Map.lookup legacyIdA (crdCredentials file))
+            `shouldBe` Just (Just "legacy")
+      raw <- TIO.readFile securityPath
+      hasLegacyLayout raw `shouldBe` False
 
 -- | Assert the action refuses, with a message mentioning @needle@.
 shouldRefuseWith :: Show a => IO (Either Text a) -> Text -> Expectation

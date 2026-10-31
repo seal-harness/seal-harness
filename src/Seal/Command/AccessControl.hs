@@ -15,7 +15,10 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
-import Seal.Config.Paths (SealPaths, configFilePath, getSealPaths, securityFilePath)
+import Seal.Config.Credentials
+  ( MigrationOutcome (..), migrateLegacyCredentials )
+import Seal.Config.Paths
+  ( SealPaths, configFilePath, credentialsFilePath, getSealPaths, securityFilePath )
 import Seal.Config.Security (WriteMode (..), clearAccessControlSection)
 import Seal.Config.BootPlan
   ( BindCoordinates (..), BootPlan (..), bootPlan, bootRefusalMessage, preflight )
@@ -29,8 +32,9 @@ runAccessControl :: AccessControlAction -> IO ()
 runAccessControl action = do
   paths <- getSealPaths
   case action of
-    AcStatus   -> status paths
-    AcReset    -> reset paths
+    AcStatus                 -> status paths
+    AcReset                  -> reset paths
+    AcMigrateCredentials force -> migrate paths force
 
 -- | Print the current mode, the resolved origin/rpId and the enrolled
 -- credentials (labels and counters — never key material).
@@ -70,6 +74,21 @@ status paths = do
         <> "  rp_id=" <> credRpId cred
         <> "  " <> (if Just (credRpId cred) == rpId then "usable" else "not usable here")
         <> "  sign_count=" <> T.pack (show (credSignCount cred)))
+
+-- | Move credentials out of @security.toml@ and into @credentials.toml@.
+migrate :: SealPaths -> Bool -> IO ()
+migrate paths force = do
+  result <- migrateLegacyCredentials (securityFilePath paths)
+                                     (credentialsFilePath paths) force
+  case result of
+    Left err -> TIO.putStrLn ("Could not migrate credentials: " <> err)
+    Right NothingToMigrate ->
+      TIO.putStrLn "Nothing to migrate: security.toml holds no credential tables."
+    Right (Migrated count) -> do
+      TIO.putStrLn ("Moved " <> T.pack (show count) <> " credential(s) to "
+                     <> T.pack (credentialsFilePath paths) <> ".")
+      TIO.putStrLn "  Removed the [access_control.credentials] tables from security.toml."
+      TIO.putStrLn "  Restart `seal serve` to pick up the new store."
 
 -- | Remove the @[access_control]@ table, returning the gateway to the setup
 -- screen.

@@ -29,6 +29,7 @@ module Seal.Config.Security
   , normalizeAccessControlTable
   , fixNode
   , hasLegacyLayout
+  , readLegacyCredentials
   , tomlKeyPaths
   , WriteMode (..)
   , updateAccessControlSection
@@ -50,6 +51,8 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.Functor ((<&>))
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (fromMaybe)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -275,6 +278,39 @@ expandDottedKeys toml = foldl' insert base dottedPaths
 -- | Everything 'loadSecurityConfig' does to a parsed document before decoding.
 normalizeSecurityToml :: Toml.TOML -> Toml.TOML
 normalizeSecurityToml = normalizeAccessControlTable . expandDottedKeys
+
+-- | The pre-split @[access_control]@ shape, read back only by
+-- @migrate-credentials@.
+--
+-- Detection ('hasLegacyLayout') walks key paths because no codec can see the
+-- dotted-key spelling. /Reading/ is different: 'normalizeSecurityToml' expands
+-- dotted keys into nodes first, so by the time this codec runs both spellings
+-- look the same and a codec is the right tool.
+newtype LegacyAccessControlFileConfig = LegacyAccessControlFileConfig
+  { lacfcCredentials :: Map Text CredentialFileConfig
+  } deriving stock (Eq, Show)
+
+legacyAccessControlCodec :: Toml.TomlCodec LegacyAccessControlFileConfig
+legacyAccessControlCodec = LegacyAccessControlFileConfig
+  <$> Toml.tableMap Toml._KeyText (Toml.table credentialCodec) "credentials"
+        .= lacfcCredentials
+
+-- | Read the credential tables that still live in a pre-split @security.toml@.
+--
+-- An absent section is an empty map, not an error: that is the idempotent case.
+-- A document that does not parse is an error, because the caller is about to
+-- rewrite it and must not do so on a guess.
+readLegacyCredentials :: Text -> Either Text (Map Text CredentialFileConfig)
+readLegacyCredentials raw = case Toml.parse raw of
+  Left err -> Left (Toml.unTomlParseError err)
+  Right toml -> case Toml.runTomlCodec legacySectionCodec
+                     (normalizeSecurityToml toml) of
+    Success Nothing          -> Right Map.empty
+    Success (Just section)   -> Right (lacfcCredentials section)
+    Failure errs             -> Left (Toml.prettyTomlDecodeErrors errs)
+
+legacySectionCodec :: Toml.TomlCodec (Maybe LegacyAccessControlFileConfig)
+legacySectionCodec = Toml.dioptional (Toml.table legacyAccessControlCodec "access_control")
 
 -- | Does this raw @security.toml@ still carry the pre-split credential tables?
 --

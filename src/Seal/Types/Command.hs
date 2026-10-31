@@ -28,6 +28,9 @@ data Command
 data AccessControlAction
   = AcStatus
   | AcReset
+  | AcMigrateCredentials !Bool
+    -- ^ @--force@: re-run the table removal even though @credentials.toml@
+    -- exists. Never overwrites the store itself.
   deriving (Eq, Show)
 
 pCommand :: Parser Command
@@ -51,6 +54,23 @@ pAccessControl = CommandAccessControl <$> hsubparser
   <> command "reset"
        (info (AcReset <$ pResetConfirm)
              (progDesc "Remove [access_control] so you can re-enroll (requires --yes)"))
+  <> command "migrate-credentials"
+       (info (AcMigrateCredentials <$> pMigrateForce <* pMigrateConfirm)
+             (progDesc "Move passkeys out of security.toml into credentials.toml (requires --yes)"))
+  )
+
+-- | @--force@ re-runs the table removal. It never overwrites @credentials.toml@.
+pMigrateForce :: Parser Bool
+pMigrateForce = switch
+  ( long "force"
+ <> help "Drop the stale tables even if credentials.toml already exists (the store is never overwritten)"
+  )
+
+-- | @--yes@ is mandatory: a migration rewrites the file the next boot depends on.
+pMigrateConfirm :: Parser ()
+pMigrateConfirm = flag' ()
+  ( long "yes"
+ <> help "Confirm rewriting security.toml"
   )
 
 -- | @--yes@ is mandatory: resetting access control hands the gateway to anyone

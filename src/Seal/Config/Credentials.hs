@@ -34,6 +34,8 @@ module Seal.Config.Credentials
   , saveCredentials
   , createCredentialsFile
   , updateCredentialsFile
+  , MigrationOutcome (..)
+  , migrateLegacyCredentials
   , credentialsVersion
   ) where
 
@@ -60,7 +62,9 @@ import Toml ((.=))
 import Toml qualified
 
 import Seal.Config.Security
-  ( CredentialFileConfig, credentialCodec, fixNode, securityWriteLock )
+  ( CredentialFileConfig (..), WriteMode (DropCredentials), credentialCodec
+  , fixNode, loadSecurityConfig, readLegacyCredentials, saveSecurityConfig
+  , securityWriteLock )
 
 -- | The decoded @credentials.toml@: a format version plus the credential map
 -- keyed by base64url credential id.
@@ -232,3 +236,78 @@ roundTripRefusal :: Text
 roundTripRefusal =
   "refusing to write credentials.toml: the encoded document does not round-trip \
   \the new credential map"
+
+--------------------------------------------------------------------------------
+-- Migration from the pre-split layout
+--------------------------------------------------------------------------------
+
+-- | What a migration did, so the caller can print something true. A no-op is a
+-- success, not an error: re-running the command is how you finish an
+-- interrupted run.
+data MigrationOutcome
+  = NothingToMigrate
+  | Migrated !Int
+    -- ^ How many credentials moved.
+  deriving stock (Eq, Show)
+
+-- | Move the credential tables out of @security.toml@.
+--
+-- Order is deliberate: the store is written first, the tables are removed
+-- second. A crash between the two leaves both copies, which boot refuses with
+-- @BrLegacyLayout@ — loud, and re-running finishes the job. Removing first
+-- would leave nothing anywhere.
+--
+-- @force@ re-runs only the /table removal/. It never overwrites an existing
+-- @credentials.toml@: that file is the only copy of credentials the operator
+-- may still be able to sign in with, and a migration is not allowed to be the
+-- thing that destroys it. If the store already exists, the credentials in
+-- @security.toml@ are stale leftovers and only the tables are dropped.
+migrateLegacyCredentials
+  :: FilePath      -- ^ security.toml
+  -> FilePath      -- ^ credentials.toml
+  -> Bool          -- ^ force: re-run the table removal
+  -> IO (Either Text MigrationOutcome)
+migrateLegacyCredentials securityPath credentialsPath force = do
+  securityExists <- doesFileExist securityPath
+  if not securityExists
+    then pure (Right NothingToMigrate)
+    else do
+      raw <- TIO.readFile securityPath
+      case readLegacyCredentials raw of
+        Left err -> pure (Left ("could not read the pre-split credential tables: " <> err))
+        Right legacy
+          | Map.null legacy -> pure (Right NothingToMigrate)
+          | otherwise -> do
+              storeExists <- doesFileExist credentialsPath
+              if storeExists && not force
+                then pure (Left (storeExistsRefusal credentialsPath))
+                else do
+                  written <-
+                    if storeExists
+                      then pure (Right ())
+                      else createCredentialsFile credentialsPath (Map.map markLegacy legacy)
+                  case written of
+                    Left err -> pure (Left err)
+                    Right () -> dropTables raw >> pure (Right (Migrated (Map.size legacy)))
+  where
+    -- Every credential the old layout produced claims only what is true of it:
+    -- that it predates the grant vocabulary.
+    markLegacy cfg = cfg { cfcAddedVia = Just "legacy" }
+
+    -- Re-encode security.toml from the decoded config. The tables go away
+    -- because the codec does not know them; 'DropCredentials' is the exemption
+    -- that lets this write through the credential-preserving guard, and this is
+    -- one of the two @--yes@-gated callers allowed to use it.
+    dropTables _raw = do
+      loaded <- loadSecurityConfig securityPath
+      case loaded of
+        Left err -> pure (Left err)
+        Right cfg -> do
+          saveSecurityConfig securityPath cfg DropCredentials
+
+storeExistsRefusal :: FilePath -> Text
+storeExistsRefusal path =
+  "refusing to migrate: " <> T.pack path <> " already exists.\n"
+    <> "  It is the only copy of credentials the gateway can sign in with, so it is\n"
+    <> "  never overwritten. Re-run with --force to drop the stale tables in\n"
+    <> "  security.toml and keep the existing store."
