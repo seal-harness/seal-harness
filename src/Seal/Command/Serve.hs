@@ -65,7 +65,8 @@ import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity, writeSecretFile )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Security.WebAuthn.Types (AccessMode (..))
 import Seal.Gateway.AccessControl
   ( NewAccess (..), accessControlCredentialCount, accessControlMode
@@ -127,6 +128,10 @@ runServeMainInner
 runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
+  -- Claim this SEAL_HOME for the life of the process before anything else
+  -- starts listening. The lock is advisory and kernel-held, so a previous
+  -- daemon that crashed does not block this one (design §12).
+  _serveLock <- claimSealHome paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
   -- a crashed/killed seal process so their stale entries don't accumulate
   -- (#88). Live agents are reused (the key is still loaded).
@@ -487,6 +492,19 @@ mkRepoTestSeam rt repoRegH agentRegH paths = do
         Nothing -> pure (Left VaultLocked)
         Just vh -> vhPut vh k v
   }
+
+-- | Take the per-@SEAL_HOME@ daemon lock for the life of this process.
+--
+-- Refuses rather than queueing: two daemons on one @SEAL_HOME@ would fight for
+-- the same port and the same transcript directories, and the second one is
+-- always a mistake. The returned lock is never released explicitly — process
+-- exit is the release.
+claimSealHome :: SealPaths -> IO ServeLock
+claimSealHome paths = do
+  locked <- acquireServeLock (serveLockPath paths)
+  case locked of
+    Left err -> ioError (userError (T.unpack err))
+    Right lock -> pure lock
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.

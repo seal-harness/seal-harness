@@ -26,7 +26,9 @@ import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Config.Credentials
   ( MigrationOutcome (..), migrateLegacyCredentials )
 import Seal.Config.Paths
-  ( SealPaths, configFilePath, credentialsFilePath, getSealPaths, securityFilePath )
+  ( SealPaths, configFilePath, credentialsFilePath, getSealPaths, securityFilePath
+  , serveLockPath )
+import Seal.Security.DaemonLock (daemonHoldsLock)
 import Seal.Config.Security (WriteMode (..), clearAccessControlSection)
 import Seal.Config.BootPlan
   ( BindCoordinates (..), BootPlan (..), bootPlan, bootRefusalMessage, preflight )
@@ -56,6 +58,18 @@ runAccessControlWith paths action = case action of
 -- @seal access-control enroll >token.txt@ and still see what happened.
 refuse :: T.Text -> IO ExitCode
 refuse message = hPutStrLn stderr (T.unpack message) >> pure (ExitFailure 1)
+
+-- | Refuse to touch the store while a daemon owns this @SEAL_HOME@.
+--
+-- The probe is the kernel lock, not a pid file: a daemon that crashed leaves no
+-- false refusal behind (design §12).
+requireDaemonStopped :: SealPaths -> T.Text -> IO (Either T.Text ())
+requireDaemonStopped paths action = do
+  running <- daemonHoldsLock (serveLockPath paths)
+  pure $ if running
+    then Left ("refusing to " <> action <> ": `seal serve` is running for this SEAL_HOME.\n"
+                <> "  Stop it first — it has the credential store and state files open.")
+    else Right ()
 
 -- | Print the current mode, the resolved origin/rpId and the enrolled
 -- credentials (labels and counters — never key material).
@@ -100,6 +114,13 @@ status paths = do
 -- | Move credentials out of @security.toml@ and into @credentials.toml@.
 migrate :: SealPaths -> Bool -> IO ExitCode
 migrate paths force = do
+  stopped <- requireDaemonStopped paths "migrate credentials"
+  case stopped of
+    Left err -> refuse err
+    Right () -> migrateWith paths force
+
+migrateWith :: SealPaths -> Bool -> IO ExitCode
+migrateWith paths force = do
   result <- migrateLegacyCredentials (securityFilePath paths)
                                      (credentialsFilePath paths) force
   case result of
@@ -123,6 +144,13 @@ migrate paths force = do
 -- 'PreserveCredentials' and is refused instead.
 reset :: SealPaths -> IO ExitCode
 reset paths = do
+  stopped <- requireDaemonStopped paths "reset access control"
+  case stopped of
+    Left err -> refuse err
+    Right () -> resetWith paths
+
+resetWith :: SealPaths -> IO ExitCode
+resetWith paths = do
   result <- clearAccessControlSection (securityFilePath paths) DropCredentials
   case result of
     Left err -> refuse ("Could not reset access control: " <> err)

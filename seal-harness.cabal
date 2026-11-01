@@ -200,6 +200,7 @@ library
          Seal.Telegram.Config
          Seal.Security.Command
          Seal.Security.Crypto
+         Seal.Security.DaemonLock
          Seal.Security.EnrollmentGrant
          Seal.Security.Path
         Seal.Security.AccessControl
@@ -544,6 +545,7 @@ test-suite tests
         Seal.IngestSpec
         Seal.Security.CommandSpec
         Seal.Security.EnrollmentGrantSpec
+        Seal.Security.DaemonLockSpec
         Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
        Seal.Security.WebAuthnSpec

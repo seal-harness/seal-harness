@@ -14,6 +14,7 @@ import Seal.Config.Paths
   , resolveSealHome, getSealPaths, ensureSealDirs
   , configFilePath, vaultFilePath, securityFilePath, credentialsFilePath
   , enrollmentGrantPath
+  , serveLockPath
   , reposFilePath, repoCloneStateDir
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionConversationIndexPath, sessionEntriesPath, sessionRequestsPath
@@ -113,6 +114,12 @@ spec = describe "Seal.Config.Paths" $ do
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           enrollmentGrantPath paths `shouldBe` tmp </> "state" </> "enrollment-grant.json"
+
+    it "serveLockPath lives under state/ (per-SEAL_HOME, ephemeral)" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          serveLockPath paths `shouldBe` tmp </> "state" </> "serve.lock"
 
     it "reposFilePath returns config/repos.toml" $
       withSystemTempDirectory "seal-home" $ \tmp ->

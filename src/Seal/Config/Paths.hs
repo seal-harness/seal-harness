@@ -9,6 +9,7 @@ module Seal.Config.Paths
   , credentialsFilePath
   , enrollmentGrantPath
   , enrollmentClaimPath
+  , serveLockPath
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
@@ -154,6 +155,16 @@ enrollmentGrantPath paths = spState paths </> "enrollment-grant.json"
 enrollmentClaimPath :: SealPaths -> T.Text -> FilePath
 enrollmentClaimPath paths grantId =
   spState paths </> ("enrollment-grant.claimed-" <> T.unpack grantId)
+
+-- | Path to the daemon liveness lock: @\<state\>\/serve.lock@.
+--
+-- @seal serve@ holds an advisory write lock on this file for its whole
+-- lifetime, and the commands that must not race a live daemon (@disable@,
+-- @reset@, @migrate-credentials@) probe it. The lock lives in the kernel, so a
+-- crashed daemon releases it: the file's existence says nothing, only a
+-- successful lock acquisition does.
+serveLockPath :: SealPaths -> FilePath
+serveLockPath paths = spState paths </> "serve.lock"
 
 -- | Absolute path to the source-control repo registry TOML file:
 -- @\<config\>\/repos.toml@.
