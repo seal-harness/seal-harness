@@ -14,8 +14,15 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.Text (Text)
+import Data.Bits ((.&.))
 import Data.Time (UTCTime, addUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+
+import System.Posix.Files (fileMode, getFileStatus)
 
 import Test.Hspec
 
@@ -24,8 +31,9 @@ import Seal.Security.WebAuthn.Types (AccessMode (..))
 import Seal.Security.EnrollmentGrant
   ( ChallengeId (..), Grant (..), GrantDenied (..)
   , GrantContext (..), GrantId (..), GrantPhase (..), GrantSource (..)
-  , enrollmentAuthority, findAuthority, grantBody
-  , grantFromJson, grantSourceText, grantToJson, parseGrantSource, tokenDigest )
+  , deleteGrantFile, enrollmentAuthority, findAuthority, grantBody
+  , grantFromJson, grantLiveAt, grantSourceText, grantToJson, loadGrantFile
+  , parseGrantSource, saveGrantFile, tokenDigest )
 
 spec :: Spec
 spec = describe "Seal.Security.EnrollmentGrant" $ do
@@ -146,6 +154,54 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
       , enrollmentAuthority (mkContext mode availability (Just Assertion) True)
           /= Left GrantRequired ]
         `shouldBe` []
+
+
+  describe "grant file store" $ do
+    it "round-trips through a file, mode 0600" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "enrollment-grant.json"
+        saveGrantFile path tokenGrant `shouldReturn` Right ()
+        loadGrantFile path `shouldReturn` Just tokenGrant
+        stat <- getFileStatus path
+        (fileMode stat .&. 0o777) `shouldBe` 0o600
+
+    it "is absent when the file is" $
+      withSystemTempDirectory "seal-grant" $ \dir ->
+        loadGrantFile (dir </> "enrollment-grant.json") `shouldReturn` Nothing
+
+    -- A file the gateway cannot read must never be more permissive than no file
+    -- (design §7.3), so it is treated as absent AND removed.
+    it "treats an unparseable grant as absent and deletes it" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "enrollment-grant.json"
+        writeFile path "{ this is not json"
+        loadGrantFile path `shouldReturn` Nothing
+        doesFileExist path `shouldReturn` False
+
+    it "treats a structurally wrong grant as absent and deletes it" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "enrollment-grant.json"
+        writeFile path "{\"grant_id\":\"g\",\"minted_via\":\"sneaky\",\"expires_at\":\"2026-01-01T00:00:00Z\"}"
+        loadGrantFile path `shouldReturn` Nothing
+        doesFileExist path `shouldReturn` False
+
+    -- Expired is absent to every reader, but the file stays: reaping a polled
+    -- read would make GET /status a writer.
+    it "treats an expired grant as absent but leaves it for the reaper" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "enrollment-grant.json"
+            expired = tokenGrant { grExpiresAt = addUTCTime (-1) fixtureTime }
+        saveGrantFile path expired `shouldReturn` Right ()
+        grantLiveAt fixtureTime expired `shouldBe` False
+        doesFileExist path `shouldReturn` True
+
+    it "can delete a grant, and deleting an absent one is a no-op" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "enrollment-grant.json"
+        saveGrantFile path tokenGrant `shouldReturn` Right ()
+        deleteGrantFile path
+        doesFileExist path `shouldReturn` False
+        deleteGrantFile path
 
 
 --------------------------------------------------------------------------------

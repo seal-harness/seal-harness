@@ -28,10 +28,14 @@ module Seal.Security.EnrollmentGrant
   , grantFromJson
   , grantBody
   , grantBodyText
+  , grantLiveAt
+  , loadGrantFile
+  , saveGrantFile
+  , deleteGrantFile
   , tokenDigest
   ) where
 
-import Data.Aeson (Value, encode, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.ByteString (ByteString)
 import Data.Maybe (isJust)
@@ -40,6 +44,11 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Control.Monad (when)
+import System.Directory (doesFileExist, removeFile, renameFile)
+import System.FilePath (takeBaseName, takeDirectory)
+import System.IO (hClose, openBinaryTempFile)
+import System.Posix.Files (setFileMode)
 
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
@@ -329,3 +338,62 @@ enrollmentAuthority ctx
       -- without granting anything.
       (AccessUnconfigured, Just CliToken) -> Right CliToken
       (AccessUnconfigured, _)             -> Left GrantRequired
+
+--------------------------------------------------------------------------------
+-- Persistence
+--------------------------------------------------------------------------------
+
+-- | Is the grant still within its lifetime?
+--
+-- Expiry is an upper bound, never a quota: a grant that has expired is
+-- indistinguishable from no grant at all, which is why every reader treats it
+-- that way instead of refusing.
+grantLiveAt :: UTCTime -> Grant -> Bool
+grantLiveAt now grant = now < grExpiresAt grant
+
+-- | Read the outstanding grant.
+--
+-- Three states collapse to @Nothing@, deliberately:
+--
+-- * absent — the normal state;
+-- * unparseable — treated as absent /and deleted/, because a file the gateway
+--   cannot read must never be more permissive than no file (design §7.3);
+-- * expired — treated as absent, but left on disk for the reaper. Reaping on a
+--   polled read would turn @GET \/status@ into a writer.
+--
+-- Never cached: the CLI mints grants while the daemon runs, so a cached copy
+-- would be invisible until restart.
+loadGrantFile :: FilePath -> IO (Maybe Grant)
+loadGrantFile path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- LBS.readFile path
+      case eitherDecode raw of
+        Right value -> case grantFromJson value of
+          Just grant -> pure (Just grant)
+          Nothing    -> reap path
+        Left _ -> reap path
+  where
+    reap p = removeFile p >> pure Nothing
+
+-- | Write the grant atomically, mode @0600@.
+--
+-- A unique temp name and an atomic rename are the only cross-process
+-- guarantees available here: the write lock is process-local, and the CLI writes
+-- this file while the daemon reads it.
+saveGrantFile :: FilePath -> Grant -> IO (Either Text ())
+saveGrantFile path grant = do
+  let dir = takeDirectory path
+  (tmp, h) <- openBinaryTempFile dir (takeBaseName path <> ".tmp")
+  LBS.hPut h (grantBody grant)
+  hClose h
+  setFileMode tmp 0o600
+  renameFile tmp path
+  pure (Right ())
+
+deleteGrantFile :: FilePath -> IO ()
+deleteGrantFile path = do
+  exists <- doesFileExist path
+  when exists (removeFile path)

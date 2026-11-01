@@ -7,6 +7,7 @@ module Seal.Config.Paths
   , vaultFilePath
   , securityFilePath
   , credentialsFilePath
+  , enrollmentGrantPath
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
@@ -134,6 +135,15 @@ securityFilePath paths = spHome paths </> "security.toml"
 -- @~\/.seal\/@.
 credentialsFilePath :: SealPaths -> FilePath
 credentialsFilePath paths = spHome paths </> "credentials.toml"
+
+-- | Path to the outstanding enrollment grant: @\<state\>\/enrollment-grant.json@.
+--
+-- Under @state\/@ because it is ephemeral: the grant is authority with a
+-- minutes-scale lifetime, and nothing needs it after it is consumed. Deleting
+-- the whole @state\/@ directory loses at most the current enrollment, which is
+-- what @--cancel@ does on purpose.
+enrollmentGrantPath :: SealPaths -> FilePath
+enrollmentGrantPath paths = spState paths </> "enrollment-grant.json"
 
 -- | Absolute path to the source-control repo registry TOML file:
 -- @\<config\>\/repos.toml@.
