@@ -951,6 +951,7 @@ persistRegistration h authority isAdd result now = do
         , credLabel = "passkey"
         , credCreatedAt = now
         , credRpId = fromMaybeText (acsRpId st)
+        , credAddedVia = Just (grantSourceText authority)
         }
   -- Raise the mode and write the credential as ONE operation (design §6.1):
   -- two files, so neither is atomic alone, and two interleaved ceremonies could
@@ -1251,6 +1252,7 @@ listCredentials h _req = do
              , "created_at" .= credCreatedAt cred
              , "sign_count" .= credSignCount cred
              , "rp_id" .= credRpId cred
+             , "added_via" .= credAddedVia cred
              , "current" .= (Just (credRpId cred) == acsRpId st)
              ]
     | (cid, cred) <- Map.toList (acsCredentials st) ]))

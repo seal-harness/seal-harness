@@ -201,6 +201,7 @@ credentialFromFile (rawId, cfc) = do
     , credLabel = cfcLabel cfc
     , credCreatedAt = createdAt
     , credRpId = cfcRpId cfc
+    , credAddedVia = cfcAddedVia cfc
     })
   where
     bad = "credential \"" <> rawId <> "\": "
@@ -213,7 +214,7 @@ credentialToFile cred = CredentialFileConfig
   , cfcLabel     = credLabel cred
   , cfcCreatedAt = formatIsoTime (credCreatedAt cred)
   , cfcRpId      = credRpId cred
-  , cfcAddedVia  = Nothing
+  , cfcAddedVia  = credAddedVia cred
   }
   where
     unCose (CosePublicKey b) = b

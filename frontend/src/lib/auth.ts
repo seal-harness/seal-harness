@@ -18,6 +18,28 @@ export interface AuthStatus {
   rp_mismatch: boolean
   setup_required: boolean
   credentials: number
+  /** Where enrollment authority would come from right now (design §8.3). A
+   *  timing signal, not a predicate: `none` means "ask the operator to mint a
+   *  token, then check again". */
+  enrollment_via: 'cli_token' | 'cli_window' | 'assertion' | 'none'
+  usable_credentials: number
+  orphaned_credentials: number
+}
+
+/** What `added_via` renders as, per design §13.8. */
+export function addedViaCopy(addedVia: string | null | undefined): string {
+  switch (addedVia) {
+    case 'cli_token':
+      return 'added from the terminal'
+    case 'cli_window':
+      return 'added with an enrollment window'
+    case 'assertion':
+      return 'confirmed with an existing passkey'
+    case 'legacy':
+      return 'migrated'
+    default:
+      return 'added'
+  }
 }
 
 export interface CredentialInfo {
@@ -27,58 +49,66 @@ export interface CredentialInfo {
   sign_count: number
   rp_id: string
   current: boolean
+  /** How it was added (design §13.8): rendered as human copy, never raw. */
+  added_via?: string | null
 }
 
 export type AuthResult<T = unknown> =
   | { ok: true; data: T }
   | { ok: false; code: string; error: string }
 
-const SETUP_CODE_KEY = 'seal.setup-code'
+const ENROLL_TOKEN_KEY = 'seal.enroll-token'
 
 // ── Setup code plumbing ──────────────────────────────────────────────────
 
-/** Read `#setup=<code>` from the URL and strip it, so the code never ends up in
- *  history, a screenshot or a copied link. Falls back to a previously stored
- *  code (a reload before enrolling must not force retyping 32 characters). */
-export function readSetupCodeFromHash(): string | null {
+/** Read `#enroll=<token>` from the URL and strip it, so the token never ends up
+ *  in history, a screenshot or a copied link. Accepts a bare token or a pasted
+ *  full URL (its hash is used). Falls back to a previously stored token: a
+ *  reload before enrolling must not force retyping 32 characters. */
+export function readEnrollTokenFromHash(): string | null {
   if (typeof window === 'undefined') return null
   const hash = window.location.hash
-  const m = hash.match(/^#setup=(.+)$/)
+  const m = hash.match(/^#enroll=(.+)$/)
   if (m) {
-    const code = normaliseCode(decodeURIComponent(m[1] ?? ''))
+    const token = normaliseToken(decodeURIComponent(m[1] ?? ''))
     window.history.replaceState(null, '', window.location.pathname + window.location.search)
-    if (code) {
-      storeSetupCode(code)
-      return code
+    if (token) {
+      storeEnrollToken(token)
+      return token
     }
   }
-  return getStoredSetupCode()
+  return getStoredEnrollToken()
 }
 
-export function normaliseCode(raw: string): string {
-  return raw.trim().replace(/^#?setup=/, '').trim().toLowerCase()
+/** A pasted full URL contributes only its `#enroll=` fragment; a bare token is
+ *  taken as-is. The server's tokens are lowercase hex, so input is lowercased
+ *  and trimmed to the 32-character shape rather than validated as hex here (a
+ *  wrong token must reach the server to be told so). */
+export function normaliseToken(raw: string): string {
+  const fromUrl = raw.includes('#') ? (raw.split('#').pop() ?? '') : raw
+  return fromUrl.trim().replace(/^#?(enroll)?=/, '').trim().toLowerCase()
 }
 
-export function storeSetupCode(code: string): void {
+export function storeEnrollToken(token: string): void {
   try {
-    window.sessionStorage.setItem(SETUP_CODE_KEY, code)
+    window.sessionStorage.setItem(ENROLL_TOKEN_KEY, token)
   } catch {
-    /* sessionStorage can be unavailable (privacy mode); the code still works
+    /* sessionStorage can be unavailable (privacy mode); the token still works
        for this page's lifetime via component state. */
   }
 }
 
-export function getStoredSetupCode(): string | null {
+export function getStoredEnrollToken(): string | null {
   try {
-    return window.sessionStorage.getItem(SETUP_CODE_KEY)
+    return window.sessionStorage.getItem(ENROLL_TOKEN_KEY)
   } catch {
     return null
   }
 }
 
-export function clearSetupCode(): void {
+export function clearEnrollToken(): void {
   try {
-    window.sessionStorage.removeItem(SETUP_CODE_KEY)
+    window.sessionStorage.removeItem(ENROLL_TOKEN_KEY)
   } catch {
     /* ignore */
   }
@@ -100,10 +130,10 @@ export function hasWebAuthn(): boolean {
 
 async function authRequest<T>(
   path: string,
-  init: { method?: string; body?: unknown; setupCode?: string | null } = {},
+  init: { method?: string; body?: unknown; enrollToken?: string | null } = {},
 ): Promise<AuthResult<T>> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (init.setupCode) headers['X-Seal-Setup-Token'] = init.setupCode
+  if (init.enrollToken) headers['X-Seal-Enroll-Token'] = init.enrollToken
   let res: Response
   try {
     res = await fetch(`/api/auth/${path}`, {
@@ -186,10 +216,13 @@ export function ceremonyCode(err: unknown): string {
  * `navigator.credentials.create()` — enroll a passkey.
  * Returns the JSON body for `/api/auth/register/verify`.
  */
-export async function createPasskey(setupCode: string | null): Promise<AuthResult<unknown>> {
+export async function createPasskey(
+  enrollToken: string | null,
+  target: 'bootstrap' | 'add' = 'bootstrap',
+): Promise<AuthResult<unknown>> {
   const options = await authRequest<PublicKeyCredentialCreationOptionsJSON>(
-    'register/options',
-    { setupCode },
+    target === 'add' ? 'credentials/options' : 'register/options',
+    { enrollToken },
   )
   if (!options.ok) return options
 
@@ -294,16 +327,66 @@ function describe(err: unknown): string {
 
 // ── Endpoint convenience wrappers ────────────────────────────────────────
 
-export function verifyRegistration(body: unknown, setupCode: string | null, add = false) {
-  return authRequest(add ? 'credentials/verify' : 'register/verify', { body, setupCode })
+export function verifyRegistration(
+  body: unknown,
+  enrollToken: string | null,
+  add = false,
+) {
+  return authRequest(add ? 'credentials/verify' : 'register/verify', { body, enrollToken })
+}
+
+/** `enroll/options`: prove an existing passkey before adding another (design
+ *  §8.1). Session-gated; offers only usable credentials. */
+export function enrollOptions() {
+  return authRequest<PublicKeyCredentialRequestOptionsJSON>('enroll/options', {})
+}
+
+/** `enroll/verify`: check the step-up assertion, returning the 120 s grant. */
+export function enrollVerify(body: unknown) {
+  return authRequest<{ ok: boolean; grant_token: string; grant_expires_at: string }>(
+    'enroll/verify',
+    { body },
+  )
+}
+
+/** The full step-up: options → assertion → verify → grant token. */
+export async function stepUpPasskey(): Promise<AuthResult<{ grantToken: string }>> {
+  const options = await enrollOptions()
+  if (!options.ok) return options
+  const opts = options.data
+  let cred: Credential | null
+  try {
+    cred = await navigator.credentials.get({
+      publicKey: {
+        challenge: b64urlToBytes(opts.challenge),
+        rpId: opts.rpId,
+        timeout: opts.timeout,
+        userVerification: opts.userVerification,
+        allowCredentials: (opts.allowCredentials ?? []).map((c) => ({
+          type: c.type,
+          id: b64urlToBytes(c.id),
+        })),
+      },
+    })
+  } catch (e) {
+    return { ok: false, code: ceremonyCode(e), error: describe(e) }
+  }
+  if (!(cred instanceof PublicKeyCredential)) {
+    return { ok: false, code: 'ceremony_failed', error: 'no credential was returned' }
+  }
+  const assertion = cred.response as AuthenticatorAssertionResponse
+  const verified = await enrollVerify({
+    clientDataJSON: bytesToB64url(assertion.clientDataJSON),
+    authenticatorData: bytesToB64url(assertion.authenticatorData),
+    signature: bytesToB64url(assertion.signature),
+    rawId: bytesToB64url(cred.rawId),
+  })
+  if (!verified.ok) return verified
+  return { ok: true, data: { grantToken: verified.data.grant_token } }
 }
 
 export function verifyLogin(body: unknown) {
   return authRequest('login/verify', { body })
-}
-
-export function waive(setupCode: string | null) {
-  return authRequest('waive', { setupCode })
 }
 
 export function logout() {

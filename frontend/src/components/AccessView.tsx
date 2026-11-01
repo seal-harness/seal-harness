@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
+  addedViaCopy,
+  clearEnrollToken,
   createPasskey,
   fetchAuthStatus,
   listCredentials,
   logout,
   removeCredential,
+  stepUpPasskey,
   verifyRegistration,
   type AuthStatus,
   type CredentialInfo,
@@ -12,19 +15,25 @@ import {
 import { notifyAuthChanged } from '../lib/unauthorized'
 
 /**
- * The Access view (`/access`): the mode, the enrolled passkeys, and the two
- * actions that change them.
+ * The Access view (`/access`): the mode, the enrolled passkeys, and the actions
+ * that change them.
  *
- * It is reachable from the top bar so a second device never needs a terminal
- * round trip — "add a passkey" from a laptop that is already signed in is the
- * normal way to enroll a phone.
+ * Adding a passkey here is the normal way to enroll a second device: with a
+ * usable credential enrolled the flow proves it first (`enroll/options` →
+ * assertion → 120 s grant), then registers the new key with that grant. With
+ * nothing usable enrolled it falls back to the bootstrap path, which needs a
+ * token from `seal access-control enroll`.
+ *
+ * In `open` mode the gateway administers credentials unauthenticated — that is
+ * what lets this page work at all there — so `listCredentials` and removal
+ * succeed without a session.
  */
 export function AccessView() {
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [creds, setCreds] = useState<CredentialInfo[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [setupCode, setSetupCode] = useState('')
 
   const load = useCallback(async () => {
     const [s, c] = await Promise.all([fetchAuthStatus(), listCredentials()])
@@ -38,38 +47,66 @@ export function AccessView() {
   const add = useCallback(async () => {
     setBusy(true)
     setError(null)
-    const code = setupCode.trim() || null
-    const created = await createPasskey(code)
-    if (!created.ok) {
-      setBusy(false)
-      if (created.code === 'not_allowed') {
-        setError('The passkey prompt was cancelled or timed out.')
+    setNotice(null)
+    const usable = status?.usable_credentials ?? 0
+    const target = usable > 0 ? 'add' : 'bootstrap'
+
+    let token: string | null = null
+    if (usable > 0) {
+      // Two distinct prompts, in order: "confirm it's you" then "create".
+      const step = await stepUpPasskey()
+      if (!step.ok) {
+        setBusy(false)
+        setError(
+          step.code === 'not_allowed'
+            ? 'The confirmation prompt was cancelled or timed out.'
+            : step.error,
+        )
         return
       }
-      setError(created.error)
+      token = step.data.grantToken
+    }
+
+    const created = await createPasskey(token, target)
+    if (!created.ok) {
+      setBusy(false)
+      setError(
+        created.code === 'grant_required'
+          ? 'Adding a passkey needs a token from `seal access-control enroll`.'
+          : created.error,
+      )
       return
     }
-    const verified = await verifyRegistration(created.data, code, true)
+    const verified = await verifyRegistration(created.data, token, target === 'add')
     setBusy(false)
     if (!verified.ok) {
       setError(verified.error)
       return
     }
-    setSetupCode('')
+    clearEnrollToken()
+    setNotice('Passkey added.')
     await load()
-  }, [setupCode, load])
+  }, [status, load])
 
   const remove = useCallback(async (id: string) => {
     setError(null)
+    setNotice(null)
     const res = await removeCredential(id)
     if (!res.ok) {
-      setError(res.error)
+      setError(
+        res.code === 'last_credential'
+          ? 'That is the last passkey that can sign in here; add another first.'
+          : res.error,
+      )
       return
     }
     await load()
   }, [load])
 
-  const needsCode = status !== null && status.state !== 'passkey'
+  // Design §9.4: the last *usable* credential cannot be removed. A credential
+  // for another address is a safe removal even when it is the only one listed.
+  const usable = creds.filter((c) => c.current).length
+  const removeDisabled = (cred: CredentialInfo) => cred.current && usable <= 1
 
   return (
     <div className="agate-wrap">
@@ -97,10 +134,10 @@ export function AccessView() {
           </p>
         )}
 
-        {status?.state === 'unconfigured' && (
+        {status?.enrollment_via === 'none' && (
           <p className="agate-note">
-            No access control has been configured yet. Register a passkey below, or open the
-            setup screen.
+            No enrollment token is armed. Run <code>seal access-control enroll</code> in the
+            terminal where Seal runs, then add the passkey — the grant lasts ten minutes.
           </p>
         )}
 
@@ -111,17 +148,17 @@ export function AccessView() {
               <div>
                 <strong>{c.label}</strong>{' '}
                 <span className="agate-hint">
-                  {c.created_at} · rp_id={c.rp_id} · used {c.sign_count}×
-                  {c.current ? ' · current address' : ' · other address'}
+                  {addedViaCopy(c.added_via)} · rp_id={c.rp_id} · used {c.sign_count}×
+                  {c.current ? ' · current address' : ' · cannot sign you in here; safe to remove'}
                 </span>
               </div>
               <button
                 className="agate-danger"
                 onClick={() => { void remove(c.id) }}
-                disabled={status?.state === 'passkey' && creds.length <= 1}
+                disabled={removeDisabled(c)}
                 title={
-                  status?.state === 'passkey' && creds.length <= 1
-                    ? 'Add another passkey before removing the only one'
+                  removeDisabled(c)
+                    ? 'Add another passkey before removing the last one that can sign in'
                     : 'Remove this passkey'
                 }
               >
@@ -131,22 +168,8 @@ export function AccessView() {
           ))}
         </ul>
 
-        {needsCode && (
-          <label className="agate-field">
-            <span>Setup code</span>
-            <input
-              value={setupCode}
-              onChange={(e) => setSetupCode(e.target.value)}
-              placeholder="printed by `seal serve`"
-            />
-            <small>
-              Required while access control is off: it is what stops a remote client from
-              enrolling its own passkey and taking over.
-            </small>
-          </label>
-        )}
-
         {error && <p className="agate-error">{error}</p>}
+        {notice && <p className="agate-hint">{notice}</p>}
 
         <div className="agate-actions">
           <button className="agate-primary" disabled={busy} onClick={() => { void add() }}>

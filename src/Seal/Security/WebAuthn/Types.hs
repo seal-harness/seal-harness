@@ -72,4 +72,10 @@ data Credential = Credential
     -- ^ The rpId this credential was created for. A credential only validates
     -- against its own rpId, so this is compared with the boot-resolved rpId to
     -- detect an orphaned credential.
+  , credAddedVia  :: Maybe Text
+    -- ^ How the credential was added — the @added_via@ vocabulary
+    -- (@cli_token@, @cli_window@, @assertion@, @legacy@). 'Text' rather than
+    -- 'Seal.Security.EnrollmentGrant.GrantSource' because that module imports
+    -- this one; the spelling is the storage format either way, and the UI
+    -- renders it as human copy.
   } deriving stock (Eq, Show)

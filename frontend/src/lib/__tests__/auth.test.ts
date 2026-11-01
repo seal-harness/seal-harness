@@ -4,8 +4,8 @@ import {
   bytesToB64url,
   ceremonyCode,
   isSecureContextOk,
-  normaliseCode,
-  readSetupCodeFromHash,
+  normaliseToken,
+  readEnrollTokenFromHash,
 } from '../auth'
 import {
   AUTH_CHANGED_EVENT,
@@ -30,23 +30,25 @@ describe('auth helpers', () => {
     expect(Array.from(decoded)).toEqual(Array.from(bytes))
   })
 
-  it('normalises a pasted setup code', () => {
-    expect(normaliseCode('  ABC123 ')).toBe('abc123')
-    expect(normaliseCode('#setup=abc123')).toBe('abc123')
-    expect(normaliseCode('setup=abc123')).toBe('abc123')
+  it('normalises a pasted enrollment token', () => {
+    expect(normaliseToken('  ABC123 ')).toBe('abc123')
+    expect(normaliseToken('#enroll=abc123')).toBe('abc123')
+    expect(normaliseToken('enroll=abc123')).toBe('abc123')
+    // A pasted full URL contributes only its fragment (design §8.2).
+    expect(normaliseToken('http://localhost:8080/#enroll=abc123')).toBe('abc123')
   })
 
-  it('reads the setup code from the fragment and strips it from the URL', () => {
-    window.history.replaceState(null, '', '/#setup=deadbeef')
-    expect(readSetupCodeFromHash()).toBe('deadbeef')
+  it('reads the token from the fragment and strips it from the URL', () => {
+    window.history.replaceState(null, '', '/#enroll=deadbeef')
+    expect(readEnrollTokenFromHash()).toBe('deadbeef')
     expect(window.location.hash).toBe('')
     // It survives a reload via sessionStorage.
-    expect(readSetupCodeFromHash()).toBe('deadbeef')
+    expect(readEnrollTokenFromHash()).toBe('deadbeef')
   })
 
-  it('returns null when there is no code anywhere', () => {
+  it('returns null when there is no token anywhere', () => {
     window.history.replaceState(null, '', '/')
-    expect(readSetupCodeFromHash()).toBeNull()
+    expect(readEnrollTokenFromHash()).toBeNull()
   })
 
   it('maps DOMException names onto the code vocabulary', () => {

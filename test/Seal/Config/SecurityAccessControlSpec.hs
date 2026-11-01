@@ -210,6 +210,7 @@ mkCredential cid rp = Credential
   , credLabel     = "test"
   , credCreatedAt = fixtureTime
   , credRpId      = rp
+  , credAddedVia  = Nothing
   }
 
 fixtureTime :: UTCTime

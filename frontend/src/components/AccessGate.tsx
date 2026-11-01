@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  clearEnrollToken,
   createPasskey,
   fetchAuthStatus,
   getPasskey,
   hasWebAuthn,
   isSecureContextOk,
-  normaliseCode,
-  readSetupCodeFromHash,
-  storeSetupCode,
+  normaliseToken,
+  readEnrollTokenFromHash,
+  stepUpPasskey,
+  storeEnrollToken,
   verifyLogin,
   verifyRegistration,
-  waive,
   type AccessState,
   type AuthStatus,
 } from '../lib/auth'
@@ -19,38 +20,46 @@ import { AUTH_CHANGED_EVENT } from '../lib/unauthorized'
 /**
  * The gate that stands in front of the whole app.
  *
- * Three states, from `/api/auth/status`:
+ * The gate's decision is a function of one status payload (design §13):
  *
- * | state          | renders                                             |
- * |----------------|-----------------------------------------------------|
- * | `unconfigured` | the setup screen (enroll a passkey, or waive)       |
- * | `open`         | the app, with a persistent "access control is off"  |
- * |                | banner                                              |
- * | `passkey`      | the login screen, or the app once authenticated     |
+ * | state          | authenticated | usable | enrollment_via | renders          |
+ * |----------------|---------------|--------|----------------|------------------|
+ * | `passkey`      | yes           | >0     | any            | the app          |
+ * | `open`         | –             | –      | any            | app + off banner |
+ * | `passkey`      | no            | >0     | any            | login + token    |
+ * | `unconfigured` | –             | 0      | `cli_token`    | setup + token    |
+ * | `passkey`      | no            | 0      | `cli_token`    | re-enroll + token|
+ * | either         | –             | –      | `none`         | setup, no field, |
+ * |                |               |        |                | CLI hint + check |
  *
- * A 401 from anywhere in the app — and an explicit sign-out — dispatches
- * `seal-auth-changed`; the gate then
- * re-fetches the status and re-applies the table above rather than assuming
- * "login" (after a `reset --yes` + restart the state is `unconfigured`, and no
- * further 401 will fire).
+ * `enrollment_via: none` means no authority is armed, so a token field would be
+ * a dead end: the operator mints one in the terminal and presses "Check again".
+ *
+ * Two prompts, deliberately distinct: the step-up ("Confirm it's you…") proves
+ * an existing passkey, the create prompt adds a new one. A `step_up_required`
+ * answer while authenticated restarts the whole add ceremony once, with the
+ * returned 120 s grant; while unauthenticated it explains that a device which
+ * already has a passkey must sign in first.
  */
 export function AccessGate({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [loadFailed, setLoadFailed] = useState(false)
-  const [setupCode, setSetupCode] = useState<string | null>(null)
-  const [codeInput, setCodeInput] = useState('')
+  const [enrollToken, setEnrollToken] = useState<string | null>(null)
+  const [tokenInput, setTokenInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [recovery, setRecovery] = useState(false)
+  const steppedUp = useRef(false)
 
   const refresh = useCallback(async () => {
     const res = await fetchAuthStatus()
     if (res.ok) {
       setStatus(res.data)
       setLoadFailed(false)
-      if (res.data.state !== 'unconfigured' && !res.data.rp_mismatch) {
-        // The setup code is spent once setup completes.
-        setSetupCode(null)
+      if (res.data.state === 'passkey' && res.data.usable_credentials > 0) {
+        // The token is spent once a usable credential exists.
+        setEnrollToken(null)
+        clearEnrollToken()
       }
     } else {
       setLoadFailed(true)
@@ -58,16 +67,25 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   }, [])
 
   useEffect(() => {
-    const fromHash = readSetupCodeFromHash()
-    setSetupCode(fromHash)
+    setEnrollToken(readEnrollTokenFromHash())
     void refresh()
   }, [refresh])
 
   useEffect(() => {
     const onAuthChanged = () => { void refresh() }
+    // "Check again" without a button press: coming back to the window after
+    // minting a token in the terminal re-reads the status (design §13.4).
+    const onFocus = () => { void refresh() }
     window.addEventListener(AUTH_CHANGED_EVENT, onAuthChanged)
-    return () => window.removeEventListener(AUTH_CHANGED_EVENT, onAuthChanged)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener(AUTH_CHANGED_EVENT, onAuthChanged)
+      window.removeEventListener('focus', onFocus)
+    }
   }, [refresh])
+
+  const typedToken = normaliseToken(tokenInput)
+  const effectiveToken = enrollToken ?? (typedToken || null)
 
   const runCeremony = useCallback(
     async (fn: () => Promise<{ ok: boolean; code?: string; error?: string }>) => {
@@ -78,6 +96,12 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       if (!res.ok) {
         setError(res.error ?? 'the passkey ceremony failed')
         if (res.code === 'not_allowed') setRecovery(true)
+        if (res.code === 'grant_invalid') {
+          // Stop sending a token the server rejected; keep the typed text so it
+          // can be corrected (design §8.2).
+          setEnrollToken(null)
+          clearEnrollToken()
+        }
         return false
       }
       return true
@@ -85,19 +109,50 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     [],
   )
 
-  const enroll = useCallback(async () => {
-    const code = (setupCode ?? normaliseCode(codeInput)) || null
-    if (code) storeSetupCode(code)
+  /** Add a passkey, stepping up first when the gateway requires it. */
+  const addPasskey = useCallback(async () => {
+    const usable = status?.usable_credentials ?? 0
+    const authenticated = status?.authenticated ?? false
+    const target = usable > 0 ? 'add' : 'bootstrap'
+    const token = effectiveToken
+    if (token) storeEnrollToken(token)
+
     const created = await runCeremony(async () => {
-      const c = await createPasskey(code)
-      if (!c.ok) return c
-      return verifyRegistration(c.data, code)
+      let attemptToken = token
+      let options = await createPasskey(attemptToken, target)
+      if (!options.ok) {
+        if (options.code === 'step_up_required') {
+          if (!authenticated) {
+            return {
+              ...options,
+              error:
+                'Sign in on a device that already has a passkey, or paste an enrollment ' +
+                'token from `seal access-control enroll`.',
+            }
+          }
+          if (steppedUp.current) {
+            return { ...options, error: 'That took too long — try adding the passkey again.' }
+          }
+          steppedUp.current = true
+          const step = await stepUpPasskey()
+          if (!step.ok) return step
+          attemptToken = step.data.grantToken
+          options = await createPasskey(attemptToken, target)
+        }
+        if (!options.ok) return options
+      }
+      if (options.ok) {
+        return verifyRegistration(options.data, attemptToken, target === 'add')
+      }
+      return options
     })
+    steppedUp.current = false
     if (created) {
+      setTokenInput('')
       setStatus(null)
       await refresh()
     }
-  }, [setupCode, codeInput, runCeremony, refresh])
+  }, [status, effectiveToken, runCeremony, refresh])
 
   const signIn = useCallback(async () => {
     const ok = await runCeremony(async () => {
@@ -110,15 +165,6 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       await refresh()
     }
   }, [runCeremony, refresh])
-
-  const doWaive = useCallback(async () => {
-    const code = (setupCode ?? normaliseCode(codeInput)) || null
-    const ok = await runCeremony(async () => waive(code))
-    if (ok) {
-      setStatus(null)
-      await refresh()
-    }
-  }, [setupCode, codeInput, runCeremony, refresh])
 
   if (loadFailed) {
     return (
@@ -156,47 +202,88 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     )
   }
 
+  const tokenField = status.enrollment_via === 'none' ? null : (
+    <TokenField
+      value={tokenInput}
+      onChange={setTokenInput}
+      captured={enrollToken !== null}
+      minted={status.enrollment_via === 'cli_token' || status.enrollment_via === 'cli_window'}
+    />
+  )
+
+  const mintHint = (
+    <div className="agate-note">
+      <p>
+        No enrollment token is armed. In the terminal where Seal runs, run
+      </p>
+      <p>
+        <code>seal access-control enroll</code>
+      </p>
+      <p>then press “Check again” below. (Enrolling works while the daemon runs.)</p>
+      <button className="agate-secondary" onClick={() => { void refresh() }}>
+        Check again
+      </button>
+    </div>
+  )
+
   // A passkey boot whose credentials are orphaned (the rpId moved) has nobody
   // who can sign in, so it goes to re-enrollment rather than the login screen.
-  if (status.state === 'passkey' && !status.rp_mismatch) {
+  if (status.state === 'passkey' && status.usable_credentials > 0) {
     return (
       <Panel title="Sign in to Seal Harness">
         <p className="agate-text">
           This gateway is protected by a passkey. Use Touch ID, Windows Hello, or your
           security key.
         </p>
-        <CapabilityNote />
+        <CapabilityNote surface="login" />
         <OriginNote status={status} />
         {error && <p className="agate-error">{error}</p>}
-        <button className="agate-primary" disabled={busy || !canUsePasskey()} onClick={() => { void signIn() }}>
+        <button
+          className="agate-primary"
+          disabled={busy || !canUsePasskey()}
+          onClick={() => { void signIn() }}
+        >
           {busy ? 'Waiting for your passkey…' : 'Sign in with a passkey'}
         </button>
+
+        <details className="agate-waive">
+          <summary>Enroll this device</summary>
+          {tokenField ?? mintHint}
+          <button
+            className="agate-secondary"
+            disabled={busy || !canUsePasskey() || effectiveToken === null}
+            onClick={() => { void addPasskey() }}
+          >
+            {busy ? 'Waiting for your passkey…' : 'Enroll a passkey on this device'}
+          </button>
+        </details>
+
         {recovery && (
           <div className="agate-note">
             <p>
               No passkey on this device? Add one from a device that is already signed in
-              (<em>Access</em>), or run
-              <code> seal access-control reset --yes</code> in the terminal where Seal is
-              running — that clears the existing passkeys so you can enroll again.
+              (<em>Access</em>), or mint a token with
+              <code> seal access-control enroll</code> and paste it above. If every passkey
+              is lost, run <code>seal access-control reset --yes</code> (stop
+              <code> seal serve</code> first).
             </p>
           </div>
         )}
         {!recovery && (
           <p className="agate-hint">
-            Lost your only passkey? Run <code>seal access-control reset --yes</code> in the
-            terminal where Seal is running.
+            Lost your only passkey? Run <code>seal access-control enroll</code> to add a new
+            one, or <code>seal access-control reset --yes</code> (with the daemon stopped) to
+            start over.
           </p>
         )}
       </Panel>
     )
   }
 
-  // state === 'unconfigured' (or a passkey boot whose credentials are orphaned)
-  const needsCode = true
-  const passkeyUsable = canUsePasskey()
+  // unconfigured, or a passkey boot whose credentials cannot sign in here.
   return (
-    <Panel title={status.rp_mismatch ? 'Register a new passkey' : 'Set up access control'}>
-      {status.rp_mismatch && (
+    <Panel title={status.state === 'passkey' ? 'Register a new passkey' : 'Set up access control'}>
+      {status.state === 'passkey' && (
         <p className="agate-error">
           The enrolled passkeys were registered for a different address
           (<code>{status.origin ?? 'unknown'}</code>), so they cannot be used here. Register a
@@ -205,68 +292,29 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       )}
       <p className="agate-text">
         Seal is reachable over the network, and every session, transcript and slash command
-        is behind this page. Protect it with a passkey, or explicitly run without one.
+        is behind this page. Protect it with a passkey.
       </p>
-      <CapabilityNote />
+      <CapabilityNote surface="setup" />
       <OriginNote status={status} />
 
-      {needsCode && (
-        <label className="agate-field">
-          <span>Setup code</span>
-          <input
-            value={codeInput}
-            onChange={(e) => setCodeInput(e.target.value)}
-            placeholder={setupCode ? 'already captured from the banner link' : 'printed by `seal serve`'}
-            aria-label="Setup code"
-          />
-          <small>
-            Printed in the terminal where you ran <code>seal serve</code>
-            {setupCode ? ' (and captured from the link you followed).' : '.'} If you lost it,
-            restart <code>seal serve</code> for a fresh one.
-          </small>
-        </label>
-      )}
+      {tokenField ?? mintHint}
 
       {error && <p className="agate-error">{error}</p>}
 
       <div className="agate-actions">
         <button
           className="agate-primary"
-          disabled={busy || !passkeyUsable || !(setupCode || codeInput.trim())}
-          onClick={() => { void enroll() }}
+          disabled={busy || !canUsePasskey() || effectiveToken === null}
+          onClick={() => { void addPasskey() }}
         >
           {busy ? 'Waiting for your passkey…' : 'Register a passkey'}
         </button>
       </div>
 
-      <details className="agate-waive">
-        <summary>Run without access control</summary>
-        <p>
-          Anyone who can reach this address gets full control of every session: messages the
-          agent will execute, every transcript, every slash command. This choice is recorded
-          in <code>~/.seal/security.toml</code>. Undo it with
-          <code> seal access-control reset --yes</code>.
-        </p>
-        <label className="agate-check">
-          <input type="checkbox" id="agate-confirm" />
-          <span>I understand this gateway will accept unauthenticated requests.</span>
-        </label>
-        <button
-          className="agate-danger"
-          disabled={busy || !(setupCode || codeInput.trim())}
-          onClick={(e) => {
-            const box = (e.currentTarget.previousElementSibling as HTMLElement | null)
-              ?.querySelector('input[type="checkbox"]') as HTMLInputElement | null
-            if (!box?.checked) {
-              setError('Tick the confirmation box first.')
-              return
-            }
-            void doWaive()
-          }}
-        >
-          Waive access control
-        </button>
-      </details>
+      <p className="agate-hint">
+        Prefer to run without access control? Stop <code>seal serve</code> and run
+        <code> seal access-control disable --yes</code>. Only the terminal can turn it off.
+      </p>
     </Panel>
   )
 }
@@ -275,15 +323,51 @@ function canUsePasskey(): boolean {
   return isSecureContextOk() && hasWebAuthn()
 }
 
-function CapabilityNote() {
+function TokenField({
+  value,
+  onChange,
+  captured,
+  minted,
+}: {
+  value: string
+  onChange: (value: string) => void
+  captured: boolean
+  minted: boolean
+}) {
+  return (
+    <label className="agate-field">
+      <span>Enrollment token</span>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={captured ? 'already captured from the link' : 'printed by `seal access-control enroll`'}
+        aria-label="Enrollment token"
+      />
+      <small>
+        {minted
+          ? 'A grant is armed on this gateway. Paste the token printed in the terminal (or follow the link it printed).'
+          : 'Mint one with `seal access-control enroll` in the terminal where Seal runs.'}
+      </small>
+    </label>
+  )
+}
+
+function CapabilityNote({ surface }: { surface: 'setup' | 'login' }) {
   if (canUsePasskey()) return null
   if (!isSecureContextOk()) {
     return (
       <p className="agate-note">
         Passkeys need HTTPS or <code>http://localhost</code>. This page is not a secure
-        context, so the browser will not run a passkey ceremony. Run Seal behind a TLS
-        reverse proxy (and set <code>[access_control] origin</code> to its https URL), or
-        continue without access control.
+        context, so the browser will not run a passkey ceremony.{' '}
+        {surface === 'setup' ? (
+          <>
+            Run Seal behind a TLS reverse proxy (and set <code>[access_control] origin</code>{' '}
+            to its https URL), or run <code>seal access-control disable --yes</code> in the
+            terminal (stop <code>seal serve</code> first).
+          </>
+        ) : (
+          <>Open the gateway over https or localhost.</>
+        )}
       </p>
     )
   }
