@@ -56,8 +56,7 @@ import Network.Wai
   , requestHeaders, requestMethod, responseLBS )
 
 import Seal.Config.BootPlan (BootPlan (..))
-import Seal.Config.Credentials
-  ( createCredentialsFile, loadCredentials, updateCredentialsFile )
+import Seal.Config.Credentials (enrollCredential, updateCredentialsFile)
 import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..)
@@ -690,19 +689,16 @@ persistRegistration h isAdd result now = do
         , credCreatedAt = now
         , credRpId = fromMaybeText (acsRpId st)
         }
-  -- Mode first, credential second (design §6.1). A crash between the two leaves
-  -- passkey mode with no credentials, which resolves to the loud, grant-gated
-  -- bootstrap. The other order would leave a credential on a still-open
-  -- gateway: silent non-enforcement.
-  raised <- updateAccessControlSection (securityFilePath (achPaths h))
-              (\cfg -> cfg { acfcMode = Just "passkey" })
-  case raised of
+  -- Raise the mode and write the credential as ONE operation (design §6.1):
+  -- two files, so neither is atomic alone, and two interleaved ceremonies could
+  -- otherwise leave a credential on a gateway whose mode still says "none".
+  -- 'enrollCredential' takes the write lock exactly once around both.
+  written <- enrollCredential (securityFilePath (achPaths h))
+                              (credentialsFilePath (achPaths h))
+                              (Map.singleton rawId (credentialToFile cred))
+  case written of
     Left err -> pure (Left (AuthErr status500 "write_failed" err))
-    Right _ -> do
-      written <- upsertCredential (achPaths h) rawId (credentialToFile cred)
-      case written of
-        Left err -> pure (Left (AuthErr status500 "write_failed" err))
-        Right () -> do
+    Right () -> do
           modifyMVar_ (achState h) $ \s ->
             let creds' = Map.insert rawId cred (acsCredentials s)
             in pure s { acsMode = AccessPasskey
@@ -719,20 +715,6 @@ persistRegistration h isAdd result now = do
             , "added" .= isAdd
             ]
             , [cookie] ))
-
--- | Add or replace one credential in @credentials.toml@.
---
--- Creates the store when it does not exist (the first enrollment) and updates
--- it otherwise. 'updateCredentialsFile' refuses a missing file on purpose, so
--- the absent case is its own branch rather than a read-then-write that could
--- race another process creating the file in between.
-upsertCredential :: SealPaths -> Text -> CredentialFileConfig -> IO (Either Text ())
-upsertCredential paths rawId cfg = do
-  let path = credentialsFilePath paths
-  existing <- loadCredentials path
-  case existing of
-    Right Nothing -> createCredentialsFile path (Map.singleton rawId cfg)
-    _             -> updateCredentialsFile path (Right . Map.insert rawId cfg)
 
 
 loginVerify :: AccessControlHandle -> Request -> IO (Either AuthErr (Value, [Header]))

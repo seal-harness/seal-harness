@@ -36,6 +36,7 @@ module Seal.Config.Credentials
   , updateCredentialsFile
   , MigrationOutcome (..)
   , migrateLegacyCredentials
+  , enrollCredential
   , credentialsVersion
   ) where
 
@@ -63,8 +64,8 @@ import Toml qualified
 
 import Seal.Config.Security
   ( CredentialFileConfig (..), WriteMode (DropCredentials), credentialCodec
-  , fixNode, loadSecurityConfig, readLegacyCredentials, saveSecurityConfig
-  , securityWriteLock )
+  , fixNode, loadSecurityConfig, raiseMode, readLegacyCredentials, restoreMode
+  , saveSecurityConfig, securityWriteLock )
 
 -- | The decoded @credentials.toml@: a format version plus the credential map
 -- keyed by base64url credential id.
@@ -165,9 +166,14 @@ credentialsVersion = 1
 -- processes. @0600@ is applied at creation, so credential public keys are
 -- never world-readable.
 createCredentialsFile :: FilePath -> Map Text CredentialFileConfig -> IO (Either Text ())
-createCredentialsFile path creds
+createCredentialsFile path creds =
+  withMVar securityWriteLock $ \_ -> createCredentialsFileUnlocked path creds
+
+-- | 'createCredentialsFile' without the lock, for a caller that already holds it.
+createCredentialsFileUnlocked :: FilePath -> Map Text CredentialFileConfig -> IO (Either Text ())
+createCredentialsFileUnlocked path creds
   | Map.null creds = pure (Left emptyStoreRefusal)
-  | otherwise = withMVar securityWriteLock $ \_ -> do
+  | otherwise = do
       exists <- doesFileExist path
       if exists
         then pure (Left (existsRefusal path))
@@ -200,7 +206,15 @@ updateCredentialsFile
   :: FilePath
   -> (Map Text CredentialFileConfig -> Either Text (Map Text CredentialFileConfig))
   -> IO (Either Text ())
-updateCredentialsFile path f = withMVar securityWriteLock $ \_ -> do
+updateCredentialsFile path f =
+  withMVar securityWriteLock $ \_ -> updateCredentialsFileUnlocked path f
+
+-- | 'updateCredentialsFile' without the lock, for a caller that already holds it.
+updateCredentialsFileUnlocked
+  :: FilePath
+  -> (Map Text CredentialFileConfig -> Either Text (Map Text CredentialFileConfig))
+  -> IO (Either Text ())
+updateCredentialsFileUnlocked path f = do
   loaded <- loadCredentials path
   case loaded of
     Left err          -> pure (Left err)
@@ -311,3 +325,55 @@ storeExistsRefusal path =
     <> "  It is the only copy of credentials the gateway can sign in with, so it is\n"
     <> "  never overwritten. Re-run with --force to drop the stale tables in\n"
     <> "  security.toml and keep the existing store."
+
+--------------------------------------------------------------------------------
+-- Enrollment: raise the mode and write the credential as one operation
+--------------------------------------------------------------------------------
+
+-- | Turn access control on and add a credential, atomically (design §6.1).
+--
+-- The two writes go to two files, so neither is atomic on its own; what has to
+-- be atomic is the /pair/. Two failures are possible and both matter:
+--
+-- * a crash between the two — mode-first ordering leaves @passkey@ with no
+--   credentials, which resolves to the loud, grant-gated bootstrap. The reverse
+--   ordering would leave a credential on a still-open gateway: silent
+--   non-enforcement;
+-- * two ceremonies interleaving — one raises, the other raises and writes, the
+--   first then writes and fails. Without one lock around both, a store can end
+--   up holding a credential while the mode says @none@.
+--
+-- So the lock is taken exactly once, here, and the unlocked primitives are used
+-- inside it. 'securityWriteLock' is non-reentrant: calling the public writers
+-- from within would self-deadlock.
+--
+-- A failed credential write restores the previous mode via 'restoreMode', which
+-- only restores if the on-disk mode is still the @passkey@ this raise wrote.
+enrollCredential
+  :: FilePath                        -- ^ security.toml
+  -> FilePath                        -- ^ credentials.toml
+  -> Map Text CredentialFileConfig   -- ^ entries to add
+  -> IO (Either Text ())
+enrollCredential securityPath credentialsPath creds =
+  withMVar securityWriteLock $ \_ -> do
+    raised <- raiseMode securityPath
+    case raised of
+      Left err -> pure (Left err)
+      Right witness -> do
+        written <- writeStoreUnlocked credentialsPath creds
+        case written of
+          Right () -> pure (Right ())
+          Left err -> do
+            -- Put the mode back. Best effort by design: if this also fails, the
+            -- gateway is left closed (passkey, no credential), which is the safe
+            -- direction and is loud on the next boot.
+            _ <- restoreMode securityPath witness
+            pure (Left err)
+
+-- | Create the store, or merge into it, without taking the lock.
+writeStoreUnlocked :: FilePath -> Map Text CredentialFileConfig -> IO (Either Text ())
+writeStoreUnlocked path creds = do
+  exists <- doesFileExist path
+  if exists
+    then updateCredentialsFileUnlocked path (Right . Map.union creds)
+    else createCredentialsFileUnlocked path creds

@@ -32,6 +32,9 @@ module Seal.Config.Security
   , readLegacyCredentials
   , tomlKeyPaths
   , WriteMode (..)
+  , ModeRaise
+  , raiseMode
+  , restoreMode
   , updateAccessControlSection
   , clearAccessControlSection
   , writeSecretFile
@@ -659,3 +662,66 @@ localModeResult uec =
 localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
 localModeResult _ = Nothing
 #endif
+
+--------------------------------------------------------------------------------
+-- The one-way mode writer (design §6.1)
+--------------------------------------------------------------------------------
+
+-- | What a mode raise needs in order to be undone.
+--
+-- The constructor is deliberately not exported. @RaisedFrom@ is the only value
+-- 'restoreMode' accepts as proof that /this/ code path raised the mode, so a
+-- caller cannot conjure one and lower the mode to @none@: the web path can turn
+-- access control on, and cannot turn it off, as a type fact rather than a
+-- convention. @AlreadyRaised@ restores nothing.
+data ModeRaise
+  = AlreadyRaised
+  | RaisedFrom !(Maybe Text)
+  deriving stock (Eq, Show)
+
+-- | Raise @access_control.mode@ to @passkey@, remembering what it was.
+--
+-- __The caller must hold 'securityWriteLock'.__ It is not taken here because the
+-- only caller that needs it ('Seal.Config.Credentials.enrollCredential') takes
+-- it once around the raise /and/ the credential write, and the lock is
+-- non-reentrant.
+--
+-- @mode@ is the only field this touches; origin, rp_id and @untrusted_execution@
+-- are unreachable from here by construction.
+raiseMode :: FilePath -> IO (Either Text ModeRaise)
+raiseMode path = do
+  loaded <- loadSecurityConfig path
+  case loaded of
+    Left err  -> pure (Left err)
+    Right cfg -> do
+      let section = fromMaybe emptyAccessControl (scAccessControl cfg)
+      case acfcMode section of
+        Just "passkey" -> pure (Right AlreadyRaised)
+        previous -> do
+          written <- saveSecurityConfig path
+                       (cfg { scAccessControl = Just (section { acfcMode = Just "passkey" }) })
+                       PreserveCredentials
+          pure (RaisedFrom previous <$ written)
+
+-- | Undo a raise — but only if the on-disk mode is still the @passkey@ the
+-- raise wrote.
+--
+-- Compare-and-swap, not a blind write: if anything else moved the mode in the
+-- meantime (an operator running @disable --yes@, another ceremony), restoring
+-- would silently undo their decision. Leaving it alone is the safe direction —
+-- the gateway stays closed and the operator can still enroll.
+--
+-- __The caller must hold 'securityWriteLock'.__
+restoreMode :: FilePath -> ModeRaise -> IO (Either Text ())
+restoreMode _ AlreadyRaised = pure (Right ())
+restoreMode path (RaisedFrom previous) = do
+  loaded <- loadSecurityConfig path
+  case loaded of
+    Left err  -> pure (Left err)
+    Right cfg -> case scAccessControl cfg >>= acfcMode of
+      Just "passkey" ->
+        saveSecurityConfig path
+          (cfg { scAccessControl =
+                   fmap (\section -> section { acfcMode = previous }) (scAccessControl cfg) })
+          PreserveCredentials
+      _ -> pure (Right ())

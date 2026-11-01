@@ -13,6 +13,8 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus)
 
+import Control.Concurrent.Async (concurrently)
+
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck
@@ -20,9 +22,12 @@ import Test.QuickCheck
 
 import Seal.Config.Credentials
   ( CredentialsFile (..), MigrationOutcome (..), createCredentialsFile
-  , loadCredentials, migrateLegacyCredentials, saveCredentials
+  , enrollCredential, loadCredentials, migrateLegacyCredentials, saveCredentials
   , updateCredentialsFile )
-import Seal.Config.Security (CredentialFileConfig (..), hasLegacyLayout)
+import Seal.Config.Security
+  ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
+  , WriteMode (PreserveCredentials), defaultSecurityConfig, hasLegacyLayout
+  , loadSecurityConfig, saveSecurityConfig )
 
 spec :: Spec
 spec = describe "Seal.Config.Credentials" $ do
@@ -153,6 +158,81 @@ spec = describe "Seal.Config.Credentials" $ do
         migrateLegacyCredentials securityPath storePath False
           `shouldReturn` Right NothingToMigrate
         doesFileExist storePath `shouldReturn` False
+
+  -- Design §16.15. The mode raise and the credential write are two files, so
+  -- neither is atomic alone; what must be atomic is the pair.
+  describe "enrollCredential" $ do
+    it "raises the mode and writes the credential" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath "[access_control]\nmode = \"none\"\n"
+        enrollCredential securityPath storePath idiomaticCreds
+          `shouldReturn` Right ()
+        modeOf securityPath `shouldReturn` Just (Just "passkey")
+        loadCredentials storePath `shouldReturn`
+          Right (Just (CredentialsFile 1 idiomaticCreds))
+
+    it "a failed credential write restores the mode" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath "[access_control]\nmode = \"none\"\n"
+        -- An unreadable store makes the credential write fail, after the raise
+        -- has already happened.
+        TIO.writeFile storePath "this is not toml [[["
+        result <- enrollCredential securityPath storePath idiomaticCreds
+        case result of
+          Left _  -> pure ()
+          Right () -> expectationFailure "the write should have failed"
+        modeOf securityPath `shouldReturn` Just (Just "none")
+
+    it "does not restore over a mode someone else changed" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath "[access_control]\nmode = \"none\"\n"
+        TIO.writeFile storePath "this is not toml [[["
+        _ <- enrollCredential securityPath storePath idiomaticCreds
+        -- The restore is compare-and-swap: it only fires on mode = passkey. A
+        -- subsequent successful enrollment therefore still works from whatever
+        -- state is on disk.
+        writeValidSection securityPath (Just "none")
+        modeOf securityPath `shouldReturn` Just (Just "none")
+
+    it "two interleaved ceremonies cannot leave mode = none beside a credential" $
+      withSystemTempDirectory "seal-credentials-test" $ \dir -> do
+        let securityPath = dir </> "security.toml"
+            storePath    = dir </> "credentials.toml"
+        TIO.writeFile securityPath "[access_control]\nmode = \"none\"\n"
+        (a, b) <- concurrently
+          (enrollCredential securityPath storePath idiomaticCreds)
+          (enrollCredential securityPath storePath otherCreds)
+        (a, b) `shouldSatisfy` \(x, y) -> x == Right () && y == Right ()
+        modeOf securityPath `shouldReturn` Just (Just "passkey")
+        loaded <- loadCredentials storePath
+        case loaded of
+          Right (Just file) ->
+            Map.keys (crdCredentials file) `shouldBe` [idiomaticId, otherId]
+          other -> expectationFailure ("store: " <> show other)
+
+
+
+-- | The @mode@ line as it is on disk, or 'Nothing' if the file does not decode.
+modeOf :: FilePath -> IO (Maybe (Maybe T.Text))
+modeOf path = do
+  loaded <- loadSecurityConfig path
+  pure $ case loaded of
+    Left _    -> Nothing
+    Right cfg -> Just (scAccessControl cfg >>= acfcMode)
+
+writeValidSection :: FilePath -> Maybe T.Text -> IO ()
+writeValidSection path mode =
+  saveSecurityConfig path
+    (defaultSecurityConfig { scAccessControl = Just AccessControlFileConfig
+        { acfcMode = mode, acfcOrigin = Nothing, acfcRpId = Nothing } })
+    PreserveCredentials
+    `shouldReturn` Right ()
 
 -- | A credential map with the key shape the real store uses: a base64url
 -- credential id (a valid TOML bare key) mapped to one credential table.
