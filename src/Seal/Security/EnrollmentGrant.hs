@@ -60,7 +60,8 @@ import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import Control.Exception (IOException, try)
 import Control.Monad (forM_, when)
 import System.Directory
-  ( createDirectoryIfMissing, doesFileExist, listDirectory, removeFile, renameFile )
+  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory
+  , removeFile, renameFile )
 import System.FilePath ((</>), takeBaseName, takeDirectory)
 import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
@@ -604,9 +605,12 @@ cancelGrant paths = do
 -- them: they name grants that no longer exist.
 reapClaims :: SealPaths -> IO ()
 reapClaims paths = do
-  entries <- listDirectory (spState paths)
-  forM_ entries $ \entry -> when (claimPrefix `T.isPrefixOf` T.pack entry) $
-    removeFile (spState paths </> entry)
+  -- A fresh SEAL_HOME has no state/ yet; nothing to reap is not an error.
+  present <- doesDirectoryExist (spState paths)
+  when present $ do
+    entries <- listDirectory (spState paths)
+    forM_ entries $ \entry -> when (claimPrefix `T.isPrefixOf` T.pack entry) $
+      removeFile (spState paths </> entry)
   where
     claimPrefix = "enrollment-grant.claimed-"
 

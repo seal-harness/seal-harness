@@ -14,11 +14,11 @@ import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath ((</>))
-import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
+import System.Directory (doesFileExist)
+import System.IO (hIsTerminalDevice, stderr)
 
 import Katip (Severity (..), ls)
 
@@ -63,14 +63,12 @@ import Seal.Config.BootPlan
   ( BindCoordinates (..), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig
-  , untrustedExecConfigFromSecurity, writeSecretFile )
+  , untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
-import Seal.Security.WebAuthn.Types (AccessMode (..))
 import Seal.Gateway.AccessControl
-  ( NewAccess (..), accessControlCredentialCount, accessControlMode
-  , newAccessControlHandle )
+  ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -642,52 +640,9 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
 -- Access-control boot banner
 -- ---------------------------------------------------------------------------
 
--- | Tell the operator, on **stderr**, what state access control is in and (when
--- one exists) the one-time setup code.
---
--- stderr, not 'logIO': the logger writes to @seal.log@, which the agent can
--- read, and the setup code authorises enrollment and waiver. When stderr is not
--- a TTY (@launchd@, @systemd@, a pipe) the code is also written to
--- @~\/.seal\/state\/setup-code@ at mode 0600 so a daemon operator is never
--- locked out of setup.
+-- | Print the boot banner through the gateway's banner module, deciding the TTY
+-- case here because only the process knows what its stderr is.
 printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
 printAccessControlBanner paths access = do
-  mode <- accessControlMode (naHandle access)
-  count <- accessControlCredentialCount (naHandle access)
-  let urlFor suffix = case naOrigin access of
-        Just origin -> Just (origin <> suffix)
-        Nothing     -> Nothing
-  case mode of
-    AccessUnconfigured -> do
-      hPutStrLn stderr "Access control is NOT configured — the API is closed until setup completes."
-      case (urlFor "/#setup=", naSetupCode access) of
-        (Just base, Just code) -> do
-          hPutStrLn stderr ("  Open  " <> T.unpack base <> T.unpack code)
-          hPutStrLn stderr ("  Or    enter the setup code " <> T.unpack code <> " on the setup screen")
-        _ -> hPutStrLn stderr "  Open the web UI to choose a passkey or waive access control."
-      hPutStrLn stderr "  Lost a passkey? Run `seal access-control reset --yes`."
-      writeSetupCodeFile paths (naSetupCode access)
-    AccessOpen -> do
-      hPutStrLn stderr "Access control is OFF — anyone who can reach this address has full control."
-      hPutStrLn stderr "  (explicitly waived by [access_control] mode = \"none\" in ~/.seal/security.toml)"
-      case (urlFor "/#setup=", naSetupCode access) of
-        (Just base, Just code) ->
-          hPutStrLn stderr ("  To turn it on: open " <> T.unpack base <> T.unpack code
-                              <> " and enroll a passkey")
-        _ -> pure ()
-      writeSetupCodeFile paths (naSetupCode access)
-    AccessPasskey ->
-      hPutStrLn stderr ("Access control: passkey (" <> show count <> " credential(s) enrolled)")
-
--- | Persist the setup code for non-interactive launches only.
-writeSetupCodeFile :: SealPaths -> Maybe T.Text -> IO ()
-writeSetupCodeFile _ Nothing = pure ()
-writeSetupCodeFile paths (Just code) = do
-  interactive <- hIsTerminalDevice stderr
-  if interactive
-    then pure ()
-    else do
-      let dir = spState paths
-          path = dir </> "setup-code"
-      createDirectoryIfMissing True dir
-      writeSecretFile path code
+  stderrIsTTY <- hIsTerminalDevice stderr
+  printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access

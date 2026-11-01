@@ -22,8 +22,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Base64.URL qualified as B64Url
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive (mk)
-import Data.Foldable (for_)
-import Data.Maybe (fromMaybe)
+import Data.Foldable (for_, toList)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -41,7 +40,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Crypto.Hash (Digest, SHA256 (..), hash)
-import Crypto.PubKey.ECC.ECDSA (PublicKey (..), Signature (..), sign)
+import Crypto.PubKey.ECC.ECDSA (PrivateKey, PublicKey (..), Signature (..), sign)
 import Crypto.PubKey.ECC.Generate (generate)
 import Crypto.PubKey.ECC.Types (CurveName (SEC_p256r1), Point (..), getCurveByName)
 import Data.ByteArray (convert)
@@ -52,11 +51,11 @@ import Seal.Config.BootPlan
 import Seal.Config.Credentials
   ( CredentialsFile (..), credentialsVersion, saveCredentials )
 import Seal.Config.Paths
-  ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, securityFilePath )
+  ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, enrollmentTokenPath
+  , securityFilePath )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
-  , WriteMode (PreserveCredentials), defaultSecurityConfig, loadSecurityConfig
-  , saveSecurityConfig )
+  , WriteMode (PreserveCredentials), defaultSecurityConfig, saveSecurityConfig )
 import Seal.Gateway.AccessControl
 import Seal.Security.EnrollmentGrant
   ( Grant (..), GrantSource (..), MintedGrant (..), enrollGrant, loadGrantFile )
@@ -101,7 +100,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
       withHome Nothing $ \paths -> do
         Right minted <- enrollGrant paths CliToken (10 * 60) False
         na <- bootHandle paths Nothing Map.empty
-        naSetupCode na `shouldBe` Nothing
+        naToken na `shouldBe` Nothing
         case naGrant na of
           Nothing -> expectationFailure "boot reported no grant"
           Just banner -> do
@@ -114,7 +113,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
     it "mints a fresh grant when nothing is outstanding" $
       withHome Nothing $ \paths -> do
         na <- bootHandle paths Nothing Map.empty
-        naSetupCode na `shouldSatisfy` isNonEmptyString
+        naToken na `shouldSatisfy` isNonEmptyString
         case naGrant na of
           Nothing -> expectationFailure "boot reported no grant"
           Just banner -> gbFresh banner `shouldBe` True
@@ -122,49 +121,44 @@ spec = describe "Seal.Gateway.AccessControl" $ do
     it "a healthy passkey boot mints nothing and reports no grant" $
       withHome (Just passkeySection) $ \paths -> do
         na <- bootHandle paths (Just passkeySection) passkeyCreds
-        naSetupCode na `shouldBe` Nothing
+        naToken na `shouldBe` Nothing
         naGrant na `shouldBe` Nothing
         doesFileExist (enrollmentGrantPath paths) `shouldReturn` False
 
   -- Design §14 / §2.2. The flag has no storage to go stale: it is computed
-  -- from the credential map on every read. This asserts the flip inside one
-  -- handle lifetime, which a stored-and-assigned flag gets wrong (the old code
-  -- hardcoded it to False on registration and never touched it on deletion).
+  -- from the credential map on every read.
   describe "rp_mismatch is derived" $ do
-    it "flips to true once the last usable credential is deleted, with no restart" $
-      withHome Nothing $ \paths -> do
-        let usable = (BS.replicate 16 0x11, BS.replicate 64 0x02)
-            store  = Map.union orphanCred passkeyCreds
-            openSection' = passkeySection { acfcMode = Just "none" }
-        -- Open mode so the DELETE is authorized without a session; the flag is
-        -- a function of the map either way.
-        na <- bootHandle paths (Just openSection') store
-        (_, _, statusBefore) <- runApp (gated na) (getReq ["api", "auth", "status"])
-        jsonField statusBefore "rp_mismatch" `shouldBe` Just (Bool False)
+    it "is true when every credential is registered for another address" $
+      withHome (Just foreignSection) $ \paths -> do
+        na <- bootHandle paths (Just foreignSection) passkeyCreds
+        (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
+        jsonField body "rp_mismatch" `shouldBe` Just (Bool True)
+        jsonField body "usable_credentials" `shouldBe` Just (Number 0)
+        jsonField body "orphaned_credentials" `shouldBe` Just (Number 1)
 
-        -- Open mode still authorizes credential admin with the setup code
-        -- (CredentialAdmin = AdminOpen arrives with the endpoint work).
-        code <- setupCodeOf na
-        (st, _, _) <- runApp (gated na)
-          (deleteReq ["api", "auth", "credentials", b64 (fst usable)]
-                     [("X-Seal-Setup-Token", code)])
-        st `shouldBe` status200'
-
-        (_, _, statusAfter) <- runApp (gated na) (getReq ["api", "auth", "status"])
-        jsonField statusAfter "rp_mismatch" `shouldBe` Just (Bool True)
-        jsonField statusAfter "setup_required" `shouldBe` Just (Bool True)
-
-    it "stays false while a usable credential remains" $
+    it "stays false after a deletion while a usable credential remains" $
       withHome Nothing $ \paths -> do
         let store = Map.union orphanCred passkeyCreds
-        na <- bootHandle paths (Just passkeySection { acfcMode = Just "none" }) store
+        na <- bootHandle paths (Just openSection) store
         code <- setupCodeOf na
         (st, _, _) <- runApp (gated na)
           (deleteReq ["api", "auth", "credentials", b64 (BS.replicate 16 0x77)]
-                     [("X-Seal-Setup-Token", code)])
+                     [("X-Seal-Enroll-Token", code)])
         st `shouldBe` status200'
         (_, _, statusAfter) <- runApp (gated na) (getReq ["api", "auth", "status"])
         jsonField statusAfter "rp_mismatch" `shouldBe` Just (Bool False)
+
+    -- Design §9.4: the store is never left with zero usable credentials, even
+    -- though the orphan next to it could not sign in either.
+    it "refuses to delete the last usable credential while an orphan remains" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths (Just openSection) (Map.union orphanCred passkeyCreds)
+        code <- setupCodeOf na
+        (st, _, body) <- runApp (gated na)
+          (deleteReq ["api", "auth", "credentials", b64 (BS.replicate 16 0x11)]
+                     [("X-Seal-Enroll-Token", code)])
+        st `shouldBe` toEnum 409
+        jsonField body "code" `shouldBe` Just (String "last_credential")
 
   describe "unconfigured" $ do
     it "closes the API" $ withHome Nothing $ \paths -> do
@@ -187,26 +181,26 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         (st2, _, _) <- runApp (gated na) (getReq ["assets", "index.js"])
         st2 `shouldBe` status200'
 
-    it "rejects enrollment without the setup code" $ withHome Nothing $ \paths -> do
+    it "rejects enrollment with no grant token" $ withHome Nothing $ \paths -> do
       na <- bootHandle paths Nothing Map.empty
       (st, _, body) <- runApp (gated na)
         (postReq ["api", "auth", "register", "options"] [])
       st `shouldBe` status403'
-      jsonField body "code" `shouldBe` Just (String "setup_code_required")
+      jsonField body "code" `shouldBe` Just (String "grant_required")
 
-    it "rejects enrollment with a wrong setup code" $ withHome Nothing $ \paths -> do
+    it "rejects enrollment with a token that matches no grant" $ withHome Nothing $ \paths -> do
       na <- bootHandle paths Nothing Map.empty
       (st, _, body) <- runApp (gated na)
-        (postReq ["api", "auth", "register", "options"] [("X-Seal-Setup-Token", "nope")])
+        (postReq ["api", "auth", "register", "options"] [("X-Seal-Enroll-Token", "nope")])
       st `shouldBe` status403'
-      jsonField body "code" `shouldBe` Just (String "setup_code_invalid")
+      jsonField body "code" `shouldBe` Just (String "grant_invalid")
 
-    it "returns registration options with the right setup code" $
+    it "returns registration options with the right grant token" $
       withHome Nothing $ \paths -> do
         na <- bootHandle paths Nothing Map.empty
         code <- setupCodeOf na
         (st, _, body) <- runApp (gated na)
-          (postReq ["api", "auth", "register", "options"] [("X-Seal-Setup-Token", code)])
+          (postReq ["api", "auth", "register", "options"] [("X-Seal-Enroll-Token", code)])
         st `shouldBe` status200'
         jsonField body "challenge" `shouldSatisfy` isNonEmptyValue
         jsonField body "attestation" `shouldBe` Just (String "none")
@@ -222,7 +216,7 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         code <- setupCodeOf na
         (st, _, body) <- runApp (gated na)
           (postReq ["api", "auth", "register", "options"]
-                   [("X-Seal-Setup-Token", T.toLower code)])
+                   [("X-Seal-Enroll-Token", T.toLower code)])
         st `shouldBe` status200'
         jsonField body "challenge" `shouldSatisfy` isNonEmptyValue
 
@@ -234,10 +228,8 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
         jsonField body "state" `shouldBe` Just (String "unconfigured")
       -- open
-      withHome Nothing $ \paths -> do
-        na <- bootHandle paths Nothing Map.empty
-        code <- setupCodeOf na
-        _ <- runApp (gated na) (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection) Map.empty
         (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
         jsonField body "state" `shouldBe` Just (String "open")
         jsonField body "authenticated" `shouldBe` Just (Bool True)
@@ -251,27 +243,21 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         jsonField body "setup_required" `shouldBe` Just (Bool False)
         jsonField body "rp_id" `shouldBe` Just (String "localhost")
 
-  describe "waive" $ do
-    it "records mode = none and opens the API" $ withHome Nothing $ \paths -> do
+  -- Design §8.1: disabling access control is CLI-only, so no HTTP request can
+  -- do it. The endpoint is gone rather than guarded.
+  describe "waive is removed" $ do
+    it "has no waive endpoint" $ withHome Nothing $ \paths -> do
       na <- bootHandle paths Nothing Map.empty
       code <- setupCodeOf na
       (st, _, _) <- runApp (gated na)
-        (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
-      st `shouldBe` status200'
-      accessControlMode (naHandle na) `shouldReturn` AccessOpen
-      (st2, _, _) <- runApp (gated na) (getReq ["api", "sessions"])
-      st2 `shouldBe` status200'
-      loaded <- readSection paths
-      fmap acfcMode loaded `shouldBe` Just (Just "none")
+        (postReq ["api", "auth", "waive"] [("X-Seal-Enroll-Token", code)])
+      st `shouldBe` toEnum 404
 
-    it "is refused when a passkey is already configured" $
-      withHome (Just passkeySection) $ \paths -> do
-        na <- bootHandle paths (Just passkeySection) passkeyCreds
-        let code = fromMaybe "" (naSetupCode na)
-        (st, _, body) <- runApp (gated na)
-          (postReq ["api", "auth", "waive"] [("X-Seal-Setup-Token", code)])
-        st `shouldBe` status403'
-        jsonField body "code" `shouldBe` Just (String "waive_forbidden")
+    it "leaves the mode untouched when the old endpoint is called" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths Nothing Map.empty
+        _ <- runApp (gated na) (postReq ["api", "auth", "waive"] [])
+        accessControlMode (naHandle na) `shouldReturn` AccessUnconfigured
 
   describe "passkey mode" $ do
     it "rejects an unauthenticated API request" $ withHome (Just passkeySection) $ \paths -> do
@@ -291,10 +277,11 @@ spec = describe "Seal.Gateway.AccessControl" $ do
     it "refuses the service token on auth paths" $
       withHome (Just passkeySection) $ \paths -> do
         na <- bootHandle paths (Just passkeySection) passkeyCreds
-        (st, _, _) <- runApp (gated na)
+        (st, _, body) <- runApp (gated na)
           (getReqWith ["api", "auth", "credentials"]
              [("Authorization", "Bearer " <> naServiceToken na)])
-        st `shouldBe` status401'
+        st `shouldBe` status403'
+        jsonField body "code" `shouldBe` Just (String "grant_required")
 
     it "authenticates a full WebAuthn login ceremony" $
       withHome Nothing $ \paths -> do
@@ -369,15 +356,263 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         stReplay `shouldBe` status400'
         jsonField replayBody "code" `shouldBe` Just (String "challenge_invalid")
 
-  describe "rate limiting" $
-    it "returns 429 once the challenge budget is spent" $
+
+  -- Design §8.1 / §16.11-12. The assertion path: a live session proves itself
+  -- with an existing passkey, receives a 120 s grant, and presents it to add a
+  -- second one.
+  describe "enroll/* (step-up)" $ do
+    it "refuses enroll/options without a session" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
+        (st, _, body) <- runApp (gated na) (postReq ["api", "auth", "enroll", "options"] [])
+        st `shouldBe` status403'
+        jsonField body "code" `shouldBe` Just (String "grant_required")
+
+    it "refuses enroll/options in open mode" $
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection) Map.empty
+        (st, _, _) <- runApp (gated na) (postReq ["api", "auth", "enroll", "options"] [])
+        st `shouldBe` status403'
+
+    it "offers only usable credentials and needs a session that can sign in" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.fromList
+              [ (b64 usableId, credFor usableId (pointBytes (public_q pub)))
+              , (b64 (BS.replicate 16 0x77), orphanCfg (BS.replicate 16 0x77))
+              ]
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (st, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"]
+                       [("Cookie", "seal_session=" <> cookie)])
+        st `shouldBe` status200'
+        let offered = case jsonField opts "allowCredentials" of
+              Just (Array xs) ->
+                [ i | Object o <- toList xs, Just (String i) <- [jsonField' o "id"] ]
+              _               -> []
+        offered `shouldBe` [b64 usableId]
+
+    it "mints an assertion grant that authorizes credentials/options" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.singleton (b64 usableId) (credFor usableId (pointBytes (public_q pub)))
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (stOpts, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"] [("Cookie", "seal_session=" <> cookie)])
+        stOpts `shouldBe` status200'
+        challenge <- challengeOf opts
+        body <- assertionBody challenge usableId priv 6
+        verifyReq <- postJsonWith ["api", "auth", "enroll", "verify"] body
+          [("Cookie", "seal_session=" <> cookie)]
+        (stVer, _, granted) <- runApp (gated na) verifyReq
+        stVer `shouldBe` status200'
+        grantToken <- case jsonField granted "grant_token" of
+          Just (String t) -> pure t
+          _               -> expectationFailure "no grant_token" >> pure ""
+        jsonField granted "grant_expires_at" `shouldSatisfy` isNonEmptyValue
+        -- The token alone, without the session, is not authority (invariant 2).
+        (stNoCookie, _, _) <- runApp (gated na)
+          (postReq ["api", "auth", "credentials", "options"]
+                   [("X-Seal-Enroll-Token", grantToken)])
+        stNoCookie `shouldBe` status403'
+        -- With the session it is.
+        (stBound, _, _) <- runApp (gated na)
+          (postReqWith ["api", "auth", "credentials", "options"]
+                       [("X-Seal-Enroll-Token", grantToken),
+                        ("Cookie", "seal_session=" <> cookie)])
+        stBound `shouldBe` status200'
+
+    -- Gate round 4, B-1: rev 4 let an absent token fall through to the
+    -- session-held grant, so a stolen cookie could redeem the victim's live
+    -- assertion grant by omitting the header.
+    it "a cookie-only client cannot redeem a live assertion grant" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.singleton (b64 usableId) (credFor usableId (pointBytes (public_q pub)))
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (stOpts, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"] [("Cookie", "seal_session=" <> cookie)])
+        stOpts `shouldBe` status200'
+        challenge <- challengeOf opts
+        body <- assertionBody challenge usableId priv 6
+        verifyReq <- postJsonWith ["api", "auth", "enroll", "verify"] body
+          [("Cookie", "seal_session=" <> cookie)]
+        (stVer, _, _) <- runApp (gated na) verifyReq
+        stVer `shouldBe` status200'
+        -- Same cookie, no X-Seal-Enroll-Token.
+        (st, _, refusal) <- runApp (gated na)
+          (postReqWith ["api", "auth", "credentials", "options"]
+                       [("Cookie", "seal_session=" <> cookie)])
+        st `shouldBe` status403'
+        jsonField refusal "code" `shouldBe` Just (String "step_up_required")
+        -- And no credential was created.
+        accessControlCredentialCount (naHandle na) `shouldReturn` 1
+
+    it "refuses a step-up assertion that names an orphaned credential" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.fromList
+              [ (b64 usableId, credFor usableId (pointBytes (public_q pub)))
+              , (b64 (BS.replicate 16 0x77), orphanCfg (BS.replicate 16 0x77))
+              ]
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (stOpts, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"] [("Cookie", "seal_session=" <> cookie)])
+        stOpts `shouldBe` status200'
+        challenge <- challengeOf opts
+        body <- assertionBody challenge (BS.replicate 16 0x77) priv 6
+        verifyReq <- postJsonWith ["api", "auth", "enroll", "verify"] body
+          [("Cookie", "seal_session=" <> cookie)]
+        (st, _, refusal) <- runApp (gated na) verifyReq
+        st `shouldBe` status403'
+        jsonField refusal "code" `shouldBe` Just (String "grant_invalid")
+
+    it "registers a credential with the assertion grant and consumes it" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        (newPub, _) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            newId = BS.replicate 16 0x33
+            store = Map.singleton (b64 usableId) (credFor usableId (pointBytes (public_q pub)))
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (_, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"] [("Cookie", "seal_session=" <> cookie)])
+        challenge <- challengeOf opts
+        assertion <- assertionBody challenge usableId priv 6
+        verifyReq <- postJsonWith ["api", "auth", "enroll", "verify"] assertion
+          [("Cookie", "seal_session=" <> cookie)]
+        (_, _, granted) <- runApp (gated na) verifyReq
+        grantToken <- case jsonField granted "grant_token" of
+          Just (String t) -> pure t
+          _               -> expectationFailure "no grant_token" >> pure ""
+        -- Ask for registration options with the grant, then register.
+        (stOpts, _, regOpts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "credentials", "options"]
+                       [("X-Seal-Enroll-Token", grantToken),
+                        ("Cookie", "seal_session=" <> cookie)])
+        stOpts `shouldBe` status200'
+        regChallenge <- challengeOf regOpts
+        regReq <- postJsonWith ["api", "auth", "credentials", "verify"]
+          (registrationBody regChallenge "http://localhost:8080" newId (public_q newPub))
+          [("X-Seal-Enroll-Token", grantToken), ("Cookie", "seal_session=" <> cookie)]
+        (stReg, _, _) <- runApp (gated na) regReq
+        stReg `shouldBe` status200'
+        accessControlCredentialCount (naHandle na) `shouldReturn` 2
+        -- The grant is consumed: replaying the same registration is refused.
+        replay <- postJsonWith ["api", "auth", "credentials", "verify"]
+          (registrationBody regChallenge "http://localhost:8080" newId (public_q newPub))
+          [("X-Seal-Enroll-Token", grantToken), ("Cookie", "seal_session=" <> cookie)]
+        (stReplay, _, _) <- runApp (gated na) replay
+        stReplay `shouldBe` status403'
+        accessControlCredentialCount (naHandle na) `shouldReturn` 2
+
+  -- Design §8.1: @open@ mode is fully open, so it administers credentials
+  -- unauthenticated — which is what lets /access work there at all.
+  describe "CredentialAdmin" $ do
+    it "lets open mode list and delete without a session" $
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection)
+          (Map.union orphanCred passkeyCreds)
+        (stList, _, body) <- runApp (gated na) (getReq ["api", "auth", "credentials"])
+        stList `shouldBe` status200'
+        case A.decode body of
+          Just (Array xs) -> length xs `shouldBe` 2
+          _               -> expectationFailure "credential list is not a JSON array"
+        -- The orphan goes: the usable credential remains.
+        (stDel, _, _) <- runApp (gated na)
+          (deleteReq ["api", "auth", "credentials", b64 (BS.replicate 16 0x77)] [])
+        stDel `shouldBe` status200'
+        -- The last usable one does not, even in open mode (design §9.4).
+        (stLast, _, _) <- runApp (gated na)
+          (deleteReq ["api", "auth", "credentials", b64 (BS.replicate 16 0x11)] [])
+        stLast `shouldBe` toEnum 409
+
+    it "refuses a sessionless client in passkey mode" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
+        (st, _, body) <- runApp (gated na) (getReq ["api", "auth", "credentials"])
+        st `shouldBe` status403'
+        jsonField body "code" `shouldBe` Just (String "grant_required")
+
+    it "a window grant is enrollment-only, not credential admin" $
+      withHome Nothing $ \paths -> do
+        Right _ <- enrollGrant paths CliWindow (5 * 60) False
+        na <- bootHandle paths Nothing Map.empty
+        (st, _, body) <- runApp (gated na) (getReq ["api", "auth", "credentials"])
+        st `shouldBe` status403'
+        jsonField body "code" `shouldBe` Just (String "grant_required")
+
+
+  -- Design §11 / §16.14: the banner's sink and TTY decision are arguments, so
+  -- every branch is assertable without a terminal.
+  describe "boot banner" $ do
+    it "prints the enrollment URL and the token on a TTY" $
       withHome Nothing $ \paths -> do
         na <- bootHandle paths Nothing Map.empty
-        code <- setupCodeOf na
+        lines' <- captureBanner True paths na
+        let printed = T.concat lines'
+        token <- setupCodeOf na
+        printed `shouldSatisfy` T.isInfixOf token
+        printed `shouldSatisfy` T.isInfixOf "#enroll="
+        doesFileExist (enrollmentTokenPath paths) `shouldReturn` False
+
+    it "prints the token's path, never the token, off a TTY" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths Nothing Map.empty
+        lines' <- captureBanner False paths na
+        let printed = T.concat lines'
+        token <- setupCodeOf na
+        printed `shouldSatisfy` (not . T.isInfixOf token)
+        printed `shouldSatisfy` T.isInfixOf (T.pack (enrollmentTokenPath paths))
+        doesFileExist (enrollmentTokenPath paths) `shouldReturn` True
+
+    it "prints neither a token nor a URL for a healthy passkey boot" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
+        lines' <- captureBanner True paths na
+        let printed = T.concat lines'
+        printed `shouldSatisfy` T.isInfixOf "passkey"
+        printed `shouldSatisfy` (not . T.isInfixOf "#enroll=")
+        printed `shouldSatisfy` (not . T.isInfixOf "enroll --force")
+
+    it "reports a preserved grant's minted_via and remaining TTL" $
+      withHome Nothing $ \paths -> do
+        Right _ <- enrollGrant paths CliToken (10 * 60) False
+        na <- bootHandle paths Nothing Map.empty
+        lines' <- captureBanner True paths na
+        let printed = T.concat lines'
+        printed `shouldSatisfy` T.isInfixOf "cli_token"
+        printed `shouldSatisfy` T.isInfixOf "still valid"
+        printed `shouldSatisfy` T.isInfixOf "enroll --force"
+
+  describe "status authority fields" $ do
+    it "reports enrollment_via, usable and orphaned counts" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) (Map.union orphanCred passkeyCreds)
+        (_, _, body) <- runApp (gated na) (getReq ["api", "auth", "status"])
+        jsonField body "enrollment_via" `shouldBe` Just (String "none")
+        jsonField body "usable_credentials" `shouldBe` Just (Number 1)
+        jsonField body "orphaned_credentials" `shouldBe` Just (Number 1)
+
+  describe "rate limiting" $
+    -- login/options is the ungated challenge source (design §8.1), so it is
+    -- where the issuance budget is observable. Enrollment options bind a grant
+    -- and are one-per-grant by construction.
+    it "returns 429 once the challenge budget is spent" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
         statuses <- mapM (\_ -> do
             (st, _, _) <- runApp (gated na)
-              (postReq ["api", "auth", "register", "options"]
-                 [("X-Seal-Setup-Token", code)])
+              (postReq ["api", "auth", "login", "options"] [])
             pure st) ([1 .. 25] :: [Int])
         length (filter (== status200') statuses) `shouldBe` 20
         length (filter (== status429') statuses) `shouldBe` 5
@@ -447,7 +682,7 @@ cookieToken raw =
        Nothing   -> ""
 
 setupCodeOf :: NewAccess -> IO Text
-setupCodeOf na = case naSetupCode na of
+setupCodeOf na = case naToken na of
   Just c  -> pure c
   Nothing -> expectationFailure "expected a setup code" >> pure ""
 
@@ -520,10 +755,22 @@ writeSection paths section = do
     defaultSecurityConfig { scAccessControl = Just section } PreserveCredentials
     `shouldReturn` Right ()
 
-readSection :: SealPaths -> IO (Maybe AccessControlFileConfig)
-readSection paths = do
-  loaded <- loadSecurityConfig (securityFilePath paths)
-  pure (either (const Nothing) scAccessControl loaded)
+-- | A section whose origin resolves to a different rp id than the fixtures'
+-- credentials, which is how a real rp_mismatch is created (design §14).
+foreignSection :: AccessControlFileConfig
+foreignSection = AccessControlFileConfig
+  { acfcMode = Just "passkey"
+  , acfcOrigin = Just "https://seal.example.com"
+  , acfcRpId = Just "seal.example.com"
+  }
+
+-- | @mode = "none"@: access control explicitly off.
+openSection :: AccessControlFileConfig
+openSection = AccessControlFileConfig
+  { acfcMode = Just "none"
+  , acfcOrigin = Nothing
+  , acfcRpId = Nothing
+  }
 
 passkeySection :: AccessControlFileConfig
 passkeySection = AccessControlFileConfig
@@ -565,6 +812,132 @@ credMap credId key64 = Map.singleton (b64 credId) CredentialFileConfig
   , cfcRpId = "localhost"
   , cfcAddedVia = Nothing
   }
+
+
+
+
+-- | Collect the banner lines a boot would print.
+captureBanner :: Bool -> SealPaths -> NewAccess -> IO [Text]
+captureBanner stderrIsTTY paths na = do
+  ref <- newIORef []
+  printAccessControlBannerTo stderrIsTTY
+    (\line -> modifyIORef' ref (<> [line])) paths na
+  readIORef ref
+
+-- | A credential record for a key the test holds.
+credFor :: ByteString -> ByteString -> CredentialFileConfig
+credFor _credId key64 = CredentialFileConfig
+  { cfcPublicKey = b64 key64
+  , cfcSignCount = 0
+  , cfcLabel = "test key"
+  , cfcCreatedAt = "2026-10-30T14:00:00Z"
+  , cfcRpId = "localhost"
+  , cfcAddedVia = Nothing
+  }
+
+-- | A credential enrolled for another rp id: present, unusable here.
+orphanCfg :: ByteString -> CredentialFileConfig
+orphanCfg credId = (credFor credId (BS.replicate 64 0x04))
+  { cfcLabel = "old key"
+  , cfcRpId = "old.example.com"
+  }
+
+-- | Field lookup on an already-decoded object.
+jsonField' :: KeyMap.KeyMap Value -> Text -> Maybe Value
+jsonField' o k = KeyMap.lookup (Key.fromText k) o
+
+-- | 'postJson' with request headers.
+postJsonWith :: [Text] -> Value -> [(Text, Text)] -> IO Request
+postJsonWith segs value hs = do
+  ref <- newIORef [BL.toStrict (A.encode value)]
+  let nextChunk = atomicModifyIORef' ref $ \case
+        []     -> ([], BS.empty)
+        (c:cs) -> (cs, c)
+  pure (setRequestBodyChunks nextChunk (postReq segs hs))
+
+-- | A signed assertion body for @challenge@, from a key the test holds.
+assertionBody :: Text -> ByteString -> PrivateKey -> Int -> IO Value
+assertionBody challenge credId priv counter = do
+  let clientData = clientDataJSON "webauthn.get" challenge "http://localhost:8080"
+      authData = assertionAuthData counter
+  sig <- sign priv SHA256 (authData <> sha256Raw clientData)
+  pure (object
+    [ "clientDataJSON" .= b64 clientData
+    , "authenticatorData" .= b64 authData
+    , "signature" .= b64 (encodeDerSig sig)
+    , "rawId" .= b64 credId
+    ])
+
+-- | Run a full login ceremony and return the session cookie value.
+loginSession :: NewAccess -> ByteString -> PrivateKey -> IO Text
+loginSession na credId priv = do
+  (stOpts, _, opts) <- runApp (gated na) (postReq ["api", "auth", "login", "options"] [])
+  stOpts `shouldBe` status200'
+  challenge <- challengeOf opts
+  body <- assertionBody challenge credId priv 5
+  req <- postJson ["api", "auth", "login", "verify"] body
+  (st, headers, _) <- runApp (gated na) req
+  st `shouldBe` status200'
+  pure (maybe "" cookieToken (lookup hSetCookie headers))
+
+challengeOf :: BL.ByteString -> IO Text
+challengeOf raw = case jsonField raw "challenge" of
+  Just (String c) -> pure c
+  _               -> expectationFailure "no challenge" >> pure ""
+
+-- | A registration response for @challenge@, built the way a browser builds it.
+--
+-- The verifier checks internal consistency only (design §3): the challenge is
+-- one it issued, rpIdHash matches, the flags are set, rawId agrees with the
+-- attested id, and the COSE key is a valid P-256 point. Every one of those is
+-- client-produced, so a test can produce them — which is exactly why the
+-- enrollment grant, not this ceremony, is the gate.
+registrationBody :: Text -> Text -> ByteString -> Point -> Value
+registrationBody challenge origin credId point = object
+  [ "clientDataJSON" .= b64 clientData
+  , "attestationObject" .= b64 attestation
+  , "rawId" .= b64 credId
+  ]
+  where
+    clientData = clientDataJSON "webauthn.create" challenge origin
+    attestation = cborMap 3
+      <> cborText "fmt" <> cborText "none"
+      <> cborText "attStmt" <> cborMap 0
+      <> cborText "authData" <> cborBytes authData
+    authData = sha256Raw "localhost"
+      <> BS.singleton 0x45              -- user present + user verified + attested data
+      <> beN 4 0                        -- sign count
+      <> BS.replicate 16 0             -- AAGUID
+      <> beN 2 (toInteger (BS.length credId)) <> credId
+      <> coseKey
+    (xc, yc) = BS.splitAt 32 (pointBytes point)
+    coseKey = cborMap 5
+      <> cborInt 1 <> cborInt 2         -- kty: EC2
+      <> cborInt 3 <> cborInt (-7)      -- alg: ES256
+      <> cborInt (-1) <> cborInt 1      -- crv: P-256
+      <> cborInt (-2) <> cborBytes xc
+      <> cborInt (-3) <> cborBytes yc
+
+cborHeader :: Int -> Int -> ByteString
+cborHeader major n
+  | n < 24 = BS.singleton (fromIntegral (major * 32 + n))
+  | n < 256 = BS.pack [fromIntegral (major * 32 + 24), fromIntegral n]
+  | otherwise = BS.pack [ fromIntegral (major * 32 + 25)
+                        , fromIntegral (n `div` 256), fromIntegral (n `mod` 256) ]
+
+cborBytes :: ByteString -> ByteString
+cborBytes b = cborHeader 2 (BS.length b) <> b
+
+cborText :: ByteString -> ByteString
+cborText t = cborHeader 3 (BS.length t) <> t
+
+cborMap :: Int -> ByteString
+cborMap = cborHeader 5
+
+cborInt :: Int -> ByteString
+cborInt n
+  | n >= 0 = cborHeader 0 n
+  | otherwise = cborHeader 1 (negate n - 1)
 
 pointBytes :: Point -> ByteString
 pointBytes (Point x y) = be32 x <> be32 y

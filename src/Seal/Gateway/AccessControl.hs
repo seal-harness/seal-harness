@@ -28,6 +28,7 @@ module Seal.Gateway.AccessControl
   , accessControlMode
   , accessControlCredentialCount
   , authStatusState
+  , printAccessControlBannerTo
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
@@ -41,13 +42,12 @@ import Data.ByteString.Base64.URL qualified as B64Url
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
-import Control.Monad (when)
-import System.Directory (doesFileExist, removeFile)
-import System.FilePath ((</>))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time
+  ( NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime )
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, hCookie, methodDelete, methodGet, methodOptions
   , methodPost, status200, status400, status401, status403, status404
@@ -59,18 +59,22 @@ import Network.Wai
 import Seal.Config.BootPlan (BootPlan (..))
 import Seal.Config.Credentials (enrollCredential, updateCredentialsFile)
 import Seal.Config.Paths
-  ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, securityFilePath )
+  ( SealPaths (..), credentialsFilePath, enrollmentClaimPath, enrollmentGrantPath
+  , enrollmentTokenPath, securityFilePath )
 import Seal.Security.EnrollmentGrant
-  ( Grant (..), GrantSource (..), MintedGrant (..), defaultTtlFor, enrollGrant
-  , grantLiveAt, loadGrantFile )
-import Seal.Config.Security
-  ( AccessControlFileConfig (..), CredentialFileConfig (..)
-  , updateAccessControlSection )
-import Seal.Security.AccessControl (credentialToFile, rpMismatch)
+  ( ChallengeId (..), EnrollmentAuthority, Grant (..), GrantClaim (..)
+  , GrantContext (..), GrantDenied (..), GrantId (..), GrantPhase (..)
+  , GrantSource (..), MintedGrant (..), cancelGrant, claimExclusively
+  , claimLiveAt, defaultTtlFor, effectiveDeadline, enrollGrant, enrollmentAuthority
+  , findAuthority, grantLiveAt, grantRedeems, grantSourceText, loadClaimFile
+  , loadGrantFile, saveGrantFile, tokenDigest )
+import Seal.Config.Security (CredentialFileConfig (..), writeSecretFile)
+import Seal.Security.AccessControl
+  ( CredentialAvailability (..), credentialAvailability, credentialToFile, rpMismatch )
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
 import Seal.Security.WebAuthn
   ( AssertionInput (..), RegistrationInput (..), RegistrationResult (..)
-  , WebAuthnError, verifyAssertion, verifyRegistration, webAuthnErrorCode
+  , WebAuthnError (..), verifyAssertion, verifyRegistration, webAuthnErrorCode
   , webAuthnErrorText )
 import Seal.Security.WebAuthn.Types
   ( AccessMode (..), Credential (..), accessModeText )
@@ -79,14 +83,25 @@ import Seal.Security.WebAuthn.Types
 -- Runtime state
 -- ---------------------------------------------------------------------------
 
+-- | Which ceremony a challenge was issued for. A challenge cannot be redeemed
+-- by a different one, which is what stops a login challenge being used to
+-- register (or a step-up being used to log in).
+data ChallengeKind
+  = ChallengeCreate
+  | ChallengeGet
+  | ChallengeStepUp
+    -- ^ @enroll/options@: prove an existing credential before adding another.
+    -- Bound to the session that asked for it.
+  deriving stock (Eq, Show)
+
 -- | A challenge issued for an in-flight ceremony. Removed on the first verify
 -- attempt (consume-on-attempt), never reusable.
 data Challenge = Challenge
   { chIssuedAt :: !UTCTime
-  , chKind     :: !Text
-    -- ^ @\"create\"@ or @\"get\"@, so a challenge cannot be redeemed by the
-    -- other ceremony.
-  }
+  , chKind     :: !ChallengeKind
+  , chSession  :: !(Maybe Text)
+    -- ^ The session key a 'ChallengeStepUp' belongs to; 'Nothing' otherwise.
+  } deriving stock (Eq, Show)
 
 -- | One authenticated browser session.
 data Session = Session
@@ -101,6 +116,10 @@ data AccessControlState = AccessControlState
   , acsCredentials       :: !(Map Text Credential)
   , acsChallenges        :: !(Map Text Challenge)
   , acsSessions          :: !(Map Text Session)
+  , acsSessionGrants     :: !(Map Text Grant)
+    -- ^ Assertion grants, keyed by the session that earned them. Only the digest
+    -- is stored, and only for the session that presented the step-up: a cookie
+    -- alone can never redeem one (design §7.2, B-1).
   , acsSetupCode         :: !(Maybe Text)
   , acsSetupHash         :: !(Maybe Text)
   , acsServiceToken      :: !Text
@@ -122,8 +141,9 @@ data AccessControlHandle = AccessControlHandle
 -- | What a fresh handle hands back for the boot banner.
 data NewAccess = NewAccess
   { naHandle       :: AccessControlHandle
-  , naSetupCode    :: Maybe Text
-    -- ^ The plaintext token minted by /this/ boot, when boot minted one.
+  , naToken        :: Maybe Text
+    -- ^ The plaintext enrollment token minted by /this/ boot, when boot minted
+    -- one. Never the digest — the digest is in the grant file.
   , naServiceToken :: Text
   , naOrigin       :: Maybe Text
   , naGrant        :: Maybe GrantBanner
@@ -135,7 +155,7 @@ data GrantBanner = GrantBanner
   { gbSource    :: !GrantSource
   , gbRemaining :: !NominalDiffTime
   , gbFresh     :: !Bool
-    -- ^ 'True' when this boot minted it (so the token is 'naSetupCode').
+    -- ^ 'True' when this boot minted it (so the token is 'naToken').
   } deriving stock (Eq, Show)
 
 -- | The gate's verdict.
@@ -211,6 +231,7 @@ newAccessControlHandle paths plan = do
     , acsCredentials = creds
     , acsChallenges = Map.empty
     , acsSessions = Map.empty
+    , acsSessionGrants = Map.empty
     , acsSetupCode = mCode
     , acsSetupHash = tokenKey <$> mCode
     , acsServiceToken = serviceToken
@@ -224,7 +245,7 @@ newAccessControlHandle paths plan = do
     }
   pure NewAccess
     { naHandle       = AccessControlHandle st paths
-    , naSetupCode    = mCode
+    , naToken        = mCode
     , naServiceToken = serviceToken
     , naOrigin       = mOrigin
     , naGrant        = naBanner
@@ -278,7 +299,6 @@ unconfiguredAllow =
   [ ["api", "auth", "status"]
   , ["api", "auth", "register", "options"]
   , ["api", "auth", "register", "verify"]
-  , ["api", "auth", "waive"]
   ]
 
 passkeyAllow :: [[Text]]
@@ -323,17 +343,37 @@ accessControlStatusJson :: AccessControlHandle -> Request -> IO Value
 accessControlStatusJson h req = do
   now <- getCurrentTime
   st <- withMVar (achState h) pure
-  let mismatch s = rpMismatch (acsRpId s) (acsCredentials s)
+  -- The file grant is read per request, never cached (design §7.3): the CLI
+  -- mints while the daemon runs and the UI polls this endpoint.
+  filed <- loadGrantFile (enrollmentGrantPath (achPaths h))
+  let liveFile = filed >>= \grant -> if grantLiveAt now grant then Just grant else Nothing
+      sessKey = sessionKeyFromRequest req
+      sessGrant = sessKey >>= \key -> Map.lookup key (acsSessionGrants st)
+      mismatch = rpMismatch (acsRpId st) (acsCredentials st)
       authenticated = acsMode st == AccessOpen
-        || sessionValid now st (sessionKeyFromRequest req)
+        || sessionValid now st sessKey
+      -- A timing signal ("authority is armed"), not a boolean the UI acts on.
+      enrollmentVia = case (liveFile, sessGrant) of
+        (Just grant, _)   -> grantSourceText (grSource grant)
+        (Nothing, Just grant) -> grantSourceText (grSource grant)
+        _                 -> "none"
+      usable = case acsRpId st of
+        Nothing  -> Map.size (acsCredentials st)
+        Just rp  -> length [ () | cred <- Map.elems (acsCredentials st)
+                                , Just (credRpId cred) == Just rp ]
   pure $ object
     [ "state" .= authStatusState st
     , "authenticated" .= authenticated
     , "origin" .= acsOrigin st
     , "rp_id" .= acsRpId st
-    , "rp_mismatch" .= mismatch st
-    , "setup_required" .= (acsMode st == AccessUnconfigured || mismatch st)
+    , "rp_mismatch" .= mismatch
+    , "setup_required" .= (acsMode st == AccessUnconfigured || mismatch)
     , "credentials" .= Map.size (acsCredentials st)
+    -- Design §8.3: no `enrollment_available` boolean — rev 3 keyed a button on
+    -- the wrong one.
+    , "enrollment_via" .= enrollmentVia
+    , "usable_credentials" .= usable
+    , "orphaned_credentials" .= (Map.size (acsCredentials st) - usable)
     ]
 
 authStatusState :: AccessControlState -> Text
@@ -345,13 +385,6 @@ authStatusState = accessModeText . acsMode
 
 tokenKey :: Text -> Text
 tokenKey = TE.decodeUtf8 . sha256Hash . TE.encodeUtf8
-
--- | Compare a presented token with a stored hash in constant time.
-tokenMatches :: Text -> Maybe Text -> Bool
-tokenMatches presented mHash = case mHash of
-  Nothing -> False
-  Just hashed ->
-    constantTimeEq (TE.encodeUtf8 (tokenKey presented)) (TE.encodeUtf8 hashed)
 
 cookieName :: Text
 cookieName = "seal_session"
@@ -446,8 +479,8 @@ challengeFresh now ch =
 
 -- | Issue a challenge, or fail when the issuance budget or the map cap is
 -- exhausted (never evicting a live entry).
-issueChallenge :: AccessControlHandle -> Text -> IO (Either AuthErr Text)
-issueChallenge h kind = do
+issueChallenge :: AccessControlHandle -> ChallengeKind -> Maybe Text -> IO (Either AuthErr Text)
+issueChallenge h kind mSession = do
   now <- getCurrentTime
   modifyMVar (achState h) $ \st0 -> do
     let st = refillChallenges now st0
@@ -462,18 +495,23 @@ issueChallenge h kind = do
         else do
           raw <- getRandomBytes 32
           let ch = TE.decodeUtf8 (B64Url.encodeUnpadded raw)
-          pure ( st' { acsChallenges = Map.insert ch (Challenge now kind) live
+          pure ( st' { acsChallenges = Map.insert ch (Challenge now kind mSession) live
                      , acsChallengeTokens = acsChallengeTokens st' - 1 }
                , Right ch )
 
 -- | Remove a challenge (consume-on-attempt) and report whether it was present,
 -- fresh and of the right ceremony.
-consumeChallenge :: AccessControlHandle -> Text -> Text -> IO Bool
-consumeChallenge h presented kind = do
+consumeChallenge :: AccessControlHandle -> Text -> ChallengeKind -> Maybe Text -> IO Bool
+consumeChallenge h presented kind mSession = do
   now <- getCurrentTime
   modifyMVar (achState h) $ \st ->
     case Map.lookup presented (acsChallenges st) of
-      Just ch | chKind ch == kind && challengeFresh now ch ->
+      -- A step-up challenge belongs to exactly one session: a different session
+      -- presenting it consumes nothing, so a stolen challenge string is not
+      -- enough to redeem it.
+      Just ch | chKind ch == kind
+              , chSession ch == mSession
+              , challengeFresh now ch ->
         pure (st { acsChallenges = Map.delete presented (acsChallenges st) }, True)
       _ -> pure (st, False)
 
@@ -526,11 +564,11 @@ authApp h req respond =
       accessControlStatusJson h req >>= respond . authOk []
 
     (m, ["api", "auth", "register", "options"]) | m == methodPost -> do
-      result <- withSetupAuthorization h req (registerOptions h)
+      result <- withEnrollment h req (registerOptions h)
       respond (respondResult [] result)
 
     (m, ["api", "auth", "register", "verify"]) | m == methodPost -> do
-      result <- withSetupAuthorization h req (verifyRegistrationEndpoints h False)
+      result <- withEnrollment h req (verifyRegistrationEndpoints h False)
       respond (respondSession result)
 
     (m, ["api", "auth", "login", "options"]) | m == methodPost -> do
@@ -541,13 +579,6 @@ authApp h req respond =
       result <- loginVerify h req
       respond (respondSession result)
 
-    (m, ["api", "auth", "waive"]) | m == methodPost -> do
-      -- The mode is checked before the setup code: in passkey mode there is no
-      -- setup code to present, and the honest answer is "waiving is not
-      -- something a network request can do".
-      result <- waive h req
-      respond (respondResult [] result)
-
     (m, ["api", "auth", "logout"]) | m == methodPost -> do
       logout h req
       -- Clearing the cookie (not just forgetting the session) matters: the
@@ -556,78 +587,191 @@ authApp h req respond =
       cleared <- clearedSessionCookie h
       respond (authOk [cleared] (object ["ok" .= True]))
 
-    (m, ["api", "auth", "credentials"]) | m == methodGet -> do
-      result <- withSessionAuthorization h req (listCredentials h)
+    -- The step-up endpoint pair (design §8.1): a live session confirms itself
+    -- with an existing passkey and receives a short-lived assertion grant.
+    (m, ["api", "auth", "enroll", "options"]) | m == methodPost -> do
+      result <- enrollOptions h req
+      respond (respondResult [] result)
+
+    (m, ["api", "auth", "enroll", "verify"]) | m == methodPost -> do
+      result <- enrollVerify h req
       respond (respondResult [] result)
 
     (m, ["api", "auth", "credentials", "options"]) | m == methodPost -> do
-      result <- withSessionAuthorization h req (registerOptions h)
+      result <- withEnrollment h req (registerOptions h)
       respond (respondResult [] result)
 
     (m, ["api", "auth", "credentials", "verify"]) | m == methodPost -> do
-      result <- withSessionAuthorization h req (verifyRegistrationEndpoints h True)
+      result <- withEnrollment h req (verifyRegistrationEndpoints h True)
       respond (respondSession result)
 
+    (m, ["api", "auth", "credentials"]) | m == methodGet -> do
+      result <- withCredentialAdmin h req (listCredentials h)
+      respond (respondResult [] result)
+
     (m, ["api", "auth", "credentials", cid]) | m == methodDelete -> do
-      result <- withSessionAuthorization h req (const (deleteCredential h cid))
+      result <- withCredentialAdmin h req (const (deleteCredential h cid))
       respond (respondResult [] result)
 
     _ -> respond (authError status404 "not_found" "no such endpoint")
 
--- | The setup-code gate: every enrollment path when the gateway is not yet in a
--- healthy @passkey@ state.
-withSetupAuthorization
-  :: AccessControlHandle -> Request -> (Request -> IO (Either AuthErr a))
-  -> IO (Either AuthErr a)
-withSetupAuthorization h req action = do
-  allowed <- checkSetupCode h req
-  case allowed of
-    Left e    -> pure (Left e)
-    Right ()  -> action req
+-- ---------------------------------------------------------------------------
+-- Enrollment authority
+-- ---------------------------------------------------------------------------
 
--- | The session gate. In a healthy @passkey@ state the browser must hold a
--- session; otherwise (open \/ unconfigured \/ orphaned-rpId) the setup code is
--- what authorises the change, so a remote client cannot enroll a credential and
--- flip the gateway into passkey mode.
-withSessionAuthorization
-  :: AccessControlHandle -> Request -> (Request -> IO (Either AuthErr a))
-  -> IO (Either AuthErr a)
-withSessionAuthorization h req action = do
-  st <- withMVar (achState h) pure
-  if acsMode st == AccessPasskey && not (rpMismatch (acsRpId st) (acsCredentials st))
-    then do
-      now <- getCurrentTime
-      if sessionValid now st (sessionKeyFromRequest req)
-        then action req
-        else pure (Left (AuthErr status401 "unauthenticated" "a passkey session is required"))
-    else withSetupAuthorization h req action
-
-checkSetupCode :: AccessControlHandle -> Request -> IO (Either AuthErr ())
-checkSetupCode h req = do
-  st <- withMVar (achState h) pure
-  case acsSetupHash st of
-    Nothing -> pure (Left (AuthErr status403 "setup_code_required"
-                     "no setup code is active; restart `seal serve` to get one"))
-    Just hashed -> case setupCodeHeader req of
-      Nothing -> pure (Left (AuthErr status403 "setup_code_required"
-                       "missing X-Seal-Setup-Token header"))
-      Just code
-        | tokenMatches code (Just hashed) -> pure (Right ())
-        | otherwise -> pure (Left (AuthErr status403 "setup_code_invalid"
-                             "the setup code is wrong"))
-
-setupCodeHeader :: Request -> Maybe Text
-setupCodeHeader req =
-  case lookup "X-Seal-Setup-Token" (requestHeaders req) of
+-- | The header a client presents enrollment authority in.
+--
+-- Replaces @X-Seal-Setup-Token@: the setup code was a boot-time bearer token
+-- with no expiry, and it is now a grant like any other (design §7.2, §8.2).
+enrollTokenHeader :: Request -> Maybe Text
+enrollTokenHeader req =
+  case lookup "X-Seal-Enroll-Token" (requestHeaders req) of
     Nothing  -> Nothing
     Just raw -> let t = T.strip (TE.decodeUtf8Lenient raw) in if T.null t then Nothing else Just t
+
+-- | Resolve the authority this request presents, then ask whether this boot
+-- state accepts it.
+--
+-- The file-backed grant is re-read on every call and never cached: the CLI
+-- mints while the daemon runs, so a cached copy would be invisible until
+-- restart (design §7.3). Only session-carried assertion grants live in memory.
+--
+-- A presented token that matches nothing is 'GrantInvalid' — it must not be
+-- downgraded to "no authority presented", or a wrong token would be as good as
+-- an absent one (gate round 4, B-1).
+resolveEnrollment
+  :: AccessControlHandle -> AccessControlState -> Request
+  -> IO (Either GrantDenied EnrollmentAuthority)
+resolveEnrollment h st req = do
+  now <- getCurrentTime
+  filed <- loadGrantFile (enrollmentGrantPath (achPaths h))
+  let liveFile = filed >>= \grant -> if grantLiveAt now grant then Just grant else Nothing
+      presented = enrollTokenHeader req
+      sessKey = sessionKeyFromRequest req
+      sessGrant = sessKey >>= \key -> Map.lookup key (acsSessionGrants st)
+      ctx = GrantContext
+        { gcMode = acsMode st
+        , gcAvailability = credentialAvailability (acsRpId st) (acsCredentials st)
+        , gcAuthorized = Nothing
+        , gcHasSession = sessionValid now st sessKey
+        }
+  pure $ case findAuthority presented liveFile sessGrant (isJust sessGrant) of
+    Right grant -> enrollmentAuthority ctx { gcAuthorized = Just (grSource grant) }
+    Left GrantInvalid | isJust presented -> Left GrantInvalid
+    Left _ -> enrollmentAuthority ctx
+
+-- | The wire response for each refusal. The constructors exist for this.
+enrollRefusal :: GrantDenied -> AuthErr
+enrollRefusal denied = case denied of
+  GrantRequired ->
+    AuthErr status403 "grant_required"
+      "enrollment needs an enrollment token; run `seal access-control enroll`"
+  StepUpRequired ->
+    AuthErr status403 "step_up_required"
+      "confirm it's you with an existing passkey to add another"
+  GrantInvalid ->
+    AuthErr status403 "grant_invalid"
+      "that enrollment token is not valid for this gateway; run `seal access-control enroll`"
+
+-- | Gate an enrollment endpoint on 'resolveEnrollment', handing the accepted
+-- authority to the handler.
+withEnrollment
+  :: AccessControlHandle -> Request
+  -> (EnrollmentAuthority -> Request -> IO (Either AuthErr a))
+  -> IO (Either AuthErr a)
+withEnrollment h req action = do
+  st <- withMVar (achState h) pure
+  decision <- resolveEnrollment h st req
+  case decision of
+    Left denied -> pure (Left (enrollRefusal denied))
+    Right authority -> action authority req
+
+-- | Who may list and delete credentials (design §8.1).
+data CredentialAdmin
+  = AdminSession
+  | AdminCliToken
+  | AdminOpen
+  | AdminDenied
+  deriving stock (Eq, Show)
+
+-- | Credential administration is session-or-CLI-token, plus unauthenticated in
+-- @open@ mode (which is fully open anyway, and is what lets @\/access@ work
+-- there at all). Window and assertion grants are enrollment-only.
+credentialAdminFor
+  :: AccessControlHandle -> AccessControlState -> Request -> IO CredentialAdmin
+credentialAdminFor h st req = do
+  now <- getCurrentTime
+  if acsMode st == AccessOpen
+    then pure AdminOpen
+    else if sessionValid now st (sessionKeyFromRequest req)
+      then pure AdminSession
+      else do
+        filed <- loadGrantFile (enrollmentGrantPath (achPaths h))
+        let liveFile = filed >>= \grant -> if grantLiveAt now grant then Just grant else Nothing
+            tokenOk = case (enrollTokenHeader req, liveFile) of
+              (Just raw, Just grant) | grSource grant == CliToken ->
+                case grTokenSha grant of
+                  Just digest -> constantTimeEq digest (tokenDigest raw)
+                  Nothing     -> False
+              _ -> False
+        pure (if tokenOk then AdminCliToken else AdminDenied)
+
+withCredentialAdmin
+  :: AccessControlHandle -> Request
+  -> (Request -> IO (Either AuthErr a))
+  -> IO (Either AuthErr a)
+withCredentialAdmin h req action = do
+  st <- withMVar (achState h) pure
+  verdict <- credentialAdminFor h st req
+  case verdict of
+    AdminDenied -> pure (Left (enrollRefusal GrantRequired))
+    _           -> action req
+
+-- | Bind the outstanding file grant to a challenge, exclusively.
+--
+-- @O_CREAT|O_EXCL@ on the claim file decides which ceremony wins, and the grant
+-- is written back with its bound challenge so a grant bound to A cannot redeem
+-- B (design §7.3). A grant in a session ('Assertion') is not bound here: it is
+-- single-use through the challenge itself.
+bindGrant :: SealPaths -> Grant -> ChallengeId -> IO Bool
+bindGrant paths grant challenge = do
+  now <- getCurrentTime
+  let GrantId rawId = grId grant
+      claim = GrantClaim
+        { clGrantId = grId grant
+        , clChallengeId = challenge
+        , clDeadline = effectiveDeadline grant now (fromIntegral challengeTtlSeconds)
+        }
+  won <- claimExclusively (enrollmentClaimPath paths rawId) claim
+  if not won
+    then pure False
+    else do
+      saved <- saveGrantFile (enrollmentGrantPath paths) grant { grPhase = GrantBound challenge }
+      pure (either (const False) (const True) saved)
+
+-- | Does the outstanding grant permit redeeming this challenge?
+--
+-- 'True' when there is no file grant (the authority was an assertion, carried
+-- by the session), so the assertion path is unaffected by the file protocol.
+grantPermits :: SealPaths -> ChallengeId -> IO Bool
+grantPermits paths challenge = do
+  filed <- loadGrantFile (enrollmentGrantPath paths)
+  case filed of
+    Nothing -> pure True
+    Just grant -> do
+      let GrantId rawId = grId grant
+      held <- loadClaimFile (enrollmentClaimPath paths rawId)
+      now <- getCurrentTime
+      pure (grantRedeems challenge grant && maybe False (claimLiveAt now) held)
 
 -- ---------------------------------------------------------------------------
 -- Handlers
 -- ---------------------------------------------------------------------------
 
-registerOptions :: AccessControlHandle -> Request -> IO (Either AuthErr Value)
-registerOptions h _req = do
+registerOptions
+  :: AccessControlHandle -> EnrollmentAuthority -> Request
+  -> IO (Either AuthErr Value)
+registerOptions h authority _req = do
   st <- withMVar (achState h) pure
   case (acsOrigin st, acsRpId st) of
     (_, Nothing) -> pure (Left (AuthErr status400 "origin_mismatch"
@@ -635,31 +779,49 @@ registerOptions h _req = do
     (Nothing, _) -> pure (Left (AuthErr status400 "origin_mismatch"
                          "this gateway has no origin configured"))
     (Just _, Just rpId) -> do
-      challenge <- issueChallenge h "create"
+      now <- getCurrentTime
+      challenge <- issueChallenge h ChallengeCreate Nothing
       case challenge of
         Left e      -> pure (Left e)
         Right value -> do
-          userRaw <- getRandomBytes 16
-          pure (Right (object
-            [ "challenge" .= value
-            , "rp" .= object ["id" .= rpId, "name" .= ("Seal Harness" :: Text)]
-            , "user" .= object
-                [ "id" .= TE.decodeUtf8 (B64Url.encodeUnpadded userRaw)
-                , "name" .= ("operator" :: Text)
-                , "displayName" .= ("Seal Harness operator" :: Text)
-                ]
-            , "pubKeyCredParams" .=
-                [ object ["type" .= ("public-key" :: Text), "alg" .= (-7 :: Int)] ]
-            , "timeout" .= (120000 :: Int)
-            , "attestation" .= ("none" :: Text)
-            , "authenticatorSelection" .= object
-                [ "userVerification" .= ("required" :: Text)
-                , "residentKey" .= ("preferred" :: Text)
-                ]
-            , "excludeCredentials" .=
-                [ object [ "type" .= ("public-key" :: Text)
-                         , "id" .= cid ] | cid <- Map.keys (acsCredentials st) ]
-            ]))
+          -- Bind the outstanding grant to this challenge before handing out
+          -- the options (design §7.3): the O_EXCL claim is what makes one grant
+          -- redeemable exactly once, even across processes. An assertion grant
+          -- lives in the session and needs no file binding.
+          bound <- case authority of
+            Assertion -> pure True
+            _ -> do
+              filed <- loadGrantFile (enrollmentGrantPath (achPaths h))
+              case filed of
+                Just grant | grantLiveAt now grant ->
+                  bindGrant (achPaths h) grant (ChallengeId value)
+                -- The token was live when 'resolveEnrollment' looked, so this is
+                -- a race with --cancel/--force: the ceremony must not proceed.
+                _ -> pure False
+          if not bound
+            then pure (Left (enrollRefusal GrantInvalid))
+            else do
+              userRaw <- getRandomBytes 16
+              pure (Right (object
+                [ "challenge" .= value
+                , "rp" .= object ["id" .= rpId, "name" .= ("Seal Harness" :: Text)]
+                , "user" .= object
+                    [ "id" .= TE.decodeUtf8 (B64Url.encodeUnpadded userRaw)
+                    , "name" .= ("operator" :: Text)
+                    , "displayName" .= ("Seal Harness operator" :: Text)
+                    ]
+                , "pubKeyCredParams" .=
+                    [ object ["type" .= ("public-key" :: Text), "alg" .= (-7 :: Int)] ]
+                , "timeout" .= (120000 :: Int)
+                , "attestation" .= ("none" :: Text)
+                , "authenticatorSelection" .= object
+                    [ "userVerification" .= ("required" :: Text)
+                    , "residentKey" .= ("preferred" :: Text)
+                    ]
+                , "excludeCredentials" .=
+                    [ object [ "type" .= ("public-key" :: Text)
+                             , "id" .= cid ] | cid <- Map.keys (acsCredentials st) ]
+                ]))
 
 loginOptions :: AccessControlHandle -> IO (Either AuthErr Value)
 loginOptions h = do
@@ -668,7 +830,7 @@ loginOptions h = do
     Nothing -> pure (Left (AuthErr status400 "origin_mismatch"
                      "this gateway has no relying-party id configured"))
     Just rpId -> do
-      challenge <- issueChallenge h "get"
+      challenge <- issueChallenge h ChallengeGet Nothing
       case challenge of
         Left e      -> pure (Left e)
         Right value -> pure (Right (object
@@ -684,8 +846,9 @@ loginOptions h = do
 -- | Verify a registration response. @isAdd@ distinguishes the
 -- authenticated "add another passkey" path from first-run enrollment.
 verifyRegistrationEndpoints
-  :: AccessControlHandle -> Bool -> Request -> IO (Either AuthErr (Value, [Header]))
-verifyRegistrationEndpoints h isAdd req = do
+  :: AccessControlHandle -> Bool -> EnrollmentAuthority -> Request
+  -> IO (Either AuthErr (Value, [Header]))
+verifyRegistrationEndpoints h isAdd authority req = do
   body <- readJsonBody req
   case body of
     Left e -> pure (Left e)
@@ -697,11 +860,23 @@ verifyRegistrationEndpoints h isAdd req = do
         Right (clientData, attestation, rawId) -> do
           now <- getCurrentTime
           let presentedChallenge = clientChallenge clientData
-          consumed <- maybe (pure False) (\c -> consumeChallenge h c "create")
-                                           presentedChallenge
+          -- The grant must still be bound to this challenge and its claim must
+          -- still be inside the deadline; only then is the challenge consumed.
+          permits <- case (authority, presentedChallenge) of
+            (Assertion, Just c) -> pure (Just c)
+            (_, Just c) -> do
+              ok <- grantPermits (achPaths h) (ChallengeId c)
+              pure (if ok then Just c else Nothing)
+            (_, Nothing) -> pure Nothing
+          consumed <- case permits of
+            Nothing -> pure False
+            Just c  -> consumeChallenge h c ChallengeCreate Nothing
           if not consumed
-            then pure (Left (AuthErr status400 "challenge_invalid"
-                       "the challenge is missing, expired or already used"))
+            then pure (Left
+                   (case permits of
+                      Nothing | isJust presentedChallenge -> enrollRefusal GrantInvalid
+                      _ -> AuthErr status400 "challenge_invalid"
+                             "the challenge is missing, expired or already used"))
             else
               case (acsOrigin st, acsRpId st) of
                 (Just origin, Just rpId) ->
@@ -750,7 +925,10 @@ persistRegistration h isAdd result now = do
                       , acsSetupCode = Nothing
                       , acsSetupHash = Nothing
                       }
-          clearSetupCodeFile h
+          -- Success consumes the authority: file grant, claim marker and the
+          -- plaintext token all go, and any session-carried grant with them
+          -- (design §7.2). Sessions themselves are untouched.
+          clearOutstandingGrants h
           token <- mintSession h
           cookie <- sessionCookie h token
           pure (Right ( object
@@ -785,7 +963,7 @@ loginVerify h req = do
                   pure (Left (AuthErr status400 "unknown_credential" "no credential with that id is enrolled"))
                 Just cred -> do
                   consumed <- maybe (pure False)
-                                    (\c -> consumeChallenge h c "get")
+                                    (\c -> consumeChallenge h c ChallengeGet Nothing)
                                     (clientChallenge clientData)
                   if not consumed
                     then pure (Left (AuthErr status400 "challenge_invalid"
@@ -829,6 +1007,144 @@ loginVerify h req = do
                                     "this gateway has no origin configured"))
             Left e -> pure (Left e)
 
+-- ---------------------------------------------------------------------------
+-- enroll/*: prove an existing passkey, then add another
+-- ---------------------------------------------------------------------------
+
+-- | @enroll/options@ (design §8.1): the assertion that authorises adding a
+-- second passkey.
+--
+-- Unlike @login/options@ this is not a session gate but a mode+availability
+-- gate: it exists only in a healthy @passkey@ boot with at least one usable
+-- credential, because there is nothing to prove anywhere else. The challenge is
+-- single-use and bound to the calling session, so a challenge lifted from
+-- another session cannot be redeemed here.
+enrollOptions :: AccessControlHandle -> Request -> IO (Either AuthErr Value)
+enrollOptions h req = do
+  st <- withMVar (achState h) pure
+  now <- getCurrentTime
+  let sessKey = sessionKeyFromRequest req
+  case (acsMode st, credentialAvailability (acsRpId st) (acsCredentials st),
+        sessionValid now st sessKey, sessKey) of
+    (AccessPasskey, Usable, True, Just key) -> do
+      challenge <- issueChallenge h ChallengeStepUp (Just key)
+      case challenge of
+        Left e      -> pure (Left e)
+        Right value -> pure (Right (object
+          [ "challenge" .= value
+          , "rpId" .= fromMaybeText (acsRpId st)
+          , "timeout" .= (120000 :: Int)
+          , "userVerification" .= ("required" :: Text)
+          -- Only usable credentials: the picker must never offer one that
+          -- cannot sign in here.
+          , "allowCredentials" .=
+              [ object [ "type" .= ("public-key" :: Text), "id" .= cid ]
+              | (cid, cred) <- Map.toList (acsCredentials st)
+              , Just (credRpId cred) == acsRpId st ]
+          ]))
+    (AccessPasskey, _, False, _) ->
+      pure (Left (enrollRefusal GrantRequired))
+    _ ->
+      pure (Left (AuthErr status403 "grant_required"
+        "adding a passkey is available only once one is enrolled and usable here"))
+
+-- | @enroll/verify@: check the step-up assertion and return the grant the
+-- client presents to @credentials/*@.
+--
+-- The grant is an 'Assertion' grant: 120 s, digest stored in this session only,
+-- and presented as @X-Seal-Enroll-Token@ on the retried @credentials/options@.
+-- No failure body carries @grant_token@ or @grant_expires_at@.
+enrollVerify :: AccessControlHandle -> Request -> IO (Either AuthErr Value)
+enrollVerify h req = do
+  body <- readJsonBody req
+  case body of
+    Left e -> pure (Left e)
+    Right obj -> do
+      now <- getCurrentTime
+      st <- withMVar (achState h) pure
+      let sessKey = sessionKeyFromRequest req
+      if not (sessionValid now st sessKey)
+           || credentialAvailability (acsRpId st) (acsCredentials st) /= Usable
+        then pure (Left (enrollRefusal GrantRequired))
+        else case (,,,) <$> b64Field obj "clientDataJSON"
+                          <*> b64Field obj "authenticatorData"
+                          <*> b64Field obj "signature"
+                          <*> b64Field obj "rawId" of
+            Left e -> pure (Left e)
+            Right (clientData, authData, signature, rawId) -> do
+              let claimedId = TE.decodeUtf8 (B64Url.encodeUnpadded rawId)
+              case Map.lookup claimedId (acsCredentials st) of
+                Nothing -> pure (Left (enrollRefusal GrantInvalid))
+                Just cred
+                  -- The picker only offers usable credentials, so naming an
+                  -- orphaned one is forged or racing (design §8.1).
+                  | Just (credRpId cred) /= acsRpId st ->
+                      pure (Left (enrollRefusal GrantInvalid))
+                  | otherwise -> do
+                      consumed <- maybe (pure False)
+                        (\c -> consumeChallenge h c ChallengeStepUp sessKey)
+                        (clientChallenge clientData)
+                      if not consumed
+                        then pure (Left (AuthErr status400 "challenge_invalid"
+                                   "the challenge is missing, expired or already used"))
+                        else case (acsOrigin st, acsRpId st) of
+                          (Just origin, Just rpId) ->
+                            case verifyAssertion (credPublicKey cred) AssertionInput
+                                  { aiClientDataJSON = clientData
+                                  , aiAuthenticatorData = authData
+                                  , aiSignature = signature
+                                  , aiExpectedChallenge = fromMaybeText (clientChallenge clientData)
+                                  , aiExpectedOrigin = origin
+                                  , aiExpectedRpId = rpId
+                                  , aiStoredSignCount = credSignCount cred
+                                  } of
+                              Left e -> pure (Left (webAuthnFailure e))
+                              Right newCount -> do
+                                bumped <- claimSignCount h claimedId (credSignCount cred) newCount
+                                if not bumped
+                                  then pure (Left (AuthErr status400 "sign_count_regression"
+                                            "this assertion was already used"))
+                                  else do
+                                    persisted <- persistSignCount h claimedId newCount
+                                    case persisted of
+                                      Left err -> pure (Left (AuthErr status500 "write_failed" err))
+                                      Right () -> mintAssertionGrant h claimedId sessKey
+                          _ -> pure (Left (AuthErr status400 "origin_mismatch"
+                                      "this gateway has no origin configured"))
+
+-- | Write the assertion grant into the session that earned it.
+mintAssertionGrant
+  :: AccessControlHandle -> Text -> Maybe Text -> IO (Either AuthErr Value)
+mintAssertionGrant h _credId mSession = case mSession of
+  Nothing -> pure (Left (enrollRefusal GrantRequired))
+  Just key -> do
+    token <- generateToken 32
+    now <- getCurrentTime
+    ident <- GrantId <$> generateToken 16
+    let grant = Grant
+          { grId        = ident
+          , grExpiresAt = addUTCTime (fromIntegral assertionGrantTtlSeconds) now
+          , grSource    = Assertion
+          , grPhase     = GrantMinted
+          , grTokenSha  = Just (tokenDigest token)
+          }
+    modifyMVar_ (achState h) $ \s ->
+      let live = Map.filter (grantLiveAt now) (acsSessionGrants s)
+      in pure s { acsSessionGrants = Map.insert key grant live }
+    pure (Right (object
+      [ "ok" .= True
+      , "grant_token" .= token
+      , "grant_expires_at" .= isoTimeText (grExpiresAt grant)
+      ]))
+
+-- | The assertion grant's lifetime (design §7.1). Short on purpose: it is the
+-- window between "this is me" and "here is the credential I am adding".
+assertionGrantTtlSeconds :: Int
+assertionGrantTtlSeconds = 120
+
+isoTimeText :: UTCTime -> Text
+isoTimeText = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
 -- | Atomically bump the stored counter only if it is still what we verified
 -- against, so two concurrent replays of one assertion cannot both succeed.
 claimSignCount :: AccessControlHandle -> Text -> Int -> Int -> IO Bool
@@ -866,27 +1182,6 @@ resetBackoff :: AccessControlHandle -> IO ()
 resetBackoff h = modifyMVar_ (achState h) $ \st ->
   pure st { acsFailures = 0 }
 
-waive :: AccessControlHandle -> Request -> IO (Either AuthErr Value)
-waive h req = do
-  st <- withMVar (achState h) pure
-  if acsMode st == AccessPasskey
-    then pure (Left (AuthErr status403 "waive_forbidden"
-               "access control is already configured; edit ~/.seal/security.toml or run `seal access-control reset --yes`"))
-    else do
-      allowed <- checkSetupCode h req
-      case allowed of
-        Left e -> pure (Left e)
-        Right () -> do
-          written <- updateAccessControlSection (securityFilePath (achPaths h)) $ \cfg ->
-            cfg { acfcMode = Just "none" }
-          case written of
-            Left err -> pure (Left (AuthErr status500 "write_failed" err))
-            Right _ -> do
-              modifyMVar_ (achState h) $ \s -> pure s
-                { acsMode = AccessOpen, acsSetupCode = Nothing, acsSetupHash = Nothing }
-              clearSetupCodeFile h
-              pure (Right (object ["ok" .= True, "mode" .= ("none" :: Text)]))
-
 logout :: AccessControlHandle -> Request -> IO ()
 logout h req = case sessionKeyFromRequest req of
   Nothing  -> pure ()
@@ -908,13 +1203,21 @@ listCredentials h _req = do
 
 deleteCredential :: AccessControlHandle -> Text -> IO (Either AuthErr Value)
 deleteCredential h cid = do
+  st <- withMVar (achState h) pure
+  let rpId = acsRpId st
+      -- With a wildcard bind every credential is usable (design §9.4).
+      usable cred = case rpId of
+        Nothing -> True
+        Just rp -> cfcRpId cred == rp
   -- The guard runs inside the writer, on the freshly loaded map, so two
   -- concurrent deletes cannot each see "one other credential remains" and both
   -- proceed. A read-then-write in the handler could.
   written <- updateCredentialsFile (credentialsFilePath (achPaths h)) $ \creds ->
-    if Map.size creds <= 1 && Map.member cid creds
-      then Left "that is the only passkey; add another before removing it"
-      else Right (Map.delete cid creds)
+    let remaining = Map.delete cid creds
+        usableLeft = length (filter usable (Map.elems remaining))
+    in if Map.member cid creds && usableLeft == 0
+         then Left "that is the last passkey that can sign in here; add or fix another before removing it"
+         else Right remaining
   case written of
     Left err -> pure (Left (AuthErr status409 "last_credential" err))
     Right () -> do
@@ -923,13 +1226,15 @@ deleteCredential h cid = do
       pure (Right (object ["ok" .= True, "removed" .= cid]))
 
 
--- | The setup code has been spent, so the non-interactive copy on disk (written
--- by `seal serve` when stderr is not a TTY) must go too.
-clearSetupCodeFile :: AccessControlHandle -> IO ()
-clearSetupCodeFile h = do
-  let path = spState (achPaths h) </> "setup-code"
-  exists <- doesFileExist path
-  when exists (removeFile path)
+-- | Consume every outstanding grant after a successful enrollment.
+--
+-- The file grant, every claim marker and the plaintext token file are removed;
+-- session-carried assertion grants are dropped from memory. Sessions are never
+-- touched — enrollment does not log anyone out.
+clearOutstandingGrants :: AccessControlHandle -> IO ()
+clearOutstandingGrants h = do
+  cancelGrant (achPaths h)
+  modifyMVar_ (achState h) $ \s -> pure s { acsSessionGrants = Map.empty }
 
 -- ---------------------------------------------------------------------------
 -- Body / JSON helpers
@@ -993,3 +1298,77 @@ fromMaybeText = fromMaybe ""
 
 webAuthnFailure :: WebAuthnError -> AuthErr
 webAuthnFailure e = AuthErr status400 (webAuthnErrorCode e) (webAuthnErrorText e)
+
+--------------------------------------------------------------------------------
+-- Boot banner
+--------------------------------------------------------------------------------
+
+-- | Tell the operator, on stderr, what access control is in and what authority
+-- is armed.
+--
+-- Moved out of the unexported 'Seal.Command.Serve' so the behaviour is testable
+-- with an injected sink (design §11). The TTY decision is an argument for the
+-- same reason: the off-TTY path writes @state/enrollment-token@ and prints its
+-- path, and the token itself must never reach a log.
+--
+-- A healthy @passkey@ boot prints neither a token nor a URL, because there is
+-- nothing to set up.
+printAccessControlBannerTo :: Bool -> (Text -> IO ()) -> SealPaths -> NewAccess -> IO ()
+printAccessControlBannerTo stderrIsTTY emit paths access = do
+  mode <- accessControlMode (naHandle access)
+  count <- accessControlCredentialCount (naHandle access)
+  case mode of
+    AccessUnconfigured -> do
+      emit "Access control is NOT configured — the API is closed until setup completes."
+      enrollLines (urlFor "/#enroll=")
+    AccessOpen -> do
+      emit "Access control is OFF — anyone who can reach this address has full control."
+      emit "  (explicitly waived by [access_control] mode = \"none\" in ~/.seal/security.toml)"
+      enrollLines (urlFor "/#enroll=")
+      emit "  Enrolling turns it back on: the grant below stops a network client from enrolling its own key."
+    AccessPasskey -> do
+      emit ("Access control: passkey (" <> T.pack (show count) <> " credential(s) enrolled)")
+      case naGrant access of
+        Just banner | not (gbFresh banner) -> do
+          emit "  Keys registered for a different address cannot sign in here."
+          grantLines banner
+        Just banner -> do
+          emit "  No registered key can sign in here — enroll a new one."
+          grantLines banner
+        Nothing -> pure ()
+  where
+    urlFor suffix = fmap (<> suffix) (naOrigin access)
+
+    enrollLines mUrl = case naGrant access of
+      Just banner -> grantLines banner
+      Nothing -> do
+        emit "  Run `seal access-control enroll` to mint an enrollment token."
+        case mUrl of
+          Just _ -> pure ()
+          Nothing -> emit "  (no origin resolved yet — set [access_control] origin in security.toml)"
+
+    grantLines banner
+      | gbFresh banner = case naToken access of
+          Just token
+            | stderrIsTTY -> do
+                case urlFor "/#enroll=" of
+                  Just base -> emit ("  Open  " <> base <> token)
+                  Nothing   -> pure ()
+                emit ("  Or    paste the token " <> token <> " on the setup screen")
+                emit "  It expires in a few minutes and is consumed by a successful enrollment."
+            -- Off a terminal the token must never reach stderr: that stream is
+            -- a log under systemd or launchd. The operator gets the path.
+            | otherwise -> do
+                writeSecretFile (enrollmentTokenPath paths) token
+                emit ("  Token at " <> T.pack (enrollmentTokenPath paths)
+                        <> " (mode 0600) — stderr is not a terminal.")
+                emit "  It expires in a few minutes and is consumed by a successful enrollment."
+          Nothing -> emit "  Run `seal access-control enroll` to mint an enrollment token."
+      | otherwise = do
+          emit ("  An enrollment grant minted via " <> grantSourceText (gbSource banner)
+                  <> " is still valid for " <> tshowSeconds (gbRemaining banner) <> ".")
+          emit "  Paste the token you were given, or run `seal access-control enroll --force`."
+
+tshowSeconds :: NominalDiffTime -> Text
+tshowSeconds delta =
+  T.pack (show (max 0 (ceiling (realToFrac delta :: Double) :: Int))) <> "s"
