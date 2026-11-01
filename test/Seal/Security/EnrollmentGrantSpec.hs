@@ -14,6 +14,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Bits ((.&.))
 import Data.Time (UTCTime, addUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -24,6 +25,8 @@ import System.IO.Temp (withSystemTempDirectory)
 
 import System.Posix.Files (fileMode, getFileStatus)
 
+import Control.Concurrent.Async (concurrently)
+
 import Test.Hspec
 
 import Seal.Security.AccessControl (CredentialAvailability (..))
@@ -31,8 +34,10 @@ import Seal.Security.WebAuthn.Types (AccessMode (..))
 import Seal.Security.EnrollmentGrant
   ( ChallengeId (..), Grant (..), GrantDenied (..)
   , GrantContext (..), GrantId (..), GrantPhase (..), GrantSource (..)
-  , deleteGrantFile, enrollmentAuthority, findAuthority, grantBody
-  , grantFromJson, grantLiveAt, grantSourceText, grantToJson, loadGrantFile
+  , GrantClaim (..), claimExclusively, claimLiveAt, deleteGrantFile
+  , effectiveDeadline, enrollmentAuthority, findAuthority, grantBody
+  , grantFromJson, grantLiveAt, grantRedeems, grantSourceText, grantToJson
+  , loadClaimFile, loadGrantFile, releaseClaim
   , parseGrantSource, saveGrantFile, tokenDigest )
 
 spec :: Spec
@@ -64,6 +69,12 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
 
     it "treats a missing expires_at as absent" $
       grantFromJson (dropField "expires_at" (grantToJson tokenGrant))
+        `shouldBe` Nothing
+
+    -- The grant id names the claim file, so a separator in it would move the
+    -- file. Only reachable from a hand-edited or corrupted document.
+    it "refuses a grant id containing a path separator" $
+      grantFromJson (withField "grant_id" "../../passwd" (grantToJson tokenGrant))
         `shouldBe` Nothing
 
     it "refuses a token-backed grant with no digest" $
@@ -204,6 +215,85 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
         deleteGrantFile path
 
 
+  -- Design §7.3, step 3.4. The claim is what makes a grant one-shot: the O_EXCL
+  -- create result decides the winner, never a prior read.
+  describe "claim exclusivity" $ do
+    it "lets exactly one of two claimants win" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "claim"
+            claim = mkClaim "challenge-A"
+        first  <- claimExclusively path claim
+        second <- claimExclusively path claim
+        first `shouldBe` True
+        second `shouldBe` False
+
+    it "lets exactly one of two concurrent claimants win" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "claim"
+        (a, b) <- concurrently (claimExclusively path (mkClaim "A"))
+                               (claimExclusively path (mkClaim "B"))
+        [a, b] `shouldSatisfy` \wins -> length (filter id wins) == 1
+
+    it "round-trips a claim through the file" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "claim"
+            claim = mkClaim "challenge-A"
+        claimExclusively path claim `shouldReturn` True
+        loadClaimFile path `shouldReturn` Just claim
+
+    it "releases only the claim it owns (compare-and-delete)" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "claim"
+            claim = mkClaim "challenge-A"
+        claimExclusively path claim `shouldReturn` True
+        -- A stale ceremony must not release the current claim.
+        releaseClaim path (ChallengeId "challenge-B")
+        loadClaimFile path `shouldReturn` Just claim
+        releaseClaim path (ChallengeId "challenge-A")
+        loadClaimFile path `shouldReturn` Nothing
+        -- …and the grant can be rebound afterwards.
+        claimExclusively path (mkClaim "challenge-C") `shouldReturn` True
+
+    it "treats an unreadable claim as no claim at all" $
+      withSystemTempDirectory "seal-grant" $ \dir -> do
+        let path = dir </> "claim"
+        writeFile path "not json"
+        loadClaimFile path `shouldReturn` Nothing
+
+  describe "effectiveDeadline / claimLiveAt" $ do
+    it "takes the challenge TTL when it expires before the grant" $
+      effectiveDeadline shortLivedGrant fixtureTime 120
+        `shouldBe` addUTCTime 120 fixtureTime
+
+    it "never outlives the grant" $
+      effectiveDeadline nearExpiryGrant fixtureTime 600
+        `shouldBe` addUTCTime 60 fixtureTime
+
+    it "is live at 119 s and 119.5 s, and dead at 120 s" $ do
+      let claim = mkClaimAt (addUTCTime 120 fixtureTime)
+      claimLiveAt (addUTCTime 119 fixtureTime) claim `shouldBe` True
+      claimLiveAt (addUTCTime 119.5 fixtureTime) claim `shouldBe` True
+      claimLiveAt (addUTCTime 120 fixtureTime) claim `shouldBe` False
+
+    it "is dead for a claim whose deadline is 1 s in the past" $ do
+      let claim = mkClaimAt (addUTCTime (-1) fixtureTime)
+      claimLiveAt fixtureTime claim `shouldBe` False
+
+  describe "grantRedeems" $ do
+    it "accepts the challenge the grant was bound to" $
+      grantRedeems (ChallengeId "challenge-A")
+                   tokenGrant { grPhase = GrantBound (ChallengeId "challenge-A") }
+        `shouldBe` True
+
+    it "refuses a different challenge" $
+      grantRedeems (ChallengeId "challenge-B")
+                   tokenGrant { grPhase = GrantBound (ChallengeId "challenge-A") }
+        `shouldBe` False
+
+    it "refuses a grant that was never bound (options was skipped)" $
+      grantRedeems (ChallengeId "challenge-A") tokenGrant `shouldBe` False
+
+
 --------------------------------------------------------------------------------
 -- Matrix
 --------------------------------------------------------------------------------
@@ -301,6 +391,23 @@ tokenGrant = Grant
   , grSource    = CliToken
   , grPhase     = GrantMinted
   , grTokenSha  = Just rawDigest
+  }
+
+shortLivedGrant :: Grant
+shortLivedGrant = tokenGrant { grExpiresAt = addUTCTime 3600 fixtureTime }
+
+nearExpiryGrant :: Grant
+nearExpiryGrant = tokenGrant { grExpiresAt = addUTCTime 60 fixtureTime }
+
+mkClaim :: T.Text -> GrantClaim
+mkClaim challenge = (mkClaimAt (addUTCTime 120 fixtureTime))
+  { clChallengeId = ChallengeId challenge }
+
+mkClaimAt :: UTCTime -> GrantClaim
+mkClaimAt deadline = GrantClaim
+  { clGrantId = GrantId "grant-1"
+  , clChallengeId = ChallengeId "challenge-A"
+  , clDeadline = deadline
   }
 
 windowGrant :: Grant

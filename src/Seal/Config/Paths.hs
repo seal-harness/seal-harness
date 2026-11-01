@@ -8,6 +8,7 @@ module Seal.Config.Paths
   , securityFilePath
   , credentialsFilePath
   , enrollmentGrantPath
+  , enrollmentClaimPath
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
@@ -144,6 +145,15 @@ credentialsFilePath paths = spHome paths </> "credentials.toml"
 -- what @--cancel@ does on purpose.
 enrollmentGrantPath :: SealPaths -> FilePath
 enrollmentGrantPath paths = spState paths </> "enrollment-grant.json"
+
+-- | Path to the exclusive claim marker for one grant:
+-- @\<state\>\/enrollment-grant.claimed-\<grant-id\>@.
+--
+-- The claim is created @O_CREAT|O_EXCL@: the /create/ result decides which
+-- ceremony wins, so two verifies cannot both redeem one grant (design §7.3).
+enrollmentClaimPath :: SealPaths -> T.Text -> FilePath
+enrollmentClaimPath paths grantId =
+  spState paths </> ("enrollment-grant.claimed-" <> T.unpack grantId)
 
 -- | Absolute path to the source-control repo registry TOML file:
 -- @\<config\>\/repos.toml@.

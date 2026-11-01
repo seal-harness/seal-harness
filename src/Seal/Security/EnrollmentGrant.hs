@@ -28,6 +28,13 @@ module Seal.Security.EnrollmentGrant
   , grantFromJson
   , grantBody
   , grantBodyText
+  , GrantClaim (..)
+  , claimExclusively
+  , claimLiveAt
+  , effectiveDeadline
+  , grantRedeems
+  , loadClaimFile
+  , releaseClaim
   , grantLiveAt
   , loadGrantFile
   , saveGrantFile
@@ -42,13 +49,17 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time (UTCTime)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Control.Exception (IOException, try)
 import Control.Monad (when)
 import System.Directory (doesFileExist, removeFile, renameFile)
 import System.FilePath (takeBaseName, takeDirectory)
 import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
+import System.Posix.IO
+  ( OpenFileFlags (creat, exclusive), OpenMode (WriteOnly), defaultFileFlags
+  , fdToHandle, openFd )
 
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
@@ -124,6 +135,20 @@ data Grant = Grant
   , grSource    :: !GrantSource
   , grPhase     :: !GrantPhase
   , grTokenSha  :: !(Maybe ByteString)
+  } deriving stock (Eq, Show)
+
+-- | One ceremony's exclusive hold on a grant (design §7.3).
+--
+-- Created @O_CREAT|O_EXCL@ when @options@ binds, so the /create/ result decides
+-- which of two racing verifies wins — a prior read cannot, because two readers
+-- can both see "no claim" before either writes.
+--
+-- @clDeadline@ is 'effectiveDeadline': the claim may never outlive the grant it
+-- belongs to.
+data GrantClaim = GrantClaim
+  { clGrantId     :: !GrantId
+  , clChallengeId :: !ChallengeId
+  , clDeadline    :: !UTCTime
   } deriving stock (Eq, Show)
 
 -- | The authority a request proved it holds. Same vocabulary as
@@ -222,7 +247,13 @@ grantFromJson = parseMaybe parseGrant
 
 parseGrant :: Value -> Parser Grant
 parseGrant = withObject "Grant" $ \o -> do
-  ident <- GrantId <$> o .: "grant_id"
+  ident@(GrantId rawId) <- GrantId <$> o .: "grant_id"
+  -- The id names the claim file, so a separator in it would move the file.
+  -- Grant ids are minted as hex, so this only rejects a hand-edited or
+  -- corrupted document.
+  when (any (`elem` ("/\\" :: String)) (T.unpack rawId)
+          || ".." `T.isInfixOf` rawId)
+    (fail "grant_id must not contain a path separator")
   source <- o .: "minted_via" >>= requireSource
   expires <- o .: "expires_at" >>= requireTime
   phase <- maybe GrantMinted (GrantBound . ChallengeId) <$> o .:? "bound_challenge"
@@ -397,3 +428,93 @@ deleteGrantFile :: FilePath -> IO ()
 deleteGrantFile path = do
   exists <- doesFileExist path
   when exists (removeFile path)
+
+--------------------------------------------------------------------------------
+-- Claims
+--------------------------------------------------------------------------------
+
+-- | The one deadline rule: a claim expires at whichever comes first, the
+-- grant's own expiry or the challenge's TTL from now.
+--
+-- Both bounds are needed. Only the challenge TTL would let a claim outlive a
+-- grant with a shorter TTL; only the grant expiry would let a ceremony keep a
+-- bound claim alive for the grant's whole lifetime after its prompt was
+-- abandoned.
+effectiveDeadline :: Grant -> UTCTime -> NominalDiffTime -> UTCTime
+effectiveDeadline grant now challengeTtl =
+  min (grExpiresAt grant) (addUTCTime challengeTtl now)
+
+-- | Is the claim still within its deadline?
+--
+-- @now == deadline@ is expired: the deadline is the first instant at which the
+-- claim may no longer be used.
+claimLiveAt :: UTCTime -> GrantClaim -> Bool
+claimLiveAt now claim = now < clDeadline claim
+
+-- | May this grant redeem @challenge@?
+--
+-- Only a grant that @options@ bound to this exact challenge can. A grant still
+-- in 'GrantMinted' means the client skipped @options@, and a grant bound
+-- elsewhere is a race or a forgery — both refuse, and neither silently rebinds.
+grantRedeems :: ChallengeId -> Grant -> Bool
+grantRedeems challenge grant = grPhase grant == GrantBound challenge
+
+-- | Take the exclusive claim for a grant, or lose the race.
+--
+-- @True@ means this caller holds it. The file is created @O_CREAT|O_EXCL@ and
+-- written directly: there is no temp-and-rename here, because the atomicity
+-- this needs is over /existence/, not over content. A crash mid-write leaves a
+-- claim the reader cannot parse, which is treated as no claim — the next
+-- @options@ rebinds.
+claimExclusively :: FilePath -> GrantClaim -> IO Bool
+claimExclusively path claim = do
+  opened <- try (openFd path WriteOnly defaultFileFlags
+                   { creat = Just 0o600, exclusive = True })
+  case opened of
+    Left (_ :: IOException) -> pure False
+    Right fd -> do
+      h <- fdToHandle fd
+      LBS.hPut h (claimBody claim)
+      hClose h
+      setFileMode path 0o600
+      pure True
+
+-- | Give the claim back, but only if it is still /this/ ceremony's claim.
+--
+-- Compare-and-delete: a failed verify must not delete a claim that a newer
+-- @options@ has already replaced, or the retry would find the grant claimed by
+-- nobody and the loser of that race would win the next one.
+releaseClaim :: FilePath -> ChallengeId -> IO ()
+releaseClaim path challenge = do
+  held <- loadClaimFile path
+  case held of
+    Just claim | clChallengeId claim == challenge -> deleteGrantFile path
+    _ -> pure ()
+
+-- | Read a claim. Unparseable or absent both mean "nobody holds it".
+loadClaimFile :: FilePath -> IO (Maybe GrantClaim)
+loadClaimFile path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      raw <- LBS.readFile path
+      pure (either (const Nothing) claimFromJson (eitherDecode raw))
+
+claimBody :: GrantClaim -> LBS.ByteString
+claimBody claim = encode (object
+  [ "grant_id" .= grantIdText (clGrantId claim)
+  , "challenge_id" .= challengeIdText (clChallengeId claim)
+  , "deadline" .= isoTime (clDeadline claim)
+  ])
+
+claimFromJson :: Value -> Maybe GrantClaim
+claimFromJson = parseMaybe $ withObject "GrantClaim" $ \o -> do
+  ident     <- GrantId <$> o .: "grant_id"
+  challenge <- ChallengeId <$> o .: "challenge_id"
+  deadline  <- o .: "deadline" >>= requireTime
+  pure (GrantClaim ident challenge deadline)
+  where
+    requireTime raw = case parseIsoTimeMaybe raw of
+      Just t  -> pure t
+      Nothing -> fail ("unparseable deadline: " <> T.unpack raw)
