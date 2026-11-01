@@ -15,6 +15,7 @@ import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.AccessControlSpec
+import qualified Seal.Command.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
@@ -220,6 +221,7 @@ specs = do
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.AccessControlSpec.spec
+  Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec

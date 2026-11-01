@@ -7,6 +7,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Lens (view)
 import System.Environment (getArgs, withArgs)
 import qualified Configuration.Utils as CUtils
+import System.Exit (exitWith)
 import System.Posix.Resource
   ( ResourceLimits (..), ResourceLimit (..), Resource (ResourceOpenFiles)
   , getResourceLimit, setResourceLimit )
@@ -44,7 +45,11 @@ dispatch cfg =
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
       CommandServe autonomy mStaticDir -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir logger)
-      CommandAccessControl action -> liftIO (Seal.Command.AccessControl.runAccessControl action)
+      CommandAccessControl action -> do
+        -- The command returns its code; exiting stays here so every code is
+        -- assertable in-process (design §12).
+        code <- liftIO (Seal.Command.AccessControl.runAccessControl action)
+        liftIO (exitWith code)
       CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 
 -- | Map the process arguments so that an empty argument list behaves as if

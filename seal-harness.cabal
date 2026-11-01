@@ -526,6 +526,7 @@ test-suite tests
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec
+        Seal.Command.AccessControlSpec
         Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
