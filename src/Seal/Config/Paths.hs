@@ -9,6 +9,7 @@ module Seal.Config.Paths
   , credentialsFilePath
   , enrollmentGrantPath
   , enrollmentClaimPath
+  , enrollmentTokenPath
   , serveLockPath
   , reposFilePath
   , repoCloneStateDir
@@ -155,6 +156,16 @@ enrollmentGrantPath paths = spState paths </> "enrollment-grant.json"
 enrollmentClaimPath :: SealPaths -> T.Text -> FilePath
 enrollmentClaimPath paths grantId =
   spState paths </> ("enrollment-grant.claimed-" <> T.unpack grantId)
+
+-- | Path to the plaintext enrollment token:
+-- @\<state\>\/enrollment-token@.
+--
+-- Written only when @seal access-control enroll@ (or the boot banner) runs with
+-- stderr not a TTY, so a daemon operator is never left holding a token that was
+-- printed into a log. Mode @0600@; reaped on @--cancel@, on the next mint and at
+-- boot.
+enrollmentTokenPath :: SealPaths -> FilePath
+enrollmentTokenPath paths = spState paths </> "enrollment-token"
 
 -- | Path to the daemon liveness lock: @\<state\>\/serve.lock@.
 --

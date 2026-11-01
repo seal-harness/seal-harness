@@ -28,6 +28,11 @@ module Seal.Security.EnrollmentGrant
   , grantFromJson
   , grantBody
   , grantBodyText
+  , MintedGrant (..)
+  , enrollGrant
+  , cancelGrant
+  , parseTtl
+  , defaultTtlFor
   , GrantClaim (..)
   , claimExclusively
   , claimLiveAt
@@ -49,12 +54,13 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time (NominalDiffTime, UTCTime, addUTCTime)
+import Data.Char (isDigit)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import Control.Exception (IOException, try)
-import Control.Monad (when)
-import System.Directory (doesFileExist, removeFile, renameFile)
-import System.FilePath (takeBaseName, takeDirectory)
+import Control.Monad (forM_, when)
+import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
+import System.FilePath ((</>), takeBaseName, takeDirectory)
 import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
 import System.Posix.IO
@@ -65,7 +71,9 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.ByteString.Base64.URL qualified as B64Url
 
-import Seal.Security.Crypto (constantTimeEq, sha256Hash)
+import Seal.Security.Crypto (constantTimeEq, generateToken, sha256Hash)
+import Seal.Config.Paths
+  ( SealPaths (..), enrollmentGrantPath, enrollmentTokenPath )
 import Seal.Security.AccessControl (CredentialAvailability (..))
 import Seal.Security.WebAuthn.Types (AccessMode (..))
 
@@ -518,3 +526,138 @@ claimFromJson = parseMaybe $ withObject "GrantClaim" $ \o -> do
     requireTime raw = case parseIsoTimeMaybe raw of
       Just t  -> pure t
       Nothing -> fail ("unparseable deadline: " <> T.unpack raw)
+
+--------------------------------------------------------------------------------
+-- Minting
+--------------------------------------------------------------------------------
+
+-- | A grant that was just written to @state/@, plus the plaintext token the
+-- client must present.
+--
+-- The token is the only copy: the file stores its digest. Losing it means
+-- @--force@ (or @--cancel@), which is why the command prints it to stdout.
+-- 'Nothing' for a 'CliWindow' grant, which presents no secret at all.
+data MintedGrant = MintedGrant
+  { mgGrant :: !Grant
+  , mgToken :: !(Maybe Text)
+  } deriving stock (Eq, Show)
+
+-- | The default lifetime of a grant minted from the terminal (design §7.1).
+defaultGrantTtl :: GrantSource -> NominalDiffTime
+defaultGrantTtl CliWindow = 5 * 60
+defaultGrantTtl _         = 10 * 60
+
+-- | Mint a grant, unless one is already outstanding.
+--
+-- Refusing rather than overwriting is what makes a lost token recoverable: the
+-- refusal names the outstanding grant's source and remaining lifetime, and
+-- @--force@ is the deliberate way to replace it. Minting also reaps every stale
+-- claim marker and the previous token file, because a new grant invalidates all
+-- of them.
+enrollGrant
+  :: SealPaths
+  -> GrantSource
+  -> NominalDiffTime
+  -> Bool              -- ^ force: replace an outstanding grant
+  -> IO (Either Text MintedGrant)
+enrollGrant paths source ttl force = do
+  now <- getCurrentTime
+  existing <- loadGrantFile (enrollmentGrantPath paths)
+  case existing of
+    Just grant | grantLiveAt now grant, not force ->
+      pure (Left (outstandingRefusal now grant))
+    _ -> do
+      token <- case source of
+        CliWindow -> pure Nothing
+        _         -> Just <$> generateToken 32
+      ident <- GrantId <$> generateToken 16
+      let grant = Grant
+            { grId        = ident
+            , grExpiresAt = addUTCTime ttl now
+            , grSource    = source
+            , grPhase     = GrantMinted
+            , grTokenSha  = tokenDigest <$> token
+            }
+      reapClaims paths
+      reapTokenFile paths
+      saved <- saveGrantFile (enrollmentGrantPath paths) grant
+      pure $ case saved of
+        Left err  -> Left err
+        Right ()  -> Right (MintedGrant grant token)
+
+-- | Drop every trace of the outstanding grant: the grant file, every claim
+-- marker and the plaintext token.
+--
+-- Idempotent and silent when nothing is outstanding — @--cancel@ with nothing
+-- to cancel is a success, not an error.
+cancelGrant :: SealPaths -> IO ()
+cancelGrant paths = do
+  deleteGrantFile (enrollmentGrantPath paths)
+  reapClaims paths
+  reapTokenFile paths
+
+-- | Delete every claim marker. A new grant (or a cancel) invalidates all of
+-- them: they name grants that no longer exist.
+reapClaims :: SealPaths -> IO ()
+reapClaims paths = do
+  entries <- listDirectory (spState paths)
+  forM_ entries $ \entry -> when (claimPrefix `T.isPrefixOf` T.pack entry) $
+    removeFile (spState paths </> entry)
+  where
+    claimPrefix = "enrollment-grant.claimed-"
+
+reapTokenFile :: SealPaths -> IO ()
+reapTokenFile paths = do
+  let path = enrollmentTokenPath paths
+  exists <- doesFileExist path
+  when exists (removeFile path)
+
+-- | How long the grant has left. Negative once expired.
+grantRemaining :: UTCTime -> Grant -> NominalDiffTime
+grantRemaining now grant = diffUTCTime (grExpiresAt grant) now
+
+outstandingRefusal :: UTCTime -> Grant -> Text
+outstandingRefusal now grant =
+  "an enrollment grant is already outstanding (minted via "
+    <> grantSourceText (grSource grant) <> ", "
+    <> tshowSeconds (grantRemaining now grant) <> " left).\n"
+    <> "  Use the token you were given, or re-run with --force to replace it,\n"
+    <> "  or run `seal access-control enroll --cancel` to drop it."
+
+tshowSeconds :: NominalDiffTime -> Text
+tshowSeconds delta =
+  T.pack (show (max 0 (ceiling (realToFrac delta :: Double) :: Int))) <> "s"
+
+-- | Parse a @--ttl@ value: @\<N\>\<s|m|h\>@.
+--
+-- A bare number is a usage error, not a default unit: "10" meaning ten minutes
+-- and "10" meaning ten seconds are both plausible, so guessing is how an
+-- operator ends up with a window that closed before they used it. The result is
+-- clamped to 30 s – 24 h, the range the design allows.
+parseTtl :: Text -> Either Text NominalDiffTime
+parseTtl raw =
+  case T.unsnoc (T.strip raw) of
+    Just (digits, unit) | not (T.null digits), T.all isAsciiDigit digits ->
+      let multiplier = case unit of
+            's' -> 1
+            'm' -> 60
+            'h' -> 3600
+            _   -> 0
+      in if multiplier == 0
+           then Left (badTtl raw)
+           else Right (fromIntegral (max 30 (min 86400 (digitsToSeconds digits * multiplier))))
+    _ -> Left (badTtl raw)
+  where
+    badTtl value =
+      "--ttl \"" <> value <> "\" is not a duration.\n"
+        <> "  Use a number followed by s, m or h — for example 90s, 10m or 1h."
+
+isAsciiDigit :: Char -> Bool
+isAsciiDigit = isDigit
+
+digitsToSeconds :: Text -> Integer
+digitsToSeconds = T.foldl' (\acc c -> acc * 10 + toInteger (fromEnum c - fromEnum '0')) 0
+
+-- | The lifetime the command should use when @--ttl@ is absent.
+defaultTtlFor :: GrantSource -> NominalDiffTime
+defaultTtlFor = defaultGrantTtl
