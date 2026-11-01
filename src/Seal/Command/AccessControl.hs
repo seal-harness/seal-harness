@@ -33,6 +33,8 @@ import Seal.Config.Paths
   ( SealPaths, configFilePath, credentialsFilePath, getSealPaths, securityFilePath
   , enrollmentTokenPath, serveLockPath )
 import Seal.Security.DaemonLock (daemonHoldsLock)
+import Seal.Gateway.Audit
+  ( AuditEvent (..), AuditFields (..), appendAudit, emptyAuditFields )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), WriteMode (..), clearAccessControlSection
   , updateAccessControlSection, writeSecretFile )
@@ -191,6 +193,10 @@ windowAllowed paths CliWindow = do
 announce :: SealPaths -> MintedGrant -> IO ExitCode
 announce paths minted = do
   now <- getCurrentTime
+  _ <- appendAudit paths now (emptyAuditFields GrantMinted)
+         { afVia = Just (grSource (mgGrant minted))
+         , afRemainingSeconds = Just (secondsLeft now (mgGrant minted))
+         }
   interactive <- hIsTerminalDevice stderr
   case mgToken minted of
     Just token -> do
@@ -205,6 +211,9 @@ announce paths minted = do
   hPutStrLn stderr (T.unpack (summary now (mgGrant minted)))
   pure ExitSuccess
   where
+    secondsLeft now grant =
+      max 0 (ceiling (realToFrac (diffUTCTime (grExpiresAt grant) now) :: Double) :: Int)
+
     summary now grant =
       "Grant minted via " <> grantSourceText (grSource grant) <> ", expiring in "
         <> T.pack (show (max 0 (ceiling
@@ -229,6 +238,8 @@ disable paths True = do
       case written of
         Left err -> refuse ("could not disable access control: " <> err)
         Right _ -> do
+          now <- getCurrentTime
+          _ <- appendAudit paths now (emptyAuditFields ModeDisabled)
           TIO.putStrLn "Access control is off ([access_control] mode = \"none\")."
           TIO.putStrLn "  Credentials are kept. `seal access-control enroll` turns it back on."
           pure ExitSuccess

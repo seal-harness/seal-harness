@@ -32,6 +32,7 @@ module Seal.Gateway.AccessControl
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
+import Control.Monad (when)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -69,6 +70,9 @@ import Seal.Security.EnrollmentGrant
   , findAuthority, grantLiveAt, grantRedeems, grantSourceText, loadClaimFile
   , loadGrantFile, saveGrantFile, tokenDigest )
 import Seal.Config.Security (CredentialFileConfig (..), writeSecretFile)
+import Seal.Gateway.Audit qualified as Audit
+import Seal.Gateway.Audit
+  ( AuditFields (..), admitRefusal, appendAudit, emptyAuditFields, newAuditGate )
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), credentialAvailability, credentialToFile, rpMismatch )
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
@@ -136,6 +140,9 @@ data AccessControlState = AccessControlState
 data AccessControlHandle = AccessControlHandle
   { achState :: MVar AccessControlState
   , achPaths :: SealPaths
+  , achAudit :: Audit.AuditGate
+    -- ^ Aggregation state for refusal events. Per-handle so a restart starts
+    -- with a clean table; the log itself is path-based and shared with the CLI.
   }
 
 -- | What a fresh handle hands back for the boot banner.
@@ -221,11 +228,21 @@ newAccessControlHandle paths plan = do
           pure (Nothing, Just (banner (grSource grant) now grant False))
         _ -> do
           minted <- enrollGrant paths source (defaultTtlFor source) True
+          case minted of
+            Right result -> do
+              _ <- Audit.appendAudit paths now
+                     (emptyAuditFields Audit.GrantMinted)
+                       { afVia = Just (grSource (mgGrant result))
+                       , afRemainingSeconds = Just (round (defaultTtlFor source))
+                       }
+              pure ()
+            Left _ -> pure ()
           pure $ case minted of
             Left _ -> (Nothing, Nothing)
             Right result ->
               ( mgToken result
               , Just (banner (grSource (mgGrant result)) now (mgGrant result) True) )
+  auditGate <- newAuditGate
   st <- newMVar AccessControlState
     { acsMode = bpMode plan
     , acsCredentials = creds
@@ -244,7 +261,7 @@ newAccessControlHandle paths plan = do
     , acsRetryAfter = now
     }
   pure NewAccess
-    { naHandle       = AccessControlHandle st paths
+    { naHandle       = AccessControlHandle st paths auditGate
     , naToken        = mCode
     , naServiceToken = serviceToken
     , naOrigin       = mOrigin
@@ -683,8 +700,35 @@ withEnrollment h req action = do
   st <- withMVar (achState h) pure
   decision <- resolveEnrollment h st req
   case decision of
-    Left denied -> pure (Left (enrollRefusal denied))
+    Left denied -> do
+      auditRefusal h denied
+      pure (Left (enrollRefusal denied))
     Right authority -> action authority req
+
+-- | Record a refused enrollment attempt, aggregated.
+--
+-- Aggregation is what keeps a pre-auth flood from rotating the state-changing
+-- evidence away (design §15): the key is the refusal code, never anything the
+-- client chose.
+auditRefusal :: AccessControlHandle -> GrantDenied -> IO ()
+auditRefusal h denied = do
+  now <- getCurrentTime
+  let code = case denied of
+        GrantRequired   -> "grant_required"
+        StepUpRequired  -> "step_up_required"
+        GrantInvalid    -> "grant_invalid"
+  admitted <- admitRefusal (achAudit h) now code
+  when admitted $ do
+    _ <- appendAudit (achPaths h) now (emptyAuditFields Audit.GrantRefused)
+    pure ()
+
+-- | Record a state-changing event. Failures are swallowed on purpose: the audit
+-- log is detective, and a full disk must not fail a login.
+auditEvent :: AccessControlHandle -> AuditFields -> IO ()
+auditEvent h fields = do
+  now <- getCurrentTime
+  _ <- appendAudit (achPaths h) now fields
+  pure ()
 
 -- | Who may list and delete credentials (design §8.1).
 data CredentialAdmin
@@ -889,15 +933,15 @@ verifyRegistrationEndpoints h isAdd authority req = do
                         , riExpectedRpId = rpId
                         } of
                     Left e -> pure (Left (webAuthnFailure e))
-                    Right result -> persistRegistration h isAdd result now
+                    Right result -> persistRegistration h authority isAdd result now
                 _ -> pure (Left (AuthErr status400 "origin_mismatch"
                             "this gateway has no origin configured"))
         Left e -> pure (Left e)
 
 persistRegistration
-  :: AccessControlHandle -> Bool -> RegistrationResult -> UTCTime
+  :: AccessControlHandle -> EnrollmentAuthority -> Bool -> RegistrationResult -> UTCTime
   -> IO (Either AuthErr (Value, [Header]))
-persistRegistration h isAdd result now = do
+persistRegistration h authority isAdd result now = do
   st <- withMVar (achState h) pure
   let rawId = TE.decodeUtf8 (B64Url.encodeUnpadded (rrCredentialId result))
       cred = Credential
@@ -929,6 +973,16 @@ persistRegistration h isAdd result now = do
           -- plaintext token all go, and any session-carried grant with them
           -- (design §7.2). Sessions themselves are untouched.
           clearOutstandingGrants h
+          auditEvent h (emptyAuditFields Audit.CredentialAdded)
+            { afCredentialId = Just rawId
+            , afLabel = Just (credLabel cred)
+            , afRpId = Just (credRpId cred)
+            , afOrigin = acsOrigin st
+            , afVia = Just authority
+            }
+          when (acsMode st /= AccessPasskey) $
+            auditEvent h (emptyAuditFields Audit.ModeEnabled) { afOrigin = acsOrigin st }
+          auditEvent h (emptyAuditFields Audit.GrantConsumed) { afOrigin = acsOrigin st }
           token <- mintSession h
           cookie <- sessionCookie h token
           pure (Right ( object
@@ -1223,6 +1277,11 @@ deleteCredential h cid = do
     Right () -> do
       modifyMVar_ (achState h) $ \s ->
         pure s { acsCredentials = Map.delete cid (acsCredentials s) }
+      auditEvent h (emptyAuditFields Audit.CredentialRemoved)
+        { afCredentialId = Just cid
+        , afRpId = rpId
+        , afOrigin = acsOrigin st
+        }
       pure (Right (object ["ok" .= True, "removed" .= cid]))
 
 
