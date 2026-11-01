@@ -19,9 +19,12 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 
 import Test.Hspec
 
+import Seal.Security.AccessControl (CredentialAvailability (..))
+import Seal.Security.WebAuthn.Types (AccessMode (..))
 import Seal.Security.EnrollmentGrant
   ( ChallengeId (..), Grant (..), GrantDenied (..)
-  , GrantId (..), GrantPhase (..), GrantSource (..), findAuthority, grantBody
+  , GrantContext (..), GrantId (..), GrantPhase (..), GrantSource (..)
+  , enrollmentAuthority, findAuthority, grantBody
   , grantFromJson, grantSourceText, grantToJson, parseGrantSource, tokenDigest )
 
 spec :: Spec
@@ -105,6 +108,117 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
       let second = findAuthority (Just "wrong") (Just tokenGrant) Nothing False
       first `shouldBe` second
       first `shouldBe` Left GrantInvalid
+
+  -- Design §7.2. Totality is the point: every one of the 36 combinations must
+  -- land on exactly one row, so there is no "fall through to something
+  -- reasonable" arm to drift.
+  describe "enrollmentAuthority" $ do
+    it "matches the matrix over all 36 combinations (session present)" $
+      [ (mode, availability, authority, enrollmentAuthority (mkContext mode availability authority True))
+      | mode <- modes, availability <- availabilities, authority <- authorities ]
+        `shouldBe` matrixWithSession
+
+    it "answers GrantRequired instead of StepUpRequired with no session" $
+      enrollmentAuthority (mkContext AccessPasskey Usable Nothing False)
+        `shouldBe` Left GrantRequired
+
+    -- Gate round 4, B-2: the window is authority that presents no secret, so it
+    -- must not exist in the state an attacker who can change origin/rp_id
+    -- would create.
+    it "refuses the loopback window once credentials exist" $ do
+      enrollmentAuthority (mkContext AccessPasskey UnusableOnly (Just CliWindow) True)
+        `shouldBe` Left GrantRequired
+      enrollmentAuthority (mkContext AccessPasskey Usable (Just CliWindow) True)
+        `shouldBe` Left GrantRequired
+
+    it "refuses the loopback window in open mode when a credential exists" $
+      enrollmentAuthority (mkContext AccessOpen Usable (Just CliWindow) True)
+        `shouldBe` Left GrantRequired
+
+    it "accepts the window in the bootstrap state" $
+      enrollmentAuthority (mkContext AccessUnconfigured NoCredentials (Just CliWindow) True)
+        `shouldBe` Right CliWindow
+
+    it "never lets an assertion authorize anything without a usable credential" $
+      [ (mode, availability)
+      | mode <- modes
+      , availability <- [NoCredentials, UnusableOnly]
+      , enrollmentAuthority (mkContext mode availability (Just Assertion) True)
+          /= Left GrantRequired ]
+        `shouldBe` []
+
+
+--------------------------------------------------------------------------------
+-- Matrix
+--------------------------------------------------------------------------------
+
+modes :: [AccessMode]
+modes = [AccessUnconfigured, AccessOpen, AccessPasskey]
+
+availabilities :: [CredentialAvailability]
+availabilities = [NoCredentials, UnusableOnly, Usable]
+
+authorities :: [Maybe GrantSource]
+authorities = [Nothing, Just CliToken, Just CliWindow, Just Assertion]
+
+mkContext
+  :: AccessMode -> CredentialAvailability -> Maybe GrantSource -> Bool
+  -> GrantContext
+mkContext mode availability authority hasSession = GrantContext
+  { gcMode = mode
+  , gcAvailability = availability
+  , gcAuthorized = authority
+  , gcHasSession = hasSession
+  }
+
+-- | The design §7.2 table, expanded. Written out rather than computed so a
+-- change to the implementation has to disagree with a human-readable row.
+matrixWithSession
+  :: [ (AccessMode, CredentialAvailability, Maybe GrantSource
+        , Either GrantDenied GrantSource) ]
+matrixWithSession = concat
+  [ block AccessUnconfigured
+      [ row Nothing              (Left GrantRequired)
+      , row (Just CliToken)      (Right CliToken)
+      , row (Just CliWindow)     (Right CliWindow)
+      , row (Just Assertion)     (Left GrantRequired)
+      ]
+      [ tokenOnly, tokenOnly ]
+  , block AccessOpen
+      [ row Nothing              (Left GrantRequired)
+      , row (Just CliToken)      (Right CliToken)
+      , row (Just CliWindow)     (Right CliWindow)
+      , row (Just Assertion)     (Left GrantRequired)
+      ]
+      [ tokenOnly, tokenOnly ]
+  , block AccessPasskey
+      [ row Nothing              (Left GrantRequired)
+      , row (Just CliToken)      (Right CliToken)
+      , row (Just CliWindow)     (Right CliWindow)
+      , row (Just Assertion)     (Left GrantRequired)
+      ]
+      [ tokenOnly
+      , [ row Nothing          (Left StepUpRequired)
+        , row (Just CliToken)  (Right CliToken)
+        , row (Just CliWindow) (Left GrantRequired)
+        , row (Just Assertion) (Right Assertion)
+        ]
+      ]
+  ]
+  where
+    row authority verdict = (authority, verdict)
+    tokenOnly =
+      [ row Nothing          (Left GrantRequired)
+      , row (Just CliToken)  (Right CliToken)
+      , row (Just CliWindow) (Left GrantRequired)
+      , row (Just Assertion) (Left GrantRequired)
+      ]
+    block mode noCreds rest =
+      [ (mode, NoCredentials, authority, verdict) | (authority, verdict) <- noCreds ]
+        <> [ (mode, availability, authority, verdict)
+           | (availability, rows) <- zip [UnusableOnly, Usable] rest
+           , (authority, verdict) <- rows
+           ]
 
 --------------------------------------------------------------------------------
 -- Fixtures

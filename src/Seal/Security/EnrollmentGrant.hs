@@ -21,6 +21,8 @@ module Seal.Security.EnrollmentGrant
   , Grant (..)
   , EnrollmentAuthority
   , GrantDenied (..)
+  , GrantContext (..)
+  , enrollmentAuthority
   , findAuthority
   , grantToJson
   , grantFromJson
@@ -44,6 +46,8 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.ByteString.Base64.URL qualified as B64Url
 
 import Seal.Security.Crypto (constantTimeEq, sha256Hash)
+import Seal.Security.AccessControl (CredentialAvailability (..))
+import Seal.Security.WebAuthn.Types (AccessMode (..))
 
 -- | How a grant was minted — and, for an enrolled credential, how it was added
 -- (@added_via@ plus @legacy@, which no grant can produce).
@@ -257,3 +261,71 @@ isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
 parseIsoTimeMaybe :: Text -> Maybe UTCTime
 parseIsoTimeMaybe raw =
   parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw)
+
+--------------------------------------------------------------------------------
+-- Which authorities this boot accepts
+--------------------------------------------------------------------------------
+
+-- | Everything the enrollment decision depends on.
+--
+-- There is no clock here on purpose. A grant's expiry is decided when it is
+-- read ('findAuthority' returns a grant that is already known live, and the
+-- claim protocol re-checks the deadline), so this function cannot decide it and
+-- a @gcNow@ field would suggest otherwise. Design §7.2 lists one; it is
+-- deliberately omitted rather than carried unused.
+data GrantContext = GrantContext
+  { gcMode         :: !AccessMode
+  , gcAvailability :: !CredentialAvailability
+  , gcAuthorized   :: !(Maybe EnrollmentAuthority)
+    -- ^ What 'findAuthority' resolved. 'Nothing' means no authority was
+    -- presented, which is a state this function must still answer for: the
+    -- status endpoint asks it without a request.
+  , gcHasSession   :: !Bool
+  } deriving stock (Eq, Show)
+
+-- | Which authorities are acceptable in this boot state.
+--
+-- Total over 3 modes x 3 availabilities x 4 authorities. Two rules do most of
+-- the work:
+--
+-- * __The loopback window exists only with nothing enrolled.__ It is authority
+--   that presents no secret, so allowing it once a credential exists — or in
+--   @UnusableOnly@, which is the state an attacker who can change
+--   @origin@\\/@rp_id@ aims to create — would hand enrollment to anyone who
+--   can reach the port. That is gate round 4's B-2, and the reason
+--   @cli_window@ outside @NoCredentials@ is @GrantRequired@ rather than
+--   @GrantInvalid@: the token is well-formed, the state no longer permits it.
+-- * __Enrolling always needs authority, even in @open@ mode.__ A public gateway
+--   that let a network client enroll would be flipped from open to locked with
+--   a key the operator does not hold.
+enrollmentAuthority :: GrantContext -> Either GrantDenied EnrollmentAuthority
+enrollmentAuthority ctx
+  -- Bootstrap. Nothing is enrolled, so a token (or the confined window) is the
+  -- only thing that can authorize; an assertion cannot exist yet.
+  | gcAvailability ctx == NoCredentials = case gcAuthorized ctx of
+      Just CliToken  -> Right CliToken
+      Just CliWindow -> Right CliWindow
+      _              -> Left GrantRequired
+  | otherwise = case (gcMode ctx, gcAuthorized ctx) of
+      -- Open mode is fully open to *use*, not to enroll.
+      (AccessOpen, Just CliToken) -> Right CliToken
+      (AccessOpen, _)             -> Left GrantRequired
+      -- passkey + UnusableOnly is rp_mismatch: token only, never the window.
+      (AccessPasskey, Just CliToken) -> Right CliToken
+      (AccessPasskey, _) | gcAvailability ctx == UnusableOnly -> Left GrantRequired
+      -- passkey + Usable: an existing credential's assertion can add another,
+      -- and a token still works.
+      (AccessPasskey, Just Assertion) -> Right Assertion
+      -- Only "no authority presented at all" can ask for a step-up. A window
+      -- that arrives in the wrong state is well-formed but not permitted, so it
+      -- is GrantRequired: telling that client to prove its device would be a
+      -- dead end.
+      (AccessPasskey, Nothing)
+        | gcHasSession ctx -> Left StepUpRequired
+        | otherwise        -> Left GrantRequired
+      (AccessPasskey, Just _) -> Left GrantRequired
+      -- Unconfigured with credentials present is not a state boot produces
+      -- (it resolves to passkey or open); answering it keeps the function total
+      -- without granting anything.
+      (AccessUnconfigured, Just CliToken) -> Right CliToken
+      (AccessUnconfigured, _)             -> Left GrantRequired
