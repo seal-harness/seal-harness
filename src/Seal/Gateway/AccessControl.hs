@@ -20,6 +20,7 @@ module Seal.Gateway.AccessControl
   ( AccessControlHandle
   , NewAccess (..)
   , AuthDecision (..)
+  , GrantBanner (..)
   , newAccessControlHandle
   , accessControlAuthorize
   , accessControlMiddleware
@@ -46,7 +47,7 @@ import System.FilePath ((</>))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, hCookie, methodDelete, methodGet, methodOptions
   , methodPost, status200, status400, status401, status403, status404
@@ -57,7 +58,11 @@ import Network.Wai
 
 import Seal.Config.BootPlan (BootPlan (..))
 import Seal.Config.Credentials (enrollCredential, updateCredentialsFile)
-import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
+import Seal.Config.Paths
+  ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, securityFilePath )
+import Seal.Security.EnrollmentGrant
+  ( Grant (..), GrantSource (..), MintedGrant (..), defaultTtlFor, enrollGrant
+  , grantLiveAt, loadGrantFile )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..)
   , updateAccessControlSection )
@@ -118,9 +123,20 @@ data AccessControlHandle = AccessControlHandle
 data NewAccess = NewAccess
   { naHandle       :: AccessControlHandle
   , naSetupCode    :: Maybe Text
+    -- ^ The plaintext token minted by /this/ boot, when boot minted one.
   , naServiceToken :: Text
   , naOrigin       :: Maybe Text
+  , naGrant        :: Maybe GrantBanner
+    -- ^ The grant outstanding after boot, whether freshly minted or preserved.
   }
+
+-- | What the banner says about the outstanding grant, without the secret.
+data GrantBanner = GrantBanner
+  { gbSource    :: !GrantSource
+  , gbRemaining :: !NominalDiffTime
+  , gbFresh     :: !Bool
+    -- ^ 'True' when this boot minted it (so the token is 'naSetupCode').
+  } deriving stock (Eq, Show)
 
 -- | The gate's verdict.
 data AuthDecision
@@ -171,9 +187,25 @@ newAccessControlHandle paths plan = do
   let creds = bpCreds plan
       mOrigin = bpOrigin plan
       mRpId = bpRpId plan
-  mCode <- case bpMintGrant plan of
-    Just _  -> Just <$> generateToken 16
-    Nothing -> pure Nothing
+  -- Boot never clobbers an outstanding grant (design §7.3, §16.9). The CLI
+  -- mints while the daemon runs, so a restart that minted unconditionally would
+  -- invalidate a token the operator is holding. Minting is also skipped
+  -- entirely when a usable credential exists: an assertion is already the
+  -- authority.
+  (mCode, naBanner) <- case bpMintGrant plan of
+    Nothing -> pure (Nothing, Nothing)
+    Just source -> do
+      outstanding <- loadGrantFile (enrollmentGrantPath paths)
+      case outstanding of
+        Just grant | grantLiveAt now grant ->
+          pure (Nothing, Just (banner (grSource grant) now grant False))
+        _ -> do
+          minted <- enrollGrant paths source (defaultTtlFor source) True
+          pure $ case minted of
+            Left _ -> (Nothing, Nothing)
+            Right result ->
+              ( mgToken result
+              , Just (banner (grSource (mgGrant result)) now (mgGrant result) True) )
   st <- newMVar AccessControlState
     { acsMode = bpMode plan
     , acsCredentials = creds
@@ -190,7 +222,19 @@ newAccessControlHandle paths plan = do
     , acsFailures = 0
     , acsRetryAfter = now
     }
-  pure (NewAccess (AccessControlHandle st paths) mCode serviceToken mOrigin)
+  pure NewAccess
+    { naHandle       = AccessControlHandle st paths
+    , naSetupCode    = mCode
+    , naServiceToken = serviceToken
+    , naOrigin       = mOrigin
+    , naGrant        = naBanner
+    }
+  where
+    banner source stamp grant fresh = GrantBanner
+      { gbSource    = source
+      , gbRemaining = diffUTCTime (grExpiresAt grant) stamp
+      , gbFresh     = fresh
+      }
 
 -- | Accessors for the boot banner and for tests.
 accessControlMode :: AccessControlHandle -> IO AccessMode

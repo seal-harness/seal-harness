@@ -59,7 +59,8 @@ import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentT
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import Control.Exception (IOException, try)
 import Control.Monad (forM_, when)
-import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
+import System.Directory
+  ( createDirectoryIfMissing, doesFileExist, listDirectory, removeFile, renameFile )
 import System.FilePath ((</>), takeBaseName, takeDirectory)
 import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
@@ -562,6 +563,9 @@ enrollGrant
   -> IO (Either Text MintedGrant)
 enrollGrant paths source ttl force = do
   now <- getCurrentTime
+  -- The grant lives in state/, which boot creates; a CLI invocation may be the
+  -- first thing to touch it (a fresh SEAL_HOME, or state/ removed by hand).
+  createDirectoryIfMissing True (spState paths)
   existing <- loadGrantFile (enrollmentGrantPath paths)
   case existing of
     Just grant | grantLiveAt now grant, not force ->

@@ -35,7 +35,7 @@ import Network.Wai
   , requestHeaders, requestMethod, responseLBS, responseToStream
   , setRequestBodyChunks )
 import Network.Wai.Internal (ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -51,12 +51,15 @@ import Seal.Config.BootPlan
   , bootPlan )
 import Seal.Config.Credentials
   ( CredentialsFile (..), credentialsVersion, saveCredentials )
-import Seal.Config.Paths (SealPaths (..), credentialsFilePath, securityFilePath)
+import Seal.Config.Paths
+  ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, securityFilePath )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
   , WriteMode (PreserveCredentials), defaultSecurityConfig, loadSecurityConfig
   , saveSecurityConfig )
 import Seal.Gateway.AccessControl
+import Seal.Security.EnrollmentGrant
+  ( Grant (..), GrantSource (..), MintedGrant (..), enrollGrant, loadGrantFile )
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
 import Seal.Security.AccessControl (credentialFromFile)
 import Seal.Security.WebAuthn.Types (AccessMode (..), Credential)
@@ -89,6 +92,39 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         accessControlCredentialCount (naHandle na) `shouldReturn` 1
         (st, _, _) <- runApp (gated na) (getReq ["api", "sessions"])
         st `shouldBe` status401'
+
+  -- Design §7.3 / §16.9: a restart must not invalidate a token the operator is
+  -- holding. Boot reads the outstanding grant, keeps it, and the banner reports
+  -- its source and remaining lifetime instead of printing a new token.
+  describe "boot does not clobber an outstanding grant" $ do
+    it "preserves a grant minted by the CLI and mints no second one" $
+      withHome Nothing $ \paths -> do
+        Right minted <- enrollGrant paths CliToken (10 * 60) False
+        na <- bootHandle paths Nothing Map.empty
+        naSetupCode na `shouldBe` Nothing
+        case naGrant na of
+          Nothing -> expectationFailure "boot reported no grant"
+          Just banner -> do
+            gbFresh banner `shouldBe` False
+            gbSource banner `shouldBe` CliToken
+            gbRemaining banner `shouldSatisfy` (> 0)
+        loaded <- loadGrantFile (enrollmentGrantPath paths)
+        (grId <$> loaded) `shouldBe` Just (grId (mgGrant minted))
+
+    it "mints a fresh grant when nothing is outstanding" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths Nothing Map.empty
+        naSetupCode na `shouldSatisfy` isNonEmptyString
+        case naGrant na of
+          Nothing -> expectationFailure "boot reported no grant"
+          Just banner -> gbFresh banner `shouldBe` True
+
+    it "a healthy passkey boot mints nothing and reports no grant" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
+        naSetupCode na `shouldBe` Nothing
+        naGrant na `shouldBe` Nothing
+        doesFileExist (enrollmentGrantPath paths) `shouldReturn` False
 
   -- Design §14 / §2.2. The flag has no storage to go stale: it is computed
   -- from the credential map on every read. This asserts the flip inside one
