@@ -2,25 +2,46 @@
 
 ## 0.1.0.0 — unreleased
 
-* **Web access control (passkeys).** `seal serve` now gates its HTTP API and
+* **Web access control (passkeys).** `seal serve` gates its HTTP API and
   WebSocket stream behind WebAuthn passkeys, configured in
   `~/.seal/security.toml` under `[access_control]`. Three states: absent →
   *unconfigured* (only the setup screen is served), `mode = "none"` → *open*
   (an explicit waiver), `mode = "passkey"` → every request needs a
-  passkey-backed session. Enrollment and waiver require a one-time setup code
-  printed by `seal serve`, so a remote client cannot configure or open the
-  gateway first. New commands: `seal access-control status` and
-  `seal access-control reset --yes`.
+  passkey-backed session. Credentials moved out of `security.toml` into a
+  gateway-owned `~/.seal/credentials.toml` (0600), so a login no longer rewrites
+  the boot-critical document. Enrollment is authorised by a short-lived,
+  one-shot **grant** — a token from `seal access-control enroll`, a
+  loopback-confined window during bootstrap, or a 120 s assertion from an
+  already-enrolled passkey — never by a session cookie. `rp_mismatch` (every
+  credential registered for another address) is derived from the store instead
+  of stored, so it clears. An audit trail lands in
+  `~/.seal/state/access-control.log`.
 
-  **Upgrading:** an existing gateway that binds a non-loopback address keeps
-  starting, but its API is closed until setup completes — the setup screen
-  appears on the first visit. If that host is only reachable over a VPN, add
-  `[access_control] mode = "none"` to `~/.seal/security.toml` to restore the
-  previous open behaviour. An unparseable `security.toml` now makes
-  `seal serve` exit instead of silently falling back to defaults. The
-  `[access_control]` table may be written by the gateway (enrollment, waiver,
-  credential management) — no other section of `security.toml` can be.
+  New commands: `seal access-control status`, `enroll [--ttl N[s|m|h]]
+  [--no-token] [--force] [--cancel]`, `disable --yes`, `reset --yes`,
+  `migrate-credentials`.
 
+  **Upgrading:**
+  - A pre-split install that kept credentials in
+    `[access_control.credentials.*]` makes `seal serve` refuse to start and
+    names `seal access-control migrate-credentials`. Nothing is migrated
+    silently.
+  - `POST /api/auth/waive` is **removed**. Disabling access control is
+    terminal-only: `seal access-control disable --yes` (stop `seal serve`
+    first). The setup screen now prints the instruction instead of offering a
+    button.
+  - Enrollment uses `X-Seal-Enroll-Token`; `X-Seal-Setup-Token` is retired.
+    Tokens expire — ten minutes for a CLI token, five for a window, 120 s for an
+    assertion — and a successful enrollment consumes them. A restart no longer
+    mints a new token while one is still valid; use `enroll --force` to replace
+    it.
+  - `seal access-control reset --yes` now also deletes `credentials.toml` and
+    the grant artefacts, and refuses while `seal serve` is running.
+  - `[access_control]` with no `mode` line no longer means "open": absence
+    means passkey when credentials exist, and *unconfigured* otherwise. Only a
+    written `mode = "none"` turns access control off.
+  - Enrolling works in `mode = "none"`, so an open gateway can be locked down
+    from the web UI; it can never be turned back off from there.
 
 * Project scaffolding. Subcommand CLI built on `configuration-tools`, a
   `ReaderT Env (KatipContextT IO)` application monad, IORef-based mutable

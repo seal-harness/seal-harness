@@ -224,9 +224,11 @@ Provider credentials are read from the vault (set them with
 
 `seal serve` exposes the whole agent surface — sending messages (which the
 agent executes), every transcript, every slash command — over HTTP and
-WebSocket. Access control is configured once, in `~/.seal/security.toml`:
+WebSocket. Access control is configured once, in `~/.seal/security.toml`;
+the enrolled passkeys live next door in `~/.seal/credentials.toml`:
 
 ```toml
+# ~/.seal/security.toml
 [access_control]
 # "passkey" (require a passkey) | "none" (run open — an explicit waiver)
 mode = "passkey"
@@ -234,6 +236,19 @@ mode = "passkey"
 # Optional: only needed when a TLS reverse proxy fronts the gateway.
 # origin = "https://seal.example.com"
 # rp_id  = "seal.example.com"
+```
+
+```toml
+# ~/.seal/credentials.toml — gateway-owned, mode 0600; do not edit by hand
+version = 1
+
+[credentials.<credential-id-base64url>]
+public_key = "<base64url, 64-byte x||y>"
+sign_count = 0
+label      = "passkey"
+created_at = "2026-10-30T14:00:00Z"
+rp_id      = "localhost"
+added_via  = "cli_token"   # cli_token | cli_window | assertion | legacy
 ```
 
 Three states:
@@ -244,24 +259,48 @@ Three states:
 | `mode = "none"` | **open** — runs with no authentication (for a host only reachable over a VPN) |
 | `mode = "passkey"` | **passkey** — every request needs a passkey-backed session |
 
-The setup screen offers two choices: register a passkey, or explicitly waive
-access control (which writes `mode = "none"`). Both require the one-time setup
-code that `seal serve` prints on stderr — and writes to
-`~/.seal/state/setup-code` when it is not attached to a terminal — so a remote
-client can neither enroll nor waive before you do.
+**Enroll before you expose the port.** The first enrollment is a race: any
+client that can reach the gateway and holds an enrollment token can win the
+one slot. Nothing is escalated to before a passkey exists, and the operator
+finds out immediately (their own attempt fails with `grant_invalid`), but the
+winner holds the full agent surface until `seal access-control reset --yes`.
+So enroll from the machine itself, then open the firewall or the tunnel.
+
+Enrollment authority is always a secret presented on the request — never a
+cookie:
+
+```bash
+seal access-control enroll                 # 10-minute token on stdout, hints on stderr
+seal access-control enroll --ttl 90s       # s/m/h required; clamped to 30s-24h
+seal access-control enroll --no-token      # loopback-only window, bootstrap state only
+seal access-control enroll --cancel        # drop the outstanding grant
+seal access-control status                 # mode, origin, credentials, armed grant
+seal access-control disable --yes          # turn access control off (keeps credentials)
+seal access-control reset --yes            # delete credentials.toml + the section
+seal access-control migrate-credentials    # move pre-split credentials out of security.toml
+```
+
+On a terminal the boot banner prints the enrollment URL and the token; off a
+terminal (`systemd`, `launchd`, a pipe) it writes the token to
+`~/.seal/state/enrollment-token` at mode 0600 and prints only the path, so the
+token never lands in a log. A restart does **not** mint a new token when one is
+still valid.
+
+Adding a second passkey no longer needs a terminal: from `/access` on a signed-in
+device, Seal asks you to confirm with an existing passkey (a 120 s grant), then
+runs the create prompt. `disable` and `reset` require the daemon stopped —
+`serve.lock` is an advisory kernel lock, so a crashed daemon never blocks them.
 
 Passkeys need a **secure context**: `http://localhost`, or HTTPS. To protect a
 gateway reached over a VPN, put a TLS reverse proxy in front of it and set
-`origin` / `rp_id` to the proxy's URL.
+`origin` / `rp_id` to the proxy's URL. Deleting the last **usable** passkey is
+refused; an orphaned one (registered for another address) is safe to remove.
 
-```bash
-seal access-control status      # mode, resolved origin, enrolled credentials
-seal access-control reset --yes # delete the [access_control] table (lost passkey)
-```
-
-`reset` is the terminal-only escape hatch: no opcode and no HTTP route can
-change access-control settings. The agent runs as the same uid and can read
-`~/.seal/`, so passkeys defend the **network** — not a compromised agent.
+`reset` is the terminal-only escape hatch: no opcode and no HTTP route can turn
+access control off — `POST /api/auth/waive` was removed, and `mode = "none"` can
+only be written by `seal access-control disable --yes`. The agent runs as the
+same uid and can read `~/.seal/`, so passkeys defend the **network** — not a
+compromised agent.
 
 ## Development
 
