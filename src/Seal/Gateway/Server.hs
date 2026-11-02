@@ -30,6 +30,8 @@ import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeo
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeExtension)
 
+import Seal.Gateway.AccessControl
+  ( AccessControlHandle, accessControlMiddleware )
 import Seal.Gateway.API (apiApp, ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..))
 import Seal.Gateway.Embedded (embeddedAssets)
@@ -48,14 +50,22 @@ import Seal.Security.Path
 -- otherwise falls back to the compile-time-embedded asset map (release
 -- default). Each request is wrapped with 'requestTimingMiddleware' so the
 -- method, path, status, and duration are logged via Katip for observability.
-gatewayApp :: SealLogger -> ApiDeps -> Maybe FilePath -> Application
-gatewayApp logger deps mStaticDir =
+--
+-- The optional 'AccessControlHandle' gates the @\/api\/*@ branch only: the
+-- static bundle must always load, because the setup screen is part of it
+-- (design §7 "Where the middleware sits").
+gatewayApp :: SealLogger -> Maybe AccessControlHandle -> ApiDeps -> Maybe FilePath -> Application
+gatewayApp logger mAccess deps mStaticDir =
   requestTimingMiddleware logger $ \req respond ->
     case pathInfo req of
-      ("api" : _) -> apiApp deps req respond
+      ("api" : _) -> gatedApi req respond
       _ -> case mStaticDir of
         Just staticDir -> serveStatic staticDir req respond
         Nothing        -> serveEmbedded req respond
+  where
+    gatedApi = case mAccess of
+      Nothing     -> apiApp deps
+      Just access -> accessControlMiddleware access (apiApp deps)
 
 -- | The assembled application WITH the WebSocket stream endpoint mounted
 -- on the same port.
@@ -66,13 +76,14 @@ gatewayApp logger deps mStaticDir =
 -- collide with.
 gatewayAppWithStream
   :: SealLogger
+  -> Maybe AccessControlHandle
   -> ApiDeps
   -> Maybe FilePath
   -> StreamGuard
   -> StreamBroker
   -> Application
-gatewayAppWithStream logger deps mStaticDir guard broker =
-  streamMiddleware guard broker (gatewayApp logger deps mStaticDir)
+gatewayAppWithStream logger mAccess deps mStaticDir guard broker =
+  streamMiddleware guard broker (gatewayApp logger mAccess deps mStaticDir)
 
 -- | WAI middleware that logs each request's HTTP method, path, response
 -- status, and total duration (in milliseconds) via the Katip 'SealLogger'.
@@ -252,13 +263,14 @@ contentTypeFor ext = case ext of
 -- than leaving a half-running gateway whose live transcript was dead.
 runGateway
   :: SealLogger
+  -> Maybe AccessControlHandle
   -> GatewayConfig
   -> Bool
   -> ApiDeps
   -> StreamGuard
   -> StreamBroker
   -> IO ()
-runGateway logger cfg failClosedOnNonLoopback deps guard broker = do
+runGateway logger mAccess cfg failClosedOnNonLoopback deps guard broker = do
   let host = gcHost cfg
       port = gcPort cfg
   logIO logger InfoS "Seal Harness gateway"
@@ -275,11 +287,11 @@ runGateway logger cfg failClosedOnNonLoopback deps guard broker = do
           logIO logger WarningS ("binding to " <> ls host
                                  <> " — the full slash-command surface is reachable by anything that can reach this address")
           let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-              app = gatewayAppWithStream logger deps mStaticDir guard broker
+              app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
           runSettings (setPort port settings) app
     else do
       let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-          app = gatewayAppWithStream logger deps mStaticDir guard broker
+          app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
       runSettings (setPort port settings) app
 
 -- | Warp settings for the gateway.

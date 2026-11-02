@@ -6,6 +6,11 @@ module Seal.Config.Paths
   , configFilePath
   , vaultFilePath
   , securityFilePath
+  , credentialsFilePath
+  , enrollmentGrantPath
+  , enrollmentClaimPath
+  , enrollmentTokenPath
+  , serveLockPath
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
@@ -121,6 +126,56 @@ vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
 -- vault settings). Mode 0600, owned by the harness user.
 securityFilePath :: SealPaths -> FilePath
 securityFilePath paths = spHome paths </> "security.toml"
+
+-- | Absolute path to the gateway-owned credential store:
+-- @\<home\>\/credentials.toml@.
+--
+-- A sibling of @security.toml@ (not under @config\/@) for the same reason:
+-- the git-versioned @config\/@ tree must not be able to resurrect a stale
+-- credential or a stale credential count. The file is created @0600@ and is
+-- written only by 'Seal.Config.Credentials'. No opcode may read or write it —
+-- it is agent-immutable security state, like everything else in
+-- @~\/.seal\/@.
+credentialsFilePath :: SealPaths -> FilePath
+credentialsFilePath paths = spHome paths </> "credentials.toml"
+
+-- | Path to the outstanding enrollment grant: @\<state\>\/enrollment-grant.json@.
+--
+-- Under @state\/@ because it is ephemeral: the grant is authority with a
+-- minutes-scale lifetime, and nothing needs it after it is consumed. Deleting
+-- the whole @state\/@ directory loses at most the current enrollment, which is
+-- what @--cancel@ does on purpose.
+enrollmentGrantPath :: SealPaths -> FilePath
+enrollmentGrantPath paths = spState paths </> "enrollment-grant.json"
+
+-- | Path to the exclusive claim marker for one grant:
+-- @\<state\>\/enrollment-grant.claimed-\<grant-id\>@.
+--
+-- The claim is created @O_CREAT|O_EXCL@: the /create/ result decides which
+-- ceremony wins, so two verifies cannot both redeem one grant (design §7.3).
+enrollmentClaimPath :: SealPaths -> T.Text -> FilePath
+enrollmentClaimPath paths grantId =
+  spState paths </> ("enrollment-grant.claimed-" <> T.unpack grantId)
+
+-- | Path to the plaintext enrollment token:
+-- @\<state\>\/enrollment-token@.
+--
+-- Written only when @seal access-control enroll@ (or the boot banner) runs with
+-- stderr not a TTY, so a daemon operator is never left holding a token that was
+-- printed into a log. Mode @0600@; reaped on @--cancel@, on the next mint and at
+-- boot.
+enrollmentTokenPath :: SealPaths -> FilePath
+enrollmentTokenPath paths = spState paths </> "enrollment-token"
+
+-- | Path to the daemon liveness lock: @\<state\>\/serve.lock@.
+--
+-- @seal serve@ holds an advisory write lock on this file for its whole
+-- lifetime, and the commands that must not race a live daemon (@disable@,
+-- @reset@, @migrate-credentials@) probe it. The lock lives in the kernel, so a
+-- crashed daemon releases it: the file's existence says nothing, only a
+-- successful lock acquisition does.
+serveLockPath :: SealPaths -> FilePath
+serveLockPath paths = spState paths </> "serve.lock"
 
 -- | Absolute path to the source-control repo registry TOML file:
 -- @\<config\>\/repos.toml@.

@@ -122,13 +122,13 @@ spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
   it "gatewayApp routes /api/health to the API" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "gatewayApp returns 404 for a non-api path with no static dir" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["foo", "bar"] })
     -- When assets are embedded: SPA fallback → 200.
     -- When no assets (fresh checkout): emptyEmbedResponse → 404.
@@ -141,35 +141,35 @@ spec = describe "Seal.Gateway.Server" $ do
   it "serveEmbedded: GET / returns 200 (index.html) when assets embedded" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
   it "serveEmbedded: GET /some/spa/route returns 200 (SPA fallback) when assets embedded" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["some", "spa", "route"] })
       status `shouldBe` 200
 
   it "serveEmbedded: GET /assets/nonexistent.js returns 404 (asset miss)" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "nonexistent.js"] })
       status `shouldBe` 404
 
   it "serveEmbedded: GET /user.profile returns 200 (SPA fallback, .profile not in assetExtensions)" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["user.profile"] })
       status `shouldBe` 200
 
   it "serveEmbedded: all responses have X-Content-Type-Options: nosniff" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       resp <- runAppResp app (defaultRequest { pathInfo = [] })
       responseStatus resp `shouldBe` status200
       hasHeader resp "X-Content-Type-Options" "nosniff" `shouldBe` True
@@ -178,7 +178,7 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
@@ -188,7 +188,7 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [".."] })
       status `shouldNotBe` 200
 
@@ -198,7 +198,7 @@ spec = describe "Seal.Gateway.Server" $ do
       BC.writeFile (dir </> "assets" </> "test.js") "console.log('hi');"
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "test.js"] })
       status `shouldBe` 200
 
@@ -206,19 +206,19 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = ["nonexistent.js"] })
       status `shouldBe` 404
 
   it "gatewayApp serves /api/openapi.json as JSON" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi.json"], requestMethod = methodGet })
     status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi as HTML (Swagger UI)" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
     status `shouldBe` 200
 
