@@ -65,7 +65,7 @@ import Seal.Config.Paths
 import Seal.Security.EnrollmentGrant
   ( ChallengeId (..), EnrollmentAuthority, Grant (..), GrantClaim (..)
   , GrantContext (..), GrantDenied (..), GrantId (..), GrantPhase (..)
-  , GrantSource (..), MintedGrant (..), cancelGrant, claimExclusively
+  , GrantSource (..), MintedGrant (..), bindClaimSuperseding, cancelGrant
   , claimLiveAt, defaultTtlFor, effectiveDeadline, enrollGrant, enrollmentAuthority
   , findAuthority, grantLiveAt, grantRedeems, grantSourceText, loadClaimFile
   , loadGrantFile, saveGrantFile, tokenDigest )
@@ -792,6 +792,8 @@ withCredentialAdmin h req action = do
 -- is written back with its bound challenge so a grant bound to A cannot redeem
 -- B (design §7.3). A grant in a session ('Assertion') is not bound here: it is
 -- single-use through the challenge itself.
+--
+-- Retries supersede an abandoned claim: see 'bindClaimSuperseding'.
 bindGrant :: SealPaths -> Grant -> ChallengeId -> IO Bool
 bindGrant paths grant challenge = do
   now <- getCurrentTime
@@ -801,7 +803,7 @@ bindGrant paths grant challenge = do
         , clChallengeId = challenge
         , clDeadline = effectiveDeadline grant now (fromIntegral challengeTtlSeconds)
         }
-  won <- claimExclusively (enrollmentClaimPath paths rawId) claim
+  won <- bindClaimSuperseding (enrollmentClaimPath paths rawId) claim
   if not won
     then pure False
     else do

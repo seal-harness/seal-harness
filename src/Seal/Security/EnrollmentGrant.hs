@@ -40,6 +40,7 @@ module Seal.Security.EnrollmentGrant
   , grantRedeems
   , loadClaimFile
   , releaseClaim
+  , bindClaimSuperseding
   , grantLiveAt
   , loadGrantFile
   , saveGrantFile
@@ -516,6 +517,31 @@ releaseClaim path challenge = do
   case held of
     Just claim | clChallengeId claim == challenge -> deleteGrantFile path
     _ -> pure ()
+
+-- | Bind a claim, superseding one left behind by an abandoned ceremony.
+--
+-- The ordinary case is 'claimExclusively'. The exception is a claim nobody
+-- finished: the operator dismissed the OS passkey prompt, or the tab died, so
+-- no @verify@ ever arrives and the marker sits there for the whole challenge
+-- window. Refusing every retry in that window makes the first accidental
+-- dismissal burn the link — and since the SPA treats @grant_invalid@ as "this
+-- token is spent", it also throws the token away.
+--
+-- A fresh bind therefore wins: last bind wins. Exactly-once does not depend on
+-- this function. It is carried one level up by the single-use challenge
+-- (consumed before verification) and by 'grantRedeems', which refuses a grant
+-- bound to a different challenge — so of two ceremonies only the one the grant
+-- is currently bound to can complete. A third party that also holds the link
+-- can make the operator's ceremony lose, which is a denial, not an escalation:
+-- it already has the link.
+bindClaimSuperseding :: FilePath -> GrantClaim -> IO Bool
+bindClaimSuperseding path claim = do
+  won <- claimExclusively path claim
+  if won
+    then pure True
+    else do
+      deleteGrantFile path
+      claimExclusively path claim
 
 -- | Read a claim. Unparseable or absent both mean "nobody holds it".
 loadClaimFile :: FilePath -> IO (Maybe GrantClaim)

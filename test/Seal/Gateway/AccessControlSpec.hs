@@ -458,6 +458,15 @@ spec = describe "Seal.Gateway.AccessControl" $ do
           (postReq ["api", "auth", "credentials", "options"]
                    [("X-Seal-Enroll-Token", grantToken)])
         stOther `shouldBe` status200'
+        -- A ceremony whose OS prompt was dismissed never reaches verify, so
+        -- nothing releases its claim. A fresh options must supersede it, or the
+        -- operator's first accidental dismissal — the likeliest mistake on a
+        -- phone — burns the link for the rest of the challenge window, and the
+        -- SPA discards the token on the grant_invalid that follows.
+        (stRetry, _, _) <- runApp (gated na)
+          (postReq ["api", "auth", "credentials", "options"]
+                   [("X-Seal-Enroll-Token", grantToken)])
+        stRetry `shouldBe` status200'
 
     it "refuses a second portable mint with 409 grant_outstanding, and force replaces it" $
       withHome (Just passkeySection) $ \paths -> do
