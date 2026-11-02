@@ -36,6 +36,9 @@ data GatewayConfig = GatewayConfig
   , gcTls            :: Bool
     -- ^ Serve HTTPS. The PEM paths default to @keys\/tls\/@{cert,key}@.on.pem
     -- under @SEAL_HOME@, so this flag alone is the whole configuration.
+  , gcTlsHosts       :: [Text]
+    -- ^ Names to put in a generated certificate's subject alternative name.
+    -- Empty means "the bind host, if it names a machine" — see 'sanHostsFor'.
   } deriving stock (Eq, Show)
 
 -- | The compiled-in default. Loopback + port 8080 + the local origin.
@@ -49,6 +52,7 @@ defaultGatewayConfig = GatewayConfig
   , gcTlsCert = Nothing
   , gcTlsKey = Nothing
   , gcTls = False
+  , gcTlsHosts = []
   }
 
 -- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
@@ -66,6 +70,7 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.text "tls_cert") .= pgcTlsCert
   <*> Toml.dioptional (Toml.text "tls_key") .= pgcTlsKey
   <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
+  <*> hostsCodec .= pgcTlsHosts
 
 -- | A partial gateway config where every field is optional. 'withGatewayDefaults'
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
@@ -78,6 +83,7 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcTlsCert        :: Maybe Text
   , pgcTlsKey         :: Maybe Text
   , pgcTls            :: Maybe Bool
+  , pgcTlsHosts       :: [Text]
   } deriving stock (Eq, Show)
 
 -- | Merge a partial gateway config with the compiled-in defaults, producing
@@ -97,11 +103,19 @@ withGatewayDefaults p = GatewayConfig
   , gcTlsCert        = pgcTlsCert p
   , gcTlsKey         = pgcTlsKey p
   , gcTls            = fromMaybe False (pgcTls p)
+  , gcTlsHosts       = pgcTlsHosts p
   }
 
 -- | Codec for the @allowed_origins@ array (a TOML array of strings).
 originsCodec :: Toml.TomlCodec [Text]
 originsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text "allowed_origins"))
+  where
+    maybeToList Nothing   = []
+    maybeToList (Just xs) = xs
+
+-- | Codec for the @tls_hosts@ array (a TOML array of strings).
+hostsCodec :: Toml.TomlCodec [Text]
+hostsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text "tls_hosts"))
   where
     maybeToList Nothing   = []
     maybeToList (Just xs) = xs

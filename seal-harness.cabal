@@ -207,6 +207,7 @@ library
          Seal.Security.Policy
          Seal.Security.Secrets
         Seal.Security.WebAuthn
+        Seal.Security.TlsCert
         Seal.Security.WebAuthn.Cbor
         Seal.Security.WebAuthn.Der
         Seal.Security.WebAuthn.Types
@@ -412,6 +413,7 @@ test-suite tests
       , case-insensitive
       , wai
       , warp
+      , tls
       , http-types
       , vector
       , tomland
@@ -554,6 +556,7 @@ test-suite tests
        Seal.Security.WebAuthnSpec
        Seal.Security.WebAuthn.CborSpec
        Seal.Security.WebAuthn.DerSpec
+       Seal.Security.TlsCertSpec
        Seal.Security.WebAuthnSpecFixture
         Seal.Security.PathSpec
         Seal.Security.PolicySpec

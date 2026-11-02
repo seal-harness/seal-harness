@@ -8,7 +8,7 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (catch)
-import Control.Monad (filterM, void, forever)
+import Control.Monad (filterM, void, forever, when)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -87,6 +87,7 @@ import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Security.TlsCert (ensureTlsCertificate, sanHostsFor)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
@@ -175,21 +176,31 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       ioError (userError (T.unpack err))
     Nothing -> pure ()
   -- TLS paths default under keys/tls, so `tls = true` is the whole
-  -- configuration. Missing material is a refusal that names the paths and the
-  -- command that makes them, rather than a handshake failure on first request.
+  -- configuration. A missing pair is generated with openssl rather than left
+  -- to the operator; see 'Seal.Security.TlsCert' for why that is not a
+  -- substitute for a trusted certificate.
   gwCfgTls <- if tlsEnabled gwCfgAccess
     then do
       let (certPath, keyPath) =
             effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
-      haveCert <- doesFileExist certPath
-      haveKey  <- doesFileExist keyPath
-      if haveCert && haveKey
-        then pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
-                              , gcTlsKey  = Just (T.pack keyPath) }
-        else do
-          let msg = missingTlsFilesMessage haveCert haveKey certPath keyPath
-          logIO logger ErrorS ("gateway: " <> ls msg)
-          ioError (userError (T.unpack msg))
+          hosts = sanHostsFor (gcHost gwCfgAccess) (gcTlsHosts gwCfgAccess)
+      generated <- ensureTlsCertificate certPath keyPath hosts
+      case generated of
+        Left err -> do
+          logIO logger ErrorS ("gateway: " <> ls err)
+          ioError (userError (T.unpack err))
+        Right wasGenerated -> do
+          when wasGenerated $ do
+            logIO logger InfoS ("generated a self-signed TLS certificate for "
+              <> ls (T.intercalate ", " hosts) <> " at " <> ls (T.pack certPath)
+              <> " (private key " <> ls (T.pack keyPath) <> ", mode 0600)")
+            logIO logger WarningS
+              ("a generated certificate is self-signed: browsers refuse WebAuthn "
+                <> "on a certificate they do not trust, so install it on the device "
+                <> "(and mark it trusted) — or replace tls_cert/tls_key with a "
+                <> "publicly-trusted pair, e.g. from `tailscale cert`.")
+          pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
+                            , gcTlsKey  = Just (T.pack keyPath) }
     else pure gwCfgAccess
   -- The §10 matrix runs here, before any channel is forked or port bound.
   bootInputs <- preflight paths
@@ -680,27 +691,3 @@ printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
 printAccessControlBanner paths access = do
   stderrIsTTY <- hIsTerminalDevice stderr
   printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access
-
--- | What to say when TLS is on but the PEM material is not there.
---
--- Names the paths, gives the command that produces a working pair, and states
--- the two constraints that make this a decision rather than a formality: a
--- bare IP cannot be an RP ID, and a browser refuses WebAuthn on a certificate
--- the client does not already trust.
-missingTlsFilesMessage :: Bool -> Bool -> FilePath -> FilePath -> T.Text
-missingTlsFilesMessage haveCert haveKey certPath keyPath = T.intercalate "\n"
-  [ "[gateway] tls is on but the certificate material is missing:"
-  , "  cert: " <> T.pack certPath <> presence haveCert
-  , "  key:  " <> T.pack keyPath <> presence haveKey
-  , "  Point tls_cert / tls_key at a real certificate, or make a self-signed pair:"
-  , "    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \\"
-  , "      -days 3650 -keyout " <> T.pack keyPath <> " -out " <> T.pack certPath
-  , "      -subj \"/CN=<host>\" -addext \"subjectAltName=DNS:<host>\""
-  , "  Replace <host> with the name clients use — a bare IP cannot work, because a"
-  , "  WebAuthn RP ID must be a domain. A browser also refuses WebAuthn on any"
-  , "  certificate the client does not already trust, so a self-signed pair has to"
-  , "  be installed on the device first; `tailscale cert <name>` gives a trusted one."
-  ]
-  where
-    presence True  = " (present)"
-    presence False = " (missing)"

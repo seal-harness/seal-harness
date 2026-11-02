@@ -65,6 +65,7 @@ import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
 import qualified Seal.Security.WebAuthnSpec
+import qualified Seal.Security.TlsCertSpec
 import qualified Seal.Security.WebAuthn.CborSpec
 import qualified Seal.Security.WebAuthn.DerSpec
 import qualified Seal.Security.PathSpec
@@ -273,6 +274,7 @@ specs = do
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
   Seal.Security.WebAuthnSpec.spec
+  Seal.Security.TlsCertSpec.spec
   Seal.Security.WebAuthn.CborSpec.spec
   Seal.Security.WebAuthn.DerSpec.spec
   Seal.Security.PathSpec.spec

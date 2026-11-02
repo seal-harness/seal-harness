@@ -302,12 +302,15 @@ port = 8443
 tls  = true                       # serves ~/.seal/keys/tls/{cert,key}.pem
 # tls_cert = "/etc/ssl/fullchain.pem"   # optional overrides for a real cert
 # tls_key  = "/etc/ssl/privkey.pem"
+# tls_hosts = ["seal.lan"]          # names for a generated certificate's SAN
 ```
 
 `tls = true` is the whole configuration: the PEM paths default to
 `~/.seal/keys/tls/cert.pem` and `~/.seal/keys/tls/key.pem`. Setting both paths
 explicitly also turns TLS on, so pointing at a real certificate needs no flag.
-The certificate files themselves are **not** generated — see below.
+If those files are absent, Seal generates a self-signed pair with `openssl`
+(key written `0600`) on the next start. `tls_hosts` names what the certificate
+should be valid for; the bind host and `localhost` are included by default.
 
 ```toml
 # ~/.seal/security.toml — must be the https URL clients actually use
@@ -320,15 +323,15 @@ and `https://`: the loopback default is `http://localhost:<port>`, which no
 ceremony could ever match. A reverse proxy still works too — leave
 `tls_cert`/`tls_key` unset and point `origin` / `rp_id` at the proxy's URL.
 
-Seal refuses to start when TLS is on and the PEM files are missing, and prints
-the exact `openssl` command to create a pair. It does not generate one for you,
-deliberately: a self-signed certificate does not make passkeys work. Since
-Chrome 110 a browser disables WebAuthn outright on a site whose certificate it
-does not trust — clicking through the warning is not enough — so the
-certificate has to be installed on the phone before any ceremony will run, and
-it has to name a hostname (an IP can never be an RP ID). For the same effort,
+**A generated certificate does not make passkeys work on its own.** Since Chrome
+110 a browser disables WebAuthn outright on a site whose certificate it does not
+trust — clicking through the warning is not enough — so the generated
+certificate has to be *installed* on the phone (and marked trusted) before any
+ceremony will run. It also has to name a hostname: an IP can never be an RP ID,
+so set `tls_hosts` to the name the device will use. For the same effort,
 `tailscale cert <name>` produces a certificate that every device already
-trusts, with no installation step.
+trusts, with no installation step — that is the better default when you have a
+tailnet.
 
 **A hostname is required, not just TLS.** A WebAuthn RP ID must be a domain
 string, so `https://192.168.1.42:8443` still cannot register a passkey — Chrome

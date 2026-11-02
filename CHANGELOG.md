@@ -53,18 +53,24 @@
     from the web UI; it can never be turned back off from there.
 
 * **The gateway can serve HTTPS itself.** `[gateway] tls_cert` and `tls_key`
-  (PEM paths, required together) switch the listener from plain HTTP to TLS,
-  so a passkey ceremony no longer needs a reverse proxy in front. The startup
-  banner reports `https://` / `wss://`, and the WebSocket `Origin` allowlist
-  derives its scheme from the listener rather than assuming `http://`. Turning
-  TLS on also makes `[access_control] origin` mandatory and `https://` — the
-  derived loopback origin would otherwise never match — and a half-configured
-  certificate/key pair is refused at boot instead of failing inside the
-  handshake.
+  (PEM paths) switch the listener from plain HTTP to TLS, so a passkey ceremony
+  no longer needs a reverse proxy in front. `[gateway] tls = true` alone is the
+  whole configuration: the paths default to `keys/tls/cert.pem` and
+  `keys/tls/key.pem`, and a missing pair is generated with `openssl` on the next
+  start (`[gateway] tls_hosts` names what it should be valid for; the bind host
+  and `localhost` are included by default). The startup banner reports
+  `https://` / `wss://`, and the WebSocket `Origin` allowlist derives its scheme
+  from the listener rather than assuming `http://`. Turning TLS on also makes
+  `[access_control] origin` mandatory and `https://` — the derived loopback
+  origin would otherwise never match — and a half-configured certificate/key
+  pair is refused at boot instead of failing inside the handshake.
 
-  Note that TLS alone does not make a bare IP usable for passkeys: a WebAuthn
-  RP ID must be a domain string, so `https://192.168.1.42:8443` still cannot
-  register a credential. The gateway needs a hostname, not just a certificate.
+  A generated certificate is self-signed, and that is not enough for passkeys:
+  since Chrome 110 a browser disables WebAuthn on any certificate it does not
+  trust, so the file has to be installed on the client device and marked
+  trusted. TLS also does not make a bare IP usable — a WebAuthn RP ID must be a
+  domain string — so `tls_hosts` has to name a hostname the device will use.
+  `tailscale cert` remains the frictionless option when a tailnet is available.
 
 * **The gateway no longer refuses a non-loopback bind in remote mode.**
   `untrusted_execution.mode = "remote"` used to make `seal serve` exit rather
