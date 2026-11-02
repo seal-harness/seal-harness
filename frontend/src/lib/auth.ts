@@ -317,7 +317,13 @@ function describe(err: unknown): string {
     case 'NotAllowedError':
       return 'The passkey prompt was cancelled or timed out.'
     case 'SecurityError':
-      return 'This address does not match the relying-party id in security.toml.'
+      // The browser's own sentence is the only thing that separates "this is an
+      // IP, which can never be an RP ID" from "the origin and rp_id disagree".
+      // Reporting both as "does not match" sent operators hunting for a suffix
+      // bug in a configuration that could never have worked.
+      return `This address cannot use passkeys: ${
+        err instanceof Error && err.message ? err.message : 'the browser refused the ceremony'
+      }. The gateway's origin and rp_id must be an https hostname that matches this page — an IP address can never be a relying-party id.`
     case 'InvalidStateError':
       return 'That passkey is already registered on this device.'
     case 'NotSupportedError':

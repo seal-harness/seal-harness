@@ -30,9 +30,10 @@ import Seal.Config.Security
   )
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), canonicalOriginFor, credentialAvailability
+  , isIpLiteral, resolveCoordinates
   , credentialFromFile, credentialToFile, parseIsoTime, rpMismatch )
 import Seal.Security.WebAuthn.Types
-  ( CosePublicKey (..), Credential (..) )
+  ( AccessMode (..), CosePublicKey (..), Credential (..) )
 
 spec :: Spec
 spec = describe "Seal.Config.Security access_control" $ do
@@ -190,6 +191,36 @@ spec = describe "Seal.Config.Security access_control" $ do
       canonicalOriginFor "::1" 9000 `shouldBe` "http://localhost:9000"
     it "uses the bind host otherwise" $
       canonicalOriginFor "10.0.0.5" 8080 `shouldBe` "http://10.0.0.5:8080"
+
+  -- A WebAuthn RP ID must be a domain string. Browsers reject an IP origin with
+  -- `SecurityError` before any ceremony runs, so an IP must be caught at boot
+  -- instead of surfacing as "this address does not match the relying-party id".
+  describe "isIpLiteral" $ do
+    it "recognises addresses that can never be a relying-party id" $
+      map isIpLiteral
+        ["192.168.0.107", "127.0.0.1", "10.0.0.5", "::1", "[::1]", "fe80::1"]
+        `shouldBe` replicate 6 True
+
+    it "leaves names alone, including single-label ones" $
+      map isIpLiteral ["localhost", "seal.lan", "chani.tail1234.ts.net", "seal.test"]
+        `shouldBe` replicate 4 False
+
+  describe "resolveCoordinates" $ do
+    it "refuses an IP origin rather than letting the browser fail the ceremony" $
+      case resolveCoordinates "0.0.0.0" 8443
+             (Just sampleSection { acfcOrigin = Just "https://192.168.0.107:8443" })
+             AccessPasskey of
+        Left err -> err `shouldSatisfy` T.isInfixOf "must be a domain name"
+        Right ok -> expectationFailure ("expected a refusal, got " <> show ok)
+
+    it "accepts a hostname origin" $
+      case resolveCoordinates "0.0.0.0" 8443
+             (Just sampleSection { acfcOrigin = Just "https://seal.lan:8443" })
+             AccessPasskey of
+        Left err -> expectationFailure ("unexpected refusal: " <> T.unpack err)
+        Right (origin, rpId) -> do
+          origin `shouldBe` Just "https://seal.lan:8443"
+          rpId `shouldBe` Just "seal.lan"
 
 -- Helpers ------------------------------------------------------------------
 

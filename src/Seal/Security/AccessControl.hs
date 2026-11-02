@@ -15,6 +15,7 @@ module Seal.Security.AccessControl
   , canonicalOriginFor
   , isLoopbackHost
   , isWildcardHost
+  , isIpLiteral
   , credentialFromFile
   , credentialToFile
   , parseIsoTime
@@ -88,7 +89,38 @@ canonicalOriginFor bindHost bindPort
   | otherwise               = "http://" <> T.toLower bindHost <> ":" <> tshow bindPort
 
 resolveRpId :: Maybe Text -> Maybe Text -> Either Text (Maybe Text)
-resolveRpId mOrigin mRpId = case (mOrigin, mRpId) of
+resolveRpId mOrigin mRpId = do
+  resolved <- resolveRpIdUnchecked mOrigin mRpId
+  case resolved of
+    Just rp | isIpLiteral rp -> Left (ipRpIdMessage rp)
+    _ -> Right resolved
+
+-- | An IPv4 or IPv6 literal, which can never be an RP ID.
+--
+-- WebAuthn requires the relying-party id to be a valid domain string, and
+-- browsers reject an IP origin with @SecurityError@ before any ceremony runs.
+-- Catching it here turns a baffling in-browser failure into a boot refusal.
+isIpLiteral :: Text -> Bool
+isIpLiteral raw =
+  let h = T.toLower (T.dropWhile (== '[') (T.dropWhileEnd (== ']') raw))
+  in (not (T.null h) && T.isInfixOf ":" h) || isIpv4 h
+  where
+    isIpv4 h = T.count "." h == 3
+                 && T.all (\c -> isDigit c || c == '.') h
+                 && not (any T.null (T.splitOn "." h))
+
+ipRpIdMessage :: Text -> Text
+ipRpIdMessage rp = T.intercalate "\n"
+  [ "[access_control] rp_id resolves to \"" <> rp <> "\", which is an IP address."
+  , "  A WebAuthn relying-party id must be a domain name. Browsers reject an IP"
+  , "  with `SecurityError` before any passkey ceremony runs, however valid the"
+  , "  certificate is. Give this gateway a hostname — a DNS record, a tailnet"
+  , "  name, or an entry in every client's hosts file — and set origin and rp_id"
+  , "  to that name (not to the address it resolves to)."
+  ]
+
+resolveRpIdUnchecked :: Maybe Text -> Maybe Text -> Either Text (Maybe Text)
+resolveRpIdUnchecked mOrigin mRpId = case (mOrigin, mRpId) of
   (Nothing, Nothing) -> Right Nothing
   (Just o, Nothing)  -> Right (hostOf o)
   (Nothing, Just _)  ->
