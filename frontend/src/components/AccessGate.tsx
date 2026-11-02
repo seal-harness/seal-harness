@@ -56,11 +56,13 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     if (res.ok) {
       setStatus(res.data)
       setLoadFailed(false)
-      if (res.data.state === 'passkey' && res.data.usable_credentials > 0) {
-        // The token is spent once a usable credential exists.
-        setEnrollToken(null)
-        clearEnrollToken()
-      }
+      // Deliberately *not* cleared here. `usable_credentials` counts
+      // credentials the *gateway* can verify with, not credentials on this
+      // device, so "a usable credential exists" does not mean "this token has
+      // been spent". A phone landing on a link is exactly `passkey` + a usable
+      // credential, and clearing on that condition destroyed the link on
+      // arrival. The token is dropped when it is actually spent — after a
+      // successful ceremony, or when the server says `grant_invalid`.
     } else {
       setLoadFailed(true)
     }
@@ -149,6 +151,9 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     steppedUp.current = false
     if (created) {
       setTokenInput('')
+      // Spent: this device now has the credential the token existed to add.
+      setEnrollToken(null)
+      clearEnrollToken()
       setStatus(null)
       await refresh()
     }
@@ -182,6 +187,57 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     return (
       <Panel title="Seal Harness">
         <p className="agate-text">Checking access control…</p>
+      </Panel>
+    )
+  }
+
+  // A token captured from a link means "enroll here" — whether or not this
+  // device already has a passkey, and whether or not the operator is signed
+  // in. Without this, a second device landed on the login screen's
+  // "Sign in with a passkey" (which cannot work there) and an already-signed-in
+  // operator landed in the app with the token still pending.
+  //
+  // Scoped to the two states that were wrong: an authenticated operator (who
+  // would otherwise land in the app) and a device with no usable passkey (who
+  // would otherwise be told to sign in with one). `unconfigured` keeps its own
+  // setup panel, which already takes the token.
+  if (
+    status.state === 'passkey' &&
+    enrollToken !== null &&
+    (status.authenticated || status.usable_credentials > 0)
+  ) {
+    return (
+      <Panel title="Add a passkey on this device">
+        <p className="agate-text">
+          This link authorises one new passkey for{' '}
+          <code>{status.origin ?? 'this gateway'}</code>. The passkey is created here, on
+          this device, and can then sign you in from it.
+        </p>
+        <CapabilityNote surface="login" />
+        <OriginNote status={status} />
+        {error && <p className="agate-error">{error}</p>}
+        <div className="agate-actions">
+          <button
+            className="agate-primary"
+            disabled={busy || !canUsePasskey()}
+            onClick={() => { void addPasskey() }}
+          >
+            {busy ? 'Waiting for your passkey…' : 'Add a passkey here'}
+          </button>
+          <button
+            className="agate-secondary"
+            disabled={busy}
+            onClick={() => {
+              setEnrollToken(null)
+              // Drop the local copy too, or the stored token would pre-empt the
+              // app again on the next mount. Nothing is revoked server-side:
+              // the grant stays armed until it expires or is replaced.
+              clearEnrollToken()
+            }}
+          >
+            Not now
+          </button>
+        </div>
       </Panel>
     )
   }

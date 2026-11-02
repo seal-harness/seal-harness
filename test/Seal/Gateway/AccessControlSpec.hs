@@ -27,7 +27,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Network.HTTP.Types (Header, Status, methodDelete, methodGet, methodPost)
+import Network.HTTP.Types (Header, Status, methodDelete, methodGet, methodPost, status409)
 import Network.HTTP.Types.Header (hSetCookie)
 import Network.Wai
   ( Application, Request, Response, defaultRequest, pathInfo
@@ -425,6 +425,86 @@ spec = describe "Seal.Gateway.AccessControl" $ do
                        [("X-Seal-Enroll-Token", grantToken),
                         ("Cookie", "seal_session=" <> cookie)])
         stBound `shouldBe` status200'
+
+    it "mints a portable grant that a client with no cookie can redeem" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.singleton (b64 usableId) (credFor usableId (pointBytes (public_q pub)))
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (stOpts, _, opts) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"]
+                       [("Cookie", "seal_session=" <> cookie)])
+        stOpts `shouldBe` status200'
+        challenge <- challengeOf opts
+        body <- assertionBody challenge usableId priv 6
+        verifyReq <- postJsonWith ["api", "auth", "enroll", "verify"]
+          (withGrant body "portable" Nothing)
+          [("Cookie", "seal_session=" <> cookie)]
+        (stVer, _, granted) <- runApp (gated na) verifyReq
+        stVer `shouldBe` status200'
+        grantToken <- case jsonField granted "grant_token" of
+          Just (String t) -> pure t
+          _               -> expectationFailure "no grant_token" >> pure ""
+        -- Composed from the boot-resolved origin, never from the request.
+        jsonField granted "enroll_url" `shouldBe`
+          Just (String ("http://localhost:8080/#enroll=" <> grantToken))
+        -- The point of the feature: a *different* client — no cookie, no
+        -- session — redeems it. The assertion grant deliberately cannot do
+        -- this (the test above pins that), which is why the portable mint
+        -- exists at all.
+        (stOther, _, _) <- runApp (gated na)
+          (postReq ["api", "auth", "credentials", "options"]
+                   [("X-Seal-Enroll-Token", grantToken)])
+        stOther `shouldBe` status200'
+
+    it "refuses a second portable mint with 409 grant_outstanding, and force replaces it" $
+      withHome (Just passkeySection) $ \paths -> do
+        (pub, priv) <- generate (getCurveByName SEC_p256r1)
+        let usableId = BS.replicate 16 0x11
+            store = Map.singleton (b64 usableId) (credFor usableId (pointBytes (public_q pub)))
+        na <- bootHandle paths (Just passkeySection) store
+        cookie <- loginSession na usableId priv
+        (_, _, opts1) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"]
+                       [("Cookie", "seal_session=" <> cookie)])
+        challenge1 <- challengeOf opts1
+        body1 <- assertionBody challenge1 usableId priv 6
+        (_, _, granted1) <- runApp (gated na) =<<
+          postJsonWith ["api", "auth", "enroll", "verify"]
+            (withGrant body1 "portable" Nothing)
+            [("Cookie", "seal_session=" <> cookie)]
+        firstToken <- case jsonField granted1 "grant_token" of
+          Just (String t) -> pure t
+          _               -> expectationFailure "no first grant_token" >> pure ""
+        -- Second step-up. The refusal happens *before* the single-use challenge
+        -- is consumed, so the same assertion can be retried with force at no
+        -- extra WebAuthn prompt.
+        (_, _, opts2) <- runApp (gated na)
+          (postReqWith ["api", "auth", "enroll", "options"]
+                       [("Cookie", "seal_session=" <> cookie)])
+        challenge2 <- challengeOf opts2
+        body2 <- assertionBody challenge2 usableId priv 7
+        (stBusy, _, refused) <- runApp (gated na) =<<
+          postJsonWith ["api", "auth", "enroll", "verify"]
+            (withGrant body2 "portable" Nothing)
+            [("Cookie", "seal_session=" <> cookie)]
+        stBusy `shouldBe` status409
+        jsonField refused "code" `shouldBe` Just (String "grant_outstanding")
+        jsonField refused "minted_via" `shouldBe` Just (String "ui_token")
+        jsonField refused "expires_at" `shouldSatisfy` isNonEmptyValue
+        -- force replaces it, and the assertion still works because the refused
+        -- path consumed nothing.
+        (stForced, _, replaced) <- runApp (gated na) =<<
+          postJsonWith ["api", "auth", "enroll", "verify"]
+            (withGrant body2 "portable" (Just True))
+            [("Cookie", "seal_session=" <> cookie)]
+        stForced `shouldBe` status200'
+        secondToken <- case jsonField replaced "grant_token" of
+          Just (String t) -> pure t
+          _               -> expectationFailure "no replacement grant_token" >> pure ""
+        secondToken `shouldNotBe` firstToken
 
     -- Gate round 4, B-1: rev 4 let an absent token fall through to the
     -- session-held grant, so a stolen cookie could redeem the victim's live
@@ -867,6 +947,16 @@ assertionBody challenge credId priv counter = do
     , "signature" .= b64 (encodeDerSig sig)
     , "rawId" .= b64 credId
     ])
+
+-- | An assertion body with the portable-mint selector added. Kept separate so
+-- the assertion path's fixtures stay exactly as they were.
+withGrant :: Value -> Text -> Maybe Bool -> Value
+withGrant body grant mForce = case body of
+  Object o -> Object $ case mForce of
+    Nothing  -> KeyMap.insert (Key.fromText "grant") (String grant) o
+    Just f   -> KeyMap.insert (Key.fromText "force") (Bool f)
+                  (KeyMap.insert (Key.fromText "grant") (String grant) o)
+  other -> other
 
 -- | Run a full login ceremony and return the session cookie value.
 loginSession :: NewAccess -> ByteString -> PrivateKey -> IO Text

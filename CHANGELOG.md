@@ -21,6 +21,15 @@
   [--no-token] [--force] [--cancel]`, `disable --yes`, `reset --yes`,
   `migrate-credentials`.
 
+  **Adding a passkey on another device.** `/access` → "Add a passkey" now
+  mints a **link** (a file-backed `ui_token` grant, five minutes, single use)
+  instead of running the ceremony in the browser that clicked it, because the
+  passkey an operator adds is usually for a different device. Open the link
+  there; "Add the passkey on this computer" performs the same enrollment
+  locally. A captured `#enroll=` token is no longer discarded when the gateway
+  reports a usable credential — that count is gateway-side, so a phone holding
+  a valid link was losing it on arrival.
+
   **Upgrading:**
   - A pre-split install that kept credentials in
     `[access_control.credentials.*]` makes `seal serve` refuse to start and

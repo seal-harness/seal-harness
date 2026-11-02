@@ -536,7 +536,14 @@ consumeChallenge h presented kind mSession = do
 -- Responses
 -- ---------------------------------------------------------------------------
 
-data AuthErr = AuthErr Status Text Text
+data AuthErr
+  = AuthErr Status Text Text
+  | AuthErrDetail Status Text Text Value
+    -- ^ A refusal that also carries machine-readable fields (the @code@ is
+    -- still the discriminator; the detail is what the panel renders). A
+    -- separate constructor rather than a fourth field on 'AuthErr' so the
+    -- ~28 positional construction sites keep working: only the two
+    -- response builders below have to learn about it.
   deriving stock (Eq, Show)
 
 -- | Auth responses carry NO @Access-Control-Allow-Origin@: the gateway's other
@@ -558,17 +565,25 @@ authError st code msg = authJson st [] (object ["error" .= msg, "code" .= code])
 authOk :: [Header] -> Value -> Response
 authOk = authJson status200
 
+authErrorWith :: Status -> Text -> Text -> Value -> Response
+authErrorWith st code msg detail = authJson st [] $ case detail of
+  Object o -> Object (KeyMap.insert (Key.fromText "error") (String msg)
+           (KeyMap.insert (Key.fromText "code") (String code) o))
+  other    -> object ["error" .= msg, "code" .= code, "detail" .= other]
+
 respondResult :: [Header] -> Either AuthErr Value -> Response
 respondResult extra result = case result of
-  Left (AuthErr st code msg) -> authError st code msg
-  Right v                    -> authOk extra v
+  Left (AuthErr st code msg)              -> authError st code msg
+  Left (AuthErrDetail st code msg detail) -> authErrorWith st code msg detail
+  Right v                                 -> authOk extra v
 
 -- | Like 'respondResult', for handlers that mint a session and therefore carry
 -- a @Set-Cookie@ header back.
 respondSession :: Either AuthErr (Value, [Header]) -> Response
 respondSession result = case result of
-  Left (AuthErr st code msg)  -> authError st code msg
-  Right (v, extra)            -> authOk extra v
+  Left (AuthErr st code msg)              -> authError st code msg
+  Left (AuthErrDetail st code msg detail) -> authErrorWith st code msg detail
+  Right (v, extra)                        -> authOk extra v
 
 -- ---------------------------------------------------------------------------
 -- The auth API
@@ -1114,58 +1129,160 @@ enrollVerify h req = do
   body <- readJsonBody req
   case body of
     Left e -> pure (Left e)
-    Right obj -> do
-      now <- getCurrentTime
-      st <- withMVar (achState h) pure
-      let sessKey = sessionKeyFromRequest req
-      if not (sessionValid now st sessKey)
-           || credentialAvailability (acsRpId st) (acsCredentials st) /= Usable
-        then pure (Left (enrollRefusal GrantRequired))
-        else case (,,,) <$> b64Field obj "clientDataJSON"
-                          <*> b64Field obj "authenticatorData"
-                          <*> b64Field obj "signature"
-                          <*> b64Field obj "rawId" of
-            Left e -> pure (Left e)
-            Right (clientData, authData, signature, rawId) -> do
-              let claimedId = TE.decodeUtf8 (B64Url.encodeUnpadded rawId)
-              case Map.lookup claimedId (acsCredentials st) of
-                Nothing -> pure (Left (enrollRefusal GrantInvalid))
-                Just cred
-                  -- The picker only offers usable credentials, so naming an
-                  -- orphaned one is forged or racing (design §8.1).
-                  | Just (credRpId cred) /= acsRpId st ->
-                      pure (Left (enrollRefusal GrantInvalid))
-                  | otherwise -> do
-                      consumed <- maybe (pure False)
-                        (\c -> consumeChallenge h c ChallengeStepUp sessKey)
-                        (clientChallenge clientData)
-                      if not consumed
-                        then pure (Left (AuthErr status400 "challenge_invalid"
-                                   "the challenge is missing, expired or already used"))
-                        else case (acsOrigin st, acsRpId st) of
-                          (Just origin, Just rpId) ->
-                            case verifyAssertion (credPublicKey cred) AssertionInput
-                                  { aiClientDataJSON = clientData
-                                  , aiAuthenticatorData = authData
-                                  , aiSignature = signature
-                                  , aiExpectedChallenge = fromMaybeText (clientChallenge clientData)
-                                  , aiExpectedOrigin = origin
-                                  , aiExpectedRpId = rpId
-                                  , aiStoredSignCount = credSignCount cred
-                                  } of
-                              Left e -> pure (Left (webAuthnFailure e))
-                              Right newCount -> do
-                                bumped <- claimSignCount h claimedId (credSignCount cred) newCount
-                                if not bumped
-                                  then pure (Left (AuthErr status400 "sign_count_regression"
-                                            "this assertion was already used"))
-                                  else do
-                                    persisted <- persistSignCount h claimedId newCount
-                                    case persisted of
-                                      Left err -> pure (Left (AuthErr status500 "write_failed" err))
-                                      Right () -> mintAssertionGrant h claimedId sessKey
-                          _ -> pure (Left (AuthErr status400 "origin_mismatch"
-                                      "this gateway has no origin configured"))
+    Right obj ->
+      -- Order is part of the contract (design §4.1). The type checks, the
+      -- mode/session gate and the outstanding-grant check all run before
+      -- 'consumeChallenge', so a malformed body, an absent session or an
+      -- already-armed grant costs the operator no WebAuthn prompt and burns no
+      -- sign counter.
+      case (parseGrantMode obj, boolField obj "force") of
+        (Left e, _) -> pure (Left e)
+        (_, Left e) -> pure (Left e)
+        (Right portable, Right force) -> do
+          now <- getCurrentTime
+          st <- withMVar (achState h) pure
+          let sessKey = sessionKeyFromRequest req
+          if not (sessionValid now st sessKey)
+               || acsMode st /= AccessPasskey
+               || credentialAvailability (acsRpId st) (acsCredentials st) /= Usable
+            then pure (Left (enrollRefusal GrantRequired))
+            else do
+              armed <- if portable && not force
+                         then liveFileGrant h now
+                         else pure Nothing
+              case armed of
+                Just grant -> pure (Left (grantOutstandingRefusal grant))
+                Nothing    -> verifyStepUp h obj st sessKey portable
+
+-- | The assertion half of @enroll/verify@: the body's base64url fields, the
+-- challenge, the signature, the sign counter and the mint. Split out only so
+-- the checks above read as the ordered contract they are.
+verifyStepUp
+  :: AccessControlHandle -> Value -> AccessControlState -> Maybe Text -> Bool
+  -> IO (Either AuthErr Value)
+verifyStepUp h obj st sessKey portable =
+  case (,,,) <$> b64Field obj "clientDataJSON"
+             <*> b64Field obj "authenticatorData"
+             <*> b64Field obj "signature"
+             <*> b64Field obj "rawId" of
+    Left e -> pure (Left e)
+    Right (clientData, authData, signature, rawId) -> do
+      let claimedId = TE.decodeUtf8 (B64Url.encodeUnpadded rawId)
+      case Map.lookup claimedId (acsCredentials st) of
+        Nothing -> pure (Left (enrollRefusal GrantInvalid))
+        Just cred
+          -- The picker only offers usable credentials, so naming an orphaned
+          -- one is forged or racing (design §8.1).
+          | Just (credRpId cred) /= acsRpId st ->
+              pure (Left (enrollRefusal GrantInvalid))
+          | otherwise -> do
+              consumed <- maybe (pure False)
+                (\c -> consumeChallenge h c ChallengeStepUp sessKey)
+                (clientChallenge clientData)
+              if not consumed
+                then pure (Left (AuthErr status400 "challenge_invalid"
+                           "the challenge is missing, expired or already used"))
+                else case (acsOrigin st, acsRpId st) of
+                  (Just origin, Just rpId) ->
+                    case verifyAssertion (credPublicKey cred) AssertionInput
+                          { aiClientDataJSON = clientData
+                          , aiAuthenticatorData = authData
+                          , aiSignature = signature
+                          , aiExpectedChallenge = fromMaybeText (clientChallenge clientData)
+                          , aiExpectedOrigin = origin
+                          , aiExpectedRpId = rpId
+                          , aiStoredSignCount = credSignCount cred
+                          } of
+                      Left e -> pure (Left (webAuthnFailure e))
+                      Right newCount -> do
+                        bumped <- claimSignCount h claimedId (credSignCount cred) newCount
+                        if not bumped
+                          then pure (Left (AuthErr status400 "sign_count_regression"
+                                    "this assertion was already used"))
+                          else do
+                            persisted <- persistSignCount h claimedId newCount
+                            case persisted of
+                              Left err -> pure (Left (AuthErr status500 "write_failed" err))
+                              -- One step-up, one mint: the portable branch
+                              -- deliberately does not also write a session
+                              -- grant, so there is never a live same-device
+                              -- token for the client to discard.
+                              Right ()
+                                | portable  -> mintPortableGrant h
+                                | otherwise -> mintAssertionGrant h claimedId sessKey
+                  _ -> pure (Left (AuthErr status400 "origin_mismatch"
+                              "this gateway has no origin configured"))
+
+-- | Which grant @enroll/verify@ should mint. Absent means the assertion grant,
+-- so every pre-existing client keeps working unchanged.
+parseGrantMode :: Value -> Either AuthErr Bool
+parseGrantMode obj = case field obj "grant" of
+  Nothing          -> Right False
+  Just "assertion" -> Right False
+  Just "portable"  -> Right True
+  Just other       -> Left (AuthErr status400 "invalid_grant"
+    ("grant must be \"assertion\" or \"portable\", not \"" <> other <> "\""))
+
+-- | @force@ is a JSON boolean, and anything else is a refusal rather than a
+-- silent 'fromMaybe False'. A typo here is the difference between "replace the
+-- operator's live link" and "leave it alone", which is not a thing to guess at.
+boolField :: Value -> Text -> Either AuthErr Bool
+boolField (Object o) name = case KeyMap.lookup (Key.fromText name) o of
+  Nothing       -> Right False
+  Just (Bool b) -> Right b
+  Just _        -> Left (AuthErr status400 "invalid_force"
+                    ("field \"" <> name <> "\" must be a boolean"))
+boolField _ _ = Right False
+
+-- | The live file-backed grant, if any. A pure read: it never mints, reaps or
+-- extends anything (design §4.1 step 3).
+liveFileGrant :: AccessControlHandle -> UTCTime -> IO (Maybe Grant)
+liveFileGrant h now = do
+  filed <- loadGrantFile (enrollmentGrantPath (achPaths h))
+  pure (filed >>= \grant -> if grantLiveAt now grant then Just grant else Nothing)
+
+-- | 409 for "a grant is already armed". 'outstandingRefusal' is written for a
+-- terminal ("re-run with --force, or run `seal access-control enroll
+-- --cancel`"), so its prose is not reused here: the panel branches on @code@
+-- and renders the remaining lifetime from @expires_at@.
+grantOutstandingRefusal :: Grant -> AuthErr
+grantOutstandingRefusal grant = AuthErrDetail status409 "grant_outstanding"
+  ("an enrollment grant minted via " <> grantSourceText (grSource grant)
+     <> " is already armed")
+  (object
+    [ "minted_via" .= grantSourceText (grSource grant)
+    , "expires_at" .= isoTimeText (grExpiresAt grant)
+    ])
+
+-- | Mint the portable grant that makes the link work on another device.
+--
+-- A 'UiToken' file grant: the same authority a terminal-minted token carries,
+-- differing only in provenance. Not an 'Assertion' grant — those are bound to
+-- the session that earned them and cannot travel.
+--
+-- 'enrollGrant' runs with @force = True@ because the outstanding case was
+-- decided above; any 'Left' here is a write failure, not a live grant.
+mintPortableGrant :: AccessControlHandle -> IO (Either AuthErr Value)
+mintPortableGrant h = do
+  st <- withMVar (achState h) pure
+  minted <- enrollGrant (achPaths h) UiToken (defaultTtlFor UiToken) True
+  case minted of
+    Left err -> pure (Left (AuthErr status500 "write_failed" err))
+    Right mg -> case mgToken mg of
+      Nothing -> pure (Left (AuthErr status500 "write_failed"
+                  "the grant was written without a token"))
+      Just token -> pure (Right (object
+        [ "ok" .= True
+        , "grant_token" .= token
+        , "grant_expires_at" .= isoTimeText (grExpiresAt (mgGrant mg))
+        , "enroll_url" .= enrollUrlFrom (acsOrigin st) token
+        ]))
+
+-- | Compose the handoff link. Built from the boot-resolved origin, never from
+-- the request: a link composed from @Host@ would fail the origin check on the
+-- other machine, and under DNS rebinding it would be the attacker's origin.
+enrollUrlFrom :: Maybe Text -> Text -> Maybe Text
+enrollUrlFrom origin token = fmap (<> "/#enroll=" <> token) origin
 
 -- | Write the assertion grant into the session that earned it.
 mintAssertionGrant

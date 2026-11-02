@@ -97,6 +97,12 @@ data GrantSource
   | Assertion
     -- ^ Minted by a successful assertion from an already-enrolled credential;
     -- the authority for adding a second passkey.
+  | UiToken
+    -- ^ Minted by an authenticated browser session that has just completed a
+    -- step-up assertion (@POST /api/auth/enroll/verify@ with
+    -- @grant: portable@), so the operator can open the link on a *different*
+    -- device. Token-presented, file-backed, exactly like 'CliToken' — it
+    -- differs only in provenance, which the audit log and @minted_via@ report.
   deriving stock (Eq, Show)
 
 -- | The wire/TOML spelling (@minted_via@, @added_via@).
@@ -105,6 +111,7 @@ grantSourceText source = case source of
   CliToken  -> "cli_token"
   CliWindow -> "cli_window"
   Assertion -> "assertion"
+  UiToken   -> "ui_token"
 
 -- | Parse the stored spelling. 'Nothing' for anything unrecognised — callers
 -- decide whether that is a refusal (grants) or a fallback to @legacy@
@@ -114,6 +121,7 @@ parseGrantSource raw = case raw of
   "cli_token"  -> Just CliToken
   "cli_window" -> Just CliWindow
   "assertion"  -> Just Assertion
+  "ui_token"   -> Just UiToken
   _            -> Nothing
 
 -- | Where a grant is in its lifecycle (design §7.3).
@@ -335,7 +343,7 @@ data GrantContext = GrantContext
 
 -- | Which authorities are acceptable in this boot state.
 --
--- Total over 3 modes x 3 availabilities x 4 authorities. Two rules do most of
+-- Total over 3 modes x 3 availabilities x 5 authorities. Two rules do most of
 -- the work:
 --
 -- * __The loopback window exists only with nothing enrolled.__ It is authority
@@ -359,9 +367,17 @@ enrollmentAuthority ctx
   | otherwise = case (gcMode ctx, gcAuthorized ctx) of
       -- Open mode is fully open to *use*, not to enroll.
       (AccessOpen, Just CliToken) -> Right CliToken
+      (AccessOpen, Just UiToken)  -> Right UiToken
       (AccessOpen, _)             -> Left GrantRequired
       -- passkey + UnusableOnly is rp_mismatch: token only, never the window.
       (AccessPasskey, Just CliToken) -> Right CliToken
+      -- A browser-minted token is a peer of a terminal-minted one everywhere a
+      -- token is accepted, *except* bootstrap (@NoCredentials@, above) and
+      -- @unconfigured@ (below): those slots are reserved for authority minted
+      -- with local access, because they are what stops a reachable network
+      -- client enrolling a key the operator does not hold. Placed after the
+      -- CliToken clause so @UnusableOnly@ accepts it too, matching CliToken.
+      (AccessPasskey, Just UiToken) -> Right UiToken
       (AccessPasskey, _) | gcAvailability ctx == UnusableOnly -> Left GrantRequired
       -- passkey + Usable: an existing credential's assertion can add another,
       -- and a token still works.
@@ -547,6 +563,10 @@ data MintedGrant = MintedGrant
 -- | The default lifetime of a grant minted from the terminal (design §7.1).
 defaultGrantTtl :: GrantSource -> NominalDiffTime
 defaultGrantTtl CliWindow = 5 * 60
+-- Five minutes, not ten: a link minted in a browser is exposed in the DOM, in
+-- clipboard managers and cloud clipboard sync, and on a screen share, which a
+-- token printed to a terminal is not. Nothing in the flow needs longer.
+defaultGrantTtl UiToken   = 5 * 60
 defaultGrantTtl _         = 10 * 60
 
 -- | Mint a grant, unless one is already outstanding.

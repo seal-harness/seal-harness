@@ -167,6 +167,10 @@ enroll paths opts
 windowAllowed :: SealPaths -> GrantSource -> IO (Either T.Text ())
 windowAllowed _ CliToken = pure (Right ())
 windowAllowed _ Assertion = pure (Right ())
+-- A browser-minted grant is created by the gateway, never by this command, so
+-- reaching here would be a bug. Refuse rather than wave it through: the
+-- window preflight is what keeps authority-without-a-secret off a reachable port.
+windowAllowed _ UiToken = pure (Left "ui_token grants are minted by the gateway, not by `seal access-control enroll`.")
 windowAllowed paths CliWindow = do
   gwCfg <- gatewayConfig paths
   inputs <- preflight paths

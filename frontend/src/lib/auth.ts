@@ -21,7 +21,7 @@ export interface AuthStatus {
   /** Where enrollment authority would come from right now (design §8.3). A
    *  timing signal, not a predicate: `none` means "ask the operator to mint a
    *  token, then check again". */
-  enrollment_via: 'cli_token' | 'cli_window' | 'assertion' | 'none'
+  enrollment_via: 'cli_token' | 'cli_window' | 'ui_token' | 'assertion' | 'none'
   usable_credentials: number
   orphaned_credentials: number
 }
@@ -35,6 +35,8 @@ export function addedViaCopy(addedVia: string | null | undefined): string {
       return 'added with an enrollment window'
     case 'assertion':
       return 'confirmed with an existing passkey'
+    case 'ui_token':
+      return 'added from another device'
     case 'legacy':
       return 'migrated'
     default:
@@ -341,16 +343,39 @@ export function enrollOptions() {
   return authRequest<PublicKeyCredentialRequestOptionsJSON>('enroll/options', {})
 }
 
-/** `enroll/verify`: check the step-up assertion, returning the 120 s grant. */
-export function enrollVerify(body: unknown) {
-  return authRequest<{ ok: boolean; grant_token: string; grant_expires_at: string }>(
-    'enroll/verify',
-    { body },
-  )
+/** What a completed step-up yields. `url` is present only for a portable grant,
+ *  and is `null` when the daemon resolved no origin to build it from. */
+export interface EnrollGrant {
+  grantToken: string
+  expiresAt: string
+  url: string | null
 }
 
-/** The full step-up: options → assertion → verify → grant token. */
-export async function stepUpPasskey(): Promise<AuthResult<{ grantToken: string }>> {
+/** `enroll/verify`: check the step-up assertion.
+ *
+ *  `grant: "portable"` mints a file-backed grant that can be carried to
+ *  another device and returns the link to open there. The default mints the
+ *  120 s assertion grant bound to this session, so an in-flight ceremony
+ *  cannot be hijacked with the token alone. */
+export function enrollVerify(body: unknown) {
+  return authRequest<{
+    ok: boolean
+    grant_token: string
+    grant_expires_at: string
+    enroll_url?: string | null
+  }>('enroll/verify', { body })
+}
+
+/** The full step-up: options → assertion → verify → grant.
+ *
+ *  `grant: "portable"` is the cross-device path: the grant is a file-backed
+ *  `ui_token`, not the session-bound assertion grant, so the link it comes
+ *  with works in a browser on another machine. `force` replaces a grant that
+ *  is already armed. */
+export async function stepUpPasskey(
+  grant: 'assertion' | 'portable' = 'assertion',
+  force = false,
+): Promise<AuthResult<EnrollGrant>> {
   const options = await enrollOptions()
   if (!options.ok) return options
   const opts = options.data
@@ -380,9 +405,18 @@ export async function stepUpPasskey(): Promise<AuthResult<{ grantToken: string }
     authenticatorData: bytesToB64url(assertion.authenticatorData),
     signature: bytesToB64url(assertion.signature),
     rawId: bytesToB64url(cred.rawId),
+    grant,
+    force,
   })
   if (!verified.ok) return verified
-  return { ok: true, data: { grantToken: verified.data.grant_token } }
+  return {
+    ok: true,
+    data: {
+      grantToken: verified.data.grant_token,
+      expiresAt: verified.data.grant_expires_at,
+      url: verified.data.enroll_url ?? null,
+    },
+  }
 }
 
 export function verifyLogin(body: unknown) {

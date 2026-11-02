@@ -38,6 +38,7 @@ import Seal.Security.EnrollmentGrant
   , effectiveDeadline, enrollmentAuthority, findAuthority, grantBody
   , grantFromJson, grantLiveAt, grantRedeems, grantSourceText, grantToJson
   , loadClaimFile, loadGrantFile, releaseClaim
+  , defaultTtlFor
   , parseGrantSource, saveGrantFile, tokenDigest )
 
 spec :: Spec
@@ -45,8 +46,15 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
 
   describe "grantSourceText / parseGrantSource" $ do
     it "round-trips every source" $
-      map (parseGrantSource . grantSourceText) [CliToken, CliWindow, Assertion]
-        `shouldBe` map Just [CliToken, CliWindow, Assertion]
+      map (parseGrantSource . grantSourceText)
+        [CliToken, CliWindow, Assertion, UiToken]
+        `shouldBe` map Just [CliToken, CliWindow, Assertion, UiToken]
+
+    -- A ui_token grant lives in a browser (DOM, clipboard sync, screen share)
+    -- in a way a printed token does not, so it gets the shorter window.
+    it "gives a browser-minted grant a tighter default lifetime than a CLI one" $
+      (defaultTtlFor UiToken, defaultTtlFor CliToken, defaultTtlFor CliWindow)
+        `shouldBe` (5 * 60, 10 * 60, 5 * 60)
 
     it "rejects an unknown spelling (the caller decides what that means)" $
       parseGrantSource "sneaky" `shouldBe` Nothing
@@ -128,11 +136,11 @@ spec = describe "Seal.Security.EnrollmentGrant" $ do
       first `shouldBe` second
       first `shouldBe` Left GrantInvalid
 
-  -- Design §7.2. Totality is the point: every one of the 36 combinations must
+  -- Design §7.2. Totality is the point: every one of the 45 combinations must
   -- land on exactly one row, so there is no "fall through to something
   -- reasonable" arm to drift.
   describe "enrollmentAuthority" $ do
-    it "matches the matrix over all 36 combinations (session present)" $
+    it "matches the matrix over all 45 combinations (session present)" $
       [ (mode, availability, authority, enrollmentAuthority (mkContext mode availability authority True))
       | mode <- modes, availability <- availabilities, authority <- authorities ]
         `shouldBe` matrixWithSession
@@ -305,7 +313,7 @@ availabilities :: [CredentialAvailability]
 availabilities = [NoCredentials, UnusableOnly, Usable]
 
 authorities :: [Maybe GrantSource]
-authorities = [Nothing, Just CliToken, Just CliWindow, Just Assertion]
+authorities = [Nothing, Just CliToken, Just CliWindow, Just Assertion, Just UiToken]
 
 mkContext
   :: AccessMode -> CredentialAvailability -> Maybe GrantSource -> Bool
@@ -328,31 +336,52 @@ matrixWithSession = concat
       , row (Just CliToken)      (Right CliToken)
       , row (Just CliWindow)     (Right CliWindow)
       , row (Just Assertion)     (Left GrantRequired)
+      , row (Just UiToken)       (Left GrantRequired)
       ]
-      [ tokenOnly, tokenOnly ]
+      -- Unconfigured with credentials is not a state boot produces; answering
+      -- it keeps the function total without granting anything, so a
+      -- browser-minted token is refused here too.
+      [ tokenOnlyWithUiRevoked, tokenOnlyWithUiRevoked ]
   , block AccessOpen
       [ row Nothing              (Left GrantRequired)
       , row (Just CliToken)      (Right CliToken)
       , row (Just CliWindow)     (Right CliWindow)
       , row (Just Assertion)     (Left GrantRequired)
+      , row (Just UiToken)       (Left GrantRequired)
       ]
-      [ tokenOnly, tokenOnly ]
+      -- Open mode accepts a browser-minted token exactly as it accepts a
+      -- terminal-minted one: "fully open to *use*, not to enroll".
+      [ openToken, openToken ]
   , block AccessPasskey
       [ row Nothing              (Left GrantRequired)
       , row (Just CliToken)      (Right CliToken)
       , row (Just CliWindow)     (Right CliWindow)
       , row (Just Assertion)     (Left GrantRequired)
+      , row (Just UiToken)       (Left GrantRequired)
       ]
-      [ tokenOnly
+      [ tokenOnlyWithUi
       , [ row Nothing          (Left StepUpRequired)
         , row (Just CliToken)  (Right CliToken)
         , row (Just CliWindow) (Left GrantRequired)
         , row (Just Assertion) (Right Assertion)
+        , row (Just UiToken)   (Right UiToken)
         ]
       ]
   ]
   where
     row authority verdict = (authority, verdict)
+    -- passkey + UnusableOnly: a token of either provenance still works; the
+    -- loopback window does not. @NoCredentials@ stays reserved for authority
+    -- minted with local access, which is why the block above refuses UiToken.
+    tokenOnlyWithUi =
+      [ row Nothing          (Left GrantRequired)
+      , row (Just CliToken)  (Right CliToken)
+      , row (Just CliWindow) (Left GrantRequired)
+      , row (Just Assertion) (Left GrantRequired)
+      , row (Just UiToken)   (Right UiToken)
+      ]
+    openToken = tokenOnly <> [row (Just UiToken) (Right UiToken)]
+    tokenOnlyWithUiRevoked = tokenOnly <> [row (Just UiToken) (Left GrantRequired)]
     tokenOnly =
       [ row Nothing          (Left GrantRequired)
       , row (Just CliToken)  (Right CliToken)

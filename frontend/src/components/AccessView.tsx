@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   addedViaCopy,
-  clearEnrollToken,
   createPasskey,
   fetchAuthStatus,
   listCredentials,
@@ -14,19 +13,48 @@ import {
 } from '../lib/auth'
 import { notifyAuthChanged } from '../lib/unauthorized'
 
+/** True when `origin` only resolves on this machine. */
+function isLoopbackOrigin(origin: string | null | undefined): boolean {
+  if (!origin) return false
+  try {
+    const host = new URL(origin).hostname
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1'
+  } catch {
+    return false
+  }
+}
+
+function mmss(totalSeconds: number): string {
+  const s = Math.max(0, totalSeconds)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+interface ArmedLink {
+  url: string | null
+  token: string
+  expiresAt: string
+}
+
 /**
  * The Access view (`/access`): the mode, the enrolled passkeys, and the actions
  * that change them.
  *
- * Adding a passkey here is the normal way to enroll a second device: with a
- * usable credential enrolled the flow proves it first (`enroll/options` →
- * assertion → 120 s grant), then registers the new key with that grant. With
- * nothing usable enrolled it falls back to the bootstrap path, which needs a
- * token from `seal access-control enroll`.
+ * "Add a passkey" mints a **link** rather than running a ceremony here, because
+ * the passkey an operator adds is usually for a different device — a phone, a
+ * second laptop. The grant behind the link is a file-backed `ui_token` with a
+ * five-minute life, minted only after a step-up assertion from a passkey on
+ * this device, so a session cookie alone can never produce one.
  *
- * In `open` mode the gateway administers credentials unauthenticated — that is
- * what lets this page work at all there — so `listCredentials` and removal
- * succeed without a session.
+ * The link is shown once: the gateway stores only the token's digest, so a
+ * reload cannot re-display it. "Add the passkey on this computer" is the same
+ * link used locally, which is why the panel offers it instead of a second
+ * ceremony.
+ *
+ * Minting needs `passkey` mode and a usable credential; with nothing enrolled
+ * there is nothing to step up with, so the panel points at the terminal
+ * instead. In `open` mode the gateway administers credentials unauthenticated
+ * — that is what lets this page work there — so listing and removal succeed
+ * without a session.
  */
 export function AccessView() {
   const [status, setStatus] = useState<AuthStatus | null>(null)
@@ -34,6 +62,8 @@ export function AccessView() {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [link, setLink] = useState<ArmedLink | null>(null)
+  const [ticks, setTicks] = useState(0)
 
   const load = useCallback(async () => {
     const [s, c] = await Promise.all([fetchAuthStatus(), listCredentials()])
@@ -44,49 +74,81 @@ export function AccessView() {
 
   useEffect(() => { void load() }, [load])
 
-  const add = useCallback(async () => {
+  // The countdown is advisory: it is computed against this browser's clock, so
+  // it clamps at zero rather than claiming the grant is dead, and the link
+  // stays on screen if it does.
+  useEffect(() => {
+    if (!link) return
+    const id = setInterval(() => setTicks((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [link])
+
+  const remaining = useMemo(() => {
+    void ticks
+    if (!link) return 0
+    const ms = Date.parse(link.expiresAt) - Date.now()
+    return Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0
+  }, [link, ticks])
+
+  const canMint = status?.state === 'passkey' && (status?.usable_credentials ?? 0) > 0
+
+  /** Step up on an existing passkey, then ask the gateway for a portable grant. */
+  const mint = useCallback(async (force: boolean) => {
     setBusy(true)
     setError(null)
     setNotice(null)
-    const usable = status?.usable_credentials ?? 0
-    const target = usable > 0 ? 'add' : 'bootstrap'
-
-    let token: string | null = null
-    if (usable > 0) {
-      // Two distinct prompts, in order: "confirm it's you" then "create".
-      const step = await stepUpPasskey()
-      if (!step.ok) {
-        setBusy(false)
-        setError(
-          step.code === 'not_allowed'
-            ? 'The confirmation prompt was cancelled or timed out.'
-            : step.error,
-        )
-        return
-      }
-      token = step.data.grantToken
-    }
-
-    const created = await createPasskey(token, target)
-    if (!created.ok) {
-      setBusy(false)
+    const step = await stepUpPasskey('portable', force)
+    setBusy(false)
+    if (!step.ok) {
       setError(
-        created.code === 'grant_required'
-          ? 'Adding a passkey needs a token from `seal access-control enroll`.'
-          : created.error,
+        step.code === 'not_allowed'
+          ? 'The confirmation prompt was cancelled or timed out.'
+          : step.code === 'grant_outstanding'
+            ? 'A link is already armed on this gateway. Press "Replace" to mint a new one.'
+            : step.error,
       )
       return
     }
-    const verified = await verifyRegistration(created.data, token, target === 'add')
+    setLink({
+      url: step.data.url,
+      token: step.data.grantToken,
+      expiresAt: step.data.expiresAt,
+    })
+    setTicks(0)
+  }, [])
+
+  /** Add the passkey here, using the very link that is on screen. */
+  const addHere = useCallback(async () => {
+    if (!link) return
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    const created = await createPasskey(link.token, 'add')
+    if (!created.ok) {
+      setBusy(false)
+      setError(created.error)
+      return
+    }
+    const verified = await verifyRegistration(created.data, link.token, true)
     setBusy(false)
     if (!verified.ok) {
       setError(verified.error)
       return
     }
-    clearEnrollToken()
+    setLink(null)
     setNotice('Passkey added.')
     await load()
-  }, [status, load])
+  }, [link, load])
+
+  const copyLink = useCallback(async () => {
+    if (!link?.url) return
+    try {
+      await navigator.clipboard.writeText(link.url)
+      setNotice('Link copied.')
+    } catch {
+      setNotice('Copy failed — select the link and copy it by hand.')
+    }
+  }, [link])
 
   const remove = useCallback(async (id: string) => {
     setError(null)
@@ -115,8 +177,8 @@ export function AccessView() {
 
         <p className="agate-text">
           Mode: <strong>{status?.state ?? '…'}</strong>
-          {status?.origin ? <> · verified origin <code>{status.origin}</code></> : null}
-          {status?.rp_id ? <> · rp id <code>{status.rp_id}</code></> : null}
+          {status?.origin ? (<> · verified origin <code>{status.origin}</code></>) : null}
+          {status?.rp_id ? (<> · rp id <code>{status.rp_id}</code></>) : null}
         </p>
 
         {status?.state === 'open' && (
@@ -134,10 +196,12 @@ export function AccessView() {
           </p>
         )}
 
-        {status?.enrollment_via === 'none' && (
+        {!canMint && (
           <p className="agate-note">
-            No enrollment token is armed. Run <code>seal access-control enroll</code> in the
-            terminal where Seal runs, then add the passkey — the grant lasts ten minutes.
+            A link has to be authorised by a passkey that already works here, so nothing can
+            be minted from this page yet. Run{' '}
+            <code>seal access-control enroll</code> in the terminal where Seal runs, then add
+            the passkey — the grant lasts five minutes.
           </p>
         )}
 
@@ -171,27 +235,102 @@ export function AccessView() {
         {error && <p className="agate-error">{error}</p>}
         {notice && <p className="agate-hint">{notice}</p>}
 
-        <div className="agate-actions">
-          <button className="agate-primary" disabled={busy} onClick={() => { void add() }}>
-            {busy ? 'Waiting for your passkey…' : 'Add a passkey'}
-          </button>
-          {status?.state === 'passkey' && status.authenticated && (
+        {link ? (
+          <div className="agate-note">
+            <p>
+              Open this link in a browser on the device that should hold the new passkey.
+              Anyone who opens it can add a passkey to this gateway until it expires, and it
+              can only be shown once.
+            </p>
+            {link.url ? (
+              <>
+                <label className="agate-field">
+                  <span>Enrollment link</span>
+                  <input readOnly value={link.url} aria-label="Enrollment link" onFocus={(e) => e.currentTarget.select()} />
+                </label>
+                <button className="agate-secondary" onClick={() => { void copyLink() }}>
+                  Copy link
+                </button>
+              </>
+            ) : (
+              <label className="agate-field">
+                <span>Enrollment token</span>
+                <input readOnly value={link.token} aria-label="Enrollment token" onFocus={(e) => e.currentTarget.select()} />
+                <small>
+                  This gateway resolved no origin, so build the link yourself:
+                  <code>{'<your origin>'}/#enroll={'<token>'}</code>
+                </small>
+              </label>
+            )}
+            <p className="agate-hint">
+              Expires in {mmss(remaining)}.
+              {isLoopbackOrigin(status?.origin) && (
+                <>
+                  {' '}Seal is only reachable at <code>{status?.origin}</code>, so this link
+                  opens in a browser on this computer. To enroll a phone, put Seal behind an
+                  HTTPS origin and mint again.
+                </>
+              )}
+            </p>
+            <p className="agate-hint">
+              Open the address exactly as written: a different scheme, port, or host spelling
+              registers a passkey that cannot sign in here. Clipboard managers and cloud
+              clipboard sync can read a copied link.
+            </p>
+
+            <div className="agate-actions">
+              <button
+                className="agate-primary"
+                disabled={busy || remaining === 0}
+                onClick={() => { void addHere() }}
+              >
+                {busy ? 'Waiting for your passkey…' : 'Add the passkey on this computer'}
+              </button>
+              <button
+                className="agate-secondary"
+                disabled={busy}
+                onClick={() => { void mint(true) }}
+                title="Replace this link with a new one"
+              >
+                Replace
+              </button>
+              <button
+                className="agate-secondary"
+                disabled={busy}
+                onClick={() => { setLink(null); setNotice('Link discarded. It stays valid until it expires.') }}
+              >
+                Hide
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="agate-actions">
             <button
-              className="agate-danger"
-              onClick={() => {
-                void (async () => {
-                  await logout()
-                  notifyAuthChanged()
-                  // Closes the already-authorised WebSocket and clears every
-                  // in-memory transcript — see SignOutButton.
-                  window.location.reload()
-                })()
-              }}
+              className="agate-primary"
+              disabled={busy || !canMint}
+              onClick={() => { void mint(false) }}
+              title={canMint ? undefined : 'Requires a passkey that already works here'}
             >
-              Sign out
+              {busy ? 'Waiting for your passkey…' : 'Add a passkey'}
             </button>
-          )}
-        </div>
+            {status?.state === 'passkey' && status.authenticated && (
+              <button
+                className="agate-danger"
+                onClick={() => {
+                  void (async () => {
+                    await logout()
+                    notifyAuthChanged()
+                    // Closes the already-authorised WebSocket and clears every
+                    // in-memory transcript — see SignOutButton.
+                    window.location.reload()
+                  })()
+                }}
+              >
+                Sign out
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

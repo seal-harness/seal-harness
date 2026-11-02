@@ -62,7 +62,13 @@ function installFetch() {
       return ok({ challenge: 'AAAA', rpId: 'localhost', timeout: 120000, userVerification: 'required', allowCredentials: [] })
     }
     if (url.endsWith('/api/auth/enroll/verify')) {
-      return ok({ ok: true, grant_token: 'grant123', grant_expires_at: '2026-10-31T00:02:00Z' })
+      return ok({
+        ok: true,
+        grant_token: 'grant123',
+        // A live deadline: the panel disables "add on this computer" at zero.
+        grant_expires_at: new Date(Date.now() + 300_000).toISOString(),
+        enroll_url: 'http://localhost:8080/#enroll=grant123',
+      })
     }
     if (url.endsWith('/api/auth/credentials/options')) {
       return ok({
@@ -151,21 +157,29 @@ describe('AccessView', () => {
     expect(buttons[1]).toBeEnabled() // the orphan
   })
 
-  it('adds a passkey by stepping up first, with two distinct prompts', async () => {
+  it('mints a link by stepping up, then adds the passkey here with that link', async () => {
     render(<AccessView />)
     await screen.findByText('laptop')
     fireEvent.click(screen.getByRole('button', { name: 'Add a passkey' }))
-    await waitFor(() => expect(createFn).toHaveBeenCalledTimes(1))
-    // The step-up runs the get() ceremony before the create() ceremony.
-    expect(getFn).toHaveBeenCalledTimes(1)
+    // One get() ceremony — the step-up. Nothing is created on this device yet:
+    // the button now mints a link for wherever the passkey actually goes.
+    await waitFor(() => expect(getFn).toHaveBeenCalledTimes(1))
+    expect(createFn).not.toHaveBeenCalled()
     expect(calls.some((u) => u.endsWith('/api/auth/enroll/options'))).toBe(true)
-    expect(calls.some((u) => u.endsWith('/api/auth/credentials/options'))).toBe(true)
+    expect(await screen.findByLabelText('Enrollment link'))
+      .toHaveValue('http://localhost:8080/#enroll=grant123')
+    fireEvent.click(screen.getByRole('button', { name: /Add the passkey on this computer/ }))
     expect(await screen.findByText(/Passkey added/)).toBeInTheDocument()
+    // The same portable token, not a second ceremony, carried the create().
+    expect(createFn).toHaveBeenCalledTimes(1)
+    expect(calls.some((u) => u.endsWith('/api/auth/credentials/options'))).toBe(true)
   })
 
-  it('tells the operator where the token comes from when none is armed', async () => {
+  it('explains that a link needs a passkey that already works here', async () => {
+    status = { ...status, usable_credentials: 0 }
     render(<AccessView />)
     await screen.findByText('laptop')
     expect(screen.getByText(/seal access-control enroll/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add a passkey' })).toBeDisabled()
   })
 })
