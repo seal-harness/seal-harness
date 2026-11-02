@@ -312,6 +312,11 @@ If those files are absent, Seal generates a self-signed pair with `openssl`
 (key written `0600`) on the next start. `tls_hosts` names what the certificate
 should be valid for; the bind host and `localhost` are included by default.
 
+Changing `tls_hosts` does **not** regenerate an existing pair — the files are
+left alone so a restart never rotates the key. Delete `keys/tls/cert.pem` and
+`keys/tls/key.pem` after editing `tls_hosts`, or the certificate keeps the old
+names and the browser rejects the ceremony.
+
 ```toml
 # ~/.seal/security.toml — must be the https URL clients actually use
 [access_control]
