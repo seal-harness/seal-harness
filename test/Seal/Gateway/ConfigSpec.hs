@@ -2,6 +2,7 @@
 module Seal.Gateway.ConfigSpec (spec) where
 
 import Data.Text qualified as T
+import Data.Maybe (isJust)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -23,7 +24,7 @@ spec = describe "Seal.Gateway.Config" $ do
 
   describe "withGatewayDefaults" $ do
     it "fills in defaults for missing fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 8080   -- default (same as the HTTP port)
@@ -32,7 +33,7 @@ spec = describe "Seal.Gateway.Config" $ do
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
 
     it "preserves all set fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 9091
@@ -50,6 +51,8 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcHost = Just "0.0.0.0"
               , pgcStaticDir = Just "/srv/seal"
               , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
+              , pgcTlsCert = Just "/srv/seal/fullchain.pem"
+              , pgcTlsKey = Just "/srv/seal/privkey.pem"
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg
@@ -68,6 +71,8 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcHost = Just "0.0.0.0"
               , pgcStaticDir = Nothing
               , pgcAllowedOrigins = []
+              , pgcTlsCert = Nothing
+              , pgcTlsKey = Nothing
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg
@@ -89,3 +94,31 @@ spec = describe "Seal.Gateway.Config" $ do
         case result of
           Right loaded -> rcGateway loaded `shouldBe` Nothing
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
+
+  -- TLS is what makes a passkey ceremony possible without a reverse proxy:
+  -- WebAuthn needs a secure context, and a plain http LAN address is not one.
+  describe "TLS" $ do
+    let tlsCfg cert key = defaultGatewayConfig { gcTlsCert = cert, gcTlsKey = key }
+
+    it "is off by default" $ do
+      tlsEnabled defaultGatewayConfig `shouldBe` False
+      tlsConfigError defaultGatewayConfig `shouldBe` Nothing
+
+    it "is on only when both the certificate and the key are set" $ do
+      tlsEnabled (tlsCfg (Just "cert.pem") (Just "key.pem")) `shouldBe` True
+      tlsEnabled (tlsCfg (Just "cert.pem") Nothing) `shouldBe` False
+      tlsEnabled (tlsCfg Nothing (Just "key.pem")) `shouldBe` False
+
+    it "refuses a half-configured pair rather than failing in the handshake" $ do
+      tlsConfigError (tlsCfg (Just "cert.pem") (Just "key.pem")) `shouldBe` Nothing
+      tlsConfigError (tlsCfg (Just "cert.pem") Nothing) `shouldSatisfy` isJust
+      tlsConfigError (tlsCfg Nothing (Just "key.pem")) `shouldSatisfy` isJust
+
+    it "requires an https origin once TLS is on" $ do
+      tlsOriginError False (Just "http://localhost:8080") `shouldBe` Nothing
+      tlsOriginError True (Just "https://seal.example.com") `shouldBe` Nothing
+      tlsOriginError True Nothing `shouldBe` Nothing
+      -- The derived loopback origin, and any explicit http one, would fail
+      -- every ceremony's origin check against an https listener.
+      tlsOriginError True (Just "http://localhost:8080") `shouldSatisfy` isJust
+      tlsOriginError True (Just "http://192.168.0.107:8080") `shouldSatisfy` isJust

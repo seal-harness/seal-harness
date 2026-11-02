@@ -52,6 +52,20 @@
   - Enrolling works in `mode = "none"`, so an open gateway can be locked down
     from the web UI; it can never be turned back off from there.
 
+* **The gateway can serve HTTPS itself.** `[gateway] tls_cert` and `tls_key`
+  (PEM paths, required together) switch the listener from plain HTTP to TLS,
+  so a passkey ceremony no longer needs a reverse proxy in front. The startup
+  banner reports `https://` / `wss://`, and the WebSocket `Origin` allowlist
+  derives its scheme from the listener rather than assuming `http://`. Turning
+  TLS on also makes `[access_control] origin` mandatory and `https://` — the
+  derived loopback origin would otherwise never match — and a half-configured
+  certificate/key pair is refused at boot instead of failing inside the
+  handshake.
+
+  Note that TLS alone does not make a bare IP usable for passkeys: a WebAuthn
+  RP ID must be a domain string, so `https://192.168.1.42:8443` still cannot
+  register a credential. The gateway needs a hostname, not just a certificate.
+
 * **The gateway no longer refuses a non-loopback bind in remote mode.**
   `untrusted_execution.mode = "remote"` used to make `seal serve` exit rather
   than bind anything but loopback. That was a compensating control for an

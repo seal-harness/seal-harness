@@ -60,7 +60,7 @@ import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.BootPlan
-  ( BindCoordinates (..), bootPlan, bootRefusalMessage, preflight )
+  ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
   ( SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
@@ -70,7 +70,9 @@ import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+import Seal.Gateway.Config
+  ( GatewayConfig (..), defaultGatewayConfig, tlsConfigError, tlsEnabled, tlsOriginError
+  , withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
@@ -163,6 +165,14 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   let gwCfgAccess = case mCliStaticDir of
         Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
         Nothing  -> gwCfgForAccess
+  -- TLS is validated before anything binds. A half-configured certificate/key
+  -- pair is a boot refusal rather than a handshake failure on the first
+  -- connection, where the message would be about a cipher, not a typo.
+  case tlsConfigError gwCfgAccess of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
   -- The §10 matrix runs here, before any channel is forked or port bound.
   bootInputs <- preflight paths
   let planResult = bootInputs >>= bootPlan (BindCoordinates (gcHost gwCfgAccess)
@@ -172,7 +182,13 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       let reason = bootRefusalMessage refusal
       logIO logger ErrorS ("access control: " <> ls reason)
       ioError (userError (T.unpack reason))
-    Right plan -> newAccessControlHandle paths plan
+    -- Serving HTTPS makes the https origin authoritative; a verified origin
+    -- that still says http:// would fail every ceremony's origin check.
+    Right plan -> case tlsOriginError (tlsEnabled gwCfgAccess) (bpOrigin plan) of
+      Just err -> do
+        logIO logger ErrorS ("gateway: " <> ls err)
+        ioError (userError (T.unpack err))
+      Nothing -> newAccessControlHandle paths plan
   printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
@@ -419,7 +435,11 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- any Origin) — overriding even the default loopback origin. For a specific
   -- host, derive the origin + prepend it to the configured list.
   let isWildcard = gcHost gwCfg == "0.0.0.0" || gcHost gwCfg == "::"
-      httpOrigins = [ "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
+      -- The scheme has to match what clients actually reach: with TLS on they
+      -- send an https Origin, and an http-only allowlist would reject the
+      -- WebSocket handshake.
+      scheme = if tlsEnabled gwCfg then "https" else "http"
+      httpOrigins = [ scheme <> "://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
                     | not isWildcard ]
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any

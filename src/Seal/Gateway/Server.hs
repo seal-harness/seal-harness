@@ -29,13 +29,14 @@ import Network.Wai
   ( Application, pathInfo, requestMethod, responseFile
   , responseLBS, responseStatus, Response )
 import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeout, Settings)
+import Network.Wai.Handler.WarpTLS (runTLS, tlsSettings)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeExtension)
 
 import Seal.Gateway.AccessControl
   ( AccessControlHandle, accessControlMiddleware )
 import Seal.Gateway.API (apiApp, ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..))
+import Seal.Gateway.Config (GatewayConfig (..), tlsEnabled)
 import Seal.Gateway.Embedded (embeddedAssets)
 import Seal.Gateway.Stream (StreamGuard, streamMiddleware)
 import Seal.Gateway.StreamBroker (StreamBroker)
@@ -292,14 +293,24 @@ runGateway logger mAccess cfg deps guard broker = do
   let host = gcHost cfg
       port = gcPort cfg
       mStaticDir = fmap T.unpack (gcStaticDir cfg)
+      scheme = if tlsEnabled cfg then "https" else "http" :: T.Text
+      streamScheme = if tlsEnabled cfg then "wss" else "ws" :: T.Text
   logIO logger InfoS "Seal Harness gateway"
-  logIO logger InfoS ("  URL:      http://" <> ls host <> ":" <> ls (show port))
-  logIO logger InfoS ("  Stream:   ws://" <> ls host <> ":" <> ls (show port) <> "/ (same port)")
+  logIO logger InfoS ("  URL:      " <> ls scheme <> "://" <> ls host <> ":" <> ls (show port))
+  logIO logger InfoS ("  Stream:   " <> ls streamScheme <> "://" <> ls host <> ":"
+                       <> ls (show port) <> "/ (same port)")
   when (isExposedBind host) $
     logIO logger WarningS ("binding to " <> ls host
       <> " — the full slash-command surface is reachable by anything that can reach this address")
-  runSettings (setPort port settings)
-    (gatewayAppWithStream logger mAccess deps mStaticDir guard broker)
+  let app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
+      warpSettings = setPort port settings
+  -- TLS in-process when both PEM paths are configured, so passkeys work with
+  -- no reverse proxy in front. 'tlsConfigError' has already refused the
+  -- half-configured case at boot.
+  case (gcTlsCert cfg, gcTlsKey cfg) of
+    (Just cert, Just key) ->
+      runTLS (tlsSettings (T.unpack cert) (T.unpack key)) warpSettings app
+    _ -> runSettings warpSettings app
 
 -- | Does this bind expose the gateway beyond the local machine?
 --

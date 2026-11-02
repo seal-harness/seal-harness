@@ -291,10 +291,37 @@ device, Seal asks you to confirm with an existing passkey (a 120 s grant), then
 runs the create prompt. `disable` and `reset` require the daemon stopped —
 `serve.lock` is an advisory kernel lock, so a crashed daemon never blocks them.
 
-Passkeys need a **secure context**: `http://localhost`, or HTTPS. To protect a
-gateway reached over a VPN, put a TLS reverse proxy in front of it and set
-`origin` / `rp_id` to the proxy's URL. Deleting the last **usable** passkey is
-refused; an orphaned one (registered for another address) is safe to remove.
+Passkeys need a **secure context**: `http://localhost`, or HTTPS. The gateway
+can terminate TLS itself, so no reverse proxy is required:
+
+```toml
+# ~/.seal/config/config.toml
+[gateway]
+host     = "0.0.0.0"
+port     = 8443
+tls_cert = "/home/me/.seal/keys/fullchain.pem"
+tls_key  = "/home/me/.seal/keys/privkey.pem"
+```
+
+```toml
+# ~/.seal/security.toml — must be the https URL clients actually use
+[access_control]
+origin = "https://seal.example.com:8443"
+```
+
+Both PEM paths are required together. Turning TLS on makes `origin` mandatory
+and `https://`: the loopback default is `http://localhost:<port>`, which no
+ceremony could ever match. A reverse proxy still works too — leave
+`tls_cert`/`tls_key` unset and point `origin` / `rp_id` at the proxy's URL.
+
+**A hostname is required, not just TLS.** A WebAuthn RP ID must be a domain
+string, so `https://192.168.1.42:8443` still cannot register a passkey — Chrome
+raises `SecurityError` before the ceremony starts. Use a name that resolves on
+the client (a tailnet name, a DNS record for the LAN address, or
+`tailscale cert` for a real certificate) and set `origin`/`rp_id` to it.
+
+Deleting the last **usable** passkey is refused; an orphaned one (registered
+for another address) is safe to remove.
 
 `reset` is the terminal-only escape hatch: no opcode and no HTTP route can turn
 access control off — `POST /api/auth/waive` was removed, and `mode = "none"` can

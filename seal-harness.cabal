@@ -349,6 +349,7 @@ library
         , uuid-types
       , wai
       , warp
+      , warp-tls
       , websockets
       , wai-websockets
       , case-insensitive
