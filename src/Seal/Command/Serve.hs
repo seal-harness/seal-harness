@@ -65,15 +65,16 @@ import Seal.Config.Security
   ( SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config
   ( GatewayConfig (..), defaultGatewayConfig, tlsConfigError, tlsEnabled, tlsOriginError
-  , withGatewayDefaults )
+  , effectiveTlsPaths, withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
+
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -173,6 +174,23 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       logIO logger ErrorS ("gateway: " <> ls err)
       ioError (userError (T.unpack err))
     Nothing -> pure ()
+  -- TLS paths default under keys/tls, so `tls = true` is the whole
+  -- configuration. Missing material is a refusal that names the paths and the
+  -- command that makes them, rather than a handshake failure on first request.
+  gwCfgTls <- if tlsEnabled gwCfgAccess
+    then do
+      let (certPath, keyPath) =
+            effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
+      haveCert <- doesFileExist certPath
+      haveKey  <- doesFileExist keyPath
+      if haveCert && haveKey
+        then pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
+                              , gcTlsKey  = Just (T.pack keyPath) }
+        else do
+          let msg = missingTlsFilesMessage haveCert haveKey certPath keyPath
+          logIO logger ErrorS ("gateway: " <> ls msg)
+          ioError (userError (T.unpack msg))
+    else pure gwCfgAccess
   -- The §10 matrix runs here, before any channel is forked or port bound.
   bootInputs <- preflight paths
   let planResult = bootInputs >>= bootPlan (BindCoordinates (gcHost gwCfgAccess)
@@ -388,7 +406,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
           -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg = gwCfgAccess
+  let gwCfg = gwCfgTls
   -- The WS stream server's liveness, published through /api/health. The
   -- ref is created BEFORE the ApiDeps that reads it and is filled in by
   -- the WS server thread once it has attempted its bind. Reporting the
@@ -662,3 +680,27 @@ printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
 printAccessControlBanner paths access = do
   stderrIsTTY <- hIsTerminalDevice stderr
   printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access
+
+-- | What to say when TLS is on but the PEM material is not there.
+--
+-- Names the paths, gives the command that produces a working pair, and states
+-- the two constraints that make this a decision rather than a formality: a
+-- bare IP cannot be an RP ID, and a browser refuses WebAuthn on a certificate
+-- the client does not already trust.
+missingTlsFilesMessage :: Bool -> Bool -> FilePath -> FilePath -> T.Text
+missingTlsFilesMessage haveCert haveKey certPath keyPath = T.intercalate "\n"
+  [ "[gateway] tls is on but the certificate material is missing:"
+  , "  cert: " <> T.pack certPath <> presence haveCert
+  , "  key:  " <> T.pack keyPath <> presence haveKey
+  , "  Point tls_cert / tls_key at a real certificate, or make a self-signed pair:"
+  , "    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \\"
+  , "      -days 3650 -keyout " <> T.pack keyPath <> " -out " <> T.pack certPath
+  , "      -subj \"/CN=<host>\" -addext \"subjectAltName=DNS:<host>\""
+  , "  Replace <host> with the name clients use — a bare IP cannot work, because a"
+  , "  WebAuthn RP ID must be a domain. A browser also refuses WebAuthn on any"
+  , "  certificate the client does not already trust, so a self-signed pair has to"
+  , "  be installed on the device first; `tailscale cert <name>` gives a trusted one."
+  ]
+  where
+    presence True  = " (present)"
+    presence False = " (missing)"

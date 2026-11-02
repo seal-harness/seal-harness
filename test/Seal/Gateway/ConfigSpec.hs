@@ -24,7 +24,7 @@ spec = describe "Seal.Gateway.Config" $ do
 
   describe "withGatewayDefaults" $ do
     it "fills in defaults for missing fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 8080   -- default (same as the HTTP port)
@@ -33,7 +33,7 @@ spec = describe "Seal.Gateway.Config" $ do
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
 
     it "preserves all set fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 9091
@@ -53,6 +53,7 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
               , pgcTlsCert = Just "/srv/seal/fullchain.pem"
               , pgcTlsKey = Just "/srv/seal/privkey.pem"
+              , pgcTls = Just True
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg
@@ -73,6 +74,7 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcAllowedOrigins = []
               , pgcTlsCert = Nothing
               , pgcTlsKey = Nothing
+              , pgcTls = Nothing
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg
@@ -122,3 +124,20 @@ spec = describe "Seal.Gateway.Config" $ do
       -- every ceremony's origin check against an https listener.
       tlsOriginError True (Just "http://localhost:8080") `shouldSatisfy` isJust
       tlsOriginError True (Just "http://192.168.0.107:8080") `shouldSatisfy` isJust
+
+    -- `tls = true` is meant to be the whole configuration: the PEM paths are
+    -- implied, and an explicit one only overrides its side of the pair.
+    it "defaults both paths, and lets either be overridden" $ do
+      let cfg = defaultGatewayConfig { gcTls = True }
+      effectiveTlsPaths "/k/tls/cert.pem" "/k/tls/key.pem" cfg
+        `shouldBe` ("/k/tls/cert.pem", "/k/tls/key.pem")
+      effectiveTlsPaths "/k/tls/cert.pem" "/k/tls/key.pem"
+        cfg { gcTlsCert = Just "/etc/ssl/fullchain.pem" }
+        `shouldBe` ("/etc/ssl/fullchain.pem", "/k/tls/key.pem")
+      effectiveTlsPaths "/k/tls/cert.pem" "/k/tls/key.pem"
+        cfg { gcTlsKey = Just "/etc/ssl/privkey.pem" }
+        `shouldBe` ("/k/tls/cert.pem", "/etc/ssl/privkey.pem")
+
+    it "is on when the flag is set, or when both paths are given" $ do
+      tlsEnabled defaultGatewayConfig `shouldBe` False
+      tlsEnabled (defaultGatewayConfig { gcTls = True }) `shouldBe` True

@@ -15,6 +15,8 @@ module Seal.Config.Paths
   , repoCloneStateDir
   , repoKeysDir
   , sshAgentsDir
+  , tlsCertPath
+  , tlsKeyPath
   , sessionsRoot
   , sessionDir
   , sessionMetaPath
@@ -206,6 +208,17 @@ repoKeysDir paths = repoCloneStateDir paths </> "keys"
 -- (the socket paths are not secrets but shouldn't be world-readable).
 sshAgentsDir :: SealPaths -> FilePath
 sshAgentsDir paths = repoCloneStateDir paths </> "ssh-agents"
+
+-- | Default gateway TLS certificate, under the 0700 key directory.
+--
+-- Defaulting the pair is what lets @[gateway] tls = true@ be the whole
+-- configuration; an operator with a real certificate overrides both paths.
+tlsCertPath :: SealPaths -> FilePath
+tlsCertPath paths = spKeys paths </> "tls" </> "cert.pem"
+
+-- | Default gateway TLS private key. Written 0600 when generated.
+tlsKeyPath :: SealPaths -> FilePath
+tlsKeyPath paths = spKeys paths </> "tls" </> "key.pem"
 
 -- | Root directory holding one subdirectory per session: @\<state\>\/sessions@.
 sessionsRoot :: SealPaths -> FilePath

@@ -10,6 +10,7 @@ module Seal.Gateway.Config
   , gatewayConfigCodec
   , withGatewayDefaults
   , tlsEnabled
+  , effectiveTlsPaths
   , tlsConfigError
   , tlsOriginError
   ) where
@@ -32,6 +33,9 @@ data GatewayConfig = GatewayConfig
     -- directly, with no reverse proxy in front.
   , gcTlsKey         :: Maybe Text
     -- ^ PEM private key.
+  , gcTls            :: Bool
+    -- ^ Serve HTTPS. The PEM paths default to @keys\/tls\/@{cert,key}@.on.pem
+    -- under @SEAL_HOME@, so this flag alone is the whole configuration.
   } deriving stock (Eq, Show)
 
 -- | The compiled-in default. Loopback + port 8080 + the local origin.
@@ -44,6 +48,7 @@ defaultGatewayConfig = GatewayConfig
   , gcAllowedOrigins = ["http://localhost:8080"]
   , gcTlsCert = Nothing
   , gcTlsKey = Nothing
+  , gcTls = False
   }
 
 -- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
@@ -60,6 +65,7 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> originsCodec .= pgcAllowedOrigins
   <*> Toml.dioptional (Toml.text "tls_cert") .= pgcTlsCert
   <*> Toml.dioptional (Toml.text "tls_key") .= pgcTlsKey
+  <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
 
 -- | A partial gateway config where every field is optional. 'withGatewayDefaults'
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
@@ -71,6 +77,7 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcAllowedOrigins :: [Text]
   , pgcTlsCert        :: Maybe Text
   , pgcTlsKey         :: Maybe Text
+  , pgcTls            :: Maybe Bool
   } deriving stock (Eq, Show)
 
 -- | Merge a partial gateway config with the compiled-in defaults, producing
@@ -89,6 +96,7 @@ withGatewayDefaults p = GatewayConfig
                          else pgcAllowedOrigins p
   , gcTlsCert        = pgcTlsCert p
   , gcTlsKey         = pgcTlsKey p
+  , gcTls            = fromMaybe False (pgcTls p)
   }
 
 -- | Codec for the @allowed_origins@ array (a TOML array of strings).
@@ -104,7 +112,17 @@ originsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._
 -- passkeys: a WebAuthn ceremony requires a secure context, and a bare
 -- @http://@ LAN address is not one.
 tlsEnabled :: GatewayConfig -> Bool
-tlsEnabled cfg = isJust (gcTlsCert cfg) && isJust (gcTlsKey cfg)
+tlsEnabled cfg = gcTls cfg || (isJust (gcTlsCert cfg) && isJust (gcTlsKey cfg))
+
+-- | The PEM paths to load, given the defaults for this @SEAL_HOME@.
+--
+-- 'gcTls' opts in; an explicit path overrides the default; and setting both
+-- paths still turns TLS on by itself, which is the spelling the README used
+-- before the flag existed.
+effectiveTlsPaths :: FilePath -> FilePath -> GatewayConfig -> (FilePath, FilePath)
+effectiveTlsPaths defaultCert defaultKey cfg =
+  ( maybe defaultCert T.unpack (gcTlsCert cfg)
+  , maybe defaultKey T.unpack (gcTlsKey cfg) )
 
 -- | A TLS setting that cannot be served.
 --
