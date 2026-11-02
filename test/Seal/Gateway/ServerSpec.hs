@@ -23,7 +23,7 @@ import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
-import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
+import Seal.Gateway.Server (gatewayApp, isExposedBind, requestTimingMiddlewareWith)
 import Seal.Gateway.Embedded (embeddedAssetCount)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
@@ -259,3 +259,20 @@ spec = describe "Seal.Gateway.Server" $ do
       case logs of
         (entry : _) -> entry `shouldSatisfy` ("POST" `isInfixOf`)
         [] -> expectationFailure "expected at least one log entry"
+
+  -- The gateway used to REFUSE to bind a non-loopback address when
+  -- `untrusted_execution.mode = "remote"`. That was a compensating control for
+  -- an unauthenticated config write that could flip `remote` to `local`; the
+  -- type split removed the write, and the refusal then only pushed operators
+  -- toward `mode = "local"` — the weaker configuration, because in remote mode
+  -- the agent cannot reach the harness binary or its environment. What is left
+  -- is a warning, so the only observable decision here is whether one is
+  -- logged. A non-loopback bind is never refused.
+  describe "isExposedBind" $ do
+    it "warns for every address a remote client can reach" $
+      map isExposedBind ["0.0.0.0", "::", "192.168.0.107", "seal.example.com"]
+        `shouldBe` [True, True, True, True]
+
+    it "does not warn for loopback, which nothing off-host can reach" $
+      map isExposedBind ["127.0.0.1", "::1", "localhost"]
+        `shouldBe` [False, False, False]

@@ -10,9 +10,11 @@ module Seal.Gateway.Server
   , requestTimingMiddleware
   , requestTimingMiddlewareWith
   , runGateway
+  , isExposedBind
   ) where
 
 import Data.ByteString.Char8 qualified as BC
+import Control.Monad (when)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Char (toLower)
 import Data.List (isPrefixOf)
@@ -253,9 +255,26 @@ contentTypeFor ext = case ext of
   _              -> "application/octet-stream"
 
 -- | Run the gateway. Logs a startup banner with the bind address via the
--- Katip 'SealLogger'. When the host is non-loopback:
---   - If @failClosedOnNonLoopback@ is True (mode=remote), REFUSES to start.
---   - Otherwise, warns (the full slash-command surface is reachable).
+-- Katip 'SealLogger'.
+--
+-- A non-loopback host is allowed in **every** configuration, including
+-- @untrusted_execution.mode = "remote"@, and warned about. There is
+-- deliberately no refusal path.
+--
+-- It used to refuse in remote mode, as a compensating control for an
+-- unauthenticated config write that could flip @remote@ to @local@
+-- (design 2026-07-22, V6). That control was retired when the write path's
+-- type was narrowed to 'Seal.Config.File.RuntimeConfig', which cannot name
+-- the @untrusted_execution@ section at all — the attack became
+-- unrepresentable rather than merely refused.
+--
+-- Keeping the refusal would now be actively harmful. Remote mode is the
+-- configuration where the agent cannot reach the harness binary or its
+-- environment, so refusing to bind it on a network address pushes operators
+-- toward @mode = "local"@, which is strictly weaker. Exposing the port is the
+-- operator's decision — behind a VPN, a loopback TLS proxy, or passkey access
+-- control it is the normal one — so 'isExposedBind' warns and the gateway
+-- serves.
 --
 -- The WebSocket stream endpoint is served by the SAME listener (mounted
 -- via 'gatewayAppWithStream'), so there is exactly one port and one bind.
@@ -265,34 +284,29 @@ runGateway
   :: SealLogger
   -> Maybe AccessControlHandle
   -> GatewayConfig
-  -> Bool
   -> ApiDeps
   -> StreamGuard
   -> StreamBroker
   -> IO ()
-runGateway logger mAccess cfg failClosedOnNonLoopback deps guard broker = do
+runGateway logger mAccess cfg deps guard broker = do
   let host = gcHost cfg
       port = gcPort cfg
+      mStaticDir = fmap T.unpack (gcStaticDir cfg)
   logIO logger InfoS "Seal Harness gateway"
   logIO logger InfoS ("  URL:      http://" <> ls host <> ":" <> ls (show port))
   logIO logger InfoS ("  Stream:   ws://" <> ls host <> ":" <> ls (show port) <> "/ (same port)")
-  if host /= "127.0.0.1" && host /= "::1" && host /= "localhost"
-    then
-      if failClosedOnNonLoopback
-        then do
-          logIO logger ErrorS ("refusing to start gateway on non-loopback address " <> ls host
-                               <> " in remote-only mode — bind 127.0.0.1 or disable remote-only")
-          pure ()
-        else do
-          logIO logger WarningS ("binding to " <> ls host
-                                 <> " — the full slash-command surface is reachable by anything that can reach this address")
-          let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-              app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
-          runSettings (setPort port settings) app
-    else do
-      let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-          app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
-      runSettings (setPort port settings) app
+  when (isExposedBind host) $
+    logIO logger WarningS ("binding to " <> ls host
+      <> " — the full slash-command surface is reachable by anything that can reach this address")
+  runSettings (setPort port settings)
+    (gatewayAppWithStream logger mAccess deps mStaticDir guard broker)
+
+-- | Does this bind expose the gateway beyond the local machine?
+--
+-- Only ever chooses a log line. There is intentionally no "refuse" outcome:
+-- see the note on 'runGateway'.
+isExposedBind :: T.Text -> Bool
+isExposedBind host = host `notElem` ["127.0.0.1", "::1", "localhost"]
 
 -- | Warp settings for the gateway.
 --

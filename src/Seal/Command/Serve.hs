@@ -62,7 +62,7 @@ import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.BootPlan
   ( BindCoordinates (..), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
-  ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig
+  ( SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
@@ -450,13 +450,9 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- via the 'seal-chat-channels' package.
   forkNewSignalChatChannel logger gwCfg mgr cfg watchState
   forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState
-  -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
-  -- mode=remote (design V6: prevents network access to the unauthenticated
-  -- updateRuntimeConfig caller).
-  let isRemote = case scUntrustedExec secCfg of
-        Just uefc -> uefcMode uefc == "remote"
-        Nothing   -> False
-  runGateway logger (Just (naHandle access)) gwCfg isRemote deps guard broker
+  -- Run the HTTP gateway (blocks). A non-loopback bind is allowed in every
+  -- configuration; it is warned about, never refused (see 'runGateway').
+  runGateway logger (Just (naHandle access)) gwCfg deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live

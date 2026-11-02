@@ -52,6 +52,18 @@
   - Enrolling works in `mode = "none"`, so an open gateway can be locked down
     from the web UI; it can never be turned back off from there.
 
+* **The gateway no longer refuses a non-loopback bind in remote mode.**
+  `untrusted_execution.mode = "remote"` used to make `seal serve` exit rather
+  than bind anything but loopback. That was a compensating control for an
+  unauthenticated config write that could flip `remote` to `local`
+  (design 2026-07-22, V6); the write path's type is now `RuntimeConfig`, which
+  cannot name `[untrusted_execution]` at all, so the attack is unrepresentable
+  rather than merely blocked. The refusal had also become counter-productive:
+  remote mode is the configuration where the agent cannot reach the harness
+  binary or its environment, so refusing to bind it on a network address
+  pushed operators toward `mode = "local"`, which is strictly weaker. A
+  non-loopback bind now logs a warning and serves, in every configuration.
+
 * Project scaffolding. Subcommand CLI built on `configuration-tools`, a
   `ReaderT Env (KatipContextT IO)` application monad, IORef-based mutable
   state, and katip structured logging. The `greet` / `tick` commands are
