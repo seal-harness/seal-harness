@@ -47,6 +47,7 @@ module Seal.ISA.Ops.Agent
   , authorizeStart
   , encodeForegroundResults
   , encodeSpawnInfos
+  , encodeHandoffSpawnInfos
   , completionMessage
   , killSwitchMsg
   , leafMsg
@@ -683,6 +684,7 @@ allowSpawnBlockedMsg =
 data AgentAction
   = AgInstances
   | AgStart
+  | AgHandoff
   | AgStatus
   | AgStop
   | AgInterrupt
@@ -693,6 +695,7 @@ parseAgentAction v =
     Just t -> case t :: Text of
       "instances" -> Right AgInstances
       "start"     -> Right AgStart
+      "handoff"   -> Right AgHandoff
       "status"    -> Right AgStatus
       "stop"      -> Right AgStop
       "interrupt" -> Right AgInterrupt
@@ -730,9 +733,23 @@ authorizeAgentManage wiring v =
     Right action -> case action of
       AgInstances -> Right ()
       AgStart     -> authorizeStart wiring v
+      AgHandoff   -> authorizeHandoff wiring v
       AgStatus    -> maybe (Left "status requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgStop      -> maybe (Left "stop requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgInterrupt -> maybe (Left "interrupt requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
+-- | Authorize gate for the @handoff@ action. Requires @id@ and @goal@
+-- (single-task only — no batch mode). The role/kill-switch gate is NOT
+-- applied: a handoff creates a top-level session (operator-authorized),
+-- so the gate is always open regardless of the caller's role.
+authorizeHandoff :: AgentStartWiring -> Value -> Either Text ()
+authorizeHandoff _wiring v =
+  let mId = idField v
+      mGoal = textFieldMaybe "goal" v
+  in case (mId, mGoal) of
+       (Just _, Just g) | not (T.null g) -> Right ()
+       (Just _, Just _)                  -> Left "AGENT_MANAGE handoff requires a non-empty 'goal'."
+       (Just _, Nothing)                 -> Left "AGENT_MANAGE handoff requires a 'goal'."
+       (Nothing, _)                      -> Left "AGENT_MANAGE handoff requires an 'id' (agent def id)."
 
 -- | Handle the instances action (shared with the legacy AGENT_INSTANCES shim).
 handleInstances :: AgentRuntime -> App OpResult
@@ -866,6 +883,80 @@ handleStartBackground wiring _v di = do
           pure (OpResult [TrpText (encodeSpawnInfos spawnInfos)] False
                  (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
 
+-- | Handle the @handoff@ action: spawn a new **top-level** agent session
+-- (not a child of the caller). The new session:
+--
+--   * Lives at @sessions/\<sid\>@ (visible to @SESSION_LIST@).
+--   * Has @smParent = Nothing@ (no parent in metadata).
+--   * Has lineage @[sid]@ only (no chain back to the caller).
+--   * Runs at delegation depth 0 (top-level).
+--   * Gets a full session registry (all opcodes, like a top-level session).
+--
+-- Completion is fire-and-forget: the result is registered in the
+-- 'AgentRuntime' (visible via @AGENT_INSTANCES@ / @AGENT_STATUS@) but NO
+-- completion message is appended to the caller's transcript. The caller
+-- can later read the handoff session's transcript via @SESSION_GET@
+-- (it's not in the caller's lineage, so the self/ancestor read guard
+-- doesn't block it).
+--
+-- Single-task only (no batch mode). Always async (no foreground mode).
+handleHandoff :: AgentStartWiring -> AgentWorkerBuilder -> Value -> App OpResult
+handleHandoff wiring handoffWorker v = do
+  let mDefId = idField v
+      mGoal  = textFieldMaybe "goal" v
+  case (mDefId, mGoal) of
+    (Just defId, Just goal) | not (T.null goal) -> do
+      cfg <- liftIO (aswConfig wiring)
+      let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
+          runtime = aswRuntime wiring
+          task = ChildTask defId goal (textFieldMaybe "context" v) Nothing False
+          callback :: AgentCompletionCallback
+          callback result = do
+            registerCompletedAgentResult runtime (crSubagentId result) result
+            globalLogIO DebugS (ls ("[handoff] completion registered: subagent=" <> subagentIdText (crSubagentId result)
+              <> " session=" <> maybe "none" sessionIdText (crChildSession result)))
+          spawnCb :: SpawnCallback
+          spawnCb sid def childSid =
+            registerRunningAgent runtime (adId def) sid childSid childSid 0
+      eSpawnInfos <- liftIO (runDelegateAsync
+                               cfg
+                               (aswPauseFlag wiring)
+                               (aswParentActivity wiring)
+                               0
+                               (DiSingle task)
+                               (resolveTask (aswDefBackend wiring)
+                                            runtime
+                                            0
+                                            orchEnabled
+                                            handoffWorker)
+                               callback
+                               spawnCb
+                               (aswMintSession wiring))
+      case eSpawnInfos of
+        Left err -> pure (OpResult [TrpText err] True (object []))
+        Right spawnInfos ->
+          pure (OpResult [TrpText (encodeHandoffSpawnInfos spawnInfos)] False
+                 (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
+    (Just _, Just _) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires a non-empty 'goal'."] True (object []))
+    (Just _, Nothing) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires a 'goal'."] True (object []))
+    (Nothing, _) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires an 'id' (agent def id)."] True (object []))
+
+-- | Encode handoff 'SpawnInfo' as a text block for the model. Similar to
+-- 'encodeSpawnInfos' but with a handoff-specific message (no completion
+-- notification — the caller should use SESSION_GET to check the result).
+encodeHandoffSpawnInfos :: [SpawnInfo] -> Text
+encodeHandoffSpawnInfos [] = "(no handoff session spawned)"
+encodeHandoffSpawnInfos infos = T.intercalate "\n" (map renderOne infos)
+  <> "\n\nHandoff session(s) are running independently in the background.\
+  \ No completion notification will be delivered to you — the new session\
+  \ is a top-level peer, not a child. Use SESSION_GET with the session_id\
+  \ to read its transcript when needed, or AGENT_MANAGE action=status with\
+  \ the subagent_id to check its status."
+  where
+    renderOne si =
+      subagentIdText (siSubagentId si) <> " | " <>
+      sessionIdText (siChildSession si) <> " | running (handoff)"
+
 -- | Handle the status action (shared with the legacy AGENT_STATUS shim).
 -- Enriched: when the registry has a completed entry with aiResult, the
 -- response includes summary, child_session, exit_reason, and duration.
@@ -927,17 +1018,17 @@ handleInterrupt runtime v = do
 -- @status@, @stop@, and @interrupt@. The @start@ action carries the full
 -- 'AgentStartWiring' (delegation config, worker builder, role/kill-switch
 -- gate, batch mode).
-agentManageOp :: AgentStartWiring -> Opcode
-agentManageOp wiring = TrustedOpcode
+agentManageOp :: AgentStartWiring -> AgentWorkerBuilder -> Opcode
+agentManageOp wiring handoffWorker = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), handoff (spawn a new top-level agent session — fire-and-forget; the new session is independent with no parent-child lineage; returns session_id + subagent_id), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "action" .= object
               [ "type" .= ("string" :: Text)
-              , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
+              , "enum" .= (["instances", "start", "handoff", "status", "stop", "interrupt"] :: [Text])
               , "description" .= ("Operation to perform." :: Text)
               ]
           , fromText "mode" .= object
@@ -947,15 +1038,15 @@ agentManageOp wiring = TrustedOpcode
               ]
           , fromText "id" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Agent def id (start, single-task)." :: Text)
+              , "description" .= ("Agent def id (start single-task, or handoff)." :: Text)
               ]
           , fromText "goal" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Task goal (start, single-task)." :: Text)
+              , "description" .= ("Task goal (start single-task, or handoff)." :: Text)
               ]
           , fromText "context" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Background context (start)." :: Text)
+              , "description" .= ("Background context (start, handoff)." :: Text)
               ]
           , fromText "role" .= object
               [ "type" .= ("string" :: Text)
@@ -981,6 +1072,7 @@ agentManageOp wiring = TrustedOpcode
         Right action -> case action of
           AgInstances -> handleInstances (aswRuntime wiring)
           AgStart     -> handleStart wiring v
+          AgHandoff   -> handleHandoff wiring handoffWorker v
           AgStatus    -> handleStatus (aswRuntime wiring) v
           AgStop      -> handleStop (aswRuntime wiring) v
           AgInterrupt -> handleInterrupt (aswRuntime wiring) v

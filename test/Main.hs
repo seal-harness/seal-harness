@@ -149,6 +149,7 @@ import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
 import qualified Seal.ISA.Ops.AgentSpec
+import qualified Seal.ISA.Ops.AgentHandoffSpec
 import qualified Seal.ISA.Ops.SessionSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
@@ -346,6 +347,7 @@ specs = do
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
+  Seal.ISA.Ops.AgentHandoffSpec.spec
   Seal.ISA.Ops.SessionSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec

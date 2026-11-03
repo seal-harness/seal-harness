@@ -302,6 +302,7 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
       -- the CHILD's own track from the minted child sid at spawn time
       -- (session-read hardening WU4).
     , dwdToolTimeout = defaultToolTimeoutConfig
+    , dwdTopLevel = False
     }
 
 -- | A minimal 'SealPaths' fixture rooted at @tmp@.
