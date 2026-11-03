@@ -268,6 +268,13 @@ data ChildTask = ChildTask
     -- @cache/workdirs/<child-session>@. When 'False' (the default), the
     -- child inherits the parent's workdir (WU-4: repo clones and plan
     -- files visible to children without re-cloning).
+  , ctRepoUrl :: !(Maybe Text)
+    -- ^ Repo URL to materialize in the child's own workdir before the run.
+    -- Only read for a **top-level / handoff** spawn (@AGENT_MANAGE
+    -- action=handoff@, which also sets 'ctIsolateWorkdir'); 'Nothing' means
+    -- "inherit the caller's 'smRepoUrl'" (see
+    -- 'Seal.Agent.Runtime.Delegation.Worker.handoffRepoUrl'). Plain
+    -- @AGENT_START@ children always pass 'Nothing'.
   } deriving stock (Eq, Show)
 
 -- | Why a child stopped.

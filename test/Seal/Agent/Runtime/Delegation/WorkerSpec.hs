@@ -6,18 +6,22 @@
 module Seal.Agent.Runtime.Delegation.WorkerSpec (spec) where
 
 import Control.Exception (SomeException, catch)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Aeson (object, withObject, (.:))
+import Data.Aeson.Types (parseMaybe)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (findIndex)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
-import System.Directory (doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.QuickCheck
 
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..))
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText)
 import Seal.Agent.Runtime.Delegation
   ( ChildExitReason (..)
   , ChildRunHooks (..)
@@ -26,23 +30,29 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Delegation.Worker
 import Seal.Channel.Caps (ChannelCaps)
-import Seal.Config.Paths (SealPaths (..), agentSessionDir)
+import Seal.Config.Paths
+  ( SealPaths (..), agentSessionDir, sessionDir, sessionEntriesPath, sessionMetaPath )
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.ISA.Registry (mkRegistry)
+import Seal.Handles.Transcript (readEntries, withIndexedTranscript)
+import Seal.ISA.Opcode (Opcode (..), OpResult (..))
+import Seal.ISA.Registry (lookupOp, mkRegistry)
 import Seal.ISA.RepeatDetect (newSessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Logging.Logger (testSealLogger)
-import Seal.Providers.Class (SomeProvider (..))
+import Seal.Providers.Class (SomeProvider (..), ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.TestHelpers.Arbitrary ()
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
+import Seal.Tools.Exec.UIO (uioLiftIO)
 import Seal.Tools.Exec.Abort (newAbortFlag)
 import Seal.Tools.Exec.UIO.Internal
   (mkRemoteUntrustedIOStub, mkTestUIOEnv)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
+import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Util.StrictIO (decodeFileStrict)
@@ -138,7 +148,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
-            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
             childSid = mkSystemSessionId "child"
         hooks <- mkHooks
         -- The worker may fail (no real provider round-trip is wired),
@@ -155,7 +165,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
-            task = ChildTask "a1" "do the thing" Nothing Nothing True
+            task = ChildTask "a1" "do the thing" Nothing Nothing True Nothing
             childSid = mkSystemSessionId "child"
         hooks <- mkHooks
         _ <- worker sampleAgentDef childSid task hooks
@@ -184,7 +194,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
-            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
             childSid = mkSystemSessionId "child"
         hooks <- mkHooks
         _ <- worker sampleAgentDef childSid task hooks
@@ -206,7 +216,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef lineageRef
         let worker = mkDelegateWorker deps
-            task = ChildTask "a1" "do the thing" Nothing Nothing False
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
             childSid = mkSystemSessionId "child"
         hooks <- mkHooks
         _ <- worker sampleAgentDef childSid task hooks
@@ -215,6 +225,145 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         -- The seam must receive the CHILD's full lineage: the child's own
         -- id prepended to the parent's baked chain (self first).
         captured `shouldBe` Just [childSid, sampleSession, grandparentSid]
+
+  describe "handoffRepoUrl (the one handoff repo rule)" $ do
+    let parent r = Just (sampleMetaWithRepo r)
+    it "explicit wins over the caller's repo" $
+      handoffRepoUrl (Just "https://x/y.git") (parent (Just "https://a/b.git"))
+        `shouldBe` Just "https://x/y.git"
+
+    it "inherits the caller's repo when nothing is supplied" $
+      handoffRepoUrl Nothing (parent (Just "https://a/b.git"))
+        `shouldBe` Just "https://a/b.git"
+
+    it "treats a blank explicit value as absent" $
+      handoffRepoUrl (Just "   ") (parent (Just "https://a/b.git"))
+        `shouldBe` Just "https://a/b.git"
+
+    it "is Nothing when neither side has a repo" $ do
+      handoffRepoUrl Nothing (parent Nothing) `shouldBe` Nothing
+      handoffRepoUrl Nothing Nothing `shouldBe` Nothing
+
+    it "treats a blank inherited value as absent" $
+      handoffRepoUrl Nothing (parent (Just "  ")) `shouldBe` Nothing
+
+    it "trims the value it carries" $
+      handoffRepoUrl (Just "  https://x/y.git  ") Nothing `shouldBe` Just "https://x/y.git"
+
+    it "is idempotent (feeding the result back as explicit changes nothing)" $ do
+      let r = handoffRepoUrl Nothing (parent (Just "https://a/b.git"))
+      handoffRepoUrl r (parent (Just "https://a/b.git")) `shouldBe` r
+
+  describe "readSessionMeta (the single session.json reader)" $ do
+    it "round-trips a session meta" $ withSystemTempDirectory "seal-meta-read" $ \tmp -> do
+      let paths = samplePaths tmp
+      saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+      mMeta <- readSessionMeta paths sampleSession
+      fmap smRepoUrl mMeta `shouldBe` Just (Just "https://a/b.git")
+      fmap smId mMeta `shouldBe` Just sampleSession
+
+    it "returns Nothing when session.json is missing" $
+      withSystemTempDirectory "seal-meta-missing" $ \tmp -> do
+        mMeta <- readSessionMeta (samplePaths tmp) (mkSystemSessionId "nope")
+        mMeta `shouldBe` (Nothing :: Maybe SessionMeta)
+
+    it "returns Nothing when session.json is undecodable (no throw)" $
+      withSystemTempDirectory "seal-meta-bad" $ \tmp -> do
+        let paths = samplePaths tmp
+        createDirectoryIfMissing True (sessionDir paths sampleSession)
+        writeFile (sessionMetaPath paths sampleSession) "not json"
+        mMeta <- readSessionMeta paths sampleSession
+        mMeta `shouldBe` (Nothing :: Maybe SessionMeta)
+
+  describe "writeHandoffMeta (handoff session meta)" $ do
+    it "inherits the caller's repo, binds the def, and has no parent" $
+      withSystemTempDirectory "seal-handoff-meta" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+        runHandoffWorker tmp childSid Nothing
+        mMeta <- readSessionMeta paths childSid
+        fmap smRepoUrl mMeta `shouldBe` Just (Just "https://a/b.git")
+        fmap smParent mMeta `shouldBe` Just Nothing
+        fmap smAgent mMeta `shouldBe` Just (Just (adId sampleAgentDef))
+        fmap smAgentName mMeta `shouldBe` Just (Just "test-agent")
+
+    it "an explicit ctRepoUrl overrides the caller's repo" $
+      withSystemTempDirectory "seal-handoff-meta-explicit" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+        runHandoffWorker tmp childSid (Just "https://explicit/x.git")
+        mMeta <- readSessionMeta paths childSid
+        fmap smRepoUrl mMeta `shouldBe` Just (Just "https://explicit/x.git")
+
+    it "a blank def name leaves smAgentName Nothing" $
+      withSystemTempDirectory "seal-handoff-meta-noname" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+        runHandoffWorkerWith (sampleAgentDef { adName = "   " }) tmp childSid Nothing
+        mMeta <- readSessionMeta paths childSid
+        fmap smAgentName mMeta `shouldBe` Just Nothing
+
+  describe "handoffRepoRegistry" $ do
+    it "always contains SETUP_REPO (a def allow-list cannot drop it)" $
+      case lookupOp (handoffRepoRegistry stubCloneDeps Full) (OpName "SETUP_REPO") of
+        Just _  -> pure ()
+        Nothing -> expectationFailure "SETUP_REPO missing from the handoff repo registry"
+
+  describe "dispatchHandoffRepo (audited SETUP_REPO for the new session)" $ do
+    it "dispatches the url and records invocation + result in the transcript" $
+      withSystemTempDirectory "seal-handoff-clone" $ \tmp -> do
+        let paths = samplePaths tmp
+            sid = mkSystemSessionId "handoff"
+        createDirectoryIfMissing True (sessionDir paths sid)
+        seen <- newIORef []
+        runDispatch paths sid seen (OpResult [TrpText "fake cloned"] False (object []))
+        readIORef seen `shouldReturn` ["https://a/b.git"]
+        entries <- readEntries (sessionEntriesPath paths sid)
+        let setupEntries = filter isSetupRepoEntry entries
+        length setupEntries `shouldBe` 2
+        length (filter (Map.member "result" . erMeta) setupEntries) `shouldBe` 1
+
+    it "records an error result and returns normally (no throw)" $
+      withSystemTempDirectory "seal-handoff-clone-fail" $ \tmp -> do
+        let paths = samplePaths tmp
+            sid = mkSystemSessionId "handoff"
+        createDirectoryIfMissing True (sessionDir paths sid)
+        seen <- newIORef []
+        runDispatch paths sid seen (OpResult [TrpText "clone exploded"] True (object []))
+        entries <- readEntries (sessionEntriesPath paths sid)
+        let setupEntries = filter isSetupRepoEntry entries
+        length (filter (Map.member "result" . erMeta) setupEntries) `shouldBe` 1
+
+    it "returns normally when the registry has no SETUP_REPO" $
+      withSystemTempDirectory "seal-handoff-clone-missing" $ \tmp -> do
+        let paths = samplePaths tmp
+            sid = mkSystemSessionId "handoff"
+        createDirectoryIfMissing True (sessionDir paths sid)
+        logger <- testSealLogger
+        appEnv <- mkEnv logger defaultConfig
+        abortFlag <- newAbortFlag
+        withIndexedTranscript (sessionDir paths sid) $ \h ->
+          runApp appEnv (dispatchHandoffRepo h (mkRegistry [])
+                          (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
+                          defaultToolTimeoutConfig abortFlag "https://a/b.git" Nothing)
+        entries <- readEntries (sessionEntriesPath paths sid)
+        entries `shouldBe` []
+
+  describe "mkDelegateWorker handoff repo checkout ordering" $ do
+    it "the SETUP_REPO invocation precedes the first request entry" $
+      withSystemTempDirectory "seal-handoff-order" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+        runHandoffWorker tmp childSid Nothing
+        entries <- readEntries (sessionEntriesPath paths childSid)
+        let idxSetup = findIndex isSetupRepoEntry entries
+            idxFirstReq = findIndex ((== EKRequest) . erKind) entries
+        idxSetup `shouldSatisfy` isJust
+        idxFirstReq `shouldSatisfy` isJust
+        (idxSetup, idxFirstReq) `shouldSatisfy` uncurry (<)
 
   where
     roleText :: Text -> Text
@@ -323,3 +472,78 @@ mkHooks = do
   writtenRef <- newIORef []
   interruptedRef <- newIORef False
   pure (ChildRunHooks traceRef readRef writtenRef interruptedRef)
+
+-- | A minimal 'SessionMeta' for @parent@ carrying the given repo.
+sampleMetaWithRepo :: Maybe Text -> SessionMeta
+sampleMetaWithRepo mRepo = SessionMeta
+  { smId = sampleSession
+  , smProvider = "anthropic"
+  , smModel = "claude-opus-4"
+  , smChannel = "cli"
+  , smParent = Nothing
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = mRepo
+  , smCreatedAt = t
+  , smLastActive = t
+  }
+  where
+    t = read "1970-01-01 00:00:00 UTC"
+
+-- | A fake SETUP_REPO that records the URL it was handed and returns a
+-- canned result (no clone): lets 'dispatchHandoffRepo' be tested without a
+-- real git binary or credentials.
+fakeSetupRepoOp :: IORef [Text] -> OpResult -> Opcode
+fakeSetupRepoOp seen result = UntrustedOpcode
+  { uoName = OpName "SETUP_REPO"
+  , uoDesc = "test fake SETUP_REPO"
+  , uoInSchema = object []
+  , uoOutSchema = object []
+  , uoAuthorize = const (Right ())
+  , uoRun = \v -> do
+      uioLiftIO $ case parseMaybe (withObject "in" (.: "url")) v :: Maybe Text of
+        Just url -> modifyIORef' seen (<> [url])
+        Nothing  -> pure ()
+      pure result
+  }
+
+-- | Is this transcript entry a SETUP_REPO invocation/result record?
+isSetupRepoEntry :: EntryRecord -> Bool
+isSetupRepoEntry e = case Map.lookup "op" (erMeta e) of
+  Nothing -> False
+  Just v  -> (parseMaybe (withObject "op" (.: "name")) v :: Maybe Text) == Just "SETUP_REPO"
+
+-- | Dispatch a fake SETUP_REPO through 'dispatchHandoffRepo' against a real
+-- (temporary) transcript.
+runDispatch :: SealPaths -> SessionId -> IORef [Text] -> OpResult -> IO ()
+runDispatch paths sid seen result = do
+  logger <- testSealLogger
+  appEnv <- mkEnv logger defaultConfig
+  abortFlag <- newAbortFlag
+  withIndexedTranscript (sessionDir paths sid) $ \h ->
+    runApp appEnv (dispatchHandoffRepo h
+                    (mkRegistry [fakeSetupRepoOp seen result])
+                    (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
+                    defaultToolTimeoutConfig abortFlag "https://a/b.git" (Just "web"))
+
+-- | Run the delegation worker in TOP-LEVEL (handoff) mode: own workdir
+-- (@ctIsolateWorkdir@) and the given explicit repo.
+runHandoffWorker :: FilePath -> SessionId -> Maybe Text -> IO ()
+runHandoffWorker = runHandoffWorkerWith sampleAgentDef
+
+runHandoffWorkerWith :: AgentDef -> FilePath -> SessionId -> Maybe Text -> IO ()
+runHandoffWorkerWith agentDef tmp childSid mRepo = do
+  anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+  deps0 <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
+  let deps = deps0 { dwdTopLevel = True }
+      worker = mkDelegateWorker deps
+      task = ChildTask (agentDefIdText (adId agentDef)) "continue the work"
+                       Nothing Nothing True mRepo
+  hooks <- mkHooks
+  _ <- worker agentDef childSid task hooks
+         `catch` \(_e :: SomeException) ->
+           pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+  pure ()

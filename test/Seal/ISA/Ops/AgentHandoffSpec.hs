@@ -6,6 +6,8 @@ import Data.Aeson (object, (.=))
 import Data.IORef
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend
@@ -25,7 +27,7 @@ import Seal.Agent.Runtime.Registry
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
-  ( OpResult (..), localBackend, opAuthorize, opRun )
+  ( OpResult (..), localBackend, opAuthorize, opRun, toDesc, toInSchema )
 import Seal.ISA.Ops.Agent
   ( AgentStartWiring (..)
   , AgentHandoffDeps (..)
@@ -34,6 +36,8 @@ import Seal.ISA.Ops.Agent
   , agentManageOp
   )
 import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveSessionMeta)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -241,3 +245,147 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
                                     , "goal" .= ("do the thing" :: Text)
                                     , "active_tab" .= False]))
       readIORef tabCalled `shouldReturn` False
+
+  specHandoffRepo
+-- ---------------------------------------------------------------------------
+-- Handoff repo propagation (AGENT_MANAGE action=handoff, `repo` input)
+-- ---------------------------------------------------------------------------
+
+-- | A worker that captures the 'ChildTask' it was handed (and runs nothing),
+-- so the opcode's task construction can be asserted.
+taskRecordingWorker :: IORef (Maybe Del.ChildTask) -> Del.AgentWorkerBuilder
+taskRecordingWorker ref _def _childSid task _hooks = do
+  writeIORef ref (Just task)
+  pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0
+         (Just (mkSystemSessionId "handoff-child")))
+
+-- | 'AgentStartWiring' over an explicit 'SealPaths' (so the caller's
+-- @session.json@ can be seeded in a temp dir).
+mkWiringAt :: SealPaths -> AgentDefBackend -> AgentRuntime -> SpawnPauseFlag -> AgentStartWiring
+mkWiringAt paths backend rt pauseFlag =
+  (mkWiring backend rt pauseFlag) { aswPaths = paths }
+
+-- | A caller session meta carrying the given repo.
+callerMetaWithRepo :: Maybe Text -> SessionMeta
+callerMetaWithRepo mRepo = SessionMeta
+  { smId = sampleSession
+  , smProvider = "ollama"
+  , smModel = "llama3"
+  , smChannel = "web"
+  , smParent = Nothing
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = mRepo
+  , smCreatedAt = t
+  , smLastActive = t
+  }
+  where
+    t = read "1970-01-01 00:00:00 UTC"
+
+specHandoffRepo :: Spec
+specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
+  it "passes an explicit repo through with an isolated workdir" $
+    withSystemTempDirectory "seal-handoff-op" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      taskRef <- newIORef Nothing
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (taskRecordingWorker taskRef))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)
+                                    , "repo" .= ("https://explicit/x.git" :: Text)]))
+      orIsError r `shouldBe` False
+      threadDelay 100000
+      mTask <- readIORef taskRef
+      fmap Del.ctRepoUrl mTask `shouldBe` Just (Just "https://explicit/x.git")
+      fmap Del.ctIsolateWorkdir mTask `shouldBe` Just True
+
+  it "inherits the caller's repo when `repo` is absent, and says so" $
+    withSystemTempDirectory "seal-handoff-inherit" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      saveSessionMeta paths (callerMetaWithRepo (Just "https://caller/repo.git"))
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      taskRef <- newIORef Nothing
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (taskRecordingWorker taskRef))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "https://caller/repo.git" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+      threadDelay 100000
+      mTask <- readIORef taskRef
+      fmap Del.ctRepoUrl mTask `shouldBe` Just (Just "https://caller/repo.git")
+
+  it "leaves ctRepoUrl Nothing (and reports none) when nobody has a repo" $
+    withSystemTempDirectory "seal-handoff-none" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      taskRef <- newIORef Nothing
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (taskRecordingWorker taskRef))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "repo: none" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+      threadDelay 100000
+      mTask <- readIORef taskRef
+      fmap Del.ctRepoUrl mTask `shouldBe` Just Nothing
+
+  it "rejects an invalid repo and does not spawn" $
+    withSystemTempDirectory "seal-handoff-bad" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (recordingWorker ran))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)
+                                    , "repo" .= ("https://x/y.git; rm -rf /" :: Text)]))
+      orIsError r `shouldBe` True
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "repo" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+      threadDelay 100000
+      readIORef ran `shouldReturn` 0
+
+  it "exposes `repo` in the AGENT_MANAGE input schema and names it in toDesc" $ do
+    backend <- noneBackend
+    rt <- newAgentRuntime
+    pauseFlag <- newSpawnPauseFlag
+    let op = agentManageOp (mkWiring backend rt pauseFlag) (stubDeps stubWorker)
+    T.isInfixOf "repo" (T.pack (show (toInSchema op))) `shouldBe` True
+    T.isInfixOf "repo" (toDesc op) `shouldBe` True
+
+-- | A 'SealPaths' fixture rooted at @tmp@.
+samplePathsAt :: FilePath -> SealPaths
+samplePathsAt tmp = SealPaths
+  { spHome = tmp
+  , spConfig = tmp </> "config"
+  , spState = tmp </> "state"
+  , spKeys = tmp </> "keys"
+  , spCache = tmp </> "cache"
+  }
