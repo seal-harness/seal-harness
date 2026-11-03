@@ -791,20 +791,22 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "AGENT_STATUS" $ do
     it "\"Is the 'greeter' agent running?\" -> AGENT_STATUS -> reports not running when absent" $ do
       rt <- newAgentRuntime
-      let op = agentStatusOp rt
+      let op = agentStatusOp (mkSystemSessionId "owner") rt
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_STATUS")
                         (object ["subagent_id" .= ("sa-greeter-00000001" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "not running"]
+          case orParts res of
+            [TrpText t] -> T.isInfixOf "unknown subagent id" t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   describe "AGENT_INSTANCES" $ do
     it "\"List the running agents.\" -> AGENT_INSTANCES -> empty when none running" $ do
       rt <- newAgentRuntime
-      let op = agentInstancesOp rt
+      let op = agentInstancesOp (mkSystemSessionId "owner") rt
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_INSTANCES") (object []))
       case r of
@@ -816,14 +818,14 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "AGENT_STOP" $ do
     it "\"Stop the 'greeter' agent.\" -> AGENT_STOP -> idempotent when not running" $ do
       rt <- newAgentRuntime
-      let op = agentStopOp rt
+      let op = agentStopOp (mkSystemSessionId "owner") rt
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_STOP")
                         (object ["subagent_id" .= ("sa-greeter-00000001" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "stopped"]
+          orParts res `shouldBe` [TrpText "stopped (resumable with AGENT_MANAGE continue)"]
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------

@@ -22,27 +22,42 @@ module Seal.Agent.Runtime.Registry
   ( AgentStatus (..)
   , AgentInstance (..)
   , SpawnOrigin (..)
+  , StopOutcome (..)
+  , Delivery (..)
   , AgentRuntime
   , newAgentRuntime
   , startAgent
   , registerRunningAgent
   , registerRunningChild
-  , registerCompletedAgent
+  , registerFinishedAgent
   , registerCompletedAgentResult
+  , registerRunResult
+  , registerRunCrash
+  , endRun
+  , resumeAgent
   , stopAgent
   , interruptAgent
   , listAgents
-  , agentStatus
-  , agentInstanceBySubagentId
+  , listAgentsFor
+  , agentStatusFor
+  , ownsChild
+  , workerSettled
+  , countRunningChildren
+  , countFinishedChildren
+  , pruneRetained
+  , pollUntil
   , hasRunningChildren
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, mask, try)
+import Control.Monad (forM_, void)
+import GHC.Conc (ThreadStatus (..), threadStatus)
+import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
@@ -188,7 +203,7 @@ hasRunningChildren (AgentRuntime tv) parentSid = do
 -- succeeds, or 'Crashed' on exception.
 startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
 startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker = do
-  tid <- forkIO (runWorker tv subagentId worker)
+  tid <- forkIO (runWorker tv subagentId 1 worker)
   now <- getCurrentTime
   mInst <- atomically $ do
     insts <- readTVar tv
@@ -280,16 +295,14 @@ registerRunningChild (AgentRuntime tv) aid subagentId parentSession session dept
 -- | Register a synchronously-completed child in the runtime registry. The
 -- synchronous delegation model runs the worker to completion BEFORE this is
 -- called (the 'ChildResult' payload IS the post-hoc record), so the instance
--- is recorded with status 'Stopped' (the child has already finished) and the
--- @ThreadId@ of the registering thread (the parent's). This makes the child
+-- is recorded with status 'Stopped' (the child has already finished) and NO
+-- worker handle (there is no live thread to kill). This makes the child
 -- visible to 'AGENT_INSTANCES' / 'AGENT_STATUS' / 'AGENT_STOP' after the
--- synchronous run completes. 'AGENT_STOP' removes it; 'AGENT_INTERRUPT'
--- flips its status to 'Interrupted' (a no-op for an already-stopped child,
--- but harmless). Idempotent: re-registering the same subagent id overwrites
--- the prior entry (the second registration wins).
-registerCompletedAgent
+-- synchronous run completes, and continuable. Idempotent: re-registering the
+-- same subagent id overwrites the prior entry (the second registration wins).
+registerFinishedAgent
   :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO ()
-registerCompletedAgent (AgentRuntime tv) aid subagentId parentSession session depth = do
+registerFinishedAgent (AgentRuntime tv) aid subagentId parentSession session depth = do
   tid <- myThreadId
   now <- getCurrentTime
   atomically $ do
@@ -312,7 +325,7 @@ registerCompletedAgent (AgentRuntime tv) aid subagentId parentSession session de
           , aiLastActivity = now
           }
     writeTVar tv (Map.insert subagentId inst insts)
-  globalLogIO DebugS (ls ("[idle-diag] registerCompletedAgent: subagent=" <> subagentIdText subagentId
+  globalLogIO DebugS (ls ("[idle-diag] registerFinishedAgent: subagent=" <> subagentIdText subagentId
     <> " thread=" <> T.pack (show tid)))
 
 -- | Register a completed async child's result in the runtime registry.
@@ -348,29 +361,77 @@ registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
 -- registry's 'stopAgent' is called (the worker is the child turn; reaching
 -- its end without exception is a clean completion that the orchestrator
 -- observes via 'runDelegate').
-runWorker :: TVar (Map SubagentId AgentInstance) -> SubagentId -> IO () -> IO ()
-runWorker tv subagentId worker =
+runWorker :: TVar (Map SubagentId AgentInstance) -> SubagentId -> Int -> IO () -> IO ()
+runWorker tv subagentId gen worker =
   catch worker $ \(e :: SomeException) ->
-    atomically (modifyTVar' tv (Map.adjust (\i -> i { aiStatus = Crashed (T.pack (show e)) }) subagentId))
+    atomically (modifyTVar' tv (Map.adjust (crashIfCurrent e) subagentId))
+  where
+    -- Generation-guarded: a stop bumps the generation before killing, so the
+    -- killed worker's own crash write must not overwrite 'Stopped'.
+    crashIfCurrent e i
+      | aiGeneration i == gen = i { aiStatus = Crashed (T.pack (show e)) }
+      | otherwise = i
 
--- | Stop a child: kill its worker thread and RETAIN the entry as 'Stopped'
--- (so it stays resumable). Idempotent (stopping an already-stopped child is a
--- success). Kills only 'aiWorkerThread' — never a bookkeeping thread.
-stopAgent :: AgentRuntime -> SubagentId -> IO (Either Text ())
-stopAgent (AgentRuntime tv) subagentId = do
-  mInst <- atomically $ do
+-- | Outcome of a stop request.
+data StopOutcome
+  = StopOk
+    -- ^ The child is stopped (and retained, so it stays continuable).
+  | StillShuttingDown
+    -- ^ The worker did not settle inside the bound. The status is left
+    -- untouched so the operator is never told a live writer is stopped.
+  deriving stock (Eq, Show)
+
+-- | Whether a completed run's result should be delivered to the parent.
+-- 'SuppressDelivery' is returned for an intentional termination, so a killed
+-- child does not fabricate a @status=failed@ completion message.
+data Delivery = DeliverResult | SuppressDelivery
+  deriving stock (Eq, Show)
+
+-- | Only the session that spawned a child may read, stop, interrupt, or
+-- continue it. The runtime is process-global, so this is the whole
+-- authorization story for every model-reachable agent-runtime path.
+ownsChild :: SessionId -> AgentInstance -> Bool
+ownsChild owner i = aiParentSession i == owner
+
+-- | Stop a child: bump its run generation (so the dying run's report is
+-- suppressed), kill its worker thread, wait — bounded — for it to settle, and
+-- RETAIN the entry as 'Stopped' (so it stays resumable). Kills only
+-- 'aiWorkerThread', never a bookkeeping thread. Idempotent.
+stopAgent :: AgentRuntime -> SessionId -> SubagentId -> IO (Either Text StopOutcome)
+stopAgent (AgentRuntime tv) owner subagentId = do
+  now <- getCurrentTime
+  claimed <- atomically $ do
     insts <- readTVar tv
     case Map.lookup subagentId insts of
-      Nothing -> pure Nothing
-      Just i  -> do
-        let finalised = i { aiStatus = Stopped, aiWorkerThread = Nothing }
-        writeTVar tv (Map.insert subagentId finalised insts)
-        pure (Just i)
-  case mInst of
-    Nothing -> pure (Right ())
-    Just i  -> do
-      maybe (pure ()) killThread (aiWorkerThread i)
-      pure (Right ())
+      Nothing -> pure (Right Nothing)  -- idempotent: nothing to stop
+      Just i
+        | not (ownsChild owner i) -> pure (Left notOwnerMsg)
+        | isTerminal (aiStatus i) -> pure (Right Nothing)
+        | otherwise -> do
+            let i' = i { aiStatus = Stopped
+                       , aiWorkerThread = Nothing
+                       , aiGeneration = aiGeneration i + 1
+                       , aiLastActivity = now
+                       }
+            writeTVar tv (Map.insert subagentId i' insts)
+            pure (Right (aiWorkerThread i))
+  case claimed of
+    Left e -> pure (Left e)
+    Right Nothing -> pure (Right StopOk)
+    Right (Just tid) -> do
+      -- 'killThread' is 'throwTo', which blocks until the target accepts the
+      -- exception; a masked worker could block it indefinitely, so the kill
+      -- runs in its own thread and is raced against the settle poll.
+      _ <- forkIO (killThread tid)
+      settled <- pollUntil 500 (workerSettledThread tid)
+      pure (Right (if settled then StopOk else StillShuttingDown))
+  where
+    workerSettledThread tid = do
+      st <- threadStatus tid
+      pure $ case st of
+        ThreadFinished -> True
+        ThreadDied     -> True
+        _              -> False
 
 -- | Request that a single running subagent stop at its next iteration
 -- boundary. Does NOT hard-kill the worker thread (Haskell can't safely); sets
@@ -383,29 +444,251 @@ stopAgent (AgentRuntime tv) subagentId = do
 -- registry cannot force the worker to stop — only the worker can decide to
 -- exit. 'interruptAgent' /sets the flag and the status/; the worker /observes
 -- the flag/.
-interruptAgent :: AgentRuntime -> SubagentId -> IO Bool
-interruptAgent (AgentRuntime tv) subagentId = do
-  mInst <- atomically $ do
+interruptAgent :: AgentRuntime -> SessionId -> SubagentId -> IO (Either Text Bool)
+interruptAgent (AgentRuntime tv) owner subagentId = do
+  now <- getCurrentTime
+  atomically $ do
     insts <- readTVar tv
     case Map.lookup subagentId insts of
-      Nothing -> pure Nothing
-      Just i  -> do
-        let i' = i { aiStatus = Interrupted }
-        writeTVar tv (Map.insert subagentId i' insts)
-        pure (Just i')
-  pure (isJust mInst)
+      Nothing -> pure (Right False)  -- no match: nothing to interrupt
+      Just i
+        | not (ownsChild owner i) -> pure (Left notOwnerMsg)
+        | otherwise -> do
+            let i' = i { aiStatus = Interrupted
+                       , aiGeneration = aiGeneration i + 1
+                       , aiLastActivity = now
+                       }
+            writeTVar tv (Map.insert subagentId i' insts)
+            pure (Right True)
 
 -- | Snapshot all running instances.
 listAgents :: AgentRuntime -> IO [AgentInstance]
 listAgents (AgentRuntime tv) = Map.elems <$> readTVarIO tv
 
--- | Read one instance's status. @Nothing@ if not running.
-agentStatus :: AgentRuntime -> SubagentId -> IO (Maybe AgentStatus)
-agentStatus (AgentRuntime tv) subagentId =
-  fmap aiStatus . Map.lookup subagentId <$> readTVarIO tv
+-- | Snapshot the instances owned by one session (the model-facing view).
+listAgentsFor :: AgentRuntime -> SessionId -> IO [AgentInstance]
+listAgentsFor rt owner = filter (ownsChild owner) <$> listAgents rt
 
--- | Look up a full instance by subagent id (for the opcode to read its def
--- id, session id, depth, etc.).
-agentInstanceBySubagentId :: AgentRuntime -> SubagentId -> IO (Maybe AgentInstance)
-agentInstanceBySubagentId (AgentRuntime tv) subagentId =
-  Map.lookup subagentId <$> readTVarIO tv
+-- | Read one instance, refusing a child owned by another session.
+agentStatusFor :: AgentRuntime -> SessionId -> SubagentId -> IO (Either Text AgentInstance)
+agentStatusFor (AgentRuntime tv) owner subagentId = do
+  insts <- readTVarIO tv
+  pure $ case Map.lookup subagentId insts of
+    Nothing -> Left (unknownIdMsg subagentId)
+    Just i
+      | ownsChild owner i -> Right i
+      | otherwise         -> Left notOwnerMsg
+
+-- | Clear the run handle for a run that has finished — but only when the
+-- handle is this thread's, so a completed run can never clear a newer run's
+-- handle. This is what lets the parent's wake turn continue immediately after
+-- reading a reply.
+endRun :: AgentRuntime -> SubagentId -> IO ()
+endRun (AgentRuntime tv) subagentId = do
+  me <- myThreadId
+  now <- getCurrentTime
+  atomically $ modifyTVar' tv
+    (Map.adjust (\i -> case aiWorkerThread i of
+       Just t | t == me -> i { aiWorkerThread = Nothing, aiLastActivity = now }
+       _                -> i) subagentId)
+
+-- | Record a run's terminal result, generation-guarded:
+--   * current generation -> terminal status + result, 'DeliverResult';
+--   * stale generation, instance already terminal (an intentional stop) ->
+--     keep the answer but 'SuppressDelivery';
+--   * stale generation, a NEWER run owns the entry -> no-op.
+registerRunResult :: AgentRuntime -> SubagentId -> Int -> ChildResult -> IO Delivery
+registerRunResult rt@(AgentRuntime tv) subagentId gen result = do
+  now <- getCurrentTime
+  insts0 <- readTVarIO tv
+  let mParent = aiParentSession <$> Map.lookup subagentId insts0
+  delivery <- atomically $ do
+    insts <- readTVar tv
+    case Map.lookup subagentId insts of
+      Nothing -> pure SuppressDelivery
+      Just i
+        | aiGeneration i == gen -> do
+            let newStatus = case crStatus result of
+                  CsError -> Crashed (fromMaybe "unknown error" (crError result))
+                  _       -> Stopped
+                i' = i { aiStatus = newStatus, aiResult = Just result, aiLastActivity = now }
+            writeTVar tv (Map.insert subagentId i' insts)
+            pure DeliverResult
+        | isTerminal (aiStatus i) -> do
+            let i' = i { aiResult = Just result, aiLastActivity = now }
+            writeTVar tv (Map.insert subagentId i' insts)
+            pure SuppressDelivery
+        | otherwise -> pure SuppressDelivery
+  forM_ mParent (pruneRetained rt)
+  pure delivery
+
+-- | Record a run that died outside the worker's own catch (kill, async
+-- exception), generation-guarded.
+registerRunCrash :: AgentRuntime -> SubagentId -> Int -> SomeException -> IO ()
+registerRunCrash (AgentRuntime tv) subagentId gen e = do
+  now <- getCurrentTime
+  atomically $ modifyTVar' tv (Map.adjust (apply now) subagentId)
+  globalLogIO DebugS (ls ("[idle-diag] registerRunCrash: subagent=" <> subagentIdText subagentId
+    <> " err=" <> T.pack (show e)))
+  where
+    apply now' i
+      | aiGeneration i == gen = i { aiStatus = Crashed (T.pack (show e)), aiLastActivity = now' }
+      | otherwise = i
+
+-- | Claim a terminal instance and fork a new run of it.
+--
+-- The claim, the fork and the handle recording are ordered so no failure path
+-- leaves a permanent 'Starting' entry: the claim is undone on any exception,
+-- the handle is recorded in the parent (the child inherits the mask, so it
+-- cannot run its body yet), and the body runs under 'restore' so it is
+-- interruptible exactly like a normally-spawned child. The returned 'TMVar' is
+-- always filled — with the result and its 'Delivery' verdict, or with the
+-- exception that killed the run — so a foreground caller can never hang.
+resumeAgent
+  :: AgentRuntime
+  -> SessionId
+  -> SubagentId
+  -> SpawnOrigin
+  -> IO ChildResult
+  -> IO (Either Text (AgentInstance, TMVar (Either SomeException (Delivery, ChildResult))))
+resumeAgent rt@(AgentRuntime tv) owner subagentId origin body = mask $ \restore -> do
+  now <- getCurrentTime
+  claimed <- atomically $ do
+    insts <- readTVar tv
+    case Map.lookup subagentId insts of
+      Nothing -> pure (Left (unknownIdMsg subagentId))
+      Just i
+        | not (ownsChild owner i) -> pure (Left notOwnerMsg)
+        | not (isTerminal (aiStatus i)) -> pure (Left stillRunningMsg)
+        | isNothing (aiTask i) || isNothing (aiDef i) -> pure (Left noSnapshotMsg)
+        | aiRuns i >= maxContinuesPerChild -> pure (Left runBudgetMsg)
+        | otherwise -> do
+            let claimed' = i { aiStatus = Starting
+                             , aiResult = Nothing
+                             , aiGeneration = aiGeneration i + 1
+                             , aiOrigin = origin
+                             , aiRuns = aiRuns i + 1
+                             , aiLastActivity = now
+                             }
+            writeTVar tv (Map.insert subagentId claimed' insts)
+            pure (Right claimed')
+  case claimed of
+    Left e -> pure (Left e)
+    Right inst -> do
+      let gen = aiGeneration inst
+      sink <- newEmptyTMVarIO
+      tid <- forkIO $ do
+        outcome <- try (restore body)
+        case outcome of
+          Right result -> do
+            delivery <- registerRunResult rt subagentId gen result
+            endRun rt subagentId
+            atomically (void (tryPutTMVar sink (Right (delivery, result))))
+          Left e -> do
+            registerRunCrash rt subagentId gen e
+            endRun rt subagentId
+            atomically (void (tryPutTMVar sink (Left e)))
+      ok <- atomically $ do
+        insts <- readTVar tv
+        case Map.lookup subagentId insts of
+          Just i | aiGeneration i == gen && aiStatus i == Starting -> do
+            writeTVar tv (Map.insert subagentId
+                            (i { aiStatus = Running, aiWorkerThread = Just tid }) insts)
+            pure True
+          _ -> pure False
+      if ok
+        then pure (Right (inst, sink))
+        else do
+          killThread tid
+          pure (Left "the child was stopped while it was being resumed; retry.")
+
+-- | Has the current run's worker thread finished (or is there no run)?
+workerSettled :: AgentInstance -> IO Bool
+workerSettled i = case aiWorkerThread i of
+  Nothing -> pure True
+  Just tid -> do
+    st <- threadStatus tid
+    pure $ case st of
+      ThreadFinished -> True
+      ThreadDied     -> True
+      _              -> False
+
+-- | Children of this parent that are starting or running.
+countRunningChildren :: AgentRuntime -> SessionId -> IO Int
+countRunningChildren rt owner =
+  length . filter (isLive . aiStatus) <$> listAgentsFor rt owner
+
+-- | Children of this parent that are known but finished (retained).
+countFinishedChildren :: AgentRuntime -> SessionId -> IO Int
+countFinishedChildren rt owner =
+  length . filter (isTerminal . aiStatus) <$> listAgentsFor rt owner
+
+-- | Bound the retained entries per parent: keep the most recently active
+-- 'retainedChildrenCap' finished children and drop the rest. Running (or
+-- mid-claim) children are never pruned.
+pruneRetained :: AgentRuntime -> SessionId -> IO ()
+pruneRetained (AgentRuntime tv) owner =
+  atomically $ modifyTVar' tv keep
+  where
+    keep insts =
+      let finished = [ (k, i) | (k, i) <- Map.toList insts
+                               , ownsChild owner i
+                               , isTerminal (aiStatus i) ]
+          excess = length finished - retainedChildrenCap
+          doomed
+            | excess <= 0 = []
+            | otherwise = take excess (map fst (sortOn (aiLastActivity . snd) finished))
+      in foldr Map.delete insts doomed
+
+-- | Poll a predicate every 10 ms up to a bound in ms; exits as soon as it
+-- holds.
+pollUntil :: Int -> IO Bool -> IO Bool
+pollUntil budgetMs act = go (max 0 budgetMs)
+  where
+    go remaining = do
+      ok <- act
+      if ok || remaining <= 0
+        then pure ok
+        else threadDelay 10000 >> go (remaining - 10)
+
+-- ---------------------------------------------------------------------------
+-- Limits and messages
+-- ---------------------------------------------------------------------------
+
+maxContinuesPerChild :: Int
+maxContinuesPerChild = 50
+
+retainedChildrenCap :: Int
+retainedChildrenCap = 32
+
+isTerminal :: AgentStatus -> Bool
+isTerminal Stopped     = True
+isTerminal Interrupted = True
+isTerminal (Crashed _) = True
+isTerminal _           = False
+
+isLive :: AgentStatus -> Bool
+isLive Starting = True
+isLive Running  = True
+isLive _        = False
+
+unknownIdMsg :: SubagentId -> Text
+unknownIdMsg sid =
+  "unknown subagent id \"" <> subagentIdText sid
+    <> "\". It was not spawned by this session, or was lost to a restart or to retention pruning."
+
+notOwnerMsg :: Text
+notOwnerMsg =
+  "that subagent belongs to a different session; a session may only act on the children it spawned."
+
+stillRunningMsg :: Text
+stillRunningMsg = "the subagent is still running. Stop or interrupt it before continuing."
+
+noSnapshotMsg :: Text
+noSnapshotMsg =
+  "the subagent was registered without a task snapshot and cannot be continued; start a new child."
+
+runBudgetMsg :: Text
+runBudgetMsg =
+  "the subagent has been continued " <> T.pack (show maxContinuesPerChild)
+    <> " times; start a fresh child for new work."

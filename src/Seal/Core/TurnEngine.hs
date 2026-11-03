@@ -299,11 +299,11 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentDefReadOp (bAgentDefs backends)
       , agentDefListOp (bAgentDefs backends)
       , agentDefDeleteOp (bAgentDefs backends)
-      , agentInstancesOp (bRuntime backends)
+      , agentInstancesOp sid (bRuntime backends)
       , agentStartOp startWiring
-      , agentStatusOp (bRuntime backends)
-      , agentStopOp (bRuntime backends)
-      , agentInterruptOp (bRuntime backends)
+      , agentStatusOp sid (bRuntime backends)
+      , agentStopOp sid (bRuntime backends)
+      , agentInterruptOp sid (bRuntime backends)
      , agentManageOp startWiring
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling

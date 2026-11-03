@@ -652,7 +652,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
   describe "AGENT_INSTANCES / STATUS / STOP / INTERRUPT (subagent-id keyed)" $ do
     it "AGENT_INSTANCES reports (no agents running) when the synchronous model has finished" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
+      r <- runTestApp (opRun (agentInstancesOp sampleSession rt) localBackend (object []))
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText t] -> t `shouldBe` "(no agents running)"
@@ -660,23 +660,23 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
 
     it "AGENT_STATUS reports not running when absent" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentStatusOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
+      r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
-        [TrpText t] -> t `shouldBe` "not running"
+        [TrpText t] -> T.isInfixOf "unknown subagent id" t `shouldBe` True
         _           -> expectationFailure "expected a single text part"
 
     it "AGENT_STOP is idempotent on a non-running subagent id" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentStopOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
+      r <- runTestApp (opRun (agentStopOp sampleSession rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
-        [TrpText t] -> t `shouldBe` "stopped"
+        [TrpText t] -> t `shouldBe` "stopped (resumable with AGENT_MANAGE continue)"
         _           -> expectationFailure "expected a single text part"
 
     it "AGENT_INTERRUPT returns 'subagent not running' when no match" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentInterruptOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
+      r <- runTestApp (opRun (agentInterruptOp sampleSession rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText t] -> t `shouldBe` "subagent not running"
@@ -818,12 +818,12 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       _ <- startAgent rt sampleDefId sid (mkSystemSessionId "parent") childSid 0 (pure ())
       -- Then register the completed result
       registerCompletedAgentResult rt sid result
-      mInst <- agentInstanceBySubagentId rt sid
-      case mInst of
-        Just inst -> do
+      rInst <- agentStatusFor rt (mkSystemSessionId "parent") sid
+      case rInst of
+        Right inst -> do
           aiStatus inst `shouldBe` Stopped
           aiResult inst `shouldBe` Just result
-        Nothing -> expectationFailure "instance not found in registry"
+        Left e -> expectationFailure ("instance not found in registry: " <> T.unpack e)
 
   describe "runDelegate (foreground/sync core)" $ do
     it "returns ChildResult with completed status for a successful worker" $ do

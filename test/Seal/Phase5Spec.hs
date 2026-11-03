@@ -169,11 +169,11 @@ buildRegistry cfgRoot workerRan sid = do
     , skillDeleteOp skillBackend
     , agentDefWriteOp defBackend sid
     , agentDefReadOp defBackend
-    , agentInstancesOp rt
+    , agentInstancesOp sid rt
     , agentStartOp startWiring
-    , agentStatusOp rt
-    , agentStopOp rt
-    , agentInterruptOp rt
+    , agentStatusOp sid rt
+    , agentStopOp sid rt
+    , agentInterruptOp sid rt
     ]
 
 spec :: Spec
@@ -273,9 +273,9 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
           reg = ISA.mkRegistry
             [ agentDefWriteOp defBackend sid
             , agentStartOp startWiring
-            , agentStatusOp rt
-            , agentStopOp rt
-            , agentInterruptOp rt
+            , agentStatusOp sid rt
+            , agentStopOp sid rt
+            , agentInterruptOp sid rt
             ]
       (tHandle, _) <- fakeIndexedTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).

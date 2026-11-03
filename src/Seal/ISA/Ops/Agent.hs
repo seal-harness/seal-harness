@@ -91,8 +91,9 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..)
-  , agentInstanceBySubagentId
-  , interruptAgent, listAgents
+  , StopOutcome (..)
+  , agentStatusFor
+  , interruptAgent, listAgentsFor
   , registerCompletedAgentResult, registerRunningAgent, stopAgent )
 import Seal.Agent.Runtime.RunRecord qualified as RunRecord
   ( RunRecordRegistry, shouldDeferDelivery )
@@ -735,9 +736,9 @@ authorizeAgentManage wiring v =
       AgInterrupt -> maybe (Left "interrupt requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
 
 -- | Handle the instances action (shared with the legacy AGENT_INSTANCES shim).
-handleInstances :: AgentRuntime -> App OpResult
-handleInstances runtime = do
-  insts <- liftIO (listAgents runtime)
+handleInstances :: AgentRuntime -> SessionId -> App OpResult
+handleInstances runtime owner = do
+  insts <- liftIO (listAgentsFor runtime owner)
   let rendered = case insts of
         [] -> "(no agents running)"
         _  -> T.intercalate "\n"
@@ -869,20 +870,21 @@ handleStartBackground wiring _v di = do
 -- | Handle the status action (shared with the legacy AGENT_STATUS shim).
 -- Enriched: when the registry has a completed entry with aiResult, the
 -- response includes summary, child_session, exit_reason, and duration.
-handleStatus :: AgentRuntime -> Value -> App OpResult
-handleStatus runtime v = do
+handleStatus :: AgentRuntime -> SessionId -> Value -> App OpResult
+handleStatus runtime owner v = do
   let mSid = subagentIdField v
   case mSid of
     Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
     Just sid -> do
-      mInst <- liftIO (agentInstanceBySubagentId runtime sid)
-      case mInst of
-        Nothing -> pure (OpResult [TrpText "not running"] False
-                         (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
-        Just inst -> do
+      rInst <- liftIO (agentStatusFor runtime owner sid)
+      case rInst of
+        Left err -> pure (OpResult [TrpText err] False
+                         (object ["subagent_id" .= subagentIdText sid, "status" .= ("unknown" :: Text)]))
+        Right inst -> do
           let s = aiStatus inst
               baseRecord = [ "subagent_id" .= subagentIdText sid
                            , "status" .= renderStatus s
+                           , "runs" .= aiRuns inst
                            ]
           case aiResult inst of
             Nothing ->
@@ -898,25 +900,40 @@ handleStatus runtime v = do
               in pure (OpResult [TrpText statusText] False (object enriched))
 
 -- | Handle the stop action (shared with the legacy AGENT_STOP shim).
-handleStop :: AgentRuntime -> Value -> App OpResult
-handleStop runtime v = do
+handleStop :: AgentRuntime -> SessionId -> Value -> App OpResult
+handleStop runtime owner v = do
   let mSid = subagentIdField v
   case mSid of
     Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
     Just sid -> do
-      _ <- liftIO (stopAgent runtime sid)
-      pure (OpResult [TrpText "stopped"] False (object ["subagent_id" .= subagentIdText sid]))
+      rOut <- liftIO (stopAgent runtime owner sid)
+      case rOut of
+        Left err -> pure (OpResult [TrpText err] True
+                           (object ["subagent_id" .= subagentIdText sid]))
+        Right StopOk -> pure (OpResult
+          [TrpText "stopped (resumable with AGENT_MANAGE continue)"] False
+          (object ["subagent_id" .= subagentIdText sid, "outcome" .= ("stopped" :: Text)]))
+        Right StillShuttingDown -> pure (OpResult
+          [TrpText "could not stop: the child is still inside a provider call; retry or wait"] True
+          (object ["subagent_id" .= subagentIdText sid, "outcome" .= ("still_shutting_down" :: Text)]))
 
 -- | Handle the interrupt action (shared with the legacy AGENT_INTERRUPT shim).
-handleInterrupt :: AgentRuntime -> Value -> App OpResult
-handleInterrupt runtime v = do
+handleInterrupt :: AgentRuntime -> SessionId -> Value -> App OpResult
+handleInterrupt runtime owner v = do
   let mSid = subagentIdField v
   case mSid of
     Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
     Just sid -> do
-      found <- liftIO (interruptAgent runtime sid)
-      let msg = if found then "interrupt requested" else "subagent not running"
-      pure (OpResult [TrpText msg] False (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
+      rFound <- liftIO (interruptAgent runtime owner sid)
+      case rFound of
+        Left err -> pure (OpResult [TrpText err] True
+                           (object ["subagent_id" .= subagentIdText sid]))
+        Right found ->
+          let msg = if found
+                      then "interrupt requested (the child stays continuable)"
+                      else "subagent not running"
+          in pure (OpResult [TrpText msg] False
+                    (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
 
 -- ---------------------------------------------------------------------------
 -- Consolidated opcode: AGENT_MANAGE
@@ -979,11 +996,11 @@ agentManageOp wiring = TrustedOpcode
       case parseAgentAction v of
         Left e -> pure (OpResult [TrpText e] True (object []))
         Right action -> case action of
-          AgInstances -> handleInstances (aswRuntime wiring)
+          AgInstances -> handleInstances (aswRuntime wiring) (aswParentSession wiring)
           AgStart     -> handleStart wiring v
-          AgStatus    -> handleStatus (aswRuntime wiring) v
-          AgStop      -> handleStop (aswRuntime wiring) v
-          AgInterrupt -> handleInterrupt (aswRuntime wiring) v
+          AgStatus    -> handleStatus (aswRuntime wiring) (aswParentSession wiring) v
+          AgStop      -> handleStop (aswRuntime wiring) (aswParentSession wiring) v
+          AgInterrupt -> handleInterrupt (aswRuntime wiring) (aswParentSession wiring) v
   }
 
 -- ---------------------------------------------------------------------------
@@ -991,8 +1008,8 @@ agentManageOp wiring = TrustedOpcode
 -- ---------------------------------------------------------------------------
 
 -- | AGENT_INSTANCES (legacy shim): delegates to the instances handler.
-agentInstancesOp :: AgentRuntime -> Opcode
-agentInstancesOp runtime = TrustedOpcode
+agentInstancesOp :: SessionId -> AgentRuntime -> Opcode
+agentInstancesOp owner runtime = TrustedOpcode
   { toName = OpName "AGENT_INSTANCES"
   , toTrust = Trusted
   , toDesc = "List running agent instances (subagent_id + def id + status). (Legacy — prefer AGENT_MANAGE with action=\"instances\".)"
@@ -1003,7 +1020,7 @@ agentInstancesOp runtime = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = const (Right ())
   , toBlocking = False
-  , toRun = \_ _ -> handleInstances runtime
+  , toRun = \_ _ -> handleInstances runtime owner
   }
 
 -- | AGENT_START (legacy shim): delegates to the start handler.
@@ -1045,8 +1062,8 @@ agentStartOp wiring = TrustedOpcode
   }
 
 -- | AGENT_STATUS (legacy shim): delegates to the status handler.
-agentStatusOp :: AgentRuntime -> Opcode
-agentStatusOp runtime = TrustedOpcode
+agentStatusOp :: SessionId -> AgentRuntime -> Opcode
+agentStatusOp owner runtime = TrustedOpcode
   { toName = OpName "AGENT_STATUS"
   , toTrust = Trusted
   , toDesc = "Read one running agent's status by subagent_id. For debugging/observability only — NOT for completion checking. Completion is delivered automatically via push notification. (Legacy — prefer AGENT_MANAGE with action=\"status\".)"
@@ -1054,12 +1071,12 @@ agentStatusOp runtime = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> handleStatus runtime v
+  , toRun = \_ v -> handleStatus runtime owner v
   }
 
 -- | AGENT_STOP (legacy shim): delegates to the stop handler.
-agentStopOp :: AgentRuntime -> Opcode
-agentStopOp runtime = TrustedOpcode
+agentStopOp :: SessionId -> AgentRuntime -> Opcode
+agentStopOp owner runtime = TrustedOpcode
   { toName = OpName "AGENT_STOP"
   , toTrust = Trusted
   , toDesc = "Stop a running agent instance by subagent_id (idempotent). (Legacy — prefer AGENT_MANAGE with action=\"stop\".)"
@@ -1067,12 +1084,12 @@ agentStopOp runtime = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STOP requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> handleStop runtime v
+  , toRun = \_ v -> handleStop runtime owner v
   }
 
 -- | AGENT_INTERRUPT (legacy shim): delegates to the interrupt handler.
-agentInterruptOp :: AgentRuntime -> Opcode
-agentInterruptOp runtime = TrustedOpcode
+agentInterruptOp :: SessionId -> AgentRuntime -> Opcode
+agentInterruptOp owner runtime = TrustedOpcode
   { toName = OpName "AGENT_INTERRUPT"
   , toTrust = Trusted
   , toDesc = "Request that a running subagent stop at its next iteration boundary (cooperative; the worker polls an interrupt flag between turns). (Legacy — prefer AGENT_MANAGE with action=\"interrupt\".)"
@@ -1080,7 +1097,7 @@ agentInterruptOp runtime = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_INTERRUPT requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toBlocking = False
-  , toRun = \_ v -> handleInterrupt runtime v
+  , toRun = \_ v -> handleInterrupt runtime owner v
   }
 
 -- ---------------------------------------------------------------------------
