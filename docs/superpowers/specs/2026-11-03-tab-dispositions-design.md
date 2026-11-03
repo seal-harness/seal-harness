@@ -22,7 +22,8 @@
 - **Round 4** — **the Active Tabs filter is a set of independent per-disposition
   toggles**, not a single-select. Each of the four open dispositions can be shown
   or hidden independently (§6.2). This also settles two gaps round 3 left open:
-  a brand-new tab now starts as `Todo` rather than untagged (D5), and hiding is
+  a brand-new tab now starts as `Todo` rather than untagged (D5 — **superseded in
+  round 8**, see §14.9: there are no automatic writers), and hiding is
   literal while attention is surfaced rather than silently dropped (I12).
 - **Round 5** — **the derived sidecar is in scope, as PR 0** (operator). The
   listing path's §5.11 problem turned out to be independent of dispositions —
@@ -170,7 +171,7 @@ Eight dispositions, each belonging to exactly one section. A three-valued
 **class** carries the behaviour, so the code needs one predicate rather than a
 per-disposition table:
 
-| Section | Disposition   | slug          | Class    | Holds a tab | Default-visible |
+| Section | Disposition   | slug          | Class    | Seat effect (D1/D2) | Default-visible |
 |---------|---------------|---------------|----------|-------------|-----------------|
 | **Active Tabs** | Backlog       | `backlog`      | `open`   | yes         | yes |
 |                 | Todo          | `todo`         | `open`   | yes         | yes |
@@ -306,22 +307,46 @@ asymmetry: a completed session is still useful context; a filed-away one is not.
   session's tab and notify the wrong channel.)
 - **D3 (untagged is inert).** No disposition → tab state unchanged. This is what
   makes migration safe.
-- **D4 (a turn is a commitment).** A successful turn sets `In Progress` unless the
-  session is already `In Progress`. From `Backlog`/`Todo` that is a promotion;
-  from `Needs Review` it means review found work (correct); from a closed state
-  it reopens the session (also correct). Without D4, `ensureTabForSession` on
-  every successful turn (`Send.hs:558,578,587`) resurrects closed sessions one
-  message later. Implementation: one helper at those three sites, preserving the
-  existing `isTabCommand` exclusion (`Send.hs:606-612`), which exists for exactly
-  this bug class.
+- **D4 (every disposition is user-authored; there are no automatic writers).**
+  **This supersedes the earlier D4/D5.** All eight values — open and closed — are
+  produced only by the operator through the row's status control (§6.1). Nothing
+  in the harness writes a disposition on its own: not a turn, not a tab
+  creation, not an agent, not a channel message, not a timer.
+  Consequences, accepted deliberately:
+  - A successful turn does **not** promote `Backlog`/`Todo` to `In Progress`.
+    The operator decides when work started.
+  - A new tab does **not** get `Todo`. New sessions are **untagged** until the
+    operator files them, and untagged is therefore a permanent, legitimate state
+    rather than a legacy-only one (§5.1's earlier claim is withdrawn).
+  - `ensureTabForSession` still auto-creates a seat on a successful turn
+    (`Send.hs:558,578,587`), preserving the existing `isTabCommand` exclusion
+    (`Send.hs:606-612`). That is a **seat**, not a disposition: it never changes
+    what the operator decided.
+  Rationale: the value of this field is that it records the operator's judgment
+  and nothing else. A harness that guesses the judgment produces a field that
+  looks maintained and is not — the failure the operator set out to escape. So
+  the field is honest about being manual, and §1's "beats a stale TODO list"
+  claim is withdrawn: what beats a stale list here is that **the session is the
+  work** (tokens were spent, the transcript exists), not that the status keeps
+  itself current.
 
-- **D5 (a new tab starts in `Todo`).** `handleTabNew`'s session branch sets the
-  new session's disposition to `todo` at creation. `Todo` means "committed, not
-  started", which is exactly what opening a tab expresses, and it gives every
-  board row a column — untagged then only ever means *legacy* (a session from
-  before this field existed). D4 promotes it on the first successful turn.
 
-**Section membership is by tab presence; disposition is by intent.** They are in
+
+**Section membership follows the disposition.** A session appears in *Active
+Tabs* iff its disposition is `ClassOpen`, and in *Sessions* iff `ClassClosed` or
+`ClassHidden`; untagged sessions appear in *Sessions*. The tab is the **seat**
+(needed to interact with a row, and to give it a `/N` shortcut), not the
+grouping key. When a closed session receives a message it still gets a seat
+(auto-tab), but it stays in *Sessions* under its own disposition — so the
+operator's decision is never silently overridden, and the earlier "a `Done`
+session renders in Active Tabs with a Done pill" oddity disappears.
+
+This means the frontend groups rows by disposition and uses `tabSessions` only
+to know which rows have seats (for the "open in tab" affordance and the index
+chip). `partitionSessions` keeps doing what it does for dedup; its three lists
+are no longer the section definition.
+
+ They are in
 lockstep by D1/D2 *except* under board pressure: if the 36-slot list is full, a
 `ClassOpen` disposition is still **persisted** (I2) and the row renders in
 *Sessions* with a muted "no seat — board full" affordance and a retry on click
@@ -544,17 +569,34 @@ exactly where it is.
 
 ## 6. UI
 
-### 6.1 The row control (the menu)
+### 6.1 The row control: a status icon that opens the menu
 
-The pill **is** the trigger; it is suppressed when the row's disposition equals
-the filter's single selection (otherwise it is redundant) and, in Active Tabs,
-for `In Progress` (the modal state — so most rows stay clean). Where suppressed,
-a hover-revealed trigger with a **non-✕ glyph**, `aria-label="Set disposition"`,
-`title="Where does this session go?"` — a close glyph that opens a menu is a
-bait-and-switch.
+**One control per session-backed row.** The ✕ is replaced by a **status icon**
+whose glyph and colour encode the session's current disposition. Clicking it
+opens a dropdown listing all eight values. There is no separate pill and no
+second affordance — one control both *shows* and *sets* the state, which is what
+resolves the round-7 objection that "the pill and the trigger are two controls
+for one field".
 
-The menu lists all eight, **grouped by destination section**, so moving a row is
-predictable:
+```
+  b   ◐  Fix the flaky integration test        ·  repo    ·  web    2h
+      ↑
+      status icon: current disposition, click for the menu
+```
+
+| Disposition   | Glyph | Colour |
+|---------------|-------|--------|
+| untagged      | ○     | faint  |
+| Backlog       | ◔     | muted  |
+| Todo          | ◑     | muted  |
+| In Progress   | ◐     | accent |
+| Needs Review  | ◉     | accent-2 |
+| Done          | ●     | success |
+| Canceled      | ⊘     | faint  |
+| Archived      | ▣     | faint  |
+| Deleted       | ⨯     | faint  |
+
+The menu, grouped by destination section so the move is predictable:
 
 ```
   Active Tabs
@@ -567,22 +609,32 @@ predictable:
      Done
      Canceled
      Archived
-     Deleted…              ← requires a second activation
+     Delete…               ← requires a second activation
 ```
 
-- **Initial highlight is always the current disposition**, so `Enter` means "no
-  change, dismiss". No terminal state is ever pre-selected.
-- Dead rows (`exited`/`orphaned`) keep today's **Dismiss** — clearing a corpse is
-  not a decision about the work.
-- Harness and raw-shell tabs (no session) keep Close/Dismiss/Release verbatim.
-- The same menu replaces `ArchiveButton` on Sessions rows
-  (`frontend/src/components/Sidebar.tsx:32`).
-- No `role="menu"`: a plain-button popover with `aria-expanded` on the trigger,
-  matching `TabLineConfigBar`. Upgrading to a real menu (roving tabindex,
-  `menuitemradio` + `aria-checked`, arrows) is a follow-up.
-- Picking a `ClassOpen` item from a Sessions row opens a tab, so the row moves to
-  Active Tabs. Intended, and documented here because it will look like the row
-  vanished. If the board is full, the row stays put with the §5.5 no-seat affordance.
+Rules (each closes a round-7 finding):
+
+- **Always perceivable, never hover-only.** The icon is always in the tab order
+  and in the accessibility tree; on low-emphasis rows it may be revealed by
+  `opacity`, never by `display: none` — `.session-archive`'s `display: none`
+  pattern is exactly the bug that made the old controls keyboard-unreachable
+  (`App.css:816-836`). Accessible name is stable across states:
+  `Disposition: <current>` with `aria-haspopup="true"` and `aria-expanded`.
+- **The menu is portalled**, `position: fixed` from the trigger's rect, with
+  flip/clamp and a max height — it lives inside the sidebar's scrolling list and
+  would otherwise clip (precedent: `NewTabComposer.tsx:595-601`).
+- **Initial highlight is the current disposition**, so `Enter` means "no change,
+  dismiss". A terminal value is never pre-selected.
+- **`Delete…`'s confirmation disarms** on popover close, Escape, focus loss, or
+  choosing any other item — otherwise the confirm is theatre.
+- **Picking an open value from a Sessions row** moves the row to Active Tabs; the
+  menu names the destination, the section header counts update, and selection is
+  re-pointed from the `tab.index` in the 200 response. If the board is full the
+  row stays put with the "no seat — board full" affordance.
+- **Dead rows** (`exited`/`orphaned`) keep Dismiss. Harness and raw-shell tabs
+  have no session and keep Close/Dismiss/Release verbatim.
+- No `role="menu"`: a plain-button popover, as elsewhere in this UI. Upgrading to
+  a real menu (roving tabindex, `menuitemradio`, arrows) is a follow-up.
 
 ### 6.2 The Active Tabs filter: per-disposition toggles
 
@@ -1144,3 +1196,31 @@ ids-only audit line per transition; (v) bound `/session reindex` (single-flight)
   removes the reason to build the epic. Open questions Q-H (who produces
   `Needs Review`), Q-I (the 335 legacy sessions), Q-J (do channel-originated
   sessions belong on the board) join Q-B/Q-C/Q-F in §12.
+
+### 14.9 Round 8 — operator decision resolves §14.1
+
+The operator settled the premise question: **all disposition values, open and
+closed, are produced by the operator from the frontend control.** There is no
+automatic producer, and none is wanted.
+
+What that changes:
+
+- §14.1 is resolved by **withdrawing** the anti-rot claim rather than by adding a
+  producer. §5.5's D4/D5 are replaced (see D4 there); §1 no longer claims the
+  field maintains itself. The honest proposition is that the transcript is the
+  evidence a session mattered, and the disposition records what the operator
+  decided — a manual annotation with a truthful scope, not a to-do list that
+  pretends to keep itself current.
+- §14.3's D5 gap (untagged is not legacy-only) is now **by design**: untagged is a
+  permanent valid state, so the `Untagged` filter entry stays available and does
+  not claim to self-clean.
+- §14.7's pill-vs-trigger objection is **resolved by construction**: §6.1 is now a
+  single status icon that opens the menu, so there is one control per row.
+- The remaining round-7 blockers still stand and still block PR 1–3:
+  the tab-coupling funnel (§14.3), the single critical section (§14.4), the
+  partitioned enumerator and non-destructive unarchive (§14.5), the security
+  fact-corrections and `smId` validation (§14.6), the menu geometry and keyboard
+  contract (§14.7, now specified in §6.1), and the metrics that cannot fail
+  (§14.7). Those are design work, not questions.
+- **PR 0 is unaffected by this decision** and remains not mergeable until W0a
+  (bench) and W0c (read path) land and clear the §4 gate.
