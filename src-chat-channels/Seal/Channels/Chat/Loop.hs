@@ -749,10 +749,10 @@ ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState think
       -- Re-target: the callback closed over 'boundSid' by value, so a
       -- FocusOp alone would leave this conversation deaf to 'sid'.
       | otherwise -> do
+          atomically (modifyTVar' wsConns (Map.delete key))
+          wcClose ws
           dbg ("[watch] ensureWsConn re-target " <> sessionIdText boundSid
                <> " -> " <> sessionIdText sid)
-          wcClose ws
-          atomically (modifyTVar' wsConns (Map.delete key))
           connectWs
     Nothing -> do
       connectWs
@@ -783,8 +783,20 @@ handleServerEvent
   -> WatchState
   -> ThinkingTabs
   -> SessionId -> ServerEvent -> IO ()
-handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs focusedSid ev =
-  case ev of
+handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs focusedSid ev = do
+  -- Staleness guard: when the WS connection for this conversation has been
+  -- re-targeted to a different session (the user changed focus via /N or
+  -- sent a message that created a new session), this callback is stale —
+  -- its 'focusedSid' no longer matches the 'boundSid' in 'wsConns'. A
+  -- stale callback must not process events: the old streaming state has
+  -- been replaced, and processing events here would send messages from
+  -- the wrong session's accumulated text (e.g. a partial reply fragment
+  -- arriving before the watch notification from the new connection).
+  conns <- readTVarIO wsConns
+  let isCurrent = case Map.lookup key conns of
+        Just (boundSid, _, _) -> boundSid == focusedSid
+        Nothing -> False
+  when isCurrent $ case ev of
     SeEntryUpdate sid val
       | sid == focusedSid ->
           withStreamingState wsConns key (\ss -> handleEntryUpdate cfg chan ss val)
