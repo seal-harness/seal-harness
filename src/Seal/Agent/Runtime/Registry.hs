@@ -601,7 +601,13 @@ resumeAgent rt@(AgentRuntime tv) owner subagentId origin body = mask $ \restore 
     Right inst -> do
       let gen = aiGeneration inst
       sink <- newEmptyTMVarIO
+      -- The body waits for its own handle to be recorded. Without the gate a
+      -- fast run can finish (and write its terminal result) before the CAS
+      -- below, which then loses and reports a spurious "stopped while being
+      -- resumed" — and, worse, kills a thread that already reported.
+      gate <- newEmptyTMVarIO
       tid <- forkIO $ do
+        atomically (takeTMVar gate)
         outcome <- try (restore body)
         case outcome of
           Right result -> do
@@ -621,7 +627,9 @@ resumeAgent rt@(AgentRuntime tv) owner subagentId origin body = mask $ \restore 
             pure True
           _ -> pure False
       if ok
-        then pure (Right (inst, sink))
+        then do
+          atomically (putTMVar gate ())
+          pure (Right (inst, sink))
         else do
           killThread tid
           pure (Left "the child was stopped while it was being resumed; retry.")

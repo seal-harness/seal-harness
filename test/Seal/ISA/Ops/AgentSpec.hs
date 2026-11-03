@@ -6,14 +6,18 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (AsyncException (ThreadKilled), bracket, throwIO)
-import Control.Monad (replicateM_, void)
-import Data.Aeson (encode, object, (.=))
+import Control.Monad (forM_, replicateM_, void, when)
+import Data.Aeson (Value, encode, object, (.=))
+import Data.Aeson.Key qualified as Key
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend
@@ -35,7 +39,7 @@ import Seal.Agent.Runtime.Delegation
   , subagentIdText
   )
 import Seal.Agent.Runtime.Registry
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), agentSessionDir)
 import Seal.Core.Types (SessionId, mkSystemSessionId, ModelId (..))
 import Seal.ISA.Opcode
   ( OpResult (..), localBackend, opAuthorize, opRun )
@@ -115,7 +119,14 @@ errorWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothin
 mkLifecycleWiring
   :: AgentDefBackend -> AgentRuntime -> Del.SpawnPauseFlag
   -> Del.AgentWorkerBuilder -> Maybe (IO ()) -> AgentStartWiring
-mkLifecycleWiring backend rt pauseFlag worker onIdle = AgentStartWiring
+mkLifecycleWiring = mkLifecycleWiringAt samplePaths
+
+-- | 'mkLifecycleWiring' over an explicit 'SealPaths' — the @continue@ tests
+-- need a real child directory to look for.
+mkLifecycleWiringAt
+  :: SealPaths -> AgentDefBackend -> AgentRuntime -> Del.SpawnPauseFlag
+  -> Del.AgentWorkerBuilder -> Maybe (IO ()) -> AgentStartWiring
+mkLifecycleWiringAt paths backend rt pauseFlag worker onIdle = AgentStartWiring
   { aswDefBackend = backend
   , aswRuntime = rt
   , aswConfig = pure defaultDelegationConfig
@@ -125,7 +136,7 @@ mkLifecycleWiring backend rt pauseFlag worker onIdle = AgentStartWiring
   , aswParentDepth = 0
   , aswWorker = worker
   , aswGate = gateOpen
-  , aswPaths = samplePaths
+  , aswPaths = paths
   , aswParentSession = sampleSession
   , aswRunRecords = Nothing
   , aswOnIdleCompletion = onIdle
@@ -176,6 +187,41 @@ taskCapturingWorker :: IORef (Maybe Del.ChildTask) -> Del.AgentWorkerBuilder
 taskCapturingWorker ref _ _ task _ = do
   writeIORef ref (Just task)
   pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
+-- | Paths rooted in a scratch dir, so a @continue@ test's child directory is
+-- real without touching any other test's fixture.
+scratchPaths :: FilePath -> SealPaths
+scratchPaths root = SealPaths
+  { spHome = root
+  , spConfig = root </> "config"
+  , spState = root </> "state"
+  , spKeys = root </> "keys"
+  , spCache = root </> "cache"
+  }
+
+-- | The child session every test spawn mints.
+childSessionFixture :: SessionId
+childSessionFixture = mkSystemSessionId "fresh"
+
+-- | Create the child's session directory, with a conversation of the given
+-- size (0 = "killed before the first request").
+seedChildDir :: SealPaths -> SessionId -> Int -> IO ()
+seedChildDir paths owner bytes = do
+  let dir = agentSessionDir paths owner childSessionFixture
+  createDirectoryIfMissing True dir
+  writeFile (dir </> "conversation.jsonl") (replicate bytes 'x')
+
+-- | The single text part of a tool result.
+resultText :: OpResult -> Text
+resultText r = case orParts r of
+  [TrpText t] -> t
+  _           -> ""
+
+-- | The continue gate's refusal text (or a failure if it allowed the call).
+gateRefusal :: AgentStartWiring -> Value -> IO Text
+gateRefusal wiring v = case opAuthorize (agentManageOp wiring) v of
+  Left e   -> pure e
+  Right () -> expectationFailure "expected the gate to refuse" >> pure ""
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Agent" $ do
@@ -845,6 +891,275 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend
                              (object ["subagent_id" .= ("sa-a1-\n00000001" :: Text)]))
       orIsError r `shouldBe` True
+
+  describe "AGENT_MANAGE continue — pure gate" $ do
+    let sidText = "sa-a1-00000001" :: Text
+        base = ["action" .= ("continue" :: Text)]
+    it "accepts action=continue with a well-formed subagent_id" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+      opAuthorize (agentManageOp w) (object (base <> ["subagent_id" .= sidText]))
+        `shouldBe` Right ()
+
+    it "rejects a missing, over-long, or control-character subagent_id" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+      e1 <- gateRefusal w (object base)
+      T.isInfixOf "at most 256 characters" e1 `shouldBe` True
+      e2 <- gateRefusal w (object (base <> ["subagent_id" .= T.replicate 257 "a"]))
+      T.isInfixOf "at most 256 characters" e2 `shouldBe` True
+      e3 <- gateRefusal w (object (base <> ["subagent_id" .= ("sa-a1\n00000001" :: Text)]))
+      T.isInfixOf "at most 256 characters" e3 `shouldBe` True
+
+    it "rejects an empty, oversized, or control-character prompt" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+          withPrompt p = object (base <> ["subagent_id" .= sidText, "prompt" .= p])
+      e1 <- gateRefusal w (withPrompt ("" :: Text))
+      T.isInfixOf "must not be empty" e1 `shouldBe` True
+      e2 <- gateRefusal w (withPrompt (T.replicate (32 * 1024 + 1) "x"))
+      T.isInfixOf "the limit is 32768" e2 `shouldBe` True
+      e3 <- gateRefusal w (withPrompt ("a\tb" :: Text))
+      T.isInfixOf "control characters" e3 `shouldBe` True
+      -- the boundary is allowed
+      opAuthorize (agentManageOp w) (withPrompt (T.replicate (32 * 1024) "x"))
+        `shouldBe` Right ()
+
+    it "rejects each start-only field with the pinned text" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+      forM_ (["id", "goal", "context", "role"] :: [Text]) $ \f -> do
+        e <- gateRefusal w (object (base <> ["subagent_id" .= sidText, Key.fromText f .= ("x" :: Text)]))
+        e `shouldBe` ("continue: \"" <> f
+                        <> "\" is a start-only field; pass the instruction as \"prompt\".")
+      e <- gateRefusal w (object (base <> ["subagent_id" .= sidText, "tasks" .= ([] :: [Value])]))
+      e `shouldBe` "continue: \"tasks\" is a start-only field; pass the instruction as \"prompt\"."
+
+    it "rejects an unknown mode but accepts foreground and background" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+          withMode m = object (base <> ["subagent_id" .= sidText, "mode" .= m])
+      e <- gateRefusal w (withMode ("Foreground" :: Text))
+      T.isInfixOf "\"mode\" must be" e `shouldBe` True
+      opAuthorize (agentManageOp w) (withMode ("foreground" :: Text)) `shouldBe` Right ()
+      opAuthorize (agentManageOp w) (withMode ("background" :: Text)) `shouldBe` Right ()
+
+  describe "AGENT_MANAGE continue — behaviour" $ do
+    let spawnGreeter w =
+          runTestApp (opRun (agentStartOp w) localBackend
+            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+        continueOn w fields =
+          runTestApp (opRun (agentManageOp w) localBackend
+            (object (["action" .= ("continue" :: Text)] <> fields)))
+        onlySid rt = do
+          insts <- listAgentsFor rt sampleSession
+          case insts of
+            [i] -> pure (aiSubagentId i)
+            _   -> expectationFailure
+                     ("expected exactly one instance, got " <> show (length insts))
+                     >> pure (Del.SubagentId "sa-none-00000000")
+
+    it "refuses an unknown subagent id with the pinned text" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "x") Nothing
+      r <- continueOn w ["subagent_id" .= ("sa-nope-00000001" :: Text)]
+      orIsError r `shouldBe` True
+      resultText r `shouldBe`
+        "continue: unknown subagent id \"sa-nope-00000001\". It was not spawned \
+        \by this session, or was lost to a restart or to retention pruning. \
+        \Start a new child."
+
+    it "refuses another session's child and never echoes the owner" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "done") Nothing
+      _ <- spawnGreeter w
+      finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+      finished `shouldBe` True
+      sid <- onlySid rt
+      r <- continueOn w { aswParentSession = mkSystemSessionId "s2" }
+             ["subagent_id" .= subagentIdText sid]
+      orIsError r `shouldBe` True
+      resultText r `shouldBe`
+        "continue: that subagent belongs to a different session; a session may \
+        \only continue the children it spawned."
+      T.isInfixOf "s1" (resultText r) `shouldBe` False
+
+    it "refuses while spawning is paused, with the shared pause text" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      let w = mkLifecycleWiring backend rt pf (recordingWorker' "done") Nothing
+      _ <- spawnGreeter w
+      finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+      finished `shouldBe` True
+      sid <- onlySid rt
+      _ <- setSpawnPaused pf True
+      r <- continueOn w ["subagent_id" .= subagentIdText sid]
+      _ <- setSpawnPaused pf False
+      orIsError r `shouldBe` True
+      resultText r `shouldBe` spawnPausedMsg
+
+    it "refuses while the child is still running" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pf <- newSpawnPauseFlag
+      gate <- newEmptyMVar :: IO (MVar ())
+      let w = mkLifecycleWiring backend rt pf (gatedWorker gate) Nothing
+      _ <- spawnGreeter w
+      registered <- pollUntil 2000 (not . null <$> listAgentsFor rt sampleSession)
+      registered `shouldBe` True
+      sid <- onlySid rt
+      r <- continueOn w ["subagent_id" .= subagentIdText sid]
+      orIsError r `shouldBe` True
+      resultText r `shouldBe` ("continue: subagent " <> subagentIdText sid
+        <> " is still running. Stop or interrupt it before continuing.")
+      putMVar gate ()
+
+    it "refuses when the child's session directory is gone" $
+      withSystemTempDirectory "seal-continue" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        let w = mkLifecycleWiringAt paths backend rt pf (recordingWorker' "done") Nothing
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        sid <- onlySid rt
+        r <- continueOn w ["subagent_id" .= subagentIdText sid]
+        orIsError r `shouldBe` True
+        resultText r `shouldBe` ("continue: subagent " <> subagentIdText sid
+          <> " has no transcript on disk any more; start a new child.")
+
+    it "foreground continue sends the prompt, returns the reply in-band, and does not wake" $
+      withSystemTempDirectory "seal-continue" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        seen <- newIORef (Nothing :: Maybe Text)
+        wakes <- newIORef (0 :: Int)
+        let worker _ _ task _ = do
+              writeIORef seen (Just (Del.ctGoal task))
+              pure (ChildWorkerOutcome (Just "second answer") CerCompleted 0 0
+                     (Just childSessionFixture))
+            w = mkLifecycleWiringAt paths backend rt pf worker
+                  (Just (void (atomicModifyIORef' wakes (\n -> (n + 1, n + 1)))))
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        -- the spawn's own completion already fired a wake; count the continue's
+        writeIORef wakes 0
+        seedChildDir paths sampleSession 8
+        sid <- onlySid rt
+        r <- continueOn w [ "subagent_id" .= subagentIdText sid
+                          , "mode" .= ("foreground" :: Text)
+                          , "prompt" .= ("the next step" :: Text) ]
+        orIsError r `shouldBe` False
+        let text = resultText r
+        T.isInfixOf "replied (continue #2)" text `shouldBe` True
+        T.isInfixOf "second answer" text `shouldBe` True
+        T.isInfixOf continueHint text `shouldBe` True
+        readIORef seen `shouldReturn` Just "the next step"
+        -- in-band: no sidecar, no wake
+        readIORef wakes `shouldReturn` 0
+        settled <- agentStatusFor rt sampleSession sid
+        case settled of
+          Left e -> expectationFailure ("child vanished: " <> T.unpack e)
+          Right i -> do
+            aiRuns i `shouldBe` 2
+            aiStatus i `shouldBe` Stopped
+            aiOrigin i `shouldBe` SoContinueForeground
+
+    it "sends the default nudge when the prompt is omitted" $
+      withSystemTempDirectory "seal-continue" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        seen <- newIORef (Nothing :: Maybe Text)
+        let worker _ _ task _ = do
+              writeIORef seen (Just (Del.ctGoal task))
+              pure (ChildWorkerOutcome (Just "ok") CerCompleted 0 0 (Just childSessionFixture))
+            w = mkLifecycleWiringAt paths backend rt pf worker Nothing
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        seedChildDir paths sampleSession 8
+        sid <- onlySid rt
+        r <- continueOn w [ "subagent_id" .= subagentIdText sid
+                          , "mode" .= ("foreground" :: Text) ]
+        orIsError r `shouldBe` False
+        readIORef seen `shouldReturn` Just continueNudge
+
+    it "falls back to the stored goal when the conversation is empty" $
+      withSystemTempDirectory "seal-continue" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        seen <- newIORef (Just ("not run" :: Text))
+        let worker _ _ task _ = do
+              writeIORef seen (Just (Del.ctGoal task))
+              pure (ChildWorkerOutcome (Just "ok") CerCompleted 0 0 (Just childSessionFixture))
+            w = mkLifecycleWiringAt paths backend rt pf worker Nothing
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        -- directory exists, conversation empty: the child was killed before its
+        -- first request, so continuing it with a nudge would resume nothing
+        seedChildDir paths sampleSession 0
+        sid <- onlySid rt
+        r <- continueOn w [ "subagent_id" .= subagentIdText sid
+                          , "mode" .= ("foreground" :: Text) ]
+        orIsError r `shouldBe` False
+        readIORef seen `shouldReturn` Just "do the thing"
+
+    it "background continue acks continued #2 and delivers the reply with one wake" $
+      withSystemTempDirectory "seal-continue" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        wakes <- newIORef (0 :: Int)
+        let w = mkLifecycleWiringAt paths backend rt pf (recordingWorker' "background reply")
+                  (Just (void (atomicModifyIORef' wakes (\n -> (n + 1, n + 1)))))
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        writeIORef wakes 0
+        seedChildDir paths sampleSession 8
+        sid <- onlySid rt
+        r <- continueOn w [ "subagent_id" .= subagentIdText sid ]
+        when (orIsError r) $
+          expectationFailure ("continue was refused: " <> T.unpack (resultText r))
+        let text = resultText r
+        T.isInfixOf "running (continued #2)" text `shouldBe` True
+        T.isInfixOf "replied (continue #2)" text `shouldBe` True
+        woke <- pollUntil 2000 ((== 1) <$> readIORef wakes)
+        woke `shouldBe` True
 
   describe "runChildTask (one child-run core)" $ do
     let mkTask = Del.ChildTask "a1" "do the thing" Nothing Nothing False

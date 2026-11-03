@@ -63,16 +63,18 @@ module Seal.ISA.Ops.Agent
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (myThreadId)
+import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent.STM (TMVar, atomically, takeTMVar)
 import Control.Exception
-  ( SomeAsyncException, fromException, throwIO, try )
-import Control.Monad (join, forM_)
+  ( SomeAsyncException, SomeException, fromException, throwIO, try )
+import Control.Monad (join, forM_, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
+import Data.List (find)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -101,7 +103,10 @@ import Seal.Agent.Runtime.Delegation
   , ParentActivity
   , SubagentId (..)
   , resolveDelegationConfig
+  , runChildTask
   , runDelegateAsync
+  , isSpawnPaused
+  , spawnPausedMsg
   , mkErrorResult
   , subagentIdText
   )
@@ -111,13 +116,19 @@ import Seal.Agent.Runtime.Registry
   , SpawnOrigin (..)
   , StopOutcome (..)
   , agentStatusFor
+  , countRunningChildren
   , endRun
-  , interruptAgent, listAgentsFor
+  , hasRunningChildren
+  , interruptAgent, listAgents, listAgentsFor
+  , ownsChild
+  , pollUntil
   , registerRunCrash, registerRunResult, registerRunningChild
-  , stopAgent )
+  , resumeAgent
+  , stopAgent
+  , workerSettled )
 import Seal.Agent.Runtime.RunRecord qualified as RunRecord
   ( RunRecordRegistry, shouldDeferDelivery )
-import Seal.Config.Paths (SealPaths)
+import Seal.Config.Paths (SealPaths, childConversationPresent)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Handles.Transcript (appendCompletionToSidecar)
 import Katip (Severity (..), ls)
@@ -704,6 +715,7 @@ allowSpawnBlockedMsg =
 data AgentAction
   = AgInstances
   | AgStart
+  | AgContinue
   | AgStatus
   | AgStop
   | AgInterrupt
@@ -714,6 +726,7 @@ parseAgentAction v =
     Just t -> case t :: Text of
       "instances" -> Right AgInstances
       "start"     -> Right AgStart
+      "continue"  -> Right AgContinue
       "status"    -> Right AgStatus
       "stop"      -> Right AgStop
       "interrupt" -> Right AgInterrupt
@@ -751,6 +764,7 @@ authorizeAgentManage wiring v =
     Right action -> case action of
       AgInstances -> Right ()
       AgStart     -> authorizeStart wiring v
+      AgContinue  -> authorizeContinue v
       AgStatus    -> maybe (Left "status requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgStop      -> maybe (Left "stop requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgInterrupt -> maybe (Left "interrupt requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
@@ -847,7 +861,6 @@ handleStartBackground wiring _v di = do
       let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           runtime = aswRuntime wiring
           parentSid = aswParentSession wiring
-          paths = aswPaths wiring
           callback :: AgentCompletionCallback
           callback result = do
             -- Generation-guarded: a stop or interrupt that landed while this
@@ -863,44 +876,11 @@ handleStartBackground wiring _v di = do
                             initialRunGeneration result
             globalLogIO DebugS (ls ("[idle-diag] completion callback fired: subagent=" <> subagentIdText (crSubagentId result)
               <> " parentSid=" <> sessionIdText parentSid))
-            -- Descendant settle — if the child has pending descendants,
-            -- defer the completion delivery. The child's results would be
-            -- partial; wait for its descendants to settle so the child can
-            -- synthesize a final summary. When the registry is unavailable
-            -- (tests) or the child has no pending descendants, deliver
-            -- immediately.
-            let mRunRecords = aswRunRecords wiring
-                mChildSession = crChildSession result
-            defer <- case delivery of
-              SuppressDelivery -> do
+            case delivery of
+              SuppressDelivery ->
                 globalLogIO DebugS (ls ("[idle-diag] delivery suppressed (intentional termination): subagent=" <> subagentIdText (crSubagentId result)))
-                pure True
-              DeliverResult -> case (mRunRecords, mChildSession) of
-                (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
-                _ -> pure False
-            if defer
-              then globalLogIO DebugS (ls ("[idle-diag] completion deferred (descendants pending): subagent=" <> subagentIdText (crSubagentId result)))
-              else do
-                -- Append the completion message to a sidecar file. The turn
-                -- engine reads this file at the start of the parent's next turn
-                -- and injects the messages into the conversation. This avoids
-                -- interfering with the single-writer daemon's in-memory diff
-                -- state (itsWritten) during the ongoing turn — writing directly
-                -- to conversation.jsonl while the daemon is active causes the
-                -- daemon's diff to desynchronize, corrupting the transcript.
-                appendCompletionToSidecar paths parentSid (completionMessage result)
-                globalLogIO DebugS (ls ("[idle-diag] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
-                  <> " parentSid=" <> sessionIdText parentSid
-                  <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
-                  <> " messageChars=" <> T.pack (show (T.length (completionMessage result)))))
-                -- Wake-up hook: if the parent session is idle (no turn in
-                -- flight), trigger a synthetic turn so the sidecar
-                -- completions are read and processed. Without this, the
-                -- completions sit in the sidecar until the user sends
-                -- another message — the session appears dead even though
-                -- sub-agents have finished.
-                globalLogIO DebugS (ls ("[idle-diag] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
-                forM_ (aswOnIdleCompletion wiring) id
+              DeliverResult ->
+                deliverToParent wiring parentSid (completionMessage result) result
           spawnCb :: SpawnCallback
           spawnCb sid def childSid task body = do
             -- 'runDelegateAsync' calls this from the forked child thread, so
@@ -1034,6 +1014,338 @@ handleInterrupt runtime owner v = do
                     (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
 
 -- ---------------------------------------------------------------------------
+-- continue: resume a child this session spawned
+-- ---------------------------------------------------------------------------
+
+-- | Cap on a @prompt@: it is fsync'd into the child's transcript and re-sent on
+-- every later turn of that child, so it is bounded.
+promptCap :: Int
+promptCap = 32 * 1024
+
+-- | The run budget a child may consume across continues (both modes; the claim
+-- re-checks it). Mirrors 'Seal.Agent.Runtime.Registry.maxContinuesPerChild'.
+continueRunLimit :: Int
+continueRunLimit = 50
+
+-- | Refusal texts — one per failed precondition, in the pinned order. Each
+-- names the precondition that failed and what to do about it.
+continueUnknownMsg :: SubagentId -> Text
+continueUnknownMsg sid =
+  "continue: unknown subagent id \"" <> subagentIdText sid
+    <> "\". It was not spawned by this session, or was lost to a restart or to \
+       \retention pruning. Start a new child."
+
+continueNotOwnerMsg :: Text
+continueNotOwnerMsg =
+  "continue: that subagent belongs to a different session; a session may only \
+  \continue the children it spawned."
+
+continueStillRunningMsg :: SubagentId -> Text
+continueStillRunningMsg sid =
+  "continue: subagent " <> subagentIdText sid
+    <> " is still running. Stop or interrupt it before continuing."
+
+continueNotSettledMsg :: SubagentId -> Text
+continueNotSettledMsg sid =
+  "continue: subagent " <> subagentIdText sid
+    <> " is still finishing its previous turn. If this persists, stop it."
+
+continueChildrenRunningMsg :: SubagentId -> Text
+continueChildrenRunningMsg sid =
+  "continue: subagent " <> subagentIdText sid
+    <> " still has running subagents of its own; wait for them or stop them."
+
+continueParentBudgetMsg :: Int -> Text
+continueParentBudgetMsg n =
+  "continue: delegation.max_concurrent_children reached (" <> tshow n
+    <> "); wait for a child to finish."
+
+continueNoSnapshotMsg :: SubagentId -> Text
+continueNoSnapshotMsg sid =
+  "continue: subagent " <> subagentIdText sid
+    <> " was registered without a task snapshot and cannot be continued; \
+       \start a new child."
+
+continueRunBudgetMsg :: SubagentId -> Text
+continueRunBudgetMsg sid =
+  "continue: subagent " <> subagentIdText sid <> " has been continued "
+    <> tshow continueRunLimit <> " times; start a fresh child for new work."
+
+continueMissingDirMsg :: SubagentId -> Text
+continueMissingDirMsg sid =
+  "continue: subagent " <> subagentIdText sid
+    <> " has no transcript on disk any more; start a new child."
+
+continueNoIdMsg :: Text
+continueNoIdMsg =
+  "continue requires {subagent_id:string} (non-empty, at most 256 characters, \
+  \no control characters)."
+
+continueEmptyPromptMsg :: Text
+continueEmptyPromptMsg =
+  "continue: \"prompt\" must not be empty; omit it to send the default \
+  \continuation nudge."
+
+continuePromptTooLongMsg :: Int -> Text
+continuePromptTooLongMsg n =
+  "continue: \"prompt\" is " <> tshow n <> " characters; the limit is "
+    <> tshow promptCap <> "."
+
+continuePromptControlMsg :: Text
+continuePromptControlMsg =
+  "continue: \"prompt\" must not contain NUL or control characters."
+
+continueBadModeMsg :: Text
+continueBadModeMsg =
+  "continue: \"mode\" must be \"foreground\" or \"background\"."
+
+-- | Fields that only @start@ accepts. Ignoring them would spend a whole child
+-- turn on the wrong message.
+startOnlyFields :: [Text]
+startOnlyFields = ["id", "goal", "context", "role", "tasks"]
+
+-- | Is @field@ present in the object (whatever its type)?
+hasField :: Value -> Text -> Bool
+hasField v f =
+  case parseMaybe (withObject "in" (.:? fromText f)) v :: Maybe (Maybe Value) of
+    Just (Just _) -> True
+    _             -> False
+
+-- | Authorize gate for @continue@: shape first (prompt, mode), then the
+-- start-only fields, then the id text. Pure — no IO, no state.
+authorizeContinue :: Value -> Either Text ()
+authorizeContinue v = do
+  case textFieldMaybe "prompt" v of
+    Nothing -> pure ()
+    Just p
+      | T.null p              -> Left continueEmptyPromptMsg
+      | T.length p > promptCap -> Left (continuePromptTooLongMsg (T.length p))
+      | T.any isControlChar p  -> Left continuePromptControlMsg
+      | otherwise              -> pure ()
+  case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe Text) of
+    Just (Just m) | m /= "foreground" && m /= "background" -> Left continueBadModeMsg
+    _ -> pure ()
+  forM_ startOnlyFields $ \f ->
+    when (hasField v f) $
+      Left ("continue: \"" <> f <> "\" is a start-only field; pass the "
+              <> "instruction as \"prompt\".")
+  case subagentIdField v of
+    Nothing -> Left continueNoIdMsg
+    Just _  -> Right ()
+
+-- | Bounded settle wait: the ordinary kill→cleanup window is not a refusal.
+settleWait :: AgentInstance -> IO Bool
+settleWait inst = do
+  settled <- workerSettled inst
+  if settled then pure True else pollUntil 250 (workerSettled inst)
+
+-- | Refuse a continue: log the reason (never the prompt body, never the
+-- instance), return the text, and spend no run budget.
+refuseContinue :: SubagentId -> Text -> Text -> App OpResult
+refuseContinue sid reason msg = do
+  liftIO $ globalLogIO DebugS (ls ("[continue] refused reason=" <> reason
+    <> " sid=" <> subagentIdText sid))
+  pure (OpResult [TrpText msg] True
+         (object ["subagent_id" .= subagentIdText sid, "refused" .= reason]))
+
+-- | Handle the @continue@ action. The prechecks run in the pinned order —
+-- lookup, ownership, pause, terminal status, settle, the child's own children,
+-- the per-parent budget — and the claim then re-checks ownership, status, the
+-- snapshot and the run budget atomically.
+handleContinue :: AgentStartWiring -> Value -> App OpResult
+handleContinue wiring v = do
+  let runtime = aswRuntime wiring
+      owner = aswParentSession wiring
+  case subagentIdField v of
+    Nothing -> pure (OpResult [TrpText continueNoIdMsg] True (object []))
+    Just sid -> do
+      insts <- liftIO (listAgents runtime)
+      case find (\i -> aiSubagentId i == sid) insts of
+        Nothing -> refuseContinue sid "unknown-id" (continueUnknownMsg sid)
+        Just inst
+          | not (ownsChild owner inst) ->
+              refuseContinue sid "not-owner" continueNotOwnerMsg
+          | otherwise -> do
+              paused <- liftIO (isSpawnPaused (aswPauseFlag wiring))
+              if paused
+                then refuseContinue sid "paused" spawnPausedMsg
+                else if not (isTerminalStatus (aiStatus inst))
+                  then refuseContinue sid "not-terminal" (continueStillRunningMsg sid)
+                  else do
+                    settled <- liftIO (settleWait inst)
+                    if not settled
+                      then refuseContinue sid "not-settled" (continueNotSettledMsg sid)
+                      else do
+                        childrenRunning <- liftIO (hasRunningChildren runtime (aiSession inst))
+                        if childrenRunning
+                          then refuseContinue sid "children-running"
+                                 (continueChildrenRunningMsg sid)
+                          else do
+                            cfg <- liftIO (aswConfig wiring)
+                            let (maxConc, childTimeout, _, _) = resolveDelegationConfig cfg
+                                mode = parseSpawnMode v
+                            withinBudget <- case mode of
+                              SpawnModeForeground -> pure True
+                              SpawnModeBackground ->
+                                (< maxConc) <$> liftIO (countRunningChildren runtime owner)
+                            if not withinBudget
+                              then refuseContinue sid "parent-budget"
+                                     (continueParentBudgetMsg maxConc)
+                              else startContinue wiring v sid inst mode childTimeout
+
+-- | The claim and the run. The message, the def, the child session, the task
+-- index and the worker builder are all the spawn's — only the user message
+-- changes.
+startContinue
+  :: AgentStartWiring -> Value -> SubagentId -> AgentInstance
+  -> SpawnMode -> Double -> App OpResult
+startContinue wiring v sid inst mode childTimeout =
+  case (aiTask inst, aiDef inst) of
+    (Just task, Just def)
+      -- The claim re-checks this atomically; checking here first is what lets
+      -- the refusal name the run budget instead of a generic claim failure.
+      | aiRuns inst >= continueRunLimit ->
+          refuseContinue sid "run-budget" (continueRunBudgetMsg sid)
+      | otherwise -> do
+      let runtime = aswRuntime wiring
+          owner = aswParentSession wiring
+          paths = aswPaths wiring
+          prompt = textFieldMaybe "prompt" v
+          promptChars = maybe 0 T.length prompt
+          modeText = case mode of
+            SpawnModeForeground -> "foreground" :: Text
+            SpawnModeBackground -> "background"
+          origin = case mode of
+            SpawnModeForeground -> SoContinueForeground
+            SpawnModeBackground -> SoContinueBackground
+          recorded runs = object
+            [ "subagent_id" .= subagentIdText sid
+            , "child_session" .= sessionIdText (aiSession inst)
+            , "mode" .= modeText
+            , "prompt_present" .= isJust prompt
+            , "prompt_chars" .= promptChars
+            , "runs" .= runs
+            , "status" .= ("running" :: Text)
+            ]
+      conv <- liftIO (childConversationPresent paths owner (aiSession inst))
+      case conv of
+        Nothing -> refuseContinue sid "missing-dir" (continueMissingDirMsg sid)
+        Just hasConversation -> do
+          let message = fromMaybe
+                          (if hasConversation then continueNudge else ctGoal task)
+                          prompt
+              worker = aswWorker wiring
+          start <- liftIO getCurrentTime
+          let body = runChildTask (aswParentActivity wiring) childTimeout start
+                       (aiTaskIndex inst) sid (aiSession inst) def worker
+                       (task { ctGoal = message })
+          claim <- liftIO (resumeAgent runtime owner sid origin body)
+          case claim of
+            Left e ->
+              refuseContinue sid "claim-lost"
+                ("continue: could not start the run (" <> e
+                   <> "); check AGENT_STATUS and retry.")
+            Right (claimed, sink) -> do
+              let runs = aiRuns claimed
+              liftIO $ globalLogIO DebugS (ls ("[continue] started sid="
+                <> subagentIdText sid <> " runs=" <> tshow runs
+                <> " mode=" <> modeText <> " prompt_chars=" <> tshow promptChars))
+              case mode of
+                SpawnModeForeground -> do
+                  outcome <- liftIO (atomically (takeTMVar sink))
+                  case outcome of
+                    Right (_, result) ->
+                      pure (OpResult
+                             [TrpText (continueForegroundText runs result)]
+                             False (recorded runs))
+                    Left e ->
+                      pure (OpResult
+                             [TrpText ("continue: the run failed (" <> tshow e
+                                         <> "); check AGENT_STATUS.")]
+                             True (recorded runs))
+                SpawnModeBackground -> do
+                  liftIO $ void $ forkIO $
+                    deliverContinued wiring owner runs sink
+                  pure (OpResult
+                         [TrpText (continueAckText sid (aiSession inst) runs)]
+                         False (recorded runs))
+    _ -> refuseContinue sid "no-snapshot" (continueNoSnapshotMsg sid)
+
+-- | Wait for a background continue's run to finish and deliver its reply
+-- through the shared completion path (sidecar + idle wake), off the worker
+-- thread. The sink is always filled, so this cannot block for ever.
+deliverContinued
+  :: AgentStartWiring -> SessionId -> Int
+  -> TMVar (Either SomeException (Delivery, ChildResult)) -> IO ()
+deliverContinued wiring parentSid runs sink = do
+  outcome <- atomically (takeTMVar sink)
+  case outcome of
+    Right (DeliverResult, result) ->
+      deliverToParent wiring parentSid (continueCompletionText runs result) result
+    Right (SuppressDelivery, result) ->
+      globalLogIO DebugS (ls ("[continue] delivery suppressed (intentional termination): subagent="
+        <> subagentIdText (crSubagentId result)))
+    Left e ->
+      globalLogIO DebugS (ls ("[continue] run failed, nothing to deliver: " <> tshow e))
+
+-- | Background acknowledgement: the child is working, its reply will arrive on
+-- its own.
+continueAckText :: SubagentId -> SessionId -> Int -> Text
+continueAckText sid childSid runs =
+  subagentIdText sid <> " | " <> sessionIdText childSid
+    <> " | running (continued #" <> tshow runs <> ")\n\n"
+    <> "The child is working in the background. Its reply will arrive as a "
+    <> "separate message headed [subagent " <> subagentIdText sid
+    <> " replied (continue #" <> tshow runs <> ")] — do NOT call AGENT_MANAGE "
+    <> "status, sleep, or any polling tool."
+
+-- | The reply header for a continued child.
+continueTitle :: Int -> Text
+continueTitle runs = "replied (continue #" <> tshow runs <> ")"
+
+-- | Foreground result: returned in this tool result, so no NO_REPLY clause and
+-- no wake.
+continueForegroundText :: Int -> ChildResult -> Text
+continueForegroundText runs r =
+  outcomeHeader (continueTitle runs) r <> "\n" <> outcomeBody r
+    <> "\n\n" <> continueHint
+
+-- | Background completion message: the reply the parent asked for.
+continueCompletionText :: Int -> ChildResult -> Text
+continueCompletionText runs r =
+  outcomeHeader (continueTitle runs) r
+    <> "\nThis is the reply you requested. " <> outcomeBody r
+    <> "\n\n" <> continueHint <> "\n\n" <> noReplyClause
+
+-- | Append a completion to the parent's sidecar and wake it if idle — the one
+-- delivery path, shared by spawn and continue.
+--
+-- Honours the descendant-settle rule: a child with pending descendants has only
+-- a partial answer, so the delivery waits for them and the child then
+-- synthesizes a final summary. When the run-record registry is unavailable
+-- (tests) or the child has no pending descendants, delivery is immediate.
+--
+-- The sidecar (not @conversation.jsonl@) is the target because writing straight
+-- into the conversation while the single-writer daemon is active desynchronizes
+-- its in-memory diff and silently drops messages.
+deliverToParent :: AgentStartWiring -> SessionId -> Text -> ChildResult -> IO ()
+deliverToParent wiring parentSid message result = do
+  let mRunRecords = aswRunRecords wiring
+  defer <- case (mRunRecords, crChildSession result) of
+    (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
+    _                         -> pure False
+  if defer
+    then globalLogIO DebugS (ls ("[idle-diag] completion deferred (descendants pending): subagent=" <> subagentIdText (crSubagentId result)))
+    else do
+      appendCompletionToSidecar (aswPaths wiring) parentSid message
+      globalLogIO DebugS (ls ("[idle-diag] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
+        <> " parentSid=" <> sessionIdText parentSid
+        <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
+        <> " messageChars=" <> tshow (T.length message)))
+      globalLogIO DebugS (ls ("[idle-diag] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
+      forM_ (aswOnIdleCompletion wiring) id
+
+-- ---------------------------------------------------------------------------
 -- Consolidated opcode: AGENT_MANAGE
 -- ---------------------------------------------------------------------------
 
@@ -1046,19 +1358,19 @@ agentManageOp :: AgentStartWiring -> Opcode
 agentManageOp wiring = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list the children this session spawned that are running now), start (spawn child agents), continue (resume a child this session spawned and keep its conversation — only after it has finished, been stopped, been interrupted, or crashed; with prompt it receives that as its next user message, without prompt it receives \"[System: the harness is resuming you. Continue your previous task from where you left off. Pick up whatever is unfinished; do not start over.]\"; its agent def and tool grant are the ones it was spawned with), status (debugging/observability only — NOT for completion checking), stop (kill the agent — no completion message arrives — and it stays continuable), interrupt (cooperative stop; its reply still arrives). start and continue deliver the reply automatically in background mode — do NOT call AGENT_MANAGE status, sleep, or any polling tool. mode: \"foreground\" blocks until the reply and returns it in this tool result (it can block for up to delegation.child_timeout_seconds and cannot be interrupted); mode: \"background\" (default) returns immediately and the reply arrives later as a separate message. Replies are headed [subagent <sid> replied (continue #n)], where #n is the child's run number (1 = the original spawn). A continued child stays resumable: pass the same subagent_id to continue again. Ids do not survive a harness restart and finished children may be pruned."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "action" .= object
               [ "type" .= ("string" :: Text)
-              , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
+              , "enum" .= (["instances", "start", "continue", "status", "stop", "interrupt"] :: [Text])
               , "description" .= ("Operation to perform." :: Text)
               ]
           , fromText "mode" .= object
               [ "type" .= ("string" :: Text)
               , "enum" .= (["foreground", "background"] :: [Text])
-              , "description" .= ("Spawn mode for start: \"foreground\" blocks until children complete and returns results in-band; \"background\" (default) returns immediately and delivers completion via push notification." :: Text)
+              , "description" .= ("Run mode (start/continue). \"foreground\" blocks until the child finishes and returns the reply in this tool result; \"background\" (default) returns immediately and the reply arrives as a separate message. Foreground can block for child_timeout_seconds and cannot be interrupted. Must be one of these two values." :: Text)
               ]
           , fromText "id" .= object
               [ "type" .= ("string" :: Text)
@@ -1080,9 +1392,13 @@ agentManageOp wiring = TrustedOpcode
               [ "type" .= ("array" :: Text)
               , "description" .= ("Batch: [{id, goal, context?, role?, isolate_workdir?}] (start)." :: Text)
               ]
+          , fromText "prompt" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Next user message for the child (continue). A non-empty string of at most 32 KiB; it is re-sent on every later turn of this child, so keep it short. Omit to send the default continuation nudge. Not the system prompt — that is fixed by the agent def. Start-only fields (id/goal/context/role/tasks) are rejected, not ignored." :: Text)
+              ]
           , fromText "subagent_id" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Subagent id (status/stop/interrupt)." :: Text)
+              , "description" .= ("Subagent id, as returned by start/continue and echoed in completion messages (status/stop/interrupt/continue)." :: Text)
               ]
           ]
       , "required" .= (["action"] :: [Text])
@@ -1096,6 +1412,7 @@ agentManageOp wiring = TrustedOpcode
         Right action -> case action of
           AgInstances -> handleInstances (aswRuntime wiring) (aswParentSession wiring)
           AgStart     -> handleStart wiring v
+          AgContinue  -> handleContinue wiring v
           AgStatus    -> handleStatus (aswRuntime wiring) (aswParentSession wiring) v
           AgStop      -> handleStop (aswRuntime wiring) (aswParentSession wiring) v
           AgInterrupt -> handleInterrupt (aswRuntime wiring) (aswParentSession wiring) v

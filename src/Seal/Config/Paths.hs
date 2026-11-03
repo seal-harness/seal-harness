@@ -22,6 +22,7 @@ module Seal.Config.Paths
   , sessionResponsesPath
   , sessionLogPath
   , agentSessionDir
+  , childConversationPresent
   , resolveChildSessionPath
   , workdirsRoot
   , sessionWorkdir
@@ -32,7 +33,7 @@ module Seal.Config.Paths
 
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , getHomeDirectory, listDirectory )
+  , getFileSize, getHomeDirectory, listDirectory )
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeDirectory)
 import System.Posix.Files (setFileMode)
@@ -250,6 +251,28 @@ watchMapPath paths = spState paths </> "watch_state.json"
 agentSessionDir :: SealPaths -> SessionId -> SessionId -> FilePath
 agentSessionDir paths parentSid childSid =
   sessionDir paths parentSid </> "agents" </> T.unpack (sessionIdText childSid)
+
+-- | Does a nested child session have a conversation to resume? 'Nothing'
+-- when its directory is gone (the transcript was pruned or never created),
+-- @Just False@ when the directory exists but no message was ever written (the
+-- child was killed before its first request), @Just True@ otherwise.
+--
+-- Used by @AGENT_MANAGE continue@: a resumed child must never be silently
+-- restarted as if it had no history.
+childConversationPresent :: SealPaths -> SessionId -> SessionId -> IO (Maybe Bool)
+childConversationPresent paths parentSid childSid = do
+  let dir = agentSessionDir paths parentSid childSid
+      conv = dir </> "conversation.jsonl"
+  dirOk <- doesDirectoryExist dir
+  if not dirOk
+    then pure Nothing
+    else do
+      fileOk <- doesFileExist conv
+      if not fileOk
+        then pure (Just False)
+        else do
+          size <- getFileSize conv
+          pure (Just (size > 0))
 
 -- | Locate a child session's directory by scanning every parent session's
 -- @agents\/@ subtree: @\<state\>\/sessions\/\<parent\>\/agents\/\<sid\>@.
