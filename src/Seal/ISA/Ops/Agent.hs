@@ -879,10 +879,14 @@ handleStartBackground wiring _v di = do
               Left e -> do
                 registerRunCrash runtime sid initialRunGeneration e
                 case fromException e :: Maybe SomeAsyncException of
-                  -- Killed by 'stopAgent'/'interruptAgent' (or abandoned before
-                  -- the cap let it start). A killed run is not a completed run:
-                  -- re-throw, so 'runDelegateAsync' reports no completion —
-                  -- the parent must not be told the work failed.
+                  -- Killed by 'stopAgent' / 'interruptAgent', or abandoned
+                  -- before the cap let it start. A killed run is not a
+                  -- completed run: re-throw, so 'runDelegateAsync' reports no
+                  -- completion — the parent must never be told the work
+                  -- failed. Nothing synchronous escapes the run body today
+                  -- ('runChildTask' catches the worker around its timeout), so
+                  -- the arm below is the seam's defensive floor rather than a
+                  -- live path.
                   Just _ -> throwIO e
                   Nothing -> pure (mkErrorResult 0 sid 0 (T.pack (show e))
                                                   (Just childSid))

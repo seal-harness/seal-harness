@@ -28,10 +28,11 @@ import Seal.Agent.Runtime.Delegation
   , runChildTask
   , runDelegate
   , SpawnInfo (..)
-  , defaultDelegationConfig, dcChildTimeoutSeconds
+  , defaultDelegationConfig, dcChildTimeoutSeconds, dcMaxConcurrentChildren
   , newSpawnPauseFlag, setSpawnPaused
   , runDelegateAsync
   , spawnPausedMsg
+  , subagentIdText
   )
 import Seal.Agent.Runtime.Registry
 import Seal.Config.Paths (SealPaths (..))
@@ -840,18 +841,94 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           aiWorkerThread inst `shouldBe` Nothing
         _ -> expectationFailure "expected exactly one instance"
 
-    it "a spawn callback that throws reports no completion (a killed run is not a result)" $ do
+    it "reports no completion when the spawn callback throws (killed before the body)" $ do
       pauseFlag <- newSpawnPauseFlag
+      entered <- newIORef (0 :: Int)
       completed <- newIORef (0 :: Int)
       let cfg = defaultDelegationConfig
           callback _ = void (atomicModifyIORef' completed (\n -> (n + 1, n + 1)))
-          killedSpawnCb _ _ _ _ _body = throwIO ThreadKilled
+          killedSpawnCb _ _ _ _ _body = do
+            void (atomicModifyIORef' entered (\n -> (n + 1, n + 1)))
+            throwIO ThreadKilled
           resolver _task = pure (Right (undefined, recordingWorker' "done"))
       _ <- runDelegateAsync cfg pauseFlag Nothing 0
              (DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False))
              resolver callback killedSpawnCb (pure (mkSystemSessionId "child"))
+      -- The callback ran, and its failure produced no completion.
+      ran <- pollUntil 2000 ((== 1) <$> readIORef entered)
+      ran `shouldBe` True
       threadDelay 100000
       readIORef completed `shouldReturn` 0
+
+    it "stopping a child that is still queued for the cap reports no result" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      gate <- newEmptyMVar :: IO (MVar ())
+      mintCount <- newIORef (0 :: Int)
+      enteredBodies <- newIORef ([] :: [SessionId])
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object [ "id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text) ]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            -- One slot: the second child is registered but held in the
+            -- semaphore's acquire, i.e. it is killed before its body starts.
+            , aswConfig = pure defaultDelegationConfig { dcMaxConcurrentChildren = Just 1 }
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = do
+                n <- atomicModifyIORef' mintCount (\k -> (k + 1, k + 1))
+                pure (mkSystemSessionId ("c" <> T.pack (show n)))
+            , aswParentDepth = 0
+            , aswWorker = \_def childSid _task _hooks -> do
+                void (atomicModifyIORef' enteredBodies (\ss -> (ss <> [childSid], ())))
+                takeMVar gate
+                pure (ChildWorkerOutcome (Just "released") CerCompleted 0 0 (Just childSid))
+            , aswGate = gateOpen
+            , aswPaths = samplePaths
+            , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["tasks" .=
+                              [ object ["id" .= ("a1" :: Text), "goal" .= ("one" :: Text)]
+                              , object ["id" .= ("a1" :: Text), "goal" .= ("two" :: Text)]
+                              ]]))
+      orIsError r `shouldBe` False
+      bothRegistered <- pollUntil 2000 ((== 2) . length <$> listAgentsFor rt sampleSession)
+      bothRegistered `shouldBe` True
+      oneRunning <- pollUntil 2000 ((== 1) . length <$> readIORef enteredBodies)
+      oneRunning `shouldBe` True
+      -- The child that never entered its body is the one held by the cap.
+      startedSids <- readIORef enteredBodies
+      insts <- listAgentsFor rt sampleSession
+      case filter (\i -> aiSession i `notElem` startedSids) insts of
+        [queued] -> do
+          stopR <- runTestApp (opRun (agentStopOp sampleSession rt) localBackend
+                                 (object ["subagent_id" .= subagentIdText (aiSubagentId queued)]))
+          orIsError stopR `shouldBe` False
+          -- The dying run must not fabricate a result: before the fix it went
+          -- through the completion callback, which flips the retained entry to
+          -- 'Crashed' and stores an error 'ChildResult' in aiResult.
+          threadDelay 200000
+          afterStop <- agentStatusFor rt sampleSession (aiSubagentId queued)
+          case afterStop of
+            Left e -> expectationFailure ("queued child vanished: " <> T.unpack e)
+            Right inst -> do
+              aiStatus inst `shouldBe` Stopped
+              aiResult inst `shouldBe` Nothing
+              aiWorkerThread inst `shouldBe` Nothing
+        other -> expectationFailure
+                   ("expected exactly one queued child, got " <> show (length other))
+      -- Release the running child so the suite finishes cleanly.
+      putMVar gate ()
+      done <- pollUntil 2000 $
+                any (\i -> case aiResult i of { Just _ -> True; Nothing -> False })
+                  <$> listAgentsFor rt sampleSession
+      done `shouldBe` True
 
   describe "spawnPausedMsg" $ do
     it "is the single source of the pause refusal, shared by both runners" $ do
