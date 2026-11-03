@@ -12,7 +12,7 @@ module Seal.Agent.Loop
 import Control.Exception (SomeException, catch)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race)
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -39,6 +39,10 @@ import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..), TrustLevel (
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
+import Katip (Severity (..), ls)
+
+import Seal.Agent.ConvRepair (repairDanglingToolUse)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
@@ -118,7 +122,17 @@ runTurn env userText = do
   -- the on-disk conversation; without the prior messages, the diff falls back
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
-  prior <- liftIO (itwReadConversation (aeTranscript env))
+  prior0 <- liftIO (itwReadConversation (aeTranscript env))
+  -- Repair a conversation whose last turn was cut off between an assistant's
+  -- @tool_use@ and its @tool_result@ (a kill, a crash, or a mid-turn abort).
+  -- Without this the next request carries a dangling @tool_use@ and providers
+  -- reject it — and @continue@ makes such conversations long-lived. The repair
+  -- is append-only, so the indexed writer's prefix-extension invariant holds
+  -- and the synthetic result is persisted as ordinary conversation lines.
+  let (unrepairable, prior) = repairDanglingToolUse prior0
+  forM_ unrepairable $ \tid ->
+    liftIO (globalLogIO WarningS (ls ("[conv-repair] mid-history dangling tool_use "
+      <> tid <> ": not repairable")))
   let userMsg = textMsg User userText
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta

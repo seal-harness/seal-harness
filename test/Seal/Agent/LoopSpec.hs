@@ -311,6 +311,68 @@ spec = describe "Seal.Agent.Loop" $ do
       [resp] -> erUsage resp `shouldBe` Just (Usage 1 2)
       _      -> expectationFailure "expected exactly one response entry"
 
+  -- Regression (subagent continue / WU-6): a conversation cut off between an
+  -- assistant's tool_use and its tool_result (kill, crash, mid-turn abort) must
+  -- be repaired before the next request, or the provider rejects the dangling
+  -- tool_use. The repair is append-only and lands in conversation.jsonl.
+  it "repairs a dangling tool_use before sending the next request" $
+    withSystemTempDirectory "seal-loop-repair" $ \dir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      ref <- newIORef [CompletionResponse [CbText "carried on"] StopEnd (Usage 0 0)]
+      BL.writeFile (dir </> "conversation.jsonl") $
+        BL.intercalate "\n"
+          [ A.encode (Message User [CbText "read it"])
+          , A.encode (Message Assistant
+              [ CbText "reading"
+              , CbToolUse (ToolCallId "call-1") (OpName "FILE_READ") (object []) ])
+          , "" ]
+      withIndexedTranscript dir $ \h -> do
+        stopFanoutDoneRef <- newIORef False
+        let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
+            mkEnv' = AgentEnv
+              { aeProvider = SomeProvider (ScriptProvider ref)
+              , aeProviderLabel = "ollama"
+              , aeModel = ModelId "m"
+              , aeSystem = Nothing
+              , aeRegistry = mkRegistry []
+              , aeTranscript = h
+              , aeBackend = localBackend
+              , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+              , aeCaps = caps
+              , aeSession = either (error "sid") id (mkSessionId "s1")
+              , aeMaxTurns = 8
+              , aeChannel = "test"
+              , aeMessageSource = Nothing
+              , aeAutonomy = Full
+              , aeApprovals = approvals
+              , aeDebugRequestsPath = Nothing
+              , aeDebugResponsePath = Nothing
+              , aeOnEntry = pure ()
+              , aeMaxModelRetries = 3
+              , aeRetryBaseDelayMs = 1000
+              , aeOnUserMessage = Nothing
+              , aeOnStop = Nothing
+              , aeStopFanoutDone = stopFanoutDoneRef
+              , aeOnToolCall = \_ _ -> pure ()
+              , aeOnTextDelta = Nothing
+              , aeOnDemandSchemas = False
+              , aeLogPath = Nothing
+              , aeAbortFlag = testAbortFlag
+              , aeRepeatTrack = testRepeatTrack
+              , aeToolTimeout = defaultToolTimeoutConfig
+              }
+        runTestApp (runTurn mkEnv' "carry on")
+      conv <- BS8.readFile (dir </> "conversation.jsonl")
+      let convLines = BS8.lines conv
+      length [ l | l <- convLines
+                  , "interrupted before this tool returned" `BS8.isInfixOf` l ]
+        `shouldBe` 1
+      -- user, assistant(tool_use), the synthetic user/tool_result, the new user
+      -- message, the assistant reply
+      length convLines `shouldBe` 5
+      readIORef sent `shouldReturn` ["carried on"]
+
   -- Regression: a second turn must load the prior conversation from disk so
   -- the model sees the full history, and the indexed transcript writer's diff-based
   -- appender never duplicates messages. Before the fix, runTurn started each
