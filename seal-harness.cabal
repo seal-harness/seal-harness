@@ -183,6 +183,7 @@ library
         Seal.Ingest
         Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
+        Seal.Session.Derived
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
@@ -532,6 +533,7 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
+        Seal.Session.DerivedSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec

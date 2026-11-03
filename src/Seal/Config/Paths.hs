@@ -18,6 +18,7 @@ module Seal.Config.Paths
   , sessionConversationPath
   , sessionConversationIndexPath
   , sessionEntriesPath
+  , sessionDerivedPath
   , sessionRequestsPath
   , sessionResponsesPath
   , sessionLogPath
@@ -181,6 +182,13 @@ sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl
 -- | The session's entry log (new indexed transcript format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | The session's derived-value sidecar: @<sessionDir>/derived.json@. A
+-- materialized cache of values that are pure functions of the transcript but
+-- expensive to recompute on every listing (see "Seal.Session.Derived"). Never
+-- authoritative: deleting it changes nothing observable except latency.
+sessionDerivedPath :: SealPaths -> SessionId -> FilePath
+sessionDerivedPath paths sid = sessionDir paths sid </> "derived.json"
 
 -- | The session's conversation index file: @\<sessionDir\>\/conversation.idx@.
 -- A binary file of contiguous little-endian 'Word64' values storing the byte
