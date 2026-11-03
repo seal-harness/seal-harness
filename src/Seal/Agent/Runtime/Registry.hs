@@ -21,10 +21,12 @@
 module Seal.Agent.Runtime.Registry
   ( AgentStatus (..)
   , AgentInstance (..)
+  , SpawnOrigin (..)
   , AgentRuntime
   , newAgentRuntime
   , startAgent
   , registerRunningAgent
+  , registerRunningChild
   , registerCompletedAgent
   , registerCompletedAgentResult
   , stopAgent
@@ -43,17 +45,29 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime, getCurrentTime)
 
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
-import Seal.Agent.Def.Types (AgentDefId)
-import Seal.Agent.Runtime.Delegation (SubagentId (..), ChildResult (..), ChildStatus (..), subagentIdText)
+import Seal.Agent.Def.Types (AgentDef, AgentDefId)
+import Seal.Agent.Runtime.Delegation
+  (ChildResult (..), ChildStatus (..), ChildTask, SubagentId (..), subagentIdText)
 import Seal.Core.Types (SessionId, sessionIdText)
 
 -- | The lifecycle status of a running agent instance. 'Crashed' carries the
 -- exception message; 'Interrupted' means the parent/operator requested a
 -- stop via 'interruptAgent' (sets a flag the worker polls between turns).
 data AgentStatus = Starting | Running | Idle | Stopped | Interrupted | Crashed Text
+  deriving stock (Eq, Show)
+
+-- | What produced the current run. The mode is part of the origin because
+-- delivery differs: foreground replies are returned in-band, background runs
+-- append a completion message and wake the parent.
+data SpawnOrigin
+  = SoStartForeground
+  | SoStartBackground
+  | SoContinueForeground
+  | SoContinueBackground
   deriving stock (Eq, Show)
 
 -- | One running agent instance, bound to a definition, a fresh session, and
@@ -66,8 +80,12 @@ data AgentInstance = AgentInstance
   , aiSession    :: SessionId
     -- ^ The fresh session the child runs under.
   , aiStatus     :: AgentStatus
-  , aiThreadId   :: ThreadId
-    -- ^ The forked worker thread (killed on stop / interrupt).
+  , aiWorkerThread :: !(Maybe ThreadId)
+    -- ^ The worker thread of the CURRENT run — the only handle 'stopAgent'
+    -- may kill. 'Nothing' when no run is in flight (post-hoc registration, or
+    -- a run that already settled). Never a bookkeeping thread: storing the
+    -- *completing* thread here made 'stopAgent' able to kill the parent's own
+    -- turn.
   , aiDepth      :: Int
     -- ^ The parent's delegation depth (0 = top-level parent). The child's
     -- depth is @aiDepth + 1@; checked against @max_spawn_depth@ before
@@ -81,7 +99,53 @@ data AgentInstance = AgentInstance
     -- running, 'Just' after completion). Populated by
     -- 'registerCompletedAgentResult'. Allows 'AGENT_STATUS' to return
     -- summary + child_session + exit_reason after the child finishes.
-  } deriving stock (Eq, Show)
+  , aiTask       :: !(Maybe ChildTask)
+    -- ^ Spawn snapshot: context / role / isolate_workdir, plus the goal used
+    -- only as the empty-history fallback when a run is resumed.
+  , aiDef        :: !(Maybe AgentDef)
+    -- ^ The def the child was BUILT from. Pinned: a resumed run uses it
+    -- verbatim, so a def edited (or shadowed by a repo-local def) after the
+    -- spawn cannot widen the child's authority.
+  , aiTaskIndex  :: !Int
+    -- ^ Batch index of the task, reused so a resumed run reports the same one.
+  , aiGeneration :: !Int
+    -- ^ Bumped by every claim. Status/result writes carry the generation they
+    -- observed, so a late completion from run N cannot clobber run N+1.
+  , aiOrigin     :: !SpawnOrigin
+    -- ^ What produced the current run (drives wording; surfaced by status).
+  , aiRuns       :: !Int
+    -- ^ Runs so far (1 = the original spawn); the @#n@ ordinal and the
+    -- per-child continue budget.
+  , aiLastActivity :: !UTCTime
+    -- ^ Bumped on claim and on every terminal write; the retention-pruning
+    -- key.
+  } deriving stock (Eq)
+
+-- | Debugging only, and deliberately lossy: the task, the def, and the result
+-- carry model-authored text (goal, system prompt, child summary) that must
+-- never reach a log line.
+instance Show AgentInstance where
+  show i =
+    "AgentInstance {aiId = " <> show (aiId i)
+      <> ", aiSubagentId = " <> show (aiSubagentId i)
+      <> ", aiSession = " <> show (aiSession i)
+      <> ", aiStatus = " <> show (aiStatus i)
+      <> ", aiWorkerThread = " <> maybe "Nothing" (const "Just <thread>") (aiWorkerThread i)
+      <> ", aiDepth = " <> show (aiDepth i)
+      <> ", aiParentSession = " <> show (aiParentSession i)
+      <> ", aiResult = " <> elided (aiResult i)
+      <> ", aiTask = " <> elided (aiTask i)
+      <> ", aiDef = " <> elided (aiDef i)
+      <> ", aiTaskIndex = " <> show (aiTaskIndex i)
+      <> ", aiGeneration = " <> show (aiGeneration i)
+      <> ", aiOrigin = " <> show (aiOrigin i)
+      <> ", aiRuns = " <> show (aiRuns i)
+      <> ", aiLastActivity = " <> show (aiLastActivity i)
+      <> "}"
+    where
+      elided :: Maybe a -> String
+      elided Nothing  = "Nothing"
+      elided (Just _) = "Just <elided>"
 
 -- | The STM-backed registry of running instances, keyed by 'SubagentId'. No
 -- two running instances share a subagent id: 'startAgent' generates a fresh
@@ -125,12 +189,29 @@ hasRunningChildren (AgentRuntime tv) parentSid = do
 startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
 startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker = do
   tid <- forkIO (runWorker tv subagentId worker)
+  now <- getCurrentTime
   mInst <- atomically $ do
     insts <- readTVar tv
     if Map.member subagentId insts
       then pure Nothing  -- lost the race; shouldn't happen with random ids
       else do
-        let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
+        let inst = AgentInstance
+              { aiId = aid
+              , aiSubagentId = subagentId
+              , aiSession = session
+              , aiStatus = Running
+              , aiWorkerThread = Just tid
+              , aiDepth = depth
+              , aiParentSession = parentSession
+              , aiResult = Nothing
+              , aiTask = Nothing
+              , aiDef = Nothing
+              , aiTaskIndex = 0
+              , aiGeneration = 1
+              , aiOrigin = SoStartBackground
+              , aiRuns = 1
+              , aiLastActivity = now
+              }
         writeTVar tv (Map.insert subagentId inst insts)
         pure (Just inst)
   case mInst of
@@ -147,10 +228,46 @@ startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker =
 -- correct thread. Idempotent: re-registering overwrites.
 registerRunningAgent
   :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> ThreadId -> IO ()
-registerRunningAgent (AgentRuntime tv) aid subagentId parentSession session depth tid =
+registerRunningAgent rt aid subagentId parentSession session depth tid =
+  registerRunningChild rt aid subagentId parentSession session depth tid Nothing Nothing 0 SoStartBackground
+
+-- | Register a running child WITH its full spawn snapshot. This is the
+-- production path: the snapshot is what makes the child resumable, and the
+-- recorded thread is what makes it stoppable.
+registerRunningChild
+  :: AgentRuntime
+  -> AgentDefId
+  -> SubagentId
+  -> SessionId
+  -> SessionId
+  -> Int
+  -> ThreadId
+  -> Maybe ChildTask
+  -> Maybe AgentDef
+  -> Int
+  -> SpawnOrigin
+  -> IO ()
+registerRunningChild (AgentRuntime tv) aid subagentId parentSession session depth tid mTask mDef taskIndex origin =
   do
+    now <- getCurrentTime
     atomically $ do
-      let inst = AgentInstance aid subagentId session Running tid depth parentSession Nothing
+      let inst = AgentInstance
+            { aiId = aid
+            , aiSubagentId = subagentId
+            , aiSession = session
+            , aiStatus = Running
+            , aiWorkerThread = Just tid
+            , aiDepth = depth
+            , aiParentSession = parentSession
+            , aiResult = Nothing
+            , aiTask = mTask
+            , aiDef = mDef
+            , aiTaskIndex = taskIndex
+            , aiGeneration = 1
+            , aiOrigin = origin
+            , aiRuns = 1
+            , aiLastActivity = now
+            }
       modifyTVar' tv (Map.insert subagentId inst)
     -- Log outside STM (globalLogIO is IO). This is the critical registration
     -- point: if the bracket cleanup's hasRunningChildren check runs before
@@ -174,10 +291,29 @@ registerCompletedAgent
   :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO ()
 registerCompletedAgent (AgentRuntime tv) aid subagentId parentSession session depth = do
   tid <- myThreadId
+  now <- getCurrentTime
   atomically $ do
     insts <- readTVar tv
-    let inst = AgentInstance aid subagentId session Stopped tid depth parentSession Nothing
+    let inst = AgentInstance
+          { aiId = aid
+          , aiSubagentId = subagentId
+          , aiSession = session
+          , aiStatus = Stopped
+          , aiWorkerThread = Nothing
+          , aiDepth = depth
+          , aiParentSession = parentSession
+          , aiResult = Nothing
+          , aiTask = Nothing
+          , aiDef = Nothing
+          , aiTaskIndex = 0
+          , aiGeneration = 1
+          , aiOrigin = SoStartForeground
+          , aiRuns = 1
+          , aiLastActivity = now
+          }
     writeTVar tv (Map.insert subagentId inst insts)
+  globalLogIO DebugS (ls ("[idle-diag] registerCompletedAgent: subagent=" <> subagentIdText subagentId
+    <> " thread=" <> T.pack (show tid)))
 
 -- | Register a completed async child's result in the runtime registry.
 -- Updates the existing entry's status to 'Stopped' (or 'Crashed' if the
@@ -189,7 +325,6 @@ registerCompletedAgent (AgentRuntime tv) aid subagentId parentSession session de
 registerCompletedAgentResult
   :: AgentRuntime -> SubagentId -> ChildResult -> IO ()
 registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
-  tid <- myThreadId
   atomically $ do
     insts <- readTVar tv
     case Map.lookup subagentId insts of
@@ -198,7 +333,9 @@ registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
         let newStatus = case crStatus result of
               CsError -> Crashed (fromMaybe "unknown error" (crError result))
               _       -> Stopped
-            inst' = inst { aiStatus = newStatus, aiResult = Just result, aiThreadId = tid }
+            -- Deliberately does NOT touch 'aiWorkerThread': that handle
+            -- belongs to the run's own thread, which records/clears it.
+            inst' = inst { aiStatus = newStatus, aiResult = Just result }
         writeTVar tv (Map.insert subagentId inst' insts)
   -- Log outside STM. If this fires before registerRunningAgent (the race
   -- the in-fork spawnCallback was meant to fix), this is a no-op and the
@@ -216,10 +353,9 @@ runWorker tv subagentId worker =
   catch worker $ \(e :: SomeException) ->
     atomically (modifyTVar' tv (Map.adjust (\i -> i { aiStatus = Crashed (T.pack (show e)) }) subagentId))
 
--- | Stop a running agent instance: kill the thread, remove the entry.
--- Idempotent (stopping a non-running subagent id is a success with a
--- \"not running\" message, not an error). Always leaves the registry without
--- an entry for this subagent id, so a fresh 'startAgent' can proceed.
+-- | Stop a child: kill its worker thread and RETAIN the entry as 'Stopped'
+-- (so it stays resumable). Idempotent (stopping an already-stopped child is a
+-- success). Kills only 'aiWorkerThread' — never a bookkeeping thread.
 stopAgent :: AgentRuntime -> SubagentId -> IO (Either Text ())
 stopAgent (AgentRuntime tv) subagentId = do
   mInst <- atomically $ do
@@ -227,12 +363,13 @@ stopAgent (AgentRuntime tv) subagentId = do
     case Map.lookup subagentId insts of
       Nothing -> pure Nothing
       Just i  -> do
-        writeTVar tv (Map.delete subagentId insts)
+        let finalised = i { aiStatus = Stopped, aiWorkerThread = Nothing }
+        writeTVar tv (Map.insert subagentId finalised insts)
         pure (Just i)
   case mInst of
     Nothing -> pure (Right ())
     Just i  -> do
-      killThread (aiThreadId i)
+      maybe (pure ()) killThread (aiWorkerThread i)
       pure (Right ())
 
 -- | Request that a single running subagent stop at its next iteration
