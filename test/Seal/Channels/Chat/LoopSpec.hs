@@ -7,7 +7,7 @@ module Seal.Channels.Chat.LoopSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (wait, withAsync)
-import Control.Concurrent.STM (newTVarIO, readTVarIO, TVar)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, TVar)
 import Data.IORef
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
@@ -377,7 +377,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess1", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -415,7 +415,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess2", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -453,7 +453,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess3", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -599,7 +599,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -619,7 +619,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test2", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -638,7 +638,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test3", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -883,7 +883,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -908,7 +908,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -931,7 +931,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -953,7 +953,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -977,7 +977,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1004,7 +1004,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1037,7 +1037,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1059,6 +1059,56 @@ spec = do
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+    it "stale callback (after re-target) does not send a partial reply fragment" $ do
+      -- When the user changes focus while a tab is finishing, the old WS
+      -- callback (bound to the old focusedSid) may still process one more
+      -- event before its reader loop exits. Without the staleness guard,
+      -- the old callback would find the old streaming state (still in
+      -- wsConns) and send the accumulated text — a partial reply fragment
+      -- that arrives BEFORE the watch notification from the new callback.
+      -- With the guard, the old callback checks wsConns and sees its
+      -- focusedSid no longer matches the boundSid, so it ignores the event.
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ssA <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-a", stubWs, ssA))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sidA = mkSid "sess-a"
+          sidB = mkSid "sess-b"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      -- Session A starts thinking — old callback (focusedSid = sidA)
+      -- processes it via the focused path.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeActivity sidA (statusJson "thinking"))
+      -- Text accumulates for session A.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeEntryUpdate sidA (streamingJsonFor "partial reply text"))
+      -- Simulate re-target: replace the wsConns entry with session B.
+      ssB <- newStreamingState
+      atomically $ modifyTVar' conns (Map.insert key (sidB, stubWs, ssB))
+      -- The old callback (focusedSid = sidA) receives the idle event.
+      -- Without the staleness guard, withStreamingState would find ssB
+      -- (the new streaming state, which is empty) and send nothing —
+      -- but if the old entry hadn't been replaced yet, it would find ssA
+      -- and send "partial reply text" as a fragment. The guard ensures
+      -- the old callback ignores the event entirely.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeActivity sidA (statusJson "idle"))
+      sendsAfterStale <- getSends chan
+      -- No partial reply fragment was sent by the stale callback.
+      sendsAfterStale `shouldSatisfy`
+        not . any (T.isInfixOf "partial reply text")
 
   describe "/bg (background sessions)" $ do
     let bgKey = ConversationKey "signal" "conv-bg"
