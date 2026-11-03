@@ -110,6 +110,33 @@ maxConcurrent state = withMVar state (\(_, m) -> pure m)
 errorWorker :: Del.AgentWorkerBuilder
 errorWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
 
+-- | Wiring for the AGENT_MANAGE lifecycle tests: the standard test env with
+-- one injectable worker and an optional idle-wake hook.
+mkLifecycleWiring
+  :: AgentDefBackend -> AgentRuntime -> Del.SpawnPauseFlag
+  -> Del.AgentWorkerBuilder -> Maybe (IO ()) -> AgentStartWiring
+mkLifecycleWiring backend rt pauseFlag worker onIdle = AgentStartWiring
+  { aswDefBackend = backend
+  , aswRuntime = rt
+  , aswConfig = pure defaultDelegationConfig
+  , aswPauseFlag = pauseFlag
+  , aswParentActivity = Nothing
+  , aswMintSession = pure (mkSystemSessionId "fresh")
+  , aswParentDepth = 0
+  , aswWorker = worker
+  , aswGate = gateOpen
+  , aswPaths = samplePaths
+  , aswParentSession = sampleSession
+  , aswRunRecords = Nothing
+  , aswOnIdleCompletion = onIdle
+  }
+
+-- | Register the @a1@ def the lifecycle tests spawn.
+defineGreeter :: AgentDefBackend -> IO ()
+defineGreeter backend = void $ runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+  (object [ "id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+          , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text) ]))
+
 -- | A minimal 'AgentDef' for the 'runChildTask' tests. The child-run core
 -- takes the def as a parameter, and the test workers ignore it.
 sampleAgentDef :: AgentDef
@@ -722,6 +749,103 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         [TrpText t] -> t `shouldBe` "subagent not running"
         _           -> expectationFailure "expected a single text part"
 
+  describe "run lifecycle through AGENT_START / STATUS / INSTANCES / STOP" $ do
+    it "STATUS reports runs=, origin= and the resumable hint for a retained child" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      gate <- newEmptyMVar :: IO (MVar ())
+      let wiring = mkLifecycleWiring backend rt pauseFlag (gatedWorker gate) Nothing
+      _ <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      registered <- pollUntil 2000 (not . null <$> listAgentsFor rt sampleSession)
+      registered `shouldBe` True
+      putMVar gate ()
+      finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+      finished `shouldBe` True
+      insts <- listAgentsFor rt sampleSession
+      case insts of
+        [inst] -> do
+          r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend
+                                 (object ["subagent_id" .= subagentIdText (aiSubagentId inst)]))
+          case orParts r of
+            [TrpText t] -> do
+              T.isInfixOf "status=stopped" t `shouldBe` True
+              T.isInfixOf "runs=1" t `shouldBe` True
+              T.isInfixOf "origin=start/background" t `shouldBe` True
+              T.isInfixOf "resumable: AGENT_MANAGE continue with this subagent_id" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+        _ -> expectationFailure "expected exactly one instance"
+
+    it "INSTANCES lists only live children and summarises the finished ones" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      let wiring = mkLifecycleWiring backend rt pauseFlag (recordingWorker' "done") Nothing
+      _ <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+      finished `shouldBe` True
+      r <- runTestApp (opRun (agentInstancesOp sampleSession rt) localBackend (object []))
+      case orParts r of
+        [TrpText t] -> do
+          T.isInfixOf "(no agents running)" t `shouldBe` True
+          T.isInfixOf "(1 finished child(ren) from this session, all resumable with AGENT_MANAGE continue)"
+            t `shouldBe` True
+        _ -> expectationFailure "expected a single text part"
+
+    it "a stop suppresses the completion delivery (no wake) and keeps the entry stopped" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      gate <- newEmptyMVar :: IO (MVar ())
+      wakes <- newIORef (0 :: Int)
+      let wiring = mkLifecycleWiring backend rt pauseFlag (gatedWorker gate)
+                     (Just (void (atomicModifyIORef' wakes (\n -> (n + 1, n + 1)))))
+      _ <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      registered <- pollUntil 2000 (not . null <$> listAgentsFor rt sampleSession)
+      registered `shouldBe` True
+      insts <- listAgentsFor rt sampleSession
+      case insts of
+        [inst] -> do
+          stopR <- runTestApp (opRun (agentStopOp sampleSession rt) localBackend
+                                 (object ["subagent_id" .= subagentIdText (aiSubagentId inst)]))
+          orIsError stopR `shouldBe` False
+          -- The killed run still reports its (error) result to the registry —
+          -- generation-guarded, so the entry keeps 'Stopped' — but nothing is
+          -- delivered to the parent.
+          settled <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+          settled `shouldBe` True
+          afterStop <- agentStatusFor rt sampleSession (aiSubagentId inst)
+          case afterStop of
+            Left e -> expectationFailure ("stopped child vanished: " <> T.unpack e)
+            Right i -> aiStatus i `shouldBe` Stopped
+          readIORef wakes `shouldReturn` 0
+        _ -> expectationFailure "expected exactly one instance"
+
+  describe "subagent_id validation" $ do
+    let tooLong = T.replicate 257 "a"
+        atTheCap = T.replicate 256 "a"
+    it "rejects a 257-character id" $ do
+      rt <- newAgentRuntime
+      r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend
+                             (object ["subagent_id" .= tooLong]))
+      orIsError r `shouldBe` True
+    it "accepts a 256-character id (and reports it unknown)" $ do
+      rt <- newAgentRuntime
+      r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend
+                             (object ["subagent_id" .= atTheCap]))
+      orIsError r `shouldBe` False
+    it "rejects a control character in the id" $ do
+      rt <- newAgentRuntime
+      r <- runTestApp (opRun (agentStatusOp sampleSession rt) localBackend
+                             (object ["subagent_id" .= ("sa-a1-\n00000001" :: Text)]))
+      orIsError r `shouldBe` True
+
   describe "runChildTask (one child-run core)" $ do
     let mkTask = Del.ChildTask "a1" "do the thing" Nothing Nothing False
         sid = Del.SubagentId "sa-a1-00000001"
@@ -1228,6 +1352,55 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       parseSpawnMode (object ["action" .= ("start" :: Text), "mode" .= ("bogus" :: Text)])
         `shouldBe` SpawnModeBackground
 
+  describe "outcome vocabulary (one dialect)" $ do
+    let mkResult st ex summary err = ChildResult
+          { crTaskIndex = 0
+          , crStatus = st
+          , crSummary = summary
+          , crExitReason = ex
+          , crDurationSeconds = 1.0
+          , crSubagentId = Del.SubagentId "sa-a1-00000001"
+          , crTokensInput = 0
+          , crTokensOutput = 0
+          , crToolTrace = []
+          , crError = err
+          , crFilesRead = []
+          , crFilesWritten = []
+          , crChildSession = Just (mkSystemSessionId "child")
+          }
+
+    it "pins the status= and exit= tokens for every constructor" $ do
+      map renderChildStatus [CsCompleted, CsFailed, CsTimeout, CsInterrupted, CsError]
+        `shouldBe` ["completed", "failed", "timeout", "interrupted", "error"]
+      map renderChildExit [CerCompleted, CerMaxIterations, CerTimeout, CerInterrupted, CerError]
+        `shouldBe` ["completed", "max_iterations", "timeout", "interrupted", "error"]
+
+    it "never leaks a Haskell constructor name" $ do
+      let text = completionMessage (mkResult CsFailed CerMaxIterations Nothing Nothing)
+      T.isInfixOf "CsFailed" text `shouldBe` False
+      T.isInfixOf "CerMaxIterations" text `shouldBe` False
+      T.isInfixOf "status=failed" text `shouldBe` True
+      T.isInfixOf "exit=max_iterations" text `shouldBe` True
+
+    it "falls back summary -> crError -> placeholder" $ do
+      let withSummary = completionMessage (mkResult CsCompleted CerCompleted (Just "the answer") Nothing)
+          withError = completionMessage (mkResult CsError CerError Nothing (Just "provider refused"))
+          withNeither = completionMessage (mkResult CsFailed CerMaxIterations Nothing Nothing)
+      T.isInfixOf "the answer" withSummary `shouldBe` True
+      T.isInfixOf "provider refused" withError `shouldBe` True
+      T.isInfixOf "(no final text from the child)" withNeither `shouldBe` True
+
+    it "adds the timeout clause only for status=timeout" $ do
+      let timedOut = completionMessage (mkResult CsTimeout CerTimeout Nothing Nothing)
+          completed = completionMessage (mkResult CsCompleted CerCompleted (Just "ok") Nothing)
+      T.isInfixOf timeoutContinuationClause timedOut `shouldBe` True
+      T.isInfixOf timeoutContinuationClause completed `shouldBe` False
+
+    it "uses the request-scoped NO_REPLY clause, not the conversation-scoped one" $ do
+      let text = completionMessage (mkResult CsCompleted CerCompleted (Just "ok") Nothing)
+      T.isInfixOf noReplyClause text `shouldBe` True
+      T.isInfixOf "If you have already sent your final answer" text `shouldBe` False
+
   describe "encodeForegroundResults" $ do
     it "renders a completed result with status and summary" $ do
       let result = ChildResult
@@ -1247,8 +1420,11 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             }
           text = encodeForegroundResults [result]
       T.isInfixOf "sa-a1-00000001" text `shouldBe` True
-      T.isInfixOf "CsCompleted" text `shouldBe` True
+      T.isInfixOf "status=completed" text `shouldBe` True
+      T.isInfixOf "child_session=child" text `shouldBe` True
       T.isInfixOf "task completed successfully" text `shouldBe` True
+      -- a foreground-spawned child is retained, so the reply says how to resume
+      T.isInfixOf continueHint text `shouldBe` True
     it "renders empty list as no children" $ do
       encodeForegroundResults [] `shouldBe` "(no children spawned)"
 
@@ -1323,14 +1499,14 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           , crFilesWritten = []
           , crChildSession = Just (mkSystemSessionId "child")
           }
-    it "includes the NO_REPLY instruction for late completions" $ do
+    it "includes the request-scoped NO_REPLY instruction" $ do
       let text = completionMessage mkResult
       ("NO_REPLY" `T.isInfixOf` text) `shouldBe` True
-      ("final answer" `T.isInfixOf` text) `shouldBe` True
-    it "includes the subagent id and status" $ do
+      (noReplyClause `T.isInfixOf` text) `shouldBe` True
+    it "includes the subagent id and the pinned status vocabulary" $ do
       let text = completionMessage mkResult
       ("sa-a1-00000001" `T.isInfixOf` text) `shouldBe` True
-      ("CsCompleted" `T.isInfixOf` text) `shouldBe` True
+      ("status=completed" `T.isInfixOf` text) `shouldBe` True
 
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do

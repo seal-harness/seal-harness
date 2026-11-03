@@ -294,9 +294,9 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- After the async start, the child is registered via spawnCallback
-      -- (synchronous, before forking), so AGENT_INSTANCES shows 1.
-      countOf (firstResult listResults) `shouldBe` 1
+      -- The async start registers the child, which AGENT_INSTANCES reports
+      -- (live line, or the one-line summary if it already finished).
+      textOf (firstResult listResults) `shouldSatisfy` childReported "a-inv-9"
 
   describe "#10 Stop decreases instances by one — after start, AGENT_INSTANCES shows 1" $
     runLifecycleTest $ \env -> do
@@ -321,9 +321,9 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- After the async start, the child is registered via spawnCallback
-      -- (synchronous, before forking), so AGENT_INSTANCES shows 1.
-      countOf (firstResult listResults) `shouldBe` 1
+      -- The async start registers the child, which AGENT_INSTANCES reports
+      -- (live line, or the one-line summary if it already finished).
+      textOf (firstResult listResults) `shouldSatisfy` childReported "a-inv-10"
 
   describe "#11 Status of started agent — AGENT_INSTANCES shows the child after start" $
     runLifecycleTest $ \env -> do
@@ -348,10 +348,10 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- The async start registers the child via spawnCallback
-      -- (synchronous, before forking). The list text should mention
-      -- the def id.
-      textOf (firstResult listResults) `shouldSatisfy` ("a-inv-11" `T.isInfixOf`)
+      -- The async start registers the child via spawnCallback. The render is
+      -- LIVE-ONLY now: the scripted child may already have finished, in which
+      -- case it is summarised by one line instead of listed by def id.
+      textOf (firstResult listResults) `shouldSatisfy` childReported "a-inv-11"
 
   describe "#12 Stop idempotent — AGENT_STOP with a non-running subagent_id returns \"stopped\"" $
     runDefTest $ \env -> do
@@ -483,9 +483,9 @@ crossGroupSpec = describe "cross-group sequencing" $ do
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- The async start registers the child via spawnCallback.
-      countOf (firstResult listResults) `shouldBe` 1
-      textOf (firstResult listResults) `shouldSatisfy` ("a-inv-16b" `T.isInfixOf`)
+      -- The async start registers the child; the live-only render lists it or
+      -- summarises it (the scripted child often finishes first).
+      textOf (firstResult listResults) `shouldSatisfy` childReported "a-inv-16b"
 
   describe "#17 Def list unchanged by AGENT_INSTANCES — AGENT_INSTANCES doesn't mutate the def store" $
     runDefTest $ \env -> do
@@ -1308,6 +1308,13 @@ countOf r =
   in if "(no agent" `T.isInfixOf` txt
        then 0
        else length (filter (not . T.null) (T.lines (T.strip txt)))
+
+-- | @AGENT_INSTANCES@ renders LIVE children only plus one summary line for the
+-- retained ones, so a just-spawned child shows up either as a live line (its
+-- def id) or as the summary line — the scripted child often finishes first.
+childReported :: Text -> Text -> Bool
+childReported defId t =
+  defId `T.isInfixOf` t || "(1 finished child(ren)" `T.isInfixOf` t
 
 -- | The list of ids from an AGENT_DEF_LIST / AGENT_INSTANCES result. Each
 -- list line is @<id>: <name> (<provider>/<model>)@ or

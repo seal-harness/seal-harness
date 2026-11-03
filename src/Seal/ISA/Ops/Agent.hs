@@ -46,6 +46,15 @@ module Seal.ISA.Ops.Agent
   , gateOpen
   , authorizeStart
   , encodeForegroundResults
+  , renderChildStatus
+  , renderChildExit
+  , continueHint
+  , noReplyClause
+  , continueNudge
+  , timeoutContinuationClause
+  , noFinalTextPlaceholder
+  , outcomeHeader
+  , outcomeBody
   , encodeSpawnInfos
   , completionMessage
   , killSwitchMsg
@@ -53,6 +62,7 @@ module Seal.ISA.Ops.Agent
   , allowSpawnBlockedMsg
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (myThreadId)
 import Control.Exception
   ( SomeAsyncException, fromException, throwIO, try )
@@ -79,7 +89,9 @@ import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , AgentCompletionCallback
   , SpawnCallback
+  , ChildExitReason (..)
   , ChildResult (..)
+  , ChildStatus (..)
   , ChildTask (..)
   , DelegationConfig
   , DelegateInput (..)
@@ -95,12 +107,13 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..)
+  , Delivery (..)
   , SpawnOrigin (..)
   , StopOutcome (..)
   , agentStatusFor
   , endRun
   , interruptAgent, listAgentsFor
-  , registerCompletedAgentResult, registerRunCrash, registerRunningChild
+  , registerRunCrash, registerRunResult, registerRunningChild
   , stopAgent )
 import Seal.Agent.Runtime.RunRecord qualified as RunRecord
   ( RunRecordRegistry, shouldDeferDelivery )
@@ -746,13 +759,29 @@ authorizeAgentManage wiring v =
 handleInstances :: AgentRuntime -> SessionId -> App OpResult
 handleInstances runtime owner = do
   insts <- liftIO (listAgentsFor runtime owner)
-  let rendered = case insts of
-        [] -> "(no agents running)"
-        _  -> T.intercalate "\n"
-                [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
-                | i <- insts ]
+  -- Live children only, plus ONE bounded line about the retained ones.
+  -- Retained entries are resumable but finished; listing them here would grow
+  -- the model's context without bound and make "(no agents running)"
+  -- unreachable.
+  let live = filter (isLiveStatus . aiStatus) insts
+      finished = length insts - length live
+      liveLines = case live of
+        [] -> ["(no agents running)"]
+        _  -> [ subagentIdText (aiSubagentId i) <> ": "
+                  <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
+                  <> maybe "" (" — " <>) (crSummary =<< aiResult i)
+              | i <- live ]
+      summaryLines =
+        [ "(" <> tshow finished
+            <> " finished child(ren) from this session, all resumable with AGENT_MANAGE continue)"
+        | finished > 0 ]
+      rendered = T.intercalate "\n" (liveLines <> summaryLines)
       recorded = object
+        -- "count"/"ids" stay "children this session knows about" (the render
+        -- is what became live-only); "live"/"finished" split it out.
         [ "count" .= length insts
+        , "live" .= length live
+        , "finished" .= finished
         , "ids" .= fmap (subagentIdText . aiSubagentId) insts
         ]
   pure (OpResult [TrpText rendered] False recorded)
@@ -821,20 +850,34 @@ handleStartBackground wiring _v di = do
           paths = aswPaths wiring
           callback :: AgentCompletionCallback
           callback result = do
-            registerCompletedAgentResult runtime (crSubagentId result) result
+            -- Generation-guarded: a stop or interrupt that landed while this
+            -- run was in flight leaves the retained entry's status alone and
+            -- suppresses the delivery, so the parent is never told that work
+            -- failed after it asked for it to stop.
+            mInst <- agentStatusFor runtime parentSid (crSubagentId result)
+            delivery <- case mInst of
+              -- A child that never registered (a resolve error) has no run to
+              -- suppress: the parent must still learn the spawn failed.
+              Left _   -> pure DeliverResult
+              Right _  -> registerRunResult runtime (crSubagentId result)
+                            initialRunGeneration result
             globalLogIO DebugS (ls ("[idle-diag] completion callback fired: subagent=" <> subagentIdText (crSubagentId result)
               <> " parentSid=" <> sessionIdText parentSid))
-            -- WU-5: descendant settle — if the child has pending
-            -- descendants, defer the completion delivery. The child's
-            -- results would be partial; wait for its descendants to
-            -- settle so the child can synthesize a final summary. When
-            -- the registry is unavailable (tests) or the child has no
-            -- pending descendants, deliver immediately.
+            -- Descendant settle — if the child has pending descendants,
+            -- defer the completion delivery. The child's results would be
+            -- partial; wait for its descendants to settle so the child can
+            -- synthesize a final summary. When the registry is unavailable
+            -- (tests) or the child has no pending descendants, deliver
+            -- immediately.
             let mRunRecords = aswRunRecords wiring
                 mChildSession = crChildSession result
-            defer <- case (mRunRecords, mChildSession) of
-              (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
-              _ -> pure False
+            defer <- case delivery of
+              SuppressDelivery -> do
+                globalLogIO DebugS (ls ("[idle-diag] delivery suppressed (intentional termination): subagent=" <> subagentIdText (crSubagentId result)))
+                pure True
+              DeliverResult -> case (mRunRecords, mChildSession) of
+                (Just reg, Just childSid) -> RunRecord.shouldDeferDelivery reg childSid
+                _ -> pure False
             if defer
               then globalLogIO DebugS (ls ("[idle-diag] completion deferred (descendants pending): subagent=" <> subagentIdText (crSubagentId result)))
               else do
@@ -925,22 +968,34 @@ handleStatus runtime owner v = do
                          (object ["subagent_id" .= subagentIdText sid, "status" .= ("unknown" :: Text)]))
         Right inst -> do
           let s = aiStatus inst
-              baseRecord = [ "subagent_id" .= subagentIdText sid
-                           , "status" .= renderStatus s
-                           , "runs" .= aiRuns inst
-                           ]
-          case aiResult inst of
-            Nothing ->
-              pure (OpResult [TrpText (renderStatus s)] False (object baseRecord))
-            Just result ->
-              let enriched = baseRecord
-                    ++ [ "summary" .= crSummary result
-                       , "child_session" .= fmap sessionIdText (crChildSession result)
-                       , "exit_reason" .= T.pack (show (crExitReason result))
-                       , "duration_seconds" .= crDurationSeconds result
-                       ]
-                  statusText = renderStatus s <> maybe "" ("\n" <>) (crSummary result)
-              in pure (OpResult [TrpText statusText] False (object enriched))
+              terminal = isTerminalStatus s
+              header = "status=" <> renderStatus s
+                         <> " runs=" <> tshow (aiRuns inst)
+                         <> " origin=" <> renderOrigin (aiOrigin inst)
+                         <> maybe "" (\r -> " exit=" <> renderChildExit (crExitReason r)
+                                              <> maybe "" ((" child_session=" <>) . sessionIdText)
+                                                   (crChildSession r))
+                                  (aiResult inst)
+              text = header
+                       <> maybe "" (("\n" <>) . outcomeBody) (aiResult inst)
+                       <> (if terminal
+                             then "\nresumable: AGENT_MANAGE continue with this subagent_id"
+                             else "")
+              recorded = [ "subagent_id" .= subagentIdText sid
+                         , "status" .= renderStatus s
+                         , "runs" .= aiRuns inst
+                         , "origin" .= renderOrigin (aiOrigin inst)
+                         , "resumable" .= terminal
+                         ]
+                       ++ case aiResult inst of
+                            Nothing -> []
+                            Just result ->
+                              [ "summary" .= crSummary result
+                              , "child_session" .= fmap sessionIdText (crChildSession result)
+                              , "exit_reason" .= renderChildExit (crExitReason result)
+                              , "duration_seconds" .= crDurationSeconds result
+                              ]
+          pure (OpResult [TrpText text] False (object recorded))
 
 -- | Handle the stop action (shared with the legacy AGENT_STOP shim).
 handleStop :: AgentRuntime -> SessionId -> Value -> App OpResult
@@ -1144,8 +1199,104 @@ agentInterruptOp owner runtime = TrustedOpcode
   }
 
 -- ---------------------------------------------------------------------------
--- JSON encoding of ChildResult
+-- Outcome vocabulary and reply texts
 -- ---------------------------------------------------------------------------
+
+-- | The single @status=@ dialect, shared by every render (@AGENT_STATUS@,
+-- foreground results, completion messages). Pinned by the design so the model
+-- never sees a Haskell constructor name.
+renderChildStatus :: ChildStatus -> Text
+renderChildStatus = \case
+  CsCompleted   -> "completed"
+  CsFailed      -> "failed"
+  CsTimeout     -> "timeout"
+  CsInterrupted -> "interrupted"
+  CsError       -> "error"
+
+-- | The single @exit=@ dialect.
+renderChildExit :: ChildExitReason -> Text
+renderChildExit = \case
+  CerCompleted     -> "completed"
+  CerMaxIterations -> "max_iterations"
+  CerTimeout       -> "timeout"
+  CerInterrupted   -> "interrupted"
+  CerError         -> "error"
+
+-- | How the child was started or continued (part of the instance's origin).
+renderOrigin :: SpawnOrigin -> Text
+renderOrigin = \case
+  SoStartForeground    -> "start/foreground"
+  SoStartBackground    -> "start/background"
+  SoContinueForeground -> "continue/foreground"
+  SoContinueBackground -> "continue/background"
+
+-- | How the parent continues this child again. One wording, every surface.
+continueHint :: Text
+continueHint =
+  "Send another message with AGENT_MANAGE continue and the same subagent_id \
+  \to continue the conversation."
+
+-- | Scoped to THIS request: the global "you already answered" wording licensed
+-- throwing away a fresh reply in a multi-turn exchange.
+noReplyClause :: Text
+noReplyClause =
+  "If you already sent your answer for this request, reply with NO_REPLY."
+
+-- | The default message for a continue with no @prompt@. Framed like the
+-- harness's own injected prompt so the child distinguishes a nudge from a
+-- parent instruction.
+continueNudge :: Text
+continueNudge =
+  "[System: the harness is resuming you. Continue your previous task from \
+  \where you left off. Pick up whatever is unfinished; do not start over.]"
+
+-- | Shown when a child produced neither a summary nor an error.
+noFinalTextPlaceholder :: Text
+noFinalTextPlaceholder = "(no final text from the child)"
+
+-- | Appended for @status=timeout@: the child's conversation survives, so a
+-- continue resumes rather than restarts it.
+timeoutContinuationClause :: Text
+timeoutContinuationClause =
+  "the child was cut off at its time limit; continuing resumes it rather than \
+  \restarting it."
+
+-- | @[subagent <sid> completed] status=… exit=… child_session=…@ (or
+-- @replied (continue #n)@). @child_session@ is stable across continues and is
+-- not a correlation key — only the run number is.
+outcomeHeader :: Text -> ChildResult -> Text
+outcomeHeader title r =
+  "[subagent " <> subagentIdText (crSubagentId r) <> " " <> title <> "] status="
+    <> renderChildStatus (crStatus r) <> " exit=" <> renderChildExit (crExitReason r)
+    <> maybe "" ((" child_session=" <>) . sessionIdText) (crChildSession r)
+
+-- | The reply body: summary, else @crError@, else a placeholder — every
+-- failure path sets the summary to 'Nothing' and puts the diagnosis in
+-- @crError@, so a summary-only render would silently drop it.
+outcomeBody :: ChildResult -> Text
+outcomeBody r = body <> timeoutClause
+  where
+    body = fromMaybe noFinalTextPlaceholder (crSummary r <|> crError r)
+    timeoutClause
+      | crStatus r == CsTimeout = "\n" <> timeoutContinuationClause
+      | otherwise = ""
+
+-- | Render an 'Int' as 'Text' (no 'show'-through-'pack' sprinkled around).
+tshow :: Show a => a -> Text
+tshow = T.pack . show
+
+-- | Starting or running — the states @AGENT_INSTANCES@ lists.
+isLiveStatus :: AgentStatus -> Bool
+isLiveStatus Starting = True
+isLiveStatus Running  = True
+isLiveStatus _        = False
+
+-- | Retained and finished — the states @continue@ can claim.
+isTerminalStatus :: AgentStatus -> Bool
+isTerminalStatus Stopped     = True
+isTerminalStatus Interrupted = True
+isTerminalStatus (Crashed _) = True
+isTerminalStatus _           = False
 
 renderStatus :: AgentStatus -> Text
 renderStatus = \case
@@ -1156,11 +1307,26 @@ renderStatus = \case
   Interrupted  -> "interrupted"
   Crashed m    -> "crashed: " <> m
 
--- | Extract the @subagent_id@ string field from a JSON object.
+-- | Extract and validate the @subagent_id@ string field from a JSON object:
+-- non-empty, at most 'subagentIdCap' characters, and free of control
+-- characters. Validation happens here so no @AGENT_MANAGE@ action, no legacy
+-- shim, and no debug line or @orRecorded@ payload can carry a forged id.
 subagentIdField :: Value -> Maybe SubagentId
 subagentIdField v = do
   t <- parseMaybe (withObject "in" (.: "subagent_id")) v
-  if T.null t then Nothing else Just (SubagentId t)
+  if isValidSubagentIdText t then Just (SubagentId t) else Nothing
+
+-- | Cap on a @subagent_id@ string: a def id (≤1024 is the def-name cap, but
+-- ids are shorter) plus a 9-character suffix fits well inside this.
+subagentIdCap :: Int
+subagentIdCap = 256
+
+isValidSubagentIdText :: Text -> Bool
+isValidSubagentIdText t =
+  not (T.null t) && T.length t <= subagentIdCap && not (T.any isControlChar t)
+
+isControlChar :: Char -> Bool
+isControlChar c = c < ' ' || c == '\DEL'
 
 -- ---------------------------------------------------------------------------
 -- Helpers (def rendering / encoding)
@@ -1257,23 +1423,10 @@ encodeForegroundResults :: [ChildResult] -> Text
 encodeForegroundResults [] = "(no children spawned)"
 encodeForegroundResults results = T.intercalate "\n\n" (map renderOne results)
   where
+    -- A foreground-spawned child is retained, so this is the moment the
+    -- parent holds a resumable handle: say how to continue.
     renderOne r =
-      let sid = subagentIdText (crSubagentId r)
-          status = T.pack (show (crStatus r))
-          exitReason = T.pack (show (crExitReason r))
-          mSummary = crSummary r
-          mChildSession = sessionIdText <$> crChildSession r
-          header = "[subagent " <> sid <> " completed] status=" <> status
-                     <> " exit=" <> exitReason
-          sessionLine = case mChildSession of
-            Just cs -> " child_session=" <> cs
-            Nothing -> ""
-          summaryLine = case mSummary of
-            Just s  -> "\n" <> s
-            Nothing -> case crError r of
-              Just e  -> "\nerror: " <> e
-              Nothing -> ""
-      in header <> sessionLine <> summaryLine
+      outcomeHeader "completed" r <> "\n" <> outcomeBody r <> "\n\n" <> continueHint
 
 -- | Encode a 'ChildResult' as JSON for the 'orRecorded' payload.
 toJSONChildResult :: ChildResult -> Value
@@ -1293,20 +1446,4 @@ toJSONChildResult r = object
 -- status, child session, and exit reason — never @crParts@).
 completionMessage :: ChildResult -> Text
 completionMessage r =
-  let sid = subagentIdText (crSubagentId r)
-      status = T.pack (show (crStatus r))
-      mSummary = crSummary r
-      mChildSession = sessionIdText <$> crChildSession r
-      exitReason = T.pack (show (crExitReason r))
-      header = "[subagent " <> sid <> " completed] status=" <> status
-                 <> " exit=" <> exitReason
-      sessionLine = case mChildSession of
-        Just cs -> " child_session=" <> cs
-        Nothing -> ""
-      summaryLine = case mSummary of
-        Just s  -> "\n" <> s
-        Nothing -> case crError r of
-          Just e  -> "\nerror: " <> e
-          Nothing -> ""
-  in header <> sessionLine <> summaryLine
-     <> "\n\nIf you have already sent your final answer, reply with NO_REPLY."
+  outcomeHeader "completed" r <> "\n" <> outcomeBody r <> "\n\n" <> noReplyClause
