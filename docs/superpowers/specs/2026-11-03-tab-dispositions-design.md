@@ -975,3 +975,172 @@ with `seal index rebuild` and a test that deletes the file and asserts identical
 output — the same contract as §5.11 and `conversation.idx`. The architecture's
 "transcript is truth, everything else is a materialized view" rule is what makes
 that guarantee cheap; a database must enter under it, not around it.
+
+## 14. Gate round 7 — full 5-agent design review + plan re-review: NOT READY
+
+Round 7 ran the full Design Review Gate (PM, Architect, Designer, Security,
+CTO) against this design *and* against PR 0 as actually shipped on
+`perf/derived-sidecar` (`5e00a0d`, `1937a8f`), plus a completeness review of the
+PR 0 plan. **Result: 0 of 6 approved.** The blockers below are consolidated and
+de-duplicated; each was verified against the code by the reviewer that raised it.
+
+### 14.1 The blocker that invalidates the premise
+
+**Nothing produces `Needs Review`.** D4 sets `In Progress` on every successful
+turn; D5 sets `Todo` when a tab is created. Those are the only automatic
+writers. `Needs Review` — described here as "the trust boundary made visible"
+and "the first column because it is the human's queue" — has no producer at all;
+the only mechanism that would give it one (§11.2, agent-proposed dispositions)
+is deferred.
+
+Consequence: the field's only automatically-maintained value is a constant, and
+every judgment-bearing state is hand-maintained. **A field that is 90% one value
+does not beat a stale TODO list; it is a stale TODO list that looks maintained,
+which is worse.** The operator's original thesis ("to-do lists get out of date")
+is therefore not answered by this design as written, and §1's claim that the
+disposition is what makes tabs beat a stale list must be withdrawn or earned.
+
+**Decision required (operator).** Either:
+
+- **(a)** Give it a producer inside this epic: the same disposition menu in the
+  composer footer when a turn ends ("Done · Needs review · Keep"). It asks for
+  the judgment at the only moment the operator has the context, needs no opcode
+  and no new security surface, and turns §3's use case 3 into a real trigger; or
+- **(b)** Withdraw the claim, and accept that the field is a manual annotation
+  with a one-way ratchet to `In Progress`. If (b), the epic should probably not
+  be built.
+
+### 14.2 PR 0 as shipped is inert, and its own gate was never applied
+
+Verified on the branch: the only production consumer of `Seal.Session.Derived`
+is `renderIso`; `lastUserMessageAtFast` is byte-for-byte unchanged and
+`readDerived` / `derivedIsFresh` / `computeDerived` / `writeDerived` have no
+caller outside the spec. So PR 0 added an on-disk format, a write path, a
+validation rule and 275 lines of tests **with zero runtime effect**, while §4
+Metric 4 declared the ≥5× threshold "a gate, not a report: if it is not met the
+PR is not opened". That is exactly the unmeasured-micro-optimisation pattern
+this document elsewhere refuses. The "no behaviour change, revertible with zero
+user-visible effect" defence is trivially true of code nothing calls.
+
+**Decision:** PR 0 is not mergeable in this state. It either lands **complete**
+(W0a bench + W0c read path + the gate cleared) or is **reverted**. §4 Q-D's
+"may PR 0 merge standalone" is answered **no** until then.
+
+### 14.3 Tab-coupling funnel is incomplete
+
+D1–D5 cover three of at least eight tab-binding paths. Missing: `POST
+/api/tabs/new {resume}` and `/tab resume` both call `insertTabH (BoundSession
+sid)` without reading the disposition, so a `Done`/`Archived`/`Deleted` session
+can acquire a live seat by a plain user action — so §5.6's "unreachable through
+this route" is false (it is not a race). D5 covers only `handleTabNew`'s provider
+branch, so `POST /api/sessions/new`, `POST /api/sessions/:id/new` and the CLI
+`/tab new` still create untagged sessions, which falsifies §5.1's "untagged then
+only ever means legacy" and makes the `Untagged` toggle permanent (it can never
+self-clean). D4 also lands in `Core/TurnEngine.hs` for every non-web channel,
+which the work-unit list does not name.
+
+**Decision:** replace D1–D5 with **one funnel** — a single
+`applyDisposition`/`bindSeatFor` that every writer calls — and enumerate all
+sites in the work unit. Make section membership a read-time function of the
+disposition so a missed site is *invisible* rather than corrupting.
+
+### 14.4 The concurrency story does not deliver its guarantee
+
+There is no `adSessionLocks`; the in-repo per-session lock is `SessionLocks`
+(`Session/Lock.hs:75-95`), held for the whole turn by design. A new MVar on
+`ApiDeps` serialises PUT-vs-PUT only, while D4 runs inside a turn under
+`SessionLocks` and cannot reach `ApiDeps` — so D4 (`In Progress`) and a PUT
+(`Done`) interleave freely and leave disk-says-Done with a live tab, unrepairable.
+Separately `TabsHandle.thSave` snapshots *before* taking the persist MVar
+(`Tabs.hs:64`), so two concurrent mutations can persist the older list last, and
+`seedTabsHandle` loads exactly that at boot. And there is no repair path.
+
+**Decision:** the write must be **one critical section** (store MVar: session.json
+→ marker → tab reconcile → broadcast) that *every* writer goes through
+(`PUT`, the archived route, D4, D5, resume). Last-writer-wins then gives a total
+order and disk/marker/tab agree by construction, with no turn lock. Take the tab
+snapshot inside the persist lock. Restate I1 with its full exception list.
+
+### 14.5 `Archived` projection is destructive on one side and incomplete on the other
+
+`archive=false → untagged` unconditionally clears the field, so the existing
+Unarchive button silently erases a `Done` verdict. And projecting archived-ness
+from the disposition requires *both* enumerators to apply one shared predicate in
+both directions — a marker-less session whose disposition is `Archived` must
+still come back from `listArchivedSessions`, or the row exists in neither list and
+disappears from the UI. The current shape cannot express that (it skips
+marker-present dirs without decoding), and decoding every dir twice per snapshot
+undercuts PR 0's own goal. Also: `.:?` on a `"disposition": 42` field fails the
+whole record and `listSessions` silently skips undecodable files, so the session
+vanishes instead of reading as untagged.
+
+**Decision:** one `listSessionsPartitioned :: SealPaths -> IO ([SessionMeta],
+[SessionMeta])` doing a single enumeration and one predicate application;
+`archive=false` = `Archived → untagged`, anything else unchanged; tolerant disk
+decode via `parseMaybe` on the field.
+
+### 14.6 §5.8's security claims are wrong on the facts
+
+"Touches only `session.json` and the marker — pinned by tests, not prose" is
+false: closing a tab through the route also persists `<state>/tabs.json`
+(`Tabs.hs:52`), persists `<state>/cursors.json` via the close notifier
+(`Cursor.hs:73-79`), and sends outbound user-visible messages to attached
+Telegram/Signal sinks (`Loop.hs:171`). That is network egress from an
+unauthenticated route. And the "single-operator loopback tool" premise is not
+enforced — `gw.host` is configurable and `Server.hs:265-283` binds `0.0.0.0` with
+a warning. And "the sidecar never touches `keys/` / `config/vault/`" is filename
+luck, not structure: `SessionMeta`'s `FromJSON` never runs `isValidSessionId`, so
+a crafted `"id"` reaches `sessionDir`; today it is a read, but W0c turns it into a
+write. `/session reindex` is also reachable from the unauthenticated
+`POST /api/sessions/:id/send` slash dispatch — a new amplification primitive.
+
+**Decisions:** (i) restate §5.8's effect set accurately, including egress;
+(ii) validate `smId` at the `SessionMeta` decode boundary (precedent:
+`Session/Workdir.hs:60-103`); (iii) add invariant **I18**: no code path may branch
+on a disposition for authorization, spending, deletion or scheduling — so
+"only the human asserts Done" is honestly advisory, not security; (iv) add an
+ids-only audit line per transition; (v) bound `/session reindex` (single-flight).
+
+### 14.7 UX blockers (Designer)
+
+- **The suppressed-row trigger is unreachable by keyboard.** The pattern it
+  extends, `.session-archive`, uses `display: none` until hover, which removes
+  the element from the tab order — `:focus-visible` can never fire, so a
+  keyboard user cannot open the menu on any row whose pill is suppressed. After
+  D4 that is nearly every Active Tabs row. It is also untestable as configured:
+  `App.css` is imported only in `main.tsx`, so jsdom applies none of it.
+  **Fix:** reserve the slot and reveal by `opacity`, never `display`; add a RED
+  that asserts perceivability (slot reserved, focusable, stable accessible name).
+- **The pill-suppression predicate is undefined** now that Active Tabs uses
+  independent toggles ("equals the filter's single selection" no longer exists),
+  and suppression removes the only marker distinguishing archived rows once
+  `ArchivedSection` goes.
+- **The menu has no geometry**: it is inside the sidebar's `overflow-y-auto`
+  container, so eight items (~268px) clip or scroll the list. Use a portal with
+  `position: fixed` + flip/clamp (precedent: `NewTabComposer.tsx:595-601`).
+- **`Deleted`'s second activation never resets** — the confirm is theatre unless
+  popover close / Escape / focus loss / another item disarm it.
+- **Attention copy is wrong**: the set is `thinking` + `idle-unread`, so hiding a
+  *thinking* row renders "1 hidden with unread". Make the §6.3 muted
+  `(Todo hidden)` per-column line normative instead (`Todo · hidden · 1 unread`).
+- **Removing `ArchivedSection` puts archived rows at full height in the default
+  view**, so archiving no longer visibly shortens the list. Default Sessions to
+  `All` *excluding* `Archived`, or keep a collapsed archived group.
+- **Metrics.** Metric 1 (adoption ≥60%) cannot fail — every session active in
+  the window was tagged by D4/D5. Count **menu-originated** writes only and
+  report the distribution. Metric 2 (≤25 rows at day 30) is unreachable: the real
+  store has ~335 non-archived untagged sessions and the design has no bulk path —
+  state a legacy policy (e.g. untagged && `lastActive` older than N days resolves
+  to `Archived` at read time) or a bulk action. The rollback criterion is not
+  computable — no tab-close is recorded anywhere; emit one server-side line per
+  removal first.
+
+### 14.8 What happens now
+
+- **The epic is NOT READY.** PR 1–3 must not start.
+- **PR 0** is incomplete on `perf/derived-sidecar`; it must be finished
+  (W0a bench + W0c read path, gate cleared) or reverted before merge.
+- The operator must answer §14.1(a)/(b) before anything else, because (b)
+  removes the reason to build the epic. Open questions Q-H (who produces
+  `Needs Review`), Q-I (the 335 legacy sessions), Q-J (do channel-originated
+  sessions belong on the board) join Q-B/Q-C/Q-F in §12.
