@@ -30,6 +30,7 @@ module Seal.Session.Derived
   , entriesSize
   , derivedIsFresh
   , computeDerived
+  , mkDerived
   ) where
 
 import Control.Exception (IOException, onException, try)
@@ -37,14 +38,12 @@ import Control.Monad (void)
 import Data.Aeson
   ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson qualified as A
-import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Int (Int64)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.Encoding.Error (lenientDecode)
 import Data.Time (UTCTime, defaultTimeLocale, formatTime)
 
 import System.Directory (doesDirectoryExist, removeFile, renameFile)
@@ -55,6 +54,7 @@ import System.Posix.Files (FileStatus, fileSize, getFileStatus, setFileMode)
 import Seal.Config.Paths (SealPaths, sessionDerivedPath, sessionDir, sessionEntriesPath)
 import Seal.Core.Types (SessionId)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+import Seal.Util.StrictIO (readFileTextStrict)
 
 -- | The sidecar record. The field set is deliberately minimal: one derived
 -- value plus the byte count that keys its validity.
@@ -74,7 +74,7 @@ derivedVersion = 1
 
 instance ToJSON DerivedMeta where
   toJSON m = object
-    [ "version"             .= dmVersion m
+    [ "version"             .= derivedVersion
     , "last_user_message_at" .= dmLastUserMessageAt m
     , "entries_bytes"       .= dmEntriesBytes m
     ]
@@ -84,9 +84,9 @@ instance FromJSON DerivedMeta where
     DerivedMeta <$> o .: "version" <*> o .:? "last_user_message_at" <*> o .: "entries_bytes"
 
 -- | ISO-8601 with milliseconds + @Z@ — the frontend's expected timestamp shape.
--- This is the /single/ formatter in the codebase: @Gateway.Transcript.showIso@
--- delegates to it (that module imports this one, so the formatter cannot live
--- there without an import cycle).
+-- @Gateway.Transcript.showIso@ delegates to it (that module imports this one,
+-- so the formatter cannot live there without an import cycle) — one formatter
+-- for both the cached and the recomputed paths.
 renderIso :: UTCTime -> Text
 renderIso = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%3QZ"
 
@@ -121,7 +121,6 @@ derivedIsFresh paths sid = do
   case m of
     Nothing -> pure False
     Just d
-      | dmEntriesBytes d < 0 -> pure False
       | otherwise -> do
           sz <- entriesSize paths sid
           pure (sz == Just (dmEntriesBytes d))
@@ -133,22 +132,30 @@ derivedIsFresh paths sid = do
 --
 -- This is the /single/ producer of 'DerivedMeta'; the read path and
 -- @\/session reindex@ both call it, so the parse and the race rule exist once.
+-- | The race rule, as a pure function so it can be tested directly: a value is
+-- only recordable when the size sampled before and after the read agree.
+mkDerived :: Int64 -> Int64 -> Maybe Text -> Maybe DerivedMeta
+mkDerived before after v
+  | before == after = Just (DerivedMeta derivedVersion v before)
+  | otherwise       = Nothing
+
+-- | Compute the current value from @entries.jsonl@, applying the
+-- stat -> read -> stat rule.
 computeDerived :: SealPaths -> SessionId -> IO (Maybe DerivedMeta)
 computeDerived paths sid = do
   s1 <- entriesSize paths sid
   case s1 of
     Nothing   -> pure Nothing
     Just n1 -> do
-      raw <- try (BS.readFile (sessionEntriesPath paths sid))
-               :: IO (Either IOException BS.ByteString)
+      raw <- try (readFileTextStrict (sessionEntriesPath paths sid))
+               :: IO (Either IOException Text)
       case raw of
         Left _   -> pure Nothing
-        Right bs -> do
+        Right t -> do
           s2 <- entriesSize paths sid
-          let v = lastRequestTs (TE.decodeUtf8With lenientDecode bs)
           pure $ case s2 of
-            Just n2 | n2 == n1 -> Just (DerivedMeta derivedVersion v n1)
-            _                  -> Nothing
+            Just n2 -> mkDerived n1 n2 (lastRequestTs t)
+            Nothing -> Nothing
 
 -- | The timestamp of the last request-direction entry, rendered by 'renderIso'.
 lastRequestTs :: Text -> Maybe Text

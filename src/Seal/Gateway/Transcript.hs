@@ -42,7 +42,7 @@ import Debug.Trace (trace)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
 import System.Posix.Process (getProcessID)
@@ -55,6 +55,7 @@ import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.ConvIndex
   (convLineCount, ensureIndex, readConvLinesRaw)
+import Seal.Session.Derived (renderIso)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstructStreaming, reconstructStreamingPage)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
@@ -901,7 +902,7 @@ rewriteMessage msg =
 
 -- | ISO-8601 with milliseconds + Z (the frontend's expected timestamp shape).
 showIso :: UTCTime -> String
-showIso = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%3QZ"
+showIso = T.unpack . renderIso
 
 -- | The ISO timestamp of the most recent @request@-direction entry in a
 -- session's transcript (the last time the USER sent a message), or 'Nothing'

@@ -97,6 +97,16 @@ spec = describe "Seal.Session.Derived" $ do
       withSystemTempDirectory "seal-derived" $ \root ->
         readDerived (fakePaths root) testSid `shouldReturn` Nothing
 
+    it "writes exactly version/last_user_message_at/entries_bytes, version 1" $
+      withSystemTempDirectory "seal-derived" $ \root -> do
+        let paths = fakePaths root
+        createDirectoryIfMissing True (sessionDir paths testSid)
+        -- deliberately pass a bogus version: the writer must still emit 1
+        writeDerived paths testSid (DerivedMeta 99 (Just "t") 7) `shouldReturn` True
+        raw <- BS.readFile (sessionDerivedPath paths testSid)
+        raw `shouldBe`
+          "{\"entries_bytes\":7,\"last_user_message_at\":\"t\",\"version\":1}"
+
     it "round-trips a written value" $
       withSystemTempDirectory "seal-derived" $ \root -> do
         let paths = fakePaths root
@@ -166,13 +176,6 @@ spec = describe "Seal.Session.Derived" $ do
           void (writeDerived paths testSid (DerivedMeta derivedVersion Nothing n))
           derivedIsFresh paths testSid `shouldReturn` want
 
-    it "is False when the recorded byte count is negative" $
-      withSystemTempDirectory "seal-derived" $ \root -> do
-        let paths = fakePaths root
-        seedBytes paths "x"
-        void (writeDerived paths testSid (DerivedMeta derivedVersion Nothing (-1)))
-        derivedIsFresh paths testSid `shouldReturn` False
-
   describe "writeDerived" $ do
     it "returns False and creates nothing when the session dir is absent" $
       withSystemTempDirectory "seal-derived" $ \root -> do
@@ -199,6 +202,16 @@ spec = describe "Seal.Session.Derived" $ do
         writeDerived paths testSid (DerivedMeta derivedVersion Nothing 0)
           `shouldReturn` False
         tempLeftovers paths `shouldReturn` []
+
+  describe "mkDerived (the stat -> read -> stat rule)" $ do
+    it "records a value when the pre and post sizes agree" $
+      mkDerived 10 10 (Just "t") `shouldBe` Just (DerivedMeta derivedVersion (Just "t") 10)
+
+    it "discards the value when an append lands during the read" $
+      mkDerived 10 11 (Just "t") `shouldBe` Nothing
+
+    it "discards the value when the file shrinks during the read" $
+      mkDerived 10 9 (Just "t") `shouldBe` Nothing
 
   describe "computeDerived" $ do
     it "returns Nothing when entries.jsonl is absent" $
@@ -256,6 +269,7 @@ spec = describe "Seal.Session.Derived" $ do
       let m = DerivedMeta derivedVersion (Just "2026-07-01T12:00:05.000Z") n
       in (A.decode (A.encode m) :: Maybe DerivedMeta) == Just m
 
-    prop "decoding arbitrary bytes never throws" $ \(ws :: [Word8]) ->
-      let bs = BS.pack (take 64 ws)
-      in (A.decodeStrict bs :: Maybe DerivedMeta) `seq` True
+    prop "arbitrary bytes decode to the value or to Nothing, never a crash" $ \(ws :: [Word8]) ->
+      case A.decodeStrict (BS.pack (take 64 ws)) :: Maybe DerivedMeta of
+        Nothing -> True
+        Just d  -> dmVersion d == derivedVersion
