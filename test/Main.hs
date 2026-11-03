@@ -142,6 +142,7 @@ import qualified Seal.Agent.Def.BackendSpec
 import qualified Seal.Agent.Def.BackendNoDirectFsFailSpec
 import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
+import qualified Seal.Agent.ConvRepairSpec
 import qualified Seal.Agent.Runtime.Delegation.WorkerSpec
 import qualified Seal.Agent.Runtime.Delegation.ConcurrentSpec
 import qualified Seal.Agent.Runtime.RunRecordSpec
@@ -340,6 +341,7 @@ specs = do
   Seal.Skills.BackendNoDirectFsFailSpec.spec
   Seal.Agent.PromptPartsSpec.spec
   Seal.Agent.Runtime.RegistrySpec.spec
+  Seal.Agent.ConvRepairSpec.spec
   Seal.Agent.Runtime.Delegation.WorkerSpec.spec
   Seal.Agent.Runtime.Delegation.ConcurrentSpec.spec
   Seal.Agent.Runtime.RunRecordSpec.spec

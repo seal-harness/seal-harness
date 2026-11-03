@@ -3,6 +3,7 @@ module Seal.Agent.Runtime.RegistrySpec (spec) where
 
 import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (throwIO)
+import Data.List (isInfixOf)
 import Data.IORef
 import Test.Hspec
 
@@ -35,6 +36,36 @@ blockingWorker ref = do
 
 spec :: Spec
 spec = describe "Seal.Agent.Runtime.Registry" $ do
+  describe "AgentInstance rendering" $ do
+    it "elides the task, def, and result bodies in Show" $ do
+      rt <- newAgentRuntime
+      ran <- newIORef False
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
+      insts <- listAgents rt
+      case insts of
+        [i] -> do
+          let rendered = show i
+          -- a spawn has no snapshot yet, but the field names must be present
+          "aiTask = Nothing" `isInfixOf` rendered `shouldBe` True
+          "aiResult = Nothing" `isInfixOf` rendered `shouldBe` True
+        _ -> expectationFailure "expected exactly one instance"
+      _ <- stopAgent rt sampleSubagentId
+      pure ()
+
+    it "records a fresh spawn as run 1 with its worker thread" $ do
+      rt <- newAgentRuntime
+      ran <- newIORef False
+      tid <- myThreadId
+      _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
+      insts <- listAgents rt
+      case insts of
+        [i] -> do
+          aiRuns i `shouldBe` 1
+          aiWorkerThread i `shouldSatisfy` (/= Just tid)
+        _ -> expectationFailure "expected exactly one instance"
+      _ <- stopAgent rt sampleSubagentId
+      pure ()
+
   describe "startAgent" $ do
     it "forks the worker and records the instance as Running" $ do
       rt <- newAgentRuntime
@@ -74,13 +105,13 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
       pure ()
 
   describe "stopAgent" $ do
-    it "removes the instance (a fresh start can proceed)" $ do
+    it "retains the instance as Stopped so it stays resumable" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
       _ <- startAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 (blockingWorker ran)
       _ <- stopAgent rt sampleSubagentId
-      agentStatus rt sampleSubagentId `shouldReturn` Nothing
-      -- a fresh start succeeds after stop
+      agentStatus rt sampleSubagentId `shouldReturn` Just Stopped
+      -- a fresh start with a new id still proceeds
       let sid2 = SubagentId "sa-a1-00000002"
       r2 <- startAgent rt sampleDefId sid2 sampleParentSession sampleSession 0 (blockingWorker ran)
       r2 `shouldSatisfy` isRight
