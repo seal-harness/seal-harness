@@ -5,11 +5,12 @@ import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
-import Control.Exception (bracket)
+import Control.Exception (AsyncException (ThreadKilled), bracket, throwIO)
 import Control.Monad (replicateM_, void)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -772,12 +773,85 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       crChildSession result `shouldBe` Just childSid
       crDurationSeconds result `shouldSatisfy` (>= 0.05)
 
-    it "a foreground timeout renders child_session (was Nothing before WU-4)" $ do
+    -- A real foreground timeout cannot be run in-suite: 'resolveDelegationConfig'
+    -- floors child_timeout_seconds at 30 s, so 'runDelegate' can only time out
+    -- after half a minute. The assertion therefore sits on the shared core that
+    -- now produces the foreground result, plus the foreground renderer.
+    it "a timeout result renders child_session (the foreground renderer's shape)" $ do
       start <- getCurrentTime
       result <- runChildTask Nothing 0.05 start 0 sid childSid sampleAgentDef
                   (sleepingWorker 0.3) mkTask
       T.isInfixOf "child_session=child" (encodeForegroundResults [result])
         `shouldBe` True
+
+  describe "spawn callback (run lifecycle through the opcode)" $ do
+    it "registers the child with a live worker handle and its task snapshot" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      gate <- newEmptyMVar :: IO (MVar ())
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object [ "id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text) ]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = gatedWorker gate
+            , aswGate = gateOpen
+            , aswPaths = samplePaths
+            , aswParentSession = sampleSession
+            , aswRunRecords = Nothing
+            , aswOnIdleCompletion = Nothing
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "running" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+      -- The child is registered while it is still inside the run body, with a
+      -- live control handle ('aiWorkerThread') and the spawn snapshot that
+      -- makes it resumable.
+      let hasInstance = not . null <$> listAgentsFor rt sampleSession
+      registered <- pollUntil 2000 hasInstance
+      registered `shouldBe` True
+      insts <- listAgentsFor rt sampleSession
+      case insts of
+        [inst] -> do
+          aiStatus inst `shouldBe` Running
+          aiWorkerThread inst `shouldSatisfy` isJust
+          aiTask inst `shouldBe` Just (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          fmap adId (aiDef inst) `shouldBe` Just sampleDefId
+        _ -> expectationFailure ("expected exactly one instance, got " <> show (length insts))
+      -- Release the child; it completes and the run's own thread clears the
+      -- handle BEFORE reporting, so a completed child is continuable at once.
+      putMVar gate ()
+      let hasResult = any (isJust . aiResult) <$> listAgentsFor rt sampleSession
+      reported <- pollUntil 2000 hasResult
+      reported `shouldBe` True
+      finished <- listAgentsFor rt sampleSession
+      case finished of
+        [inst] -> do
+          aiStatus inst `shouldBe` Stopped
+          aiWorkerThread inst `shouldBe` Nothing
+        _ -> expectationFailure "expected exactly one instance"
+
+    it "a spawn callback that throws reports no completion (a killed run is not a result)" $ do
+      pauseFlag <- newSpawnPauseFlag
+      completed <- newIORef (0 :: Int)
+      let cfg = defaultDelegationConfig
+          callback _ = void (atomicModifyIORef' completed (\n -> (n + 1, n + 1)))
+          killedSpawnCb _ _ _ _ _body = throwIO ThreadKilled
+          resolver _task = pure (Right (undefined, recordingWorker' "done"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0
+             (DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False))
+             resolver callback killedSpawnCb (pure (mkSystemSessionId "child"))
+      threadDelay 100000
+      readIORef completed `shouldReturn` 0
 
   describe "spawnPausedMsg" $ do
     it "is the single source of the pause refusal, shared by both runners" $ do

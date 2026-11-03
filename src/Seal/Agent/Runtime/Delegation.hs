@@ -500,6 +500,22 @@ spawnPausedMsg :: Text
 spawnPausedMsg =
   "Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying."
 
+-- | Acquire / release the counting semaphore around an IO action. The
+-- semaphore is a 'TVar Int' initialised to @max_concurrent_children@: each
+-- acquire atomically decrements (blocking if zero via 'retry'), each release
+-- atomically increments. This allows up to that many concurrent holders —
+-- unlike an 'MVar', which is a binary semaphore that would serialize every
+-- child regardless of the configured cap.
+bracketSem :: TVar Int -> IO a -> IO a
+bracketSem sem act = bracket acquire release (const act)
+  where
+    acquire = atomically $ do
+      n <- readTVar sem
+      if n > 0
+        then writeTVar sem (n - 1)
+        else retry
+    release _ = atomically (modifyTVar' sem (+1))
+
 -- | The top-level delegation runner. Spawns one or more child agents, runs
 -- each against its goal to completion (synchronously), and returns a
 -- 'ChildResult' per task. The parent blocks until all children finish (or
@@ -559,22 +575,6 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
           results <- forM mvars readMVar
           pure (Right results)
 
-    -- Acquire / release the counting semaphore around an IO action. The
-    -- semaphore is a 'TVar Int' initialized to @maxConc@: each acquire
-    -- atomically decrements (blocking if zero via 'retry'), each release
-    -- atomically increments. This allows up to @maxConc@ concurrent holders,
-    -- unlike the previous 'MVar'-based approach which was a binary semaphore
-    -- (mutex) that serialized all children regardless of @maxConc@.
-    bracketSem :: TVar Int -> IO a -> IO a
-    bracketSem sem act = bracket acquire release (const act)
-      where
-        acquire = atomically $ do
-          n <- readTVar sem
-          if n > 0
-            then writeTVar sem (n - 1)
-            else retry
-        release _ = atomically (modifyTVar' sem (+1))
-
     -- Run a single task to completion. The shared child-run core
     -- ('runChildTask') owns the timeout, the heartbeat, the accumulators and
     -- the result shape; this wrapper only resolves the def and mints the
@@ -618,8 +618,10 @@ runDelegateAsync
   -> AgentCompletionCallback
      -- ^ completion callback (called from forked child threads)
   -> SpawnCallback
-     -- ^ spawn callback (called after resolve success, before the worker
-     -- runs — used to register the child in the 'AgentRuntime').
+     -- ^ spawn callback: invoked from the forked child thread before the run
+     -- body executes. Registers the child in the 'AgentRuntime', runs the body
+     -- it is handed, and returns the 'ChildResult' — which is then passed to
+     -- the completion callback from this same thread.
   -> IO SessionId
      -- ^ mint a fresh 'SessionId' for each child (called before forking
      -- so the session is available in 'SpawnInfo' immediately).
@@ -695,17 +697,6 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
             globalLogIO DebugS (ls ("[idle-diag] spawnCallback returned, calling completion callback: subagent=" <> subagentIdText subagentId))
             callback result
       pure (SpawnInfo subagentId childSid idx)
-
-    -- Acquire / release the counting semaphore around an IO action.
-    bracketSem :: TVar Int -> IO a -> IO a
-    bracketSem sem act = bracket acquire release (const act)
-      where
-        acquire = atomically $ do
-          n <- readTVar sem
-          if n > 0
-            then writeTVar sem (n - 1)
-            else retry
-        release _ = atomically (modifyTVar' sem (+1))
 
 -- | Run one child to completion: the single child-run core shared by the
 -- foreground path ('runDelegate.runOne'), the background path

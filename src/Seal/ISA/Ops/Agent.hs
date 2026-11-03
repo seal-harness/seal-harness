@@ -54,7 +54,8 @@ module Seal.ISA.Ops.Agent
   ) where
 
 import Control.Concurrent (myThreadId)
-import Control.Exception (try)
+import Control.Exception
+  ( SomeAsyncException, fromException, throwIO, try )
 import Control.Monad (join, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
@@ -877,7 +878,14 @@ handleStartBackground wiring _v di = do
               Right result -> pure result
               Left e -> do
                 registerRunCrash runtime sid initialRunGeneration e
-                pure (mkErrorResult 0 sid 0 (T.pack (show e)) (Just childSid))
+                case fromException e :: Maybe SomeAsyncException of
+                  -- Killed by 'stopAgent'/'interruptAgent' (or abandoned before
+                  -- the cap let it start). A killed run is not a completed run:
+                  -- re-throw, so 'runDelegateAsync' reports no completion —
+                  -- the parent must not be told the work failed.
+                  Just _ -> throwIO e
+                  Nothing -> pure (mkErrorResult 0 sid 0 (T.pack (show e))
+                                                  (Just childSid))
       eSpawnInfos <- liftIO (runDelegateAsync
                                cfg
                                (aswPauseFlag wiring)
