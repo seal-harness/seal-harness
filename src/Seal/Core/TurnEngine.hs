@@ -42,7 +42,6 @@ import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath ((</>))
 import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -131,7 +130,7 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
   , updateSessionRepoUrl )
@@ -162,7 +161,6 @@ import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
@@ -311,7 +309,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
+      , setupRepoOp cloneDeps autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
      , browserManageOp securityPolicy
@@ -922,13 +920,12 @@ mkCloneDepsTurn td = do
 -- the session directory or @session.json@ is missing or undecodable. The
 -- engine uses this to re-read meta after 'autoBindRepoAgent' may have
 -- rebound 'smAgent'.
+--
+-- Thin re-export of 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the engine's many call sites stay
+-- unchanged while the gateway / delegation worker share the same code.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid System.FilePath.</> "session.json"
-  exists <- System.Directory.doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp
+loadSessionMeta = readSessionMeta
 
 -- | Should 'runSessionTurn' auto-tab the session after a turn? 'True' for
 -- normal turns (every channel-originated session is visible in the sidebar).
@@ -1390,7 +1387,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , fileWriteOp childWsRoot operatorCeiling
         , filePatchOp childWsRoot
         , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps childWsRoot (tdAutonomy td)
+        , setupRepoOp childCloneDeps (tdAutonomy td)
         , binExecOp childWsRoot securityPolicy Nothing
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg

@@ -62,7 +62,6 @@ import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AutonomyLevel (..))
-import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Clone
   ( CloneDeps (..), CloneEnv (..), renderCloneError, resolveCloneTarget
   , withCloneTarget )
@@ -81,8 +80,14 @@ import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 -- @git clone@ into @\<workdir\>\/\<sanitized-repo-name\>@ via
 -- 'uioShellExec', after an idempotency check (read the existing remote).
 -- 'orRecorded': the url + target path + status (secret-free).
-setupRepoOp :: CloneDeps -> WorkspaceRoot -> AutonomyLevel -> Opcode
-setupRepoOp deps _wsRoot autonomy = UntrustedOpcode
+--
+-- No 'WorkspaceRoot' argument: the clone's root is the 'UIOEnv' the
+-- dispatcher supplies (the per-session workdir), so the opcode never needs
+-- one — and the delegation worker (which has no workspace root in scope but
+-- does have the child's 'UIOEnv') can build this op for a handoff session's
+-- pre-turn checkout.
+setupRepoOp :: CloneDeps -> AutonomyLevel -> Opcode
+setupRepoOp deps autonomy = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
   , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent). Discover any skills it ships via the available-skills catalog on the next turn."
   , uoInSchema = setupRepoSchema

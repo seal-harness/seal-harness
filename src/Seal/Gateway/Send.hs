@@ -45,8 +45,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
-import System.Directory (doesFileExist)
-import System.FilePath ((</>))
 
 import Seal.Agent.Def.Types (AgentDef)
 import Seal.Channels.Chat.RateLimit (StreamProgressConfig (..), shouldEdit)
@@ -61,7 +59,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
 import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
-import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths, sessionLogPath)
 import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
    TurnOutcome (..), runSessionTurn, sessionSkillBackend, shouldAutoTab)
@@ -91,7 +89,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.ExecCache (SessionExecCache)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
@@ -105,7 +103,6 @@ import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Util.StrictIO (decodeFileStrict)
 
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
@@ -627,13 +624,12 @@ triggerBroadcast deps =
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.
+--
+-- Thin wrapper over 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the gateway and the delegation worker share
+-- one implementation.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid </> "session.json"
-  exists <- doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp :: IO (Maybe SessionMeta)
+loadSessionMeta = readSessionMeta
 
 -- | Resolve the system prompt for a web turn. An ad-hoc
 -- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the

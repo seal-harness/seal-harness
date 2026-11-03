@@ -1,21 +1,40 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The on-disk session metadata record ('session.json'). Holds the session's
+-- | The on-disk session metadata record ('session.json'): the session's
 -- selected provider label + model id (never a key), its channel of origin, the
--- bound agent definition (if any — set at init from @default_agent@), and
--- timestamps. The 'FromJSON' is tolerant (missing 'channel' defaults to
--- @\"cli\"@, missing 'agent' defaults to 'Nothing') so older/partial files
--- still load.
+-- bound agent definition (if any — set at init from @default_agent@), its
+-- cloned repo, and timestamps. The 'FromJSON' is tolerant (missing 'channel'
+-- defaults to @\"cli\"@, missing 'agent' defaults to 'Nothing') so
+-- older/partial files still load.
+--
+-- Also home to the single reader for that file ('readSessionMeta') — a leaf
+-- module, so every layer (the turn engine, the gateway, the delegation
+-- worker, the opcodes) and the tests can load a session without import
+-- cycles.
 module Seal.Session.Meta
   ( SessionMeta (..)
+  , readSessionMeta
   ) where
 
 import Data.Aeson
   ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=) )
 import Data.Text (Text)
 import Data.Time (UTCTime)
+import System.Directory (doesFileExist)
 
 import Seal.Agent.Def.Types (AgentDefId (..))
+import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (SessionId)
+import Seal.Util.StrictIO (decodeFileStrict)
+
+-- | Load a session's 'SessionMeta' from
+-- @\<state\>\/sessions\/\<sid\>\/session.json@. Returns 'Nothing' when the
+-- file is missing or undecodable. The existence check is required:
+-- 'decodeFileStrict' reads with @sourceFile@, which throws on a missing path.
+readSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
+readSessionMeta paths sid = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if exists then decodeFileStrict mp else pure Nothing
 
 data SessionMeta = SessionMeta
   { smId         :: SessionId
