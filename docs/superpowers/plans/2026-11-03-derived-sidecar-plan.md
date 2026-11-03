@@ -38,11 +38,13 @@ Work units are strictly **sequential** — every one of them edits
 
 ## Work units
 
+Work units are strictly **sequential** — every one of them edits
+`seal-harness.cabal` (a documented merge hotspot, AGENTS.md).
+
 ### WU-0 — `bench-lists` executable (the baseline instrument)
 
-- **Files**: `exe/bench-lists/Main.hs` (new), `seal-harness.cabal`,
-  `Makefile`.
-- **cabal stanza** (must be explicit):
+- **Files**: `exe/bench-lists/Main.hs` (new), `seal-harness.cabal`, `Makefile`.
+- **cabal stanza** (explicit, mirroring `executable seal` at cabal:353-360):
   ```
   executable bench-lists
     import:           settings
@@ -51,21 +53,29 @@ Work units are strictly **sequential** — every one of them edits
     build-depends:    base, seal-harness, seal-gateway-types,
                       containers, directory, filepath, time, optparse-applicative
   ```
+  (`aeson` is **not** needed: session ids for the byte sums come from
+  `listSessions`/`listArchivedSessions`, not from the snapshot's `[Value]`.)
 - **DoD**:
   1. `bench-lists [--iterations N]` (default 3) calls the production
      `buildListsSnapshot` (`ListsSnapshot.hs:41`) with `newTabsHandle`
      (`Tabs.hs:43`) and `Set.empty`, after **one unmeasured warm-up** iteration
-     (the run heals sidecars, so iteration 1 is cold), then prints: session
-     count, the cold iteration's ms separately, and min/median of the measured
+     (the run heals sidecars, so iteration 1 is cold). Prints: session count,
+     the cold iteration's ms **separately**, and the **median** of the measured
      iterations.
-  2. Prints modelled bytes: `Σ size(entries.jsonl)` and `Σ size(derived.json)`,
-     labelled `modelled bytes (file sizes, not syscall accounting)`. Missing
-     files count as 0.
-  3. Exits 0 with zero sessions and prints `sessions: 0`.
-  4. `make bench-lists` runs it via the existing `NIX` wrapper (`Makefile:8`):
-     `$(NIX) cabal run -v0 bench-lists -- $(ARGS)`.
-  5. `make lint` is extended to `hlint src/ test/ exe/` so the new directory is
-     covered by the gate.
+  2. Prints modelled bytes: `Σ size(entries.jsonl)` and `Σ size(derived.json)`
+     sourced from `listSessions <> listArchivedSessions`, labelled
+     `modelled bytes (file sizes, not syscall accounting)`; missing files count
+     as 0.
+  3. Resolves paths via `getSealPaths` (`Paths.hs:73-85`), which honours
+     `SEAL_HOME` — so the zero-session case is exercised by running with
+     `SEAL_HOME=$(mktemp -d)`: prints `sessions: 0`, exits 0. (This is how the
+     sandbox and CI can run it without touching `~/.seal`.)
+  4. `make bench-lists` = `$(NIX) cabal run -v0 bench-lists -- $(ARGS)`
+     (`Makefile:8`). Documented precondition, same as the existing `run:`
+     target: `frontend/dist` must exist, so `make bench-lists` is run **after**
+     `make build` on a clean tree.
+  5. `make lint` extended to `hlint src/ test/ exe/` so new `exe/` code is inside
+     the gate.
   6. `cabal build all` green.
 - **Deps**: none.
 
@@ -73,75 +83,99 @@ Work units are strictly **sequential** — every one of them edits
 
 - **Files**: `src/Seal/Session/Derived.hs` (new), `src/Seal/Config/Paths.hs`,
   `test/Seal/Session/DerivedSpec.hs` (new), `test/Seal/Config/PathsSpec.hs`,
-  `seal-harness.cabal` (library `exposed-modules:` **and** test-suite
-  `other-modules:`), `test/Main.hs`.
-  *(Six files, one concern; the ceiling is "~5" — called out as an accepted
-  deviation because `sessionDerivedPath` belongs next to `sessionMetaPath` by
-  repo convention rather than in `Derived`.)*
+  `seal-harness.cabal` (library `exposed-modules:` for `Seal.Session.Derived`;
+  test-suite `other-modules:` for **`Seal.Session.DerivedSpec`** — the spec, not
+  the library module, which would be a duplicate-module error), `test/Main.hs`.
+  *(Six files, one concern; declared deviation from the "~5" ceiling because
+  `sessionDerivedPath` belongs beside `sessionMetaPath` by repo convention.)*
 - **API**:
   ```haskell
   data DerivedMeta = DerivedMeta
     { dmVersion           :: !Int
-    , dmLastUserMessageAt :: !(Maybe Text)   -- rendered by showIso
+    , dmLastUserMessageAt :: !(Maybe Text)   -- already rendered by showIso
     , dmEntriesBytes      :: !Int64
     } deriving stock (Eq, Show)
 
   sessionDerivedPath :: SealPaths -> SessionId -> FilePath
   readDerived        :: SealPaths -> SessionId -> IO (Maybe DerivedMeta)
   writeDerived       :: SealPaths -> SessionId -> DerivedMeta -> IO Bool  -- False, never throws
-  derivedIsFresh     :: SealPaths -> SessionId -> IO Bool
   entriesSize        :: SealPaths -> SessionId -> IO (Maybe Int64)
+  derivedIsFresh     :: SealPaths -> SessionId -> IO Bool
+  computeDerived     :: SealPaths -> SessionId -> IO (Maybe DerivedMeta)
+    -- ^ THE single producer: stat -> read -> stat; Nothing when the two sizes
+    --   disagree or entries.jsonl is absent. Used by both WU-2 and WU-3 so the
+    --   parse logic is written once and the race rule is applied once.
   ```
 - **DoD**:
-  1. `sessionDerivedPath` returns `<sessionDir>/derived.json`; `PathsSpec`
-     covers it (mirrors `sessionMetaPath`, `Paths.hs:164`).
-  2. `DerivedMeta` JSON is exactly
-     `{"version":1,"last_user_message_at":…,"entries_bytes":…}`; the timestamp
-     string is opaque to this module (produced by the caller with `showIso`).
-  3. `readDerived` returns `Nothing` — **never throws** — for a missing file,
-     malformed JSON, or `version /= 1`.
-  4. `writeDerived` writes atomically (unique temp from `openBinaryTempFile`,
-     not a fixed `.tmp` name — `Store.hs:130-141` documents that race), mode
-     `0o600`, `renameFile`; **returns `False` and leaves nothing behind** on any
-     failure; **never creates a directory** (returns `False` when the session dir
-     is absent); never throws.
-  5. `entriesSize` returns `Nothing` when `entries.jsonl` is absent (it must not
-     use `getFileSize`, which throws), and `Just n` otherwise (including `0`).
-  6. `derivedIsFresh` = sidecar exists ∧ version ok ∧ `dmEntriesBytes` equals
-     `entriesSize`; **`False` when `entries.jsonl` is absent**.
-  7. QuickCheck (bounded): `decode (encode m) == Right m`; and decoding arbitrary
+  1. `sessionDerivedPath` returns `<sessionDir>/derived.json`; `PathsSpec` covers
+     it (mirrors `sessionMetaPath`, `Paths.hs:164`).
+  2. JSON is exactly
+     `{"version":1,"last_user_message_at":…,"entries_bytes":…}`; version is
+     written as `1`; the timestamp string is opaque here (produced by `showIso`).
+  3. `readDerived` → `Nothing`, never an exception, for: missing file, malformed
+     JSON, `version /= 1` (including a future `version: 2`, which the heal then
+     **overwrites** as `version: 1`), and a non-object value.
+  4. `writeDerived`: unique temp via `openBinaryTempFile` (not a fixed `.tmp`
+     name — `Store.hs:125-139` documents that race), explicit `setFileMode tmp
+     0o600` (the `unix` dep is already present; `openBinaryTempFile` alone is
+     `0600 & ~umask`), `renameFile`; returns `False` and leaves **no** temp file
+     when the session dir is absent or the write fails; never creates a
+     directory; never throws.
+  5. `entriesSize`: `Nothing` when `entries.jsonl` is absent (never
+     `getFileSize`, which throws), `Just 0` for a zero-byte file, `Just n`
+     otherwise.
+  6. `derivedIsFresh` = sidecar present ∧ version ok ∧ `dmEntriesBytes ==
+     entriesSize`; **`False`** when `entries.jsonl` is absent, on every
+     mismatch (smaller *and* larger), and when `dmEntriesBytes` is negative.
+  7. `computeDerived` returns `Nothing` when `entries.jsonl` is absent or when
+     the pre/post stat sizes disagree; otherwise the freshly parsed value with
+     the agreed byte count.
+  8. `DerivedSpec` covers, explicitly: DoD 3's four cases; DoD 4's
+     `False`-and-no-temp case (`entriesSize`-style bogus session dir) and the
+     `0o600` mode (`getFileMode`); DoD 5's `Nothing` / `Just 0`; DoD 6's matrix
+     (absent, smaller, larger, negative); DoD 7's disagreement path.
+  9. QuickCheck (bounded): `decode (encode m) == Right m`; decoding arbitrary
      mutated bytes never throws.
-  8. No partial functions; `-Wall -Werror`; hlint clean.
-- **Deps**: WU-0 (shared `seal-harness.cabal` + `test/Main.hs`).
+ 10. No partial functions; `-Wall -Werror`; hlint clean.
+- **Deps**: WU-0.
 
 ### WU-2 — read path
 
 - **Files**: `src/Seal/Gateway/Transcript.hs` (`lastUserMessageAtFast` only),
   `test/Seal/Gateway/TranscriptSpec.hs`.
+  *(No new test module: I16's two levels are both assertable from
+  `TranscriptSpec`, which can import `Seal.Gateway.ListsSnapshot` — an exposed
+  library module — so no extra cabal/`test/Main.hs` wiring is needed.)*
 - **DoD**:
   1. Fresh sidecar ⇒ return the cached value **without parsing `entries.jsonl`**
      — proven by overwriting `entries.jsonl` with unparseable bytes of the
      *same length* and still getting the cached value.
-  2. Miss / stale ⇒ compute with the existing implementation, then
-     `stat → read → stat`; write the sidecar **only if the two stats agree** and
-     `entries.jsonl` exists. Return the computed value regardless.
-  3. **I17**: appending to `entries.jsonl` (changing size) without touching the
-     sidecar ⇒ the new value is returned and the sidecar is rewritten.
-  4. **I16**: with every `derived.json` deleted, `sessionInfoJsonWithSnippet`
-     output is byte-identical for every session (the shared leaf behind
-     `/api/lists`, `/api/sessions`, `/api/sessions/archived`) — and so is
-     `buildListsSnapshot`. Tested at both levels.
+  2. Miss / stale ⇒ `computeDerived`, then `writeDerived` when it yields a value;
+     return the computed value regardless of whether the write succeeded.
+  3. **I17**: appending to `entries.jsonl` (changing its size) without touching
+     the sidecar ⇒ the new value is returned and the sidecar is rewritten.
+  4. **I16** at both levels: with every `derived.json` deleted,
+     (a) `sessionInfoJsonWithSnippet` output is byte-identical for every session
+     and (b) `buildListsSnapshot` JSON is byte-identical, versus a warm run.
   5. **Corrupt sidecar still lists**: a session whose `derived.json` is garbage
      or `version: 99` appears in the listing with the correct
      `lastUserMessageAt`.
-  6. **Absent `entries.jsonl`**: returns `Nothing`, writes **no** sidecar, and
-     creates **no** directory (the existing `/nonexistent-seal-test` test at
-     `TranscriptSpec.hs:717-721` stays green). Zero-byte `entries.jsonl`:
-     `Nothing` is returned and `{"…":null,"entries_bytes":0}` is a legitimate
-     fresh sidecar.
-  7. `firstUserMessageSnippetFast` is **unchanged** — no new code path, existing
-     tests untouched.
-  8. `-Wall -Werror`; hlint clean; `make check` green.
+  6. **Absent `entries.jsonl`**: `lastUserMessageAtFast` returns `Nothing`,
+     writes **no** sidecar and creates **no** directory. This needs its **own**
+     direct test — the existing `/nonexistent-seal-test` case at
+     `TranscriptSpec.hs:717-721` belongs to the
+     `firstUserMessageSnippetFast` block and does not execute the changed
+     function (which today has no direct test at all).
+  7. **Zero-byte `entries.jsonl`**: returns `Nothing`, and
+     `{"…":null,"entries_bytes":0}` is a legitimate fresh sidecar (a second call
+     returns `Nothing` without re-reading).
+  8. **`entries.jsonl` deleted while a sidecar exists**: the sidecar is ignored
+     (`derivedIsFresh` is `False`), `Nothing` is returned, the orphan file is
+     **left in place** (no delete — the read path never removes files), and no
+     exception escapes.
+  9. `firstUserMessageSnippetFast` is **unchanged** — no new code path; its
+     existing tests are untouched.
+ 10. `-Wall -Werror`; hlint clean; `make check` green.
 - **Deps**: WU-1.
 
 ### WU-3 — `/session reindex`
@@ -150,18 +184,27 @@ Work units are strictly **sequential** — every one of them edits
   `test/Seal/Command/SessionSpec.hs`.
 - **DoD**:
   1. `/session reindex` processes `listSessions <> listArchivedSessions`
-     (top-level, non-child) — `Store.hs:150,172`.
-  2. Prints exactly `written: N  skipped: N  failed: N`, where
-     **written** = `writeDerived` returned `True`, **skipped** = `derivedIsFresh`
-     was already `True` (or `entries.jsonl` is absent), **failed** = `writeDerived`
-     returned `False`.
-  3. Idempotent: a second run reports `written: 0` and the same `skipped` count.
-  4. No flag: it always processes everything (design's `--all` is gone — there is
-     no other mode).
-  5. Parse-and-run is tested through `SessionSpec`'s existing `runSess` hook
-     (`test/Seal/Command/SessionSpec.hs:54-58`); a missing sessions root yields
-     `written: 0 skipped: 0 failed: 0` and does not throw.
-  6. `-Wall -Werror`; hlint clean.
+     (top-level, non-child — `Store.hs:146,168`), using `computeDerived` +
+     `writeDerived` (never `lastUserMessageAtFast`, which would double-write).
+  2. Prints exactly `written: N  skipped: M  failed: K`:
+     **skipped** = `derivedIsFresh` was already `True` **or** `entries.jsonl` is
+     absent (nothing to compute); **failed** = `computeDerived` yielded a value
+     but `writeDerived` returned `False` (reachable by pointing the command at a
+     session directory that exists but is not writable — asserted in the test via
+     a bogus `SessionId` whose dir is absent); **written** = the rest.
+  3. **Values are correct, not just counted**: for each session, the value the
+     reindex wrote makes `lastUserMessageAtFast` return the same thing as it does
+     with all sidecars deleted. Asserted directly — a bytes-correct but
+     `null`-timestamp sidecar must fail this.
+  4. **Idempotent**, stated precisely: run 1 on N sessions (all stale) reports
+     `written: N  skipped: 0`; run 2 reports `written: 0  skipped: N` (the
+     `skipped` count is the *total*, not run 1's count).
+  5. No flag — it always processes everything (the design's `--all` is gone;
+     there is no other mode).
+  6. Missing sessions root ⇒ `written: 0  skipped: 0  failed: 0`, no exception.
+  7. Exercised through `SessionSpec`'s existing `runSess` hook
+     (`test/Seal/Command/SessionSpec.hs:53-58`), asserting the printed line.
+  8. `-Wall -Werror`; hlint clean.
 - **Deps**: WU-2.
 
 ## Dependency graph (strictly sequential)
@@ -206,7 +249,7 @@ make bench-lists       # $(NIX) cabal run -v0 bench-lists -- $(ARGS)
 | Corrupt / unknown-version sidecar | treated as absent; session still lists |
 | Heal write throws in a read path | `writeDerived` returns `Bool`, never throws, never creates dirs |
 | Bench mutates what it measures | one unmeasured warm-up; cold iteration reported separately |
-| Metric 4 not achieved | **gate**: if `make bench-lists` wall time is not ≥5× better than the recorded baseline, the PR is not opened |
+| Metric 4 not achieved | **gate on a named statistic**: the **median of the measured (warm) iterations**, post-change vs the baseline recorded in the PR description. Cold iteration is reported but does not gate (post-change cold includes the one-time heal). If the median is not ≥5× better, the PR is not opened and the findings are escalated. |
 
 ## Files touched (declared scope, code branch only)
 
@@ -228,6 +271,13 @@ test/Seal/Command/SessionSpec.hs
 Docs (`docs/superpowers/specs/…`, `docs/superpowers/plans/…`) ship on
 `docs/session-dispositions-spec` **before** this branch is opened, so PR 0 is one
 logical change.
+
+## Open item (operator action, not a work unit)
+
+AGENTS.md rule 2 makes issues human-authored, so the tracking issue for this epic
+is **not** created by the agent. The PR body will carry `Closes #NN` once the
+operator files it; design §12 Q-E records the same prerequisite. This is an
+explicit open item rather than a silent omission.
 
 ## Human checkpoints
 

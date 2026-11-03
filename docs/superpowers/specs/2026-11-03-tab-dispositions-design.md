@@ -725,24 +725,50 @@ unit therefore names its own command and is run by hand (Q-B covers promoting it
 
 ### PR 0 — the derived sidecar (independent, ships first, measurable alone)
 
-**W0 — `Seal.Session.Derived` + read/write wiring.**
-New `src/Seal/Session/Derived.hs` (`derived.json` encode/decode, atomic write,
-size validity check, one accessor); `src/Seal/Gateway/Transcript.hs`
-(`lastUserMessageAtFast` / `firstUserMessageSnippetFast` consult it and fall back
-+ heal); the transcript append path (`Seal.Handles.Transcript` /
-`Seal.Session.Derived.noteAppended`) updates it; `src/Seal/Command/Session.hs`
-(`/session reindex` — a slash command; the binary exposes only
-`tui`/`serve`/`gen-openapi`, `src/Seal/Types/Command.hs:15-19`).
-Wiring: `seal-harness.cabal` (library exposed-modules + test-suite
-`other-modules`), `test/Main.hs`.
-RED: round-trip encode/decode; unknown `version` → treated as absent; corrupt
-JSON → treated as absent, session still lists; **I16** (delete all sidecars →
-identical snapshot JSON); **I17** (touch `entries.jsonl` newer than the sidecar →
-slow path runs, value is current, sidecar rewritten); append → sidecar updated;
-`/session reindex` is idempotent.
-`make bench-lists` target (see §12 Q-G) printing per-phase timings and bytes.
-**No behaviour change, no wire change, no UI change** — this PR is revertible
-with zero user-visible effect.
+**W0a — bench instrument (`exe/bench-lists`).** A separate executable (not a
+`seal` subcommand: the binary exposes only `tui`/`serve`/`gen-openapi`,
+`src/Seal/Types/Command.hs:15-19`). Calls the production `buildListsSnapshot`;
+one unmeasured warm-up, then N measured iterations; prints session count, the
+cold iteration separately, the measured median, and *modelled bytes*
+(Σ `size(entries.jsonl)` vs Σ `size(derived.json)`) — file-size accounting, not
+syscall instrumentation. `make bench-lists` wraps it in `nix develop`.
+
+**W0b — `Seal.Session.Derived`.** New module: `derived.json` encode/decode,
+atomic `0o600` write that never creates a directory and never throws
+(`writeDerived :: … -> IO Bool`), `readDerived`, `entriesSize`,
+`derivedIsFresh` (byte-count key), and `computeDerived` — the single
+stat → read → stat producer that both the read path and reindex call.
+
+**W0c — read path.** `lastUserMessageAtFast`
+(`src/Seal/Gateway/Transcript.hs`) consults the sidecar and heals on miss or
+size mismatch, using `computeDerived`. **`firstUserMessageSnippetFast` is
+untouched** — it derives from `conversation.jsonl`, so it is neither cached nor
+keyed by this sidecar (§5.11 decision 1).
+
+**W0d — `/session reindex`.** A slash subcommand (`GroupSession`), not a binary
+command: processes `listSessions <> listArchivedSessions`, prints
+`written / skipped / failed`, idempotent.
+
+**Deferred: the append-time hook** (§5.11, §11.9) — it needs `withIndexedTranscript`
+to carry a sidecar path and the daemon to track the last request timestamp, and
+it buys ~nothing because every turn appends non-request entries afterwards.
+
+Wiring: `seal-harness.cabal` (library exposed-modules; test-suite
+`other-modules`; the new `executable bench-lists` stanza), `test/Main.hs`.
+
+RED: codec round-trip; unknown `version` → treated as absent (and the heal
+rewrites it as `version: 1`); corrupt JSON → treated as absent **and the session
+still lists**; `entries.jsonl` deleted while a sidecar exists → the sidecar is
+ignored, the value is `Nothing`, and the orphan file is left in place;
+writeDerived returns `False` on a missing session dir and leaves no temp file;
+mode `0o600`; **I16** (delete all sidecars → byte-identical
+`sessionInfoJsonWithSnippet` *and* `buildListsSnapshot` output); **I17** (append
+to `entries.jsonl` → the value is current and the sidecar is rewritten);
+`/session reindex` writes correct values (identity with the no-sidecar run) and
+is idempotent.
+
+**No behaviour change, no wire change, no UI change** — revertible with zero
+user-visible effect.
 
 ### PR 1 — vocabulary, storage, route, coupling (backend only, nothing user-visible)
 
