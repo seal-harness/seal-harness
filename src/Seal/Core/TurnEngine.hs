@@ -97,7 +97,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, AgentHandoffDeps (..), agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -269,7 +269,7 @@ buildSessionRegistry
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
-  -> AgentWorkerBuilder
+  -> AgentHandoffDeps
   -> HarnessRegistry
   -> TmuxRunner
   -> Maybe Manager
@@ -277,7 +277,7 @@ buildSessionRegistry
   -> Bool
   -> ISA.Registry
 buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring handoffWorker harnessReg tmuxRunner httpManager caps onDemand =
+                     startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
@@ -305,7 +305,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-     , agentManageOp startWiring handoffWorker
+     , agentManageOp startWiring handoffDeps
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
@@ -734,14 +734,17 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
       channelLabel = taChannelLabel adapter meta'
-      handoffWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+      handoffDeps = AgentHandoffDeps
+        { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+        , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+        }
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
       -- broadcast idle → thinking around the blocking ccPrompt call. This
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
-                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffWorker
+                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
@@ -1107,9 +1110,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
-        handoffWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+        handoffDeps = AgentHandoffDeps
+          { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+          , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+          }
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
-                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffWorker
+                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid

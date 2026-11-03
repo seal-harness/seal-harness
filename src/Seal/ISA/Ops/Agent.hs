@@ -30,6 +30,7 @@ module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
   , agentDefManageOp
   , agentManageOp
+  , AgentHandoffDeps (..)
   , agentDefReadOp
   , agentDefListOp
   , agentDefDeleteOp
@@ -54,7 +55,7 @@ module Seal.ISA.Ops.Agent
   , allowSpawnBlockedMsg
   ) where
 
-import Control.Monad (join, forM_)
+import Control.Monad (join, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
@@ -568,6 +569,19 @@ data AgentStartWiring = AgentStartWiring
     -- wiring time.
   }
 
+-- | Handoff-specific dependencies for @AGENT_MANAGE action=handoff@.
+-- Grouped separately from 'AgentStartWiring' to avoid adding fields to
+-- the already-large start wiring (which is constructed in many places).
+-- The 'ahdEnsureTab' callback creates a frontend tab for the new
+-- top-level session; 'Nothing' in test wirings.
+data AgentHandoffDeps = AgentHandoffDeps
+  { ahdWorker     :: !AgentWorkerBuilder
+    -- ^ The worker builder for top-level sessions (uses @dwdTopLevel = True@).
+  , ahdEnsureTab  :: !(Maybe (SessionId -> IO ()))
+    -- ^ When 'Just', called with the new session id to create an active
+    -- tab in the frontend (unless the caller passes @active_tab = false@).
+  }
+
 -- | The role/switch condition the nested AGENT_START enforces before it
 -- will spawn. Leaf children (and orchestrator children while the kill
 -- switch is off) get a present-but-rejecting op whose authorize returns
@@ -900,10 +914,11 @@ handleStartBackground wiring _v di = do
 -- doesn't block it).
 --
 -- Single-task only (no batch mode). Always async (no foreground mode).
-handleHandoff :: AgentStartWiring -> AgentWorkerBuilder -> Value -> App OpResult
-handleHandoff wiring handoffWorker v = do
+handleHandoff :: AgentStartWiring -> AgentHandoffDeps -> Value -> App OpResult
+handleHandoff wiring handoffDeps v = do
   let mDefId = idField v
-      mGoal  = textFieldMaybe "goal" v
+      mGoal    = textFieldMaybe "goal" v
+      activeTab = fromMaybe True (boolField v "active_tab")
   case (mDefId, mGoal) of
     (Just defId, Just goal) | not (T.null goal) -> do
       cfg <- liftIO (aswConfig wiring)
@@ -928,13 +943,16 @@ handleHandoff wiring handoffWorker v = do
                                             runtime
                                             0
                                             orchEnabled
-                                            handoffWorker)
+                                            (ahdWorker handoffDeps))
                                callback
                                spawnCb
                                (aswMintSession wiring))
       case eSpawnInfos of
         Left err -> pure (OpResult [TrpText err] True (object []))
-        Right spawnInfos ->
+        Right spawnInfos -> do
+          when activeTab $
+            forM_ (ahdEnsureTab handoffDeps) $ \ensureTab ->
+              liftIO (mapM_ (ensureTab . siChildSession) spawnInfos)
           pure (OpResult [TrpText (encodeHandoffSpawnInfos spawnInfos)] False
                  (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
     (Just _, Just _) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires a non-empty 'goal'."] True (object []))
@@ -1018,8 +1036,8 @@ handleInterrupt runtime v = do
 -- @status@, @stop@, and @interrupt@. The @start@ action carries the full
 -- 'AgentStartWiring' (delegation config, worker builder, role/kill-switch
 -- gate, batch mode).
-agentManageOp :: AgentStartWiring -> AgentWorkerBuilder -> Opcode
-agentManageOp wiring handoffWorker = TrustedOpcode
+agentManageOp :: AgentStartWiring -> AgentHandoffDeps -> Opcode
+agentManageOp wiring handoffDeps = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
   , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), handoff (spawn a new top-level agent session — fire-and-forget; the new session is independent with no parent-child lineage; returns session_id + subagent_id), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
@@ -1060,6 +1078,10 @@ agentManageOp wiring handoffWorker = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "description" .= ("Subagent id (status/stop/interrupt)." :: Text)
               ]
+          , fromText "active_tab" .= object
+              [ "type" .= ("boolean" :: Text)
+              , "description" .= ("When true (default), create an active frontend tab for the new session. Only meaningful for handoff." :: Text)
+              ]
           ]
       , "required" .= (["action"] :: [Text])
       ]
@@ -1072,7 +1094,7 @@ agentManageOp wiring handoffWorker = TrustedOpcode
         Right action -> case action of
           AgInstances -> handleInstances (aswRuntime wiring)
           AgStart     -> handleStart wiring v
-          AgHandoff   -> handleHandoff wiring handoffWorker v
+          AgHandoff   -> handleHandoff wiring handoffDeps v
           AgStatus    -> handleStatus (aswRuntime wiring) v
           AgStop      -> handleStop (aswRuntime wiring) v
           AgInterrupt -> handleInterrupt (aswRuntime wiring) v

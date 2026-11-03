@@ -28,6 +28,7 @@ import Seal.ISA.Opcode
   ( OpResult (..), localBackend, opAuthorize, opRun )
 import Seal.ISA.Ops.Agent
   ( AgentStartWiring (..)
+  , AgentHandoffDeps (..)
   , gateOpen
   , agentDefWriteOp
   , agentManageOp
@@ -81,6 +82,17 @@ mkWiring backend rt pauseFlag = AgentStartWiring
   , aswOnIdleCompletion = Nothing
   }
 
+-- | Handoff deps with a stub worker and no tab callback (tests).
+stubDeps :: Del.AgentWorkerBuilder -> AgentHandoffDeps
+stubDeps worker = AgentHandoffDeps { ahdWorker = worker, ahdEnsureTab = Nothing }
+
+-- | Handoff deps that track whether ensureTab was called.
+tabTrackingDeps :: IORef Bool -> Del.AgentWorkerBuilder -> AgentHandoffDeps
+tabTrackingDeps ref worker = AgentHandoffDeps
+  { ahdWorker = worker
+  , ahdEnsureTab = Just (\_ -> writeIORef ref True)
+  }
+
 spec :: Spec
 spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
   describe "AGENT_MANAGE action=handoff (authorize)" $ do
@@ -89,7 +101,7 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
       rt <- newAgentRuntime
       pauseFlag <- newSpawnPauseFlag
       let wiring = mkWiring backend rt pauseFlag
-      case opAuthorize (agentManageOp wiring stubWorker)
+      case opAuthorize (agentManageOp wiring (stubDeps stubWorker))
                        (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text), "goal" .= ("do stuff" :: Text)]) of
         Right () -> pure ()
         Left e   -> expectationFailure ("expected authorize to pass, got: " <> T.unpack e)
@@ -99,7 +111,7 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
       rt <- newAgentRuntime
       pauseFlag <- newSpawnPauseFlag
       let wiring = mkWiring backend rt pauseFlag
-      case opAuthorize (agentManageOp wiring stubWorker)
+      case opAuthorize (agentManageOp wiring (stubDeps stubWorker))
                        (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)]) of
         Left e   -> T.isInfixOf "goal" e `shouldBe` True
         Right () -> expectationFailure "expected authorize to reject missing goal"
@@ -109,7 +121,7 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
       rt <- newAgentRuntime
       pauseFlag <- newSpawnPauseFlag
       let wiring = mkWiring backend rt pauseFlag
-      case opAuthorize (agentManageOp wiring stubWorker)
+      case opAuthorize (agentManageOp wiring (stubDeps stubWorker))
                        (object ["action" .= ("handoff" :: Text), "goal" .= ("do stuff" :: Text)]) of
         Left e   -> T.isInfixOf "id" e `shouldBe` True
         Right () -> expectationFailure "expected authorize to reject missing id"
@@ -119,8 +131,7 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
       rt <- newAgentRuntime
       pauseFlag <- newSpawnPauseFlag
       let wiring = mkWiring backend rt pauseFlag
-      -- tasks without top-level id → authorize rejects because 'id' is missing.
-      case opAuthorize (agentManageOp wiring stubWorker)
+      case opAuthorize (agentManageOp wiring (stubDeps stubWorker))
                        (object ["action" .= ("handoff" :: Text)
                                , "tasks" .= [object ["id" .= ("a1" :: Text), "goal" .= ("go" :: Text)]]]) of
         Left e   -> T.isInfixOf "id" e `shouldBe` True
@@ -136,8 +147,8 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
                                      , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       let wiring = mkWiring backend rt pauseFlag
-          worker = recordingWorker ran
-      r <- runTestApp (opRun (agentManageOp wiring worker) localBackend
+          deps = stubDeps (recordingWorker ran)
+      r <- runTestApp (opRun (agentManageOp wiring deps) localBackend
                             (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
                                     , "goal" .= ("do the thing" :: Text)]))
       orIsError r `shouldBe` False
@@ -146,7 +157,6 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
           T.isInfixOf "running" t `shouldBe` True
           T.isInfixOf "handoff" t `shouldBe` True
         _ -> expectationFailure "expected a single text part"
-      -- The async worker should have run.
       threadDelay 100000
       readIORef ran `shouldReturn` 1
 
@@ -156,15 +166,11 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
       pauseFlag <- newSpawnPauseFlag
       ran <- newIORef (0 :: Int)
       let wiring = mkWiring backend rt pauseFlag
-          worker = recordingWorker ran
-      r <- runTestApp (opRun (agentManageOp wiring worker) localBackend
+          deps = stubDeps (recordingWorker ran)
+      r <- runTestApp (opRun (agentManageOp wiring deps) localBackend
                             (object ["action" .= ("handoff" :: Text), "id" .= ("nope" :: Text)
                                     , "goal" .= ("go" :: Text)]))
-      -- The spawn returns immediately with SpawnInfo — the def resolution
-      -- error is delivered async via the completion callback (which
-      -- registers the error result in the runtime).
       orIsError r `shouldBe` False
-      -- The worker should NOT have run (def resolution fails).
       threadDelay 100000
       readIORef ran `shouldReturn` 0
 
@@ -177,11 +183,61 @@ spec = describe "Seal.ISA.Ops.AgentHandoff" $ do
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
                                      , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       let wiring = mkWiring backend rt pauseFlag
-          worker = recordingWorker ran
-      _ <- runTestApp (opRun (agentManageOp wiring worker) localBackend
+          deps = stubDeps (recordingWorker ran)
+      _ <- runTestApp (opRun (agentManageOp wiring deps) localBackend
                             (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
                                     , "goal" .= ("do the thing" :: Text)]))
-      -- The spawn callback runs in a forked thread — wait for it.
       threadDelay 100000
       insts <- listAgents rt
       length insts `shouldBe` 1
+
+  describe "AGENT_MANAGE action=handoff (active_tab)" $ do
+    it "calls ensureTab by default (active_tab not specified)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      tabCalled <- newIORef False
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = mkWiring backend rt pauseFlag
+          deps = tabTrackingDeps tabCalled (recordingWorker ran)
+      _ <- runTestApp (opRun (agentManageOp wiring deps) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("do the thing" :: Text)]))
+      readIORef tabCalled `shouldReturn` True
+
+    it "calls ensureTab when active_tab=true" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      tabCalled <- newIORef False
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = mkWiring backend rt pauseFlag
+          deps = tabTrackingDeps tabCalled (recordingWorker ran)
+      _ <- runTestApp (opRun (agentManageOp wiring deps) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("do the thing" :: Text)
+                                    , "active_tab" .= True]))
+      readIORef tabCalled `shouldReturn` True
+
+    it "does NOT call ensureTab when active_tab=false" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      tabCalled <- newIORef False
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = mkWiring backend rt pauseFlag
+          deps = tabTrackingDeps tabCalled (recordingWorker ran)
+      _ <- runTestApp (opRun (agentManageOp wiring deps) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("do the thing" :: Text)
+                                    , "active_tab" .= False]))
+      readIORef tabCalled `shouldReturn` False
