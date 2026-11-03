@@ -73,6 +73,7 @@ import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.List (find)
 import Data.Set qualified as Set
@@ -122,7 +123,8 @@ import Seal.Agent.Runtime.Registry
   , interruptAgent, listAgents, listAgentsFor
   , ownsChild
   , pollUntil
-  , registerRunCrash, registerRunResult, registerRunningChild
+  , registerFinishedChild, registerRunCrash, registerRunResult
+  , registerRunningChild
   , resumeAgent
   , stopAgent
   , workerSettled )
@@ -819,6 +821,7 @@ handleStart wiring v = do
 handleStartForeground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
 handleStartForeground wiring _v di = do
   cfg <- liftIO (aswConfig wiring)
+  captured <- liftIO (newIORef [] :: IO (IORef [(ChildTask, AgentDef)]))
   let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
       runtime = aswRuntime wiring
       resolver task = do
@@ -832,6 +835,10 @@ handleStartForeground wiring _v di = do
           Left err -> pure (Left err)
           Right (def, worker) -> do
             childSid <- aswMintSession wiring
+            -- Pair the def with the task VALUE: the resolver is handed no task
+            -- index and batch runs are forked, so a zip by call order would not
+            -- be deterministic.
+            modifyIORef' captured ((task, def) :)
             pure (Right (def, worker, childSid))
   eResults <- liftIO (runDelegate
                         cfg
@@ -842,9 +849,38 @@ handleStartForeground wiring _v di = do
                         resolver)
   case eResults of
     Left err -> pure (OpResult [TrpText err] True (object []))
-    Right results ->
+    Right results -> do
+      defs <- liftIO (readIORef captured)
+      liftIO (registerForegroundChildren wiring di defs results)
       pure (OpResult [TrpText (encodeForegroundResults results)] False
              (object ["results" .= fmap toJSONChildResult results]))
+
+-- | Register the children a foreground @start@ ran, so they are retained and
+-- continuable exactly like background ones (a foreground child that cannot be
+-- paired is simply not registered — its @continue@ then fails cleanly instead
+-- of acting on a mis-paired snapshot).
+registerForegroundChildren
+  :: AgentStartWiring -> DelegateInput -> [(ChildTask, AgentDef)]
+  -> [ChildResult] -> IO ()
+registerForegroundChildren wiring di defs results = do
+  let tasks = case di of
+        DiSingle t -> [t]
+        DiBatch ts -> ts
+  forM_ results $ \result ->
+    case (taskAt tasks (crTaskIndex result), crChildSession result) of
+      (Just task, Just childSid) ->
+        case lookup task defs of
+          Nothing -> pure ()
+          Just def ->
+            registerFinishedChild (aswRuntime wiring) (adId def)
+              (crSubagentId result) (aswParentSession wiring) childSid
+              (aswParentDepth wiring + 1) (Just task) (Just def)
+              (crTaskIndex result) SoStartForeground
+      _ -> pure ()
+  where
+    taskAt ts i = case drop i ts of
+      (t : _) | i >= 0 -> Just t
+      _                -> Nothing
 
 -- | The run generation a freshly registered instance carries
 -- ('registerRunningChild' inserts at generation 1). The spawn callback's crash

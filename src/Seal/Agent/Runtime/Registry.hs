@@ -30,6 +30,7 @@ module Seal.Agent.Runtime.Registry
   , registerRunningAgent
   , registerRunningChild
   , registerFinishedAgent
+  , registerFinishedChild
   , registerCompletedAgentResult
   , registerRunResult
   , registerRunCrash
@@ -351,6 +352,46 @@ registerFinishedAgent (AgentRuntime tv) aid subagentId parentSession session dep
     writeTVar tv (Map.insert subagentId inst insts)
   globalLogIO DebugS (ls ("[idle-diag] registerFinishedAgent: subagent=" <> subagentIdText subagentId
     <> " thread=" <> T.pack (show tid)))
+
+-- | Register a child that ran to completion synchronously, WITH its spawn
+-- snapshot — the foreground-@start@ path, whose children must stay continuable
+-- exactly like background ones. No worker handle (there is no live thread).
+registerFinishedChild
+  :: AgentRuntime
+  -> AgentDefId
+  -> SubagentId
+  -> SessionId
+  -> SessionId
+  -> Int
+  -> Maybe ChildTask
+  -> Maybe AgentDef
+  -> Int
+  -> SpawnOrigin
+  -> IO ()
+registerFinishedChild (AgentRuntime tv) aid subagentId parentSession session depth mTask mDef taskIndex origin = do
+  now <- getCurrentTime
+  atomically $ do
+    insts <- readTVar tv
+    let inst = AgentInstance
+          { aiId = aid
+          , aiSubagentId = subagentId
+          , aiSession = session
+          , aiStatus = Stopped
+          , aiWorkerThread = Nothing
+          , aiDepth = depth
+          , aiParentSession = parentSession
+          , aiResult = Nothing
+          , aiTask = mTask
+          , aiDef = mDef
+          , aiTaskIndex = taskIndex
+          , aiGeneration = 1
+          , aiOrigin = origin
+          , aiRuns = 1
+          , aiLastActivity = now
+          }
+    writeTVar tv (Map.insert subagentId inst insts)
+  globalLogIO DebugS (ls ("[idle-diag] registerFinishedChild: subagent=" <> subagentIdText subagentId
+    <> " taskIndex=" <> T.pack (show taskIndex)))
 
 -- | Register a completed async child's result in the runtime registry.
 -- Updates the existing entry's status to 'Stopped' (or 'Crashed' if the

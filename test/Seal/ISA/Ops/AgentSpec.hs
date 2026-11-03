@@ -6,7 +6,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (AsyncException (ThreadKilled), bracket, throwIO)
-import Control.Monad (forM_, replicateM_, void, when)
+import Control.Monad (forM_, replicateM, replicateM_, void, when)
 import Data.Aeson (Value, encode, object, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.ByteString.Lazy qualified as BL
@@ -1135,6 +1135,73 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
                           , "mode" .= ("foreground" :: Text) ]
         orIsError r `shouldBe` False
         readIORef seen `shouldReturn` Just "do the thing"
+
+    it "refuses at the run budget and does not spend one on the refusal" $
+      withSystemTempDirectory "seal-budget" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        let w = mkLifecycleWiringAt paths backend rt pf (recordingWorker' "ok") Nothing
+        _ <- spawnGreeter w
+        finished <- pollUntil 2000 (any (isJust . aiResult) <$> listAgentsFor rt sampleSession)
+        finished `shouldBe` True
+        seedChildDir paths sampleSession 8
+        sid <- onlySid rt
+        let continueOnce = continueOn w [ "subagent_id" .= subagentIdText sid
+                                         , "mode" .= ("foreground" :: Text) ]
+        -- runs 1 (the spawn) + 49 continues = the budget of 50
+        allowed <- replicateM 49 continueOnce
+        map orIsError allowed `shouldBe` replicate 49 False
+        atCap <- agentStatusFor rt sampleSession sid
+        case atCap of
+          Left e -> expectationFailure ("child vanished: " <> T.unpack e)
+          Right i -> aiRuns i `shouldBe` 50
+        refused <- continueOnce
+        orIsError refused `shouldBe` True
+        resultText refused `shouldBe` ("continue: subagent " <> subagentIdText sid
+          <> " has been continued 50 times; start a fresh child for new work.")
+        -- the refusal consumed nothing
+        still <- agentStatusFor rt sampleSession sid
+        case still of
+          Left _ -> pure ()
+          Right i -> aiRuns i `shouldBe` 50
+
+    it "registers a foreground-spawned child so it can be continued" $
+      withSystemTempDirectory "seal-fg" $ \root -> do
+        let paths = scratchPaths root
+        backend <- noneBackend
+        defineGreeter backend
+        rt <- newAgentRuntime
+        pf <- newSpawnPauseFlag
+        runs <- newIORef (0 :: Int)
+        let worker _ _ _ _ = do
+              modifyIORef' runs (+ 1)
+              pure (ChildWorkerOutcome (Just "fg reply") CerCompleted 0 0
+                     (Just childSessionFixture))
+            w = mkLifecycleWiringAt paths backend rt pf worker Nothing
+        r0 <- runTestApp (opRun (agentStartOp w) localBackend
+                (object [ "id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)
+                        , "mode" .= ("foreground" :: Text) ]))
+        orIsError r0 `shouldBe` False
+        readIORef runs `shouldReturn` 1
+        insts <- listAgentsFor rt sampleSession
+        case insts of
+          [inst] -> do
+            aiStatus inst `shouldBe` Stopped
+            aiOrigin inst `shouldBe` SoStartForeground
+            aiRuns inst `shouldBe` 1
+            fmap adId (aiDef inst) `shouldBe` Just sampleDefId
+            aiTask inst `shouldBe` Just (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+            seedChildDir paths sampleSession 8
+            r <- continueOn w [ "subagent_id" .= subagentIdText (aiSubagentId inst)
+                              , "mode" .= ("foreground" :: Text) ]
+            when (orIsError r) $
+              expectationFailure ("continue refused: " <> T.unpack (resultText r))
+            readIORef runs `shouldReturn` 2
+            T.isInfixOf "replied (continue #2)" (resultText r) `shouldBe` True
+          _ -> expectationFailure "expected exactly one registered child"
 
     it "background continue acks continued #2 and delivers the reply with one wake" $
       withSystemTempDirectory "seal-continue" $ \root -> do
