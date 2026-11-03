@@ -3,6 +3,7 @@ module Seal.Agent.Runtime.RegistrySpec (spec) where
 
 import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (throwIO)
+import Control.Monad (forM_)
 import Data.List (isInfixOf)
 import Data.IORef
 import qualified Data.Text as T
@@ -109,6 +110,19 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
       crashed `shouldBe` True
       _ <- stopAgent rt sampleParentSession sampleSubagentId
       pure ()
+
+    it "records Crashed for a worker that throws before its handle is stored" $ do
+      rt <- newAgentRuntime
+      -- The crash write is a 'Map.adjust', so it only lands if the instance is
+      -- already in the map. With the insert happening after the fork, an
+      -- instantly-throwing worker won the race often enough to flake the
+      -- suite; twenty of them make a regression certain rather than likely.
+      forM_ [1 .. 20 :: Int] $ \n -> do
+        let sid = SubagentId ("sa-a1-crash-" <> T.pack (show n))
+        _ <- startAgent rt sampleDefId sid sampleParentSession sampleSession 0
+               (throwIO (userError "boom"))
+        crashed <- pollUntil 2000 (maybe False isCrashed <$> statusOf rt sid)
+        (n, crashed) `shouldBe` (n, True)
 
   describe "stopAgent" $ do
     it "retains the instance as Stopped so it stays resumable" $ do

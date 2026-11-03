@@ -203,9 +203,12 @@ hasRunningChildren (AgentRuntime tv) parentSid = do
 -- succeeds, or 'Crashed' on exception.
 startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
 startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker = do
-  tid <- forkIO (runWorker tv subagentId 1 worker)
   now <- getCurrentTime
-  mInst <- atomically $ do
+  -- Insert BEFORE forking. 'runWorker' records a crash with 'Map.adjust', so a
+  -- worker that throws on its first instruction would otherwise write into an
+  -- empty map, lose the 'Crashed' transition, and leave the entry 'Running'
+  -- for ever. An instantly-throwing worker does win this race under load.
+  claimed <- atomically $ do
     insts <- readTVar tv
     if Map.member subagentId insts
       then pure Nothing  -- lost the race; shouldn't happen with random ids
@@ -214,8 +217,8 @@ startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker =
               { aiId = aid
               , aiSubagentId = subagentId
               , aiSession = session
-              , aiStatus = Running
-              , aiWorkerThread = Just tid
+              , aiStatus = Starting
+              , aiWorkerThread = Nothing
               , aiDepth = depth
               , aiParentSession = parentSession
               , aiResult = Nothing
@@ -229,11 +232,32 @@ startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker =
               }
         writeTVar tv (Map.insert subagentId inst insts)
         pure (Just inst)
-  case mInst of
-    Just inst -> pure (Right inst)
-    Nothing   -> do
-      killThread tid
-      pure (Left "agent already running for this subagent id")
+  case claimed of
+    Nothing -> pure (Left "agent already running for this subagent id")
+    Just inst -> do
+      -- The worker waits for its own handle to be recorded, so there is no
+      -- window in which 'stopAgent' finds an instance it cannot kill.
+      gate <- newEmptyTMVarIO
+      tid <- forkIO $ do
+        atomically (takeTMVar gate)
+        runWorker tv subagentId 1 worker
+      recorded <- atomically $ do
+        insts <- readTVar tv
+        case Map.lookup subagentId insts of
+          Just i | aiGeneration i == 1 && aiStatus i == Starting -> do
+            writeTVar tv (Map.insert subagentId
+                            (i { aiStatus = Running, aiWorkerThread = Just tid }) insts)
+            pure True
+          _ -> pure False
+      if recorded
+        then do
+          atomically (putTMVar gate ())
+          pure (Right inst { aiStatus = Running, aiWorkerThread = Just tid })
+        else do
+          -- A stop (or an interrupt) claimed the instance before its handle
+          -- existed: the body must never run.
+          killThread tid
+          pure (Right inst { aiStatus = Stopped, aiWorkerThread = Nothing })
 
 -- | Register a running agent instance WITHOUT forking a worker thread.
 -- Used by 'runDelegateAsync' which forks its own threads (via 'forkIO')
