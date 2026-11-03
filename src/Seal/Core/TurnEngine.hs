@@ -97,7 +97,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, AgentHandoffDeps (..), agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -269,6 +269,7 @@ buildSessionRegistry
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
+  -> AgentHandoffDeps
   -> HarnessRegistry
   -> TmuxRunner
   -> Maybe Manager
@@ -276,7 +277,7 @@ buildSessionRegistry
   -> Bool
   -> ISA.Registry
 buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring harnessReg tmuxRunner httpManager caps onDemand =
+                     startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
@@ -304,7 +305,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-     , agentManageOp startWiring
+     , agentManageOp startWiring handoffDeps
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
@@ -732,13 +733,18 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   turnRepeatTrack <- lookupOrCreateRepeatTrack (tdRepeatReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
+      channelLabel = taChannelLabel adapter meta'
+      handoffDeps = AgentHandoffDeps
+        { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+        , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+        }
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
       -- broadcast idle → thinking around the blocking ccPrompt call. This
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
-                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
@@ -1104,8 +1110,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
+        handoffDeps = AgentHandoffDeps
+          { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+          , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+          }
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
-                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
@@ -1203,7 +1213,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswWorker =
         case tdMkWorker td of
           Just stub | 1 >= tdMkWorkerStubDepth td -> stub
-          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0
+          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0 False
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
@@ -1256,8 +1266,12 @@ buildWorker
      -- ^ This worker's OWN delegation depth (0 = a top-level session's
      -- worker; its children run at depth 1). Threaded so an orchestrator
      -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
+  -> Bool
+     -- ^ When 'True', the worker creates a top-level session (handoff)
+     -- instead of a child session nested under the parent's @agents\/@
+     -- directory. See 'dwdTopLevel' in "Seal.Agent.Runtime.Delegation.Worker".
   -> AgentWorkerBuilder
-buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth =
+buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth topLevel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
@@ -1302,6 +1316,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       -- re-reading its own session transcript is guarded by the child's
       -- own counts.
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+    , dwdTopLevel = topLevel
     }
   where
     -- The parent session's front-matter toggle, read from its session.json
@@ -1438,6 +1453,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
         _ -> buildWorker td sessionBackends childSid lineage adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
+                          False
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at
   -- authorize: leaf/kill-switch rejections carry the dedicated messages

@@ -41,7 +41,7 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
-import Seal.Config.Paths (SealPaths, agentSessionDir, sessionMetaPath)
+import Seal.Config.Paths (SealPaths, agentSessionDir, sessionMetaPath, sessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (withIndexedTranscript)
@@ -51,7 +51,7 @@ import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (saveChildSessionMeta)
+import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
 import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Timeout (ToolTimeoutConfig)
@@ -246,6 +246,13 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config, inherited from the parent
     -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
+  , dwdTopLevel :: !Bool
+    -- ^ When 'True', the worker creates a **top-level** session (used by
+    -- @AGENT_MANAGE action=handoff@) instead of a child session nested
+    -- under the parent's @agents\/@ directory. The session directory
+    -- becomes @sessions\/\<sid\>@ (visible to @SESSION_LIST@), the
+    -- metadata has @smParent = Nothing@, the lineage is @[sid]@ only,
+    -- and the delegation depth is 0.
   }
 
 -- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
@@ -259,8 +266,11 @@ data DelegationWorkerDeps = DelegationWorkerDeps
 -- prompt the human — that would deadlock the parent).
 mkDelegateWorker :: DelegationWorkerDeps -> AgentWorkerBuilder
 mkDelegateWorker deps agentDef childSid task _hooks = do
-  let childDir = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
-      childDepth = dwdParentDepth deps + 1
+  let topLevel = dwdTopLevel deps
+      childDir = if topLevel
+                   then sessionDir (dwdPaths deps) childSid
+                   else agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
+      childDepth = if topLevel then 0 else dwdParentDepth deps + 1
   createDirectoryIfMissing True childDir
   let resolve = case dwdResolveProviderOverride deps of
         Just testResolve -> testResolve agentDef
@@ -272,7 +282,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                        CerError 0 0 (Just childSid))
     Right (prov, model) ->
       withIndexedTranscript childDir $ \childTHandle -> do
-        writeChildMeta deps childSid
+        if topLevel
+          then writeHandoffMeta deps childSid
+          else writeChildMeta deps childSid
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
         let capturingCaps = def
@@ -282,7 +294,10 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         -- The child's full lineage, self first: the child's own id
         -- prepended to the parent's baked chain. Passed into the
         -- registry seam so the child's session ops get the whole chain.
-        let childLineage = childSid : dwdParentLineage deps
+        -- For top-level (handoff): lineage is just [childSid] — no parent chain.
+        let childLineage = if topLevel
+                             then [childSid]
+                             else childSid : dwdParentLineage deps
         childReg <- dwdChildRegistry deps childLineage agentDef childDepth
                                       (effectiveRole (adRole agentDef) (ctRole task))
                                       childSid capturingCaps
@@ -381,3 +396,32 @@ loadParentMeta deps = do
   let mp = sessionMetaPath (dwdPaths deps) (dwdParentSid deps)
   exists <- doesFileExist mp
   if not exists then pure Nothing else decodeFileStrict mp
+
+-- | Write a 'SessionMeta' for a top-level handoff session into its
+-- top-level dir (@sessions\/\<sid\>\/session.json@): the session's own id,
+-- the originating session's provider/model (for audit trail), channel
+-- @"agent"@, and 'smParent' = 'Nothing' (top-level — no parent). The
+-- handoff session IS visible to 'Seal.Session.Store.listSessions' (it's
+-- a top-level dir, not nested under @agents\/@).
+writeHandoffMeta :: DelegationWorkerDeps -> SessionId -> IO ()
+writeHandoffMeta deps childSid = do
+  mParent <- loadParentMeta deps
+  now <- getCurrentTime
+  let (provider, model) = case mParent of
+        Just pm -> (smProvider pm, smModel pm)
+        Nothing -> ("unknown", "unknown")
+  saveSessionMeta (dwdPaths deps) SessionMeta
+    { smId = childSid
+    , smProvider = provider
+    , smModel = model
+    , smChannel = "agent"
+    , smParent = Nothing
+    , smAgent = Nothing
+    , smSystemOverride = Nothing
+    , smAgentName = Nothing
+    , smDescription = Nothing
+    , smSealFrontMatter = True
+    , smRepoUrl = Nothing
+    , smCreatedAt = now
+    , smLastActive = now
+    }

@@ -476,6 +476,7 @@ test-suite tests
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.ISA.Ops.AgentHandoffSpec
         Seal.ISA.Ops.SessionSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase6aSpec
