@@ -53,6 +53,8 @@ module Seal.ISA.Ops.Agent
   , allowSpawnBlockedMsg
   ) where
 
+import Control.Concurrent (myThreadId)
+import Control.Exception (try)
 import Control.Monad (join, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
@@ -87,14 +89,18 @@ import Seal.Agent.Runtime.Delegation
   , SubagentId (..)
   , resolveDelegationConfig
   , runDelegateAsync
+  , mkErrorResult
   , subagentIdText
   )
 import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..)
+  , SpawnOrigin (..)
   , StopOutcome (..)
   , agentStatusFor
+  , endRun
   , interruptAgent, listAgentsFor
-  , registerCompletedAgentResult, registerRunningAgent, stopAgent )
+  , registerCompletedAgentResult, registerRunCrash, registerRunningChild
+  , stopAgent )
 import Seal.Agent.Runtime.RunRecord qualified as RunRecord
   ( RunRecordRegistry, shouldDeferDelivery )
 import Seal.Config.Paths (SealPaths)
@@ -796,6 +802,13 @@ handleStartForeground wiring _v di = do
       pure (OpResult [TrpText (encodeForegroundResults results)] False
              (object ["results" .= fmap toJSONChildResult results]))
 
+-- | The run generation a freshly registered instance carries
+-- ('registerRunningChild' inserts at generation 1). The spawn callback's crash
+-- write is guarded by it, so a stop or interrupt that raced the run — and
+-- bumped the generation — is not overwritten by the dying run.
+initialRunGeneration :: Int
+initialRunGeneration = 1
+
 -- | Handle the start action in background (async) mode. Forks children,
 -- returns immediately with per-child SpawnInfo. Existing behavior.
 handleStartBackground :: AgentStartWiring -> Value -> DelegateInput -> App OpResult
@@ -845,8 +858,26 @@ handleStartBackground wiring _v di = do
                 globalLogIO DebugS (ls ("[idle-diag] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
                 forM_ (aswOnIdleCompletion wiring) id
           spawnCb :: SpawnCallback
-          spawnCb sid def childSid =
-            registerRunningAgent runtime (adId def) sid parentSid childSid (aswParentDepth wiring + 1)
+          spawnCb sid def childSid task body = do
+            -- 'runDelegateAsync' calls this from the forked child thread, so
+            -- this thread IS the run's control handle: record it before the
+            -- body starts, or 'stopAgent' has nothing to kill.
+            tid <- myThreadId
+            -- The batch index is not part of the spawn seam (only 'spawnOne'
+            -- knows it), so a background child records 0; the foreground path
+            -- records the real index from 'crTaskIndex' post-hoc.
+            registerRunningChild runtime (adId def) sid parentSid childSid
+              (aswParentDepth wiring + 1) tid (Just task) (Just def) 0
+              SoStartBackground
+            outcome <- try body
+            -- Clear the handle BEFORE reporting, so the parent's wake turn can
+            -- continue the child the moment it reads the completion.
+            endRun runtime sid
+            case outcome of
+              Right result -> pure result
+              Left e -> do
+                registerRunCrash runtime sid initialRunGeneration e
+                pure (mkErrorResult 0 sid 0 (T.pack (show e)) (Just childSid))
       eSpawnInfos <- liftIO (runDelegateAsync
                                cfg
                                (aswPauseFlag wiring)

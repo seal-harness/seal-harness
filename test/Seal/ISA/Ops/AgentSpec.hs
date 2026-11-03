@@ -1,11 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.AgentSpec (spec) where
 
-import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (bracket)
+import Control.Monad (replicateM_, void)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
@@ -19,13 +20,17 @@ import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Agent.Runtime.Delegation qualified as Del
 import Seal.Agent.Runtime.Delegation
   ( ChildExitReason (..), ChildResult (..), ChildStatus (..)
+  , ChildRunHooks (..)
   , ChildWorkerOutcome (..)
   , DelegateInput (..)
+  , ToolTraceEntry (..)
+  , runChildTask
   , runDelegate
   , SpawnInfo (..)
   , defaultDelegationConfig, dcChildTimeoutSeconds
   , newSpawnPauseFlag, setSpawnPaused
   , runDelegateAsync
+  , spawnPausedMsg
   )
 import Seal.Agent.Runtime.Registry
 import Seal.Config.Paths (SealPaths (..))
@@ -102,6 +107,39 @@ maxConcurrent state = withMVar state (\(_, m) -> pure m)
 -- error outcome).
 errorWorker :: Del.AgentWorkerBuilder
 errorWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
+
+-- | A minimal 'AgentDef' for the 'runChildTask' tests. The child-run core
+-- takes the def as a parameter, and the test workers ignore it.
+sampleAgentDef :: AgentDef
+sampleAgentDef = AgentDef
+  { adId          = AgentDefId "a1"
+  , adName        = "test-agent"
+  , adProvider    = "ollama"
+  , adModel       = ModelId "llama3"
+  , adSystem      = Nothing
+  , adTools       = AllowAll
+  , adGroup       = Nothing
+  , adRole        = Nothing
+  , adDescription = Nothing
+  , adAllowSpawn  = Nothing
+  , adCreatedAt   = UTCTime (fromGregorian 1970 1 1) 0
+  , adUpdatedAt   = UTCTime (fromGregorian 1970 1 1) 0
+  , adSession     = sampleSession
+  }
+
+-- | A worker that sleeps for the given number of seconds, so a short
+-- 'runChildTask' timeout can fire without waiting the 30 s config floor.
+sleepingWorker :: Double -> Del.AgentWorkerBuilder
+sleepingWorker secs _ _ _ _ = do
+  threadDelay (round (secs * 1000000))
+  pure (ChildWorkerOutcome (Just "slow") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
+-- | A worker that blocks until the gate MVar is filled — used to hold a
+-- child inside the run body while another property is asserted.
+gatedWorker :: MVar () -> Del.AgentWorkerBuilder
+gatedWorker gate _ _ _ _ = do
+  takeMVar gate
+  pure (ChildWorkerOutcome (Just "released") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
 
 -- | A worker that captures the 'ChildTask' it received (so tests can assert
 -- on parsed fields like 'ctIsolateWorkdir'). Returns a completed outcome.
@@ -682,6 +720,81 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         [TrpText t] -> t `shouldBe` "subagent not running"
         _           -> expectationFailure "expected a single text part"
 
+  describe "runChildTask (one child-run core)" $ do
+    let mkTask = Del.ChildTask "a1" "do the thing" Nothing Nothing False
+        sid = Del.SubagentId "sa-a1-00000001"
+        childSid = mkSystemSessionId "child"
+    it "returns the worker's outcome with the caller's index and identity" $ do
+      start <- getCurrentTime
+      result <- runChildTask Nothing 5 start 4 sid childSid sampleAgentDef
+                  (recordingWorker' "core done") mkTask
+      crTaskIndex result `shouldBe` 4
+      crSubagentId result `shouldBe` sid
+      crStatus result `shouldBe` CsCompleted
+      crSummary result `shouldBe` Just "core done"
+      crExitReason result `shouldBe` CerCompleted
+      crChildSession result `shouldBe` Just childSid
+
+    it "aggregates the tool trace, files and tokens the worker recorded" $ do
+      start <- getCurrentTime
+      let tracingWorker _def _child _task hooks = do
+            atomicModifyIORef' (crhToolTrace hooks) $ \ts ->
+              (ToolTraceEntry "SHELL_EXEC" 10 20 False : ts, ())
+            atomicModifyIORef' (crhFilesRead hooks) $ \fs -> ("src/a.hs" : fs, ())
+            atomicModifyIORef' (crhFilesWritten hooks) $ \fs -> ("src/b.hs" : fs, ())
+            pure (ChildWorkerOutcome (Just "traced") CerCompleted 3 4 (Just childSid))
+      result <- runChildTask Nothing 5 start 0 sid childSid sampleAgentDef
+                  tracingWorker mkTask
+      crToolTrace result `shouldBe` [ToolTraceEntry "SHELL_EXEC" 10 20 False]
+      crFilesRead result `shouldBe` ["src/a.hs"]
+      crFilesWritten result `shouldBe` ["src/b.hs"]
+      crTokensInput result `shouldBe` 3
+      crTokensOutput result `shouldBe` 4
+
+    it "turns a worker exception into CsError, keeping the child session" $ do
+      start <- getCurrentTime
+      let crashingWorker _ _ _ _ = ioError (userError "boom")
+      result <- runChildTask Nothing 5 start 0 sid childSid sampleAgentDef
+                  crashingWorker mkTask
+      crStatus result `shouldBe` CsError
+      crExitReason result `shouldBe` CerError
+      -- The exception text lands in the summary (the rendering path the
+      -- parent already sees for a crashed child).
+      crSummary result `shouldSatisfy` maybe False (T.isInfixOf "boom")
+      crChildSession result `shouldBe` Just childSid
+
+    it "returns CsTimeout carrying the child session when the worker overruns" $ do
+      start <- getCurrentTime
+      result <- runChildTask Nothing 0.05 start 0 sid childSid sampleAgentDef
+                  (sleepingWorker 0.3) mkTask
+      crStatus result `shouldBe` CsTimeout
+      crExitReason result `shouldBe` CerTimeout
+      crChildSession result `shouldBe` Just childSid
+      crDurationSeconds result `shouldSatisfy` (>= 0.05)
+
+    it "a foreground timeout renders child_session (was Nothing before WU-4)" $ do
+      start <- getCurrentTime
+      result <- runChildTask Nothing 0.05 start 0 sid childSid sampleAgentDef
+                  (sleepingWorker 0.3) mkTask
+      T.isInfixOf "child_session=child" (encodeForegroundResults [result])
+        `shouldBe` True
+
+  describe "spawnPausedMsg" $ do
+    it "is the single source of the pause refusal, shared by both runners" $ do
+      pauseFlag <- newSpawnPauseFlag
+      _ <- setSpawnPaused pauseFlag True
+      let cfg = defaultDelegationConfig
+          resolver _task = pure (Left "unused: the pause check runs first")
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+      eSync <- runDelegate cfg pauseFlag Nothing 0 input resolver
+      eAsync <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver
+                  (const (pure ()))
+                  (\_ _ _ _ body -> body)
+                  (pure (mkSystemSessionId "child"))
+      _ <- setSpawnPaused pauseFlag False
+      eSync `shouldBe` Left spawnPausedMsg
+      eAsync `shouldBe` Left spawnPausedMsg
+
   describe "runDelegateAsync (async core)" $ do
     it "returns immediately with SpawnInfo (does not block on worker completion)" $ do
       pauseFlag <- newSpawnPauseFlag
@@ -692,7 +805,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
-      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
         Right [info] -> do
@@ -714,7 +827,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
-      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsCompleted
       crSummary result `shouldBe` Just "done"
@@ -727,7 +840,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           callback = putMVar resultMVar
           resolver _task = pure (Left "agent def not found: nope")
           input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
-      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
       crError result `shouldBe` Just "agent def not found: nope"
@@ -741,7 +854,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           crashingWorker _ _ _ _ = ioError (userError "boom")
           resolver _task = pure (Right (undefined, crashingWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
-      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
       crExitReason result `shouldBe` CerError
@@ -759,7 +872,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, slowWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
-      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsTimeout
       crExitReason result `shouldBe` CerTimeout
@@ -773,7 +886,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           dummyWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, dummyWorker))
           input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
-      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> T.isInfixOf "paused" err `shouldBe` True
         Right _  -> expectationFailure "expected Left (paused)"
@@ -789,7 +902,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           tasks = [mkTask i | i <- [1..5 :: Int]]
           input = DiBatch tasks
           resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState))
-      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ body -> body) (pure (mkSystemSessionId "child"))
       -- Wait a bit for all workers to finish
       threadDelay 500000  -- 500ms
       mc <- maxConcurrent concurrencyState
@@ -824,6 +937,76 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           aiStatus inst `shouldBe` Stopped
           aiResult inst `shouldBe` Just result
         Left e -> expectationFailure ("instance not found in registry: " <> T.unpack e)
+
+    it "spawn callback receives the task, and its result reaches the completion callback" $ do
+      pauseFlag <- newSpawnPauseFlag
+      resultMVar <- newEmptyMVar :: IO (MVar ChildResult)
+      captured <- newIORef (Nothing :: Maybe (Del.SubagentId, Del.ChildTask))
+      let cfg = defaultDelegationConfig
+          task = Del.ChildTask "a1" "do the thing" Nothing Nothing False
+          callback = putMVar resultMVar
+          resolver _task = pure (Right (undefined, recordingWorker' "done"))
+          spawnCb sid _def _childSid t body = do
+            writeIORef captured (Just (sid, t))
+            body
+      eSpawn <- runDelegateAsync cfg pauseFlag Nothing 0 (DiSingle task) resolver
+                  callback spawnCb (pure (mkSystemSessionId "child"))
+      result <- takeMVar resultMVar
+      crSummary result `shouldBe` Just "done"
+      mCaptured <- readIORef captured
+      case (eSpawn, mCaptured) of
+        (Right [info], Just (sid, t)) -> do
+          sid `shouldBe` siSubagentId info
+          t `shouldBe` task
+        (Right _, Nothing) -> expectationFailure "the spawn callback never ran"
+        _ -> expectationFailure "expected exactly one SpawnInfo"
+
+    it "spawn callback runs first, then the child body, then the completion callback" $ do
+      pauseFlag <- newSpawnPauseFlag
+      order <- newIORef ([] :: [Text])
+      done <- newEmptyMVar :: IO (MVar ())
+      let cfg = defaultDelegationConfig
+          note t = atomicModifyIORef' order (\ts -> (ts <> [t], ()))
+          callback _ = do note "completion"; putMVar done ()
+          spawnCb _ _ _ _ body = do note "spawn"; body
+          worker _ _ _ _ = do
+            note "body"
+            pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 Nothing)
+          resolver _task = pure (Right (undefined, worker))
+      _ <- runDelegateAsync cfg pauseFlag Nothing 0
+             (DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False))
+             resolver callback spawnCb (pure (mkSystemSessionId "child"))
+      takeMVar done
+      readIORef order `shouldReturn` ["spawn", "body", "completion"]
+
+    it "a child queued behind the concurrency cap is registered before it waits" $ do
+      pauseFlag <- newSpawnPauseFlag
+      registered <- newIORef (0 :: Int)
+      completed <- newIORef (0 :: Int)
+      gate <- newEmptyMVar :: IO (MVar ())
+      let cfg = defaultDelegationConfig
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
+          tasks = [mkTask i | i <- [1 .. 5 :: Int]]
+          resolver _task = pure (Right (undefined, gatedWorker gate))
+          callback _ = void (atomicModifyIORef' completed (\n -> (n + 1, n + 1)))
+          spawnCb _ _ _ _ body = do
+            void (atomicModifyIORef' registered (\n -> (n + 1, n + 1)))
+            body
+      eSpawn <- runDelegateAsync cfg pauseFlag Nothing 0 (DiBatch tasks) resolver
+                  callback spawnCb (pure (mkSystemSessionId "child"))
+      case eSpawn of
+        Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
+        Right infos -> length infos `shouldBe` 5
+      -- max_concurrent_children is 3, yet all five children register
+      -- immediately: registration must not wait behind the cap.
+      allRegistered <- pollUntil 2000 ((== 5) <$> readIORef registered)
+      allRegistered `shouldBe` True
+      readIORef completed `shouldReturn` 0
+      -- Release every child; the two that were queued acquire the slots the
+      -- first three release.
+      replicateM_ 5 (putMVar gate ())
+      allDone <- pollUntil 5000 ((== 5) <$> readIORef completed)
+      allDone `shouldBe` True
 
   describe "runDelegate (foreground/sync core)" $ do
     it "returns ChildResult with completed status for a successful worker" $ do

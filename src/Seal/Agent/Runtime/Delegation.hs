@@ -67,9 +67,12 @@ module Seal.Agent.Runtime.Delegation
     , DelegateInput (..)
     , runDelegate
     , runDelegateAsync
+    , runChildTask
     , SpawnInfo (..)
     , AgentCompletionCallback
     , SpawnCallback
+    , spawnPausedMsg
+    , mkErrorResult
      -- * Pause control
   , SpawnPauseFlag (..)
   , newSpawnPauseFlag
@@ -81,14 +84,14 @@ module Seal.Agent.Runtime.Delegation
   , touchParentActivity
   ) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay, ThreadId)
+import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM
   ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar
   , modifyTVar', retry )
 import Control.Concurrent.MVar
   ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar
   , tryTakeMVar )
-import Control.Exception (SomeException, bracket, catch)
+import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forM, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
@@ -468,13 +471,34 @@ data SpawnInfo = SpawnInfo
 -- 'ChildResult' to the parent's transcript and updating the registry.
 type AgentCompletionCallback = ChildResult -> IO ()
 
--- | The callback called from the parent thread AFTER the child worker
--- thread is forked. The opcode layer uses this to register the child in
--- the 'AgentRuntime' (so 'AGENT_INSTANCES' lists it while running, and
--- 'AGENT_STOP' can kill the correct thread). Receives the 'SubagentId',
--- the resolved 'AgentDef', the pre-minted 'SessionId', and the child's
--- forked 'ThreadId'.
-type SpawnCallback = SubagentId -> AgentDef -> SessionId -> ThreadId -> IO ()
+-- | The callback 'runDelegateAsync' invokes from the forked child thread,
+-- BEFORE the child body runs. It receives the 'SubagentId', the resolved
+-- 'AgentDef', the pre-minted child 'SessionId', the 'ChildTask', and the run
+-- body to execute; it returns the run's 'ChildResult', which
+-- 'runDelegateAsync' hands to the 'AgentCompletionCallback'.
+--
+-- Inverting the seam this way lets the registry-backed layer own the run
+-- lifecycle without owning the child thread: the callback runs the body (so
+-- it can record its own thread handle with 'Control.Concurrent.myThreadId'
+-- as the run's control handle), while forking and reporting stay here.
+--
+-- The concurrency cap wraps the body ACTION — never the callback — so a child
+-- that is queued for a slot has already been registered, and stays visible to
+-- 'AGENT_INSTANCES' / 'AGENT_STOP' / 'hasRunningChildren' while it waits.
+type SpawnCallback
+  =  SubagentId
+  -> AgentDef
+  -> SessionId
+  -> ChildTask
+  -> IO ChildResult
+  -> IO ChildResult
+
+-- | The single source of the spawn-pause refusal text, shared by
+-- 'runDelegate', 'runDelegateAsync' and the @continue@ action so the operator
+-- sees the same instruction wherever a spawn is refused.
+spawnPausedMsg :: Text
+spawnPausedMsg =
+  "Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying."
 
 -- | The top-level delegation runner. Spawns one or more child agents, runs
 -- each against its goal to completion (synchronously), and returns a
@@ -495,7 +519,7 @@ runDelegate
 runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
   paused <- isSpawnPaused pauseFlag
   if paused
-    then pure (Left "Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying.")
+    then pure (Left spawnPausedMsg)
     else do
       let (maxConc, childTimeout, maxDepth, _orchEnabled) = resolveDelegationConfig cfg
       if parentDepth >= maxDepth
@@ -551,75 +575,22 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
             else retry
         release _ = atomically (modifyTVar' sem (+1))
 
-    -- Run a single task to completion with a hard timeout and a heartbeat
-    -- thread that touches the parent-activity cell.
+    -- Run a single task to completion. The shared child-run core
+    -- ('runChildTask') owns the timeout, the heartbeat, the accumulators and
+    -- the result shape; this wrapper only resolves the def and mints the
+    -- session.
     runOne :: Int -> ChildTask -> Double -> IO ChildResult
     runOne idx task childTimeout = do
       subagentId <- mkSubagentId (ctDefId task)
-      let micros = round (childTimeout * 1000000) :: Int
       start <- getCurrentTime
-      -- Thread-safe accumulators the worker writes to.
-      traceRef     <- newIORef []
-      readRef     <- newIORef []
-      writtenRef  <- newIORef []
-      interruptedRef <- newIORef False
-      let hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef
-      mRes <- resolveTask task >>= \case
-        Left err -> pure (Left err)
-        Right (def, worker, childSid) -> do
-          -- Start the heartbeat thread.
-          hbStop <- newEmptyMVar
-          hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
-          let runWithCatch =
-                worker def childSid task hooks
-                  `catch` \e -> pure (ChildWorkerOutcome
-                                       (Just (T.pack (show (e :: SomeException))))
-                                       CerError 0 0 (Just childSid))
-          mOutcome <- timeout micros runWithCatch
-          -- Stop the heartbeat.
-          void (tryPutMVar hbStop ())
-          killThread hbThreadId
-          pure (maybe (Left "timeout") Right mOutcome)
-      end <- getCurrentTime
-      let dur = realToFrac (end `diffUTCTime` start) :: Double
-      case mRes of
-        Left err ->
-          pure (ChildResult
-                  { crTaskIndex = idx
-                  , crStatus = if err == "timeout" then CsTimeout else CsError
-                  , crSummary = Nothing
-                  , crExitReason = if err == "timeout" then CerTimeout else CerError
-                  , crDurationSeconds = dur
-                  , crSubagentId = subagentId
-                  , crTokensInput = 0
-                  , crTokensOutput = 0
-                  , crToolTrace = []
-                  , crError = Just (if err == "timeout"
-                                      then "Subagent timed out after " <> T.pack (show childTimeout) <> "s."
-                                      else err)
-                  , crFilesRead = []
-                  , crFilesWritten = []
-                  , crChildSession = Nothing
-                  })
-        Right outcome -> do
-          traceList <- readIORef traceRef
-          filesRead <- readIORef readRef
-          filesWritten <- readIORef writtenRef
-          pure (ChildResult
-                  { crTaskIndex = idx
-                  , crStatus = childStatusFor (cwoExitReason outcome)
-                  , crSummary = cwoSummary outcome
-                  , crExitReason = cwoExitReason outcome
-                  , crDurationSeconds = dur
-                  , crSubagentId = subagentId
-                  , crTokensInput = cwoTokensInput outcome
-                  , crTokensOutput = cwoTokensOutput outcome
-                  , crToolTrace = reverse traceList
-                  , crError = Nothing
-                  , crFilesRead = reverse filesRead
-                  , crFilesWritten = reverse filesWritten
-                  , crChildSession = cwoChildSession outcome
-                   })
+      resolveTask task >>= \case
+        Left err -> do
+          end <- getCurrentTime
+          let dur = realToFrac (end `diffUTCTime` start) :: Double
+          pure (mkErrorResult idx subagentId dur err Nothing)
+        Right (def, worker, childSid) ->
+          runChildTask mParentActivity childTimeout start idx subagentId
+                       childSid def worker task
 
 -- | The async delegation runner. Forks one worker per task (respecting
 -- 'max_concurrent_children'), registers each child in the 'AgentRuntime'
@@ -656,7 +627,7 @@ runDelegateAsync
 runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask callback spawnCallback mintSession = do
   paused <- isSpawnPaused pauseFlag
   if paused
-    then pure (Left "Delegation spawning is paused. Clear the pause via the TUI or the AGENT_INTERRUPT RPC before retrying.")
+    then pure (Left spawnPausedMsg)
     else do
       let (maxConc, childTimeout, maxDepth, _orchEnabled) = resolveDelegationConfig cfg
       if parentDepth >= maxDepth
@@ -675,7 +646,8 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
               pure (Right spawnInfos)
   where
     -- Fork all tasks with a concurrency cap. Returns immediately after
-    -- forking (each forked thread runs the child to completion).
+    -- forking (each forked thread registers the child, runs it and reports
+    -- the result).
     runBatchAsync :: Int -> Double -> [ChildTask] -> IO [SpawnInfo]
     runBatchAsync maxConc childTimeout tasks =
       case tasks of
@@ -687,106 +659,42 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
           forM (zip [0 ..] tasks) $ \(idx, task) -> do
             spawnOne idx task childTimeout (Just sem)
 
-    -- Spawn one child: resolve synchronously, register via spawnCallback,
-    -- then fork the worker execution. Returns SpawnInfo immediately.
-    -- The session is minted INSIDE the semaphore (when present) so that
-    -- concurrent spawns don't mint in the same microsecond — the random
-    -- suffix in 'mintSession' makes collisions vanishingly unlikely, but
-    -- serializing the mint through the semaphore is a belt-and-suspenders
-    -- guarantee.
+    -- Resolve the task, then fork one child. 'SpawnInfo' is returned
+    -- immediately; the forked thread hands the run body to the spawn callback
+    -- (which registers the child in the runtime and runs the body) and
+    -- reports the returned 'ChildResult' to the completion callback.
+    --
+    -- The concurrency cap wraps ONLY the run body. Wrapping the callback
+    -- instead would make a queued child invisible to 'AGENT_INSTANCES',
+    -- 'AGENT_STOP' and 'hasRunningChildren', and would delay the child's
+    -- registration until a slot freed up.
     spawnOne :: Int -> ChildTask -> Double -> Maybe (TVar Int) -> IO SpawnInfo
     spawnOne idx task childTimeout mSem = do
       subagentId <- mkSubagentId (ctDefId task)
-      let micros = round (childTimeout * 1000000) :: Int
-          mkChild :: IO SpawnInfo
-          mkChild = do
-            childSid <- mintSession
-            start <- getCurrentTime
-            traceRef     <- newIORef []
-            readRef     <- newIORef []
-            writtenRef  <- newIORef []
-            interruptedRef <- newIORef False
-            let hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef
-            mResolve <- resolveTask task
-            case mResolve of
-              Left err -> do
-                -- Resolve error: fork the error callback (async).
-                end <- getCurrentTime
-                let dur = realToFrac (end `diffUTCTime` start) :: Double
-                    result = mkErrorResult idx subagentId dur err Nothing
-                void (forkIO (callback result))
-              Right (def, worker) -> do
-                -- Fork the worker execution (async). The spawn callback
-                -- (which registers the child in the runtime) is called
-                -- INSIDE the forked thread before the worker runs, so the
-                -- agent is always registered before the completion
-                -- callback fires. This fixes a race where an instant
-                -- worker could complete (and call the completion callback)
-                -- before the spawn callback ran in the parent thread,
-                -- causing the result to be silently dropped
-                -- (registerCompletedAgentResult is a no-op when the agent
-                -- isn't in the registry yet). The ThreadId from myThreadId
-                -- inside the forked thread is the same as forkIO's return
-                -- value, so AGENT_STOP can still kill the correct thread.
-                globalLogIO DebugS (ls ("[idle-diag] about to fork child worker: subagent=" <> subagentIdText subagentId
-                  <> " childSid=" <> sessionIdText childSid))
-                void $ forkIO $ do
-                  tid <- myThreadId
-                  globalLogIO DebugS (ls ("[idle-diag] forked thread started, calling spawnCallback: subagent=" <> subagentIdText subagentId))
-                  spawnCallback subagentId def childSid tid
-                  globalLogIO DebugS (ls ("[idle-diag] spawnCallback completed, starting worker: subagent=" <> subagentIdText subagentId))
-                  case mSem of
-                    Nothing -> runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
-                    Just sem -> bracketSem sem $
-                      runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks
-            pure (SpawnInfo subagentId childSid idx)
-      case mSem of
-        Nothing -> mkChild
-        Just sem -> bracketSem sem mkChild
-
-    -- Run the worker to completion (called from a forked thread).
-    runWorker :: Int -> ChildTask -> Double -> SubagentId -> SessionId -> Int
-             -> UTCTime -> IORef [ToolTraceEntry] -> IORef [Text] -> IORef [Text]
-             -> AgentDef -> AgentWorkerBuilder -> ChildRunHooks -> IO ()
-    runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks = do
-      -- Start the heartbeat thread.
-      hbStop <- newEmptyMVar
-      hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
-      let runWithCatch =
-            worker def childSid task hooks
-              `catch` \e -> pure (ChildWorkerOutcome
-                                   (Just (T.pack (show (e :: SomeException))))
-                                   CerError 0 0 (Just childSid))
-      mOutcome <- timeout micros runWithCatch
-      -- Stop the heartbeat.
-      void (tryPutMVar hbStop ())
-      killThread hbThreadId
-      end <- getCurrentTime
-      let dur = realToFrac (end `diffUTCTime` start) :: Double
-      case mOutcome of
-        Nothing -> do
-          let result = mkTimeoutResult idx subagentId dur childSid childTimeout
-          callback result
-        Just outcome -> do
-          traceList <- readIORef traceRef
-          filesRead <- readIORef readRef
-          filesWritten <- readIORef writtenRef
-          let result = ChildResult
-                { crTaskIndex = idx
-                , crStatus = childStatusFor (cwoExitReason outcome)
-                , crSummary = cwoSummary outcome
-                , crExitReason = cwoExitReason outcome
-                , crDurationSeconds = dur
-                , crSubagentId = subagentId
-                , crTokensInput = cwoTokensInput outcome
-                , crTokensOutput = cwoTokensOutput outcome
-                , crToolTrace = reverse traceList
-                , crError = Nothing
-                , crFilesRead = reverse filesRead
-                , crFilesWritten = reverse filesWritten
-                , crChildSession = cwoChildSession outcome
-                }
-          callback result
+      childSid <- mintSession
+      start <- getCurrentTime
+      resolveTask task >>= \case
+        Left err -> do
+          -- Resolve error: report it asynchronously, exactly like a run
+          -- result, so the parent learns through the same channel.
+          end <- getCurrentTime
+          let dur = realToFrac (end `diffUTCTime` start) :: Double
+              result = mkErrorResult idx subagentId dur err Nothing
+          void (forkIO (callback result))
+        Right (def, worker) -> do
+          let body = runChildTask mParentActivity childTimeout start idx
+                                 subagentId childSid def worker task
+              guarded = case mSem of
+                Nothing  -> body
+                Just sem -> bracketSem sem body
+          globalLogIO DebugS (ls ("[idle-diag] about to fork child worker: subagent=" <> subagentIdText subagentId
+            <> " childSid=" <> sessionIdText childSid))
+          void $ forkIO $ do
+            globalLogIO DebugS (ls ("[idle-diag] forked thread started, calling spawnCallback: subagent=" <> subagentIdText subagentId))
+            result <- spawnCallback subagentId def childSid task guarded
+            globalLogIO DebugS (ls ("[idle-diag] spawnCallback returned, calling completion callback: subagent=" <> subagentIdText subagentId))
+            callback result
+      pure (SpawnInfo subagentId childSid idx)
 
     -- Acquire / release the counting semaphore around an IO action.
     bracketSem :: TVar Int -> IO a -> IO a
@@ -798,6 +706,82 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
             then writeTVar sem (n - 1)
             else retry
         release _ = atomically (modifyTVar' sem (+1))
+
+-- | Run one child to completion: the single child-run core shared by the
+-- foreground path ('runDelegate.runOne'), the background path
+-- ('runDelegateAsync.spawnOne') and @continue@.
+--
+-- It owns the per-child timeout, the parent-activity heartbeat, the worker
+-- accumulators (the 'ChildRunHooks' IORefs are created and read here — the
+-- production worker ignores them, test workers write them) and the shape of
+-- the resulting 'ChildResult'.
+--
+-- @start@ is the timestamp taken BEFORE the def was resolved, so
+-- 'crDurationSeconds' keeps including the resolve step. @idx@ is the task's
+-- index within the batch. The caller owns registration and reporting: this
+-- function neither touches the registry nor calls a completion callback.
+--
+-- A timeout yields 'CsTimeout' WITH the child session recorded — the child's
+-- transcript exists on disk and a @continue@ needs its id.
+runChildTask
+  :: Maybe ParentActivity
+  -> Double
+     -- ^ hard per-child timeout in seconds
+  -> UTCTime
+     -- ^ when the spawn started (before def resolution)
+  -> Int
+     -- ^ task index within the batch
+  -> SubagentId
+  -> SessionId
+  -> AgentDef
+  -> AgentWorkerBuilder
+  -> ChildTask
+  -> IO ChildResult
+runChildTask mParentActivity childTimeout start idx subagentId childSid def worker task = do
+  traceRef       <- newIORef []
+  readRef        <- newIORef []
+  writtenRef     <- newIORef []
+  interruptedRef <- newIORef False
+  hbStop <- newEmptyMVar
+  hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
+  let hooks = ChildRunHooks traceRef readRef writtenRef interruptedRef
+      micros = round (childTimeout * 1000000) :: Int
+      crashOutcome e =
+        Just (ChildWorkerOutcome (Just (T.pack (show e))) CerError 0 0 (Just childSid))
+  -- The worker's exception is caught AROUND 'timeout', not inside it: an
+  -- inner @catch \@SomeException@ also swallows the private exception
+  -- 'timeout' throws to interrupt the computation, which would turn every
+  -- overrun into a bogus CsError instead of CsTimeout.
+  ran <- try (timeout micros (worker def childSid task hooks))
+               :: IO (Either SomeException (Maybe ChildWorkerOutcome))
+  void (tryPutMVar hbStop ())
+  killThread hbThreadId
+  let mOutcome = case ran of
+        Right w -> w
+        Left e  -> crashOutcome e
+  end <- getCurrentTime
+  let dur = realToFrac (end `diffUTCTime` start) :: Double
+  case mOutcome of
+    Nothing -> pure (mkTimeoutResult idx subagentId dur childSid childTimeout)
+    Just outcome -> do
+      traceList <- readIORef traceRef
+      filesRead <- readIORef readRef
+      filesWritten <- readIORef writtenRef
+      pure ChildResult
+        { crTaskIndex = idx
+        , crStatus = childStatusFor (cwoExitReason outcome)
+        , crSummary = cwoSummary outcome
+        , crExitReason = cwoExitReason outcome
+        , crDurationSeconds = dur
+        , crSubagentId = subagentId
+        , crTokensInput = cwoTokensInput outcome
+        , crTokensOutput = cwoTokensOutput outcome
+        , crToolTrace = reverse traceList
+        , crError = Nothing
+        , crFilesRead = reverse filesRead
+        , crFilesWritten = reverse filesWritten
+        , crChildSession = cwoChildSession outcome
+        }
 
 -- | Build a 'ChildResult' for a resolve error (def not found, invalid
 -- role, etc.).
