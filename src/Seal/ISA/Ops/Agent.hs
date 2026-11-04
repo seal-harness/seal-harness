@@ -1379,7 +1379,14 @@ deliverToParent wiring parentSid message result = do
         <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
         <> " messageChars=" <> tshow (T.length message)))
       globalLogIO DebugS (ls ("[idle-diag] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
-      forM_ (aswOnIdleCompletion wiring) id
+      -- Forked: the hook starts the PARENT's synthetic turn, and this code
+      -- runs on the CHILD's worker thread (the completion callback's caller).
+      -- Running the parent's turn there would nest the parent inside the
+      -- child's run — a `continue` issued from the wake (the flagship flow)
+      -- would then wait on the very thread that must finish for the child to
+      -- settle. The sidecar write above is already durable, so the fork
+      -- costs nothing but the ordering.
+      forM_ (aswOnIdleCompletion wiring) $ \hook -> void (forkIO hook)
 
 -- ---------------------------------------------------------------------------
 -- Consolidated opcode: AGENT_MANAGE

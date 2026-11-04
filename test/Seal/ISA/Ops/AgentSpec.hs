@@ -2,7 +2,7 @@
 module Seal.ISA.Ops.AgentSpec (spec) where
 
 import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (AsyncException (ThreadKilled), bracket, throwIO)
@@ -872,6 +872,40 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             Right i -> aiStatus i `shouldBe` Stopped
           readIORef wakes `shouldReturn` 0
         _ -> expectationFailure "expected exactly one instance"
+
+    -- The idle wake runs the PARENT's synthetic turn. If it ran on the child's
+    -- worker thread, the parent's turn would be nested inside the child's run:
+    -- the parent could not stop or continue the child without waiting for
+    -- itself, and a `continue` issued from the wake (the flagship flow) would
+    -- deadlock on the child's own handle. So the hook must be forked.
+    it "fires the completion wake off the child's worker thread" $ do
+      backend <- noneBackend
+      defineGreeter backend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      workerTid <- newIORef (Nothing :: Maybe ThreadId)
+      wakeTid <- newIORef (Nothing :: Maybe ThreadId)
+      let worker _ _ _ _ = do
+            tid <- myThreadId
+            writeIORef workerTid (Just tid)
+            pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0
+                   (Just childSessionFixture))
+          hook = do
+            tid <- myThreadId
+            writeIORef wakeTid (Just tid)
+          wiring = mkLifecycleWiring backend rt pauseFlag worker (Just hook)
+      _ <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      woke <- pollUntil 2000 (isJust <$> readIORef wakeTid)
+      woke `shouldBe` True
+      mWorker <- readIORef workerTid
+      mWake <- readIORef wakeTid
+      case (mWorker, mWake) of
+        (Just w, Just k) -> do
+          w `shouldSatisfy` (/= k)
+        _ -> expectationFailure
+               ("expected both threads to be recorded, got worker=" <> show mWorker
+                  <> " wake=" <> show mWake)
 
   describe "subagent_id validation" $ do
     let tooLong = T.replicate 257 "a"

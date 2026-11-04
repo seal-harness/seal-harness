@@ -187,6 +187,20 @@ data ApiTestOptions = ApiTestOptions
     -- the SAME 'ScriptProvider' ref the top-level 'sdResolve' seam wraps,
     -- so child turns pop the same scripted queue as the parent turn
     -- ('setScript' drives both). 'False' (default) = production resolver.
+  , atoChildProviderFn :: Maybe (IO (SomeProvider, ModelId))
+    -- ^ A fully injectable child provider (subagent-continue WU-7). When
+    -- 'Just', every child run (a spawn or a @continue@) resolves to the
+    -- provider this action returns — use a single memoised instance (e.g. a
+    -- 'Seal.TestHelpers.CapturingProvider.CapturingProvider') so a multi-run
+    -- conversation shares one script queue and one capture log. Takes
+    -- precedence over 'atoChildProvider'. 'Nothing' (default) leaves the
+    -- 'atoChildProvider' behavior (or the production resolver) intact.
+  , atoEnableIdleWake :: Bool
+    -- ^ When 'True', wire the end-of-turn idle-wake hooks
+    -- ('tdOnIdleCompletion' / 'tdOnTurnEnd') that production @serve@ uses, so
+    -- a child's completion wakes the parent and runs a synthetic turn. Off by
+    -- default: most tests drive turns explicitly and a wake would race the
+    -- scripted queue.
   , atoDelegationConfig :: Maybe DelegationFileConfig
     -- ^ When 'Just', written into the harness's config.toml
     -- @[delegation]@ section before boot (max_spawn_depth /
@@ -200,6 +214,8 @@ defaultApiTestOptions = ApiTestOptions
   , atoChildWorker = Nothing
   , atoStubWorkerFromDepth = 2
   , atoChildProvider = False
+  , atoChildProviderFn = Nothing
+  , atoEnableIdleWake = False
   , atoDelegationConfig = Nothing
   }
 
@@ -513,11 +529,14 @@ buildTestEnv tmp mode mRepo opts = do
         , sdMkWorker = atoChildWorker opts
         , sdMkWorkerStubDepth = atoStubWorkerFromDepth opts
         , sdWakeMutex = wakeMutex
-        , sdEnableIdleWake = False
+        , sdEnableIdleWake = atoEnableIdleWake opts
         , sdResolveProviderOverride =
-            if atoChildProvider opts
-              then Just (\_ -> pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2")))
-              else Nothing
+            case atoChildProviderFn opts of
+              Just mk -> Just (\_ -> fmap Right mk)
+              Nothing
+                | atoChildProvider opts ->
+                    Just (\_ -> pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2")))
+                | otherwise -> Nothing
         }
       deps = ApiDeps
         { adSessionRuntime = sr

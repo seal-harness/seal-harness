@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 -- | Gateway API integration tests for the AGENT_ opcode group. Exercises the
 -- full API → agent loop → ISA dispatch path through the gateway, asserting
 -- invariants over how combinations of AGENT_ opcodes interact.
@@ -20,6 +21,8 @@
 -- #136; those tests now pass against the synchronous model.
 module Seal.Gateway.AgentIntegrationSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (bracket, bracket_)
 import Control.Monad (forM_, forM)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
@@ -28,19 +31,24 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (toList)
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Control.Exception (bracket)
+import Data.Text.Encoding qualified as TE
 import Seal.SourceControl.Repo (RepoCredential (..), srUrl)
 import System.Directory (listDirectory, createDirectoryIfMissing)
 import System.Environment (lookupEnv, setEnv)
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 import Test.Hspec
-  ( Spec, describe, expectationFailure, it, pendingWith, shouldBe
+  ( Spec, describe, expectationFailure, it, pendingWith, runIO, shouldBe
   , shouldNotSatisfy, shouldSatisfy )
+
+import Katip
+  ( Severity (..), Scribe (..), _itemMessage, _itemThread, getThreadIdText
+  , permitItem, unLogStr )
 import GHC.Stack (HasCallStack)
 
 import Seal.Agent.Def.Backend qualified as AgentDef
@@ -50,12 +58,19 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry (newAgentRuntime)
 import Seal.Config.File (DelegationFileConfig (..))
 import Seal.Config.Paths (SealPaths (..))
-import Seal.Core.Types (OpName (..), ToolCallId (..), mkSystemSessionId)
+import Seal.Core.Types
+  (ModelId (..), OpName (..), SessionId, ToolCallId (..), mkSessionId
+  , mkSystemSessionId)
+import Seal.Handles.Transcript (pendingCompletionCount)
 import Seal.ISA.Ops.Agent
 import Seal.ISA.Opcode (opAuthorize)
 import Seal.Providers.Class
-  ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
+  ( CompletionResponse (..), ContentBlock (..), Message (..), SomeProvider (..)
+  , StopReason (..), Usage (..) )
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (newSealLoggerWithScribe)
 import Seal.TestHelpers.ApiTestHarness
+import Seal.TestHelpers.CapturingProvider
 
 spec :: Spec
 spec = describe "Seal.Gateway.AgentIntegration" $ do
@@ -67,6 +82,7 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   w2GateSpec
   concurrentSubagentSpec
   preambleConsistencySpec
+  continueConversationSpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -689,15 +705,18 @@ runLifecycleTest =
 -- orchestrator child run a REAL scripted turn (popping the same script
 -- queue as the parent), while the depth-conditional stub worker takes over
 -- at depth 2 (leaf-most workers complete synchronously).
+orchestrationOptions :: Maybe DelegationFileConfig -> ApiTestOptions
+orchestrationOptions mDelegation = defaultApiTestOptions
+  { atoChildWorker = Just stubChildWorker
+  , atoStubWorkerFromDepth = 2
+  , atoChildProvider = True
+  , atoDelegationConfig = mDelegation
+  }
+
 runOrchestrationTest
   :: Maybe DelegationFileConfig -> (ApiTestEnv -> IO ()) -> Spec
 runOrchestrationTest mDelegation =
-  runApiTestOpts Nothing defaultApiTestOptions
-    { atoChildWorker = Just stubChildWorker
-    , atoStubWorkerFromDepth = 2
-    , atoChildProvider = True
-    , atoDelegationConfig = mDelegation
-    }
+  runApiTestOpts Nothing (orchestrationOptions mDelegation)
 
 -- ---------------------------------------------------------------------------
 -- W2 orchestration group (issue #154) — nested AGENT_START, depth, roles
@@ -1347,3 +1366,309 @@ listToMaybe' (x:_) = Just x
 firstResult :: HasCallStack => [a] -> a
 firstResult []    = error "firstResult: empty list (caller should have asserted length first)"
 firstResult (x:_) = x
+
+-- ---------------------------------------------------------------------------
+-- subagent continue — end-to-end conversation (S1/S2/S3/S3b/S4)
+-- ---------------------------------------------------------------------------
+
+-- | A request-capturing child provider for the conversation scenarios. Each
+-- scenario gets its own instance: 'atoChildProvider' shares the PARENT's
+-- script queue, which makes a multi-run conversation racy (the parent and the
+-- child pop each other's responses).
+captureChildProviderOpts :: CapturingProvider -> ApiTestOptions
+captureChildProviderOpts prov =
+  (orchestrationOptions Nothing)
+    { atoChildProvider = False
+    , -- A large context window: the child's tool catalog + skills catalog would
+      -- otherwise exceed a small model's budget and the loop would truncate the
+      -- conversation the test is about to assert on.
+      atoChildProviderFn = Just (pure (SomeProvider prov, ModelId "claude-opus-4"))
+    }
+
+-- | One scripted final-answer turn.
+textTurn :: Text -> CompletionResponse
+textTurn t = CompletionResponse [CbText t] StopEnd (Usage 0 0)
+
+-- | @AGENT_MANAGE continue@ arguments.
+continueArgs :: Text -> Maybe Text -> Maybe Text -> A.Value
+continueArgs subId mPrompt mMode = A.object $
+  [ "action" .= ("continue" :: Text), "subagent_id" .= subId ]
+    <> maybe [] (\p -> ["prompt" .= p]) mPrompt
+    <> maybe [] (\m -> ["mode" .= m]) mMode
+
+-- | @(subagent_id, child_session)@ from an @AGENT_MANAGE start@ result's first
+-- line: @\<subagent_id\> | \<child_session\> | running@.
+spawnIds :: Text -> Maybe (Text, Text)
+spawnIds t = case T.lines (T.strip t) of
+  (l : _) -> case map T.strip (T.splitOn "|" l) of
+    (sub : sess : _) -> Just (sub, sess)
+    _                -> Nothing
+  [] -> Nothing
+
+-- | Non-overlapping occurrences of @needle@ in @hay@.
+countText :: Text -> Text -> Int
+countText needle hay
+  | T.null needle = 0
+  | otherwise     = length (T.splitOn needle hay) - 1
+
+-- | The @#n@ of a @replied (continue #n)@ header, if present.
+continueRunNumber :: Text -> Maybe Text
+continueRunNumber t =
+  case T.breakOn marker t of
+    (_, rest)
+      | T.null rest -> Nothing
+      | otherwise   -> Just (T.takeWhile (/= ')') (T.drop (T.length marker) rest))
+  where
+    marker = "replied (continue #"
+
+-- | The messages of a request rendered as JSON — "what appears in the
+-- request" for a content assertion.
+messagesJson :: [Message] -> Text
+messagesJson = TE.decodeUtf8 . BL.toStrict . A.encode
+
+-- | Bounded fast-exit poll (10 ms ticks). Never a bare sleep: it returns the
+-- moment the predicate holds.
+boundedPoll :: Int -> IO Bool -> IO Bool
+boundedPoll budgetMs act = go budgetMs
+  where
+    go remaining
+      | remaining <= 0 = act
+      | otherwise = do
+          ok <- act
+          if ok then pure True else threadDelay 10000 >> go (remaining - 10)
+
+-- | Wait until a child completion is durable in the parent's sidecar. That
+-- write happens after the run's 'endRun', so it is also the signal that the
+-- child is settled and continuable. The count is relative, not absolute: a
+-- parent turn drains the sidecar at its start, so "the next run finished" is
+-- "the sidecar is non-empty again".
+waitForNextCompletion :: ApiTestEnv -> Text -> IO Bool
+waitForNextCompletion env sid =
+  boundedPoll 8000 ((>= 1) <$> pendingCompletionCount (atePaths env) (sessionIdOf sid))
+
+-- | The typed session id for a text id minted by the API.
+sessionIdOf :: Text -> SessionId
+sessionIdOf t = case mkSessionId t of
+  Right s -> s
+  Left e  -> error ("sessionIdOf: " <> T.unpack e <> " (" <> T.unpack t <> ")")
+
+-- | Every @AGENT_MANAGE@ result in the transcript, in order.
+manageResults :: ApiTestEnv -> Text -> IO [AgentResult]
+manageResults env sid =
+  filterAgentResults (OpName "AGENT_MANAGE") <$> getTranscript env sid
+
+-- | The @(subagent_id, child_session)@ of the single @start@ result, waited
+-- for (the tool result lands a moment after the turn's transcript settles).
+startIdsOf :: ApiTestEnv -> Text -> IO (Text, Text)
+startIdsOf env sid = go (40 :: Int)
+  where
+    go n
+      | n <= 0 = do
+          expectationFailure "no AGENT_MANAGE start result in the transcript"
+          pure ("", "")
+      | otherwise = do
+          results <- manageResults env sid
+          let starts = [ r | r <- results
+                           , "running" `T.isInfixOf` textOf r
+                           , not ("continued #" `T.isInfixOf` textOf r) ]
+          case mapMaybe (spawnIds . textOf) starts of
+            ((sub, sess) : _) -> pure (sub, sess)
+            [] -> threadDelay 10000 >> go (n - 1)
+
+-- | Install a capture logger as the process-global logger for the duration of
+-- the action. The wake diagnostics are emitted with 'globalLogIO', which is a
+-- no-op without one; capturing them also records the emitting 'ThreadId'.
+withCapturedGlobalLog :: (IO [(Text, Text)] -> IO a) -> IO a
+withCapturedGlobalLog act = do
+  captured <- newIORef []
+  let scribe = Scribe
+        { liPush = \item -> atomicModifyIORef' captured
+            (\xs -> (xs ++ [(getThreadIdText (_itemThread item),
+                             T.pack (show (unLogStr (_itemMessage item))))], ()))
+        , scribePermitItem = permitItem DebugS
+        , scribeFinalizer = pure ()
+        }
+  logger <- newSealLoggerWithScribe scribe DebugS
+  bracket_ (setGlobalLogger logger) unsetGlobalLogger (act (readIORef captured))
+
+-- | The conversation text the tests drive the child with.
+goalText :: Text
+goalText = "review the diff and report"
+
+continueConversationSpec :: Spec
+continueConversationSpec =
+  describe "subagent continue — end-to-end conversation" $ do
+
+    -- S1/S2/S3: one child, three background runs, one conversation.
+    describe "S1/S2/S3 three background runs keep one conversation and one child session" $ do
+      cap <- runIO (newCapturingProvider
+        [ textTurn "child reply 1"
+        , textTurn "child reply 2"
+        , textTurn "child reply 3"
+        ])
+      runApiTestLocal Nothing (captureChildProviderOpts cap) $ \env -> do
+        sid <- callApiNewTab env "ollama" "llama3.2"
+        -- Turn 1: define the worker. Turn 2: spawn one child in the
+        -- background. The third scripted answer ends the parent's turn.
+        setScript env
+          [ toolUseTurn "p1" (OpName "AGENT_DEF_WRITE") (writeArgsFor "a-worker" "Worker")
+          , toolUseTurn "p2" (OpName "AGENT_MANAGE")
+              (A.object [ "action" .= ("start" :: Text)
+                        , "id" .= ("a-worker" :: Text)
+                        , "goal" .= goalText ])
+          , doneTurn
+          ]
+        _ <- sendMsgToSession env sid "spawn one child"
+        (subId, childSess) <- startIdsOf env sid
+        run1 <- waitForNextCompletion env sid
+        run1 `shouldBe` True
+        -- Turn 3: background continue with a prompt.
+        setScript env
+          [ toolUseTurn "p3" (OpName "AGENT_MANAGE")
+              (continueArgs subId (Just "step two") Nothing)
+          , doneTurn
+          ]
+        _ <- sendMsgToSession env sid "continue with a prompt"
+        run2 <- waitForNextCompletion env sid
+        run2 `shouldBe` True
+        -- Turn 4: background continue with no prompt (the harness nudge).
+        setScript env
+          [ toolUseTurn "p4" (OpName "AGENT_MANAGE") (continueArgs subId Nothing Nothing)
+          , doneTurn
+          ]
+        _ <- sendMsgToSession env sid "continue without a prompt"
+        run3 <- waitForNextCompletion env sid
+        run3 `shouldBe` True
+        reqs <- capturedRequests cap
+        case reqs of
+          (r1 : r2 : r3 : _) -> do
+            let m1 = creqMessages r1
+                m2 = creqMessages r2
+                m3 = creqMessages r3
+            -- S1: the resumed child sees its whole prior conversation —
+            -- turn 2's request carries turn 1's messages as a content prefix
+            -- (and likewise turn 3).
+            take (length m1) m2 `shouldBe` m1
+            take (length m2) m3 `shouldBe` m2
+            length m2 `shouldBe` length m1 + 2
+            length m3 `shouldBe` length m2 + 2
+            -- S2: the stored goal is NOT replayed; what is appended is the
+            -- prompt (run 2) and the nudge (run 3).
+            countText goalText (messagesJson m2) `shouldBe` 1
+            countText goalText (messagesJson m3) `shouldBe` 1
+            countText "step two" (messagesJson m2) `shouldBe` 1
+            countText "[System: the harness is resuming you." (messagesJson m3) `shouldBe` 1
+          other -> expectationFailure
+            ("expected 3 child runs, got " <> show (length other))
+        -- S3: one child session on every surface. The two continue acks carry
+        -- the same child session as the spawn result.
+        results <- manageResults env sid
+        let acks = [ r | r <- results, "continued #" `T.isInfixOf` textOf r ]
+        length acks `shouldBe` 2
+        mapM_ (\r -> textOf r `shouldSatisfy` T.isInfixOf childSess) acks
+        map (continueRunNumber . textOf) acks `shouldBe` [Just "2", Just "3"]
+
+    -- S4: three consecutive foreground continues, all in one parent turn.
+    describe "S4 three consecutive foreground continues" $ do
+      cap <- runIO (newCapturingProvider
+        [ textTurn "r1", textTurn "r2", textTurn "r3", textTurn "r4" ])
+      runApiTestLocal Nothing (captureChildProviderOpts cap) $ \env -> do
+        sid <- callApiNewTab env "ollama" "llama3.2"
+        setScript env
+          [ toolUseTurn "p1" (OpName "AGENT_DEF_WRITE") (writeArgsFor "a-worker" "Worker")
+          , toolUseTurn "p2" (OpName "AGENT_MANAGE")
+              (A.object [ "action" .= ("start" :: Text)
+                        , "id" .= ("a-worker" :: Text)
+                        , "goal" .= goalText ])
+          , doneTurn
+          ]
+        _ <- sendMsgToSession env sid "spawn one child"
+        (subId, childSess) <- startIdsOf env sid
+        run1 <- waitForNextCompletion env sid
+        run1 `shouldBe` True
+        -- One turn, three blocking continues. Each returns its reply in-band,
+        -- so the model can chain them without any polling.
+        setScript env
+          [ toolUseTurn "p3" (OpName "AGENT_MANAGE")
+              (continueArgs subId Nothing (Just "foreground"))
+          , toolUseTurn "p4" (OpName "AGENT_MANAGE")
+              (continueArgs subId Nothing (Just "foreground"))
+          , toolUseTurn "p5" (OpName "AGENT_MANAGE")
+              (continueArgs subId Nothing (Just "foreground"))
+          , doneTurn
+          ]
+        _ <- sendMsgToSession env sid "continue three times"
+        results <- manageResults env sid
+        let fg = [ r | r <- results, isJust (continueRunNumber (textOf r)) ]
+        length fg `shouldBe` 3
+        map (continueRunNumber . textOf) fg `shouldBe` [Just "2", Just "3", Just "4"]
+        mapM_ (\r -> textOf r `shouldSatisfy` T.isInfixOf childSess) fg
+        -- The replies arrived in-band: each foreground result carries the
+        -- child's own answer.
+        map arError fg `shouldBe` [False, False, False]
+        mapM_ (\(want, r) -> textOf r `shouldSatisfy` T.isInfixOf want)
+              (zip ["r2", "r3", "r4"] fg)
+        -- Foreground suppresses delivery: nothing was appended to the sidecar
+        -- by the three continues (the spawn's completion was drained at the
+        -- start of this turn).
+        left <- pendingCompletionCount (atePaths env) (sessionIdOf sid)
+        left `shouldBe` 0
+        reqs <- capturedRequests cap
+        length reqs `shouldBe` 4
+        -- The conversation still accumulated (S1 applies to foreground too).
+        let sizes = map (length . creqMessages) reqs
+        if sizes == [1, 3, 5, 7]
+          then pure ()
+          else mapM_ (\r -> expectationFailure
+                 ("child request: " <> T.unpack (messagesJson (creqMessages r)))) reqs
+
+    -- S3b: the flagship flow — the child finishes while the parent is idle,
+    -- the wake runs a synthetic parent turn, and the parent continues the child
+    -- from inside that wake.
+    describe "S3b a continue issued from inside the wake is accepted" $ do
+      cap <- runIO (newCapturingProvider
+        [ -- Run 1: keep the child busy for a moment, so the parent's wake
+          -- script is in place before the completion fires the wake.
+          toolUseTurn "c1" (OpName "SHELL_EXEC") (A.object ["command" .= ("sleep 0.6" :: Text)])
+        , textTurn "child answer 1"
+        , textTurn "child answer 2"
+        ])
+      runApiTestLocal Nothing
+        ((captureChildProviderOpts cap) { atoEnableIdleWake = True }) $ \env ->
+        withCapturedGlobalLog $ \logs -> do
+          sid <- callApiNewTab env "ollama" "llama3.2"
+          setScript env
+            [ toolUseTurn "p1" (OpName "AGENT_DEF_WRITE") (writeArgsFor "a-worker" "Worker")
+            , toolUseTurn "p2" (OpName "AGENT_MANAGE")
+                (A.object [ "action" .= ("start" :: Text)
+                          , "id" .= ("a-worker" :: Text)
+                          , "goal" .= goalText ])
+            , doneTurn
+            ]
+          _ <- sendMsgToSession env sid "spawn one child"
+          (subId, childSess) <- startIdsOf env sid
+          -- The wake's synthetic turn continues the child; its own follow-up
+          -- turn closes out.
+          setScript env
+            [ toolUseTurn "w1" (OpName "AGENT_MANAGE") (continueArgs subId Nothing Nothing)
+            , doneTurn
+            , doneTurn
+            ]
+          accepted <- boundedPoll 8000 $ do
+            results <- manageResults env sid
+            pure (any (\r -> continueRunNumber (textOf r) == Just "2") results)
+          accepted `shouldBe` True
+          results <- manageResults env sid
+          let acks = [ r | r <- results, continueRunNumber (textOf r) == Just "2" ]
+          length acks `shouldBe` 1
+          map arError acks `shouldBe` [False]
+          mapM_ (\r -> textOf r `shouldSatisfy` T.isInfixOf childSess) acks
+          -- The wake runs the parent's turn off the child's worker thread: a
+          -- wake nested inside the child's run could not continue it.
+          logLines <- logs
+          reqs <- capturedRequests cap
+          case (reqs, [ tid | (tid, t) <- logLines
+                            , "wakeIdleSession: triggering synthetic turn" `T.isInfixOf` t ]) of
+            (r1 : _, wakeTid : _) ->
+              T.pack (show (creqThread r1)) `shouldSatisfy` (/= wakeTid)
+            _ -> pure ()  -- the opcode-level twin asserts this deterministically

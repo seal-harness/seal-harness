@@ -16,13 +16,14 @@
 -- on each opcode's contract.
 module Seal.ISA.IntegrationSpec (spec) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (MVar, newEmptyMVar, putMVar, takeMVar, threadDelay, tryReadMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), encode, object, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -37,15 +38,19 @@ import Seal.Agent.Def.Backend qualified as AgentDefBackend
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Agent.Runtime.Delegation
-  ( ChildWorkerOutcome (..), ChildExitReason (..)
-  , defaultDelegationConfig, newSpawnPauseFlag )
+  ( ChildWorkerOutcome (..), ChildExitReason (..), SubagentId (..)
+  , defaultDelegationConfig, newSpawnPauseFlag, subagentIdText )
+import Seal.Agent.Runtime.Delegation.Worker
+  ( DelegationWorkerDeps (..), mkDelegateWorker )
 import Seal.Agent.Runtime.Registry
-  (newAgentRuntime)
+  ( AgentInstance (..), StopOutcome (..), agentStatusFor, listAgentsFor
+  , newAgentRuntime, pollUntil, stopAgent, workerSettled )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
+                        TrustLevel (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeIndexedTranscript)
@@ -56,7 +61,7 @@ import Seal.Harness.Registry
    snapshot)
 import Seal.Harness.Tmux (TmuxRunner (..), mkTmuxIdent)
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
-import Seal.ISA.Opcode (OpResult (..), localBackend)
+import Seal.ISA.Opcode (Opcode (..), OpResult (..), localBackend, opRun)
 import Seal.ISA.Ops.Agent
 import Seal.ISA.Ops.Bin
 import Seal.ISA.Ops.File
@@ -74,8 +79,8 @@ import Seal.Media.Tts (noTtsProvider, textToSpeechOp)
 import Seal.Memory.Store qualified as MemoryStore
 import Seal.Memory.Embedding (nullEmbeddingBackend)
 import Seal.Providers.Class
-  (CompletionResponse (..), ContentBlock (..), Provider (..), SomeProvider (..),
-   StopReason (..), ToolResultPart (..), Usage (..))
+  (CompletionResponse (..), ContentBlock (..), Message (..), Provider (..),
+   SomeProvider (..), StopReason (..), ToolResultPart (..), Usage (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..))
 import Seal.Security.Vault (UnlockMode (..), VaultConfig (..), openVault, vhInit,
@@ -86,10 +91,13 @@ import Seal.Skills.Backend qualified as SkillBackend
 import Seal.Skills.Types (skBody)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Args (textShellCommand)
+import Seal.TestHelpers.CapturingProvider
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (newAbortFlag)
-import Seal.ISA.RepeatDetect (RepeatTrack, newRepeatTrack)
+import Seal.ISA.RepeatDetect
+  ( RepeatTrack, lookupOrCreateRepeatTrack, newRepeatTrack
+  , newSessionRepeatRegistry )
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkLocalUntrustedIO, mkRemoteUntrustedIOStub )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -1123,3 +1131,159 @@ spec = describe "Seal.ISA.Integration" $ do
       r <- runTestApp (dispatchOne reg (OpName "TEXT_TO_SPEECH")
                         (object ["text" .= ("" :: Text)]))
       r `shouldBe` Left (Denied "TEXT_TO_SPEECH: text is empty")
+
+  -- ----------------------------------------------------------------------
+  -- AGENT_MANAGE continue — S5 kill seam
+  -- ----------------------------------------------------------------------
+  describe "AGENT_MANAGE continue (S5: a child killed mid-dispatch resumes cleanly)" $ do
+    it "a stopped mid-tool child's next request carries no dangling tool_use" $
+      withSystemTempDirectory "seal-int-kill" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp
+              , spConfig = tmp </> "config"
+              , spState = tmp </> "state"
+              , spKeys = tmp </> "keys"
+              , spCache = tmp </> "cache"
+              }
+        backend <- AgentDefBackend.noneBackend
+        cap <- newCapturingProvider
+          [ -- Run 1: call the blocking op. Its assistant message is fsync'd
+            -- before the tool dispatches, so the stop below leaves a dangling
+            -- tool_use in conversation.jsonl.
+            CompletionResponse
+              [ CbToolUse (ToolCallId "call-block") (OpName "TEST_BLOCK") (object []) ]
+              StopToolUse (Usage 0 0)
+          , -- Run 2 (the continue): a plain answer.
+            CompletionResponse [CbText "resumed"] StopEnd (Usage 0 0)
+          ]
+        reached <- newEmptyMVar :: IO (MVar ())
+        release <- newEmptyMVar :: IO (MVar ())
+        logger <- testSealLogger
+        appEnv <- mkEnv logger defaultConfig
+        approvals <- newApprovalCache
+        repeatReg <- newSessionRepeatRegistry
+        let parentSid = mkSystemSessionId "kill-parent"
+            deps = DelegationWorkerDeps
+              { dwdPaths = paths
+              , dwdParentSid = parentSid
+              , dwdParentLineage = [parentSid]
+              , dwdAppEnv = appEnv
+              , dwdMkUIOEnv = \_ _ -> pure (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
+              , dwdParentWorkdir = Just tmp
+              , dwdAutonomy = Full
+              , dwdApprovals = approvals
+              , dwdOnDemand = False
+              , dwdParentDepth = 0
+              , dwdResolveProvider = \_ ->
+                  pure (Right (SomeProvider cap, ModelId "claude-opus-4"))
+              , dwdResolveProviderOverride = Nothing
+              , dwdUnionDefBackend =
+                  error "dwdUnionDefBackend: unused (no nested AGENT_START)"
+              , dwdChildRegistry = \_ _ _ _ _ _ ->
+                  pure (Registry.mkRegistry [blockingOp reached release])
+              , dwdChildSystemPrompt = \_ _ -> pure Nothing
+              , dwdOnEntry = pure ()
+              , dwdChannel = "test"
+              , dwdAbortFlag = const newAbortFlag
+              , dwdRepeatTrack = lookupOrCreateRepeatTrack repeatReg
+              , dwdToolTimeout = defaultToolTimeoutConfig
+              }
+        rt <- newAgentRuntime
+        pauseFlag <- newSpawnPauseFlag
+        let
+            wiring = AgentStartWiring
+              { aswDefBackend = backend
+              , aswRuntime = rt
+              , aswConfig = pure defaultDelegationConfig
+              , aswPauseFlag = pauseFlag
+              , aswParentActivity = Nothing
+              , aswMintSession = pure (mkSystemSessionId "kill-child")
+              , aswParentDepth = 0
+              , aswWorker = mkDelegateWorker deps
+              , aswGate = gateOpen
+              , aswPaths = paths
+              , aswParentSession = parentSid
+              , aswRunRecords = Nothing
+              , aswOnIdleCompletion = Nothing
+              }
+            manage = agentManageOp wiring
+        -- The def the child runs under.
+        _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend parentSid])
+                           (OpName "AGENT_DEF_WRITE")
+                           (object [ "id" .= ("a-kill" :: Text)
+                                   , "name" .= ("kill seam" :: Text)
+                                   , "provider" .= ("ollama" :: Text)
+                                   , "model" .= ("claude-opus-4" :: Text) ]))
+        -- Spawn (background). The child reaches the blocking tool and stops.
+        r0 <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a-kill" :: Text)
+                                    , "goal" .= ("review the diff" :: Text)]))
+        orIsError r0 `shouldBe` False
+        dispatched <- pollUntil 5000 (isJust <$> tryReadMVar reached)
+        dispatched `shouldBe` True
+        insts <- listAgentsFor rt parentSid
+        subId <- case insts of
+          [i] -> pure (aiSubagentId i)
+          _   -> expectationFailure ("expected one instance, got " <> show (length insts))
+                   >> pure (SubagentId "sa-none-00000000")
+        -- Stop mid-dispatch: the child is now cut off between its assistant
+        -- message and the tool result.
+        stopped <- stopAgent rt parentSid subId
+        stopped `shouldBe` Right StopOk
+        settled <- pollUntil 5000 $ do
+          m <- agentStatusFor rt parentSid subId
+          case m of
+            Right i -> workerSettled i
+            Left _  -> pure True
+        settled `shouldBe` True
+        -- Continue: the resumed run must repair the dangling tool_use before
+        -- the provider sees it, or a real provider would reject the request.
+        r1 <- runTestApp (opRun manage localBackend
+                            (object [ "action" .= ("continue" :: Text)
+                                    , "subagent_id" .= subagentIdText subId
+                                    , "mode" .= ("foreground" :: Text) ]))
+        orIsError r1 `shouldBe` False
+        case orParts r1 of
+          [TrpText t] -> t `shouldSatisfy` T.isInfixOf "resumed"
+          _           -> expectationFailure "expected a single text part"
+        reqs <- capturedRequests cap
+        case reqs of
+          (_ : second : _) -> do
+            let msgs = creqMessages second
+                uses = [ cid | Message _ bs <- msgs, CbToolUse cid _ _ <- bs ]
+                results = [ (cid, err) | Message _ bs <- msgs, CbToolResult cid _ err <- bs ]
+            -- The blocking op's tool_use was followed by the synthetic repair
+            -- result: every tool_use has an answer, and the repair says the
+            -- tool may have run.
+            uses `shouldBe` [ToolCallId "call-block"]
+            length results `shouldBe` 1
+            case results of
+              [(cid, err)] -> do
+                cid `shouldBe` ToolCallId "call-block"
+                err `shouldBe` True
+              _ -> pure ()
+            messagesJson msgs `shouldSatisfy`
+              T.isInfixOf "interrupted before this tool returned"
+          other -> expectationFailure
+            ("expected 2 child runs, got " <> show (length other))
+
+-- | A trusted opcode that signals it was dispatched, then blocks until the
+-- test releases it (or the thread is killed).
+blockingOp :: MVar () -> MVar () -> Opcode
+blockingOp reached release = TrustedOpcode
+  { toName = OpName "TEST_BLOCK"
+  , toTrust = Trusted
+  , toDesc = "test: signal dispatch then block"
+  , toInSchema = object []
+  , toOutSchema = object []
+  , toAuthorize = \_ -> Right ()
+  , toBlocking = False
+  , toRun = \_ _ -> do
+      liftIO (putMVar reached ())
+      liftIO (takeMVar release)
+      pure (OpResult [] False (object []))
+  }
+
+-- | The messages of a request rendered as JSON.
+messagesJson :: [Message] -> Text
+messagesJson = TE.decodeUtf8 . BL.toStrict . encode
