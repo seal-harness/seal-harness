@@ -1,10 +1,20 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The Agent opcode group: three Audited definition opcodes
--- (@AGENT_DEF_WRITE@, @AGENT_DEF_READ@, @AGENT_DEF_LIST@, @AGENT_DEF_DELETE@)
--- and four Trusted lifecycle opcodes (@AGENT_INSTANCES@, @AGENT_START@,
--- @AGENT_STATUS@, @AGENT_STOP@, @AGENT_INTERRUPT@). Only the *definition*
--- mutations are Audited — running an instance is harness-internal, not an
--- evolutionary mutation, so the lifecycle ops are Trusted.
+-- | The Agent opcode group. Two consolidated, action-based entry points carry
+-- the model-facing surface:
+--
+--   * @AGENT_DEF_MANAGE@ (Audited) — @write@ / @read@ / @list@ / @delete@ of
+--     agent definitions;
+--   * @AGENT_MANAGE@ (Trusted) — @instances@ / @start@ / @continue@ /
+--     @status@ / @stop@ / @interrupt@ of the live runtime.
+--
+-- The legacy single-purpose opcodes (@AGENT_DEF_WRITE@, @AGENT_DEF_READ@,
+-- @AGENT_DEF_LIST@, @AGENT_DEF_DELETE@, @AGENT_INSTANCES@, @AGENT_START@,
+-- @AGENT_STATUS@, @AGENT_STOP@, @AGENT_INTERRUPT@) remain as shims so
+-- transcripts recorded before the consolidation still replay; they are hidden
+-- from the model's tool catalog and delegate to the same handlers. Only the
+-- *definition* mutations are Audited — running an instance is
+-- harness-internal, not an evolutionary mutation, so the lifecycle ops are
+-- Trusted.
 --
 -- @AGENT_DEF_WRITE@ is an upsert: if the def already exists, its name/system/
 -- tools are updated (the original 'adSession' provenance and 'adCreatedAt' are
@@ -18,14 +28,22 @@
 -- definitions. The rename stops the confusion between "list definitions" and
 -- "list running instances".
 --
--- @AGENT_START@ is the Seal analog of Hermes' @delegate_task@: it spawns one
--- or more child agents with isolated context, runs each against a goal to
--- completion (synchronously), and returns a structured JSON result per child.
--- The parent blocks until all children finish (or time out). See
--- 'Seal.Agent.Runtime.Delegation' for the full feature list. The opcode is a
--- thin shim over 'runDelegate' — it normalizes the model's input, resolves the
--- def, delegates the worker construction to the wiring layer's
--- 'AgentWorkerBuilder', and serializes the 'ChildResult' list to JSON.
+-- @AGENT_MANAGE start@ spawns one or more child agents with isolated context.
+-- In @background@ mode (the default) it forks each child, returns immediately
+-- with the per-child @subagent_id@ / @child_session@, and delivers the reply
+-- later as a completion message the parent's next turn injects. In
+-- @foreground@ mode it runs the children to completion and returns their
+-- results in-band. Either way each child run is a
+-- 'Seal.Agent.Runtime.Delegation.ChildTask' executed by the wiring layer's
+-- 'AgentWorkerBuilder'; the opcode normalizes the model's input, resolves the
+-- def, and serializes the results.
+--
+-- @AGENT_MANAGE continue@ resumes a child this session spawned — same child
+-- session, same pinned def and tool grant, the spawn's task snapshot — after
+-- it finished, was stopped, was interrupted, or crashed. 'Seal.Agent.ConvRepair'
+-- repairs a conversation that was cut off between a tool call and its result.
+-- See 'Seal.Agent.Runtime.Delegation' for the run model and
+-- 'Seal.Agent.Runtime.Registry' for the ownership / lifecycle rules.
 module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
   , agentDefManageOp
@@ -707,9 +725,6 @@ allowSpawnBlockedMsg =
   \allow_spawn = false. Re-trying will not succeed until the operator \
   \sets allow_spawn = true on this agent definition."
 
--- | Register a finished child in the runtime registry (post-hoc; the worker
--- ran synchronously to completion). Records the instance with status
--- 'Stopped' (the synchronous child has already finished by the time this is
 -- ---------------------------------------------------------------------------
 -- Agent runtime action enum (AGENT_MANAGE)
 -- ---------------------------------------------------------------------------

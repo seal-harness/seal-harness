@@ -1,10 +1,19 @@
 # Subagent `continue` — resume a canceled child and talk to it
 
-<!-- status: draft rev 4 -->
+<!-- status: approved rev 5 (operator decision) · implemented on agent/subagent-continue -->
 <!-- date: 2026-11-03 -->
 <!-- branch: agent/subagent-continue -->
+<!-- user-approved: true — operator decision after the gate cap: single PR,
+     proceed now, all four prerequisites non-negotiable. -->
+<!-- gate iterations: design gate 3 rounds (5/5 NEEDS_REVISION each), plan gate
+     3 rounds (FAIL/FAIL/PASS, FAIL/FAIL/PASS, FAIL/FAIL/FAIL — cap reached).
+     Every finding is applied; the rev 5/6 amendments below supersede the
+     conflicting text in the body (struck inline where it appears). -->
+<!-- non-negotiable prerequisites (must ship in this PR): ownership gate, one
+     child-run lifecycle, conversation repair, child-transcript secret
+     redaction. -->
 <!-- rev 1-3: 5/5 NEEDS_REVISION each round. rev 4 resolves every finding; the
-     gate's 3-iteration cap is reached, so rev 4 goes to the operator for a
+     gate's 3-iteration cap is reached, so rev 4 went to the operator for a
      proceed/revise/simplify decision (see "Gate status"). -->
 
 ## Rev 5 amendments (plan-review round 2 + operator decision)
@@ -217,8 +226,14 @@ lifecycle. It replaces an implicit one with three defects:
 
 ```haskell
 type SpawnCallback =
-  SubagentId -> AgentDef -> SessionId -> ChildTask -> (IO ChildResult) -> IO ()
+  SubagentId -> AgentDef -> SessionId -> ChildTask -> (IO ChildResult) -> IO ChildResult
 ```
+
+> **Supersedes the rev-4 `… -> IO ()` sketch.** The callback *returns* the
+> result: `runDelegateAsync` still calls the completion callback afterwards,
+> so there is one delivery path, not two. `spawnOne` wraps only the run body
+> in the cap, and `callback` stays owned by `runDelegateAsync`.
+
 
 Two callers, one shared body — this is the fix for "`spawnCb` re-registers and
 destroys the claim":
@@ -494,10 +509,11 @@ pruneRetained         -- keeps ≤32 terminal entries per parent, oldest aiLastA
   generation-guarded, and never touches `aiWorkerThread` (already cleared).
 - `pruneRetained` bounds retained entries per parent (constant 32; configurable
   later), keyed on `aiLastActivity`.
-- `SubagentId`'s constructor is **unexported**, replaced by a validating
-  `mkSubagentIdFromText` (proof-type discipline; also makes log injection
-  structurally impossible). `unSubagentId` has zero call sites outside its
-  definition, so this is mechanical.
+- ~~`SubagentId`'s constructor is **unexported**, replaced by a validating
+  `mkSubagentIdFromText`~~ — **superseded by rev-5 amendment 7**: the
+  constructor stays exported and `subagent_id` is validated as *text* in the
+  pure `continue` gate instead (`Ops/Agent.hs`, `authorizeContinue`), which
+  leaves `RunRecord`'s decoder untouched.
 
 ## One child-run core (`src/Seal/Agent/Runtime/Delegation.hs`)
 
@@ -537,8 +553,12 @@ parent mid-continue).
 ## Conversation repair (`src/Seal/Agent/ConvRepair.hs`, new)
 
 ```haskell
-repairDanglingToolUse :: [Message] -> [Message]
+repairDanglingToolUse :: [Message] -> ([Text], [Message])
+-- (unrepairable tool-call ids, repaired conversation)
 ```
+
+> **Supersedes the rev-4 `[Message] -> [Message]` signature** (rev-5
+> amendment 5): a pure function cannot log, so `runTurn` logs the ids.
 
 Rule: find the **final** assistant message that carries `CbToolUse` ids with no
 matching `CbToolResult` after it; append one `Message User` containing a
@@ -723,8 +743,9 @@ is not lost) but is not delivered.
 - **No authority widening**: pinned def; task role narrow-only
   (`effectiveRole (adRole def) (ctRole task)`); `isolate_workdir` and the
   session-stable anchor; depth from the continuing turn's wiring.
-- **Input validation**: `subagent_id` validated through
-  `mkSubagentIdFromText` (constructor unexported); `prompt` non-empty, ≤32 KiB,
+- **Input validation**: `subagent_id` validated as text (non-empty, ≤256
+  characters, no control characters — rev-5 amendment 7; the constructor stays
+  exported); `prompt` non-empty, ≤32 KiB,
   no NUL/control characters — it is fsync'd into the child transcript and
   re-sent on every later turn, so it is bounded. Both validated in
   `authorizeAgentManage` (pure gate, mirroring `authorizeStart`'s `shapeGate`).
@@ -811,7 +832,7 @@ task (repair or session reuse broken), or `[transcript-diag] DESYNC` in
 
 1. `continue` accepts `subagent_id`, optional `prompt`, optional `mode`; schema,
    `toDesc`, and property descriptions exactly as specified.
-2. Preconditions 1-10 in order with the specified texts; 2/4/8/9 re-checked in
+2. Preconditions 1-11 (eleven refusal texts) in order with the specified texts; 2/4/8/9 re-checked in
    the claim; a refusal does not consume run budget.
 3. `continue` reuses the child session, the pinned def, the stored task, the
    task index, and the continuing turn's `aswWorker`; empty history → `ctGoal`;
@@ -828,7 +849,8 @@ task (repair or session reuse broken), or `[transcript-diag] DESYNC` in
    on every failure path; two concurrent continues → exactly one winner.
 7. `aiGeneration` guards status/result writes; `aiThreadId` deleted;
    `AgentInstance` uses named fields, strict new fields, a custom `Show`
-   eliding `aiTask`/`aiDef`/`aiResult`; `SubagentId`'s constructor unexported.
+   eliding `aiTask`/`aiDef`/`aiResult`; the `SubagentId` constructor stays
+   exported (rev-5 amendment 7).
 8. Foreground `start` registers its children; their results carry
    `continueHint`.
 9. `repairDanglingToolUse` is applied in `runTurn`, targets the final
@@ -836,14 +858,16 @@ task (repair or session reuse broken), or `[transcript-diag] DESYNC` in
 10. `AGENT_INSTANCES` owner-scoped + live-only + summary line; `AGENT_STATUS`
     outcome vocabulary + resumability hint; `AGENT_STOP`/`AGENT_INTERRUPT`
     surface their outcome and suppress delivery.
-11. All five `AGENT_MANAGE` actions **and the four legacy shims** enforce
+11. All six `AGENT_MANAGE` actions (instances/start/continue/status/stop/
+    interrupt) **and the four legacy shims** enforce
     ownership; refusals never echo the owning session id; `listAgents` retained
     for the human Command layer.
 12. Child transcript secret redaction wired (`CbToolResult` **and**
     `CbToolUse` inputs), with the prospective-only note.
 13. Retention pruned on `aiLastActivity`; `aiRuns ≤ 50`; `prompt`/`subagent_id`
-    validation; strict `mode` for both `start` and `continue` (the existing
-    `parseSpawnMode` fallback test is replaced by a strict-validation test).
+    validation; strict `mode` for **`continue` only** (rev-5 amendment 7 —
+    `start` keeps its documented lenient fallback, so no shipped behaviour
+    changes and no existing test is replaced).
 14. Module wiring: `Seal.Agent.ConvRepair` in `exposed-modules`,
     `ConvRepairSpec` in the test suite's `other-modules`, both `test/Main.hs`
     edits; `turnEngine`'s four shim wirings updated with the parent session.
@@ -879,14 +903,14 @@ I = `IntegrationSpec`.
 | 6 | R: the handle is recorded before the body runs | — |
 | 7 | R: stale-generation `registerCompletedAgentResult` is a no-op | — |
 | 7 | R: `show` omits goal, system prompt, summary; keeps ids/status | — |
-| 7 | R: `mkSubagentIdFromText` rejects empty/over-long/control-char ids | QuickCheck |
+| 7/13 | A: `subagent_id` text is rejected when empty / 257 chars / contains a control character | — |
 | 8 | A: foreground `start` → `continue` on the returned id runs the worker twice; result carries `continueHint` | IORef |
 | 9 | C: one repair per unmatched id; `repair . repair == repair`; input is a prefix of output; complete tails unchanged | QuickCheck |
 | 9 | C: partial tail (2 `CbToolUse`, 1 answered) → exactly one repair | QuickCheck |
 | 9 | C: mid-history dangling id → unchanged + `not repairable` log | — |
 | 9/S5 | I: kill between assistant fsync and tool dispatch → continue → turn-2 request has no dangling `tool_use` | test op signals an `MVar` from inside dispatch then blocks |
 | 1 | A: `parseAgentAction` accepts `"continue"` | — |
-| 2 | A: all ten refusal texts, in order (owner refusal does not contain the owner id) | — |
+| 2 | A: all eleven refusal texts, in order (owner refusal does not contain the owner id) | — |
 | 2 | A: `goal`/`id`/`context`/`role`/`tasks` with `continue` → start-only-field error | — |
 | 13 | A: `prompt: ""`, `prompt: 123`, 40 KiB, control chars → errors; absent ok; `mode: "Foreground"` → error for **both** start and continue | — |
 | 3 | A: continue passes the **same child session** (IORef-minted; today's constant `"fresh"` is vacuous) and the pinned def | IORef |
@@ -935,7 +959,7 @@ inverted (1 production site, 7 test lambdas), `stopAgent`/`interruptAgent`/
 fields, −`aiThreadId`), `stopAgent`/`interruptAgent` retain entries and suppress
 delivery, `AGENT_STATUS` gains the outcome vocabulary + `unknown` token,
 `AGENT_INSTANCES` becomes owner-scoped and live-only, `mode` validation is
-strict for `start` too (one existing test replaced — call it out in the PR).
+strict for `continue` only (rev-5 amendment 7 — `start` is unchanged).
 `README.md:144` names the opcode but not its actions, so it needs no change; the
 opcode description carries the behaviour.
 
