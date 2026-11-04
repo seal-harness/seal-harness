@@ -103,18 +103,18 @@ data AgentInstance = AgentInstance
     -- *completing* thread here made 'stopAgent' able to kill the parent's own
     -- turn.
   , aiDepth      :: Int
-    -- ^ The parent's delegation depth (0 = top-level parent). The child's
-    -- depth is @aiDepth + 1@; checked against @max_spawn_depth@ before
-    -- spawning.
+    -- ^ THIS child's delegation depth (1 = spawned by a top-level session).
+    -- The spawn compared it against @delegation.max_spawn_depth@.
   , aiParentSession :: SessionId
     -- ^ The parent session that spawned this child. Used by
     -- 'hasRunningChildren' to check whether a parent session has pending
     -- background children before transitioning it to idle.
   , aiResult     :: Maybe ChildResult
-    -- ^ The 'ChildResult' when the child has completed ('Nothing' while
-    -- running, 'Just' after completion). Populated by
-    -- 'registerCompletedAgentResult'. Allows 'AGENT_STATUS' to return
-    -- summary + child_session + exit_reason after the child finishes.
+    -- ^ The 'ChildResult' of the last finished run ('Nothing' while a run is
+    -- in flight). Written by 'registerRunResult' / 'registerFinishedAgent' /
+    -- 'registerCompletedAgentResult', generation-guarded. Lets
+    -- 'AGENT_STATUS' return summary + child_session + exit_reason after the
+    -- child finishes.
   , aiTask       :: !(Maybe ChildTask)
     -- ^ Spawn snapshot: context / role / isolate_workdir, plus the goal used
     -- only as the empty-history fallback when a run is resumed.
@@ -163,9 +163,10 @@ instance Show AgentInstance where
       elided Nothing  = "Nothing"
       elided (Just _) = "Just <elided>"
 
--- | The STM-backed registry of running instances, keyed by 'SubagentId'. No
--- two running instances share a subagent id: 'startAgent' generates a fresh
--- one per spawn. 'stopAgent' removes the entry.
+-- | The STM-backed registry of child instances, keyed by 'SubagentId'. No two
+-- instances share a subagent id: one is minted per spawn. Entries are
+-- RETAINED when a run ends (the child stays continuable); 'pruneRetained'
+-- bounds how many finished children each parent keeps.
 newtype AgentRuntime = AgentRuntime (TVar (Map SubagentId AgentInstance))
 
 -- | Build an empty runtime.
