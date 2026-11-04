@@ -558,9 +558,16 @@ export default function App() {
   // A `kind:"slash"` send response adds no transcript entry: render a
   // transient bubble and clear the optimistic spinner. When the slash
   // command mints a fresh session (e.g. /new), `session_id` is set and the
-  // SPA navigates to it so the new session becomes the focused one. Any
-  // other kind falls through to the transcript-driven clear path. Returns
-  // true when the caller must NOT keep a pending spinner.
+  // SPA navigates to it so the new session becomes the focused one.
+  //
+  // `kind:"answer"` needs the same treatment for the same reason: the
+  // backend consumed the message as the reply to a pending ASK_HUMAN
+  // question and started no turn, so the transcript-driven clear below
+  // would never fire and the message would sit in a permanent "thinking"
+  // state. The response carries a ready-made `✓ <answer>` confirmation.
+  //
+  // Any other kind falls through to the transcript-driven clear path.
+  // Returns true when the caller must NOT keep a pending spinner.
   // Ref that mirrors the current transcript-messages count so
   // `handleSendResult` can capture the insert position for a slash bubble
   // without adding `transcriptMessages` to its dependency array (which
@@ -569,7 +576,7 @@ export default function App() {
   const transcriptMsgCountRef = useRef(0)
 
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
-    if (res && res.kind === 'slash') {
+    if (res && (res.kind === 'slash' || res.kind === 'answer')) {
       setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
       setPendingMessage(null)
       setPendingMessageModel(null)

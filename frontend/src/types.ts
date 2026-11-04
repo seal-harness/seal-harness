@@ -548,11 +548,13 @@ export interface Message {
    *  the user actually clicks the "View raw JSON" button — not on every
    *  render. A plain string is also accepted (for test fixtures). */
   rawJson?: string | (() => string)
-  /** Marks a TRANSIENT slash-command output bubble (kind:"slash" send
-   *  response). These rows are NOT persisted — they never enter the
+  /** Marks a TRANSIENT output bubble: the response to a `kind:"slash"` send
+   *  (command output) or a `kind:"answer"` send (an `ASK_HUMAN` answer the
+   *  gateway consumed, so no turn runs and no transcript entry follows).
+   *  These rows are NOT persisted — they never enter the
   *  transcript and vanish on reload. Rendered in a muted "command output"
-  *  style with a "command output — not saved" label. Spliced into the
-  *  message list at the position the command occupied in the conversation
-  *  flow, so no reordering happens when new entries arrive later. */
+   *  style with a "command output — not saved" label. Spliced into the
+   *  message list at the position the command occupied in the conversation
+   *  flow, so no reordering happens when new entries arrive later. */
   slashBubble?: boolean
 }
