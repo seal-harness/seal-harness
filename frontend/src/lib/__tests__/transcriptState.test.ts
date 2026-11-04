@@ -138,6 +138,21 @@ describe('transcriptState reducer', () => {
     expect(canAutoLoadOlder(recovered.extent)).toBe(true)
   })
 
+  it('a duplicate-only older chunk blocks auto-load (no progress with this cursor)', () => {
+    const base = run(
+      INITIAL_TRANSCRIPT_STATE,
+      { type: 'seed', entries: makeEntries('e', 2, 10), chunkHasMore: true },
+    )
+    const state = reduceTranscript(base, {
+      type: 'chunk-older',
+      entries: [makeEntry('e-10'), makeEntry('e-11')],
+      chunkHasMore: true,
+    })
+    expect(state.entries).toHaveLength(2)
+    expect(canAutoLoadOlder(state.extent)).toBe(false)
+    expect(hasOlder(state.extent)).toBe(true)
+  })
+
   it('an empty older chunk does not change atStart even when hasMore is false', () => {
     const state = run(
       INITIAL_TRANSCRIPT_STATE,

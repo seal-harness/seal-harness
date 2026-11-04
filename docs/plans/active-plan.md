@@ -34,7 +34,9 @@ Work-unit status:
 - [x] WU-3 pure scroll math + virtual-window adoption (+ tests)
 - [x] WU-4 hook wiring, derived flags, cache extent (+ tests)
 - [x] WU-5 single scroll intent in ChatArea (+ tests)
-- [ ] WU-6 self-reflect, commit, PR
+- [x] WU-6 self-reflect, commit, PR (adversarial review round fixed the
+      bottom-scroll guard, the per-effect-run initial flag, the
+      duplicate-chunk retry loop, and restored the render profiler)
 
 Gates run: frontend `vitest` 775 passed, `tsc && vite build` green;
 Haskell `cabal test` 3416 examples / 0 failures / 41 pending; `hlint`

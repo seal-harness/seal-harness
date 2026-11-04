@@ -916,6 +916,66 @@ describe('useTranscriptStream window-derived pagination', () => {
     vi.unstubAllGlobals()
   })
 
+  it('restores a beginning-only window on a cache hit', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 100)
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadFromBeginning() })
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+
+    rerender({ sid: 's2' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    rerender({ sid: 's1' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('clears loadingMore when the stream disconnects', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+    await act(async () => { c.setStatus('reconnecting') })
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('reports requested when no pinned tail exists and unavailable without a session', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    // Drop the cache (and its pins) while the view keeps its entries.
+    _resetDataCacheForTests()
+    expect(result.current.loadLatest()).toBe('requested')
+
+    const noSession = renderHook(() => useTranscriptStream(null, c))
+    expect(noSession.result.current.loadFromBeginning()).toBe('unavailable')
+    expect(noSession.result.current.loadLatest()).toBe('unavailable')
+    vi.unstubAllGlobals()
+  })
+
   it('clears loadingMore when a chunk for another session arrives', async () => {
     _resetDataCacheForTests()
     const c = fakeClient()

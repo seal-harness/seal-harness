@@ -449,6 +449,14 @@ spec = describe "Seal.Gateway.Stream" $ do
       readIORef seenLimit `shouldReturn` Just ReadAll
       readIORef captured `shouldReturn` Just (50, True, 1000, Just "e100")
 
+    it "the handler core reports the whole transcript for a short beginning read" $ do
+      captured <- newIORef (Nothing :: Maybe (Int, Bool))
+      handleRequestEntriesCore
+        (\_rlim -> pure (mkEntries [0..39], 40))
+        (\chunk hasMore _ _ -> writeIORef captured (Just (length chunk, hasMore)))
+        (Just "__beginning__") 50
+      readIORef captured `shouldReturn` Just (40, False)
+
     it "the handler core keeps the bounded read for the initial chunk" $ do
       seenLimit <- newIORef (Nothing :: Maybe ReadLimit)
       handleRequestEntriesCore

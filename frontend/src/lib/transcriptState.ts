@@ -179,12 +179,12 @@ export function reduceTranscript(
           extent: { ...state.extent, atStart: !event.chunkHasMore, olderBlocked: false },
         }
       }
-      // An EMPTY chunk teaches us nothing about the start (the cursor may
-      // have been stale), but it must not be fired again automatically. A
-      // non-empty chunk whose entries were all already delivered by the
-      // live tail carries no edge information either, but it is not a
-      // no-progress request, so it does not block the next attempt.
-      if (event.entries.length === 0 && !state.extent.olderBlocked) {
+      // A request that added nothing teaches us nothing about the start
+      // (the cursor may have been stale, or every entry was already
+      // delivered by the live tail), but it must not be fired again
+      // automatically with the same cursor. The explicit "Scroll to top"
+      // button still asks the server for the beginning.
+      if (!state.extent.olderBlocked) {
         return { entries, extent: { ...state.extent, olderBlocked: true } }
       }
       return { entries, extent: state.extent }

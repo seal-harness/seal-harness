@@ -2794,17 +2794,22 @@ export function ChatArea({
   const applyScroll = useCallback((target: 'top' | 'bottom') => {
     const el = scrollerRef.current
     if (!el) return
-    const top = target === 'top' ? 0 : el.scrollHeight
+    // The expected scrollTop is the CLAMPED maximum, not scrollHeight:
+    // the browser cannot scroll past scrollHeight - clientHeight, and a
+    // guard set to the unclamped value would never match the resulting
+    // event (so the button's own bottom scroll would cancel its intent).
+    const maxTop = () => Math.max(0, el.scrollHeight - el.clientHeight)
+    const top = target === 'top' ? 0 : maxTop()
     intentScrollGuard.current = el.scrollTop === top ? null : top
-    el.scrollTo({ top })
+    el.scrollTo({ top: target === 'top' ? 0 : el.scrollHeight })
     // Follow-up frame catches layout shifts from async content (code
     // highlighting, images, markdown) that renders after commit.
     requestAnimationFrame(() => {
       const el2 = scrollerRef.current
       if (!el2) return
-      const nextTop = target === 'top' ? 0 : el2.scrollHeight
+      const nextTop = target === 'top' ? 0 : Math.max(0, el2.scrollHeight - el2.clientHeight)
       intentScrollGuard.current = el2.scrollTop === nextTop ? null : nextTop
-      el2.scrollTo({ top: nextTop })
+      el2.scrollTo({ top: target === 'top' ? 0 : el2.scrollHeight })
     })
   }, [])
 
@@ -2815,8 +2820,11 @@ export function ChatArea({
   useEffect(() => {
     const el = scrollerRef.current
     if (!el) return
-    let initial = true
-    const onScroll = () => {
+    // `userInitiated` is per CALL, never per effect run: the effect
+    // re-registers whenever `loadingMore`/`hasMore` change, and resetting
+    // an "initial" flag there would exempt the first real user scroll after
+    // every chunk from cancelling a pending intent.
+    const onScroll = (userInitiated: boolean) => {
       const scrollTop = el.scrollTop
       // The virtual window's measurement adjustment is not a user scroll.
       if (isSyntheticScroll(scrollTop, scrollGuard.current)) return
@@ -2825,10 +2833,9 @@ export function ChatArea({
       intentScrollGuard.current = null
       // A real user scroll cancels any pending intent. The button's own
       // scroll does not.
-      if (!initial && !ownScroll) {
+      if (userInitiated && !ownScroll) {
         scrollIntent.current = nextScrollIntent(scrollIntent.current, { type: 'user-scrolled' }).intent
       }
-      initial = false
       const metrics = { scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight }
       atBottomRef.current = isAtBottom(metrics)
       const step = nextScrollIntent(scrollIntent.current, {
@@ -2849,10 +2856,32 @@ export function ChatArea({
         }
       }
     }
-    onScroll()
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
+    // Initial measurement: not user-initiated, so it cannot cancel the
+    // session-switch intent that the layout effect just set.
+    onScroll(false)
+    const listener = () => onScroll(true)
+    el.addEventListener('scroll', listener, { passive: true })
+    return () => el.removeEventListener('scroll', listener)
   }, [hasMore, loadingMore, loadOlder, viewingLatest, loadLatest, applyScroll])
+
+  // Measure the time from the start of the message-list render phase to the
+  // point the browser has painted the committed DOM. React's <Profiler> is a
+  // no-op in production builds, so we use a render-phase timestamp (captured
+  // during render) + a useLayoutEffect (fires after DOM commit, before paint)
+  // + a requestAnimationFrame (fires after paint) to measure the full
+  // render→commit→paint cycle. This works in both dev and prod builds.
+  const renderStartRef = useRef(0)
+  renderStartRef.current = perf.isEnabled() ? performance.now() : 0
+  useLayoutEffect(() => {
+    if (!perf.isEnabled() || renderStartRef.current === 0) return
+    const t0 = renderStartRef.current
+    const commitDone = perf.begin('render.ChatArea.commit')
+    perf.record('render.ChatArea.commit', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'commit', n: messages.length } })
+    requestAnimationFrame(() => {
+      perf.record('render.ChatArea.paint', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'paint', n: messages.length } })
+      commitDone()
+    })
+  }, [messages])
 
   // Track the previous session id so a session switch is detected once.
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)

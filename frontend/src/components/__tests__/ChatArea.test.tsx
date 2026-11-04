@@ -2402,8 +2402,8 @@ describe('Scroll-to-bottom behavior', () => {
   it('switching to a loading session scrolls to bottom once messages arrive', () => {
     // Regression test for the cache-miss case: when switching to a session
     // whose messages haven't loaded yet (loading=true), the scroll must be
-    // deferred until the real messages arrive. The pendingScrollToBottom
-    // ref persists across the loading → messages-ready transition.
+    // deferred until the real messages arrive. The scroll intent persists
+    // across the loading → messages-ready transition.
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
 
@@ -2764,13 +2764,11 @@ describe('ChatArea connection modal', () => {
 // ── Scroll button no-op regression ───────────────────────────────────────
 //
 // When the user switches tabs and switches back, the data cache may have
-// pinned entries for the original session. If loadLatest() finds the
-// pinned entries are the same array reference as the current entries,
-// setEntries() is a no-op (React useState bails out on same ref) → no
-// re-render → useLayoutEffect never fires → pendingScrollToBottom is
-// never consumed → no scroll. The fix: a requestAnimationFrame fallback
-// in the button handler that scrolls directly if the pending flag is
-// still true after paint.
+// pinned entries for the original session. If loadLatest()/loadFromBeginning()
+// finds the pinned entries are the same array reference as the current
+// entries, dispatching would produce no observable change (React bails out
+// on the same array). The hook reports `'unchanged'`, and the button scrolls
+// directly instead of waiting for an effect that will never run.
 
 describe('scroll button no-op after tab switch', () => {
   function makeMessages(prefix: string, count: number): Message[] {
@@ -3054,6 +3052,140 @@ describe('ChatArea scroll-to-top with a window-derived hasMore', () => {
     scrollToSpy.mockClear()
     act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
     expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('applies the top scroll when the beginning chunk arrives', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgs('oldest', 3)}
+          hasMore={false}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('does not auto-scroll on a session switch while a fragment is pinned', () => {
+    window.location.hash = '#some-block'
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    // Deep-link mode: the anchor wins over the session-switch follow.
+    expect(scrollToSpy).not.toHaveBeenCalled()
+    // An explicit click still scrolls.
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('replaces a pending top intent with the bottom follow on a session switch', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { container, rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    const scroller = container.querySelector('.chat-scroll') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 600, configurable: true })
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={false}
+        />,
+      )
+    })
+    // The session-change render carries the previous session's messages
+    // and intentionally does not scroll; the content arrives next.
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={false}
+        />,
+      )
+    })
+    const bottomCalls = scrollToSpy.mock.calls.filter(
+      (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 1000,
+    )
+    expect(bottomCalls.length).toBeGreaterThan(0)
+    expect(topZeroCalls().length).toBe(0)
+  })
+
+  it('reaches index 0 on a virtualized transcript after the button scroll', async () => {
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    const { container } = renderArea({
+      messages: msgs('v', 501),
+      hasMore: true,
+      loadFromBeginning,
+    })
+    const scroller = container.querySelector('.chat-scroll') as HTMLDivElement
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+    // The mocked scrollTo does not move scrollTop; simulate the resulting
+    // event so the virtual range recomputes.
+    await act(async () => {
+      scroller.scrollTop = 0
+      scroller.dispatchEvent(new Event('scroll'))
+      await new Promise((r) => setTimeout(r, 40))
+    })
+    expect(screen.getByText('Message 0')).toBeTruthy()
+  })
+
+  it('a disabled button cannot issue a second request while a chunk loads', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: true, loadingMore: true, loadFromBeginning })
+    const btn = screen.getByLabelText('Scroll to top') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    act(() => { fireEvent.click(btn) })
+    expect(loadFromBeginning).not.toHaveBeenCalled()
   })
 
   it('disables the buttons while a chunk is loading', () => {
