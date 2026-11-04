@@ -557,4 +557,8 @@ export interface Message {
    *  message list at the position the command occupied in the conversation
    *  flow, so no reordering happens when new entries arrive later. */
   slashBubble?: boolean
+  /** Overrides the bubble's muted tag when it is set. A slash-command bubble
+   *  keeps the default "command output — not saved"; an `ASK_HUMAN` answer
+   *  confirmation says "sent as the answer — not saved". */
+  slashBubbleLabel?: string
 }

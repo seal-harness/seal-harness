@@ -163,6 +163,12 @@ interface SlashBubble {
   text: string
   at: number       // send seq (ordering among multiple slash bubbles)
   insertAt: number // transcript-messages length when the response arrived
+  /** Header title of the bubble: "Command output" for a slash command, or
+   *  "Answer" for an ASK_HUMAN answer the gateway consumed (kind:"answer"). */
+  title: string
+  /** The muted italic tag after the title. Both kinds are ephemeral: they
+   *  never enter the transcript and vanish on reload. */
+  label: string
 }
 
 // ── App ──────────────────────────────────────────────────────────────────
@@ -577,7 +583,15 @@ export default function App() {
 
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
     if (res && (res.kind === 'slash' || res.kind === 'answer')) {
-      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
+      const isAnswer = res.kind === 'answer'
+      setSlashBubbles((b) => [...b, {
+        id: `slash-${seq}`,
+        text: res.response,
+        at: seq,
+        insertAt: transcriptMsgCountRef.current,
+        title: isAnswer ? 'Answer' : 'Command output',
+        label: isAnswer ? 'sent as the answer — not saved' : 'command output — not saved',
+      }])
       setPendingMessage(null)
       setPendingMessageModel(null)
       // /new swaps the backend's active session; navigate the SPA to it so
@@ -695,11 +709,12 @@ export default function App() {
       const idx = Math.min(sb.insertAt + offset, merged.length)
       merged.splice(idx, 0, {
         id: sb.id,
-        agentName: 'Command output',
+        agentName: sb.title,
         agentStatus: 'idle' as const,
         timestamp: now,
         blocks: [{ id: sb.id + '-text', text: sb.text }],
         slashBubble: true,
+        slashBubbleLabel: sb.label,
       })
       offset++
     }

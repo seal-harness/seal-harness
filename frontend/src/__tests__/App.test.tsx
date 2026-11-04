@@ -924,6 +924,9 @@ describe('App — plain reply consumed as an ask answer', () => {
       expect(screen.getByTestId('slash-bubble')).toBeTruthy()
     })
     expect(screen.getByText('✓ main')).toBeTruthy()
+    // ... labelled as an answer, not as command output ...
+    expect(screen.getByText(/sent as the answer/)).toBeTruthy()
+    expect(screen.queryByText(/command output/)).toBeFalsy()
     // ... and the optimistic pending bubble is gone (no turn will ever
     // produce the transcript entry that normally clears it).
     await waitFor(() => {
