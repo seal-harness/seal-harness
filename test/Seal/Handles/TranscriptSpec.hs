@@ -3,6 +3,7 @@ module Seal.Handles.TranscriptSpec (spec) where
 
 import Control.Exception (try, evaluate, throwIO, fromException, SomeException)
 import Data.Aeson (object, (.=))
+import Data.Aeson qualified as Aeson
 import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -174,6 +175,52 @@ spec = describe "Seal.Handles.Transcript" $ do
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         -- Shell output passes through verbatim — NOT redacted.
         BS8.unpack convContents `shouldContain` "total used free"
+        BS8.unpack convContents `shouldNotContain` "<redacted:secret>"
+
+    it "redacts CbToolUse inputs from secret-producing opcodes (a put value never reaches disk)" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 2
+        let input = object
+              [ "action" .= ("put" :: String)
+              , "name"   .= ("vault-key" :: String)
+              , "value"  .= ("sk-live-9f3c" :: String)
+              ]
+            toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE") input]
+            resultMsg = Message User [CbToolResult (ToolCallId "tc1") [TrpText "stored"] False]
+        withIndexedTranscript dir $ \h -> do
+          itwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
+          itwRecordAndAck h (IndexedTranscriptWrite [toolUse, resultMsg] e)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        -- WU-6: the *input* half of a secret opcode is redacted too — a
+        -- SECRET_MANAGE put carries the secret value in the tool_use input,
+        -- which used to be persisted verbatim and re-sent on every turn.
+        BS8.unpack convContents `shouldNotContain` "sk-live-9f3c"
+        BS8.unpack convContents `shouldContain` "<redacted:secret>"
+        -- The structure survives so the persisted conversation stays a
+        -- replayable tool_use (providers require an object input).
+        case BS8.lines convContents of
+          (firstLine : _) ->
+            case Aeson.decodeStrict firstLine :: Maybe Message of
+              Just (Message _ (CbToolUse _ _ input' : _)) -> case input' of
+                Aeson.Object _ -> pure ()
+                other -> expectationFailure
+                  ("redacted tool_use input is not a JSON object: " <> show other)
+              other -> expectationFailure
+                ("unexpected first conversation line: " <> show other)
+          [] -> expectationFailure "conversation.jsonl is empty"
+
+    it "does NOT redact CbToolUse inputs from non-secret opcodes" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 2
+        let toolUse = Message Assistant
+              [CbToolUse (ToolCallId "tc1") (OpName "SHELL_EXEC")
+                 (object ["command" .= ("free -h" :: String)])]
+            resultMsg = Message User [CbToolResult (ToolCallId "tc1") [TrpText "ok"] False]
+        withIndexedTranscript dir $ \h -> do
+          itwSetSecretOps h (Set.fromList [OpName "SECRET_MANAGE"])
+          itwRecordAndAck h (IndexedTranscriptWrite [toolUse, resultMsg] e)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        BS8.unpack convContents `shouldContain` "free -h"
         BS8.unpack convContents `shouldNotContain` "<redacted:secret>"
 
     it "readConversation / readEntries round-trip the written data" $

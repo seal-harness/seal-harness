@@ -6,6 +6,8 @@
 module Seal.Agent.Runtime.Delegation.WorkerSpec (spec) where
 
 import Control.Exception (SomeException, catch)
+import Data.Aeson (object, (.=))
+import Data.ByteString.Char8 qualified as BS8
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
@@ -27,12 +29,17 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Config.Paths (SealPaths (..), agentSessionDir)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId)
+import Seal.Core.Types
+  (ModelId (..), OpName (..), SessionId, ToolCallId (..), TrustLevel (..)
+  , mkSystemSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
-import Seal.ISA.Registry (mkRegistry)
+import Seal.ISA.Opcode (Opcode (..), OpResult (..))
+import Seal.ISA.Registry (Registry, mkRegistry)
 import Seal.ISA.RepeatDetect (newSessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Logging.Logger (testSealLogger)
-import Seal.Providers.Class (SomeProvider (..))
+import Seal.Providers.Class
+  ( CompletionResponse (..), ContentBlock (..), SomeProvider (..)
+  , StopReason (..), ToolResultPart (..), Usage (..) )
 import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (saveSessionMeta)
@@ -168,19 +175,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
     it "writes session.json with smParent = parent into the child dir" $ do
       withSystemTempDirectory "seal-worker-meta" $ \tmp -> do
         let paths = samplePaths tmp
-        -- Seed a parent session.json so the child meta inherits its
-        -- provider/model.
-        now <- getCurrentTime
-        let parentMeta = SessionMeta
-              { smId = sampleSession, smProvider = "anthropic"
-              , smModel = "claude-opus-4", smChannel = "web"
-              , smParent = Nothing
-              , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-              , smDescription = Nothing
-              , smSealFrontMatter = True
-              , smRepoUrl = Nothing
-              , smCreatedAt = now, smLastActive = now }
-        saveSessionMeta paths parentMeta
+        seedParentMeta paths
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
         let worker = mkDelegateWorker deps
@@ -216,6 +211,59 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         -- id prepended to the parent's baked chain (self first).
         captured `shouldBe` Just [childSid, sampleSession, grandparentSid]
 
+  describe "mkDelegateWorker child transcript redaction (WU-6)" $ do
+    it "redacts a secret put value in the tool_use input and a secret result part" $
+      withSystemTempDirectory "seal-worker-redact" $ \tmp -> do
+        let paths = samplePaths tmp
+        scriptRef <- newIORef
+          [ CompletionResponse
+              [ CbToolUse (ToolCallId "tc1") (OpName "SECRET_MANAGE")
+                  (object [ "action" .= ("put" :: String)
+                          , "name"   .= ("vault-key" :: String)
+                          , "value"  .= ("sk-live-1234" :: String) ]) ]
+              StopToolUse (Usage 0 0)
+          , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+          ]
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        lineageRef <- newIORef (Nothing :: Maybe [SessionId])
+        deps <- mkWorkerDepsIOWith tmp anchorRef lineageRef
+                  (mkRegistry [secretStubOp])
+                  (SomeProvider (ScriptProvider scriptRef))
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "store the key" Nothing Nothing False
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        conv <- BS8.readFile
+          (agentSessionDir paths sampleSession childSid </> "conversation.jsonl")
+        -- The put value travels in the tool_use input; the get result in the
+        -- tool_result parts. Neither may reach the child's transcript.
+        BS8.unpack conv `shouldNotContain` "sk-live-1234"
+        BS8.unpack conv `shouldNotContain` "sk-from-vault-5678"
+        BS8.unpack conv `shouldContain` "<redacted:secret>"
+
+  describe "mkDelegateWorker child meta idempotence (WU-6)" $ do
+    it "preserves smCreatedAt when a resumed child rewrites its session.json" $
+      withSystemTempDirectory "seal-worker-createdat" $ \tmp -> do
+        let paths = samplePaths tmp
+        seedParentMeta paths
+        anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
+        deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef (Nothing :: Maybe [SessionId])
+        let worker = mkDelegateWorker deps
+            childSid = mkSystemSessionId "child"
+            mkTask goal = ChildTask "a1" goal Nothing Nothing False
+            metaPath = agentSessionDir paths sampleSession childSid </> "session.json"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid (mkTask "first run") hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        mFirst <- decodeFileStrict metaPath
+        _ <- worker sampleAgentDef childSid (mkTask "second run") hooks
+          `catch` \(_e :: SomeException) -> pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        mSecond <- decodeFileStrict metaPath
+        fmap smCreatedAt mFirst `shouldSatisfy` isJust
+        fmap smCreatedAt mSecond `shouldBe` fmap smCreatedAt mFirst
+
   where
     roleText :: Text -> Text
     roleText t = case T.strip t of
@@ -239,6 +287,22 @@ sampleSession = mkSystemSessionId "parent"
 -- worker-deps tests is more than one entry long.
 grandparentSid :: SessionId
 grandparentSid = mkSystemSessionId "grandparent"
+
+-- | A trusted opcode named @SECRET_MANAGE@ whose result part carries a
+-- secret. Registered in a test child registry so 'secretOpNames' marks it
+-- and the child transcript writer redacts it.
+secretStubOp :: Opcode
+secretStubOp = TrustedOpcode
+  { toName       = OpName "SECRET_MANAGE"
+  , toTrust      = Trusted
+  , toDesc       = "test secret op"
+  , toInSchema   = object []
+  , toOutSchema  = object []
+  , toAuthorize  = \_ -> Right ()
+  , toBlocking   = False
+  , toRun        = \_ _ -> pure (OpResult [TrpText "sk-from-vault-5678"] False
+                                  (object ["stored" .= True]))
+  }
 
 sampleAgentDef :: AgentDef
 sampleAgentDef = AgentDef
@@ -267,6 +331,17 @@ mkWorkerDepsIO
   :: FilePath -> IORef (Maybe (Maybe FilePath)) -> IORef (Maybe [SessionId])
   -> IO DelegationWorkerDeps
 mkWorkerDepsIO tmp anchorRef lineageRef = do
+  scriptRef <- newIORef ([] :: [CompletionResponse])
+  mkWorkerDepsIOWith tmp anchorRef lineageRef (mkRegistry [])
+    (SomeProvider (ScriptProvider scriptRef))
+
+-- | 'mkWorkerDepsIO' with an explicit child registry (its 'secretOpNames'
+-- drive transcript redaction) and an explicit child provider (so a test can
+-- script the child's turns).
+mkWorkerDepsIOWith
+  :: FilePath -> IORef (Maybe (Maybe FilePath)) -> IORef (Maybe [SessionId])
+  -> Registry -> SomeProvider -> IO DelegationWorkerDeps
+mkWorkerDepsIOWith tmp anchorRef lineageRef childReg childProv = do
   logger <- testSealLogger
   appEnv <- mkEnv logger defaultConfig
   approvals <- newApprovalCache
@@ -284,14 +359,12 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
     , dwdApprovals = approvals
     , dwdOnDemand = False
     , dwdParentDepth = 0
-    , dwdResolveProvider = \_def -> do
-        ref <- newIORef []
-        pure (Right (SomeProvider (ScriptProvider ref), ModelId "llama3"))
+    , dwdResolveProvider = \_def -> pure (Right (childProv, ModelId "llama3"))
     , dwdResolveProviderOverride = Nothing
     , dwdUnionDefBackend = error "dwdUnionDefBackend: unused (no nested AGENT_START in this test)"
     , dwdChildRegistry = \lineage _def _depth _role _sid (_caps :: ChannelCaps) -> do
         writeIORef lineageRef (Just lineage)
-        pure (mkRegistry [])
+        pure childReg
     , dwdChildSystemPrompt = \_ _ -> pure Nothing
     , dwdOnEntry = pure ()
     , dwdChannel = "test"
@@ -313,6 +386,21 @@ samplePaths tmp = SealPaths
   , spKeys = tmp </> "keys"
   , spCache = tmp </> "cache"
   }
+
+-- | Seed the parent session's @session.json@ so a spawned child's meta
+-- inherits its provider/model.
+seedParentMeta :: SealPaths -> IO ()
+seedParentMeta paths = do
+  now <- getCurrentTime
+  saveSessionMeta paths SessionMeta
+    { smId = sampleSession, smProvider = "anthropic"
+    , smModel = "claude-opus-4", smChannel = "web"
+    , smParent = Nothing
+    , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing
+    , smSealFrontMatter = True
+    , smRepoUrl = Nothing
+    , smCreatedAt = now, smLastActive = now }
 
 -- | Construct the 'ChildRunHooks' accumulators (all empty/fresh).
 mkHooks :: IO ChildRunHooks

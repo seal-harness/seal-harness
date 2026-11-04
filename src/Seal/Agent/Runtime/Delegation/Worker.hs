@@ -28,6 +28,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.FilePath ((</>))
 
 import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..))
@@ -44,9 +45,9 @@ import Data.Default (def)
 import Seal.Config.Paths (SealPaths, agentSessionDir, sessionMetaPath)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
-import Seal.Handles.Transcript (withIndexedTranscript)
+import Seal.Handles.Transcript (itwSetSecretOps, withIndexedTranscript)
 import Seal.ISA.Opcode (localBackend)
-import Seal.ISA.Registry (Registry)
+import Seal.ISA.Registry (Registry, secretOpNames)
 import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
@@ -286,6 +287,12 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         childReg <- dwdChildRegistry deps childLineage agentDef childDepth
                                       (effectiveRole (adRole agentDef) (ctRole task))
                                       childSid capturingCaps
+        -- WU-6: a child holds SECRET_MANAGE, so its transcript needs the
+        -- same redaction the top-level path installs (TurnEngine). Without
+        -- this, a @put@ value in the tool_use input and a @get@ value in the
+        -- tool_result parts are persisted in the clear — and @continue@
+        -- re-sends them on every later turn.
+        itwSetSecretOps childTHandle (secretOpNames childReg)
         let anchor = if ctIsolateWorkdir task then Nothing else dwdParentWorkdir deps
         childUioEnv <- dwdMkUIOEnv deps anchor childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
@@ -353,6 +360,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
 writeChildMeta :: DelegationWorkerDeps -> SessionId -> IO ()
 writeChildMeta deps childSid = do
   mParent <- loadParentMeta deps
+  -- A resumed child re-enters this function with the same session id; its
+  -- original creation time must survive the rewrite.
+  mExisting <- loadChildMeta deps childSid
   now <- getCurrentTime
   let (provider, model) = case mParent of
         Just pm -> (smProvider pm, smModel pm)
@@ -369,7 +379,7 @@ writeChildMeta deps childSid = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
-    , smCreatedAt = now
+    , smCreatedAt = maybe now smCreatedAt mExisting
     , smLastActive = now
     }
 
@@ -379,5 +389,15 @@ writeChildMeta deps childSid = do
 loadParentMeta :: DelegationWorkerDeps -> IO (Maybe SessionMeta)
 loadParentMeta deps = do
   let mp = sessionMetaPath (dwdPaths deps) (dwdParentSid deps)
+  exists <- doesFileExist mp
+  if not exists then pure Nothing else decodeFileStrict mp
+
+-- | Load the child's existing 'SessionMeta', if readable. The child's meta
+-- lives in its own nested directory (@\<parent\>\/agents\/\<child\>@), so
+-- 'sessionMetaPath' (a top-level path) does not apply.
+loadChildMeta :: DelegationWorkerDeps -> SessionId -> IO (Maybe SessionMeta)
+loadChildMeta deps childSid = do
+  let mp = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
+             </> "session.json"
   exists <- doesFileExist mp
   if not exists then pure Nothing else decodeFileStrict mp

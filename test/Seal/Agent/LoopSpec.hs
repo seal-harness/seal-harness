@@ -1,7 +1,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 module Seal.Agent.LoopSpec (spec) where
 
+import Control.Exception (bracket_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Time (getCurrentTime)
 import Data.Aeson (Value (..), object, (.=))
@@ -39,7 +41,10 @@ import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
-import Seal.Logging.Logger (testSealLogger)
+import Katip (Severity (..), Scribe (..), _itemMessage, permitItem, unLogStr)
+
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (newSealLoggerWithScribe, testSealLogger)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -80,6 +85,21 @@ instance Provider ScriptProvider where
     case rs of
       (x:xs) -> writeIORef ref xs >> pure (Right x)
       [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+
+-- | A provider that scripts responses like 'ScriptProvider' and records every
+-- request it was handed — so a test can assert what actually reached the model
+-- boundary (WU-6: the repaired conversation).
+newtype RecordingProvider =
+  RecordingProvider (IORef [CompletionResponse], IORef [CompletionRequest])
+
+instance Provider RecordingProvider where
+  listModels _ = pure (Right [])
+  complete (RecordingProvider (scriptRef, reqRef)) req = do
+    modifyIORef' reqRef (++ [req])
+    rs <- readIORef scriptRef
+    case rs of
+      (x:xs) -> writeIORef scriptRef xs >> pure (Right x)
+      []     -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 -- | A provider that returns a scripted list of responses (one per call)
 -- and counts how many times it was called. Used to assert the loop does
@@ -320,6 +340,7 @@ spec = describe "Seal.Agent.Loop" $ do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       ref <- newIORef [CompletionResponse [CbText "carried on"] StopEnd (Usage 0 0)]
+      reqRef <- newIORef ([] :: [CompletionRequest])
       BL.writeFile (dir </> "conversation.jsonl") $
         BL.intercalate "\n"
           [ A.encode (Message User [CbText "read it"])
@@ -331,7 +352,7 @@ spec = describe "Seal.Agent.Loop" $ do
         stopFanoutDoneRef <- newIORef False
         let caps = def { ccSend = \t -> modifyIORef' sent (++ [t]) }
             mkEnv' = AgentEnv
-              { aeProvider = SomeProvider (ScriptProvider ref)
+              { aeProvider = SomeProvider (RecordingProvider (ref, reqRef))
               , aeProviderLabel = "ollama"
               , aeModel = ModelId "m"
               , aeSystem = Nothing
@@ -368,10 +389,85 @@ spec = describe "Seal.Agent.Loop" $ do
       length [ l | l <- convLines
                   , "interrupted before this tool returned" `BS8.isInfixOf` l ]
         `shouldBe` 1
+      -- The repaired conversation is what actually reaches the provider:
+      -- the request carries the synthetic tool_result for the dangling id.
+      reqs <- readIORef reqRef
+      case reqs of
+        (r : _) -> do
+          let toolResults =
+                [ tcid | Message _ blocks <- crMessages r
+                       , CbToolResult tcid _ _ <- blocks ]
+          toolResults `shouldBe` [ToolCallId "call-1"]
+        [] -> expectationFailure "the provider was never called"
       -- user, assistant(tool_use), the synthetic user/tool_result, the new user
       -- message, the assistant reply
       length convLines `shouldBe` 5
       readIORef sent `shouldReturn` ["carried on"]
+
+  -- WU-6: an unmatched tool_use that is NOT on the last tool-use turn cannot
+  -- be repaired (a synthetic result appended at the end would land in the
+  -- wrong position), so 'runTurn' logs it for the operator instead of letting
+  -- the request fail opaquely. Asserting the log line keeps that diagnosis
+  -- observable — a silent skip would make a broken conversation look healthy.
+  it "logs a mid-history dangling tool_use it cannot repair" $
+    withSystemTempDirectory "seal-loop-repair-mid" $ \dir -> do
+      approvals <- newApprovalCache
+      ref <- newIORef [CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)]
+      captured <- newIORef ([] :: [Text])
+      let captureScribe = Scribe
+            { liPush = \item -> modifyIORef' captured
+                (++ [T.pack (show (unLogStr (_itemMessage item)))])
+            , scribePermitItem = permitItem DebugS
+            , scribeFinalizer = pure ()
+            }
+      logger <- newSealLoggerWithScribe captureScribe DebugS
+      BL.writeFile (dir </> "conversation.jsonl") $
+        BL.intercalate "\n"
+          [ A.encode (Message User [CbText "read it"])
+          , A.encode (Message Assistant
+              [ CbToolUse (ToolCallId "call-mid") (OpName "FILE_READ") (object []) ])
+          , A.encode (Message User [CbText "still there?"])
+          , "" ]
+      withIndexedTranscript dir $ \h -> do
+        stopFanoutDoneRef <- newIORef False
+        let caps = def { ccSend = \_ -> pure () }
+            mkEnv' = AgentEnv
+              { aeProvider = SomeProvider (ScriptProvider ref)
+              , aeProviderLabel = "ollama"
+              , aeModel = ModelId "m"
+              , aeSystem = Nothing
+              , aeRegistry = mkRegistry []
+              , aeTranscript = h
+              , aeBackend = localBackend
+              , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+              , aeCaps = caps
+              , aeSession = either (error "sid") id (mkSessionId "s1")
+              , aeMaxTurns = 8
+              , aeChannel = "test"
+              , aeMessageSource = Nothing
+              , aeAutonomy = Full
+              , aeApprovals = approvals
+              , aeDebugRequestsPath = Nothing
+              , aeDebugResponsePath = Nothing
+              , aeOnEntry = pure ()
+              , aeMaxModelRetries = 3
+              , aeRetryBaseDelayMs = 1000
+              , aeOnUserMessage = Nothing
+              , aeOnStop = Nothing
+              , aeStopFanoutDone = stopFanoutDoneRef
+              , aeOnToolCall = \_ _ -> pure ()
+              , aeOnTextDelta = Nothing
+              , aeOnDemandSchemas = False
+              , aeLogPath = Nothing
+              , aeAbortFlag = testAbortFlag
+              , aeRepeatTrack = testRepeatTrack
+              , aeToolTimeout = defaultToolTimeoutConfig
+              }
+        bracket_ (setGlobalLogger logger) unsetGlobalLogger $
+          runTestApp (runTurn mkEnv' "carry on")
+      logs <- readIORef captured
+      logs `shouldSatisfy` any (T.isInfixOf "[conv-repair] mid-history dangling tool_use")
+      logs `shouldSatisfy` any (T.isInfixOf "call-mid")
 
   -- Regression: a second turn must load the prior conversation from disk so
   -- the model sees the full history, and the indexed transcript writer's diff-based

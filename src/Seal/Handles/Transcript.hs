@@ -49,6 +49,7 @@ import Control.Concurrent.STM
 import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
 import Control.Monad (void, foldM, unless, when)
 import Data.Aeson (decode)
+import Data.Aeson qualified as Aeson
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
@@ -706,19 +707,35 @@ pendingCompletionCount paths sid =
         pure 0
     )
 
--- | Redact tool-result parts that may carry secret values. Only results from
--- secret-producing opcodes (those whose name is in the provided set) are
--- redacted — Untrusted opcodes (SHELL_EXEC, FILE_READ, etc.) produce non-secret
--- output that passes through verbatim so the frontend can display it.
+-- | Redact the secret-bearing halves of a conversation before it is written
+-- to disk. Only blocks belonging to secret-producing opcodes (those whose
+-- name is in the provided set) are touched — Untrusted opcodes (SHELL_EXEC,
+-- FILE_READ, etc.) produce non-secret output that passes through verbatim so
+-- the frontend can display it.
+--
+-- Two halves are redacted:
+--
+--   * 'CbToolResult' parts — the value a @SECRET_MANAGE get@ returns in
+--     'orParts';
+--   * 'CbToolUse' __inputs__ — the value a @SECRET_MANAGE put@ carries in the
+--     tool-call arguments.
 --
 -- The @allMsgs@ list (the full conversation) is scanned for 'CbToolUse' blocks
 -- whose 'cbName' is in the secret-opcode-name set; their 'cbId's form the set
 -- of tool-call ids whose results should be redacted. Only the @newMsgs@ are
 -- returned (after redaction); @allMsgs@ is only used for the scan.
+--
+-- Redaction preserves JSON structure: string /values/ are replaced, keys and
+-- containers are kept. A redacted tool_use must remain replayable — the
+-- conversation is fed straight back to the provider on the next turn, and
+-- providers require the tool-call input to be an object.
+--
+-- Idempotent by construction (the marker is itself a non-empty string), which
+-- the writer's diff-vs-on-disk logic depends on.
 redactMessages :: Set OpName -> [Message] -> [Message] -> [Message]
 redactMessages secretOps allMsgs newMsgs =
   let secretIds = buildSecretIds secretOps allMsgs
-  in map (redactMessage secretIds) newMsgs
+  in map (redactMessage secretOps secretIds) newMsgs
   where
     buildSecretIds :: Set OpName -> [Message] -> Set ToolCallId
     buildSecretIds ops = foldr go mempty
@@ -730,18 +747,37 @@ redactMessages secretOps allMsgs newMsgs =
               | otherwise             = a
             goBlock _ a = a
 
-    redactMessage :: Set ToolCallId -> Message -> Message
-    redactMessage secretIds (Message role blocks) =
-      Message role (map (redactBlock secretIds) blocks)
-      where
-        redactBlock ids (CbToolResult tcid parts isErr)
-          | tcid `Set.member` ids = CbToolResult tcid (map redactPart parts) isErr
-          | otherwise             = CbToolResult tcid parts isErr
-        redactBlock _ other = other
+    redactMessage :: Set OpName -> Set ToolCallId -> Message -> Message
+    redactMessage ops secretIds (Message role blocks) =
+      Message role (map (redactBlock ops secretIds) blocks)
 
-        redactPart (TrpText t)
-          | not (T.null t) = TrpText "<redacted:secret>"
-          | otherwise      = TrpText t
+    redactBlock :: Set OpName -> Set ToolCallId -> ContentBlock -> ContentBlock
+    redactBlock _ secretIds (CbToolResult tcid parts isErr)
+      | tcid `Set.member` secretIds = CbToolResult tcid (map redactPart parts) isErr
+      | otherwise                   = CbToolResult tcid parts isErr
+    redactBlock ops _ (CbToolUse tcid name input)
+      | name `Set.member` ops = CbToolUse tcid name (redactInput input)
+      | otherwise             = CbToolUse tcid name input
+    redactBlock _ _ other = other
+
+    redactPart :: ToolResultPart -> ToolResultPart
+    redactPart (TrpText t)
+      | not (T.null t) = TrpText redactedMarker
+      | otherwise      = TrpText t
+
+    -- | Replace every non-empty string in the input with the marker,
+    -- preserving keys, arrays and objects.
+    redactInput :: Aeson.Value -> Aeson.Value
+    redactInput (Aeson.String t)
+      | not (T.null t) = Aeson.String redactedMarker
+      | otherwise      = Aeson.String t
+    redactInput (Aeson.Object o) = Aeson.Object (fmap redactInput o)
+    redactInput (Aeson.Array a)  = Aeson.Array (fmap redactInput a)
+    redactInput v                = v
+
+-- | The placeholder written in place of a secret value.
+redactedMarker :: Text
+redactedMarker = "<redacted:secret>"
 
 -- | A neutral baseline envelope used when no prior envelope exists (the
 -- first request). Mirrors 'Seal.Transcript.Reconstruct.defaultEnv'.
