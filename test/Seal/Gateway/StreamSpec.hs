@@ -6,6 +6,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (catch, IOException)
 import System.Timeout (timeout)
 import Data.Aeson (object, (.=))
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Text qualified as T
@@ -19,6 +20,7 @@ import Test.Hspec
 
 import Seal.Config.Paths (SealPaths(..))
 import Seal.Gateway.Stream
+import Seal.Gateway.Transcript (ReadLimit (..))
 import Seal.Gateway.StreamBroker
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FreePort (withFreePort)
@@ -388,3 +390,71 @@ spec = describe "Seal.Gateway.Stream" $ do
           hasMore = totalCount > limit
       chunk `shouldBe` ([] :: [A.Value])
       hasMore `shouldBe` False
+
+  -- ── request-entries chunk planning (production decision path) ─────────
+  --
+  -- The scroll-to-top bug lived here: a `before` cursor read only the last
+  -- `limit * 3` entries, so once the cursor walked past that window
+  -- `entriesBeforeId` missed it and `hasMore` was computed inside the
+  -- truncated window. These tests exercise the same pure value the handler
+  -- uses, and then the handler core with an injected reader/sink so the
+  -- production path (read mode + shaping) is pinned without a socket.
+  describe "request-entries chunk planning" $ do
+    let mkEntries :: [Int] -> [A.Value]
+        mkEntries = map (\i -> A.object [Key.fromText "id" .= T.pack ("e" <> show i)])
+        full = mkEntries [0..999]
+
+    it "reads the whole transcript for a before cursor" $ do
+      readLimitFor (Just "e5") 50 `shouldBe` ReadAll
+      readLimitFor (Just "__beginning__") 50 `shouldBe` ReadFirstN 50
+      readLimitFor Nothing 50 `shouldBe` ReadLastN 50
+
+    it "returns a full page with hasMore=True for a cursor in the middle" $ do
+      let (chunk, hasMore) = shapeChunk (Just "e100") 50 1000 full
+      chunk `shouldBe` mkEntries [50..99]
+      hasMore `shouldBe` True
+
+    it "returns the first page with hasMore=False" $ do
+      let (chunk, hasMore) = shapeChunk (Just "e10") 50 1000 full
+      chunk `shouldBe` mkEntries [0..9]
+      hasMore `shouldBe` False
+
+    it "a partial backward page still reports hasMore=True" $ do
+      -- 100 entries before the cursor, limit 50: 50 remain unread.
+      let (chunk, hasMore) = shapeChunk (Just "e100") 50 1000 full
+      chunk `shouldBe` mkEntries [50..99]
+      hasMore `shouldBe` True
+
+    it "keeps the bounded windows for beginning/initial requests" $ do
+      let (beg, begMore) = shapeChunk (Just "__beginning__") 50 1000 (mkEntries [0..49])
+      beg `shouldBe` mkEntries [0..49]
+      begMore `shouldBe` True
+      let (tailChunk, tailMore) = shapeChunk Nothing 50 1000 (mkEntries [950..999])
+      tailChunk `shouldBe` mkEntries [950..999]
+      tailMore `shouldBe` True
+
+    it "a missing cursor yields an empty chunk with hasMore=False" $ do
+      shapeChunk (Just "nope") 50 1000 full `shouldBe` ([], False)
+
+    it "the handler core reads ReadAll and sends the planned frame" $ do
+      seenLimit <- newIORef (Nothing :: Maybe ReadLimit)
+      captured <- newIORef (Nothing :: Maybe (Int, Bool, Int, Maybe T.Text))
+      handleRequestEntriesCore
+        (\rlim -> do
+            writeIORef seenLimit (Just rlim)
+            pure (full, 1000))
+        (\chunk hasMore totalCount cursor ->
+            writeIORef captured (Just (length chunk, hasMore, totalCount, cursor)))
+        (Just "e100") 50
+      readIORef seenLimit `shouldReturn` Just ReadAll
+      readIORef captured `shouldReturn` Just (50, True, 1000, Just "e100")
+
+    it "the handler core keeps the bounded read for the initial chunk" $ do
+      seenLimit <- newIORef (Nothing :: Maybe ReadLimit)
+      handleRequestEntriesCore
+        (\rlim -> do
+            writeIORef seenLimit (Just rlim)
+            pure (mkEntries [950..999], 1000))
+        (\_ _ _ _ -> pure ())
+        Nothing 50
+      readIORef seenLimit `shouldReturn` Just (ReadLastN 50)

@@ -2797,7 +2797,7 @@ describe('scroll button no-op after tab switch', () => {
   it('"Scroll to bottom" works after switching tabs and back (loadLatest no-op)', () => {
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
-    const loadLatest = vi.fn() // no-op — simulates pinned cache hit with same ref
+    const loadLatest = vi.fn(() => 'unchanged' as const) // pinned cache hit, same ref
 
     const scrollToSpy = vi.fn()
     const origScrollTo = Element.prototype.scrollTo
@@ -2850,10 +2850,8 @@ describe('scroll button no-op after tab switch', () => {
         vi.advanceTimersByTime(16)
       })
 
-      // The scroller must have been called — either by the
-      // useLayoutEffect (entries changed) or by the rAF fallback
-      // (entries didn't change, no-op loadLatest). Without the fix,
-      // neither fires and scrollTo is never called.
+      // The window is already at the end (`isViewingLatest` defaults to
+      // true), so no fetch is needed and the button scrolls directly.
       expect(scrollToSpy).toHaveBeenCalled()
     } finally {
       Element.prototype.scrollTo = origScrollTo
@@ -2863,7 +2861,7 @@ describe('scroll button no-op after tab switch', () => {
   it('"Scroll to top" works after switching tabs and back (loadFromBeginning no-op)', () => {
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
-    const loadFromBeginning = vi.fn() // no-op — simulates pinned cache hit with same ref
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const) // pinned cache hit, same ref
 
     const scrollToSpy = vi.fn()
     const origScrollTo = Element.prototype.scrollTo
@@ -2919,13 +2917,148 @@ describe('scroll button no-op after tab switch', () => {
         vi.advanceTimersByTime(16)
       })
 
-      // The scroller must have been called — either by the
-      // useLayoutEffect (entries changed) or by the rAF fallback
-      // (entries didn't change, no-op loadFromBeginning). Without the
-      // fix, neither fires and scrollTo is never called.
-      expect(scrollToSpy).toHaveBeenCalled()
+      // The hook reported that no re-render will happen, so the button
+      // applied the scroll directly.
+      expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+      const topZeroCalls = scrollToSpy.mock.calls.filter(
+        (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+      )
+      expect(topZeroCalls.length).toBeGreaterThan(0)
     } finally {
       Element.prototype.scrollTo = origScrollTo
     }
+  })
+})
+
+// ── Scroll-to-top failure mode and regression (window-derived state) ─────
+//
+// The reported bug: the client believed `hasMore:false` while the loaded
+// slice started mid-transcript, so "Scroll to top" only scrolled the slice.
+// `hasMore` is now derived from the loaded window's extent; these tests pin
+// the button contract and the failure mode explicitly.
+
+describe('ChatArea scroll-to-top with a window-derived hasMore', () => {
+  function msgs(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  const renderArea = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        {...props}
+      />,
+    )
+
+  let scrollToSpy: ReturnType<typeof vi.fn>
+  let origScrollTo: typeof Element.prototype.scrollTo
+
+  beforeEach(() => {
+    scrollToSpy = vi.fn()
+    origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+  })
+
+  afterEach(() => {
+    Element.prototype.scrollTo = origScrollTo
+    window.location.hash = ''
+  })
+
+  const topZeroCalls = () =>
+    scrollToSpy.mock.calls.filter(
+      (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+    )
+
+  it('requests the beginning when the window is not at the start', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fetch when the window is already at the start', () => {
+    // Failure-mode pin: this is the state the truncated backend produced
+    // (`hasMore:false` mid-transcript). The client cannot fetch in that
+    // state, which is why the backend fix must ship with this change.
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: false, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).not.toHaveBeenCalled()
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('requests the beginning again after switching away and back', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgs('a', 3)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(2)
+  })
+
+  it('works on a virtualized transcript (> 500 messages)', () => {
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    renderArea({ messages: msgs('v', 501), hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('still scrolls to the top while a deep-link fragment is present', () => {
+    window.location.hash = '#some-block'
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    renderArea({ hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('disables the buttons while a chunk is loading', () => {
+    renderArea({ hasMore: true, loadingMore: true, loadFromBeginning: vi.fn() })
+    expect((screen.getByLabelText('Scroll to top') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByLabelText('Scroll to bottom') as HTMLButtonElement).disabled).toBe(true)
   })
 })
