@@ -478,6 +478,9 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
         -- conversation's background sessions, if there is one. Checked
         -- here (not before routing) so a /command is never consumed as an
         -- answer.
+        -- (A plain message for the conversation's own session is forwarded
+        -- to the gateway, which answers that session's pending ask itself —
+        -- see 'answerPendingBgAsk'.)
         consumed <- answerPendingBgAsk cfg chan pendingAsks bgSessions key text
         unless consumed $
           sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
@@ -1515,6 +1518,14 @@ forgetAskByPrefix pendingAsks prefix
 -- sessions with an inbound plain-text message. Returns 'True' when the
 -- message was consumed as an answer (so it must NOT be routed to the
 -- focused session).
+--
+-- Background sessions only, deliberately. The conversation's OWN (focused)
+-- session is not consulted here: a plain message for it is routed to the
+-- gateway, whose @POST \/api\/sessions\/:id\/send@ offers the text to that
+-- session's pending ask before starting a turn. That keeps the answer path
+-- working when the loop never saw the @ask@ event (a reconnect or a channel
+-- restart) and guarantees the reply never queues behind the session lock the
+-- blocked turn holds.
 --
 -- A numeric body (1-based) selects the corresponding option label; any other
 -- body is delivered verbatim -- which is what the confirmation gate needs

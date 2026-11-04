@@ -357,7 +357,9 @@ export function useTranscript(sessionId: string | null) {
  *  whose response is TRANSIENT (never enters the transcript); `"assistant"`
  *  means a normal turn whose reply lands in the transcript. Modelled as an
  *  OPEN enum — the frontend must tolerate future/unknown kinds. */
-export type SendKind = 'slash' | 'assistant' | (string & {})
+/** `answer` = the message was consumed as the reply to a pending ASK_HUMAN
+ *  question; no turn ran, so no transcript entry follows. */
+export type SendKind = 'slash' | 'assistant' | 'answer' | (string & {})
 
 /** Parsed 200 body of POST /api/sessions/:id/send. `session_id` is set only
  *  by slash commands that mint+focus a new session (e.g. /new) so the SPA
