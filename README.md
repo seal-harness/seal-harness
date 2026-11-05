@@ -309,13 +309,46 @@ tls  = true                       # serves ~/.seal/keys/tls/{cert,key}.pem
 `~/.seal/keys/tls/cert.pem` and `~/.seal/keys/tls/key.pem`. Setting both paths
 explicitly also turns TLS on, so pointing at a real certificate needs no flag.
 If those files are absent, Seal generates a self-signed pair with `openssl`
-(key written `0600`) on the next start. `tls_hosts` names what the certificate
-should be valid for; the bind host and `localhost` are included by default.
+(key written `0600`) on the next start.
 
-Changing `tls_hosts` does **not** regenerate an existing pair — the files are
-left alone so a restart never rotates the key. Delete `keys/tls/cert.pem` and
-`keys/tls/key.pem` after editing `tls_hosts`, or the certificate keeps the old
-names and the browser rejects the ceremony.
+The generated certificate is valid for **397 days**. Chromium and WebKit reject
+anything longer outright — `ERR_CERT_VALIDITY_TOO_LONG` is not a warning the
+user can click through — so a longer-lived pair is worse than useless. Its
+subject alternative name covers every name and address the gateway answers on:
+
+* `localhost`, `127.0.0.1` and `::1`
+* this machine's hostname
+* the host of `[access_control] origin`, when one is set (the name passkeys are
+  bound to)
+* every local interface address — LAN, VPN and overlay interfaces included
+* everything in `tls_hosts`, which comes first in the list and becomes the CN
+
+Anything `network-info` cannot see (it reports one address per family per
+interface) can be added to `tls_hosts`, which accepts names and IP literals.
+
+**When an existing pair is replaced.** A pair Seal generated at the default
+paths is Seal's to maintain, and is regenerated at boot when it cannot serve a
+browser a legal certificate: its window exceeds 397 days, or it does not load
+(a truncated file, or a certificate next to the wrong key). The previous pair is
+kept as `keys/tls/cert.pem.bak` and `keys/tls/key.pem.bak` so the change can be
+undone by hand. Replacing the pair means a **new key**, so the certificate has
+to be trusted again on every device that uses this gateway.
+
+Changing `tls_hosts` does **not** by itself regenerate a pair: the names in an
+existing certificate are not re-derived on every restart. Delete
+`keys/tls/cert.pem` and `keys/tls/key.pem` after editing `tls_hosts`, or the
+certificate keeps the old names and the browser rejects the ceremony. The same
+deletion is the way to force a fresh key at any other time; when a generated
+pair comes within 30 days of expiry, `serve` logs a warning telling you so.
+
+A pair you point at with `tls_cert` / `tls_key` is never validated, replaced or
+rotated — a real certificate or a private PKI may legitimately outlive 397
+days — so its renewal is your business. A missing file at those paths is
+created, exactly as before.
+
+Seal never touches your DNS configuration or zone files, and it never downgrades
+the listener to plain HTTP: with `tls = false` it serves HTTP because you asked
+it to, and it does not change that setting on its own.
 
 ```toml
 # ~/.seal/security.toml — must be the https URL clients actually use
