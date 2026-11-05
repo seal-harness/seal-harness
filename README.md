@@ -371,6 +371,52 @@ so set `tls_hosts` to the name the device will use. For the same effort,
 trusts, with no installation step — that is the better default when you have a
 tailnet.
 
+**Troubleshooting: "The passkey prompt was cancelled or timed out."** When no
+Touch ID / Windows Hello prompt appears at all and the ceremony fails
+instantly, the browser is refusing WebAuthn because it does not trust the
+certificate — the prose about cancellation is misleading, since `NotAllowedError`
+covers both user cancellation and a browser-side refusal. The definitive check
+is the address bar: "Not Secure" or a struck-through padlock means the cert is
+not trusted, and no ceremony will run until it is. A padlock means the cert is
+trusted and the failure is elsewhere.
+
+On macOS, trust the generated certificate in the **System** keychain (Chrome and
+Safari read the system trust store, not the login keychain alone):
+
+```sh
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain ~/.seal/keys/tls/cert.pem
+```
+
+Then **fully quit** the browser — `⌘Q` on macOS, not just closing the window.
+Browsers cache certificate-trust decisions for the lifetime of the process, so a
+reopened tab inherits the old "Not Secure" verdict until the whole browser is
+restarted. Reopen, confirm the address bar shows a padlock, then try the
+passkey again.
+
+A subtle trap: `seal serve` regenerates its managed certificate when the SAN
+list changes or the existing pair cannot serve a legal certificate (see above),
+which gives the new pair a **new key** — and a different fingerprint from the
+one you just trusted. If the "Not Secure" warning returns after a restart, the
+cert on disk no longer matches what is in the keychain. Verify by comparing
+fingerprints:
+
+```sh
+# What the gateway is actually serving:
+openssl s_client -connect <host>:<port> -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -fingerprint -sha256 -noout
+# What the keychain holds:
+security find-certificate -c <host> -p /Library/Keychains/System.keychain \
+  | openssl x509 -fingerprint -sha256 -noout
+```
+
+Mismatched fingerprints mean the cert was regenerated after you trusted it;
+re-run `add-trusted-cert` against the current `~/.seal/keys/tls/cert.pem`. To
+avoid this entirely, prefer `mkcert` (a local CA you install once, after which
+every generated cert is trusted with no per-cert step) or `tailscale cert` (a
+publicly-trusted pair when the host is on your tailnet) over trusting the
+self-signed pair by hand.
+
 **A hostname is required, not just TLS.** A WebAuthn RP ID must be a domain
 string, so `https://192.168.1.42:8443` still cannot register a passkey — Chrome
 raises `SecurityError` before the ceremony starts. Use a name that resolves on
