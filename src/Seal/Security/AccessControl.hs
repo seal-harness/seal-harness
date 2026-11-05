@@ -16,6 +16,7 @@ module Seal.Security.AccessControl
   , isLoopbackHost
   , isWildcardHost
   , isIpLiteral
+  , originHostOf
   , credentialFromFile
   , credentialToFile
   , parseIsoTime
@@ -137,12 +138,19 @@ resolveRpIdUnchecked mOrigin mRpId = case (mOrigin, mRpId) of
             Left ("[access_control] rp_id \"" <> raw <> "\" is not a suffix of the "
                   <> "origin host \"" <> host <> "\"")
   where
-    -- 'o' is already normalised to scheme://host[:port]
-    hostOf o = case T.breakOn "://" o of
-      (_, rest) | T.null rest -> Nothing
-      (_, rest) ->
-        let authority = T.takeWhile (/= '/') (T.drop 3 rest)
-        in Just (T.toLower (fst (splitHostPort' authority)))
+    hostOf = originHostOf
+
+-- | The host of an absolute @scheme://host[:port]@ URL, lower-cased.
+--
+-- Shared with the certificate code, which has to put the origin's name in the
+-- SAN list: a certificate that omits it makes every WebAuthn ceremony fail
+-- with a message about origins rather than about certificates.
+originHostOf :: Text -> Maybe Text
+originHostOf o = case T.breakOn "://" o of
+  (_, rest) | T.null rest -> Nothing
+  (_, rest) ->
+    let authority = T.takeWhile (/= '/') (T.drop 3 rest)
+    in Just (T.toLower (fst (splitHostPort' authority)))
 
 splitHostPort' :: Text -> (Text, Maybe Text)
 splitHostPort' authority =

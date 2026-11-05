@@ -320,6 +320,8 @@ library
       , containers
       , conduit
       , crypton
+      , crypton-x509
+      , crypton-x509-store
       , directory
       , exceptions
       , filepath
@@ -338,6 +340,7 @@ library
       , http-client-tls
       , http-types
       , network
+      , network-info
       , tomland
       , process
       , temporary
@@ -351,6 +354,8 @@ library
       , wai
       , warp
       , warp-tls
+      , tls
+      , time-hourglass
       , websockets
       , wai-websockets
       , case-insensitive
@@ -392,6 +397,8 @@ test-suite tests
       , directory
       , filepath
       , crypton
+      , crypton-x509
+      , crypton-x509-store
       , ram
       , file-embed
        , hspec
@@ -400,11 +407,13 @@ test-suite tests
        , http-client-tls
        , katip
       , network
+      , network-info
        , optparse-applicative
        , stm
        , temporary
        , text
        , time
+       , time-hourglass
        , process
        , unix
        , random

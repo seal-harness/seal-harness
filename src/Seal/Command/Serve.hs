@@ -8,17 +8,18 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (catch)
-import Control.Monad (filterM, void, forever, when)
-import Data.Foldable (for_)
+import Control.Monad (filterM, void, forever)
+import Data.Foldable (for_, forM_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
 import System.IO (hIsTerminalDevice, stderr)
+import System.Posix.Unistd (getSystemID, nodeName)
 
 import Katip (Severity (..), ls)
 
@@ -62,7 +63,7 @@ import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.BootPlan
   ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
-  ( SecurityConfig (..), loadSecurityConfig
+  ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
@@ -87,7 +88,10 @@ import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
-import Seal.Security.TlsCert (ensureTlsCertificate, sanHostsFor)
+import Seal.Security.AccessControl (originHostOf)
+import Seal.Security.TlsCert
+  ( TlsCertOutcome (..), certificateExpiryWarning, ensureCertificateAt
+  , ensureGeneratedCertificate, localAddressNames, sanHostsFor, sanInputsFor )
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
@@ -179,28 +183,54 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- configuration. A missing pair is generated with openssl rather than left
   -- to the operator; see 'Seal.Security.TlsCert' for why that is not a
   -- substitute for a trusted certificate.
+  --
+  -- A pair Seal generated at the default paths is Seal's to maintain: it is
+  -- replaced when it cannot serve a browser a legal certificate. A pair the
+  -- operator pointed at with tls_cert/tls_key is never validated or replaced.
   gwCfgTls <- if tlsEnabled gwCfgAccess
     then do
       let (certPath, keyPath) =
             effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
-          hosts = sanHostsFor (gcHost gwCfgAccess) (gcTlsHosts gwCfgAccess)
-      generated <- ensureTlsCertificate certPath keyPath hosts
-      case generated of
-        Left err -> do
-          logIO logger ErrorS ("gateway: " <> ls err)
-          ioError (userError (T.unpack err))
-        Right wasGenerated -> do
-          when wasGenerated $ do
-            logIO logger InfoS ("generated a self-signed TLS certificate for "
-              <> ls (T.intercalate ", " hosts) <> " at " <> ls (T.pack certPath)
-              <> " (private key " <> ls (T.pack keyPath) <> ", mode 0600)")
+          managed = isNothing (gcTlsCert gwCfgAccess) && isNothing (gcTlsKey gwCfgAccess)
+          warnSelfSigned =
             logIO logger WarningS
               ("a generated certificate is self-signed: browsers refuse WebAuthn "
                 <> "on a certificate they do not trust, so install it on the device "
-                <> "(and mark it trusted) — or replace tls_cert/tls_key with a "
+                <> "(and mark it trusted) \8212 or replace tls_cert/tls_key with a "
                 <> "publicly-trusted pair, e.g. from `tailscale cert`.")
-          pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
-                            , gcTlsKey  = Just (T.pack keyPath) }
+      systemId <- getSystemID
+      addresses <- localAddressNames
+      let hosts = sanHostsFor
+                    (sanInputsFor gwCfgAccess
+                       (T.pack (nodeName systemId))
+                       (scAccessControl secCfg >>= acfcOrigin >>= originHostOf)
+                       addresses)
+      ensured <- (if managed then ensureGeneratedCertificate else ensureCertificateAt)
+                   certPath keyPath hosts
+      case ensured of
+        Left err -> do
+          logIO logger ErrorS ("gateway: " <> ls err)
+          ioError (userError (T.unpack err))
+        Right TlsCertUnchanged ->
+          logIO logger DebugS ("TLS certificate unchanged at " <> ls (T.pack certPath))
+        Right TlsCertCreated -> do
+          logIO logger InfoS ("generated a self-signed TLS certificate for "
+            <> ls (T.intercalate ", " hosts) <> " at " <> ls (T.pack certPath)
+            <> " (private key " <> ls (T.pack keyPath) <> ", mode 0600)")
+          warnSelfSigned
+        Right (TlsCertReplaced why) -> do
+          logIO logger WarningS
+            ("replaced the generated TLS certificate at " <> ls (T.pack certPath)
+              <> ": " <> ls why <> ".")
+          logIO logger WarningS
+            ("the previous pair is kept at " <> ls (T.pack (certPath <> ".bak"))
+              <> " and " <> ls (T.pack (keyPath <> ".bak"))
+              <> "; trust the new certificate on every device that uses this gateway.")
+          warnSelfSigned
+      expiry <- certificateExpiryWarning certPath
+      forM_ expiry (logIO logger WarningS . ls)
+      pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
+                        , gcTlsKey  = Just (T.pack keyPath) }
     else pure gwCfgAccess
   -- The §10 matrix runs here, before any channel is forked or port bound.
   bootInputs <- preflight paths

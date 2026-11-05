@@ -38,7 +38,10 @@ data GatewayConfig = GatewayConfig
     -- under @SEAL_HOME@, so this flag alone is the whole configuration.
   , gcTlsHosts       :: [Text]
     -- ^ Names to put in a generated certificate's subject alternative name.
-    -- Empty means "the bind host, if it names a machine" — see 'sanHostsFor'.
+    -- These come first, in order. Everything else is derived: the origin's
+    -- host, the bind host (if it names a machine), the machine hostname, every
+    -- local interface address, and loopback — see
+    -- 'Seal.Security.TlsCert.sanHostsFor'.
   } deriving stock (Eq, Show)
 
 -- | The compiled-in default. Loopback + port 8080 + the local origin.
