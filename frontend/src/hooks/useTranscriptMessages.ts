@@ -126,12 +126,21 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         return messages
       }
       if (opName === 'SETUP_REPO' && parsed.result) {
-        const input = parsed.input as { url?: string } | undefined
+        const input = parsed.input as { url?: string; branch?: string } | undefined
         const result = parsed.result as { status?: string; target?: string } | undefined
         const status = result?.status ?? ''
         const target = result?.target ?? ''
-        const summary = status === 'cloned' ? `Cloned into ${target}`
-                      : status === 'noop' ? `Repo already exists — ${target}`
+        // The requested branch lives in the recorded opcode INPUT (the
+        // result carries only {status, target}) — so a branch-aware clone
+        // or switch is visible in the summary, not just in the raw JSON.
+        // `input` is untrusted JSON straight from the transcript: the
+        // backend treats a non-string branch as absent, so guard the type
+        // here too (a `.trim()` on a number would throw during render).
+        const branch = typeof input?.branch === 'string' ? input.branch.trim() : ''
+        const branchNote = branch ? ` (branch ${branch})` : ''
+        const summary = status === 'cloned' ? `Cloned into ${target}${branchNote}`
+                      : status === 'noop' ? `Repo already exists — ${target}${branchNote}`
+                      : status === 'switched' ? `Switched to ${branch || 'branch'} — ${target}`
                       : status === 'conflict' ? `Conflict at ${target}`
                       : status === 'failed' ? 'Clone failed'
                       : status

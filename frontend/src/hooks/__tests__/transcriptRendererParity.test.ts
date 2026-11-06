@@ -764,6 +764,51 @@ describe('data-layer parity: useTranscriptMessages vs transcriptToMessages', () 
       expectFullParity(conversationWithSetupRepoChannel())
     })
 
+    it('SETUP_REPO cloned onto a branch (branch comes from the input)', () => {
+      expectFullParity([
+        makeEntry({
+          id: 'rb1',
+          direction: 'request',
+          payload: JSON.stringify({
+            messages: [],
+            op: { name: 'SETUP_REPO' },
+            input: { url: 'https://github.com/example/repo.git', branch: 'dev' },
+            result: { status: 'cloned', target: 'repo' },
+          }),
+        }),
+      ])
+    })
+
+    it('SETUP_REPO switched an existing clone to a branch', () => {
+      expectFullParity([
+        makeEntry({
+          id: 'rb2',
+          direction: 'request',
+          payload: JSON.stringify({
+            messages: [],
+            op: { name: 'SETUP_REPO' },
+            input: { url: 'https://github.com/example/repo.git', branch: 'dev' },
+            result: { status: 'switched', target: 'repo' },
+          }),
+        }),
+      ])
+    })
+
+    it('SETUP_REPO with a non-string branch (must not throw in either renderer)', () => {
+      expectFullParity([
+        makeEntry({
+          id: 'rb-bad',
+          direction: 'request',
+          payload: JSON.stringify({
+            messages: [],
+            op: { name: 'SETUP_REPO' },
+            input: { url: 'https://github.com/example/repo.git', branch: 123 },
+            result: { status: 'cloned', target: 'repo' },
+          }),
+        }),
+      ])
+    })
+
     it('SETUP_REPO with failed status', () => {
       expectFullParity([
         makeEntry({

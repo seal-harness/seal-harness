@@ -317,6 +317,63 @@ describe('useTranscriptMessages', () => {
     expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
   })
 
+  it('names the branch and renders a switch summary for SETUP_REPO', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op-branch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          // The branch is recorded on the opcode INPUT; the result is
+          // {status, target} only.
+          input: { url: 'https://github.com/example/repo.git', branch: 'dev' },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+      makeEntry({
+        id: 'op-switch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/example/repo.git', branch: 'main' },
+          result: { status: 'switched', target: 'repo' },
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const summaries = result.current.flatMap((m) => m.blocks)
+      .flatMap((b) => (b.toolCall ? [b.toolCall] : []))
+      .map((tc) => tc.result)
+    expect(summaries).toEqual([
+      'Cloned into repo (branch dev)',
+      'Switched to main — repo',
+    ])
+  })
+
+  it('treats a non-string branch as absent instead of throwing (untrusted transcript JSON)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op-badbranch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          // The backend coerces a non-string branch to "absent"; the
+          // renderer must not call .trim() on it.
+          input: { url: 'https://github.com/example/repo.git', branch: 123 },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const summaries = result.current.flatMap((m) => m.blocks)
+      .flatMap((b) => (b.toolCall ? [b.toolCall] : []))
+      .map((tc) => tc.result)
+    expect(summaries).toEqual(['Cloned into repo'])
+  })
+
   it('anchors the preamble on the first LLM request, not on a preceding opcode entry', () => {
     // A session starts with a SETUP_REPO opcode entry — request-direction,
     // but not an LLM request. The preamble belongs to the first LLM

@@ -723,6 +723,50 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
     expect(msgs[0]!.agentName).toBe('Repo · web')
   })
+
+  it('names the branch in a branch-aware clone summary (branch from input)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-branch',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+          result: { status: 'cloned', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock!.toolCall!.result).toBe('Cloned into bar (branch dev)')
+  })
+
+  it('renders a branch switch as a non-error summary naming the branch', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-switch',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+          result: { status: 'switched', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock!.toolCall!.result).toBe('Switched to dev — bar')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    expect(msgs[0]!.agentStatus).toBe('completed')
+  })
 })
 
 // ── ChatArea rendering ──────────────────────────────────────────────────────
@@ -780,6 +824,58 @@ describe('ChatArea', () => {
     expect(screen.getByText('shell')).toBeTruthy()
     // System row collapses by default but is present in the DOM.
     expect(document.querySelector('.addressable-block')).toBeTruthy()
+  })
+
+  it('surfaces the repo branch inline in the tool-call header (toolCallSummary)', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'Repo · web',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'setuprepo-branch-header',
+            name: 'SETUP_REPO',
+            input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+            result: 'Cloned into bar (branch dev)',
+            resultIsError: false,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    // The header names the primary arg AND the branch qualifier, so the
+    // branch is visible without expanding the raw input JSON.
+    expect(screen.getByText('https://github.com/foo/bar.git (branch: dev)')).toBeTruthy()
+  })
+
+  it('leaves the header unchanged for a tool call without a branch', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'Repo · web',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'setuprepo-nobranch-header',
+            name: 'SETUP_REPO',
+            input: { url: 'https://github.com/foo/bar.git' },
+            result: 'Cloned into bar',
+            resultIsError: false,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    expect(screen.getByText('https://github.com/foo/bar.git')).toBeTruthy()
   })
 
   it('shows an "exit 0" pill for a tool call with exit code 0', () => {
