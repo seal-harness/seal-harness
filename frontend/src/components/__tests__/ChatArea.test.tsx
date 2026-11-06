@@ -2929,3 +2929,116 @@ describe('scroll button no-op after tab switch', () => {
     }
   })
 })
+
+// ── Transcript markdown view mode ─────────────────────────────────────────
+
+describe('ChatArea — transcript markdown view toggle', () => {
+  const TABLE_MD = '| File | Status |\n| --- | --- |\n| a.txt | ok |'
+
+  function makeMarkdownMessages(): Message[] {
+    return [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: TABLE_MD }],
+      },
+    ]
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  it('defaults to raw markdown — the literal source, pipe table and all', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    // Raw mode: the source line is present verbatim in a single <p>.
+    const raw = container.querySelector('[data-testid="msg-raw-text"]')
+    expect(raw).toBeTruthy()
+    expect(raw!.textContent).toBe(TABLE_MD)
+    // No rendered table in raw mode.
+    expect(container.querySelector('table')).toBeNull()
+  })
+
+  it('switching to Rendered renders the markdown as HTML (real <table>)', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    const table = container.querySelector('table')
+    expect(table).toBeTruthy()
+    expect(container.querySelectorAll('tbody td')[0]!.textContent).toBe('a.txt')
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeNull()
+  })
+
+  it('switching back to Raw restores the source text', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    expect(container.querySelector('table')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(container.querySelector('table')).toBeNull()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')!.textContent).toBe(TABLE_MD)
+  })
+
+  it('marks the active mode with aria-pressed', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
+    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('persists the choice so it survives a reload', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    expect(localStorage.getItem('seal.transcriptViewMode')).toBe('rendered')
+
+    // Remount: the stored preference is picked up on first render.
+    cleanup()
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    expect(container.querySelector('table')).toBeTruthy()
+  })
+
+  it('does not render the toggle when there is no transcript', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={[]} />)
+    expect(screen.queryByRole('button', { name: 'Rendered' })).toBeNull()
+  })
+
+  it('does not alter tool-call result rendering', () => {
+    const messages: Message[] = [{
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'claude-sonnet-4-20250514',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'shell',
+          input: { command: 'ls' },
+          result: '| not | a | table |',
+          resultIsError: false,
+        },
+      }],
+    }]
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={messages} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    // The tool-call block is payload data, not prose: no markdown body is
+    // created for it, so nothing in its input/result is reinterpreted.
+    expect(container.querySelectorAll('.md-body')).toHaveLength(0)
+    expect(container.querySelector('table')).toBeNull()
+    expect(screen.getByText('shell')).toBeTruthy()
+  })
+})
