@@ -27,6 +27,7 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Options.Applicative qualified as Opt
 import Options.Applicative (ParserResult (..))
 import Test.Hspec
@@ -41,15 +42,17 @@ import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Core.TurnEngine (TurnAdapter (..), TurnDeps (..), TurnOutcome (..), buildStartWiring, runSessionTurn)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps
+  , sendOutcomeJson )
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply
-  ( QuestionOption (..), deliverAnswer, newAskReplyStore
-  , newApprovalCache, pendingForSession, PendingQuestionInfo (..)
-  , AskReply (..), ApprovalScope (..), askIdText, askHumanWithOptions )
+  ( AskOutcome, AskReply (..), AskReplyStore, ApprovalScope (..)
+  , QuestionOption (..), askHumanWithOptions, askIdText, deliverAnswer
+  , newApprovalCache, newAskReplyStore, pendingForSession
+  , PendingQuestionInfo (..) )
 import Data.ByteString.Lazy qualified as BL
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -824,6 +827,119 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             res `shouldBe` Right True
           _ -> expectationFailure "expected one pending ask"
         takeMVar done
+
+  -- The reported production failure: a chat channel with no answer buttons
+  -- (Signal) received an ASK_HUMAN question, and every reply the human sent
+  -- afterwards vanished until the question was answered in the web UI.
+  -- POST /send forked a turn; a turn on a session whose running turn is
+  -- parked inside ASK_HUMAN blocks on the session write lock until the
+  -- question is answered -- so the reply queued forever behind the very
+  -- turn it was supposed to unblock. /send now offers a plain message as
+  -- the answer to a pending question first, and only starts a turn when
+  -- there is none.
+  describe "handleSend delivering a plain reply to a pending ASK_HUMAN" $ do
+    -- Register a pending ASK_HUMAN for the session and block until it is in
+    -- the store ('askHumanCore' registers before firing notify, so this is
+    -- deterministic, unlike a threadDelay). Returns an action yielding the
+    -- answer the blocked agent-loop thread received.
+    let forkPendingAsk :: AskReplyStore -> SessionId -> Text -> [QuestionOption]
+                       -> IO (IO (Either AskOutcome Text))
+        forkPendingAsk store sid q opts = do
+          registered <- newEmptyMVar
+          answered   <- newEmptyMVar
+          _ <- forkIO $ do
+            r <- askHumanWithOptions store sid q opts
+                   (\_ -> putMVar registered ())
+            putMVar answered r
+          takeMVar registered
+          pure (takeMVar answered)
+        askPaths tmp = SealPaths
+          { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+          , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        branchOpts = [ QuestionOption "main" "the default branch"
+                     , QuestionOption "develop" "the integration branch"
+                     ]
+
+    it "consumes an open-ended reply as the answer instead of starting a turn" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records every call: a turn started for this
+        -- message would be visible here (and would deadlock in production).
+        recRef <- newIORef []
+        firstRef <- newIORef True
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-099"
+            reply = "Hi, I'm Doug. I care about software quality." :: Text
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "What is your content focus?" []
+        outcome <- handleSend sendDeps sid reply
+        outcome `shouldBe` SendAnswer reply
+        -- The blocked agent-loop thread received the reply ...
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right reply)
+        -- ... the question is gone ...
+        pendingForSession (sdAskReply sendDeps) sid `shouldReturn` []
+        -- ... and no turn was started.
+        threadDelay 200000
+        readIORef recRef `shouldReturn` []
+
+    it "resolves a numbered reply to the chosen option's label" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        firstRef <- newIORef True
+        recRef <- newIORef []
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-100"
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid "2"
+        outcome `shouldBe` SendAnswer "develop"
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right "develop")
+
+    it "never consumes a slash command as an answer" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records nothing (the turn is not run) — the
+        -- slash command must still route as a command.
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-101"
+            store = sdAskReply sendDeps
+        seedSession paths sid
+        _ <- forkPendingAsk store sid "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid "/0"
+        case outcome of
+          SendSlash _ _ -> pure ()
+          other -> expectationFailure
+            ("expected SendSlash (not consumed as an answer), got " <> show other)
+        -- The question is still answerable.
+        ps <- pendingForSession store sid
+        length ps `shouldBe` 1
+        mapM_ (\info ->
+          void (deliverAnswer store (pqiId info) (AskReply ScopeOnce "main"))) ps
+
+    it "encodes a delivered answer as kind=answer with a ✓ confirmation" $ do
+      let (code, body) = sendOutcomeJson (SendAnswer "develop")
+      code `shouldBe` 200
+      fmap (KeyMap.lookup (fromText "kind")) (asObject body)
+        `shouldBe` Just (Just (A.String "answer"))
+      fmap (KeyMap.lookup (fromText "response")) (asObject body)
+        `shouldBe` Just (Just (A.String "✓ develop"))
 
   -- Integration test for the repo agents.md auto-bind feature. This is the
   -- gateway-level end-to-end test the user asked for: it exercises the SAME

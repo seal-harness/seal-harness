@@ -1524,9 +1524,10 @@ const ChatMessage = memo(function ChatMessage({
   // the blocks map runs).
   const matchedQuestionIds = useRef<Set<string>>(new Set())
 
-  // Transient slash-command output bubble. Rendered in a muted, distinct
-  // "command output" style with a "not saved" label so the user can tell it
-  // apart from persisted transcript turns. These rows never enter the
+  // Transient output bubble: slash-command output, or the confirmation that a
+  // plain reply was consumed as an ASK_HUMAN answer. Rendered in a muted,
+  // distinct style with a "not saved" tag so the user can tell it apart from
+  // persisted transcript turns. These rows never enter the
   // transcript and vanish on reload; they carry no branch/JSON affordances.
   if (message.slashBubble) {
     return (
@@ -1546,7 +1547,7 @@ const ChatMessage = memo(function ChatMessage({
             {message.agentName}
           </span>
           <span className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
-            command output &mdash; not saved
+            {message.slashBubbleLabel ?? 'command output — not saved'}
           </span>
           <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
             {message.timestamp}

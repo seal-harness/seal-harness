@@ -163,6 +163,12 @@ interface SlashBubble {
   text: string
   at: number       // send seq (ordering among multiple slash bubbles)
   insertAt: number // transcript-messages length when the response arrived
+  /** Header title of the bubble: "Command output" for a slash command, or
+   *  "Answer" for an ASK_HUMAN answer the gateway consumed (kind:"answer"). */
+  title: string
+  /** The muted italic tag after the title. Both kinds are ephemeral: they
+   *  never enter the transcript and vanish on reload. */
+  label: string
 }
 
 // ── App ──────────────────────────────────────────────────────────────────
@@ -558,9 +564,16 @@ export default function App() {
   // A `kind:"slash"` send response adds no transcript entry: render a
   // transient bubble and clear the optimistic spinner. When the slash
   // command mints a fresh session (e.g. /new), `session_id` is set and the
-  // SPA navigates to it so the new session becomes the focused one. Any
-  // other kind falls through to the transcript-driven clear path. Returns
-  // true when the caller must NOT keep a pending spinner.
+  // SPA navigates to it so the new session becomes the focused one.
+  //
+  // `kind:"answer"` needs the same treatment for the same reason: the
+  // backend consumed the message as the reply to a pending ASK_HUMAN
+  // question and started no turn, so the transcript-driven clear below
+  // would never fire and the message would sit in a permanent "thinking"
+  // state. The response carries a ready-made `✓ <answer>` confirmation.
+  //
+  // Any other kind falls through to the transcript-driven clear path.
+  // Returns true when the caller must NOT keep a pending spinner.
   // Ref that mirrors the current transcript-messages count so
   // `handleSendResult` can capture the insert position for a slash bubble
   // without adding `transcriptMessages` to its dependency array (which
@@ -569,8 +582,16 @@ export default function App() {
   const transcriptMsgCountRef = useRef(0)
 
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
-    if (res && res.kind === 'slash') {
-      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
+    if (res && (res.kind === 'slash' || res.kind === 'answer')) {
+      const isAnswer = res.kind === 'answer'
+      setSlashBubbles((b) => [...b, {
+        id: `slash-${seq}`,
+        text: res.response,
+        at: seq,
+        insertAt: transcriptMsgCountRef.current,
+        title: isAnswer ? 'Answer' : 'Command output',
+        label: isAnswer ? 'sent as the answer — not saved' : 'command output — not saved',
+      }])
       setPendingMessage(null)
       setPendingMessageModel(null)
       // /new swaps the backend's active session; navigate the SPA to it so
@@ -688,11 +709,12 @@ export default function App() {
       const idx = Math.min(sb.insertAt + offset, merged.length)
       merged.splice(idx, 0, {
         id: sb.id,
-        agentName: 'Command output',
+        agentName: sb.title,
         agentStatus: 'idle' as const,
         timestamp: now,
         blocks: [{ id: sb.id + '-text', text: sb.text }],
         slashBubble: true,
+        slashBubbleLabel: sb.label,
       })
       offset++
     }
