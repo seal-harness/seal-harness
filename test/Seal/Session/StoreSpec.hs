@@ -25,7 +25,8 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, initSession, listSessions
   , newSession, saveSessionMeta, saveChildSessionMeta
-  , updateSessionSealFrontMatter )
+  , updateSessionSealFrontMatter
+  , updateSessionRepo )
 import Seal.Util.StrictIO (decodeFileStrict)
 
 mkPaths :: FilePath -> SealPaths
@@ -73,6 +74,7 @@ spec = describe "Seal.Session.Store" $ do
                 , smDescription = Nothing
                 , smSealFrontMatter = True
                 , smRepoUrl = Nothing
+                , smRepoBranch = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })
@@ -97,6 +99,7 @@ spec = describe "Seal.Session.Store" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              , smRepoBranch = Nothing
               , smCreatedAt = aTime, smLastActive = aTime }
         saveChildSessionMeta paths parent child childMeta
         let childMetaPath = agentSessionDir paths parent child </> "session.json"
@@ -119,6 +122,7 @@ spec = describe "Seal.Session.Store" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              , smRepoBranch = Nothing
               , smCreatedAt = aTime, smLastActive = aTime }
         saveChildSessionMeta paths parent child childMeta
         metas <- listSessions paths
@@ -186,6 +190,28 @@ spec = describe "Seal.Session.Store" $ do
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
+
+  describe "updateSessionRepo" $ do
+    it "persists the repo url and branch together" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        ok <- updateSessionRepo paths (smId m)
+                (Just "https://github.com/seal-harness/seal-harness.git") (Just "release/1.2")
+        ok `shouldBe` True
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smRepoUrl mAfter `shouldBe` Just (Just "https://github.com/seal-harness/seal-harness.git")
+        fmap smRepoBranch mAfter `shouldBe` Just (Just "release/1.2")
+
+    it "clears both when given blank values" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        _ <- updateSessionRepo paths (smId m) (Just "https://x/y.git") (Just "main")
+        _ <- updateSessionRepo paths (smId m) (Just "  ") Nothing
+        mAfter <- loadSessionMeta paths (smId m)
+        fmap smRepoUrl mAfter `shouldBe` Just Nothing
+        fmap smRepoBranch mAfter `shouldBe` Just Nothing
 
   describe "updateSessionSealFrontMatter" $ do
     it "persists the front-matter flag to session.json" $

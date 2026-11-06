@@ -141,6 +141,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              , smRepoBranch = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
               }
@@ -168,6 +169,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              , smRepoBranch = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
               }
@@ -200,6 +202,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smDescription = Nothing
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
+            , smRepoBranch = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
             }
@@ -226,6 +229,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smDescription = Nothing
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
+            , smRepoBranch = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
             }

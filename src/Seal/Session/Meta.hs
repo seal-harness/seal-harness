@@ -81,6 +81,13 @@ data SessionMeta = SessionMeta
     -- @SETUP_REPO@ (either agent-invoked or the web setup-repo endpoint).
     -- 'Nothing' when no repo has been cloned. Persisted to @session.json@
     -- so the sidebar can show the repo name without scanning the workdir.
+  , smRepoBranch :: Maybe Text
+    -- ^ The branch or tag requested for 'smRepoUrl' through @SETUP_REPO@'s
+    -- optional @branch@ argument. 'Nothing' means the remote's default
+    -- branch (the *request*, not a resolved ref -- no git query is made).
+    -- Recorded so a later clone can repeat the same checkout: an
+    -- @AGENT_MANAGE action=handoff@ session inherits both the repo and
+    -- this branch from the session that handed off.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
   } deriving stock (Eq, Show)
@@ -98,6 +105,7 @@ instance ToJSON SessionMeta where
     , "description" .= smDescription m
     , "seal_front_matter" .= smSealFrontMatter m
     , "repo_url"    .= smRepoUrl m
+    , "repo_branch" .= smRepoBranch m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
     ]
@@ -115,5 +123,6 @@ instance FromJSON SessionMeta where
     <*> o .:? "description"
     <*> o .:? "seal_front_matter" .!= True
     <*> o .:? "repo_url"
+    <*> o .:? "repo_branch"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

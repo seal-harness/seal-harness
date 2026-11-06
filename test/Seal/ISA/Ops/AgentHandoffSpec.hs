@@ -279,6 +279,7 @@ callerMetaWithRepo mRepo = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = mRepo
+  , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t
   }
@@ -301,17 +302,19 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
       r <- runTestApp (opRun (agentManageOp wiring (stubDeps (taskRecordingWorker taskRef))) localBackend
                             (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
                                     , "goal" .= ("go" :: Text)
-                                    , "repo" .= ("https://explicit/x.git" :: Text)]))
+                                    , "repo" .= ("https://explicit/x.git" :: Text)
+                                    , "branch" .= ("dev" :: Text)]))
       orIsError r `shouldBe` False
       threadDelay 100000
       mTask <- readIORef taskRef
-      fmap Del.ctRepoUrl mTask `shouldBe` Just (Just "https://explicit/x.git")
+      fmap Del.ctRepo mTask `shouldBe` Just (Just (Del.RepoSpec "https://explicit/x.git" (Just "dev")))
       fmap Del.ctIsolateWorkdir mTask `shouldBe` Just True
 
   it "inherits the caller's repo when `repo` is absent, and says so" $
     withSystemTempDirectory "seal-handoff-inherit" $ \tmp -> do
       let paths = samplePathsAt tmp
-      saveSessionMeta paths (callerMetaWithRepo (Just "https://caller/repo.git"))
+      saveSessionMeta paths ((callerMetaWithRepo (Just "https://caller/repo.git"))
+                              { smRepoBranch = Just "release/1.2" })
       backend <- noneBackend
       rt <- newAgentRuntime
       pauseFlag <- newSpawnPauseFlag
@@ -325,11 +328,14 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
                                     , "goal" .= ("go" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
-        [TrpText t] -> T.isInfixOf "https://caller/repo.git" t `shouldBe` True
-        _           -> expectationFailure "expected a single text part"
+        [TrpText t] -> do
+          T.isInfixOf "https://caller/repo.git" t `shouldBe` True
+          T.isInfixOf "@release/1.2" t `shouldBe` True
+        _ -> expectationFailure "expected a single text part"
       threadDelay 100000
       mTask <- readIORef taskRef
-      fmap Del.ctRepoUrl mTask `shouldBe` Just (Just "https://caller/repo.git")
+      fmap Del.ctRepo mTask
+        `shouldBe` Just (Just (Del.RepoSpec "https://caller/repo.git" (Just "release/1.2")))
 
   it "leaves ctRepoUrl Nothing (and reports none) when nobody has a repo" $
     withSystemTempDirectory "seal-handoff-none" $ \tmp -> do
@@ -351,7 +357,7 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
         _           -> expectationFailure "expected a single text part"
       threadDelay 100000
       mTask <- readIORef taskRef
-      fmap Del.ctRepoUrl mTask `shouldBe` Just Nothing
+      fmap Del.ctRepo mTask `shouldBe` Just Nothing
 
   it "rejects an invalid repo and does not spawn" $
     withSystemTempDirectory "seal-handoff-bad" $ \tmp -> do
@@ -372,13 +378,58 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
       threadDelay 100000
       readIORef ran `shouldReturn` 0
 
-  it "exposes `repo` in the AGENT_MANAGE input schema and names it in toDesc" $ do
+  it "an explicit branch switches the branch of the inherited repo" $
+    withSystemTempDirectory "seal-handoff-branch" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      saveSessionMeta paths ((callerMetaWithRepo (Just "https://caller/repo.git"))
+                              { smRepoBranch = Just "main" })
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                     , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      taskRef <- newIORef Nothing
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (taskRecordingWorker taskRef))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)
+                                    , "branch" .= ("release/9" :: Text)]))
+      orIsError r `shouldBe` False
+      threadDelay 100000
+      mTask <- readIORef taskRef
+      fmap Del.ctRepo mTask
+        `shouldBe` Just (Just (Del.RepoSpec "https://caller/repo.git" (Just "release/9")))
+
+  it "rejects an invalid branch and does not spawn" $
+    withSystemTempDirectory "seal-handoff-badbranch" $ \tmp -> do
+      let paths = samplePathsAt tmp
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      let wiring = mkWiringAt paths backend rt pauseFlag
+      r <- runTestApp (opRun (agentManageOp wiring (stubDeps (recordingWorker ran))) localBackend
+                            (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                    , "goal" .= ("go" :: Text)
+                                    , "branch" .= ("bad branch" :: Text)]))
+      orIsError r `shouldBe` True
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "branch" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+      threadDelay 100000
+      readIORef ran `shouldReturn` 0
+
+  it "exposes `repo` and `branch` in the AGENT_MANAGE input schema and names them in toDesc" $ do
     backend <- noneBackend
     rt <- newAgentRuntime
     pauseFlag <- newSpawnPauseFlag
     let op = agentManageOp (mkWiring backend rt pauseFlag) (stubDeps stubWorker)
-    T.isInfixOf "repo" (T.pack (show (toInSchema op))) `shouldBe` True
+    let schema = T.pack (show (toInSchema op))
+    T.isInfixOf "repo" schema `shouldBe` True
+    T.isInfixOf "branch" schema `shouldBe` True
     T.isInfixOf "repo" (toDesc op) `shouldBe` True
+    T.isInfixOf "branch" (toDesc op) `shouldBe` True
 
 -- | A 'SealPaths' fixture rooted at @tmp@.
 samplePathsAt :: FilePath -> SealPaths

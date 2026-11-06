@@ -1,6 +1,8 @@
 # Handoff carries the caller's repo (`AGENT_MANAGE action=handoff`)
 
-Status: implemented (rev 6; plan-review gate: 3/3 PASS)
+Status: implemented (rev 7; plan-review gate: 3/3 PASS on rev 6; rev 7
+adds branch inheritance per the operator's follow-up, reviewed by the same
+rule set)
 Date: 2026-11-03
 
 ## Problem
@@ -318,3 +320,58 @@ Recorded in the PR body, not implemented:
   model-invoked `SETUP_REPO` does.
 - `repo_url` is recorded at session creation (intent), so it survives a clone
   failure; the failure itself is visible in the new session's transcript.
+
+## rev 7 — the handoff also carries the *branch* (post-merge of #301)
+
+`main` gained an optional `branch` on `SETUP_REPO` (#301): `{url, branch?}`
+clones/checks out that branch or tag. The operator's follow-up: *"the session
+being created by the handoff should have the same repo and branch as the
+creating session"* — "call SETUP_REPO with the same arguments as the session
+handing off".
+
+### What changed
+
+- **The branch is now persisted** — `SessionMeta.smRepoBranch` (JSON
+  `repo_branch`), written by the SETUP_REPO convergence in
+  `TurnEngine.callDispatcher` alongside `repo_url` (one read + one atomic
+  save, via the new `Store.updateSessionRepo`), so every surface that runs a
+  clone records the checkout it asked for: model-invoked `SETUP_REPO`, the web
+  setup-repo endpoint, and `/new -r -b`. The convergence parses the input with
+  the opcode's own `parseSetupRepoInput`, so what is recorded is exactly what
+  was cloned. `smRepoBranch` is the *request* (Nothing = the remote default),
+  not a resolved ref — no `git` query is made.
+- **`RepoSpec`** (`Delegation.hs`) replaces `ChildTask.ctRepoUrl`: `{rsUrl,
+  rsBranch}`, the same pair `SETUP_REPO` takes.
+- **`Worker.handoffRepo :: Maybe Text -> Maybe Text -> Maybe SessionMeta ->
+  Maybe RepoSpec`** is the one rule, applied by the opcode (for the result
+  text) and again by the worker (for the meta and the dispatch; idempotent):
+  - no explicit repo → inherit the caller's `smRepoUrl` **and**
+    `smRepoBranch`;
+  - explicit branch, inherited repo → that branch (same repo, different
+    branch);
+  - explicit repo → its own branch only (a branch of another repo is never
+    carried across);
+  - blanks are absent; an inherited branch that no longer validates is
+    dropped rather than failing the handoff.
+- **`AGENT_MANAGE action=handoff`** gains an optional `branch` input
+  (URL/`BranchName` validated before any session is spawned; a `branch`
+  without `repo` switches the branch of the inherited repo). The task carries
+  `ctRepo`, the worker writes `smRepoUrl` + `smRepoBranch`, and
+  `dispatchHandoffRepo` sends the same `{url, branch?}` shape the creating
+  session used (the `branch` key is omitted, never null).
+
+### Tests added
+
+`handoffRepo` cases (inherit both / explicit-repo isolation / branch override /
+blank / invalid inherited branch / trim / idempotent); handoff meta records
+`repo_branch`; `dispatchHandoffRepo` dispatches `{url, branch}` and records
+it; `SessionMeta` round-trips `repo_branch` (and defaults to `Nothing`);
+`Store.updateSessionRepo` writes/clears url + branch together; the opcode's
+`branch` pass-through, override, invalid-branch rejection and schema entry.
+
+### Still out of scope
+
+- Surfacing the branch in the UI (`SessionInfo`/`session.json` consumers other
+  than the handoff path) — a display follow-up, unchanged by this revision.
+- Resolving the *actual* checked-out ref (a later `git checkout` inside the
+  workdir is not observed; `smRepoBranch` records the SETUP_REPO request).

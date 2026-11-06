@@ -78,3 +78,17 @@ Flaky-under-load: `Registry.agentStatus > records Crashed` and
 `Phase7aSpec > WS client connects` both failed once in a ~97s full run and
 passed in isolation and on re-run. Timing-sensitive; unrelated to this
 change, but worth knowing before blaming a diff.
+
+## Follow-up: repo *and* branch
+
+`SETUP_REPO` grew an optional `branch` (#301) after this change landed, and
+the handoff had to inherit it. The lesson: **a clone argument that is not
+persisted cannot be inherited.** `session.json` recorded `repo_url` but not
+the branch, so "same repo and branch as the creating session" needed a new
+field (`smRepoBranch`) and a writer in the SETUP_REPO convergence — the
+handoff then just replays `{url, branch}` through the same opcode.
+
+Two details worth remembering: record the *request* (a branch, or nothing for
+the remote default), not a resolved ref — resolving it would mean querying
+git in the trusted plane; and parse the persisted values with the opcode's own
+`parseSetupRepoInput`, so what is written down is exactly what was cloned.

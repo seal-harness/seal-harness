@@ -45,6 +45,7 @@ metaWith frontMatter =
        , smAgentName = Just "zoe", smDescription = Nothing
        , smSealFrontMatter = frontMatter
        , smRepoUrl = Nothing
+       , smRepoBranch = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 -- | An agent def whose system prompt is a distinctive marker, so the test

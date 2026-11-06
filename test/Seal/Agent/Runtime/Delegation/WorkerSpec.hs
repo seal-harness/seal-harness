@@ -6,9 +6,10 @@
 module Seal.Agent.Runtime.Delegation.WorkerSpec (spec) where
 
 import Control.Exception (SomeException, catch)
-import Data.Aeson (object, withObject, (.:))
+import Data.Aeson (object, withObject, (.:), (.:?))
 import Data.Aeson.Types (parseMaybe)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Control.Monad (join)
 import Data.List (findIndex)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
@@ -27,6 +28,7 @@ import Seal.Agent.Runtime.Delegation
   , ChildRunHooks (..)
   , ChildTask (..)
   , ChildWorkerOutcome (..)
+  , RepoSpec (..)
   )
 import Seal.Agent.Runtime.Delegation.Worker
 import Seal.Channel.Caps (ChannelCaps)
@@ -189,6 +191,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              , smRepoBranch = Nothing
               , smCreatedAt = now, smLastActive = now }
         saveSessionMeta paths parentMeta
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
@@ -226,33 +229,52 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         -- id prepended to the parent's baked chain (self first).
         captured `shouldBe` Just [childSid, sampleSession, grandparentSid]
 
-  describe "handoffRepoUrl (the one handoff repo rule)" $ do
-    let parent r = Just (sampleMetaWithRepo r)
-    it "explicit wins over the caller's repo" $
-      handoffRepoUrl (Just "https://x/y.git") (parent (Just "https://a/b.git"))
-        `shouldBe` Just "https://x/y.git"
+  describe "handoffRepo (the one handoff repo rule)" $ do
+    let parent r b = Just (callerMeta r b)
+        urlOf = fmap rsUrl
+        branchOf = fmap rsBranch
 
-    it "inherits the caller's repo when nothing is supplied" $
-      handoffRepoUrl Nothing (parent (Just "https://a/b.git"))
-        `shouldBe` Just "https://a/b.git"
+    it "inherits both the repo and the branch when nothing is supplied" $ do
+      let r = handoffRepo Nothing Nothing (parent (Just "https://a/b.git") (Just "main"))
+      urlOf r `shouldBe` Just "https://a/b.git"
+      branchOf r `shouldBe` Just (Just "main")
 
-    it "treats a blank explicit value as absent" $
-      handoffRepoUrl (Just "   ") (parent (Just "https://a/b.git"))
-        `shouldBe` Just "https://a/b.git"
+    it "an explicit repo stands alone (no branch carried from another repo)" $ do
+      let r = handoffRepo (Just "https://x/y.git") Nothing
+                        (parent (Just "https://a/b.git") (Just "main"))
+      urlOf r `shouldBe` Just "https://x/y.git"
+      branchOf r `shouldBe` Just Nothing
 
-    it "is Nothing when neither side has a repo" $ do
-      handoffRepoUrl Nothing (parent Nothing) `shouldBe` Nothing
-      handoffRepoUrl Nothing Nothing `shouldBe` Nothing
+    it "an explicit branch overrides the inherited one (same repo)" $
+      branchOf (handoffRepo Nothing (Just "release/1.2")
+                  (parent (Just "https://a/b.git") (Just "main")))
+        `shouldBe` Just (Just "release/1.2")
 
-    it "treats a blank inherited value as absent" $
-      handoffRepoUrl Nothing (parent (Just "  ")) `shouldBe` Nothing
+    it "an explicit repo + branch is used as given" $
+      handoffRepo (Just "https://x/y.git") (Just "dev") Nothing
+        `shouldBe` Just (RepoSpec "https://x/y.git" (Just "dev"))
 
-    it "trims the value it carries" $
-      handoffRepoUrl (Just "  https://x/y.git  ") Nothing `shouldBe` Just "https://x/y.git"
+    it "treats blank values on either side as absent" $
+      handoffRepo (Just "  ") (Just " ")
+        (parent (Just "https://a/b.git") (Just "main"))
+        `shouldBe` Just (RepoSpec "https://a/b.git" (Just "main"))
+
+    it "is Nothing when the caller has no repo" $ do
+      handoffRepo Nothing Nothing Nothing `shouldBe` Nothing
+      handoffRepo Nothing Nothing (parent Nothing (Just "main")) `shouldBe` Nothing
+
+    it "drops an inherited branch that no longer validates" $
+      handoffRepo Nothing Nothing (parent (Just "https://a/b.git") (Just "bad branch"))
+        `shouldBe` Just (RepoSpec "https://a/b.git" Nothing)
+
+    it "trims the values it carries" $
+      handoffRepo (Just "  https://x/y.git  ") (Just "  dev  ") Nothing
+        `shouldBe` Just (RepoSpec "https://x/y.git" (Just "dev"))
 
     it "is idempotent (feeding the result back as explicit changes nothing)" $ do
-      let r = handoffRepoUrl Nothing (parent (Just "https://a/b.git"))
-      handoffRepoUrl r (parent (Just "https://a/b.git")) `shouldBe` r
+      let meta = parent (Just "https://a/b.git") (Just "main")
+          r = handoffRepo Nothing Nothing meta
+      handoffRepo (urlOf r) (join (branchOf r)) meta `shouldBe` r
 
   describe "readSessionMeta (the single session.json reader)" $ do
     it "round-trips a session meta" $ withSystemTempDirectory "seal-meta-read" $ \tmp -> do
@@ -280,22 +302,25 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
       withSystemTempDirectory "seal-handoff-meta" $ \tmp -> do
         let paths = samplePaths tmp
             childSid = mkSystemSessionId "handoff"
-        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+        saveSessionMeta paths (callerMeta (Just "https://a/b.git") (Just "main"))
         runHandoffWorker tmp childSid Nothing
         mMeta <- readSessionMeta paths childSid
         fmap smRepoUrl mMeta `shouldBe` Just (Just "https://a/b.git")
+        -- the *branch* is inherited too: same repo, same checkout
+        fmap smRepoBranch mMeta `shouldBe` Just (Just "main")
         fmap smParent mMeta `shouldBe` Just Nothing
         fmap smAgent mMeta `shouldBe` Just (Just (adId sampleAgentDef))
         fmap smAgentName mMeta `shouldBe` Just (Just "test-agent")
 
-    it "an explicit ctRepoUrl overrides the caller's repo" $
+    it "an explicit repo takes over, with its own branch" $
       withSystemTempDirectory "seal-handoff-meta-explicit" $ \tmp -> do
         let paths = samplePaths tmp
             childSid = mkSystemSessionId "handoff"
-        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
-        runHandoffWorker tmp childSid (Just "https://explicit/x.git")
+        saveSessionMeta paths (callerMeta (Just "https://a/b.git") (Just "main"))
+        runHandoffWorker tmp childSid (Just (RepoSpec "https://explicit/x.git" (Just "dev")))
         mMeta <- readSessionMeta paths childSid
         fmap smRepoUrl mMeta `shouldBe` Just (Just "https://explicit/x.git")
+        fmap smRepoBranch mMeta `shouldBe` Just (Just "dev")
 
     it "a blank def name leaves smAgentName Nothing" $
       withSystemTempDirectory "seal-handoff-meta-noname" $ \tmp -> do
@@ -319,7 +344,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         createDirectoryIfMissing True (sessionDir paths sid)
         seen <- newIORef []
         runDispatch paths sid seen (OpResult [TrpText "fake cloned"] False (object []))
-        readIORef seen `shouldReturn` ["https://a/b.git"]
+        readIORef seen `shouldReturn` [("https://a/b.git", Just "main")]
         entries <- readEntries (sessionEntriesPath paths sid)
         let setupEntries = filter isSetupRepoEntry entries
         length setupEntries `shouldBe` 2
@@ -347,7 +372,8 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         withIndexedTranscript (sessionDir paths sid) $ \h ->
           runApp appEnv (dispatchHandoffRepo h (mkRegistry [])
                           (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
-                          defaultToolTimeoutConfig abortFlag "https://a/b.git" Nothing)
+                          defaultToolTimeoutConfig abortFlag
+                          (RepoSpec "https://a/b.git" Nothing) Nothing)
         entries <- readEntries (sessionEntriesPath paths sid)
         entries `shouldBe` []
 
@@ -356,7 +382,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
       withSystemTempDirectory "seal-handoff-order" $ \tmp -> do
         let paths = samplePaths tmp
             childSid = mkSystemSessionId "handoff"
-        saveSessionMeta paths (sampleMetaWithRepo (Just "https://a/b.git"))
+        saveSessionMeta paths (callerMeta (Just "https://a/b.git") (Just "main"))
         runHandoffWorker tmp childSid Nothing
         entries <- readEntries (sessionEntriesPath paths childSid)
         let idxSetup = findIndex isSetupRepoEntry entries
@@ -487,16 +513,21 @@ sampleMetaWithRepo mRepo = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = mRepo
+  , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t
   }
   where
     t = read "1970-01-01 00:00:00 UTC"
 
+-- | A caller session meta with a repo *and* a branch.
+callerMeta :: Maybe Text -> Maybe Text -> SessionMeta
+callerMeta mRepo mBranch = (sampleMetaWithRepo mRepo) { smRepoBranch = mBranch }
+
 -- | A fake SETUP_REPO that records the URL it was handed and returns a
 -- canned result (no clone): lets 'dispatchHandoffRepo' be tested without a
 -- real git binary or credentials.
-fakeSetupRepoOp :: IORef [Text] -> OpResult -> Opcode
+fakeSetupRepoOp :: IORef [(Text, Maybe Text)] -> OpResult -> Opcode
 fakeSetupRepoOp seen result = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
   , uoDesc = "test fake SETUP_REPO"
@@ -504,8 +535,8 @@ fakeSetupRepoOp seen result = UntrustedOpcode
   , uoOutSchema = object []
   , uoAuthorize = const (Right ())
   , uoRun = \v -> do
-      uioLiftIO $ case parseMaybe (withObject "in" (.: "url")) v :: Maybe Text of
-        Just url -> modifyIORef' seen (<> [url])
+      uioLiftIO $ case parseMaybe (withObject "in" (\o -> (,) <$> o .: "url" <*> o .:? "branch")) v of
+        Just arg -> modifyIORef' seen (<> [arg])
         Nothing  -> pure ()
       pure result
   }
@@ -518,7 +549,7 @@ isSetupRepoEntry e = case Map.lookup "op" (erMeta e) of
 
 -- | Dispatch a fake SETUP_REPO through 'dispatchHandoffRepo' against a real
 -- (temporary) transcript.
-runDispatch :: SealPaths -> SessionId -> IORef [Text] -> OpResult -> IO ()
+runDispatch :: SealPaths -> SessionId -> IORef [(Text, Maybe Text)] -> OpResult -> IO ()
 runDispatch paths sid seen result = do
   logger <- testSealLogger
   appEnv <- mkEnv logger defaultConfig
@@ -527,14 +558,15 @@ runDispatch paths sid seen result = do
     runApp appEnv (dispatchHandoffRepo h
                     (mkRegistry [fakeSetupRepoOp seen result])
                     (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
-                    defaultToolTimeoutConfig abortFlag "https://a/b.git" (Just "web"))
+                    defaultToolTimeoutConfig abortFlag
+                    (RepoSpec "https://a/b.git" (Just "main")) (Just "web"))
 
 -- | Run the delegation worker in TOP-LEVEL (handoff) mode: own workdir
 -- (@ctIsolateWorkdir@) and the given explicit repo.
-runHandoffWorker :: FilePath -> SessionId -> Maybe Text -> IO ()
+runHandoffWorker :: FilePath -> SessionId -> Maybe RepoSpec -> IO ()
 runHandoffWorker = runHandoffWorkerWith sampleAgentDef
 
-runHandoffWorkerWith :: AgentDef -> FilePath -> SessionId -> Maybe Text -> IO ()
+runHandoffWorkerWith :: AgentDef -> FilePath -> SessionId -> Maybe RepoSpec -> IO ()
 runHandoffWorkerWith agentDef tmp childSid mRepo = do
   anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
   deps0 <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing

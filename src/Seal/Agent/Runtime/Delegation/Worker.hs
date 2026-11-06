@@ -18,7 +18,7 @@ module Seal.Agent.Runtime.Delegation.Worker
   , filterBlocklistedWith
   , narrowAllowList
   , narrowAllowListWith
-  , handoffRepoUrl
+  , handoffRepo
   , handoffRepoRegistry
   , dispatchHandoffRepo
   , DelegationWorkerDeps (..)
@@ -44,6 +44,7 @@ import Seal.Agent.Runtime.Delegation
   , ChildExitReason (..)
   , ChildTask (..)
   , ChildWorkerOutcome (..)
+  , RepoSpec (..)
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
@@ -62,6 +63,7 @@ import Seal.Security.Policy (AllowList (..), AutonomyLevel)
 import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
 import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Args (branchNameText, mkBranchName)
 import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv, runUIOWithEnv)
 import Seal.Tools.Exec.UIOGit (uioCdCloneDeps)
@@ -295,7 +297,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         -- Top-level (handoff): write the session's own meta and resolve the
         -- repo it carries (explicit @ctRepoUrl@ else the caller's).
         mRepo <- if topLevel
-                   then writeHandoffMeta deps childSid agentDef (ctRepoUrl task)
+                   then writeHandoffMeta deps childSid agentDef (ctRepo task)
                    else writeChildMeta deps childSid >> pure Nothing
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
@@ -322,16 +324,17 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         -- task set @ctIsolateWorkdir@, so @dwdMkUIOEnv@ above built a fresh
         -- per-session workdir) through the audited SETUP_REPO opcode — the
         -- same op the gateway's setup-repo endpoint and @/new -r@ dispatch.
-        -- Runs BEFORE the first turn so the goal sees a checkout.
+        -- It gets the same arguments the creating session used (url +
+        -- branch). Runs BEFORE the first turn so the goal sees a checkout.
         case mRepo of
           Nothing -> pure ()
-          Just repoUrl -> do
+          Just repo -> do
             cloneDeps <- runUIOWithEnv childUioEnv uioCdCloneDeps
             runApp (dwdAppEnv deps) $
               dispatchHandoffRepo childTHandle
                 (handoffRepoRegistry cloneDeps (dwdAutonomy deps))
                 childUioEnv (dwdToolTimeout deps) childAbortFlag
-                repoUrl (Just (dwdChannel deps))
+                repo (Just (dwdChannel deps))
         -- Capture the final answer via 'aeOnStop': the loop's
         -- final-answer path calls 'notifyStop' (the replyFanout hook)
         -- rather than 'ccSend' — the double-delivery fix. The
@@ -410,6 +413,7 @@ writeChildMeta deps childSid = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smRepoBranch = Nothing
     , smCreatedAt = now
     , smLastActive = now
     }
@@ -419,21 +423,45 @@ writeChildMeta deps childSid = do
 loadParentMeta :: DelegationWorkerDeps -> IO (Maybe SessionMeta)
 loadParentMeta deps = readSessionMeta (dwdPaths deps) (dwdParentSid deps)
 
--- | The repo a handoff session carries: the caller-supplied override when
--- non-blank, else the calling session's persisted 'smRepoUrl' when
--- non-blank, else 'Nothing'. Pure, and used by BOTH the opcode (to name the
--- repo in its result text) and the worker (to write the meta and clone) —
--- one resolution rule, applied twice, so the two never disagree.
-handoffRepoUrl :: Maybe Text -> Maybe SessionMeta -> Maybe Text
-handoffRepoUrl explicit mParent = case nonBlank explicit of
-  Just url -> Just url
-  Nothing  -> mParent >>= nonBlank . smRepoUrl
+-- | The repo checkout a handoff session carries, from the caller's optional
+-- overrides and the calling session's own record. Pure, and used by BOTH the
+-- opcode (to name it in the result text) and the worker (to write the meta
+-- and dispatch the clone) -- one rule, applied twice, so the two never
+-- disagree.
+--
+-- * With no explicit repo, the caller's 'smRepoUrl' *and* 'smRepoBranch' are
+--   inherited: the handoff session gets the same repo and the same branch as
+--   the session that handed off.
+-- * An explicit branch overrides the inherited one (same repo, different
+--   branch).
+-- * An explicit repo stands alone: its branch is whatever the caller passed
+--   (or the remote default). A branch belonging to a different repo is never
+--   carried across.
+-- * A blank value on either side counts as absent; an inherited branch that
+--   no longer validates (a hand-edited @session.json@) is dropped rather
+--   than failing the handoff.
+handoffRepo :: Maybe Text -> Maybe Text -> Maybe SessionMeta -> Maybe RepoSpec
+handoffRepo explicitUrl explicitBranch mParent = case nonBlank explicitUrl of
+  Just url -> Just (RepoSpec url (validBranch (nonBlank explicitBranch)))
+  Nothing  -> do
+    url <- mParent >>= nonBlank . smRepoUrl
+    let inherited = mParent >>= validBranch . smRepoBranch
+        branch = validBranch (nonBlank explicitBranch)
+    pure (RepoSpec url (pick branch inherited))
   where
     nonBlank :: Maybe Text -> Maybe Text
     nonBlank Nothing  = Nothing
     nonBlank (Just t)
       | T.null (T.strip t) = Nothing
       | otherwise          = Just (T.strip t)
+    -- A branch is only carried when it still parses as one.
+    validBranch :: Maybe Text -> Maybe Text
+    validBranch Nothing  = Nothing
+    validBranch (Just b) = case mkBranchName b of
+      Right bn -> Just (branchNameText bn)
+      Left _   -> Nothing
+    pick (Just x) _ = Just x
+    pick Nothing y  = y
 
 -- | The registry the handoff session's pre-turn repo checkout dispatches
 -- through: exactly one opcode, the real 'SETUP_REPO', with the child's own
@@ -456,15 +484,20 @@ handoffRepoRegistry cloneDeps autonomy = mkRegistry [setupRepoOp cloneDeps auton
 -- goal may not need the files.
 dispatchHandoffRepo
   :: IndexedTranscriptHandle -> Registry -> UIOEnv -> ToolTimeoutConfig
-  -> AbortFlag -> Text -> Maybe Text -> App ()
-dispatchHandoffRepo h reg uioEnv toolTimeout abortFlag repoUrl mChannel = do
-  let input = object ["url" .= repoUrl]
+  -> AbortFlag -> RepoSpec -> Maybe Text -> App ()
+dispatchHandoffRepo h reg uioEnv toolTimeout abortFlag repo mChannel = do
+  -- Same argument shape the creating session used: @{url, branch?}@. The
+  -- branch key is omitted (never null) when there is none, so the opcode
+  -- asks for the remote's default branch.
+  let input = object
+        ([ "url" .= rsUrl repo ]
+         <> maybe [] (\b -> ["branch" .= b]) (rsBranch repo))
   res <- dispatch reg h localBackend uioEnv toolTimeout abortFlag
                     (OpName "SETUP_REPO") input
   case res of
     Left dErr ->
       liftIO (globalLogIO WarningS
-               (ls ("[handoff] SETUP_REPO dispatch failed for " <> repoUrl
+               (ls ("[handoff] SETUP_REPO dispatch failed for " <> rsUrl repo
                     <> ": " <> T.pack (show dErr))))
     Right opRes ->
       liftIO (recordSetupRepoResult h (OpName "SETUP_REPO") input opRes mChannel)
@@ -474,20 +507,22 @@ dispatchHandoffRepo h reg uioEnv toolTimeout abortFlag repoUrl mChannel = do
 -- the originating session's provider/model (for audit trail), channel
 -- @"agent"@, 'smParent' = 'Nothing' (top-level — no parent), the def the
 -- session runs (so a resume keeps its agent), and the repo it carries
--- (@explicitRepo@ when the caller supplied one, else the caller's own
--- 'smRepoUrl' — see 'handoffRepoUrl'). The handoff session IS visible to
+-- (the task's @ctRepo@ when the opcode resolved one — the caller's explicit
+-- values, else the calling session's own repo *and* branch; see
+-- 'handoffRepo', which is idempotent and also covers a worker invoked with
+-- no task repo at all). The handoff session IS visible to
 -- 'Seal.Session.Store.listSessions' (it's a top-level dir, not nested under
--- @agents\/@). Returns the effective repo URL, which the caller clones.
+-- @agents\/@). Returns the effective checkout, which the caller dispatches.
 writeHandoffMeta
-  :: DelegationWorkerDeps -> SessionId -> AgentDef -> Maybe Text
-  -> IO (Maybe Text)
-writeHandoffMeta deps childSid agentDef explicitRepo = do
+  :: DelegationWorkerDeps -> SessionId -> AgentDef -> Maybe RepoSpec
+  -> IO (Maybe RepoSpec)
+writeHandoffMeta deps childSid agentDef taskRepo = do
   mParent <- loadParentMeta deps
   now <- getCurrentTime
   let (provider, model) = case mParent of
         Just pm -> (smProvider pm, smModel pm)
         Nothing -> ("unknown", "unknown")
-      repoUrl = handoffRepoUrl explicitRepo mParent
+      repo = handoffRepo (rsUrl <$> taskRepo) (taskRepo >>= rsBranch) mParent
       agentName = let n = T.strip (adName agentDef)
                   in if T.null n then Nothing else Just n
   saveSessionMeta (dwdPaths deps) SessionMeta
@@ -501,8 +536,9 @@ writeHandoffMeta deps childSid agentDef explicitRepo = do
     , smAgentName = agentName
     , smDescription = Nothing
     , smSealFrontMatter = True
-    , smRepoUrl = repoUrl
+    , smRepoUrl = rsUrl <$> repo
+    , smRepoBranch = repo >>= rsBranch
     , smCreatedAt = now
     , smLastActive = now
     }
-  pure repoUrl
+  pure repo

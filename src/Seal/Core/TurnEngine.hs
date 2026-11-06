@@ -29,9 +29,8 @@ module Seal.Core.TurnEngine
   ) where
 
 import Control.Exception (bracket, catch)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Aeson (Value)
-import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -107,7 +106,7 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput, setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -133,7 +132,7 @@ import Seal.Session.Lock
 import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
-  , updateSessionRepoUrl )
+  , updateSessionRepo )
 import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -158,6 +157,7 @@ import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
+import Seal.Tools.Args (branchNameText)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -1126,13 +1126,16 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
-              -- Persist the cloned repo URL to session.json so the sidebar
-              -- can display it. The URL comes from the opcode's input
-              -- value.
-              let mRepoUrl =
-                    AT.parseMaybe
-                      (AT.withObject "SETUP_REPO input" (AT..: "url")) val
-              _ <- updateSessionRepoUrl paths sid mRepoUrl
+              -- Persist the cloned repo URL *and* the branch (or tag) to
+              -- session.json, so the sidebar can display the repo and a
+              -- later clone — a handoff's pre-turn checkout, say — can
+              -- repeat exactly this checkout. Parsed with the opcode's own
+              -- input parser: what is recorded is exactly what was cloned.
+              case parseSetupRepoInput val of
+                Left _ -> pure ()   -- unreachable: the opcode just ran
+                Right (repoUrl, mBranch) ->
+                  void (updateSessionRepo paths sid
+                          (Just repoUrl) (branchNameText <$> mBranch))
               invalidateWorkdirScan (tdExecCache td) sid
               freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
@@ -1337,6 +1340,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
