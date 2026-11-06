@@ -58,6 +58,7 @@ import {
   adoptWindow,
   fetchProviderModels,
   fetchModelContext,
+  setupRepo,
 } from '../useApi'
 import type { TabInfoWire } from '../useApi'
 import { POLL_INTERVAL, WS_GRACE_MS } from '../useApi'
@@ -1068,5 +1069,38 @@ describe('useSecrets', () => {
     const initialCalls = fetchCalls.length
     act(() => result.current.refresh())
     await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+})
+
+describe('setupRepo', () => {
+  function lastSetupCall() {
+    const call = [...fetchCalls].reverse().find((c) => c.url.includes('/setup-repo'))
+    expect(call).toBeTruthy()
+    return call!
+  }
+
+  it('POSTs {url} when no branch is given', async () => {
+    setNextResponse({ ok: true, message: 'cloned' })
+    const res = await setupRepo('sess1', 'https://github.com/o/r.git')
+    expect(res).toEqual({ ok: true, message: 'cloned' })
+    const call = lastSetupCall()
+    expect(call.url).toBe('/api/sessions/sess1/setup-repo')
+    expect(call.init?.method).toBe('POST')
+    expect(JSON.parse(String(call.init?.body))).toEqual({ url: 'https://github.com/o/r.git' })
+  })
+
+  it('POSTs {url, branch} with a trimmed branch when one is given', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess2', 'https://github.com/o/r.git', '  dev  ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git', branch: 'dev' })
+  })
+
+  it('omits a blank branch (never sends null)', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess3', 'https://github.com/o/r.git', '   ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git' })
+    expect('branch' in body).toBe(false)
   })
 })

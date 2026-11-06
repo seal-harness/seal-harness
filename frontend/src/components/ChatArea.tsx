@@ -811,7 +811,12 @@ function toolCallSummary(input: unknown): string {
   const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url', 'question']
   for (const k of preferredKeys) {
     const v = obj[k]
-    if (typeof v === 'string' && v.length > 0) return v
+    // The branch is a qualifier on the primary arg (SETUP_REPO's url), so
+    // surface it inline instead of hiding it in the expanded JSON.
+    const br = typeof obj.branch === 'string' ? obj.branch.trim() : ''
+    if (typeof v === 'string' && v.length > 0) {
+      return br ? `${v} (branch: ${br})` : v
+    }
   }
   // Fall back to a JSON one-liner so we never silently hide structure.
   return JSON.stringify(obj)
@@ -2011,16 +2016,26 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         }
         if (opName === 'SETUP_REPO' && parsed.result) {
           // SETUP_REPO result entry — render as a tool-call box so the
-          // clone/no-op/conflict/failure is visible in the chat (not just
-          // the raw transcript). The result carries {status, target}; on
-          // failure the error text is in the conversation message, so the
-          // box shows the status + target as a one-line summary.
-          const input = parsed.input as { url?: string } | undefined
+          // clone/no-op/switch/conflict/failure is visible in the chat (not
+          // just the raw transcript). The result carries {status, target};
+          // on failure the error text is in the conversation message, so the
+          // box shows the status + target (and the branch, from the input)
+          // as a one-line summary.
+          const input = parsed.input as { url?: string; branch?: string } | undefined
           const result = parsed.result as { status?: string; target?: string } | undefined
           const status = result?.status ?? ''
           const target = result?.target ?? ''
-          const summary = status === 'cloned' ? `Cloned into ${target}`
-                        : status === 'noop' ? `Repo already exists — ${target}`
+          // The branch rides in the recorded opcode INPUT (the result is
+          // {status, target} only), so name it here — otherwise a
+          // branch-aware clone/switch would read as a plain clone.
+          // `input` is untrusted JSON straight from the transcript: the
+          // backend treats a non-string branch as absent, so guard the type
+          // here too (a `.trim()` on a number would throw during render).
+          const branch = typeof input?.branch === 'string' ? input.branch.trim() : ''
+          const branchNote = branch ? ` (branch ${branch})` : ''
+          const summary = status === 'cloned' ? `Cloned into ${target}${branchNote}`
+                        : status === 'noop' ? `Repo already exists — ${target}${branchNote}`
+                        : status === 'switched' ? `Switched to ${branch || 'branch'} — ${target}`
                         : status === 'conflict' ? `Conflict at ${target}`
                         : status === 'failed' ? 'Clone failed'
                         : status

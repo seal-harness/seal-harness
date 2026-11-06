@@ -244,6 +244,17 @@ runAppBodyHeaders app req = do
     pure ResponseReceived)
   takeMVar mv
 
+-- | Extract the status code + body from a 'Response' the API built directly
+-- (with `responseLBS`, so a `ResponseBuilder`), for unit-testing the pure
+-- response mappers without going through 'Application'.
+respStatusBody :: Response -> (Int, BL.ByteString)
+respStatusBody resp =
+  ( statusCode (responseStatus resp)
+  , case resp of
+      ResponseBuilder _ _ b -> BSB.toLazyByteString b
+      _                     -> BL.fromStrict BC.empty
+  )
+
 -- | A test scribe that captures log items into an IORef for assertions.
 -- Mirrors 'Seal.Logging.LoggerSpec.mkCaptureScribe' and the pattern in
 -- 'Seal.Tools.Exec.LogRedactionSpec'.
@@ -797,6 +808,73 @@ spec = describe "Seal.Gateway.API" $ do
           , "provider"     .= ("p" :: T.Text)
           , "model"        .= ("m" :: T.Text)
           ]
+
+  -- ── WU-3: the POST /api/sessions/:id/setup-repo body parser (widened from
+  -- the url-only 'parseRepoUrl') and the response mapper. Both are pure, so
+  -- they are pinned directly rather than through the HTTP wiring.
+  describe "parseSetupRepoBody" $ do
+    let url = "https://github.com/o/r" :: T.Text
+    it "returns the url with no branch when the branch is absent" $
+      parseSetupRepoBody (A.encode (A.object ["url" .= url]))
+        `shouldBe` Just (url, Nothing)
+
+    it "returns the branch when it is a non-blank string" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("dev" :: T.Text) ]))
+        `shouldBe` Just (url, Just "dev")
+
+    it "treats an empty branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("" :: T.Text) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "treats a whitespace-only branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("   " :: T.Text) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "treats a null branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= A.Null ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "never reads a non-string branch as a branch" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= (42 :: Int) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "rejects a body with no url" $
+      parseSetupRepoBody (A.encode (A.object ["branch" .= ("dev" :: T.Text)]))
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+    it "rejects a blank url" $
+      parseSetupRepoBody (A.encode (A.object ["url" .= ("" :: T.Text)]))
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+    it "rejects a body that is not a JSON object" $ do
+      parseSetupRepoBody "not json"
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+      parseSetupRepoBody "[1,2,3]"
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+  -- The response mapper is pinned directly (rather than over HTTP): the route
+  -- hands 'handleSetupRepo's 'Either' straight to it.
+  describe "handleSetupRepoResponse" $ do
+    it "maps a Left to 400 carrying the error text" $ do
+      let (st, body) = respStatusBody
+            (handleSetupRepoResponse (Left "SETUP_REPO: invalid branch: bad branch"))
+      st `shouldBe` 400
+      o <- decodedObject body
+      lookupK "error" o
+        `shouldBe` Just (A.String "SETUP_REPO: invalid branch: bad branch")
+
+    it "maps a Right to 200 {ok:true, message}" $ do
+      let (st, body) = respStatusBody
+            (handleSetupRepoResponse (Right "cloned r (dev)"))
+      st `shouldBe` 200
+      o <- decodedObject body
+      lookupK "ok" o `shouldBe` Just (A.Bool True)
+      lookupK "message" o `shouldBe` Just (A.String "cloned r (dev)")
 
   -- ── WU-6: GET /api/commands — the slash-command menu the chat channels
   -- render (/help on Signal/Telegram). Canonical names only, no aliases.

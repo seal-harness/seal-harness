@@ -1119,18 +1119,25 @@ export interface SetupRepoResult {
 
 /** Clone a repo into a session's workdir before the first turn (the "set
  *  up repo" combo box calls this right after creating a bare session).
+ *  `branch` is an optional branch or tag to check out instead of the
+ *  remote's default branch; blank/absent is omitted from the body, so the
+ *  request stays byte-identical to the pre-branch one.
  *  The backend dispatches the SETUP_REPO opcode, so the clone (and any
  *  failure) is recorded in the session transcript — visible in the chat,
  *  not silent. Returns the structured result, or null on a network/parse
  *  failure. */
-export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
+export async function setupRepo(sessionId: string, url: string, branch?: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  // Omit the branch entirely (never `null`) when it is absent or blank —
+  // the gateway then clones the remote's default branch.
+  const trimmedBranch = branch?.trim()
+  const body = trimmedBranch ? { url, branch: trimmedBranch } : { url }
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     })
     if (!res.ok) {
