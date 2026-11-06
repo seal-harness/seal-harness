@@ -8,6 +8,13 @@ import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
+import { MarkdownView } from './MarkdownView'
+import {
+  DEFAULT_TRANSCRIPT_VIEW_MODE,
+  loadTranscriptViewMode,
+  saveTranscriptViewMode,
+  type TranscriptViewMode,
+} from '../lib/transcriptViewMode'
 import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
@@ -261,6 +268,41 @@ function StopButton({ onStop }: { onStop: () => void }) {
         <rect x="4" y="4" width="8" height="8" rx="1.5" />
       </svg>
     </button>
+  )
+}
+
+/** Segmented control in the chat header that switches the transcript between
+ *  the raw markdown source and the rendered version.
+ *
+ *  Two visible buttons rather than a single cycling toggle: the current mode
+ *  is readable at a glance (which is the whole point of a view option), and
+ *  either mode is one click away instead of two. */
+function TranscriptViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: TranscriptViewMode
+  onChange: (mode: TranscriptViewMode) => void
+}) {
+  return (
+    <div className="view-mode-toggle" role="group" aria-label="Message rendering">
+      <button
+        type="button"
+        aria-pressed={mode === 'raw'}
+        title="Show the raw markdown source, exactly as the model wrote it"
+        onClick={() => onChange('raw')}
+      >
+        Raw
+      </button>
+      <button
+        type="button"
+        aria-pressed={mode === 'rendered'}
+        title="Render the markdown (tables, lists, code, headings)"
+        onClick={() => onChange('rendered')}
+      >
+        Rendered
+      </button>
+    </div>
   )
 }
 
@@ -775,185 +817,12 @@ function toolCallSummary(input: unknown): string {
   return JSON.stringify(obj)
 }
 
-/** A lightweight markdown renderer for SHOW_HUMAN messages. Handles the
- *  most common markdown features: headers (h1-h3), bold, italic, inline
- *  code, code blocks (fenced), unordered lists, ordered lists, blockquotes,
- *  and horizontal rules. Falls back gracefully — any unrecognized line is
- *  rendered as a paragraph with whitespace preserved. No HTML is produced
- *  directly; everything is React elements (XSS-safe by construction). */
+/** The SHOW_HUMAN body, rendered as formatted markdown (headings, lists,
+ *  code, tables, links). Shares the transcript markdown renderer, so there
+ *  is exactly one markdown implementation and one XSS surface to audit:
+ *  every node is a React element, never `dangerouslySetInnerHTML`. */
 function ShowHumanMessage({ text }: { text: string }) {
-  const blocks = parseMarkdown(text)
-  return (
-    <div className="show-human-message" style={{ color: 'var(--text-primary)', lineHeight: 'var(--leading-relaxed)' }}>
-      {blocks.map((b, i) => renderBlock(b, i))}
-    </div>
-  )
-}
-
-type MdBlock =
-  | { kind: 'heading'; level: number; inline: MdInline[] }
-  | { kind: 'code'; lang: string; code: string }
-  | { kind: 'para'; inline: MdInline[] }
-  | { kind: 'ul'; items: MdInline[][] }
-  | { kind: 'ol'; items: MdInline[][] }
-  | { kind: 'quote'; inline: MdInline[] }
-  | { kind: 'hr' }
-
-type MdInline =
-  | { kind: 'text'; text: string }
-  | { kind: 'bold'; inline: MdInline[] }
-  | { kind: 'italic'; inline: MdInline[] }
-  | { kind: 'code'; code: string }
-
-function parseMarkdown(text: string): MdBlock[] {
-  const lines = text.split('\n')
-  const blocks: MdBlock[] = []
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i]!
-    // Skip blank lines
-    if (line.trim() === '') { i++; continue }
-    // Fenced code block
-    const fence = line.match(/^```(\w*)/)
-    if (fence) {
-      const lang = fence[1] ?? ''
-      const codeLines: string[] = []
-      i++
-      while (i < lines.length && !lines[i]!.trim().startsWith('```')) {
-        codeLines.push(lines[i]!)
-        i++
-      }
-      i++ // skip closing ```
-      blocks.push({ kind: 'code', lang, code: codeLines.join('\n') })
-      continue
-    }
-    // Heading
-    const heading = line.match(/^(#{1,3})\s+(.*)/)
-    if (heading) {
-      blocks.push({ kind: 'heading', level: heading[1]!.length, inline: parseInline(heading[2]!) })
-      i++
-      continue
-    }
-    // Horizontal rule
-    if (/^---+\s*$/.test(line)) {
-      blocks.push({ kind: 'hr' })
-      i++
-      continue
-    }
-    // Blockquote
-    if (line.startsWith('> ')) {
-      const quoteLines: string[] = [line.slice(2)]
-      i++
-      while (i < lines.length && lines[i]!.startsWith('> ')) {
-        quoteLines.push(lines[i]!.slice(2))
-        i++
-      }
-      blocks.push({ kind: 'quote', inline: parseInline(quoteLines.join(' ')) })
-      continue
-    }
-    // Unordered list
-    if (/^[-*]\s+/.test(line)) {
-      const items: MdInline[][] = []
-      while (i < lines.length && /^[-*]\s+/.test(lines[i]!)) {
-        items.push(parseInline(lines[i]!.replace(/^[-*]\s+/, '')))
-        i++
-      }
-      blocks.push({ kind: 'ul', items })
-      continue
-    }
-    // Ordered list
-    if (/^\d+\.\s+/.test(line)) {
-      const items: MdInline[][] = []
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i]!)) {
-        items.push(parseInline(lines[i]!.replace(/^\d+\.\s+/, '')))
-        i++
-      }
-      blocks.push({ kind: 'ol', items })
-      continue
-    }
-    // Paragraph: collect consecutive non-blank, non-special lines
-    const paraLines: string[] = [line]
-    i++
-    while (i < lines.length && lines[i]!.trim() !== '' &&
-           !/^(#{1,3}\s|```|[-*]\s|\d+\.\s|>\s|---)/.test(lines[i]!)) {
-      paraLines.push(lines[i]!)
-      i++
-    }
-    blocks.push({ kind: 'para', inline: parseInline(paraLines.join(' ')) })
-  }
-  return blocks
-}
-
-function parseInline(text: string): MdInline[] {
-  const result: MdInline[] = []
-  let remaining = text
-  while (remaining.length > 0) {
-    // Bold: **text** or __text__
-    const bold = remaining.match(/\*\*(.+?)\*\*|__(.+?)__/)
-    // Italic: *text* or _text_ (but not ** or __)
-    const italic = remaining.match(/\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)/)
-    // Inline code: `text`
-    const code = remaining.match(/`([^`]+)`/)
-    // Find the earliest match
-    let bestIdx = Infinity
-    let bestMatch: RegExpMatchArray | null = null
-    let bestKind: 'bold' | 'italic' | 'code' | null = null
-    if (bold && bold.index! < bestIdx) { bestIdx = bold.index!; bestMatch = bold; bestKind = 'bold' }
-    if (italic && italic.index! < bestIdx) { bestIdx = italic.index!; bestMatch = italic; bestKind = 'italic' }
-    if (code && code.index! < bestIdx) { bestIdx = code.index!; bestMatch = code; bestKind = 'code' }
-    if (bestMatch === null || bestKind === null) {
-      result.push({ kind: 'text', text: remaining })
-      break
-    }
-    // Push any text before the match
-    if (bestIdx > 0) result.push({ kind: 'text', text: remaining.slice(0, bestIdx) })
-    // Push the matched element
-    if (bestKind === 'code') {
-      result.push({ kind: 'code', code: bestMatch[1]! })
-    } else if (bestKind === 'bold') {
-      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
-      result.push({ kind: 'bold', inline: parseInline(inner) })
-    } else if (bestKind === 'italic') {
-      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
-      result.push({ kind: 'italic', inline: parseInline(inner) })
-    }
-    remaining = remaining.slice(bestIdx + bestMatch[0].length)
-  }
-  return result
-}
-
-function renderInline(inline: MdInline, key: number): React.ReactNode {
-  switch (inline.kind) {
-    case 'text': return inline.text
-    case 'bold': return <strong key={key}>{inline.inline.map(renderInline)}</strong>
-    case 'italic': return <em key={key}>{inline.inline.map(renderInline)}</em>
-    case 'code': return <code key={key} className="inline-code">{inline.code}</code>
-  }
-}
-
-function renderBlock(block: MdBlock, key: number): React.ReactNode {
-  switch (block.kind) {
-    case 'heading': {
-      const Tag = (block.level <= 1 ? 'h4' : block.level === 2 ? 'h5' : 'h6') as React.ElementType
-      return <Tag key={key} style={{ margin: '0.5em 0 0.3em', fontWeight: 600 }}>{block.inline.map(renderInline)}</Tag>
-    }
-    case 'code':
-      return <pre key={key} className="code-block" style={{ margin: '0.5em 0', maxHeight: 400, overflow: 'auto' }}>{block.code}</pre>
-    case 'para':
-      return <p key={key} style={{ margin: '0.3em 0' }}>{block.inline.map(renderInline)}</p>
-    case 'ul':
-      return <ul key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'disc' }}>
-        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
-      </ul>
-    case 'ol':
-      return <ol key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'decimal' }}>
-        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
-      </ol>
-    case 'quote':
-      return <blockquote key={key} style={{ borderLeft: '3px solid var(--border)', margin: '0.3em 0', paddingLeft: '1em', color: 'var(--text-muted)' }}>{block.inline.map(renderInline)}</blockquote>
-    case 'hr':
-      return <hr key={key} style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.5em 0' }} />
-  }
+  return <MarkdownView text={text} className="show-human-message" />
 }
 
 const RESULT_PREVIEW_LINES = 4
@@ -1409,12 +1278,17 @@ function isAskHumanQuestion(pq: PendingQuestion): boolean {
 
 function MessageBlock({
   block,
+  markdownMode,
   pendingQuestions,
   matchedQuestionIds,
   onAnswer,
   onCancel,
 }: {
   block: MessageContent
+  /** How message text is displayed: the markdown source verbatim, or parsed
+   *  and rendered. Tool-call input/result bodies are unaffected — they are
+   *  payload data, not prose. */
+  markdownMode: TranscriptViewMode
   pendingQuestions?: PendingQuestion[]
   matchedQuestionIds: Set<string>
   onAnswer?: (qid: string, scope: string) => void
@@ -1474,7 +1348,18 @@ function MessageBlock({
     )
   }
   if (block.text) {
-    return <p className="mb-2 whitespace-pre-wrap" style={{ color: 'var(--text-primary)' }}>{block.text}</p>
+    if (markdownMode === 'rendered') {
+      return <MarkdownView text={block.text} className="mb-2" />
+    }
+    return (
+      <p
+        data-testid="msg-raw-text"
+        className="mb-2 whitespace-pre-wrap"
+        style={{ color: 'var(--text-primary)' }}
+      >
+        {block.text}
+      </p>
+    )
   }
   return null
 }
@@ -1503,6 +1388,7 @@ const ChatMessage = memo(function ChatMessage({
   message,
   onBranch,
   sending,
+  markdownMode,
   pendingQuestions,
   onAnswer,
   onCancel,
@@ -1510,6 +1396,8 @@ const ChatMessage = memo(function ChatMessage({
   message: Message
   onBranch?: (entryId: string) => void
   sending?: boolean
+  /** 'rendered' (default) formats the markdown; 'raw' shows the source. */
+  markdownMode?: TranscriptViewMode
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
   onCancel?: (qid: string) => void
@@ -1618,6 +1506,7 @@ const ChatMessage = memo(function ChatMessage({
           <MessageBlock
             key={block.id ?? i}
             block={block}
+            markdownMode={markdownMode ?? DEFAULT_TRANSCRIPT_VIEW_MODE}
             pendingQuestions={pendingQuestions}
             matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
@@ -2634,6 +2523,16 @@ export function ChatArea({
  isSessionThinking?: boolean
 }) {
   const [input, setInput] = useState('')
+  // Transcript rendering mode — 'raw' (markdown source) or 'rendered' (HTML).
+  // Persisted per browser so the choice survives reloads; see
+  // lib/transcriptViewMode.
+  const [markdownMode, setMarkdownMode] = useState<TranscriptViewMode>(
+    () => loadTranscriptViewMode(),
+  )
+  const changeMarkdownMode = useCallback((mode: TranscriptViewMode) => {
+    setMarkdownMode(mode)
+    saveTranscriptViewMode(mode)
+  }, [])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -3038,6 +2937,7 @@ export function ChatArea({
         {messages.length > 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
            {isThinking && onStop && <StopButton onStop={onStop} />}
+            <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
             {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
@@ -3117,7 +3017,11 @@ export function ChatArea({
                   {prefixMessages.map((msg) => (
                     // Read-only: no onBranch (no branch button) and no send
                     // affordance — the only send path is the composer below.
-                    <ChatMessage key={msg.id} message={msg} />
+                    <ChatMessage
+                      key={msg.id}
+                      message={msg}
+                      markdownMode={markdownMode}
+                    />
                   ))}
                 </div>
               )}
@@ -3164,6 +3068,7 @@ export function ChatArea({
                       <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
                         <ChatMessage
                           message={msg}
+                          markdownMode={markdownMode}
                           onBranch={onBranch}
                           sending={sending}
                           pendingQuestions={effectivePendingQuestions}
@@ -3187,6 +3092,7 @@ export function ChatArea({
                   <Profiler key={index} id="ChatMessage" onRender={onChatMessageRender}>
                     <ChatMessage
                       message={msg}
+                      markdownMode={markdownMode}
                       onBranch={onBranch}
                       sending={sending}
                       pendingQuestions={effectivePendingQuestions}
