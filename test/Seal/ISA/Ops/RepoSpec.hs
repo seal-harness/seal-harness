@@ -222,6 +222,21 @@ patRepoFixture = do
     , srKeyfilePath = Nothing
     }
 
+-- | A deploy-key repo whose URL matches 'fakeSwitchAnswer''s probe
+-- response. Its credential is a 'CredDeployKey' (no raw token), so the
+-- switch must use the agent-forwarding executor arm.
+deployKeyRepoFixture :: Either Text SourceRepo
+deployKeyRepoFixture = do
+  rid <- mkRepoId "r"
+  pure SourceRepo
+    { srId = rid
+    , srUrl = "git@github.com:o/r.git"
+    , srVcsKind = VcsGitHub
+    , srCredential = CredDeployKey "k"
+    , srDeployKeyPublic = Nothing
+    , srKeyfilePath = Nothing
+    }
+
 -- | A 'RepoRegistryHandle' seeded with a fixed list (in-memory).
 registryWith :: [SourceRepo] -> RepoRegistryHandle
 registryWith repos = RepoRegistryHandle
@@ -796,6 +811,26 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             envCalls `shouldSatisfy`
               any (any ((== "GIT_CONFIG_PARAMETERS") . fst) . reExtras)
             envCalls `shouldSatisfy`
+              any (\c -> "fetch --depth 1 origin" `T.isInfixOf` reCmd c)
+
+    it "runs a deploy-key switch through uioShellExecGitEnv, never uioShellExecEnv" $
+      case deployKeyRepoFixture of
+        Left err -> expectationFailure ("test fixture: " <> T.unpack err)
+        Right keyRepo -> withSystemTempDirectory "seal-key-switch" $ \d -> do
+          base <- mkTestCloneDeps (d </> "keys")
+          vault <- makeFakeVaultRuntime [("k", "passphrase")]
+          seen <- newIORef []
+          let deps = base { cdRepoReg = registryWith [keyRepo], cdVault = vault }
+          withBranchName "dev" $ \dev -> do
+            res <- cloneRepoIO deps (recordingUio seen) "https://github.com/o/r" (Just dev)
+            res `shouldBe` CloneSwitched "r" "dev"
+            calls <- readIORef seen
+            let gitCalls = [ c | c <- calls, reArm c == "gitenv" ]
+            -- The deploy-key arm carries the agent forwarding env, not a
+            -- raw token, so it must NOT go through the shell-env arm.
+            [ c | c <- calls, reArm c == "env" ] `shouldBe` []
+            gitCalls `shouldSatisfy` any (any ((== "SSH_AUTH_SOCK") . fst) . reExtras)
+            gitCalls `shouldSatisfy`
               any (\c -> "fetch --depth 1 origin" `T.isInfixOf` reCmd c)
 
   describe "runSetupRepo (the opcode's run seam)" $ do
