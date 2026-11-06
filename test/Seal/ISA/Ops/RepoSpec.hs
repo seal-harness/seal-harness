@@ -126,6 +126,14 @@ mkRepoWithBranches srcDir = do
     callProcess "git" ["remote", "add", "origin", bare]
     callProcess "git" ["push", "origin", "--all"]
     callProcess "git" ["push", "origin", "--tags"]
+  -- Pin the bare repo's default branch. `git init --bare` points HEAD at
+  -- whatever `init.defaultBranch` says (commonly `master` on CI), so a
+  -- branch-less clone of a repo that only has `main`/`dev` would warn
+  -- "remote HEAD refers to nonexistent ref" and leave an EMPTY working
+  -- tree with no HEAD — every later `rev-parse`/`branch` in these tests
+  -- then exits 128. Locally `init.defaultBranch=main` masked this; CI
+  -- caught it. `symbolic-ref` works on every git version we support.
+  callProcess "git" ["-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"]
   pure bare
 
 -- | Run a body with a fresh bare repo (the CWD pinned to a stable dir — see
