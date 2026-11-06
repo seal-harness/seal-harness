@@ -773,3 +773,229 @@ describe('useSessionActivityStream', () => {
     expect(result.current.sessions['s1']!.toolCall).toBeNull()
   })
 })
+
+// ── Window-derived pagination (scroll-to-top regression) ─────────────────
+//
+// The reported bug: after a couple of backward pages the server said
+// hasMore:false, the client stored it, and "Scroll to top" fell back to
+// scrolling the loaded slice. The window extent is now derived from
+// per-chunk facts, and the backend reports correct facts for every page.
+
+describe('useTranscriptStream window-derived pagination', () => {
+  const stubSeed = (entries: TranscriptEntry[], hasMore: boolean, totalCount: number) =>
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(entries), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Has-More': hasMore ? 'true' : 'false',
+          'X-Total-Count': String(totalCount),
+        },
+      })
+    }))
+
+  it('keeps hasMore true across partial backward pages and clears it at the final page', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-950', 't950')], true, 1000)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls[0]!.before).toBe('e-950')
+
+    // The fixed backend returns a full page and says there is more.
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-900', 't900')],
+        hasMore: true,
+        totalCount: 1000,
+        requestBefore: 'e-950',
+      })
+    })
+    expect(result.current.hasMore).toBe(true)
+
+    // The final page: entries 0.. arrived, nothing before them.
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: false,
+        totalCount: 1000,
+        requestBefore: 'e-900',
+      })
+    })
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(true) // the seed was the tail
+
+    // No further requests once the start is reached.
+    const before = c.requestEntriesCalls.length
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls.length).toBe(before)
+    vi.unstubAllGlobals()
+  })
+
+  it('restores the derived flags on a cache hit after switching away and back', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.isViewingLatest).toBe(true)
+
+    await act(async () => { c.pushEntry(makeEntry('e-6', 't6')) })
+    expect(result.current.entries).toHaveLength(2)
+
+    rerender({ sid: 's2' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    rerender({ sid: 's1' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    expect(result.current.entries.map((e) => e.id)).toEqual(['e-5', 'e-6'])
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.isViewingLatest).toBe(true)
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('leaves the window untouched on an error frame and clears loadingMore', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [],
+        hasMore: undefined as unknown as boolean,
+        requestBefore: 'e-5',
+      })
+    })
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('reports whether loadLatest/loadFromBeginning changed state', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 100)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    // The pinned tail is the current entries → no re-render will happen.
+    expect(result.current.loadLatest()).toBe('unchanged')
+
+    // Jump to the beginning (WS request), then back to the pinned tail.
+    expect(result.current.loadFromBeginning()).toBe('requested')
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.isViewingLatest).toBe(false)
+    await act(async () => {
+      expect(result.current.loadLatest()).toBe('applied')
+    })
+    expect(result.current.isViewingLatest).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('restores a beginning-only window on a cache hit', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 100)
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadFromBeginning() })
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+
+    rerender({ sid: 's2' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    rerender({ sid: 's1' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('clears loadingMore when the stream disconnects', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+    await act(async () => { c.setStatus('reconnecting') })
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('reports requested when no pinned tail exists and unavailable without a session', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    // Drop the cache (and its pins) while the view keeps its entries.
+    _resetDataCacheForTests()
+    expect(result.current.loadLatest()).toBe('requested')
+
+    const noSession = renderHook(() => useTranscriptStream(null, c))
+    expect(noSession.result.current.loadFromBeginning()).toBe('unavailable')
+    expect(noSession.result.current.loadLatest()).toBe('unavailable')
+    vi.unstubAllGlobals()
+  })
+
+  it('clears loadingMore when a chunk for another session arrives', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+
+    await act(async () => {
+      c.pushEntriesChunk('s2', {
+        entries: [makeEntry('x-1', 't1')],
+        hasMore: false,
+        totalCount: 1,
+        requestBefore: 'e-5',
+      })
+    })
+    expect(result.current.loadingMore).toBe(false)
+    // s1's window is untouched.
+    expect(result.current.hasMore).toBe(true)
+    vi.unstubAllGlobals()
+  })
+})
