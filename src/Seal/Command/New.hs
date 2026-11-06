@@ -8,7 +8,9 @@
 -- still listed in @\/session list@, still resumable with @\/tab resume
 -- \<id\>@. When @-r@\/@--repo@ is given, the repo is cloned into the
 -- new session's workdir via SETUP_REPO before the first turn (same as
--- the web form's "Set up repo" field).
+-- the web form's "Set up repo" field). When @-b@\/@--branch@ is also
+-- given, that branch (or tag) is checked out instead of the remote's
+-- default branch.
 --
 -- The @-r@\/@--repo@ argument accepts either a registered repo ID (looked
 -- up in the repo registry @repos.toml@) or a raw git URL. When a registered
@@ -100,7 +102,8 @@ data NewDeps = NewDeps
     -- with the new session id, the repo URL and an optional branch (or
     -- tag) to clone/check out into the session workdir (dispatching
     -- SETUP_REPO). 'Nothing' in contexts without a dispatcher (standalone
-    -- CLI, tests). The branch is threaded from @-b\/--branch@ in WU-4.
+    -- CLI, tests). The branch is threaded from @-b\/--branch@ ('Nothing'
+    -- asks for the remote's default branch).
   , ndRepoReg      :: Maybe RepoRegistryHandle
     -- ^ Optional repo-registry handle for resolving @-r@ repo IDs to URLs.
     -- 'Nothing' in contexts without a registry (tests); the @-r@ value is
@@ -114,15 +117,21 @@ newCommandSpec deps = CommandSpec
   { csName         = CommandName "new"
   , csAliases      = []
   , csGroup        = GroupSession
-  , csSynopsis     = "Start a new tab with a fresh session (optional -p/-m/-r overrides)"
+  , csSynopsis     = "Start a new tab with a fresh session (optional -p/-m/-r/-b overrides)"
   , csParserInfo   = newParserInfo deps
   , csAvailability = AlwaysAvailable
   }
 
 newParserInfo :: NewDeps -> ParserInfo CommandAction
 newParserInfo deps =
-  info (newCmd deps <$> optional providerOpt <*> optional modelOpt <*> optional repoOpt <**> helper)
-    (  progDesc "Start a new tab with a fresh session"
+  info
+    ( newCmd deps
+        <$> optional providerOpt
+        <*> optional modelOpt
+        <*> optional repoOpt
+        <*> optional branchOpt
+        <**> helper )
+    (  progDesc "Start a new tab with a fresh session (optional -p/-m/-r/-b overrides)"
     <> header   "new — start a new tab with a fresh session (old session kept in /session list)"
     )
 
@@ -150,21 +159,35 @@ repoOpt = strOption
   <> help "Repo ID (from /repo list) or git URL to clone into the session (default: none)"
   )
 
+branchOpt :: Parser Text
+branchOpt = strOption
+  (  long "branch"
+  <> short 'b'
+  <> metavar "BRANCH"
+  <> help "Branch or tag to check out when cloning the -r repo (default: the remote's default branch)"
+  )
+
 -- | The @/new@ action: read the old session, mint a fresh session using
 -- the given args (or config defaults when not specified), insert a new
 -- tab, optionally clone a repo, and send the confirmation line.
-newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
-newCmd deps mProvider mModel mRepo = commandAction $ \caps -> do
+newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
+newCmd deps mProvider mModel mRepo mBranch = commandAction $ \caps -> do
   oldMeta <- ndOldMeta deps
-  let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
+  let args = NewArgs
+        { naProvider = mProvider
+        , naModel    = mModel
+        , naRepo     = mRepo
+        , naBranch   = mBranch
+        }
   meta <- mintNewSessionWith args oldMeta deps
   oldSid <- ndInsertTab deps caps meta
   case (naRepo args, ndSetupRepo deps) of
     (Just repoVal, Just setupFn) -> do
       repoUrl <- resolveRepoUrlMaybe deps repoVal
-      -- The @-b\/--branch@ flag does not exist yet (WU-4 threads it), so
-      -- @/new@ always asks for the remote's default branch here.
-      eRes <- setupFn (smId meta) repoUrl Nothing
+      -- @-b\/--branch@ is passed through as-is: 'Nothing' asks for the
+      -- remote's default branch. @-b@ without @-r@ never reaches here (the
+      -- 'naRepo' guard above skips setup entirely).
+      eRes <- setupFn (smId meta) repoUrl (naBranch args)
       case eRes of
         Left err -> ccSend caps ("repo setup failed: " <> err)
         Right _  -> pure ()
