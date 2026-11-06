@@ -14,6 +14,8 @@ module Seal.Gateway.Send
   , sendOutcomeJson
   , handleSend
   , handleSetupRepo
+  , setupRepoInput
+  , validateSetupRepoArgs
   , ensureTabForSession
   , handleAnswerDelivery
   , handleAnswerTextDelivery
@@ -77,8 +79,9 @@ import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
-import Seal.ISA.Ops.Repo (validateRepoUrl)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput)
 import Seal.ISA.Opcode (OpResult (..))
+import Seal.Tools.Args (BranchName, branchNameText)
 import Seal.Providers.Class
   ( SomeProvider, ToolResultPart (..) )
 import Seal.Harness.Registry (HarnessRegistry)
@@ -945,14 +948,21 @@ broadcastAskResolved mBroker sid qid resolution =
 -- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
 -- reads 'srActive' to pick the transcript), then restored.
 --
--- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
--- with the opcode's text result (the clone/no-op/conflict/failure message)
--- for the API layer to pass through to the frontend.
-handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
-handleSetupRepo deps sid url =
-  case validateRepoUrl url of
-    Left err -> pure (Left ("invalid url: " <> err))
-    Right cleanUrl -> do
+-- The optional @branch@ (or tag) is cloned/checked out instead of the
+-- remote's default branch. Both arguments are validated by
+-- 'validateSetupRepoArgs' (the opcode's own input parser) BEFORE the
+-- session lookup, so a rejected url/branch never touches the session
+-- store.
+--
+-- Returns @Left err@ for an invalid url/branch or a dispatch failure;
+-- @Right msg@ with the opcode's text result (the
+-- clone/no-op/switched/conflict/failure message) for the API layer to
+-- pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> Maybe Text -> IO (Either Text Text)
+handleSetupRepo deps sid url mBranch =
+  case validateSetupRepoArgs url mBranch of
+    Left err -> pure (Left err)
+    Right (cleanUrl, validBranch) -> do
       mMeta <- loadSessionMeta (sdPaths deps) sid
       case mMeta of
         Nothing -> pure (Left "session not found")
@@ -962,13 +972,34 @@ handleSetupRepo deps sid url =
           -- W5: the dispatcher takes the explicit sid (no srActive swap).
           let td = mkWebTurnDeps deps
               dispatcher = webCallDispatcher deps td sid
-          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+              payload = setupRepoInput cleanUrl (fmap branchNameText validBranch)
+          res <- dispatcher (OpName "SETUP_REPO") payload
           case res of
             Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
             Right opRes ->
               if orIsError opRes
                 then pure (Left (opResultText opRes))
                 else pure (Right (opResultText opRes))
+
+-- | The SETUP_REPO dispatch payload for the web setup-repo path:
+-- @{\"url\": u}@ when no branch is requested, @{\"url\": u, \"branch\": b}@
+-- otherwise. The branch key is omitted — never @null@ — when it is absent,
+-- blank, or whitespace-only, and is trimmed, so the payload stays backward
+-- compatible with every caller/consumer that predates the field.
+setupRepoInput :: Text -> Maybe Text -> Value
+setupRepoInput url mBranch =
+  case fmap T.strip mBranch of
+    Just b | not (T.null b) -> object ["url" .= url, "branch" .= b]
+    _                       -> object ["url" .= url]
+
+-- | Validate the web setup-repo arguments (url + optional branch) by
+-- building the exact SETUP_REPO dispatch payload and running it through
+-- the opcode's own input parser. Validation therefore has ONE
+-- implementation: the rules, and the error text (including the
+-- @SETUP_REPO:@ prefix), are the opcode's. Returns the cleaned url and the
+-- validated 'BranchName' ('Nothing' when no branch was requested).
+validateSetupRepoArgs :: Text -> Maybe Text -> Either Text (Text, Maybe BranchName)
+validateSetupRepoArgs url mBranch = parseSetupRepoInput (setupRepoInput url mBranch)
 
 -- | Join the text parts of an 'OpResult' into a single message (the
 -- clone/no-op/conflict/failure text from SETUP_REPO).

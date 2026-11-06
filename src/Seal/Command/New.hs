@@ -95,11 +95,12 @@ data NewDeps = NewDeps
   , ndInsertTab     :: ChannelCaps -> SessionMeta -> IO SessionId
     -- ^ Insert a new tab bound to the new session, swap the active-session
     -- ref, and return the old sid.
-  , ndSetupRepo    :: Maybe (SessionId -> Text -> IO (Either Text Text))
+  , ndSetupRepo    :: Maybe (SessionId -> Text -> Maybe Text -> IO (Either Text Text))
     -- ^ Optional repo-setup seam. When 'Just', the @/new@ command calls it
-    -- with the new session id + repo URL to clone a repo into the session
-    -- workdir (dispatching SETUP_REPO). 'Nothing' in contexts without a
-    -- dispatcher (standalone CLI, tests).
+    -- with the new session id, the repo URL and an optional branch (or
+    -- tag) to clone/check out into the session workdir (dispatching
+    -- SETUP_REPO). 'Nothing' in contexts without a dispatcher (standalone
+    -- CLI, tests). The branch is threaded from @-b\/--branch@ in WU-4.
   , ndRepoReg      :: Maybe RepoRegistryHandle
     -- ^ Optional repo-registry handle for resolving @-r@ repo IDs to URLs.
     -- 'Nothing' in contexts without a registry (tests); the @-r@ value is
@@ -161,7 +162,9 @@ newCmd deps mProvider mModel mRepo = commandAction $ \caps -> do
   case (naRepo args, ndSetupRepo deps) of
     (Just repoVal, Just setupFn) -> do
       repoUrl <- resolveRepoUrlMaybe deps repoVal
-      eRes <- setupFn (smId meta) repoUrl
+      -- The @-b\/--branch@ flag does not exist yet (WU-4 threads it), so
+      -- @/new@ always asks for the remote's default branch here.
+      eRes <- setupFn (smId meta) repoUrl Nothing
       case eRes of
         Left err -> ccSend caps ("repo setup failed: " <> err)
         Right _  -> pure ()
