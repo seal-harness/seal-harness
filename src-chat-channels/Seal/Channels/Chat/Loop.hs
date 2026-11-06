@@ -1289,9 +1289,10 @@ data NewOutcome = NewOutcome
 -- orphan-session bug this work exists to fix.
 --
 -- The arguments are the CLI's (@-p\/--provider@, @-m\/--model@,
--- @-r\/--repo@), parsed by the shared 'parseNewArgs' so chat and CLI accept
--- the same flags. Message order: rebind warning, then repo failure, then the
--- confirmation.
+-- @-r\/--repo@, @-b\/--branch@), parsed by the shared 'parseNewArgs' so chat
+-- and CLI accept the same flags. @-b@ only qualifies @-r@: without a repo
+-- there is nothing to check out, so no setup is dispatched. Message order:
+-- rebind warning, then repo failure, then the confirmation.
 handleNewSession
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
@@ -1339,7 +1340,7 @@ handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker wat
         -- A rebind failure is a warning, not a failure: the session exists.
         for_ (noRebindError out) $ \e ->
           ccSend chan ("warning: /new tab rebind failed: " <> e)
-        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na)
+        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na) (naBranch na)
         for_ mRepoErr $ \e -> ccSend chan ("repo setup failed: " <> e)
         ccSend chan (newConfirmation out)
 
@@ -1352,16 +1353,18 @@ newConfirmation out = case (noOldSid out, noProvider out, noModel out) of
   _ -> "new session " <> noSid out
 
 -- | Run @-r@ after a successful @/new@: resolve a registered repo id to its
--- URL, then dispatch SETUP_REPO on the NEW session. 'Nothing' when no @-r@
--- was given or the clone succeeded (success is silent).
+-- URL, then dispatch SETUP_REPO on the NEW session, carrying @-b\/--branch@
+-- through as the checkout target ('Nothing' = the remote's default branch).
+-- 'Nothing' when no @-r@ was given or the clone succeeded (success is
+-- silent).
 setupRepoFor
   :: ChatChannelConfig -> Manager -> Text -> SessionId -> Maybe Text
-  -> IO (Maybe Text)
-setupRepoFor cfg mgr apiBase sid mRepo = case mRepo of
+  -> Maybe Text -> IO (Maybe Text)
+setupRepoFor cfg mgr apiBase sid mRepo mBranch = case mRepo of
   Nothing  -> pure Nothing
   Just raw -> do
     url <- resolveRepoArg cfg mgr apiBase raw
-    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url)
+    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url mBranch)
     pure (either Just (const Nothing) eRes)
 
 -- | Resolve a @-r@ value to a git URL: an exact match on a registered repo id

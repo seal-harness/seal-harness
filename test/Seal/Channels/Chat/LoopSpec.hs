@@ -2215,6 +2215,53 @@ spec = do
       -- A successful setup is silent: only the confirmation.
       getSends chan `shouldReturn` [confirmNew]
 
+    it "threads -b into the setup-repo body dispatched to the NEW session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "p" "m")]
+      queueRepos seams
+        [Right [A.object
+          [ "id" .= ("seal" :: Text)
+          , "url" .= ("git@github.com:o/r.git" :: Text) ]]]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -r seal -b dev"
+      -- The -r value was resolved against the registry AND the branch rode
+      -- along in the same body.
+      getRepoSetups seams `shouldReturn`
+        [(newSid, A.object
+          [ "url"    .= ("git@github.com:o/r.git" :: Text)
+          , "branch" .= ("dev" :: Text) ])]
+      getSends chan `shouldReturn` [confirmNew]
+
+    it "performs no repo setup for -b without -r" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "p" "m")]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -b dev"
+      getRepoSetups seams `shouldReturn` []
+      getSends chan `shouldReturn` [confirmNew]
+
     it "uses -r verbatim when the repo registry cannot be read" $ do
       chan <- mkMockChan
       mgr <- newManager defaultManagerSettings
