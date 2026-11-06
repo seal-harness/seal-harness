@@ -2952,15 +2952,22 @@ describe('ChatArea — transcript markdown view toggle', () => {
     localStorage.clear()
   })
 
-  it('defaults to raw markdown — the literal source, pipe table and all', () => {
+  it('defaults to rendered markdown — the table is real HTML', () => {
     const { container } = render(
       <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
     )
-    // Raw mode: the source line is present verbatim in a single <p>.
+    expect(container.querySelector('table')).toBeTruthy()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeNull()
+  })
+
+  it('honours a stored "raw" preference — the literal source, pipe table and all', () => {
+    localStorage.setItem('seal.transcriptViewMode', 'raw')
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
     const raw = container.querySelector('[data-testid="msg-raw-text"]')
     expect(raw).toBeTruthy()
     expect(raw!.textContent).toBe(TABLE_MD)
-    // No rendered table in raw mode.
     expect(container.querySelector('table')).toBeNull()
   })
 
@@ -2968,6 +2975,10 @@ describe('ChatArea — transcript markdown view toggle', () => {
     const { container } = render(
       <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
     )
+    // Leave the rendered default first, so the assertion exercises a real
+    // transition rather than a no-op click on the active mode.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(container.querySelector('table')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
     const table = container.querySelector('table')
     expect(table).toBeTruthy()
@@ -2988,24 +2999,27 @@ describe('ChatArea — transcript markdown view toggle', () => {
 
   it('marks the active mode with aria-pressed', () => {
     render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
-    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('false')
-    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
     expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('false')
     expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('false')
   })
 
   it('persists the choice so it survives a reload', () => {
     render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
-    expect(localStorage.getItem('seal.transcriptViewMode')).toBe('rendered')
+    // Persist the non-default mode, so the reload assertion proves the stored
+    // preference wins over the default.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(localStorage.getItem('seal.transcriptViewMode')).toBe('raw')
 
     // Remount: the stored preference is picked up on first render.
     cleanup()
     const { container } = render(
       <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
     )
-    expect(container.querySelector('table')).toBeTruthy()
+    expect(container.querySelector('table')).toBeNull()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeTruthy()
   })
 
   it('does not render the toggle when there is no transcript', () => {

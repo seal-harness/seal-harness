@@ -4,7 +4,8 @@
  * The transcript can show message bodies as raw markdown source or as
  * rendered HTML. The choice is a per-browser preference persisted in
  * localStorage; the loader must never throw and must fall back to the
- * default (raw — the historical behaviour) on any garbage input.
+ * default (rendered — tables and lists read far better formatted) on any
+ * garbage input.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -21,30 +22,35 @@ describe('transcriptViewMode', () => {
     localStorage.clear()
   })
 
-  it('defaults to raw markdown (the historical transcript rendering)', () => {
-    expect(DEFAULT_TRANSCRIPT_VIEW_MODE).toBe('raw')
-    expect(loadTranscriptViewMode()).toBe('raw')
+  it('defaults to rendered markdown', () => {
+    expect(DEFAULT_TRANSCRIPT_VIEW_MODE).toBe('rendered')
+    expect(loadTranscriptViewMode()).toBe('rendered')
   })
 
   it('round-trips a saved mode', () => {
+    saveTranscriptViewMode('raw')
+    expect(loadTranscriptViewMode()).toBe('raw')
+    expect(localStorage.getItem(TRANSCRIPT_VIEW_MODE_STORAGE_KEY)).toBe('raw')
     saveTranscriptViewMode('rendered')
     expect(loadTranscriptViewMode()).toBe('rendered')
-    expect(localStorage.getItem(TRANSCRIPT_VIEW_MODE_STORAGE_KEY)).toBe('rendered')
-    saveTranscriptViewMode('raw')
+  })
+
+  it('honours an explicit stored "raw" even though the default is rendered', () => {
+    localStorage.setItem(TRANSCRIPT_VIEW_MODE_STORAGE_KEY, 'raw')
     expect(loadTranscriptViewMode()).toBe('raw')
   })
 
   it('falls back to the default on an unknown stored value', () => {
     localStorage.setItem(TRANSCRIPT_VIEW_MODE_STORAGE_KEY, 'html-ish garbage')
-    expect(loadTranscriptViewMode()).toBe('raw')
+    expect(loadTranscriptViewMode()).toBe('rendered')
   })
 
   it('validates individual values', () => {
     expect(parseTranscriptViewMode('raw')).toBe('raw')
     expect(parseTranscriptViewMode('rendered')).toBe('rendered')
-    expect(parseTranscriptViewMode('')).toBe('raw')
-    expect(parseTranscriptViewMode(null)).toBe('raw')
-    expect(parseTranscriptViewMode(42)).toBe('raw')
+    expect(parseTranscriptViewMode('')).toBe('rendered')
+    expect(parseTranscriptViewMode(null)).toBe('rendered')
+    expect(parseTranscriptViewMode(42)).toBe('rendered')
   })
 
   describe('when localStorage throws', () => {
@@ -68,8 +74,8 @@ describe('transcriptViewMode', () => {
         writable: true,
       })
       expect(() => loadTranscriptViewMode()).not.toThrow()
-      expect(loadTranscriptViewMode()).toBe('raw')
-      expect(() => saveTranscriptViewMode('rendered')).not.toThrow()
+      expect(loadTranscriptViewMode()).toBe('rendered')
+      expect(() => saveTranscriptViewMode('raw')).not.toThrow()
     })
   })
 })

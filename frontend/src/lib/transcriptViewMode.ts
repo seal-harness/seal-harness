@@ -1,18 +1,19 @@
 /** How transcript message bodies are displayed.
  *
  *    - `raw`      — the markdown source exactly as the model emitted it
- *                   (the historical behaviour; good for copying or spotting
- *                   the exact characters the model wrote)
+ *                   (good for copying or spotting the exact characters the
+ *                   model wrote)
  *    - `rendered` — the markdown parsed and rendered as HTML (tables, lists,
  *                   code blocks, headings) for reading
  *
  *  The choice is a per-browser preference persisted to localStorage so it
- *  survives reloads, and defaults to `raw` so the transcript never changes
- *  shape under a user who has not asked for it. */
+ *  survives reloads. The default is `rendered`: model output is markdown, and
+ *  a pipe table or a nested list reads far better formatted. `raw` stays one
+ *  click away for copying exact source. */
 
 export type TranscriptViewMode = 'raw' | 'rendered'
 
-export const DEFAULT_TRANSCRIPT_VIEW_MODE: TranscriptViewMode = 'raw'
+export const DEFAULT_TRANSCRIPT_VIEW_MODE: TranscriptViewMode = 'rendered'
 
 export const TRANSCRIPT_VIEW_MODE_STORAGE_KEY = 'seal.transcriptViewMode'
 

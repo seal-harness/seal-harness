@@ -10,6 +10,7 @@ import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
 import { MarkdownView } from './MarkdownView'
 import {
+  DEFAULT_TRANSCRIPT_VIEW_MODE,
   loadTranscriptViewMode,
   saveTranscriptViewMode,
   type TranscriptViewMode,
@@ -1392,7 +1393,7 @@ const ChatMessage = memo(function ChatMessage({
   message: Message
   onBranch?: (entryId: string) => void
   sending?: boolean
-  /** 'raw' (default) shows the markdown source; 'rendered' formats it. */
+  /** 'rendered' (default) formats the markdown; 'raw' shows the source. */
   markdownMode?: TranscriptViewMode
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
@@ -1502,7 +1503,7 @@ const ChatMessage = memo(function ChatMessage({
           <MessageBlock
             key={block.id ?? i}
             block={block}
-            markdownMode={markdownMode ?? 'raw'}
+            markdownMode={markdownMode ?? DEFAULT_TRANSCRIPT_VIEW_MODE}
             pendingQuestions={pendingQuestions}
             matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
