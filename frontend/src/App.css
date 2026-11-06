@@ -978,18 +978,6 @@ body {
   color: var(--text-secondary);
 }
 
-.agate-creds { list-style: none; display: flex; flex-direction: column; gap: 0.45rem; }
-.agate-creds li {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  font-size: 0.8rem;
-}
-
 .signout-button {
   font: inherit;
   font-size: 0.72rem;

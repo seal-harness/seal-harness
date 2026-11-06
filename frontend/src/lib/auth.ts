@@ -335,12 +335,22 @@ function describe(err: unknown): string {
 
 // ── Endpoint convenience wrappers ────────────────────────────────────────
 
+/** What the gateway answers to a completed registration. `credential` is the
+ *  stored credential id, so a caller can select the row it just created;
+ *  `added` distinguishes "another passkey" from first-run enrollment. Both are
+ *  optional because the wire shape is the gateway's, not the client's. */
+export interface RegistrationOutcome {
+  ok: boolean
+  credential?: string
+  added?: boolean
+}
+
 export function verifyRegistration(
   body: unknown,
   enrollToken: string | null,
   add = false,
-) {
-  return authRequest(add ? 'credentials/verify' : 'register/verify', { body, enrollToken })
+): Promise<AuthResult<RegistrationOutcome>> {
+  return authRequest<RegistrationOutcome>(add ? 'credentials/verify' : 'register/verify', { body, enrollToken })
 }
 
 /** `enroll/options`: prove an existing passkey before adding another (design
