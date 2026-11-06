@@ -3,6 +3,7 @@ module Seal.Command.ModelSpec (spec) where
 
 import Control.Monad (void)
 import Data.Either (fromRight)
+import Data.Map.Strict qualified as Map
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
@@ -22,12 +23,13 @@ import Seal.Command.Model (ModelTranscriptWriter, modelCommandSpec, modelCommand
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Config.File
-  (ProviderConfig (..), loadRuntimeConfig, providerDefaultModel, updateRuntimeConfig, upsertProvider)
+  (ProviderConfig (..), loadRuntimeConfig, providerDefaultModel, updateRuntimeConfig, upsertProvider, upsertProviderForType)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Security.Vault (VaultHandle)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Registry (ProviderInstance (..), findInstance, typeId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
@@ -51,9 +53,10 @@ mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
 
 runModel :: ProviderRuntime -> SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runModel pr sr argv caps =
@@ -86,6 +89,7 @@ mkPRWithOllama cfgPath vh port = do
   ref <- newIORef (Just vh)
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  memoRef <- newIORef Map.empty
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
       baseUrl = "http://localhost:" <> T.pack (show port)
@@ -96,10 +100,11 @@ mkPRWithOllama cfgPath vh port = do
     , prVault       = vrt
     , prManager     = mgr
     , prCallCounter = cntRef
+    , prContentMemo = memoRef
     }
 
-spec :: Spec
-spec = describe "Seal.Command.Model" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Command.Model" $ do
   it "list shows configured providers and the active selection" $
     withSystemTempDirectory "seal-model" $ \root -> do
       sr <- mkSR root
@@ -168,6 +173,16 @@ spec = describe "Seal.Command.Model" $ do
       providerDefaultModel cfg "ollama" `shouldBe` Just "glm-5.2:cloud"
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("glm-5.2:cloud" `T.isInfixOf`)
+
+  it "default stamps the canonical type on the implicit openai row" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      (_, caps) <- makeFakeCaps []
+      runModel pr sr ["default", "openai", "gpt-x"] caps
+      Right cfg <- loadRuntimeConfig (srConfigPath sr)
+      providerDefaultModel cfg "openai" `shouldBe` Just "gpt-x"
+      fmap (fmap typeId . piType) (findInstance cfg "openai")
+        `shouldBe` Just (Just "openai")
 
   it "use without a model uses the provider's default" $
     withSystemTempDirectory "seal-model" $ \root -> do
@@ -323,3 +338,43 @@ spec = describe "Seal.Command.Model" $ do
       runModelForSession pr paths (pure sid) Nothing ["use","ollama","qwen3.8"] caps
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("no active session" `T.isInfixOf`)
+
+-- ---------------------------------------------------------------------------
+-- Generic OpenAI API provider (issue #271): no default model
+-- ---------------------------------------------------------------------------
+
+spec_model_less :: Spec
+spec_model_less = describe "/model with a model-less provider" $ do
+  it "use without a model argument reports the missing model and does not mutate" $
+    withSystemTempDirectory "seal-model-nomodel" $ \root -> do
+      sr <- mkSR root
+      pr <- mkPR (root </> "config.toml") Nothing
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["use", "openai"] caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("has no default model" `T.isInfixOf`)
+      m <- readActive sr
+      smProvider m `shouldBe` "anthropic"
+      smModel m    `shouldBe` "claude-opus-4-8"
+
+  it "list <provider> says it has no models instead of a resolution error" $
+    withSystemTempDirectory "seal-model-nomodel" $ \root -> do
+      sr <- mkSR root
+      vh <- makeFakeVault []
+      pr <- mkPR (root </> "config.toml") (Just vh)
+      _ <- updateRuntimeConfig (root </> "config.toml")
+             (upsertProviderForType "openai" "openai" (\p -> p { pcBaseUrl = Just "http://127.0.0.1:9/v1" }))
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["list", "openai"] caps
+      sent <- getSent fc
+      let out = T.unlines sent
+      out `shouldSatisfy` ("has no models" `T.isInfixOf`)
+      out `shouldNotSatisfy` ("could not list" `T.isInfixOf`)
+
+-- | The active session's meta.
+readActive :: SessionRuntime -> IO SessionMeta
+readActive sr = readIORef (srActive sr)
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> spec_model_less

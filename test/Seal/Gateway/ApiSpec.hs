@@ -41,7 +41,10 @@ import Seal.Command.Spec
   ( Availability (..), CommandGroup (..), CommandName (..), CommandSpec (..)
   , commandAction, mkRegistry )
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
+import Seal.Config.File
+  ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig
+  , emptyProviderConfig, loadRuntimeConfig
+  , providerBaseUrl, saveRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
@@ -60,7 +63,8 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
-import Seal.Providers.Registry (KnownProvider (..), knownProviders)
+import Seal.Providers.Registry
+  ( providerInstances )
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -293,7 +297,6 @@ mkDepsFor paths = do
     , adAdoptConsent    = Just CcWeb
     , adAgentDefs       = adb
     , adSkills          = skills
-    , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -463,7 +466,6 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adAdoptConsent    = Just CcWeb
     , adAgentDefs       = adb
     , adSkills          = skills
-    , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -517,8 +519,8 @@ waitForPoll totalWaitUs readAction predicate = go totalWaitUs
               threadDelay stepUs
               go (remaining - stepUs)
 
-spec :: Spec
-spec = describe "Seal.Gateway.API" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Gateway.API" $ do
   -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
   -- kind=provider calls newSession, which writes session.json under
   -- spState/sessions/. With spState="" that resolves to ./sessions/ in the
@@ -2234,7 +2236,6 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                  , adDefaultAgent    = pure (Just "zoe")
@@ -2310,7 +2311,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
              , adDefaultAgent    = do
@@ -2378,7 +2378,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
@@ -2449,7 +2448,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2543,7 +2541,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2602,7 +2599,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2660,7 +2656,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2699,7 +2694,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2790,7 +2784,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2847,7 +2840,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2903,7 +2895,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2953,7 +2944,6 @@ spec = describe "Seal.Gateway.API" $ do
           , adAdoptConsent    = Just CcWeb
           , adAgentDefs       = adb
           , adSkills          = skills
-          , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3012,7 +3002,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3273,7 +3262,6 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3463,7 +3451,6 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adSkills          = skills
-                , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3538,7 +3525,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3582,7 +3568,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3767,7 +3752,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -4078,62 +4062,36 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
-  it "GET /api/providers returns all known providers with a configured flag" $ do
-    -- adProviders yields the *configured* subset (here: ollama only). The
-    -- handler emits every 'knownProviders', flagging each as @configured@
-    -- by membership — so the frontend can show all supported providers and
-    -- mark which still need a credential.
-    let mkAppFiltered = do
-          tabsH <- newTabsHandle
-          reg   <- newHarnessRegistry
-          adb   <- noneBackend
-          skills <- Skill.noneBackend
-          activeRef <- newIORef fakeMeta
-          uiState <- newUiStateHandle mkPaths
-          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
-              deps = ApiDeps
-                { adSessionRuntime  = sr
-                , adTabsHandle      = tabsH
-                , adHarnessRegistry = reg
-                , adAdoptConsent    = Just CcWeb
-                , adAgentDefs       = adb
-                , adSkills          = skills
-                , adProviders       = pure [OllamaProvider]
-                , adUiState         = uiState
-                , adSend            = Nothing
-                , adDefaultAgent    = pure Nothing
-                , adBroker          = Nothing
-    , adTabCloseNotifier = noTabCloseNotifier
-        , adRepoRegistry     = fakeRepoRegistryHandle
-        , adAgentRegistry    = fakeAgentRegH
-    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
-    , adSecurityConfig = defaultSecurityConfig
-    , adMkSessionExec = Nothing
-                }
-          pure (apiApp deps)
-    app <- mkAppFiltered
+  it "GET /api/providers lists every instance with type, configured and reconfiguring" $ do
+    -- adProviders is gone: the handler loads the config and lists the implicit
+    -- instances themselves. The default (empty) config yields anthropic,
+    -- ollama and openai; ollama's local default URL is keyless, so it
+    -- is the only configured one.
+    app <- mkApp
     (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openrouter).
-    length arr `shouldBe` length knownProviders
-    -- Each entry has a name; build a name -> configured map.
-    let entries = [ (n, c) | e <- arr, A.Object o <- [e]
-                          , Just (A.String n) <- [lookupK "name" o]
-                          , Just c <- [case lookupK "configured" o of
-                                        Just (A.Bool b) -> Just b
-                                        _ -> Nothing]
-                          ]
-        byName = Map.fromList entries
-    -- Ollama is configured; the others are not.
-    byName `shouldBe` Map.fromList
-              [ ("anthropic", False)
-              , ("ollama", True)
-              , ("openrouter", False)
-              ]
+        objects = [ o | A.Object o <- arr ]
+        byName = Map.fromList
+          [ (n, o) | o <- objects, Just (A.String n) <- [lookupK "name" o] ]
+        field n f = Map.lookup n byName >>= lookupK f
+    Map.keys byName `shouldBe` ["anthropic", "ollama", "openai", "openrouter"]
+    -- displayName is the instance name; the type hint is typeDisplayName.
+    forM_ objects $ \o -> do
+      lookupK "displayName" o `shouldBe` lookupK "name" o
+      lookupK "type" o `shouldSatisfy` isJust
+      lookupK "typeDisplayName" o `shouldSatisfy` isJust
+      lookupK "reconfiguring" o `shouldSatisfy` isJust
+      lookupK "problem" o `shouldBe` Just A.Null
+    field "anthropic" "type" `shouldBe` Just (A.String "anthropic")
+    field "openai" "typeDisplayName"
+      `shouldBe` Just (A.String "OpenAI API")
+    field "anthropic" "configured" `shouldBe` Just (A.Bool False)
+    field "ollama" "configured" `shouldBe` Just (A.Bool True)
+    field "openai" "configured" `shouldBe` Just (A.Bool False)
+    field "anthropic" "defaultModel" `shouldBe` Just (A.String "claude-opus-4-8")
+    field "openai" "defaultModel" `shouldBe` Just A.Null
 
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
@@ -4158,7 +4116,7 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers/all body: " ++ show body)
-    length arr `shouldBe` length knownProviders
+    length arr `shouldBe` length (providerInstances defaultRuntimeConfig)
     forM_ arr $ \case
       A.Object o -> do
         lookupK "name" o `shouldSatisfy` isJust
@@ -4182,6 +4140,109 @@ spec = describe "Seal.Gateway.API" $ do
         _ -> pure ()
       _ -> pure ()
 
+  it "GET /api/providers reflects a POST immediately (no boot-time snapshot)" $
+    withSystemTempDirectory "seal-prov-fresh" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          configuredOf b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ lookupK "configured" o
+                       | A.Object o <- xs
+                       , lookupK "name" o == Just (A.String "anthropic") ]
+            Nothing -> []
+      (_, beforeBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      configuredOf beforeBody `shouldBe` [Just (A.Bool False)]
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object [ "name" .= ("anthropic" :: T.Text)
+                            , "type" .= ("anthropic" :: T.Text)
+                            , "api_key" .= ("sk-fresh" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 201
+      (_, afterBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      configuredOf afterBody `shouldBe` [Just (A.Bool True)]
+
+  it "GET /api/providers/all surfaces an unresolvable row with null type/flags and a problem" $
+    withSystemTempDirectory "seal-prov-problem" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      -- A type-less, non-legacy section is a problem row (design §9.3).
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let rows = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          groqRows = [ o | A.Object o <- rows, lookupK "name" o == Just (A.String "groq") ]
+      length groqRows `shouldBe` 1
+      case groqRows of
+        (o:_) -> do
+          lookupK "type" o `shouldBe` Just A.Null
+          lookupK "typeDisplayName" o `shouldBe` Just A.Null
+          lookupK "baseUrlRequired" o `shouldBe` Just A.Null
+          lookupK "defaultModelRequired" o `shouldBe` Just A.Null
+          lookupK "problem" o `shouldSatisfy` \case
+            Just (A.String s) -> "has no type" `T.isInfixOf` s
+            _                 -> False
+        [] -> expectationFailure "expected a groq problem row"
+
+  it "GET /api/providers/:name/models resolves a non-type-named instance's type list" $
+    withSystemTempDirectory "seal-prov-models" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("work", emptyProviderConfig { pcType = Just "anthropic" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          modelNames b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ v | A.Object o <- xs, Just v <- [lookupK "name" o] ]
+            Nothing -> []
+      (s1, b1) <- runAppBody app (testRequest methodGet ["api", "providers", "work", "models"])
+      s1 `shouldBe` 200
+      modelNames b1 `shouldBe`
+        [ A.String "claude-sonnet-4-20250514"
+        , A.String "claude-opus-4-8"
+        , A.String "claude-haiku-4-5" ]
+      -- an unknown instance yields []
+      (_, b2) <- runAppBody app (testRequest methodGet ["api", "providers", "ghost", "models"])
+      modelNames b2 `shouldBe` []
+
+  it "GET /api/sessions carries each session's providerType (null when unresolvable)" $
+    withSystemTempDirectory "seal-prov-sess" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sidOf t = case mkSessionId t of Right s -> s; Left _ -> error "sid"
+          known = fakeMeta { smId = sidOf "knownsess", smProvider = "anthropic" }
+          ghost = fakeMeta { smId = sidOf "ghostsess", smProvider = "does-not-exist" }
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveSessionMeta paths known
+      saveSessionMeta paths ghost
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          ptOf n b = case A.decode b :: Maybe [A.Value] of
+            Just xs -> [ lookupK "providerType" o
+                       | A.Object o <- xs, lookupK "id" o == Just (A.String n) ]
+            Nothing -> []
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      ptOf "knownsess" body `shouldBe` [Just (A.String "anthropic")]
+      ptOf "ghostsess" body `shouldBe` [Just A.Null]
+
 
   -- ── Provider CRUD (POST / PUT / DELETE) ───────────────────────────────
 
@@ -4197,6 +4258,7 @@ spec = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("anthropic" :: T.Text)
+          , "type" .= ("anthropic" :: T.Text)
           , "api_key" .= ("sk-test-123" :: T.Text)
           ]))
       (status, body) <- runAppBody app req
@@ -4214,14 +4276,57 @@ spec = describe "Seal.Gateway.API" $ do
         Right cfg -> rcDefaultProvider cfg `shouldBe` Just "anthropic"
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
 
-  it "POST /api/providers with unknown name returns 400" $ do
-    vault <- makeFakeVaultRuntime []
-    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
-    let app = apiApp deps
-    req <- testPost ["api", "providers"]
-      (A.encode (A.object [ "name" .= ("unknown" :: T.Text), "api_key" .= ("k" :: T.Text) ]))
-    status <- runAppStatus app req
-    status `shouldBe` 400
+  it "POST /api/providers rejects bad creates with 400 {field} and never writes the vault" $
+    withSystemTempDirectory "seal-prov-val" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"] (A.encode (A.object fields))
+          expectField fields field = do
+            req <- post fields
+            (s, b) <- runAppBody app req
+            s `shouldBe` 400
+            b `shouldSatisfy` \raw -> case A.decode raw :: Maybe A.Value of
+              Just (A.Object o) -> lookupK "field" o == Just (A.String field)
+              _                 -> False
+      -- malformed name
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("Bad_Name" :: T.Text) ] "name"
+      -- reserved name
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("default" :: T.Text) ] "name"
+      -- a name that is another type's id
+      expectField [ "type" .= ("anthropic" :: T.Text), "name" .= ("ollama" :: T.Text) ] "name"
+      -- unknown type
+      expectField [ "type" .= ("anthorpic" :: T.Text), "name" .= ("x" :: T.Text) ] "type"
+      -- missing required base URL (generic row) — with a key so an errant write shows
+      expectField [ "type" .= ("openai" :: T.Text)
+                  , "name" .= ("oc" :: T.Text), "default_model" .= ("m" :: T.Text)
+                  , "api_key" .= ("sk" :: T.Text) ] "base_url"
+      -- missing required model (generic row) — with a key so an errant write shows
+      expectField [ "type" .= ("openai" :: T.Text)
+                  , "name" .= ("oc" :: T.Text), "base_url" .= ("https://h/v1" :: T.Text)
+                  , "api_key" .= ("sk" :: T.Text) ] "default_model"
+      -- no rejected request wrote a credential
+      forM_ ["PROVIDER_APIKEY_OC", "ANTHROPIC_API_KEY"] $ \k -> do
+        x <- vaultHas vault k
+        x `shouldBe` Nothing
+      -- a new instance is 201; reconfiguring the same type is 200 {reconfigured:true}
+      reqNew <- post [ "type" .= ("anthropic" :: T.Text), "name" .= ("work" :: T.Text)
+                     , "api_key" .= ("k1" :: T.Text) ]
+      (sNew, _) <- runAppBody app reqNew
+      sNew `shouldBe` 201
+      reqRe <- post [ "type" .= ("anthropic" :: T.Text), "name" .= ("work" :: T.Text)
+                    , "api_key" .= ("k2" :: T.Text) ]
+      (sRe, bRe) <- runAppBody app reqRe
+      sRe `shouldBe` 200
+      bRe `shouldSatisfy` \raw -> case A.decode raw :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "reconfigured" o == Just (A.Bool True)
+        _                 -> False
+      -- a different type on an existing name is a name conflict (400 field:"name")
+      expectField [ "type" .= ("ollama" :: T.Text), "name" .= ("work" :: T.Text)
+                  , "base_url" .= ("http://localhost:11434" :: T.Text) ] "name"
 
   it "POST /api/providers with ollama + base_url (no api_key) configures keyless" $
     withSystemTempDirectory "seal-prov" $ \tmp -> do
@@ -4233,7 +4338,8 @@ spec = describe "Seal.Gateway.API" $ do
       let app = apiApp deps
       req <- testPost ["api", "providers"]
         (A.encode (A.object
-          [ "name" .= ("ollama" :: T.Text)
+          [ "name" .= ("ollama-local" :: T.Text)
+          , "type" .= ("ollama" :: T.Text)
           , "base_url" .= ("http://localhost:11434" :: T.Text)
           ]))
       (status, body) <- runAppBody app req
@@ -4290,12 +4396,12 @@ spec = describe "Seal.Gateway.API" $ do
         Right cfg -> rcDefaultProvider cfg `shouldBe` Nothing
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
 
-  it "DELETE /api/providers/:name with unknown provider returns 400" $ do
+  it "DELETE /api/providers/:name with unknown provider returns 404" $ do
     vault <- makeFakeVaultRuntime []
     deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
     let app = apiApp deps
     status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
-    status `shouldBe` 400
+    status `shouldBe` 404
 
   -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
 
@@ -4556,7 +4662,7 @@ spec = describe "Seal.Gateway.API" $ do
                 { adSessionRuntime = sr, adTabsHandle = tabsH
                 , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
                 , adAgentDefs = userAdb, adSkills = skillsBackend
-                , adProviders = pure knownProviders, adUiState = uiState
+                , adUiState = uiState
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -4689,7 +4795,7 @@ spec = describe "Seal.Gateway.API" $ do
             { adSessionRuntime = sr, adTabsHandle = tabsH
             , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
             , adAgentDefs = userAdb, adSkills = skillsBackend
-            , adProviders = pure knownProviders, adUiState = uiState
+            , adUiState = uiState
             , adSend = Nothing, adDefaultAgent = pure Nothing
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -4777,7 +4883,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = skills
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4831,9 +4936,10 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
@@ -4886,7 +4992,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4988,10 +5093,11 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
@@ -5037,7 +5143,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5116,9 +5221,10 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
@@ -5163,7 +5269,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5245,9 +5350,10 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prContentMemo = memoRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
@@ -5292,7 +5398,6 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
-            , adProviders       = pure knownProviders
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5384,3 +5489,366 @@ spec = describe "Seal.Gateway.API" $ do
                 _ -> False
             _ -> False
         _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Generic OpenAI API provider (issue #271): detail fields, validation
+-- ---------------------------------------------------------------------------
+
+decodeText :: BL.ByteString -> T.Text
+decodeText b = case A.decode b :: Maybe A.Value of
+  Just (A.Object o) -> case lookupK "error" o of
+    Just (A.String s) -> s
+    _                 -> ""
+  _ -> ""
+
+-- | Look a key up in the fake vault backing a 'VaultRuntime'.
+vaultHas :: VaultRuntime -> T.Text -> IO (Maybe T.Text)
+vaultHas vr k = do
+  mh <- readIORef (vrHandleRef vr)
+  case mh of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- vhGet vh k
+      pure (either (const Nothing) (Just . TE.decodeUtf8) r)
+
+lookupBool :: T.Text -> A.Value -> Maybe Bool
+lookupBool k (A.Object o) = case lookupK k o of
+  Just (A.Bool b) -> Just b
+  _               -> Nothing
+lookupBool _ _ = Nothing
+
+providerCompatSpec :: Spec
+providerCompatSpec = describe "generic provider API" $ do
+
+  it "GET /api/providers/all reports the generic row's required base URL and model" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let rows = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          findRow n = case [o | A.Object o <- rows, lookupK "name" o == Just (A.String n)] of
+            (o:_) -> o
+            []    -> error ("no row for " ++ T.unpack n)
+      let g = findRow "openai"
+      lookupBool "baseUrlRequired" (A.Object g) `shouldBe` Just True
+      lookupBool "defaultModelRequired" (A.Object g) `shouldBe` Just True
+      lookupBool "keyOptional" (A.Object g) `shouldBe` Just True
+      lookupK "authStatus" g `shouldBe` Just (A.String "none")
+      lookupK "displayName" g `shouldBe` Just (A.String "openai")
+      lookupK "typeDisplayName" g `shouldBe` Just (A.String "OpenAI API")
+      lookupK "family" g `shouldBe` Just (A.String "openai")
+      lookupK "familyDisplayName" g `shouldBe` Just (A.String "OpenAI API")
+      lookupK "apiKeyName" g `shouldBe` Just (A.String "OPENAI_API_KEY")
+      lookupK "oauthKeyName" g `shouldBe` Just A.Null
+      let r = findRow "openrouter"
+      lookupK "typeDisplayName" r `shouldBe` Just (A.String "OpenRouter")
+      lookupK "family" r `shouldBe` Just (A.String "openai")
+      lookupK "apiKeyName" r `shouldBe` Just (A.String "OPENROUTER_API_KEY")
+      lookupBool "baseUrlRequired" (A.Object r) `shouldBe` Just False
+
+  it "POST /api/providers rejects a missing base URL, an unusable one and a missing model — without writing the vault" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"]
+            (A.encode (A.object
+              (("name" .= ("openai" :: T.Text))
+                 : ("type" .= ("openai" :: T.Text)) : fields)))
+      -- missing base_url
+      req1 <- post [ "api_key" .= ("sk-oc" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
+      (s1, b1) <- runAppBody app req1
+      s1 `shouldBe` 400
+      b1 `shouldSatisfy` \b -> case A.decode b :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "field" o == Just (A.String "base_url")
+        _                 -> False
+      -- unusable base_url (no CLI tail in the body)
+      req2 <- post [ "base_url" .= ("ftp://h/v1" :: T.Text), "default_model" .= ("m1" :: T.Text) ]
+      (s2, b2) <- runAppBody app req2
+      s2 `shouldBe` 400
+      b2 `shouldSatisfy` \b -> not ("/provider add" `T.isInfixOf` decodeText b)
+      -- missing model
+      req3 <- post [ "base_url" .= ("https://gw.example/v1" :: T.Text) ]
+      (s3, b3) <- runAppBody app req3
+      s3 `shouldBe` 400
+      b3 `shouldSatisfy` \b -> case A.decode b :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "field" o == Just (A.String "default_model")
+        _                 -> False
+      -- a non-string field is rejected, not silently ignored
+      req4 <- testPost ["api", "providers"]
+        (A.encode (A.object [ "name" .= ("openai" :: T.Text)
+                            , "type" .= ("openai" :: T.Text)
+                            , "base_url" .= (5 :: Int) ]))
+      s4 <- runAppStatus app req4
+      s4 `shouldBe` 400
+      -- the vault was never written by any rejected request
+      missing <- vaultHas vault "OPENAI_API_KEY"
+      missing `shouldBe` Nothing
+
+  it "POST then PUT then DELETE round-trips a keyless generic provider" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime [("ANTHROPIC_OAUTH_TOKENS", "{}")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("openai" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
+          , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+          , "default_model" .= ("qwen2.5" :: T.Text)
+          ]))
+      (s1, _) <- runAppBody app req
+      s1 `shouldBe` 201
+      -- a key-only PUT is a valid partial update
+      req2 <- testPut ["api", "providers", "openai"]
+        (A.encode (A.object [ "default_model" .= ("qwen3" :: T.Text) ]))
+      s2 <- runAppStatus app req2
+      s2 `shouldBe` 200
+      -- explicitly clearing the required base URL is rejected
+      req3 <- testPut ["api", "providers", "openai"]
+        (A.encode (A.object [ "base_url" .= ("" :: T.Text) ]))
+      s3 <- runAppStatus app req3
+      s3 `shouldBe` 400
+      -- DELETE deconfigures it and leaves Anthropic's OAuth blob alone
+      s4 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
+      s4 `shouldBe` 204
+      Right cfg <- loadRuntimeConfig cfgPath
+      providerBaseUrl cfg "openai" `shouldBe` Nothing
+      oauth <- vaultHas vault "ANTHROPIC_OAUTH_TOKENS"
+      oauth `shouldBe` Just "{}"
+
+  it "PUT on the implicit openai row persists its type" $
+    withSystemTempDirectory "seal-prov-put-type" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "openai"]
+        (A.encode (A.object [ "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+                            , "default_model" .= ("m1" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      fmap pcType (Map.lookup "openai" (rcProviders cfg)) `shouldBe` Just (Just "openai")
+
+  it "PUT on openrouter ignores a base_url (fixed endpoint)" $
+    withSystemTempDirectory "seal-prov-fixed" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "openrouter"]
+        (A.encode (A.object [ "base_url" .= ("https://proxy.example/v1" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      providerBaseUrl cfg "openrouter" `shouldBe` Nothing
+
+  it "DELETE on a keyed openai instance removes OPENAI_API_KEY" $
+    withSystemTempDirectory "seal-prov-del-key" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("openai" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
+          , "base_url" .= ("http://127.0.0.1:8000/v1" :: T.Text)
+          , "default_model" .= ("m1" :: T.Text)
+          , "api_key" .= ("sk-test" :: T.Text)
+          ]))
+      (s1, _) <- runAppBody app req
+      s1 `shouldBe` 201
+      has <- vaultHas vault "OPENAI_API_KEY"
+      has `shouldBe` Just "sk-test"
+      s2 <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
+      s2 `shouldBe` 204
+      gone <- vaultHas vault "OPENAI_API_KEY"
+      gone `shouldBe` Nothing
+
+  it "PUT /api/providers/:name rejects a type change, 404s unknown and refuses a no-credential row" $
+    withSystemTempDirectory "seal-prov-put" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("work", emptyProviderConfig { pcType = Just "anthropic" })
+            , ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          fieldOf raw = case A.decode raw :: Maybe A.Value of
+            Just (A.Object o) -> lookupK "field" o
+            _                 -> Nothing
+      -- type immutable
+      req1 <- testPut ["api", "providers", "work"]
+        (A.encode (A.object [ "type" .= ("ollama" :: T.Text) ]))
+      (s1, b1) <- runAppBody app req1
+      s1 `shouldBe` 400
+      fieldOf b1 `shouldBe` Just (A.String "type")
+      -- unknown instance => 404
+      req2 <- testPut ["api", "providers", "ghost"]
+        (A.encode (A.object [ "default_model" .= ("x" :: T.Text) ]))
+      s2 <- runAppStatus app req2
+      s2 `shouldBe` 404
+      -- a problem row (no credentials) => 400 field:"type"
+      req3 <- testPut ["api", "providers", "groq"]
+        (A.encode (A.object [ "default_model" .= ("x" :: T.Text) ]))
+      (s3, b3) <- runAppBody app req3
+      s3 `shouldBe` 400
+      fieldOf b3 `shouldBe` Just (A.String "type")
+
+  it "DELETE of a type-named instance keeps the sibling and clears default only for the default" $
+    withSystemTempDirectory "seal-prov-del" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+          post fields = testPost ["api", "providers"] (A.encode (A.object fields))
+      _ <- runAppStatus app =<< post
+             [ "type" .= ("anthropic" :: T.Text), "name" .= ("work-a" :: T.Text)
+             , "api_key" .= ("ka" :: T.Text) ]
+      _ <- runAppStatus app =<< post
+             [ "type" .= ("anthropic" :: T.Text), "name" .= ("work-b" :: T.Text)
+             , "api_key" .= ("kb" :: T.Text) ]
+      reqDef <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("work-a" :: T.Text) ]))
+      _ <- runAppStatus app reqDef
+      -- delete the non-default sibling: work-a's key + the default pointer survive
+      sDel <- runAppStatus app (testRequest methodDelete ["api", "providers", "work-b"])
+      sDel `shouldBe` 204
+      ka <- vaultHas vault "PROVIDER_APIKEY_WORK_A"
+      kb <- vaultHas vault "PROVIDER_APIKEY_WORK_B"
+      ka `shouldBe` Just "ka"
+      kb `shouldBe` Nothing
+      Right cfg1 <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg1 `shouldBe` Just "work-a"
+      -- deleting the default clears the pointer
+      sDel2 <- runAppStatus app (testRequest methodDelete ["api", "providers", "work-a"])
+      sDel2 `shouldBe` 204
+      Right cfg2 <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg2 `shouldBe` Nothing
+
+  it "DELETE /api/providers/default removes a reserved-named section" $
+    withSystemTempDirectory "seal-prov-resdel" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("default", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "default"])
+      s `shouldBe` 204
+      Right cfg <- loadRuntimeConfig cfgPath
+      Map.member "default" (rcProviders cfg) `shouldBe` False
+
+  it "PUT /api/providers/default accepts an explicit instance name" $
+    withSystemTempDirectory "seal-prov-defname" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("anthropic-work", emptyProviderConfig { pcType = Just "anthropic" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "providers", "default"]
+        (A.encode (A.object [ "provider" .= ("anthropic-work" :: T.Text) ]))
+      s <- runAppStatus app req
+      s `shouldBe` 200
+      Right cfg <- loadRuntimeConfig cfgPath
+      rcDefaultProvider cfg `shouldBe` Just "anthropic-work"
+
+  it "POST /api/sessions and /api/tabs/new reject an unknown provider or a problem row" $
+    withSystemTempDirectory "seal-prov-sessval" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          cfgPath = cfgRoot </> "config.toml"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig cfgPath
+        (defaultRuntimeConfig { rcProviders = Map.fromList
+            [ ("groq", emptyProviderConfig { pcDefaultModel = Just "m" }) ] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      r1 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("ghost" :: T.Text) ]))
+      s1 <- runAppStatus app r1
+      s1 `shouldBe` 400
+      r2 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("groq" :: T.Text) ]))
+      s2 <- runAppStatus app r2
+      s2 `shouldBe` 400
+      -- an implicit unconfigured row is still allowed
+      r3 <- testPost ["api", "sessions", "new"]
+        (A.encode (A.object [ "provider" .= ("anthropic" :: T.Text)
+                            , "model" .= ("claude-opus-4-8" :: T.Text) ]))
+      s3 <- runAppStatus app r3
+      s3 `shouldBe` 200
+      -- tabs/new rejects an unknown provider too
+      r4 <- testPost ["api", "tabs", "new"]
+        (A.encode (A.object [ "kind" .= ("provider" :: T.Text)
+                            , "provider" .= ("ghost" :: T.Text) ]))
+      s4 <- runAppStatus app r4
+      s4 `shouldBe` 400
+
+  it "DELETE works with no vault configured" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      deps <- mkProviderTestDeps tmp cfgRoot =<< makeLockedVaultRuntime
+      let app = apiApp deps
+      s <- runAppStatus app (testRequest methodDelete ["api", "providers", "openai"])
+      s `shouldBe` 204
+
+  it "GET /api/providers/openai/models returns an empty list" $
+    withSystemTempDirectory "seal-prov-oc" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "providers", "openai", "models"])
+      status `shouldBe` 200
+      body `shouldBe` "[]"
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> providerCompatSpec

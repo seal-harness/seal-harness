@@ -4,14 +4,16 @@ module Seal.Command.NewSpec (spec) where
 import Data.Text (Text)
 import qualified Data.Text as T
 import Test.Hspec
+import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
-  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl )
+  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveNewModel, resolveRepoUrl )
 import Seal.Gateway.Types.NewArgs (renderNewSessionConfirmation)
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec (mkRegistry, runCommandAction)
+import Seal.Config.File (defaultRuntimeConfig)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.SourceControl.Repo
@@ -49,7 +51,7 @@ stubDeps :: NewDeps
 stubDeps =
   NewDeps
     { ndPaths = error "ndPaths: unused"
-    , ndCfg = error "ndCfg: unused"
+    , ndCfg = pure defaultRuntimeConfig
     , ndAgentDefs = error "ndAgentDefs: unused"
     , ndChannelLabel = "test"
     , ndOldMeta = error "ndOldMeta: unused by parse/render tests"
@@ -58,8 +60,8 @@ stubDeps =
     , ndRepoReg = Nothing
     }
 
-spec :: Spec
-spec = describe "Seal.Command.New" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Command.New" $ do
   let newMeta = SessionMeta
         { smId = mkSid "20260719-120000-001"
         , smProvider = "anthropic"
@@ -216,3 +218,47 @@ showPO (ParsedAction _)   = "ParsedAction"
 showPO (ParseHelp Nothing) = "ParseHelp nothing"
 showPO (ParseHelp (Just _)) = "ParseHelp just"
 showPO (ParseFailure _)   = "ParseFailure"
+
+-- ---------------------------------------------------------------------------
+-- Legacy / unknown provider ids (issue #271: openrouter -> openai)
+-- ---------------------------------------------------------------------------
+
+legacySpec :: Spec
+legacySpec = describe "new -p validation" $ do
+  it "rejects a legacy id with the rename guidance and mints no session" $ do
+    (fc, caps) <- makeFakeCaps []
+    let deps = stubDeps { ndPaths = error "ndPaths must not be touched" }
+    case parseSlash (mkRegistry [newCommandSpec deps]) "/new -p openai-compat" of
+      ParsedAction act -> do
+        _ <- runCommandAction act caps
+        sent <- getSent fc
+        let out = T.unpack (T.unlines sent)
+        out `shouldContain` "renamed to openai"
+        out `shouldContain` "known: anthropic, ollama, openai, openrouter"
+      other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+
+  it "rejects any unknown id" $ do
+    (fc, caps) <- makeFakeCaps []
+    case parseSlash (mkRegistry [newCommandSpec stubDeps]) "/new -p nope" of
+      ParsedAction act -> do
+        _ <- runCommandAction act caps
+        sent <- getSent fc
+        T.unpack (T.unlines sent) `shouldContain` "unknown provider: nope"
+      other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+
+-- | Both suites behind the module's single exported @spec@.
+spec :: Spec
+spec = spec_main >> legacySpec >> resolveModelSpec
+
+resolveModelSpec :: Spec
+resolveModelSpec = describe "resolveNewModel" $ do
+  it "repairs an empty inherited model from the target instance's default" $
+    resolveNewModel defaultRuntimeConfig "anthropic" "" `shouldBe` "claude-opus-4-8"
+  it "keeps an explicit model" $
+    resolveNewModel defaultRuntimeConfig "anthropic" "claude-haiku-4-5"
+      `shouldBe` "claude-haiku-4-5"
+  it "keeps the empty value when the instance has no default model" $
+    resolveNewModel defaultRuntimeConfig "openai" "" `shouldBe` ""
+  it "resolves OpenRouter's default model" $
+    resolveNewModel defaultRuntimeConfig "openrouter" ""
+      `shouldBe` "deepseek/deepseek-v4.1-flash-1017"

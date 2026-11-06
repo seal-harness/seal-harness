@@ -2,6 +2,7 @@
 module Seal.Channel.CliSpec (spec) where
 
 import Data.Either (fromRight)
+import Data.Map.Strict qualified as Map
 import Data.IORef
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -114,13 +115,14 @@ spec = do
       ref <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       let pr = ProviderRuntime
                  { prConfigPath = "/nonexistent/config.toml"
                  , prVault = VaultRuntime
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef, prContentMemo = memoRef }
       r <- resolveSessionProvider pr (metaWith "anthropic" "claude-opus-4-8")
       case r of
         Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
@@ -130,13 +132,14 @@ spec = do
       ref <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      memoRef <- newIORef Map.empty
       let pr = ProviderRuntime
                  { prConfigPath = "/x/config.toml"
                  , prVault = VaultRuntime
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef, prContentMemo = memoRef }
       r <- resolveSessionProvider pr (metaWith "bogus" "m")
       case r of
         Left e  -> e `shouldSatisfy` ("unknown provider" `T.isInfixOf`)

@@ -8,14 +8,15 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
+import Seal.Config.File
+  ( RuntimeConfig (..), loadRuntimeConfig )
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig )
 
-spec :: Spec
-spec = describe "Seal.Config.Migrate" $ do
+spec_main :: Spec
+spec_main = describe "Seal.Config.Migrate" $ do
 
   let makePaths tmp = SealPaths
         { spHome   = tmp
@@ -139,3 +140,7 @@ spec = describe "Seal.Config.Migrate" $ do
 -- | Helper: check if a Maybe UntrustedExecFileConfig is Just.
 isJustUexec :: Maybe UntrustedExecFileConfig -> Bool
 isJustUexec = \case Just _ -> True; Nothing -> False
+
+-- | The module's single exported @spec@.
+spec :: Spec
+spec = spec_main

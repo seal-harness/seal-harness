@@ -15,8 +15,9 @@ import Control.Exception (try, SomeException)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist)
 import System.IO (hPutStrLn, stderr)
+import System.Directory (doesFileExist)
+
 
 import Toml qualified
 

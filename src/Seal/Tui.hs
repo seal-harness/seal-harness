@@ -3,6 +3,7 @@
 module Seal.Tui (runTui) where
 
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
@@ -106,11 +107,13 @@ runTui autonomy logger = do
   -- this with the chat provider's manager when the startup hardcode is removed.)
   mgr <- newTlsManager
   callCounter <- newIORef 0
+  contentMemo <- newIORef Map.empty
   let pr = ProviderRuntime
             { prConfigPath  = cfgPath
             , prVault       = rt
             , prManager     = mgr
             , prCallCounter = callCounter
+            , prContentMemo = contentMemo
             }
   -- The config directory is a git repo (versioning + audit for the
   -- evolutionary stores: skills, agent-defs, memory live as Markdown files

@@ -138,6 +138,7 @@ function SessionRow({
       {(() => {
         const data: TabLineData = {
           provider: providerFromRuntime(session.runtime),
+          providerType: session.providerType ?? null,
           model: session.model ? shortenModel(session.model) : '',
           repoName: deriveRepoName(session.repoUrl, session.agent),
           repoUrl: session.repoUrl,

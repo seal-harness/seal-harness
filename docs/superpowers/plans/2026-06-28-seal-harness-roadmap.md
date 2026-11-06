@@ -815,7 +815,8 @@ discoverable `/help`, and the preprocessing gate come for free.
 - **Remaining Trusted ISA groups** — the Scheduling group (`CRON`,
   `HEARTBEAT_WAKEUP`, pure cron predicate + STM scheduler) and the MCP group
   (`MCP_LIST/CONNECT/DISCONNECT`), deferred from Phase 3.
-- **Remaining providers** — OpenAI, OpenRouter (Ollama already merged).
+- **Remaining providers** — OpenAI, OpenRouter, via the `openai-compat` catalog
+  (`docs/superpowers/specs/2026-10-19-openai-compat-provider-design.md`).
 - **Off-box transcript mirroring hardening** — the original Audited-log
   design had a mirror hook; the git-based design has no equivalent yet. A
   `git remote` + `git push` on auto-commit (or a cron `git push`) would be

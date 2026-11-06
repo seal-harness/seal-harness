@@ -34,7 +34,6 @@ import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddlewar
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
-import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -102,7 +101,6 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adSkills = skills
-          , adProviders = pure knownProviders
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
@@ -163,7 +161,6 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adSkills = skills
-          , adProviders = pure knownProviders
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing

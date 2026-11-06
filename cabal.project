@@ -56,7 +56,8 @@ source-repository-package
   tag: 06fc11713094bf39ac00353b052f4ded5a534567
   --sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r
 
--- OpenRouter provider uses openai (v2.5.4) non-servant interface.  Source-pin
+-- The OpenAI-compatible provider uses the openai package (v2.5.4)
+-- non-servant interface.  Source-pin
 -- the exact Hackage version until haskell.nix index is updated.
 source-repository-package
   type: git

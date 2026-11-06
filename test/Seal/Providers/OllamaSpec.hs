@@ -266,7 +266,7 @@ spec = describe "Seal.Providers.Ollama" $ do
       uniqLen allIds `shouldBe` threads * perThread
       (maximum allIds + 1) `shouldBe` threads * perThread
 
-  -- Regression: each turn rebuilds a fresh 'Ollama' value (resolveProvider is
+  -- Regression: each turn rebuilds a fresh 'Ollama' value (resolveInstance is
   -- called per-turn), but the tool-call-id counter must be shared across those
   -- instances — otherwise every turn restarts at "call_0" and the frontend's
   -- tool_result index (keyed by tool_use_id) clobbers earlier results. In the
