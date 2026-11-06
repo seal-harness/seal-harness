@@ -26,6 +26,9 @@ module Seal.Tools.Args
   , SearchPattern (..)
   , mkSearchPattern
   , textSearchPattern
+  , BranchName
+  , mkBranchName
+  , branchNameText
   ) where
 
 import Data.Char (isControl)
@@ -124,3 +127,48 @@ mkSearchPattern t
 
 textSearchPattern :: SearchPattern -> Text
 textSearchPattern (SearchPattern t) = t
+
+-- | A git branch name destined for a subprocess argv — typically
+-- @git clone --branch=<b>@ or @git fetch origin <b>:refs\/heads\/<b>@.
+--
+-- The constructor is deliberately NOT exported (the same shape as
+-- 'Seal.Core.Types.SessionId'): a 'BranchName' can only be produced by
+-- 'mkBranchName', so unvalidated 'Text' cannot reach the exec wrappers.
+--
+-- Validation runs on the input with surrounding whitespace stripped (so
+-- @\"  dev  \"@ becomes @\"dev\"@) and rejects:
+--
+--   * the empty name;
+--   * @HEAD@, which names a commit rather than a branch;
+--   * a leading @-@ (option injection, as in 'mkShellArg');
+--   * characters git forbids in a refname (space, @~@, @^@, @:@, @?@, @*@,
+--     @[@, backslash) and any control character or NUL;
+--   * @..@ and @{@-sequences, a leading or trailing @\/@, @\/\/@, a trailing
+--     @.@, and a @.lock@ suffix.
+--
+-- Error messages are distinct per rule; callers prefix them with
+-- @\"invalid branch: \"@.
+newtype BranchName = BranchName Text
+  deriving stock (Eq, Show)
+
+mkBranchName :: Text -> Either Text BranchName
+mkBranchName raw
+  | T.null t = Left "branch name is empty"
+  | t == "HEAD" = Left "branch name must not be HEAD (HEAD names a commit, not a branch)"
+  | T.head t == '-' = Left "branch name must not start with '-' (option injection)"
+  | T.any isRefnameBad t = Left "branch name contains a character git forbids in refnames (space, ~, ^, :, ?, *, [, backslash, control char, or NUL)"
+  | ".." `T.isInfixOf` t = Left "branch name must not contain '..'"
+  | "@{" `T.isInfixOf` t = Left "branch name must not contain '@{'"
+  | "/" `T.isPrefixOf` t = Left "branch name must not start with '/'"
+  | "/" `T.isSuffixOf` t = Left "branch name must not end with '/'"
+  | "//" `T.isInfixOf` t = Left "branch name must not contain '//'"
+  | "." `T.isSuffixOf` t = Left "branch name must not end with '.'"
+  | ".lock" `T.isSuffixOf` t = Left "branch name must not end with '.lock'"
+  | otherwise = Right (BranchName t)
+  where
+    t = T.strip raw
+    isRefnameBad c =
+      c `elem` (" ~^:?*[\\" :: String) || c == '\0' || isControl c
+
+branchNameText :: BranchName -> Text
+branchNameText (BranchName t) = t

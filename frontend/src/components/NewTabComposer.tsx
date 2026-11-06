@@ -84,7 +84,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       // persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl && res.session_id) {
-        const result = await setupRepo(res.session_id, repoUrl)
+        const result = await setupRepo(res.session_id, repoUrl, spec.repoBranch.trim() || undefined)
         if (!result || !result.ok) {
           const reason = result?.error ?? 'network error'
           setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
@@ -239,6 +239,21 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               testId="provider-repo-list"
             />
           </Row>
+
+          {/* Only meaningful alongside a repo: a branch with nothing to
+              clone would silently do nothing. */}
+          {spec.repo.trim() !== '' && (
+            <Row label="Repo Branch" htmlFor="provider-repo-branch">
+              <input
+                id="provider-repo-branch"
+                type="text"
+                value={spec.repoBranch}
+                onChange={(e) => spec.setRepoBranch(e.target.value)}
+                style={inputStyle}
+                placeholder="branch or tag (optional — default branch)"
+              />
+            </Row>
+          )}
 
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">

@@ -211,9 +211,23 @@ mintBody mProvider mModel = A.object (catMaybes
   , ("model" .=) <$> mModel
   ])
 
--- | The request body of @POST \/api\/sessions\/:id\/setup-repo@.
-setupRepoBody :: Text -> Value
-setupRepoBody url = A.object ["url" .= url]
+-- | The request body of @POST \/api\/sessions\/:id\/setup-repo@:
+-- @{"url": u}@, plus @{"branch": b}@ when a branch was requested.
+--
+-- The branch is trimmed and the key is OMITTED — never sent as JSON @null@ —
+-- when it is absent or blank, so the no-branch body is byte-identical to what
+-- chat sent before @-b@ existed. @Nothing@ and the empty string therefore
+-- both ask the gateway for the remote's default branch.
+setupRepoBody :: Text -> Maybe Text -> Value
+setupRepoBody url mBranch = A.object (("url" .= url) : catMaybes
+  [ ("branch" .=) <$> nonBlank mBranch
+  ])
+
+-- | 'Just' the trimmed text, or 'Nothing' when it is absent or blank.
+nonBlank :: Maybe Text -> Maybe Text
+nonBlank mText = case T.strip <$> mText of
+  Just b | not (T.null b) -> Just b
+  _                       -> Nothing
 
 -- | @POST /api/sessions/:id/setup-repo@ — clone a repo into the session's
 -- workdir before the first turn. Errors carry the gateway's @error@ text

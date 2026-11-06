@@ -53,6 +53,12 @@ export interface NewTabSpec {
   /** Force a re-fetch of the registered repos (e.g. after the Repos tab
    *  adds/removes a repo). */
   refreshRepos: () => void
+  /** The branch or tag to check out when `repo` is cloned. Empty string =
+   *  no branch (the remote's default branch). Deliberately NOT persisted:
+   *  a branch is repo-specific, so recalling the last one would be
+   *  misleading. */
+  repoBranch: string
+  setRepoBranch: (v: string) => void
 
   // Harness
   flavour: HarnessFlavour
@@ -101,6 +107,10 @@ export function useNewTabSpec(): NewTabSpec {
   // Repo URL history (loaded from persisted UI state). The "set up repo"
   // combobox offers these as suggestions; `recordRepo` appends on submit.
   const [repo, setRepo] = useState<string>('')
+  // Optional branch/tag to check out when `repo` is cloned. Kept in memory
+  // only — see the NewTabSpec doc (a branch is repo-specific, so persisting
+  // the last one across "new tab" forms would be misleading).
+  const [repoBranch, setRepoBranch] = useState<string>('')
   const [repoHistory, setRepoHistory] = useState<string[]>([])
   // Registered repos from /api/repos — their URLs are offered as "Set up
   // repo" suggestions alongside the persisted history. The hook re-fetches
@@ -321,6 +331,7 @@ export function useNewTabSpec(): NewTabSpec {
     model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
     customModels,
     repo, setRepo,
+    repoBranch, setRepoBranch,
     // Merge registered repo URLs with persisted history (deduped,
     // registered repos first so they're at the top of the dropdown).
     repoOptions: [

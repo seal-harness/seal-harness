@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { NewTabComposer } from '../NewTabComposer'
-import { adoptWindow, createTab } from '../../hooks/useApi'
+import { adoptWindow, createTab, setupRepo } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
 import type { NewTabResponse } from '../../hooks/useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../../types'
@@ -43,6 +43,8 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     repo: '',
     setRepo: vi.fn(),
     repoOptions: [], refreshRepos: () => {},
+    repoBranch: '',
+    setRepoBranch: vi.fn(),
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
@@ -411,5 +413,69 @@ describe('NewTabComposer — submit spinner', () => {
       expect(screen.getByLabelText('Provider')).toBeTruthy()
       expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
     })
+  })
+})
+
+// ── Repo branch (WU-6) ──────────────────────────────────────────────────────
+
+describe('NewTabComposer — repo branch', () => {
+  it('passes the branch to setupRepo on submit', async () => {
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', repoBranch: 'dev' })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() =>
+      expect(setupRepo).toHaveBeenCalledWith('s2', 'https://github.com/o/r.git', 'dev'),
+    )
+  })
+
+  it('passes undefined (not an empty string) when no branch is entered', async () => {
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', repoBranch: '   ' })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() =>
+      expect(setupRepo).toHaveBeenCalledWith('s2', 'https://github.com/o/r.git', undefined),
+    )
+  })
+
+
+  it('hides the branch field until a repo URL is entered', () => {
+    render(<NewTabComposer spec={makeSpec({ repo: '' })} onSubmit={() => {}} onCancel={() => {}} />)
+    expect(screen.queryByLabelText('Repo Branch')).toBeNull()
+  })
+
+  it('shows the branch field once a repo URL is entered', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git' })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.getByLabelText('Repo Branch')).toBeTruthy()
+  })
+
+  it('types into the branch field through setRepoBranch', () => {
+    const setRepoBranch = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', setRepoBranch })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Repo Branch'), { target: { value: 'dev' } })
+    expect(setRepoBranch).toHaveBeenCalledWith('dev')
   })
 })

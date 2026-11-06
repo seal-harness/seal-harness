@@ -215,6 +215,7 @@ From a running frontend, start a session with the `/new` command:
 /new                              # fresh session in the current tab
 /new -p anthropic -m claude       # Anthropic, explicit model
 /new -p ollama -m llama3          # local Ollama, no API key needed
+/new -r seal-harness -b main      # clone the -r repo, checking out `main` (branch or tag)
 ```
 
 Provider credentials are read from the vault (set them with

@@ -14,6 +14,8 @@ module Seal.Gateway.Send
   , sendOutcomeJson
   , handleSend
   , handleSetupRepo
+  , setupRepoInput
+  , validateSetupRepoArgs
   , ensureTabForSession
   , handleAnswerDelivery
   , handleAnswerTextDelivery
@@ -69,14 +71,15 @@ import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
-  , approvalScopeText, parseApprovalScope )
+  , deliverNextAnswerResolvedId, approvalScopeText, parseApprovalScope )
 import Seal.Handles.Transcript (pendingCompletionCount)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
-import Seal.ISA.Ops.Repo (validateRepoUrl)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput)
 import Seal.ISA.Opcode (OpResult (..))
+import Seal.Tools.Args (BranchName, branchNameText)
 import Seal.Providers.Class
   ( SomeProvider, ToolResultPart (..) )
 import Seal.Harness.Registry (HarnessRegistry)
@@ -499,6 +502,12 @@ data SendOutcome
     -- (e.g. @\/new@) so the frontend can navigate to it. 'Nothing' for
     -- ordinary slash commands.
   | SendAssistant       -- ^ plain turn; reply lands in the transcript
+  | SendAnswer Text
+    -- ^ a plain message was consumed as the answer to a pending @ASK_HUMAN@
+    -- question for the session, so NO turn was started. Carries the answer
+    -- that was delivered (a chosen option's label when the human replied with
+    -- a number, otherwise their text) so the wire @response@ can confirm it
+    -- to a chat channel.
   | SendError Int Text  -- ^ HTTP status code + message (400/404/500)
   deriving stock (Eq, Show)
 
@@ -515,12 +524,23 @@ sendOutcomeJson = \case
       , "session_id" .= (sessionIdText <$> mSid)
       ])
   SendAssistant  -> (200, object [ "kind" .= ("assistant" :: Text), "response" .= ("" :: Text) ])
+  SendAnswer a   ->
+    -- @kind:"answer"@ is distinct from @assistant@ so a surface knows no
+    -- turn was started (nothing more will arrive on the stream), and the
+    -- @response@ line is a ready-made chat-channel confirmation.
+    (200, object [ "kind" .= ("answer" :: Text), "response" .= ("✓ " <> a) ])
   SendError c m  -> (c, object [ "error" .= m ])
 
 -- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
 -- -> 404; an unknown provider / vault error -> 400; an internal failure ->
 -- 500 (logged to stderr).
+--
+-- A @Plain@ message is offered to the session's pending @ASK_HUMAN@ question
+-- first: if one is open, the text is delivered as the answer and the result
+-- is 'SendAnswer' (no turn is started, and @ask_resolved@ is broadcast). This
+-- is the only way a channel without answer buttons can reply, and it keeps
+-- the message from queueing behind the write lock the blocked turn holds.
 --
 -- After a successful 'Plain'/'SlashCommand'/'NewSession' turn (any outcome
 -- that is NOT 'SendError'), auto-tabs the session via
@@ -537,24 +557,24 @@ handleSend deps sid rawText = do
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        -- Async: fork the turn in a background thread and return
-        -- SendAssistant immediately. The turn streams updates via the
-        -- WS broker (entry-update, entry, activity events). The reply
-        -- is delivered to WS subscribers (web frontend, chat channels).
-        -- Slash commands remain synchronous (they return transient
-        -- output in the response body).
-        let sid' = smId meta
-        void (forkIO (do
-          er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
-            plainTurn deps meta t
-          case er of
-            Left _   -> pure ()
-            Right (Left _) -> pure ()
-            Right (Right ()) -> do
-              when (shouldAutoTab meta) $
-                ensureTabForSession (sdTabsHandle deps) KindProvider sid'
-              triggerBroadcast deps))
-        pure SendAssistant
+        -- A blocking ASK_HUMAN keeps the running turn parked on the answer
+        -- slot, and that turn holds the session write lock for as long as it
+        -- waits ('withSessionLock'). A second turn started for this text can
+        -- therefore only queue behind the question it was meant to answer —
+        -- for a chat channel with no answer buttons (Signal, Telegram) that
+        -- is a permanent deadlock, and it was reported as "my replies to the
+        -- bot are ignored". So: offer the text as the answer to a pending
+        -- question for this session first, and start a turn only if there is
+        -- none. A numbered reply ("2") resolves to that option's label, which
+        -- is how a medium without inline keyboards answers a multi-choice ask.
+        mAnswered <- deliverNextAnswerResolvedId (sdAskReply deps) (smId meta) t
+        case mAnswered of
+          Just (qid, answer, True) -> do
+            broadcastAskResolved (sdBroker deps) (smId meta) qid "answered"
+            pure (SendAnswer answer)
+          -- No pending question (or it was resolved concurrently, in which
+          -- case nothing was delivered): route the text as a normal turn.
+          _ -> startPlainTurn deps meta t
       Right (SlashCommand cmdName) -> do
         -- W5: no srActive swap bracket. The per-request call/skill
         -- dispatcher closes over the request's explicit sid (see
@@ -592,6 +612,28 @@ handleSend deps sid rawText = do
           Nothing -> SendSlash "no current tab" Nothing
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
+
+-- | Start a plain turn for @t@ asynchronously: fork the turn in a background
+-- thread and return 'SendAssistant' immediately. The turn streams updates via
+-- the WS broker (entry-update, entry, activity events). The reply is delivered
+-- to WS subscribers (web frontend, chat channels).
+--
+-- Split out of 'handleSend' so the ask-answer branch (which starts NO turn)
+-- stays readable.
+startPlainTurn :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
+startPlainTurn deps meta t = do
+  let sid' = smId meta
+  void (forkIO (do
+    er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
+      plainTurn deps meta t
+    case er of
+      Left _   -> pure ()
+      Right (Left _) -> pure ()
+      Right (Right ()) -> do
+        when (shouldAutoTab meta) $
+          ensureTabForSession (sdTabsHandle deps) KindProvider sid'
+        triggerBroadcast deps))
+  pure SendAssistant
 
 -- | Render the current tab for the web send endpoint: @<index>  <kind>  [label]@.
 renderWebTab :: Tab -> Text
@@ -902,14 +944,21 @@ broadcastAskResolved mBroker sid qid resolution =
 -- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
 -- reads 'srActive' to pick the transcript), then restored.
 --
--- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
--- with the opcode's text result (the clone/no-op/conflict/failure message)
--- for the API layer to pass through to the frontend.
-handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
-handleSetupRepo deps sid url =
-  case validateRepoUrl url of
-    Left err -> pure (Left ("invalid url: " <> err))
-    Right cleanUrl -> do
+-- The optional @branch@ (or tag) is cloned/checked out instead of the
+-- remote's default branch. Both arguments are validated by
+-- 'validateSetupRepoArgs' (the opcode's own input parser) BEFORE the
+-- session lookup, so a rejected url/branch never touches the session
+-- store.
+--
+-- Returns @Left err@ for an invalid url/branch or a dispatch failure;
+-- @Right msg@ with the opcode's text result (the
+-- clone/no-op/switched/conflict/failure message) for the API layer to
+-- pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> Maybe Text -> IO (Either Text Text)
+handleSetupRepo deps sid url mBranch =
+  case validateSetupRepoArgs url mBranch of
+    Left err -> pure (Left err)
+    Right (cleanUrl, validBranch) -> do
       mMeta <- loadSessionMeta (sdPaths deps) sid
       case mMeta of
         Nothing -> pure (Left "session not found")
@@ -919,13 +968,34 @@ handleSetupRepo deps sid url =
           -- W5: the dispatcher takes the explicit sid (no srActive swap).
           let td = mkWebTurnDeps deps
               dispatcher = webCallDispatcher deps td sid
-          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+              payload = setupRepoInput cleanUrl (fmap branchNameText validBranch)
+          res <- dispatcher (OpName "SETUP_REPO") payload
           case res of
             Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
             Right opRes ->
               if orIsError opRes
                 then pure (Left (opResultText opRes))
                 else pure (Right (opResultText opRes))
+
+-- | The SETUP_REPO dispatch payload for the web setup-repo path:
+-- @{\"url\": u}@ when no branch is requested, @{\"url\": u, \"branch\": b}@
+-- otherwise. The branch key is omitted — never @null@ — when it is absent,
+-- blank, or whitespace-only, and is trimmed, so the payload stays backward
+-- compatible with every caller/consumer that predates the field.
+setupRepoInput :: Text -> Maybe Text -> Value
+setupRepoInput url mBranch =
+  case fmap T.strip mBranch of
+    Just b | not (T.null b) -> object ["url" .= url, "branch" .= b]
+    _                       -> object ["url" .= url]
+
+-- | Validate the web setup-repo arguments (url + optional branch) by
+-- building the exact SETUP_REPO dispatch payload and running it through
+-- the opcode's own input parser. Validation therefore has ONE
+-- implementation: the rules, and the error text (including the
+-- @SETUP_REPO:@ prefix), are the opcode's. Returns the cleaned url and the
+-- validated 'BranchName' ('Nothing' when no branch was requested).
+validateSetupRepoArgs :: Text -> Maybe Text -> Either Text (Text, Maybe BranchName)
+validateSetupRepoArgs url mBranch = parseSetupRepoInput (setupRepoInput url mBranch)
 
 -- | Join the text parts of an 'OpResult' into a single message (the
 -- clone/no-op/conflict/failure text from SETUP_REPO).

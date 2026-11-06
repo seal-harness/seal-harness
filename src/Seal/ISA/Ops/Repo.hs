@@ -16,8 +16,17 @@
 --   * Shallow clone (@git clone --depth 1@) to keep large repos cheap.
 --   * Multiple repos are supported: each clones into
 --     @\<workdir\>\/\<sanitized-repo-name\>\/@.
+--   * Optional @branch@ (@{url, branch}@): a fresh clone checks that branch
+--     (or tag — a tag yields a detached HEAD) out via a single
+--     @--branch=\<ref\>@ argv token. The value reaches a subprocess argv, so
+--     it is carried by the validated 'Seal.Tools.Args.BranchName' newtype,
+--     never raw 'Text'.
 --   * Idempotent: if the target dir already holds a clone of the same
---     remote URL, the call is a no-op (\"Repo already exists — no-op\").
+--     remote URL and the requested branch is already checked out, the call
+--     is a no-op (\"Repo already exists — no-op\"). A differing / unknown /
+--     detached current branch is SWITCHED ('switchBranch': fetch the branch
+--     ref at depth 1, then check it out) — never a re-clone, and the
+--     directory is never deleted.
 --     If the dir exists but its remote differs, the call errors (\"a
 --     different repo already occupies that path\") rather than silently
 --     clobbering.
@@ -40,6 +49,12 @@
 -- 'liftIO' in the trusted plane. NO @runLocal@/@BackendExec@.
 module Seal.ISA.Ops.Repo
   ( setupRepoOp
+  , runSetupRepo
+  , parseSetupRepoInput
+  , parseRepoProbe
+  , renderCloneResult
+  , SwitchTransport (..)
+  , switchTransport
   , validateRepoUrl
   , sanitizeRepoName
   , normalizeRepoUrl
@@ -49,8 +64,9 @@ module Seal.ISA.Ops.Repo
   , tryCodegraphInit
   ) where
 
-import Data.Aeson (Value, object, withObject, (.:), (.=))
+import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
+import Data.ByteString (ByteString)
 import Data.Char (isAlphaNum)
 import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
@@ -67,7 +83,8 @@ import Seal.SourceControl.Clone
   , withCloneTarget )
 import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
-import Seal.Tools.Args (mkShellCommand, ShellCommand)
+import Seal.Tools.Args
+  ( BranchName, branchNameText, mkBranchName, mkShellCommand, ShellCommand )
 import Seal.Tools.Exec.UIO
   ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
@@ -75,11 +92,12 @@ import Seal.Tools.Exec.UntrustedIO qualified as UIORec
   (UntrustedIO (uioShellExec, uioShellExecEnv, uioShellExecGitEnv))
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 
--- | SETUP_REPO opcode. Input: @{url: Text}@. Authorize: autonomy must not
--- be 'Deny' and the URL must validate ('validateRepoUrl'). Run: a shallow
--- @git clone@ into @\<workdir\>\/\<sanitized-repo-name\>@ via
--- 'uioShellExec', after an idempotency check (read the existing remote).
--- 'orRecorded': the url + target path + status (secret-free).
+-- | SETUP_REPO opcode. Input: @{url: Text, branch?: Text}@. Authorize:
+-- autonomy must not be 'Deny' and the input must parse + validate
+-- ('parseSetupRepoInput'). Run: a shallow @git clone@ into
+-- @\<workdir\>\/\<sanitized-repo-name\>@ via 'uioShellExec', after a
+-- branch-aware idempotency check (read the existing remote + the branch it
+-- has checked out). 'orRecorded': the target path + status (secret-free).
 --
 -- No 'WorkspaceRoot' argument: the clone's root is the 'UIOEnv' the
 -- dispatcher supplies (the per-session workdir), so the opcode never needs
@@ -89,25 +107,20 @@ import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 setupRepoOp :: CloneDeps -> AutonomyLevel -> Opcode
 setupRepoOp deps autonomy = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
-  , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent). Discover any skills it ships via the available-skills catalog on the next turn."
+  , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent; an optional branch or tag is checked out). Discover any skills it ships via the available-skills catalog on the next turn."
   , uoInSchema = setupRepoSchema
   , uoOutSchema = object []
   , uoAuthorize = \v ->
-      case urlField v of
-        Nothing -> Left "SETUP_REPO requires {url:string}"
-        Just url -> case validateRepoUrl url of
-          Left err -> Left ("SETUP_REPO: invalid url: " <> err)
-          Right _ -> case autonomy of
-            Deny -> Left "SETUP_REPO denied by autonomy policy"
-            _   -> Right ()
-  , uoRun = \v -> do
-      let mUrl = urlField v
-          recorded = object [ "url" .= (mUrl :: Maybe Text) ]
-      case mUrl of
-        Nothing -> pure (OpResult [TrpText "SETUP_REPO requires {url:string}"] True recorded)
-        Just url -> case validateRepoUrl url of
-          Left err -> pure (OpResult [TrpText ("SETUP_REPO: invalid url: " <> err)] True recorded)
-          Right url' -> runSetupRepo deps url' recorded
+      case parseSetupRepoInput v of
+        Left err -> Left err
+        Right _ -> case autonomy of
+          Deny -> Left "SETUP_REPO denied by autonomy policy"
+          _    -> Right ()
+  , uoRun = \v ->
+      let recorded = object [ "url" .= (urlField v :: Maybe Text) ]
+      in case parseSetupRepoInput v of
+           Left err -> pure (OpResult [TrpText err] True recorded)
+           Right (url, mBranch) -> runSetupRepo deps url mBranch recorded
   }
 
 setupRepoSchema :: Value
@@ -119,12 +132,45 @@ setupRepoSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("The repository URL to clone (https://, git://, ssh://, or git@host:path). Cloned shallowly into <workdir>/<repo-name>." :: Text)
             ]
+        , "branch" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("The branch or tag to check out. Omit to use the remote's default branch." :: Text)
+            ]
         ]
     , "required" .= (["url"] :: [Text])
     ]
 
 urlField :: Value -> Maybe Text
 urlField = parseMaybe (withObject "in" (.: "url"))
+
+-- | The optional @branch@ field. An absent field, @null@, or a non-string
+-- value is treated as absent (the remote's default branch).
+branchField :: Value -> Maybe Text
+branchField v = case parseMaybe (withObject "in" (.:? "branch")) v of
+  Just (Just b) -> Just b
+  _             -> Nothing
+
+-- | Parse + validate the SETUP_REPO input into the cloned URL and the
+-- optional 'BranchName'. Shared by 'uoAuthorize' and 'uoRun' so the two
+-- cannot disagree about what a valid input is. An absent, empty, or
+-- whitespace-only @branch@ is 'Nothing'. The 'Left' arm is the
+-- user-facing message (the callers render it verbatim).
+parseSetupRepoInput :: Value -> Either Text (Text, Maybe BranchName)
+parseSetupRepoInput v = do
+  rawUrl <- case urlField v of
+    Just u  -> Right u
+    Nothing -> Left "SETUP_REPO requires {url:string}"
+  url <- case validateRepoUrl rawUrl of
+    Right u  -> Right u
+    Left err -> Left ("SETUP_REPO: invalid url: " <> err)
+  mBranch <- case branchField v of
+    Nothing -> Right Nothing
+    Just raw
+      | T.null (T.strip raw) -> Right Nothing
+      | otherwise -> case mkBranchName raw of
+          Right b  -> Right (Just b)
+          Left err -> Left ("SETUP_REPO: invalid branch: " <> err)
+  pure (url, mBranch)
 
 -- | Validate a repo URL. Accepts @https://@, @http://@, @git://@,
 -- @ssh://@, and the @git\@host:path@ SCP-style form. Rejects any URL
@@ -193,10 +239,70 @@ sanitizeRepoName url =
 -- and the @POST /api/sessions/:id/setup-repo@ endpoint (web combo box).
 data CloneResult
   = CloneCloned Text    -- ^ cloned into <repo-name> (shallow)
-  | CloneNoop Text      -- ^ repo already exists at <repo-name>
+  | CloneNoop Text      -- ^ repo already exists at <repo-name> (branch matches)
   | CloneConflict Text Text  -- ^ a different repo occupies <repo-name> (existing url)
-  | CloneFailed Text    -- ^ clone or idempotency check failed (<error>)
+  | CloneSwitched Text Text  -- ^ switched an existing clone to <branch> (<repo-name>)
+  | CloneFailed Text    -- ^ clone, switch, or idempotency check failed (<error>)
   deriving stock (Eq, Show)
+
+-- | Which executor arm a branch SWITCH uses, chosen from the resolved
+-- credential kind (mirrors 'cloneWithCredential''s dispatch).
+--
+-- A PAT / machine-user credential is delivered as
+-- @GIT_CONFIG_PARAMETERS='http.extraHeader=Authorization: Basic …'@ inside
+-- 'ceEnvExtras'. @GIT_CONFIG_PARAMETERS@ is a member of
+-- 'Seal.Tools.Exec.UntrustedIO.secretEnvKeys', so the remote arm of
+-- 'uioShellExecEnv' pipes it over SSH **stdin** instead of rendering it into
+-- the remote command string. @uioShellExecGitEnv@'s remote arm instead
+-- renders the extras into the remote command prefix — using it for a PAT
+-- switch would put the @Authorization@ header on the remote argv. Hence:
+-- secret-bearing credential → 'SwitchViaShellEnv'; deploy key (agent
+-- forwarding, no secret in the env) → 'SwitchViaGitEnv'.
+data SwitchTransport
+  = SwitchViaShellEnv  -- ^ PAT / machine user (@ceRawToken@ is 'Just')
+  | SwitchViaGitEnv    -- ^ deploy key (@ceRawToken@ is 'Nothing')
+  deriving stock (Eq, Show)
+
+-- | Pick the switch executor arm from the resolved credential: a raw token
+-- means a PAT/machine-user credential (see 'SwitchTransport'); no token
+-- means a deploy key.
+switchTransport :: Maybe ByteString -> SwitchTransport
+switchTransport (Just _rawToken) = SwitchViaShellEnv
+switchTransport Nothing          = SwitchViaGitEnv
+
+-- | The @--branch=\<ref\>@ argv token for a requested branch — a SINGLE
+-- token (@--branch='x'@, never @--branch x@), so the value can never be
+-- read as a separate option. Empty when no branch was requested, so the
+-- emitted clone command is byte-identical to the pre-branch one.
+branchFlag :: Maybe BranchName -> Text
+branchFlag Nothing  = ""
+branchFlag (Just b) = " --branch=" <> shellQ (branchNameText b)
+
+-- | Parse the idempotency-probe output: the existing clone's origin URL,
+-- then (second line) the branch @git@ currently has checked out
+-- (@git rev-parse --abbrev-ref HEAD@ — the literal @HEAD@ for a detached
+-- checkout). A one-line response is tolerated: the current branch is then
+-- unknown ('Nothing'), which is what the remote test fixture's
+-- @\"__NONE__\\n\"@ reply produces. A @\"__NONE__\"@ URL means "no clone
+-- here".
+parseRepoProbe :: Text -> (Text, Maybe Text)
+parseRepoProbe out = case T.lines out of
+  []             -> ("", Nothing)
+  (urlLine : ls) -> (T.strip urlLine, firstNonBlank ls)
+
+-- | The first non-blank line of a (possibly empty) list of lines.
+firstNonBlank :: [Text] -> Maybe Text
+firstNonBlank [] = Nothing
+firstNonBlank (l : ls)
+  | T.null (T.strip l) = firstNonBlank ls
+  | otherwise          = Just (T.strip l)
+
+-- | The first line of a command's output, trimmed (reads
+-- @rev-parse --abbrev-ref HEAD@).
+firstLine :: Text -> Text
+firstLine t = case T.lines t of
+  (l : _) -> T.strip l
+  []      -> ""
 
 -- | Run the clone (or no-op) via an 'UntrustedIO' capability and return a
 -- structured 'CloneResult'. This is the shared seam between the
@@ -212,36 +318,51 @@ data CloneResult
 -- env) or 'uioBinExecEnv' (PAT: @http.extraHeader@ argv) with the resolved
 -- env. If the URL is NOT registered, fall through to a bare-URL clone
 -- (public repos, backward-compat).
-cloneRepoIO :: CloneDeps -> UntrustedIO -> Text -> IO CloneResult
-cloneRepoIO deps uio url = do
+--
+-- With @mBranch@: a fresh clone checks that branch out ('branchFlag'); an
+-- existing clone of the same repo is switched when the branch differs
+-- ('switchBranch'), and a no-op when it already matches.
+cloneRepoIO :: CloneDeps -> UntrustedIO -> Text -> Maybe BranchName -> IO CloneResult
+cloneRepoIO deps uio url mBranch = do
   let repoName = sanitizeRepoName url
+      cleanUrl = T.strip url
       mCwdPath = case mkRemotePath "." of
         Right rp -> Just rp
         Left _   -> Nothing
+      -- Idempotency probe: the existing origin URL, then the branch git
+      -- currently has checked out (a second line — see 'parseRepoProbe').
       checkCmd = "if [ -d " <> shellQ repoName <> "/.git ]; then git -C "
-                 <> shellQ repoName <> " config --get remote.origin.url; else rm -rf "
+                 <> shellQ repoName <> " config --get remote.origin.url; git -C "
+                 <> shellQ repoName <> " rev-parse --abbrev-ref HEAD; else rm -rf "
                  <> shellQ repoName <> "; echo __NONE__; fi"
+      -- No clone yet: look the URL up in the repo registry. If registered,
+      -- resolve the credential via the no-disk seam; else fall through to a
+      -- bare-URL clone (public repos).
+      cloneFresh = do
+        eRepos <- rrhList (cdRepoReg deps)
+        let mRepo = case eRepos of
+              Right repos -> lookupRepoByUrl cleanUrl
+                               (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
+              Left _      -> Nothing
+        case mRepo of
+          Just repo -> cloneWithCredential deps uio repo repoName mBranch mCwdPath
+          Nothing   -> cloneBareUrl uio cleanUrl repoName mBranch mCwdPath
   checkRes <- UIORec.uioShellExec uio (shellCmd checkCmd) mCwdPath
   case checkRes of
     Left err -> pure (CloneFailed ("idempotency check failed: " <> renderUntrustedErr err))
-    Right existing -> do
-      let existingUrl = T.strip (T.filter (/= '\n') existing)
-          cleanUrl = T.strip url
-      if existingUrl /= "__NONE__"
-        then if normalizeRepoUrl existingUrl == normalizeRepoUrl cleanUrl
-               then pure (CloneNoop repoName)
-               else pure (CloneConflict repoName existingUrl)
-        else do
-          -- Look up the URL in the repo registry. If registered, resolve
-          -- the credential via the no-disk seam; else fall through to a
-          -- bare-URL clone (public repos).
-          eRepos <- rrhList (cdRepoReg deps)
-          let mRepo = case eRepos of
-                Right repos -> lookupRepoByUrl cleanUrl (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
-                Left _       -> Nothing
-          case mRepo of
-            Just repo -> cloneWithCredential deps uio repo repoName mCwdPath
-            Nothing   -> cloneBareUrl uio cleanUrl repoName mCwdPath
+    Right out -> case parseRepoProbe out of
+      (existingUrl, mCurrent)
+        | existingUrl == "__NONE__" -> cloneFresh
+        | normalizeRepoUrl existingUrl /= normalizeRepoUrl cleanUrl ->
+            pure (CloneConflict repoName existingUrl)
+        | otherwise -> case mBranch of
+            -- No branch requested: same repo ⇒ no-op (unchanged behavior).
+            Nothing -> pure (CloneNoop repoName)
+            -- Requested branch already checked out ⇒ no-op. A differing,
+            -- unknown, or detached ("HEAD") current branch ⇒ switch.
+            Just b
+              | mCurrent == Just (branchNameText b) -> pure (CloneNoop repoName)
+              | otherwise -> switchBranch deps uio cleanUrl repoName b mCwdPath
 
 -- | Clone a registered repo via the no-disk seam. Resolves the credential
 -- via 'resolveCloneTarget', then branches on the credential kind:
@@ -257,9 +378,9 @@ cloneRepoIO deps uio url = do
 --     @git clone@ with the agent-forwarding env (@SSH_AUTH_SOCK@ /
 --     @GIT_SSH_COMMAND@) — @gh@ cannot use an SSH agent.
 cloneWithCredential
-  :: CloneDeps -> UntrustedIO -> SourceRepo -> Text -> Maybe RemotePath
-  -> IO CloneResult
-cloneWithCredential deps uio repo repoName mCwdPath = do
+  :: CloneDeps -> UntrustedIO -> SourceRepo -> Text -> Maybe BranchName
+  -> Maybe RemotePath -> IO CloneResult
+cloneWithCredential deps uio repo repoName mBranch mCwdPath = do
   eTarget <- resolveCloneTarget deps repo
   case eTarget of
     Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
@@ -269,7 +390,7 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
           let token = map (toEnum . fromIntegral) (BS.unpack tokenBytes)
               envExtras = ("GH_TOKEN", token) : ceEnvExtras env
               ghCmd = "gh repo clone " <> shellQ (ceUrl env) <> " "
-                      <> shellQ repoName <> " -- --depth 1"
+                      <> shellQ repoName <> " -- --depth 1" <> branchFlag mBranch
           cloneRes <- UIORec.uioShellExecEnv uio envExtras (shellCmd ghCmd) mCwdPath
           case cloneRes of
             Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
@@ -277,16 +398,20 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
         Nothing -> do
           let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
               cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
-                         <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
+                         <> " clone --depth 1" <> branchFlag mBranch
+                         <> " -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
           cloneRes <- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
           case cloneRes of
             Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
             Right _out -> verifyClone uio repoName _out mCwdPath
 
 -- | Clone a bare URL (no credential — public repo, backward-compat).
-cloneBareUrl :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult
-cloneBareUrl uio cleanUrl repoName mCwdPath = do
-  let cloneCmd = "git clone --depth 1 -- " <> shellQ cleanUrl <> " " <> shellQ repoName
+cloneBareUrl
+  :: UntrustedIO -> Text -> Text -> Maybe BranchName -> Maybe RemotePath
+  -> IO CloneResult
+cloneBareUrl uio cleanUrl repoName mBranch mCwdPath = do
+  let cloneCmd = "git clone --depth 1" <> branchFlag mBranch
+                 <> " -- " <> shellQ cleanUrl <> " " <> shellQ repoName
   cloneRes <- UIORec.uioShellExec uio (shellCmd cloneCmd) mCwdPath
   case cloneRes of
     Left err -> pure (CloneFailed ("clone failed (transport): " <> renderUntrustedErr err))
@@ -312,25 +437,112 @@ verifyClone uio repoName cloneOut mCwdPath = do
                             ("clone did not land — git output:\n"
                              <> T.strip cloneOut))
 
--- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
--- 'cloneRepoIO' with the audit 'orRecorded' payload).
-runSetupRepo :: CloneDeps -> Text -> Value -> UIO OpResult
-runSetupRepo deps url recorded = do
+-- | Switch an EXISTING clone to @branch@ (the idempotent second call with a
+-- different branch) without re-cloning. The credential is resolved exactly
+-- like 'cloneRepoIO' does (registry lookup → 'resolveCloneTarget' →
+-- 'withCloneTarget'), then ONE shell command runs: check the branch out if
+-- it already exists locally, else fetch its ref at depth 1 and check it
+-- out. The fetch refspec is fully qualified (@refs\/heads\/\<b\>@), so a tag
+-- name fails loudly instead of DWIM-ing to the tag. The result is verified
+-- with @rev-parse --abbrev-ref HEAD@; on a mismatch 'CloneFailed' carries
+-- git's output and the directory (plus any work in it) is left intact —
+-- never deleted. On success 'tryCodegraphInit' re-runs (the graph would
+-- otherwise describe the old branch) and the result is 'CloneSwitched'.
+switchBranch
+  :: CloneDeps -> UntrustedIO -> Text -> Text -> BranchName -> Maybe RemotePath
+  -> IO CloneResult
+switchBranch deps uio cleanUrl repoName branch mCwdPath = do
+  eRepos <- rrhList (cdRepoReg deps)
+  let mRepo = case eRepos of
+        Right repos -> lookupRepoByUrl cleanUrl
+                         (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
+        Left _      -> Nothing
+  case mRepo of
+    -- Unregistered (public) repo: no credential to resolve.
+    Nothing -> runSwitch (UIORec.uioShellExec uio) (shellCmd (switchCmd repoName b))
+    Just repo -> do
+      eTarget <- resolveCloneTarget deps repo
+      case eTarget of
+        Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
+        Right target -> withCloneTarget target $ \env ->
+          runSwitch (switchExec env) (shellCmd (switchCmd repoName b))
+  where
+    b = branchNameText branch
+    -- Dispatch on the credential kind (see 'SwitchTransport'): a PAT must
+    -- ride 'uioShellExecEnv' (secret extras over stdin on the remote arm).
+    switchExec env = case switchTransport (ceRawToken env) of
+      SwitchViaShellEnv -> UIORec.uioShellExecEnv uio (ceEnvExtras env)
+      SwitchViaGitEnv ->
+        UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env)
+    runSwitch exec cmd = do
+      res <- exec cmd mCwdPath
+      case res of
+        Left err -> pure (CloneFailed ("switch failed (transport): " <> renderUntrustedErr err))
+        Right out -> verifySwitch exec out
+    verifySwitch exec switchOut = do
+      let verifyCmd = "git -C " <> shellQ repoName <> " rev-parse --abbrev-ref HEAD"
+      vRes <- exec (shellCmd verifyCmd) mCwdPath
+      case vRes of
+        Left err -> pure (CloneFailed ("switch verify failed: " <> renderUntrustedErr err))
+        Right vOut
+          | firstLine vOut == b -> do
+              _ <- tryCodegraphInit uio repoName mCwdPath
+              pure (CloneSwitched repoName b)
+          | otherwise -> pure (CloneFailed
+              ("switch to " <> b <> " did not take — git output:\n"
+               <> T.strip switchOut <> "\n" <> T.strip vOut))
+
+-- | The one shell command that moves an existing clone onto @branch@:
+-- check it out directly when the local branch ref exists, otherwise fetch
+-- that branch's ref (at depth 1) into a local branch ref and check it out.
+-- Every interpolated value is shell-quoted.
+switchCmd :: Text -> Text -> Text
+switchCmd repoName b =
+  "if git -C " <> qr <> " rev-parse --verify --quiet " <> shellQ ("refs/heads/" <> b)
+    <> " >/dev/null\n"
+  <> "then git -C " <> qr <> " checkout " <> shellQ b <> "\n"
+  <> "else git -C " <> qr <> " fetch --depth 1 origin "
+    <> shellQ ("refs/heads/" <> b <> ":refs/heads/" <> b)
+    <> " && git -C " <> qr <> " checkout " <> shellQ b <> "\n"
+  <> "fi"
+  where
+    qr = shellQ repoName
+
+-- | Render a 'CloneResult' as the user-facing text. @url@ is the requested
+-- URL and @mBranch@ the requested branch (if any) — 'CloneCloned' and
+-- 'CloneNoop' carry only the repo name, so the branch is passed in.
+renderCloneResult :: Text -> Maybe Text -> CloneResult -> Text
+renderCloneResult url mBranch res = case res of
+  CloneCloned name ->
+    "Cloned " <> T.strip url <> " into " <> name <> " (shallow"
+      <> branchNote mBranch <> ")."
+  CloneNoop name ->
+    "Repo already exists — no-op (" <> name <> branchNote mBranch <> ")."
+  CloneConflict name existing ->
+    "A different repo already occupies " <> name <> " (existing: " <> existing <> ")."
+  CloneSwitched name b ->
+    "Repo already exists — switched to branch " <> b <> " (" <> name <> ")."
+  CloneFailed err ->
+    "SETUP_REPO failed — could not clone " <> T.strip url <> ":\n" <> err
+  where
+    branchNote = maybe "" (", branch " <>)
+
+-- | Run the clone (or no-op / switch) and build the 'OpResult' (opcode
+-- path; wraps 'cloneRepoIO' with the audit 'orRecorded' payload). A
+-- 'CloneSwitched' is a NON-error result (the clone is usable on the
+-- requested branch — the turn engine's post-repo hooks must still run).
+runSetupRepo :: CloneDeps -> Text -> Maybe BranchName -> Value -> UIO OpResult
+runSetupRepo deps url mBranch recorded = do
   uio <- uioUntrustedIO
-  res <- uioLiftIO (cloneRepoIO deps uio url)
-  pure $ case res of
-    CloneCloned repoName ->
-      OpResult [TrpText ("Cloned " <> T.strip url <> " into " <> repoName <> " (shallow).")]
-               False (recordWith recorded repoName "cloned")
-    CloneNoop repoName ->
-      OpResult [TrpText ("Repo already exists — no-op (" <> repoName <> ").")]
-               False (recordWith recorded repoName "noop")
-    CloneConflict repoName existing ->
-      OpResult [TrpText ("A different repo already occupies " <> repoName <> " (existing: " <> existing <> ").")]
-               True (recordWith recorded repoName "conflict")
-    CloneFailed err ->
-      OpResult [TrpText ("SETUP_REPO failed — could not clone " <> T.strip url <> ":\n" <> err)]
-               True (recordWith recorded "" "failed")
+  res <- uioLiftIO (cloneRepoIO deps uio url mBranch)
+  let (target, status, isErr) = case res of
+        CloneCloned name      -> (name, "cloned", False)
+        CloneNoop name        -> (name, "noop", False)
+        CloneConflict name _  -> (name, "conflict", True)
+        CloneSwitched name _  -> (name, "switched", False)
+        CloneFailed _         -> ("", "failed", True)
+  pure (OpResult [TrpText (renderCloneResult url (branchNameText <$> mBranch) res)]
+                 isErr (recordWith recorded target status))
 
 -- | Construct a 'ShellCommand', total on our internally-built command
 -- strings (they contain no NULs). 'mkShellCommand' only fails on NUL, so

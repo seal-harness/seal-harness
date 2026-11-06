@@ -123,8 +123,24 @@ spec = do
       mintBody Nothing Nothing `shouldBe` A.object []
 
   describe "setupRepoBody" $ do
-    it "is {url}" $
-      setupRepoBody "git@github.com:o/r.git"
+    it "is {url} with no branch — the body chat sent before -b existed" $
+      setupRepoBody "git@github.com:o/r.git" Nothing
+        `shouldBe` A.object ["url" .= ("git@github.com:o/r.git" :: Text)]
+    it "adds the branch when one is given" $
+      setupRepoBody "git@github.com:o/r.git" (Just "dev")
+        `shouldBe` A.object
+          [ "url"    .= ("git@github.com:o/r.git" :: Text)
+          , "branch" .= ("dev" :: Text) ]
+    it "trims surrounding whitespace from the branch" $
+      setupRepoBody "git@github.com:o/r.git" (Just "  dev  ")
+        `shouldBe` A.object
+          [ "url"    .= ("git@github.com:o/r.git" :: Text)
+          , "branch" .= ("dev" :: Text) ]
+    it "omits the branch key entirely for an empty branch (never null)" $
+      setupRepoBody "git@github.com:o/r.git" (Just "")
+        `shouldBe` A.object ["url" .= ("git@github.com:o/r.git" :: Text)]
+    it "omits the branch key entirely for a whitespace-only branch" $
+      setupRepoBody "git@github.com:o/r.git" (Just "   ")
         `shouldBe` A.object ["url" .= ("git@github.com:o/r.git" :: Text)]
 
   describe "parseNewSessionResult" $ do
