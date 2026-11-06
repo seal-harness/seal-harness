@@ -19,6 +19,9 @@ import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
+import { nextScrollIntent, type ScrollIntent } from '../lib/scrollIntent'
+import { isAtBottom, isNearTop, isSyntheticScroll } from '../lib/transcriptScroll'
+import type { LoadResult } from '../types/stream'
 
 /** The connection-state banner shown above the transcript when the
  *  WebSocket stream is not live.
@@ -2416,8 +2419,8 @@ export function ChatArea({
   isViewingLatest?: boolean
   loadingMore?: boolean
   loadOlder?: () => void
-  loadFromBeginning?: () => void
-  loadLatest?: () => void
+  loadFromBeginning?: () => LoadResult
+  loadLatest?: () => LoadResult
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2533,11 +2536,20 @@ export function ChatArea({
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
-  const wasAtBottom = useRef(true)
- // Guards against duplicate loadLatest calls when the user scrolls to
- // the bottom while isViewingLatest is false. Set to true when
- // loadLatest is triggered; reset when isViewingLatest becomes true.
- const triggeredLoadLatest = useRef(false)
+  // One scroll intent for the transcript viewport, updated only through the
+  // pure reducer in lib/scrollIntent.ts. There is no second "pending" flag
+  // that can disagree with it or get stuck.
+  const scrollIntent = useRef<ScrollIntent>(null)
+  // Shared with useVirtualWindow: the expected scrollTop of the virtual
+  // window's measurement adjustment. Both listeners treat a matching event
+  // as synthetic (no range update, no intent cancellation).
+  const scrollGuard = useRef<number | null>(null)
+  // Expected scrollTop of a button-initiated scroll. A matching event must
+  // NOT cancel the intent, but it DOES update the virtual range.
+  const intentScrollGuard = useRef<number | null>(null)
+  // Whether the viewport is at the bottom. This is an INPUT to the
+  // sticky-follow rule and the virtual window, not a decision variable.
+  const atBottomRef = useRef(true)
  // Derived: treat missing prop as true (backward-compatible with tests).
  const viewingLatest = isViewingLatest ?? true
 
@@ -2546,6 +2558,7 @@ export function ChatArea({
   // smaller transcripts render all messages directly for correct scrolling.
   const virtualWindow = useVirtualWindow(
     messages.length, scrollerRef, selectedId ?? null,
+    { atBottomRef, scrollGuard },
   )
   const useVirtualization = messages.length > 500
 
@@ -2675,42 +2688,82 @@ export function ChatArea({
     return () => window.removeEventListener('hashchange', update)
   }, [])
 
-  // Track sticky-bottom state from real scroll events.
-  useEffect(() => {
-    if (hasFragment) return
+  // Apply a programmatic scroll that belongs to the current intent. The
+  // guard marks the resulting scroll event so it does not cancel that
+  // intent; a non-matching scroll clears it.
+  const applyScroll = useCallback((target: 'top' | 'bottom') => {
     const el = scrollerRef.current
     if (!el) return
-    const onScroll = () => {
-      wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-      // Load older entries when scrolled to top
-      if (el.scrollTop < 60 && hasMore && !loadingMore && loadOlder) {
-        loadOlder()
-        wasAtBottom.current = false
+    // The expected scrollTop is the CLAMPED maximum, not scrollHeight:
+    // the browser cannot scroll past scrollHeight - clientHeight, and a
+    // guard set to the unclamped value would never match the resulting
+    // event (so the button's own bottom scroll would cancel its intent).
+    const maxTop = () => Math.max(0, el.scrollHeight - el.clientHeight)
+    const top = target === 'top' ? 0 : maxTop()
+    intentScrollGuard.current = el.scrollTop === top ? null : top
+    el.scrollTo({ top: target === 'top' ? 0 : el.scrollHeight })
+    // Follow-up frame catches layout shifts from async content (code
+    // highlighting, images, markdown) that renders after commit.
+    requestAnimationFrame(() => {
+      const el2 = scrollerRef.current
+      if (!el2) return
+      const nextTop = target === 'top' ? 0 : Math.max(0, el2.scrollHeight - el2.clientHeight)
+      intentScrollGuard.current = el2.scrollTop === nextTop ? null : nextTop
+      el2.scrollTo({ top: target === 'top' ? 0 : el2.scrollHeight })
+    })
+  }, [])
+
+  // The transcript scroll listener. It measures, classifies programmatic
+  // scrolls, and feeds the pure intent reducer. It is NOT gated by
+  // `hasFragment`: deep-link mode only suppresses automatic scrolling (via
+  // the `atBottom` input below), not measurement.
+  useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    // `userInitiated` is per CALL, never per effect run: the effect
+    // re-registers whenever `loadingMore`/`hasMore` change, and resetting
+    // an "initial" flag there would exempt the first real user scroll after
+    // every chunk from cancelling a pending intent.
+    const onScroll = (userInitiated: boolean) => {
+      const scrollTop = el.scrollTop
+      // The virtual window's measurement adjustment is not a user scroll.
+      if (isSyntheticScroll(scrollTop, scrollGuard.current)) return
+      const ownScroll = isSyntheticScroll(scrollTop, intentScrollGuard.current)
+      scrollGuard.current = null
+      intentScrollGuard.current = null
+      // A real user scroll cancels any pending intent. The button's own
+      // scroll does not.
+      if (userInitiated && !ownScroll) {
+        scrollIntent.current = nextScrollIntent(scrollIntent.current, { type: 'user-scrolled' }).intent
       }
-      // When the user reaches the bottom but the loaded entries don't
-      // include the latest (e.g. after loadFromBeginning), trigger
-      // loadLatest to fetch the newest entries and enter auto-scroll
-      // mode. The triggeredLoadLatest guard prevents duplicate calls
-      // before isViewingLatest flips to true.
-      if (
-        wasAtBottom.current && !viewingLatest &&
-        !triggeredLoadLatest.current && loadLatest && !loadingMore
-      ) {
-        triggeredLoadLatest.current = true
-        pendingScrollToBottom.current = true
-        loadLatest()
+      const metrics = { scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight }
+      atBottomRef.current = isAtBottom(metrics)
+      const step = nextScrollIntent(scrollIntent.current, {
+        type: 'scrolled',
+        atTop: isNearTop(metrics),
+        atBottom: atBottomRef.current,
+        hasNewer: !viewingLatest,
+        canAutoLoadOlder: (hasMore ?? false) && !!loadOlder && !loadingMore,
+      })
+      scrollIntent.current = step.intent
+      if (step.fetch === 'older' && loadOlder && !loadingMore) {
+        loadOlder()
+      } else if (step.fetch === 'latest' && loadLatest && !loadingMore) {
+        const result = loadLatest()
+        if (result === 'unchanged' || result === 'unavailable') {
+          scrollIntent.current = null
+          applyScroll('bottom')
+        }
       }
     }
-    onScroll()
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
+    // Initial measurement: not user-initiated, so it cannot cancel the
+    // session-switch intent that the layout effect just set.
+    onScroll(false)
+    const listener = () => onScroll(true)
+    el.addEventListener('scroll', listener, { passive: true })
+    return () => el.removeEventListener('scroll', listener)
+  }, [hasMore, loadingMore, loadOlder, viewingLatest, loadLatest, applyScroll])
 
-  }, [hasFragment, hasMore, loadingMore, loadOlder, viewingLatest, loadLatest])
-  // Reset the loadLatest trigger when entries become the latest view
-  // (after loadLatest completes or on session switch).
-  useEffect(() => {
-    if (viewingLatest) triggeredLoadLatest.current = false
-  }, [viewingLatest])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2723,141 +2776,80 @@ export function ChatArea({
     if (!perf.isEnabled() || renderStartRef.current === 0) return
     const t0 = renderStartRef.current
     const commitDone = perf.begin('render.ChatArea.commit')
-    // useLayoutEffect fires after DOM commit but before paint. Measure the
-    // commit phase (render→commit).
     perf.record('render.ChatArea.commit', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'commit', n: messages.length } })
-    // Use rAF to measure the full render→paint cycle (the browser's
-    // style+layout+paint after commit).
     requestAnimationFrame(() => {
       perf.record('render.ChatArea.paint', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'paint', n: messages.length } })
       commitDone()
     })
   }, [messages])
 
-  // Track the previous session id so we can detect session changes within
-  // the auto-scroll effect. Always update it here so sessionChanged is
-  // only true on the render where the session actually changed.
+  // Track the previous session id so a session switch is detected once.
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
-  // Stays true from a session switch until we've successfully scrolled to
-  // the bottom with real messages rendered. Survives the async gap between
-  // switching to a session (cache miss → loading view) and the messages
-  // arriving (HTTP fetch completes), so the scroll fires at the right time
-  // rather than on the loading view.
-  const pendingScrollToBottom = useRef(false)
 
-  // Stays true from a "scroll to top" / loadFromBeginning click until the
-  // oldest entries arrive and we've scrolled to top: 0. Without this, the
-  // sticky-bottom effect (wasAtBottom still true from the initial load)
-  // would scroll to the BOTTOM of the newly-arrived oldest entries instead
-  // of the top — the user would see the last of the oldest chunk, not the
-  // first message (SETUP_REPO / System Prompt).
-  const pendingScrollToTop = useRef(false)
-
-  // Session-switch scroll: useLayoutEffect fires after DOM commit but
-  // BEFORE paint, so the user never sees a flash of the wrong position.
-  // This is critical for tab clicks — the user expects to see the latest
-  // messages immediately. We use scrollTo on the scroller directly (rather
-  // than scrollIntoView on the sentinel) for reliable, explicit positioning.
-  // A requestAnimationFrame follow-up catches layout shifts from async
-  // content (code highlighting, images, markdown) that render after commit.
+  // Consume the pending intent when content arrives. useLayoutEffect runs
+  // after DOM commit and before paint, so the position is applied without a
+  // flash. Not gated by `hasFragment`: an explicit button request always
+  // wins; deep links are protected by the `preserveAnchor` input instead.
   useLayoutEffect(() => {
-    if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
-      wasAtBottom.current = true
-      pendingScrollToBottom.current = true
-      // Return early — do NOT scroll on this render. The messages prop
-      // is stale: it still reflects the previous session's data because
-      // useTranscriptStream's session-load effect (which fetches the new
-      // session's entries) runs AFTER this useLayoutEffect. Scrolling now
-      // would scroll to the bottom of the WRONG session's content and
-      // clear pendingScrollToBottom, so when the new session's messages
-      // arrive on the next render, no scroll happens. The next render
-      // (triggered by setEntries in useTranscriptStream) will have the
-      // correct messages and will handle the scroll.
+      atBottomRef.current = true
+      scrollIntent.current = nextScrollIntent(scrollIntent.current, {
+        type: 'select-session',
+        preserveAnchor: hasFragment,
+      }).intent
+      // Do NOT scroll on this render: `messages` still belongs to the
+      // previous session (the transcript hook's load effect runs after this
+      // layout effect). The next render carries the correct messages.
       return
     }
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'content-arrived',
+      loading: !!loading,
+      empty: messages.length === 0,
+      atBottom: atBottomRef.current && !hasFragment,
+    })
+    scrollIntent.current = step.intent
+    if (step.scrollTo) applyScroll(step.scrollTo)
+  }, [messages, selectedSession?.id, loading, hasFragment, applyScroll])
 
-    // Scroll to the bottom when a session switch is pending and real
-    // messages are present (not loading, not empty). The pending flag
-    // survives the async gap for cache-miss sessions where messages arrive
-    // via HTTP fetch after the session id has already changed.
-    if (pendingScrollToBottom.current && !loading && messages.length > 0) {
-      const el = scrollerRef.current
-      if (el) {
-        console.log(`[chat] SCROLL-BOTTOM useLayoutEffect: scrolling to scrollHeight=${el.scrollHeight} msgs=${messages.length} loading=${loading}`)
-        el.scrollTo({ top: el.scrollHeight })
-        // Follow-up scroll on the next frame to catch layout shifts from
-        // async content rendering (code blocks, images, markdown). Use a
-        // very large value so the browser clamps to the true bottom even
-        // if scrollHeight changed after the initial scrollTo.
-        requestAnimationFrame(() => {
-          const el2 = scrollerRef.current
-          if (el2) {
-            console.log(`[chat] SCROLL-BOTTOM rAF follow-up: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
-          }
-          if (el2) el2.scrollTo({ top: 999999 })
-          if (el2) {
-            console.log(`[chat] SCROLL-BOTTOM rAF post-scroll: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
-          }
-        })
-        pendingScrollToBottom.current = false
+  // Header buttons: the pure reducer decides whether a fetch is needed.
+  const handleScrollToTop = useCallback(() => {
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'scroll-to-top',
+      atStart: !hasMore,
+    })
+    scrollIntent.current = step.intent
+    if (step.fetch === 'beginning' && loadFromBeginning) {
+      const result = loadFromBeginning()
+      if (result === 'unchanged' || result === 'unavailable') {
+        scrollIntent.current = null
+        applyScroll('top')
       }
-    } else if (pendingScrollToBottom.current && !loading && messages.length === 0) {
-      pendingScrollToBottom.current = false
+    } else if (step.scrollTo) {
+      scrollIntent.current = null
+      applyScroll(step.scrollTo)
     }
+  }, [hasMore, loadFromBeginning, applyScroll])
 
-    // Scroll to the top when a "scroll to top" / loadFromBeginning is
-    // pending and the new (oldest) entries have arrived. The pending flag
-    // survives the async gap between the button click (WS request) and
-    // the chunk arrival (setEntries → messages prop changes).
-    if (pendingScrollToTop.current && !loading && messages.length > 0) {
-      const el = scrollerRef.current
-      if (el) {
-        el.scrollTo({ top: 0 })
-        requestAnimationFrame(() => {
-          const el2 = scrollerRef.current
-          if (el2) el2.scrollTo({ top: 0 })
-        })
+  const handleScrollToBottom = useCallback(() => {
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'scroll-to-bottom',
+      atEnd: viewingLatest,
+    })
+    scrollIntent.current = step.intent
+    if (step.fetch === 'latest' && loadLatest) {
+      const result = loadLatest()
+      if (result === 'unchanged' || result === 'unavailable') {
+        scrollIntent.current = null
+        applyScroll('bottom')
       }
-      // Don't clear here — the sticky-bottom useEffect clears it after
-      // guarding against it. If we clear here, the scroll listener's
-      // onScroll() (which re-runs when hasMore changes) resets
-      // wasAtBottom before the sticky-bottom effect runs, causing an
-      // erroneous scroll-to-bottom.
-    } else if (pendingScrollToTop.current && !loading && messages.length === 0) {
-      pendingScrollToTop.current = false
+    } else if (step.scrollTo) {
+      scrollIntent.current = null
+      applyScroll(step.scrollTo)
     }
-  }, [messages, hasFragment, selectedSession?.id, loading])
-
-  // Sticky-bottom scroll for streaming messages: only auto-scroll when the
-  // user was already near the bottom. Uses scrollIntoView on the sentinel
-  // div (the existing behavior) so tests that spy on scrollIntoView remain
-  // valid. Runs in useEffect (after paint) — less timing-critical than
-  // session switches.
-  useEffect(() => {
-    if (hasFragment) return
-    if (pendingScrollToBottom.current) return
-    if (pendingScrollToTop.current) {
-      // Clear the flag here (not in useLayoutEffect) so the guard is
-      // still active when this effect runs — after the scroll listener's
-      // onScroll() may have reset wasAtBottom.
-      pendingScrollToTop.current = false
-      return
-    }
-    if (wasAtBottom.current) {
-      // Use scrollTo with a large value instead of scrollIntoView on the
-      // sentinel — the sentinel sits above the container's bottom padding
-      // (py-6 = 24px), so scrollIntoView leaves a ~23px gap. A large
-      // value is clamped by the browser to the true bottom.
-      const el = scrollerRef.current
-      if (el) {
-        console.log(`[chat] SCROLL-BOTTOM sticky useEffect: scrollHeight=${el.scrollHeight} scrollTop=${el.scrollTop} clientHeight=${el.clientHeight} atBottom=${el.scrollHeight - el.scrollTop - el.clientHeight < 80}`)
-      }
-      if (el) el.scrollTo({ top: 999999 })
-    }
-  }, [messages, hasFragment, selectedSession?.id])
+  }, [viewingLatest, loadLatest, applyScroll])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
@@ -2952,27 +2944,7 @@ export function ChatArea({
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
               aria-label="Scroll to top"
               disabled={loadingMore}
-              onClick={() => {
-                console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
-                if (hasMore && loadFromBeginning) {
-                  pendingScrollToTop.current = true
-                  wasAtBottom.current = false
-                  loadFromBeginning()
-                  // Fallback: if loadFromBeginning was a no-op (pinned
-                  // entries are the same reference → useState bails out →
-                  // no re-render → useLayoutEffect never fires →
-                  // pendingScrollToTop never consumed), do the scroll
-                  // directly after paint.
-                  requestAnimationFrame(() => {
-                    if (pendingScrollToTop.current) {
-                      scrollerRef.current?.scrollTo({ top: 0 })
-                      pendingScrollToTop.current = false
-                    }
-                  })
-                } else {
-                  scrollerRef.current?.scrollTo({ top: 0 })
-                }
-              }}
+              onClick={handleScrollToTop}
             >
               {loadingMore ? (
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -2993,50 +2965,7 @@ export function ChatArea({
               title={loadingMore ? "Loading…" : "Scroll to bottom of transcript"}
               aria-label="Scroll to bottom"
               disabled={loadingMore}
-              onClick={() => {
-                console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
-                const elDebug = scrollerRef.current
-                console.log(`[chat] SCROLL-BOTTOM pre-scroll dims: scrollTop=${elDebug?.scrollTop} scrollHeight=${elDebug?.scrollHeight} clientHeight=${elDebug?.clientHeight}`)
-                if (loadLatest) {
-                  pendingScrollToBottom.current = true
-                  wasAtBottom.current = true
-                  loadLatest()
-                  // Fallback: if loadLatest was a no-op (pinned entries
-                  // are the same reference → useState bails out → no
-                  // re-render → useLayoutEffect never fires →
-                  // pendingScrollToBottom never consumed), do the scroll
-                  // directly after paint.
-                  requestAnimationFrame(() => {
-                    if (pendingScrollToBottom.current) {
-                      const el = scrollerRef.current
-                      if (el) el.scrollTo({ top: el.scrollHeight })
-                      pendingScrollToBottom.current = false
-                    }
-                  })
-                  // Diagnostic: check if loadLatest was a no-op (same
-                  // entries reference → no re-render → useLayoutEffect
-                  // never fires → pendingScrollToBottom never consumed).
-                  // We use a microtask + timeout to check after React
-                  // would have processed state updates.
-                  queueMicrotask(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM microtask check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight}`)
-                  })
-                  setTimeout(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM 200ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
-                  }, 200)
-                  setTimeout(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM 500ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
-                  }, 500)
-                } else {
-                  const el = scrollerRef.current
-                  if (el) el.scrollTo({ top: el.scrollHeight })
-                  wasAtBottom.current = true
-                  console.log(`[chat] SCROLL-BOTTOM direct scroll to ${el?.scrollHeight}`)
-                }
-              }}
+              onClick={handleScrollToBottom}
             >
               {loadingMore ? (
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
