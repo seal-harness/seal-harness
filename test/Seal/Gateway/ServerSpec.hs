@@ -11,19 +11,22 @@ import Network.HTTP.Types (methodGet, methodPost, status200, statusCode)
 import Network.Wai
   ( Application, Request, Response, defaultRequest, pathInfo, requestMethod
   , responseLBS, responseHeaders, responseStatus )
+import Network.Wai.Handler.Warp (getHost, getPort)
 import Network.Wai.Internal (ResponseReceived (..))
+import Data.String (fromString)
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Directory (createDirectoryIfMissing)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
+import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
-import Seal.Gateway.Server (gatewayApp, isExposedBind, requestTimingMiddlewareWith)
+import Seal.Gateway.Server (gatewayApp, isExposedBind, requestTimingMiddlewareWith, warpSettingsFor)
 import Seal.Gateway.Embedded (embeddedAssetCount)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
@@ -276,3 +279,20 @@ spec = describe "Seal.Gateway.Server" $ do
     it "does not warn for loopback, which nothing off-host can reach" $
       map isExposedBind ["127.0.0.1", "::1", "localhost"]
         `shouldBe` [False, False, False]
+
+  -- ── warpSettingsFor ─────────────────────────────────────────────────
+  -- Warp's default host preference is the IPv4 wildcard, so before
+  -- 'warpSettingsFor' the configured host never reached the listener and
+  -- `seal serve` bound every interface. These assertions are the only thing
+  -- that distinguishes the two behaviours: connecting to localhost succeeds
+  -- under a wildcard bind too.
+  describe "warpSettingsFor" $ do
+    it "binds the configured host" $ do
+      getHost (warpSettingsFor defaultGatewayConfig)
+        `shouldBe` fromString "localhost"
+      getHost (warpSettingsFor defaultGatewayConfig { gcHost = "0.0.0.0" })
+        `shouldBe` fromString "0.0.0.0"
+
+    it "listens on the configured port" $
+      getPort (warpSettingsFor defaultGatewayConfig { gcPort = 9090 })
+        `shouldBe` 9090

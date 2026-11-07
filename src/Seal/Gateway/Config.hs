@@ -13,11 +13,19 @@ module Seal.Gateway.Config
   , effectiveTlsPaths
   , tlsConfigError
   , tlsOriginError
+  , gatewayHostError
+  , hostResolves
+  , gatewayHostResolutionError
   ) where
 
+import Control.Exception (IOException, try)
+import Data.Char (isSpace)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Network.Socket
+  ( AddrInfo (..), AddrInfoFlag (AI_PASSIVE), SocketType (Stream), defaultHints
+  , getAddrInfo )
 import Toml ((.=))
 import Toml qualified
 
@@ -25,7 +33,9 @@ import Toml qualified
 data GatewayConfig = GatewayConfig
   { gcPort           :: Int        -- ^ default 8080 (REST + static + the WS stream)
   , gcWsPort         :: Int        -- ^ DEPRECATED: the WS stream shares @gcPort@; kept only so old config files still parse
-  , gcHost           :: Text       -- ^ default "127.0.0.1"
+  , gcHost           :: Text
+    -- ^ default "localhost" — the one loopback name browsers treat as a
+    -- passkey-capable secure context. Handed to Warp as the bind address.
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
   , gcTlsCert        :: Maybe Text
@@ -49,7 +59,7 @@ defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
   { gcPort = 8080
   , gcWsPort = 8080
-  , gcHost = "127.0.0.1"
+  , gcHost = "localhost"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
   , gcTlsCert = Nothing
@@ -57,6 +67,72 @@ defaultGatewayConfig = GatewayConfig
   , gcTls = False
   , gcTlsHosts = []
   }
+
+-- ---------------------------------------------------------------------------
+-- Host validation
+-- ---------------------------------------------------------------------------
+--
+-- @[gateway] host@ is handed straight to Warp (see 'Seal.Gateway.Server.warpSettingsFor'),
+-- so a value that cannot bind is now a boot refusal. Before the host was wired
+-- to the listener, any string was survivable: it only fed the printed URL, the
+-- derived origins, and the exposed-bind warning.
+
+-- | A @[gateway] host@ value that could never be bound. Purely syntactic.
+--
+-- 'gatewayHostResolutionError' asks the resolver about the values that pass
+-- this check, so the two refusals stay independently testable.
+-- Every clause inspects @raw@, never a trimmed copy: the caller hands this
+-- exact string to Warp ('Seal.Gateway.Server.warpSettingsFor'), so a value that
+-- passes here has to be one the resolver will accept. Trimming first would let
+-- @host = " localhost "@ through both gates and fail inside the bind, after the
+-- banner, with a message that names neither the key nor the mistake.
+gatewayHostError :: Text -> Maybe Text
+gatewayHostError raw
+  | T.null (T.strip raw) = Just (hostRefusal "it is empty or blank" emptyFix)
+  | T.any isSpace raw    = Just (hostRefusal "it contains whitespace" spacedFix)
+  | T.any (== '/') raw   = Just (hostRefusal "it looks like a URL or a path" bareFix)
+  | T.any (`elem` bracketed) raw =
+      Just (hostRefusal "it is bracketed"
+             "write an IPv6 literal without brackets, e.g. \"::1\"")
+  | otherwise = Nothing
+  where
+    bracketed = "[]" :: String
+    emptyFix = "set a hostname (\"localhost\") or a wildcard (\"0.0.0.0\")"
+    spacedFix = "remove the surrounding or embedded whitespace: \"localhost\""
+    bareFix = "write the bare host or address, e.g. \"localhost\" or \"0.0.0.0\""
+
+hostRefusal :: Text -> Text -> Text
+hostRefusal why fix =
+  "[gateway] host is not a bindable address: " <> why <> ".\n  " <> fix
+
+-- | Does @host@ resolve to at least one address?
+--
+-- "Resolvable", not "local": Warp may legitimately bind any address this
+-- machine has, and a tailnet or LAN address is a normal @[gateway] host@ value.
+-- A name that resolves to an address the machine does not own still fails at
+-- bind time with Warp's own error; this check exists to catch typos and
+-- unusable spellings before anything starts listening.
+hostResolves :: Text -> IO Bool
+hostResolves raw = do
+  let hints = defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }
+  resolved <-
+    try (getAddrInfo (Just hints) (Just (T.unpack raw)) Nothing)
+      :: IO (Either IOException [AddrInfo])
+  pure (either (const False) (not . null) resolved)
+
+-- | The resolver-backed half of the host check.
+--
+-- The resolver is a parameter so the refusal branch is testable without DNS;
+-- @seal serve@ passes 'hostResolves'.
+gatewayHostResolutionError :: (Text -> IO Bool) -> Text -> IO (Maybe Text)
+gatewayHostResolutionError resolves raw = do
+  ok <- resolves raw
+  pure $ if ok
+    then Nothing
+    else Just
+      ("[gateway] host = \"" <> raw <> "\" does not resolve to any address.\n"
+        <> "  Fix or remove the line (the default is \"localhost\"), or set\n"
+        <> "  host = \"0.0.0.0\" to bind every interface.")
 
 -- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
 -- optional: a missing key decodes as 'Nothing', then 'withGatewayDefaults'

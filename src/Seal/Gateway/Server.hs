@@ -11,6 +11,7 @@ module Seal.Gateway.Server
   , requestTimingMiddlewareWith
   , runGateway
   , isExposedBind
+  , warpSettingsFor
   ) where
 
 import Data.ByteString.Char8 qualified as BC
@@ -19,6 +20,7 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.Char (toLower)
 import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as Map
+import Data.String (fromString)
 import Data.Text qualified as T
 import Data.Time (diffUTCTime, getCurrentTime)
 import Katip (Severity (..), ls)
@@ -28,7 +30,8 @@ import Network.HTTP.Types.Header (ResponseHeaders)
 import Network.Wai
   ( Application, pathInfo, requestMethod, responseFile
   , responseLBS, responseStatus, Response )
-import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeout, Settings)
+import Network.Wai.Handler.Warp
+  ( defaultSettings, runSettings, setHost, setPort, setTimeout, Settings )
 import Network.Wai.Handler.WarpTLS (runTLS, tlsSettings)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeExtension)
@@ -303,7 +306,7 @@ runGateway logger mAccess cfg deps guard broker = do
     logIO logger WarningS ("binding to " <> ls host
       <> " — the full slash-command surface is reachable by anything that can reach this address")
   let app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
-      warpSettings = setPort port settings
+      warpSettings = warpSettingsFor cfg
   -- TLS in-process when both PEM paths are configured, so passkeys work with
   -- no reverse proxy in front. 'tlsConfigError' has already refused the
   -- half-configured case at boot.
@@ -311,6 +314,18 @@ runGateway logger mAccess cfg deps guard broker = do
     (Just cert, Just key) ->
       runTLS (tlsSettings (T.unpack cert) (T.unpack key)) warpSettings app
     _ -> runSettings warpSettings app
+
+-- | The Warp settings for a gateway config: the port to listen on and the
+-- host to bind.
+--
+-- The host has to be passed to Warp explicitly. Warp's default host preference
+-- is the IPv4 wildcard, so a gateway configured for @localhost@ would otherwise
+-- listen on every interface — the printed URL, the WebAuthn origin and the
+-- exposed-bind warning would all describe a loopback listener that does not
+-- exist.
+warpSettingsFor :: GatewayConfig -> Settings
+warpSettingsFor cfg =
+  setHost (fromString (T.unpack (gcHost cfg))) (setPort (gcPort cfg) settings)
 
 -- | Does this bind expose the gateway beyond the local machine?
 --

@@ -73,7 +73,8 @@ import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config
-  ( GatewayConfig (..), defaultGatewayConfig, tlsConfigError, tlsEnabled, tlsOriginError
+  ( GatewayConfig (..), defaultGatewayConfig, gatewayHostError
+  , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
   , effectiveTlsPaths, withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
 
@@ -176,6 +177,21 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- pair is a boot refusal rather than a handshake failure on the first
   -- connection, where the message would be about a cipher, not a typo.
   case tlsConfigError gwCfgAccess of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  -- `host` is handed to Warp, so an unusable value is a boot refusal rather
+  -- than a string in a log line: a malformed or unresolvable host used to be
+  -- harmless (it only fed the printed URL) and now aborts inside Warp, after
+  -- the banner. Both halves run here, beside the TLS check, before anything
+  -- binds.
+  case gatewayHostError (gcHost gwCfgAccess) of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  gatewayHostResolutionError hostResolves (gcHost gwCfgAccess) >>= \case
     Just err -> do
       logIO logger ErrorS ("gateway: " <> ls err)
       ioError (userError (T.unpack err))
