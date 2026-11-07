@@ -72,6 +72,16 @@ export default async function globalSetup(): Promise<void> {
   ].join('\n')
   await writeFile(join(SEAL_HOME, 'config', 'config.toml'), configToml)
 
+  // Access control: the e2e suite drives the API directly and has no
+  // authenticator, so it runs in the explicitly-waived "none" mode. Without
+  // this the gateway would serve only the setup screen and every spec would
+  // 403.
+  await writeFile(
+    join(SEAL_HOME, 'security.toml'),
+    ['[access_control]', 'mode = "none"', ''].join('\n'),
+    { mode: 0o600 },
+  )
+
   // Spawn `nix develop --command cabal run seal -- serve`. The `--` after
   // `seal` separates cabal's run-target args from the program's own args.
   const child = spawn(

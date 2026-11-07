@@ -27,7 +27,7 @@ import Seal.Config.File
 import Seal.Config.Paths (SealPaths, configFilePath, securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig, securityConfigCodec
-  , saveSecurityConfig )
+  , WriteMode (PreserveCredentials), saveSecurityConfig )
 
 -- | One-time, idempotent migration. Examines both @config.toml@ and
 -- @security.toml@ and moves any legacy security fields from @config.toml@ to
@@ -120,7 +120,11 @@ cleanConfigToml cfgPath = do
 -- | Try to write the security config (fail-open on error).
 tryWriteSecurityConfig :: FilePath -> SecurityConfig -> IO (Either Text ())
 tryWriteSecurityConfig path cfg = do
-  result <- try @SomeException (saveSecurityConfig path cfg)
+  -- Two layers now: the write can throw, and it can refuse. Both are failures
+  -- the caller reports the same way, so they are flattened here rather than
+  -- letting a nested Either escape.
+  result <- try @SomeException (saveSecurityConfig path cfg PreserveCredentials)
   pure $ case result of
-    Left err  -> Left (T.pack (show err))
-    Right ()  -> Right ()
+    Left err         -> Left (T.pack (show err))
+    Right (Left err) -> Left err
+    Right (Right ()) -> Right ()

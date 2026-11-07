@@ -16,7 +16,9 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec (CommandSpec (..), CommandAction (..))
-import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, saveSecurityConfig)
+import Seal.Config.Security
+  ( SecurityConfig (..), WriteMode (PreserveCredentials), defaultSecurityConfig
+  , loadSecurityConfig, saveSecurityConfig )
 import Seal.Config.Paths (SealPaths (..), securityFilePath, vaultFilePath)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), VaultStatus (..), UnlockMode (..), openVault)
 import Seal.Security.Vault.Age (VaultError (..), mkMockEncryptor)
@@ -393,6 +395,7 @@ spec = describe "Seal.Vault.Commands" $ do
             -- Pre-populate security.toml with a custom vault_path.
             saveSecurityConfig (securityFilePath paths)
               (defaultSecurityConfig { scVaultPath = Just (T.pack customVaultPath) })
+              PreserveCredentials `shouldReturn` Right ()
             ref <- newIORef Nothing
             let rt = VaultRuntime paths cfgPath ref
             (fc, caps) <- makeFakeCaps ["1"]

@@ -9,14 +9,17 @@ module Seal.Command.Serve
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (catch)
 import Control.Monad (filterM, void, forever)
-import Data.Foldable (for_)
+import Data.Foldable (for_, forM_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (Manager)
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
+import System.IO (hIsTerminalDevice, stderr)
+import System.Posix.Unistd (getSystemID, nodeName)
 
 import Katip (Severity (..), ls)
 
@@ -58,12 +61,22 @@ import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.BootPlan
+  ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
+import Seal.Config.Security
+  ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
+  , untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
+import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
+import Seal.Gateway.AccessControl
+  ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+import Seal.Gateway.Config
+  ( GatewayConfig (..), defaultGatewayConfig, tlsConfigError, tlsEnabled, tlsOriginError
+  , effectiveTlsPaths, withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
+
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -76,6 +89,10 @@ import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Security.AccessControl (originHostOf)
+import Seal.Security.TlsCert
+  ( TlsCertOutcome (..), certificateExpiryWarning, ensureCertificateAt
+  , ensureGeneratedCertificate, localAddressNames, sanHostsFor, sanInputsFor )
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
@@ -118,6 +135,10 @@ runServeMainInner
 runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
+  -- Claim this SEAL_HOME for the life of the process before anything else
+  -- starts listening. The lock is advisory and kernel-held, so a previous
+  -- daemon that crashed does not block this one (design §12).
+  _serveLock <- claimSealHome paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
   -- a crashed/killed seal process so their stale entries don't accumulate
   -- (#88). Live agents are reused (the key is still loaded).
@@ -138,9 +159,97 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      logIO logger WarningS ("could not load security config: " <> ls err)
-      pure defaultSecurityConfig
+      -- Fail closed. Degrading an unparseable security.toml to the defaults
+      -- would silently reopen the access-control enrollment window on every
+      -- boot, so the gateway refuses to start and prints the diagnostics.
+      logIO logger ErrorS ("could not load security config: " <> ls err)
+      ioError (userError ("security.toml could not be parsed; refusing to start. "
+                          <> T.unpack err))
     Right c  -> pure c
+  -- Access control is resolved ONCE here, before any channel is forked or any
+  -- port is bound, so the refuse-to-start matrix (design §10) runs first.
+  let gwCfgForAccess = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
+  let gwCfgAccess = case mCliStaticDir of
+        Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
+        Nothing  -> gwCfgForAccess
+  -- TLS is validated before anything binds. A half-configured certificate/key
+  -- pair is a boot refusal rather than a handshake failure on the first
+  -- connection, where the message would be about a cipher, not a typo.
+  case tlsConfigError gwCfgAccess of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  -- TLS paths default under keys/tls, so `tls = true` is the whole
+  -- configuration. A missing pair is generated with openssl rather than left
+  -- to the operator; see 'Seal.Security.TlsCert' for why that is not a
+  -- substitute for a trusted certificate.
+  --
+  -- A pair Seal generated at the default paths is Seal's to maintain: it is
+  -- replaced when it cannot serve a browser a legal certificate. A pair the
+  -- operator pointed at with tls_cert/tls_key is never validated or replaced.
+  gwCfgTls <- if tlsEnabled gwCfgAccess
+    then do
+      let (certPath, keyPath) =
+            effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
+          managed = isNothing (gcTlsCert gwCfgAccess) && isNothing (gcTlsKey gwCfgAccess)
+          warnSelfSigned =
+            logIO logger WarningS
+              ("a generated certificate is self-signed: browsers refuse WebAuthn "
+                <> "on a certificate they do not trust, so install it on the device "
+                <> "(and mark it trusted) \8212 or replace tls_cert/tls_key with a "
+                <> "publicly-trusted pair, e.g. from `tailscale cert`.")
+      systemId <- getSystemID
+      addresses <- localAddressNames
+      let hosts = sanHostsFor
+                    (sanInputsFor gwCfgAccess
+                       (T.pack (nodeName systemId))
+                       (scAccessControl secCfg >>= acfcOrigin >>= originHostOf)
+                       addresses)
+      ensured <- (if managed then ensureGeneratedCertificate else ensureCertificateAt)
+                   certPath keyPath hosts
+      case ensured of
+        Left err -> do
+          logIO logger ErrorS ("gateway: " <> ls err)
+          ioError (userError (T.unpack err))
+        Right TlsCertUnchanged ->
+          logIO logger DebugS ("TLS certificate unchanged at " <> ls (T.pack certPath))
+        Right TlsCertCreated -> do
+          logIO logger InfoS ("generated a self-signed TLS certificate for "
+            <> ls (T.intercalate ", " hosts) <> " at " <> ls (T.pack certPath)
+            <> " (private key " <> ls (T.pack keyPath) <> ", mode 0600)")
+          warnSelfSigned
+        Right (TlsCertReplaced why) -> do
+          logIO logger WarningS
+            ("replaced the generated TLS certificate at " <> ls (T.pack certPath)
+              <> ": " <> ls why <> ".")
+          logIO logger WarningS
+            ("the previous pair is kept at " <> ls (T.pack (certPath <> ".bak"))
+              <> " and " <> ls (T.pack (keyPath <> ".bak"))
+              <> "; trust the new certificate on every device that uses this gateway.")
+          warnSelfSigned
+      expiry <- certificateExpiryWarning certPath
+      forM_ expiry (logIO logger WarningS . ls)
+      pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
+                        , gcTlsKey  = Just (T.pack keyPath) }
+    else pure gwCfgAccess
+  -- The §10 matrix runs here, before any channel is forked or port bound.
+  bootInputs <- preflight paths
+  let planResult = bootInputs >>= bootPlan (BindCoordinates (gcHost gwCfgAccess)
+                                                             (gcPort gwCfgAccess))
+  access <- case planResult of
+    Left refusal -> do
+      let reason = bootRefusalMessage refusal
+      logIO logger ErrorS ("access control: " <> ls reason)
+      ioError (userError (T.unpack reason))
+    -- Serving HTTPS makes the https origin authoritative; a verified origin
+    -- that still says http:// would fail every ceremony's origin check.
+    Right plan -> case tlsOriginError (tlsEnabled gwCfgAccess) (bpOrigin plan) of
+      Just err -> do
+        logIO logger ErrorS ("gateway: " <> ls err)
+        ioError (userError (T.unpack err))
+      Nothing -> newAccessControlHandle paths plan
+  printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
@@ -339,10 +448,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
           -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg0 = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
-      gwCfg  = case mCliStaticDir of
-        Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
-        Nothing  -> gwCfg0
+  let gwCfg = gwCfgTls
   -- The WS stream server's liveness, published through /api/health. The
   -- ref is created BEFORE the ApiDeps that reads it and is filled in by
   -- the WS server thread once it has attempted its bind. Reporting the
@@ -389,12 +495,23 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- any Origin) — overriding even the default loopback origin. For a specific
   -- host, derive the origin + prepend it to the configured list.
   let isWildcard = gcHost gwCfg == "0.0.0.0" || gcHost gwCfg == "::"
-      httpOrigins = [ "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
+      -- The scheme has to match what clients actually reach: with TLS on they
+      -- send an https Origin, and an http-only allowlist would reject the
+      -- WebSocket handshake.
+      scheme = if tlsEnabled gwCfg then "https" else "http"
+      httpOrigins = [ scheme <> "://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
                     | not isWildcard ]
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
-      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths, sgHeartbeatSeconds = 30 }
+      guard = StreamGuard
+        { sgAllowedOrigins = origins
+        , sgGlobalCap = 1024
+        , sgTabsHandle = tabsH
+        , sgPaths = paths
+        , sgHeartbeatSeconds = 30
+        , sgAccessControl = Just (naHandle access)
+        }
   -- The WS server shares the HTTP listener, so it is up as soon as the
   -- HTTP server is. Record that in the health state the /api/health
   -- endpoint publishes.
@@ -421,13 +538,9 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- via the 'seal-chat-channels' package.
   forkNewSignalChatChannel logger gwCfg mgr cfg watchState
   forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState
-  -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
-  -- mode=remote (design V6: prevents network access to the unauthenticated
-  -- updateRuntimeConfig caller).
-  let isRemote = case scUntrustedExec secCfg of
-        Just uefc -> uefcMode uefc == "remote"
-        Nothing   -> False
-  runGateway logger gwCfg isRemote deps guard broker
+  -- Run the HTTP gateway (blocks). A non-loopback bind is allowed in every
+  -- configuration; it is warned about, never refused (see 'runGateway').
+  runGateway logger (Just (naHandle access)) gwCfg deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -461,6 +574,19 @@ mkRepoTestSeam rt repoRegH agentRegH paths = do
         Nothing -> pure (Left VaultLocked)
         Just vh -> vhPut vh k v
   }
+
+-- | Take the per-@SEAL_HOME@ daemon lock for the life of this process.
+--
+-- Refuses rather than queueing: two daemons on one @SEAL_HOME@ would fight for
+-- the same port and the same transcript directories, and the second one is
+-- always a mistake. The returned lock is never released explicitly — process
+-- exit is the release.
+claimSealHome :: SealPaths -> IO ServeLock
+claimSealHome paths = do
+  locked <- acquireServeLock (serveLockPath paths)
+  case locked of
+    Left err -> ioError (userError (T.unpack err))
+    Right lock -> pure lock
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
@@ -592,3 +718,15 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
                      1000000
                       transport
                       (\chan -> runChatChannel chanCfg chan watchState)))
+
+
+-- ---------------------------------------------------------------------------
+-- Access-control boot banner
+-- ---------------------------------------------------------------------------
+
+-- | Print the boot banner through the gateway's banner module, deciding the TTY
+-- case here because only the process knows what its stderr is.
+printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
+printAccessControlBanner paths access = do
+  stderrIsTTY <- hIsTerminalDevice stderr
+  printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access

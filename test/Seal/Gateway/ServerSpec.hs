@@ -23,7 +23,7 @@ import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
-import Seal.Gateway.Server (gatewayApp, requestTimingMiddlewareWith)
+import Seal.Gateway.Server (gatewayApp, isExposedBind, requestTimingMiddlewareWith)
 import Seal.Gateway.Embedded (embeddedAssetCount)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
@@ -122,13 +122,13 @@ spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
   it "gatewayApp routes /api/health to the API" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "gatewayApp returns 404 for a non-api path with no static dir" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["foo", "bar"] })
     -- When assets are embedded: SPA fallback → 200.
     -- When no assets (fresh checkout): emptyEmbedResponse → 404.
@@ -141,35 +141,35 @@ spec = describe "Seal.Gateway.Server" $ do
   it "serveEmbedded: GET / returns 200 (index.html) when assets embedded" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
   it "serveEmbedded: GET /some/spa/route returns 200 (SPA fallback) when assets embedded" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["some", "spa", "route"] })
       status `shouldBe` 200
 
   it "serveEmbedded: GET /assets/nonexistent.js returns 404 (asset miss)" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "nonexistent.js"] })
       status `shouldBe` 404
 
   it "serveEmbedded: GET /user.profile returns 200 (SPA fallback, .profile not in assetExtensions)" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       status <- runAppStatus app (defaultRequest { pathInfo = ["user.profile"] })
       status `shouldBe` 200
 
   it "serveEmbedded: all responses have X-Content-Type-Options: nosniff" $
     when (embeddedAssetCount > 0) $ do
       deps <- mkDeps
-      let app = gatewayApp testLogger deps Nothing
+      let app = gatewayApp testLogger Nothing deps Nothing
       resp <- runAppResp app (defaultRequest { pathInfo = [] })
       responseStatus resp `shouldBe` status200
       hasHeader resp "X-Content-Type-Options" "nosniff" `shouldBe` True
@@ -178,7 +178,7 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
 
@@ -188,7 +188,7 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [".."] })
       status `shouldNotBe` 200
 
@@ -198,7 +198,7 @@ spec = describe "Seal.Gateway.Server" $ do
       BC.writeFile (dir </> "assets" </> "test.js") "console.log('hi');"
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = ["assets", "test.js"] })
       status `shouldBe` 200
 
@@ -206,19 +206,19 @@ spec = describe "Seal.Gateway.Server" $ do
     withSystemTempDirectory "seal-static-test" $ \dir -> do
       BC.writeFile (dir </> "index.html") "<html>ok</html>"
       deps <- mkDeps
-      let app = gatewayApp testLogger deps (Just dir)
+      let app = gatewayApp testLogger Nothing deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = ["nonexistent.js"] })
       status `shouldBe` 404
 
   it "gatewayApp serves /api/openapi.json as JSON" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi.json"], requestMethod = methodGet })
     status `shouldBe` 200
 
   it "gatewayApp serves /api/openapi as HTML (Swagger UI)" $ do
     deps <- mkDeps
-    let app = gatewayApp testLogger deps Nothing
+    let app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
     status `shouldBe` 200
 
@@ -259,3 +259,20 @@ spec = describe "Seal.Gateway.Server" $ do
       case logs of
         (entry : _) -> entry `shouldSatisfy` ("POST" `isInfixOf`)
         [] -> expectationFailure "expected at least one log entry"
+
+  -- The gateway used to REFUSE to bind a non-loopback address when
+  -- `untrusted_execution.mode = "remote"`. That was a compensating control for
+  -- an unauthenticated config write that could flip `remote` to `local`; the
+  -- type split removed the write, and the refusal then only pushed operators
+  -- toward `mode = "local"` — the weaker configuration, because in remote mode
+  -- the agent cannot reach the harness binary or its environment. What is left
+  -- is a warning, so the only observable decision here is whether one is
+  -- logged. A non-loopback bind is never refused.
+  describe "isExposedBind" $ do
+    it "warns for every address a remote client can reach" $
+      map isExposedBind ["0.0.0.0", "::", "192.168.0.107", "seal.example.com"]
+        `shouldBe` [True, True, True, True]
+
+    it "does not warn for loopback, which nothing off-host can reach" $
+      map isExposedBind ["127.0.0.1", "::1", "localhost"]
+        `shouldBe` [False, False, False]

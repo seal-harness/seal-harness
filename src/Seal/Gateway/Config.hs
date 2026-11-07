@@ -9,10 +9,15 @@ module Seal.Gateway.Config
   , defaultGatewayConfig
   , gatewayConfigCodec
   , withGatewayDefaults
+  , tlsEnabled
+  , effectiveTlsPaths
+  , tlsConfigError
+  , tlsOriginError
   ) where
 
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Toml ((.=))
 import Toml qualified
 
@@ -23,6 +28,20 @@ data GatewayConfig = GatewayConfig
   , gcHost           :: Text       -- ^ default "127.0.0.1"
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+  , gcTlsCert        :: Maybe Text
+    -- ^ PEM certificate chain. Set together with 'gcTlsKey' to serve HTTPS
+    -- directly, with no reverse proxy in front.
+  , gcTlsKey         :: Maybe Text
+    -- ^ PEM private key.
+  , gcTls            :: Bool
+    -- ^ Serve HTTPS. The PEM paths default to @keys\/tls\/@{cert,key}@.on.pem
+    -- under @SEAL_HOME@, so this flag alone is the whole configuration.
+  , gcTlsHosts       :: [Text]
+    -- ^ Names to put in a generated certificate's subject alternative name.
+    -- These come first, in order. Everything else is derived: the origin's
+    -- host, the bind host (if it names a machine), the machine hostname, every
+    -- local interface address, and loopback — see
+    -- 'Seal.Security.TlsCert.sanHostsFor'.
   } deriving stock (Eq, Show)
 
 -- | The compiled-in default. Loopback + port 8080 + the local origin.
@@ -33,6 +52,10 @@ defaultGatewayConfig = GatewayConfig
   , gcHost = "127.0.0.1"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
+  , gcTlsCert = Nothing
+  , gcTlsKey = Nothing
+  , gcTls = False
+  , gcTlsHosts = []
   }
 
 -- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
@@ -47,6 +70,10 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
+  <*> Toml.dioptional (Toml.text "tls_cert") .= pgcTlsCert
+  <*> Toml.dioptional (Toml.text "tls_key") .= pgcTlsKey
+  <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
+  <*> hostsCodec .= pgcTlsHosts
 
 -- | A partial gateway config where every field is optional. 'withGatewayDefaults'
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
@@ -56,6 +83,10 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
+  , pgcTlsCert        :: Maybe Text
+  , pgcTlsKey         :: Maybe Text
+  , pgcTls            :: Maybe Bool
+  , pgcTlsHosts       :: [Text]
   } deriving stock (Eq, Show)
 
 -- | Merge a partial gateway config with the compiled-in defaults, producing
@@ -72,6 +103,10 @@ withGatewayDefaults p = GatewayConfig
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)
                          then gcAllowedOrigins defaultGatewayConfig
                          else pgcAllowedOrigins p
+  , gcTlsCert        = pgcTlsCert p
+  , gcTlsKey         = pgcTlsKey p
+  , gcTls            = fromMaybe False (pgcTls p)
+  , gcTlsHosts       = pgcTlsHosts p
   }
 
 -- | Codec for the @allowed_origins@ array (a TOML array of strings).
@@ -80,3 +115,61 @@ originsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._
   where
     maybeToList Nothing   = []
     maybeToList (Just xs) = xs
+
+-- | Codec for the @tls_hosts@ array (a TOML array of strings).
+hostsCodec :: Toml.TomlCodec [Text]
+hostsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text "tls_hosts"))
+  where
+    maybeToList Nothing   = []
+    maybeToList (Just xs) = xs
+
+-- | Is the gateway configured to terminate TLS itself?
+--
+-- Serving HTTPS in-process means no reverse proxy is needed, which matters for
+-- passkeys: a WebAuthn ceremony requires a secure context, and a bare
+-- @http://@ LAN address is not one.
+tlsEnabled :: GatewayConfig -> Bool
+tlsEnabled cfg = gcTls cfg || (isJust (gcTlsCert cfg) && isJust (gcTlsKey cfg))
+
+-- | The PEM paths to load, given the defaults for this @SEAL_HOME@.
+--
+-- 'gcTls' opts in; an explicit path overrides the default; and setting both
+-- paths still turns TLS on by itself, which is the spelling the README used
+-- before the flag existed.
+effectiveTlsPaths :: FilePath -> FilePath -> GatewayConfig -> (FilePath, FilePath)
+effectiveTlsPaths defaultCert defaultKey cfg =
+  ( maybe defaultCert T.unpack (gcTlsCert cfg)
+  , maybe defaultKey T.unpack (gcTlsKey cfg) )
+
+-- | A TLS setting that cannot be served.
+--
+-- The two PEM paths are only meaningful together. A certificate without its
+-- key (or the reverse) is a typo, and saying so at boot beats failing inside
+-- the TLS handshake on the first connection.
+tlsConfigError :: GatewayConfig -> Maybe Text
+tlsConfigError cfg = case (gcTlsCert cfg, gcTlsKey cfg) of
+  (Nothing, Nothing) -> Nothing
+  (Just _, Just _)   -> Nothing
+  (Just _, Nothing)  ->
+    Just "[gateway] tls_cert is set but tls_key is not: both are required to serve HTTPS."
+  (Nothing, Just _)  ->
+    Just "[gateway] tls_key is set but tls_cert is not: both are required to serve HTTPS."
+
+-- | Is the configured origin consistent with serving HTTPS?
+--
+-- Once TLS is on, browsers reach the gateway at @https:\/\/@, so a verified
+-- origin that says @http:\/\/@ can never match: every registration and every
+-- assertion would be refused as an origin mismatch. The derived loopback
+-- origin (@http:\/\/localhost:\<port\>@) is exactly that case, so enabling TLS
+-- on a loopback bind also requires an explicit @origin@.
+tlsOriginError :: Bool -> Maybe Text -> Maybe Text
+tlsOriginError tls mOrigin
+  | not tls = Nothing
+  | otherwise = case mOrigin of
+      Nothing -> Nothing
+      Just o
+        | "https://" `T.isPrefixOf` o -> Nothing
+        | otherwise ->
+            Just ("[gateway] tls_cert/tls_key are set but [access_control] origin is \""
+                   <> o <> "\".\n  Clients will reach this gateway over https, so set origin to "
+                   <> "the https URL they use (rp_id follows from its host).")

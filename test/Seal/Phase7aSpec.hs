@@ -119,14 +119,14 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp testLogger deps Nothing
+        app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "a WS client connects, receives hello + a broadcastLists event" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
         port = 18095
     -- The WS stream is mounted in the HTTP app (single-port gateway).
     _ <- forkIO (run port (streamMiddleware guard broker fallbackApp))
@@ -180,6 +180,6 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp testLogger deps Nothing
+        app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })
     status `shouldBe` 200
