@@ -478,6 +478,9 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
         -- conversation's background sessions, if there is one. Checked
         -- here (not before routing) so a /command is never consumed as an
         -- answer.
+        -- (A plain message for the conversation's own session is forwarded
+        -- to the gateway, which answers that session's pending ask itself —
+        -- see 'answerPendingBgAsk'.)
         consumed <- answerPendingBgAsk cfg chan pendingAsks bgSessions key text
         unless consumed $
           sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
@@ -749,10 +752,10 @@ ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState think
       -- Re-target: the callback closed over 'boundSid' by value, so a
       -- FocusOp alone would leave this conversation deaf to 'sid'.
       | otherwise -> do
+          atomically (modifyTVar' wsConns (Map.delete key))
+          wcClose ws
           dbg ("[watch] ensureWsConn re-target " <> sessionIdText boundSid
                <> " -> " <> sessionIdText sid)
-          wcClose ws
-          atomically (modifyTVar' wsConns (Map.delete key))
           connectWs
     Nothing -> do
       connectWs
@@ -783,8 +786,20 @@ handleServerEvent
   -> WatchState
   -> ThinkingTabs
   -> SessionId -> ServerEvent -> IO ()
-handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs focusedSid ev =
-  case ev of
+handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs focusedSid ev = do
+  -- Staleness guard: when the WS connection for this conversation has been
+  -- re-targeted to a different session (the user changed focus via /N or
+  -- sent a message that created a new session), this callback is stale —
+  -- its 'focusedSid' no longer matches the 'boundSid' in 'wsConns'. A
+  -- stale callback must not process events: the old streaming state has
+  -- been replaced, and processing events here would send messages from
+  -- the wrong session's accumulated text (e.g. a partial reply fragment
+  -- arriving before the watch notification from the new connection).
+  conns <- readTVarIO wsConns
+  let isCurrent = case Map.lookup key conns of
+        Just (boundSid, _, _) -> boundSid == focusedSid
+        Nothing -> False
+  when isCurrent $ case ev of
     SeEntryUpdate sid val
       | sid == focusedSid ->
           withStreamingState wsConns key (\ss -> handleEntryUpdate cfg chan ss val)
@@ -1274,9 +1289,10 @@ data NewOutcome = NewOutcome
 -- orphan-session bug this work exists to fix.
 --
 -- The arguments are the CLI's (@-p\/--provider@, @-m\/--model@,
--- @-r\/--repo@), parsed by the shared 'parseNewArgs' so chat and CLI accept
--- the same flags. Message order: rebind warning, then repo failure, then the
--- confirmation.
+-- @-r\/--repo@, @-b\/--branch@), parsed by the shared 'parseNewArgs' so chat
+-- and CLI accept the same flags. @-b@ only qualifies @-r@: without a repo
+-- there is nothing to check out, so no setup is dispatched. Message order:
+-- rebind warning, then repo failure, then the confirmation.
 handleNewSession
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
@@ -1324,7 +1340,7 @@ handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker wat
         -- A rebind failure is a warning, not a failure: the session exists.
         for_ (noRebindError out) $ \e ->
           ccSend chan ("warning: /new tab rebind failed: " <> e)
-        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na)
+        mRepoErr <- setupRepoFor cfg mgr apiBase sid (naRepo na) (naBranch na)
         for_ mRepoErr $ \e -> ccSend chan ("repo setup failed: " <> e)
         ccSend chan (newConfirmation out)
 
@@ -1337,16 +1353,18 @@ newConfirmation out = case (noOldSid out, noProvider out, noModel out) of
   _ -> "new session " <> noSid out
 
 -- | Run @-r@ after a successful @/new@: resolve a registered repo id to its
--- URL, then dispatch SETUP_REPO on the NEW session. 'Nothing' when no @-r@
--- was given or the clone succeeded (success is silent).
+-- URL, then dispatch SETUP_REPO on the NEW session, carrying @-b\/--branch@
+-- through as the checkout target ('Nothing' = the remote's default branch).
+-- 'Nothing' when no @-r@ was given or the clone succeeded (success is
+-- silent).
 setupRepoFor
   :: ChatChannelConfig -> Manager -> Text -> SessionId -> Maybe Text
-  -> IO (Maybe Text)
-setupRepoFor cfg mgr apiBase sid mRepo = case mRepo of
+  -> Maybe Text -> IO (Maybe Text)
+setupRepoFor cfg mgr apiBase sid mRepo mBranch = case mRepo of
   Nothing  -> pure Nothing
   Just raw -> do
     url <- resolveRepoArg cfg mgr apiBase raw
-    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url)
+    eRes <- cccSetupRepo cfg mgr apiBase sid (setupRepoBody url mBranch)
     pure (either Just (const Nothing) eRes)
 
 -- | Resolve a @-r@ value to a git URL: an exact match on a registered repo id
@@ -1503,6 +1521,14 @@ forgetAskByPrefix pendingAsks prefix
 -- sessions with an inbound plain-text message. Returns 'True' when the
 -- message was consumed as an answer (so it must NOT be routed to the
 -- focused session).
+--
+-- Background sessions only, deliberately. The conversation's OWN (focused)
+-- session is not consulted here: a plain message for it is routed to the
+-- gateway, whose @POST \/api\/sessions\/:id\/send@ offers the text to that
+-- session's pending ask before starting a turn. That keeps the answer path
+-- working when the loop never saw the @ask@ event (a reconnect or a channel
+-- restart) and guarantees the reply never queues behind the session lock the
+-- blocked turn holds.
 --
 -- A numeric body (1-based) selects the corresponding option label; any other
 -- body is delivered verbatim -- which is what the confirmation gate needs

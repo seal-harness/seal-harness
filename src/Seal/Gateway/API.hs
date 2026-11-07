@@ -5,6 +5,8 @@ module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
   , rebindNewResponse
+  , parseSetupRepoBody
+  , handleSetupRepoResponse
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), withObject)
@@ -281,16 +283,18 @@ apiApp deps req respond =
              ]))
     -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
     -- workdir before the first turn (the web "set up repo" combo box calls
-    -- this). Shares the clone logic with the SETUP_REPO opcode via
-    -- 'cloneRepoIO'. Returns 200 {ok:true, target, status} on
-    -- cloned/noop, 409 on a conflict, 400 on an invalid url, 503 on a
-    -- clone failure. When 'adSend' is Nothing (tests without the full
-    -- runtime), returns a stub 200.
+    -- this). Body: {"url":"<git url>"} or {"url":"<git url>",
+    -- "branch":"<branch or tag>"} — the branch is optional and lands in
+    -- the SETUP_REPO dispatch payload, so the opcode clones that ref (or
+    -- switches an existing clone to it). Returns 200 {ok:true, message}
+    -- with the opcode's text result, 400 on an invalid url/branch. When
+    -- 'adSend' is Nothing (tests without the full runtime), returns a stub
+    -- 200.
     (m', ["api", "sessions", sid, "setup-repo"]) | m' == methodPost -> do
       body <- collectBody req
-      case parseRepoUrl body of
+      case parseSetupRepoBody body of
         Nothing -> respond (errJson status400 "missing or invalid 'url' field")
-        Just url -> case adSend deps of
+        Just (url, mBranch) -> case adSend deps of
           Nothing -> respond (jsonOk (object ["ok" .= True, "target" .= ("" :: Text), "status" .= ("stubbed" :: Text)]))
           Just sendDeps -> case mkSessionId sid of
             Left e -> respond (errJson status400 ("invalid session id: " <> e))
@@ -299,7 +303,7 @@ apiApp deps req respond =
               -- the frontend's session-scoped Agent dropdown re-fetches (the
               -- clone may have introduced repo-local .agents/ defs). The
               -- existing BeAgentDefsChanged event is reused (§3.6).
-              eRes <- handleSetupRepo sendDeps sId url
+              eRes <- handleSetupRepo sendDeps sId url mBranch
               when (isRight eRes) $
                 broadcastAgentDefsChanged (adBroker deps)
               respond (handleSetupRepoResponse eRes)
@@ -735,15 +739,26 @@ parseSendMessage body =
       _                 -> ""
     _ -> ""
 
--- | Parse the @url@ field from a POST /setup-repo body. Returns 'Nothing'
--- on a missing/invalid body or a non-string @url@.
-parseRepoUrl :: BL.ByteString -> Maybe Text
-parseRepoUrl body =
+-- | Parse the @url@ (required) and @branch@ (optional) fields from a POST
+-- /setup-repo body. 'Nothing' when the body is not a JSON object or @url@
+-- is missing, blank, or a non-string. The branch is 'Nothing' when the
+-- field is absent, @null@, a non-string, or blank/whitespace — only a
+-- non-blank string is a branch. Both values are returned as parsed (the
+-- SETUP_REPO input parser in 'Seal.Gateway.Send' trims and validates).
+parseSetupRepoBody :: BL.ByteString -> Maybe (Text, Maybe Text)
+parseSetupRepoBody body =
   case A.decode body :: Maybe A.Value of
     Just (A.Object o) -> case KeyMap.lookup (Key.fromText "url") o of
-      Just (A.String t) | not (T.null (T.strip t)) -> Just t
+      Just (A.String t) | not (T.null (T.strip t)) ->
+        Just (t, branchOf o)
       _ -> Nothing
     _ -> Nothing
+  where
+    -- An absent, null, non-string, or blank @branch@ means "the remote's
+    -- default branch"; a non-string is never read as a branch.
+    branchOf o = case KeyMap.lookup (Key.fromText "branch") o of
+      Just (A.String b) | not (T.null (T.strip b)) -> Just b
+      _ -> Nothing
 
 -- | Agent-metadata cache env for API-driven scans. Remote mode only —
 -- in local mode the workdir is local and the legacy crawl costs nothing.
@@ -763,10 +778,11 @@ metaCacheEnvForApi deps = case adSend deps of
       _ -> Nothing
   _ -> Nothing
 
--- | Handle @POST /api/sessions/:id/setup-repo@: build the response from the
--- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
--- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
--- url, 500 on a capability/workdir failure.
+-- | Build the @POST /api/sessions/:id/setup-repo@ response from the
+-- 'Either' returned by 'Seal.Gateway.Send.handleSetupRepo': 400 carrying
+-- the error text (invalid url/branch, unknown session, dispatch failure,
+-- clone failure) or 200 @{ok:true, message}@ carrying the opcode's text
+-- result. Exported so the mapping is unit-testable.
 handleSetupRepoResponse :: Either Text Text -> Response
 handleSetupRepoResponse eRes =
   case eRes of

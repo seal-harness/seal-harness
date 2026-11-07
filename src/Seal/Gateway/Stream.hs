@@ -31,6 +31,9 @@ module Seal.Gateway.Stream
   , extractId
   , entriesBeforeId
   , clampLimit
+  , readLimitFor
+  , shapeChunk
+  , handleRequestEntriesCore
   , sendErrorFrame
   ) where
 
@@ -378,6 +381,55 @@ extractId v = case v of
     _                 -> ""
   _ -> ""
 
+-- | How much of the transcript to read for a request-entries op.
+--
+-- A @before@ cursor must read the WHOLE transcript: the cursor can be
+-- arbitrarily far from the tail, and truncating the read makes
+-- 'entriesBeforeId' miss the cursor (empty chunk) or makes 'hasMore' lie
+-- (a partial page reports "no entries before me"). That lie is what
+-- stranded the frontend's scroll-to-top button. The initial and
+-- @__beginning__@ requests keep their bounded reads.
+readLimitFor :: Maybe Text -> Int -> ReadLimit
+readLimitFor mBefore limit = case mBefore of
+  Nothing              -> ReadLastN limit
+  Just "__beginning__" -> ReadFirstN limit
+  Just _               -> ReadAll
+
+-- | Shape the read window into the chunk to send.
+--
+-- For a @before@ cursor the window must be the full transcript (see
+-- 'readLimitFor'); 'hasMore' then means "entries exist before this chunk"
+-- and is independent of any count. For the initial and @__beginning__@
+-- requests the bounded window is already the chunk, and 'totalCount' (a
+-- conservative upper bound) decides whether anything remains.
+shapeChunk :: Maybe Text -> Int -> Int -> [A.Value] -> ([A.Value], Bool)
+shapeChunk mBefore limit totalCount window = case mBefore of
+  Nothing -> (window, totalCount > limit)
+  Just before
+    | before == "__beginning__" -> (take limit window, totalCount > limit)
+    | otherwise -> case entriesBeforeId before window of
+        Just beforeEntries ->
+          ( drop (max 0 (length beforeEntries - limit)) beforeEntries
+          , length beforeEntries > limit
+          )
+        Nothing -> ([], False)
+
+-- | Testable core of 'handleRequestEntries'. The caller supplies the reader
+-- (which must honour the 'ReadLimit') and the frame sink, so the production
+-- decision path — read mode plus chunk shaping — is exercised by tests
+-- without a live WebSocket connection.
+handleRequestEntriesCore
+  :: (ReadLimit -> IO ([A.Value], Int))
+  -> ([A.Value] -> Bool -> Int -> Maybe Text -> IO ())
+  -> Maybe Text
+  -> Int
+  -> IO ()
+handleRequestEntriesCore readEntries sendChunk mBefore limit = do
+  putStrLn $ "[ws] request-entries: limit=" <> show limit <> " mBefore=" <> show mBefore
+  (window, totalCount) <- readEntries (readLimitFor mBefore limit)
+  let (chunk, hasMore) = shapeChunk mBefore limit totalCount window
+  sendChunk chunk hasMore totalCount mBefore
+
 -- | Handle a @request-entries@ op: read the transcript from disk, slice it
 -- to the requested chunk, and send an @entries-chunk@ event. Includes a
 -- catch handler so a corrupt/missing transcript sends an error frame
@@ -387,60 +439,34 @@ handleRequestEntries :: Connection -> SealPaths -> RequestEntriesOp -> IO ()
 handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
   case mkSessionId sidTxt of
     Left _ -> sendErrorFrame conn "invalid session id"
-    Right sid -> do
-      let go = do
-            mMeta <- loadSessionMeta paths sid
-            let model = maybe "" smModel mMeta
-                fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-                limit = clampLimit mLimit
-            putStrLn $ "[ws] handleRequestEntries: limit=" <> show limit <> " mBefore=" <> show mBefore
-            -- Use the paginated read to avoid loading all entries into
-            -- memory. For the initial chunk (mBefore == Nothing), read
-            -- only the last `limit` entries. For before/id pagination,
-            -- read a wider window. For __beginning__, we need the FIRST
-            -- entries — use ReadFirstN to read only the first `limit`
-            -- entries instead of loading the entire transcript.
-            (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
-              (case mBefore of
-                Nothing              -> ReadLastN limit
-                Just "__beginning__" -> ReadFirstN limit
-                Just _               -> ReadLastN (limit * 3))
-            -- totalCount comes from the timings (full entry count before
-            -- limiting), NOT from length allEntries (which is the limited count).
-            let totalCount = ttEntryCount tt
-                (chunk, hasMore) = case mBefore of
-                  Nothing ->
-                    -- allEntries already contains only the last `limit`
-                    -- entries; the chunk is all of them, hasMore = totalCount > limit
-                    (allEntries, totalCount > limit)
-                  Just before ->
-                   if before == "__beginning__"
-                     -- allEntries already contains only the first `limit`
-                     -- entries (ReadFirstN); no take needed.
-                     then (allEntries, totalCount > limit)
-                     else
-                    case entriesBeforeId before allEntries of
-                      Just beforeEntries ->
-                        let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries
-                            hasMoreBefore = length beforeEntries > limit
-                        in (taken, hasMoreBefore)
-                      Nothing -> ([], False)
-            sendTextData conn (A.encode (A.object
-              [ "type" A..= ("entries-chunk" :: Text)
-              , "sessionId" A..= sidTxt
-              , "entries" A..= chunk
-              , "hasMore" A..= hasMore
-              , "totalCount" A..= totalCount
-              , "requestBefore" A..= mBefore
-              ]))
-      go `catch` \(e :: SomeException) -> do
-        globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
-        sendTextData conn (A.encode (A.object
-          [ "type" A..= ("entries-chunk" :: Text)
-          , "sessionId" A..= sidTxt
-          , "entries" A..= ([] :: [A.Value])
-          , "requestBefore" A..= mBefore
-          ]))
+    Right sid ->
+      handleRequestEntriesCore (readEntries sid) sendChunk
+        mBefore (clampLimit mLimit)
+        `catch` \(e :: SomeException) -> do
+          globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
+          sendTextData conn (A.encode (A.object
+            [ "type" A..= ("entries-chunk" :: Text)
+            , "sessionId" A..= sidTxt
+            , "entries" A..= ([] :: [A.Value])
+            , "requestBefore" A..= mBefore
+            ]))
+  where
+    readEntries sid rlim = do
+      mMeta <- loadSessionMeta paths sid
+      let model = maybe "" smModel mMeta
+          fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
+      (entries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid rlim
+      pure (entries, ttEntryCount tt)
+
+    sendChunk chunk hasMore totalCount before =
+      sendTextData conn (A.encode (A.object
+        [ "type" A..= ("entries-chunk" :: Text)
+        , "sessionId" A..= sidTxt
+        , "entries" A..= chunk
+        , "hasMore" A..= hasMore
+        , "totalCount" A..= totalCount
+        , "requestBefore" A..= before
+        ]))
 
 -- | Return entries before the entry with id @before@ (exclusive).
 -- Returns 'Nothing' when the id is not found (distinct from

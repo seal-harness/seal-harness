@@ -874,6 +874,67 @@ describe('App — slash bubble inline ordering', () => {
   })
 })
 
+// ── A plain reply consumed as an ASK_HUMAN answer ─────────────────────────
+// A chat channel with no answer buttons (Signal, Telegram) can only answer a
+// pending ASK_HUMAN by sending plain text. The gateway now resolves that text
+// as the answer and returns kind:"answer" instead of starting a turn — so NO
+// transcript entry ever arrives for it. The optimistic pending bubble is
+// cleared by transcript growth, which never happens: it must be cleared on a
+// kind:"answer" response too, and the "✓ <answer>" confirmation must be shown
+// as a transient bubble (the same slot slash-command output uses).
+describe('App — plain reply consumed as an ask answer', () => {
+  it('clears the pending bubble and shows the ✓ confirmation for kind:"answer"', async () => {
+    const transcript = [
+      makeEntry({ id: 'e1', timestamp: '2024-06-01T12:00:00Z',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'first message' }] }] }) }),
+    ]
+    const json = (body: unknown) =>
+      new globalThis.Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      if (url === '/api/agents') return json([])
+      if (url === '/api/providers') return json([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }])
+      if (url === '/api/providers/anthropic/models') return json([{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }])
+      if (url === '/api/sessions' && method === 'GET') return json([makeSession({ id: 'sess-ask', description: 'Ask Sess' })])
+      if (url === '/api/sessions/archived') return json([])
+      if (url === '/api/tabs') return json([])
+      if (url === '/api/harnesses' || url === '/api/harnesses/discover') return json([])
+      if (url.includes('/api/sessions/sess-ask/transcript') && method === 'GET') return json(transcript)
+      if (url === '/api/sessions/sess-ask/send' && method === 'POST') {
+        // The message answered a pending question: no turn, no WS entry.
+        return json({ kind: 'answer', response: '✓ main' })
+      }
+      if (url.includes('/questions')) return json([])
+      return json({})
+    }))
+    render(<App />)
+    const row = await screen.findByText('Ask Sess', {}, { timeout: 4000 })
+    fireEvent.click(row)
+    await screen.findByText('first message')
+
+    const textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: '1' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.some((c) => c.url === '/api/sessions/sess-ask/send')).toBe(true)
+    })
+    // The confirmation is surfaced ...
+    await waitFor(() => {
+      expect(screen.getByTestId('slash-bubble')).toBeTruthy()
+    })
+    expect(screen.getByText('✓ main')).toBeTruthy()
+    // ... labelled as an answer, not as command output ...
+    expect(screen.getByText(/sent as the answer/)).toBeTruthy()
+    expect(screen.queryByText(/command output/)).toBeFalsy()
+    // ... and the optimistic pending bubble is gone (no turn will ever
+    // produce the transcript entry that normally clears it).
+    await waitFor(() => {
+      expect(document.querySelector('.typing-dot')).toBeFalsy()
+    })
+  })
+})
+
 // ── Pending message must not cross sessions ──────────────────────────────
 // When the user sends a message in session A and switches to session B
 // before the response arrives, the optimistic pending message (and its

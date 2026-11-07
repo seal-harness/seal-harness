@@ -48,6 +48,7 @@ module Seal.Handles.AskReply
   , deliverNextAnswer
   , deliverNextAnswerAny
   , deliverNextAnswerResolved
+  , deliverNextAnswerResolvedId
   , deliverNextAnswerResolvedAny
   , findByAskIdPrefix
   , cancelAsk
@@ -536,10 +537,30 @@ resolveOptionIndex body opts =
 -- of the original @resolveStockIndex@ design). 'T.strip' is applied before
 -- parsing; @02@ → 2 is accepted. Out-of-range numbers, non-numeric text,
 -- and asks with no options are delivered as-is ("Other"). Returns
--- @(deliveredText, accepted)@.
+-- @(deliveredText, accepted)@. Use 'deliverNextAnswerResolvedId' when the
+-- caller also needs the answered question's 'AskId'.
 deliverNextAnswerResolved :: AskReplyStore -> SessionId -> Text -> IO (Text, Bool)
 deliverNextAnswerResolved store sid body = do
-  mResult <- atomically $ do
+  mResult <- deliverNextAnswerResolvedId store sid body
+  pure (case mResult of
+    Just (_, resolved, accepted) -> (resolved, accepted)
+    Nothing                      -> (body, False))
+
+-- | 'deliverNextAnswerResolved' plus the 'AskId' of the question that was
+-- resolved. The gateway's @POST \/api\/sessions\/:id\/send@ path needs the id
+-- so it can broadcast @ask_resolved@ (which dismisses the question in the web
+-- UI). Reading the id first and delivering second would reintroduce the
+-- TOCTOU race the single-transaction design exists to remove, so both the
+-- resolution and the id come out of one STM transaction.
+--
+-- 'Nothing' when the session has no pending question — the body was not an
+-- answer. 'Just' carries @(question id, resolved text, accepted)@: on a
+-- concurrent resolution the question is dropped and @accepted@ is 'False'
+-- (the text was not delivered).
+deliverNextAnswerResolvedId
+  :: AskReplyStore -> SessionId -> Text -> IO (Maybe (AskId, Text, Bool))
+deliverNextAnswerResolvedId store sid body =
+  atomically $ do
     m <- readTVar (arsPending store)
     let matching = filter (\pa -> paSession pa == sid)
                   $ sortByCreatedAt (Map.elems m)
@@ -553,12 +574,9 @@ deliverNextAnswerResolved store sid body = do
           won <- tryPutTMVar slot (Right reply')
           if won
             then writeTVar (arsPending store) (Map.delete (paId pa) m)
-                 >> pure (Just (resolved, True))
+                 >> pure (Just (paId pa, resolved, True))
             else writeTVar (arsPending store) (Map.delete (paId pa) m)
-                 >> pure (Just (resolved, False))
-  pure (case mResult of
-    Just (resolved, accepted) -> (resolved, accepted)
-    Nothing                   -> (body, False))
+                 >> pure (Just (paId pa, resolved, False))
 
 -- | The session-agnostic counterpart of 'deliverNextAnswerResolved' (mirrors
 -- 'deliverNextAnswerAny'). Finds the oldest pending ask across /all/ sessions

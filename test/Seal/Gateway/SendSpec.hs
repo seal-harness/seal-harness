@@ -10,6 +10,7 @@ import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (void, when)
 import Data.Aeson qualified as A
+import Data.Aeson ((.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
@@ -27,6 +28,7 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Options.Applicative qualified as Opt
 import Options.Applicative (ParserResult (..))
 import Test.Hspec
@@ -41,15 +43,18 @@ import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Core.TurnEngine (TurnAdapter (..), TurnDeps (..), TurnOutcome (..), buildStartWiring, runSessionTurn)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps
+  , sendOutcomeJson, handleSetupRepo, setupRepoInput, validateSetupRepoArgs )
+import Seal.Tools.Args (branchNameText)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply
-  ( QuestionOption (..), deliverAnswer, newAskReplyStore
-  , newApprovalCache, pendingForSession, PendingQuestionInfo (..)
-  , AskReply (..), ApprovalScope (..), askIdText, askHumanWithOptions )
+  ( AskOutcome, AskReply (..), AskReplyStore, ApprovalScope (..)
+  , QuestionOption (..), askHumanWithOptions, askIdText, deliverAnswer
+  , newApprovalCache, newAskReplyStore, pendingForSession
+  , PendingQuestionInfo (..) )
 import Data.ByteString.Lazy qualified as BL
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -98,6 +103,7 @@ stubMint = pure SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  , smRepoBranch = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
   }
@@ -259,7 +265,7 @@ mkSendDepsWith paths resolveStub = do
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
   testRepeatReg <- newSessionRepeatRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -316,7 +322,7 @@ seedSessionChannel :: SealPaths -> Text -> SessionId -> IO ()
 seedSessionChannel paths channel sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 -- | Seed a session.json on disk for the given sid (channel @web@).
@@ -825,6 +831,119 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           _ -> expectationFailure "expected one pending ask"
         takeMVar done
 
+  -- The reported production failure: a chat channel with no answer buttons
+  -- (Signal) received an ASK_HUMAN question, and every reply the human sent
+  -- afterwards vanished until the question was answered in the web UI.
+  -- POST /send forked a turn; a turn on a session whose running turn is
+  -- parked inside ASK_HUMAN blocks on the session write lock until the
+  -- question is answered -- so the reply queued forever behind the very
+  -- turn it was supposed to unblock. /send now offers a plain message as
+  -- the answer to a pending question first, and only starts a turn when
+  -- there is none.
+  describe "handleSend delivering a plain reply to a pending ASK_HUMAN" $ do
+    -- Register a pending ASK_HUMAN for the session and block until it is in
+    -- the store ('askHumanCore' registers before firing notify, so this is
+    -- deterministic, unlike a threadDelay). Returns an action yielding the
+    -- answer the blocked agent-loop thread received.
+    let forkPendingAsk :: AskReplyStore -> SessionId -> Text -> [QuestionOption]
+                       -> IO (IO (Either AskOutcome Text))
+        forkPendingAsk store sid q opts = do
+          registered <- newEmptyMVar
+          answered   <- newEmptyMVar
+          _ <- forkIO $ do
+            r <- askHumanWithOptions store sid q opts
+                   (\_ -> putMVar registered ())
+            putMVar answered r
+          takeMVar registered
+          pure (takeMVar answered)
+        askPaths tmp = SealPaths
+          { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+          , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        branchOpts = [ QuestionOption "main" "the default branch"
+                     , QuestionOption "develop" "the integration branch"
+                     ]
+
+    it "consumes an open-ended reply as the answer instead of starting a turn" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records every call: a turn started for this
+        -- message would be visible here (and would deadlock in production).
+        recRef <- newIORef []
+        firstRef <- newIORef True
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-099"
+            reply = "Hi, I'm Doug. I care about software quality." :: Text
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "What is your content focus?" []
+        outcome <- handleSend sendDeps sid reply
+        outcome `shouldBe` SendAnswer reply
+        -- The blocked agent-loop thread received the reply ...
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right reply)
+        -- ... the question is gone ...
+        pendingForSession (sdAskReply sendDeps) sid `shouldReturn` []
+        -- ... and no turn was started.
+        threadDelay 200000
+        readIORef recRef `shouldReturn` []
+
+    it "resolves a numbered reply to the chosen option's label" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        firstRef <- newIORef True
+        recRef <- newIORef []
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-100"
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid "2"
+        outcome `shouldBe` SendAnswer "develop"
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right "develop")
+
+    it "never consumes a slash command as an answer" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records nothing (the turn is not run) — the
+        -- slash command must still route as a command.
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-101"
+            store = sdAskReply sendDeps
+        seedSession paths sid
+        _ <- forkPendingAsk store sid "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid "/0"
+        case outcome of
+          SendSlash _ _ -> pure ()
+          other -> expectationFailure
+            ("expected SendSlash (not consumed as an answer), got " <> show other)
+        -- The question is still answerable.
+        ps <- pendingForSession store sid
+        length ps `shouldBe` 1
+        mapM_ (\info ->
+          void (deliverAnswer store (pqiId info) (AskReply ScopeOnce "main"))) ps
+
+    it "encodes a delivered answer as kind=answer with a ✓ confirmation" $ do
+      let (code, body) = sendOutcomeJson (SendAnswer "develop")
+      code `shouldBe` 200
+      fmap (KeyMap.lookup (fromText "kind")) (asObject body)
+        `shouldBe` Just (Just (A.String "answer"))
+      fmap (KeyMap.lookup (fromText "response")) (asObject body)
+        `shouldBe` Just (Just (A.String "✓ develop"))
+
   -- Integration test for the repo agents.md auto-bind feature. This is the
   -- gateway-level end-to-end test the user asked for: it exercises the SAME
   -- handleSend → plainTurn → autoBindRepoAgent → resolveSystemPrompt path the
@@ -861,7 +980,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -949,7 +1068,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -988,7 +1107,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid "tell me about yourself"
@@ -1627,7 +1746,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let td = (mkWebTurnDeps deps)
               { tdOnTurnEnd = Just (\_ ->
                   sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
         done <- newEmptyMVar
         _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -1640,10 +1759,75 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         _ <- takeMVar done
         readIORef hookRef `shouldReturn` Nothing
 
+  -- ── WU-3: the optional @branch@ on the web setup-repo path. The pure
+  -- payload/validation helpers are pinned directly; 'handleSetupRepo' is
+  -- pinned on its early-reject arm — validation runs BEFORE the session
+  -- lookup, so an invalid branch never touches the session store.
+  describe "setup-repo branch plumbing (WU-3)" $ do
+    let goodUrl = "https://github.com/o/r" :: Text
+
+    describe "setupRepoInput" $ do
+      it "omits the branch key when no branch is requested" $
+        setupRepoInput goodUrl Nothing
+          `shouldBe` A.object ["url" .= goodUrl]
+
+      it "omits the branch key for a blank branch (never a null branch)" $
+        setupRepoInput goodUrl (Just "   ")
+          `shouldBe` A.object ["url" .= goodUrl]
+
+      it "dispatches the trimmed branch when one is requested" $
+        setupRepoInput goodUrl (Just "  dev ")
+          `shouldBe` A.object ["url" .= goodUrl, "branch" .= ("dev" :: Text)]
+
+      it "has no branch key at all when no branch is requested" $
+        case setupRepoInput goodUrl Nothing of
+          A.Object o -> KeyMap.member (fromText "branch") o `shouldBe` False
+          other      -> expectationFailure ("expected an object, got " <> show other)
+
+    describe "validateSetupRepoArgs" $ do
+      it "rejects a branch the opcode parser rejects" $
+        validateSetupRepoArgs goodUrl (Just "bad branch")
+          `leftContaining` "invalid branch"
+
+      it "rejects HEAD (it names a commit, not a branch)" $
+        validateSetupRepoArgs goodUrl (Just "HEAD")
+          `leftContaining` "invalid branch"
+
+      it "treats a blank branch as absent" $
+        fmap (fmap (fmap branchNameText)) (validateSetupRepoArgs goodUrl (Just "   "))
+          `shouldBe` Right (goodUrl, Nothing)
+
+      it "returns the validated, trimmed branch" $
+        fmap (fmap (fmap branchNameText)) (validateSetupRepoArgs goodUrl (Just " dev "))
+          `shouldBe` Right (goodUrl, Just "dev")
+
+      it "still rejects an invalid url" $
+        validateSetupRepoArgs "not-a-url" Nothing
+          `leftContaining` "invalid url"
+
+    it "handleSetupRepo rejects an invalid branch before any session lookup" $
+      withSystemTempDirectory "seal-setup-repo" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef ([] :: [CompletionResponse])
+        deps <- mkSendDeps paths providerRef
+        -- The sid is *shaped* validly but has no session.json on disk: had
+        -- the handler looked the session up first, the error would have been
+        -- "session not found" rather than the branch diagnostic.
+        res <- handleSetupRepo deps (mkSid "no-such-session") goodUrl (Just "bad branch")
+        res `leftContaining` "invalid branch"
+
 -- | Discriminate a ParserResult Success for informative failure messages.
 isSuccess :: ParserResult a -> Bool
 isSuccess (Success _) = True
 isSuccess _           = False
+
+-- | 'Left' whose message contains the given substring.
+leftContaining :: Either Text a -> Text -> Expectation
+leftContaining eRes needle = case eRes of
+  Left err -> err `shouldSatisfy` T.isInfixOf needle
+  Right _  -> expectationFailure ("expected Left containing " <> T.unpack needle)
 
 -- | Extract the first content block's text from a streaming entry-update JSON.
 -- Used by the ccSend streaming test to assert the accumulated text.
@@ -1716,6 +1900,6 @@ runWithRecordedHook deps sid = do
   let td = (mkWebTurnDeps deps)
         { tdOnTurnEnd = Just (\_ ->
             sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
   outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
   pure (outcome, hookRef)

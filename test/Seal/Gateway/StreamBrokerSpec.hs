@@ -11,7 +11,7 @@ import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time (getCurrentTime, addUTCTime)
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (TVar, atomically, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar')
 import Control.Exception (Exception, throwIO)
 import Control.Monad (void)
 import System.Timeout (timeout)
@@ -190,24 +190,27 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     count `shouldBe` 1
 
   -- ── reconcileStaleThinking ──────────────────────────────────────────
-
+  --
+  -- The stale-thinking sweep must never clear a session that is still
+  -- working: the web sidebar, the chat channels' /watch set, and the /bg
+  -- connection all treat "harness-status: idle" as "the turn is over".
+  -- (Regression: a 34-minute turn was cleared at the 30-minute mark while
+  -- it was still streaming tool calls, so the tab jumped to the top of
+  -- Active Tabs as idle-unread and sat there until the turn really ended.)
   describe "Seal.Gateway.StreamBroker.reconcileStaleThinking" $ do
-    it "clears sessions that have been thinking longer than the threshold" $ do
+    it "clears sessions that have been SILENT longer than the threshold" $ do
       broker <- newStreamBroker 10
       setThinking broker (mkSid "stale") True
-      -- Manually backdate the thinking timestamp so it's older than 1 second.
-      now <- getCurrentTime
-      atomically $ writeTVar (sbThinking broker)
-        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
-      cleared <- reconcileStaleThinking broker 60
+      backdateThinking broker (mkSid "stale") 120
+      cleared <- reconcileStaleThinking broker notBusy 60
       cleared `shouldBe` Set.fromList [mkSid "stale"]
       remaining <- thinkingSessions broker
       Set.null remaining `shouldBe` True
 
-    it "does NOT clear sessions that started thinking recently" $ do
+    it "does NOT clear sessions whose last activity is recent" $ do
       broker <- newStreamBroker 10
       setThinking broker (mkSid "fresh") True
-      cleared <- reconcileStaleThinking broker 3600
+      cleared <- reconcileStaleThinking broker notBusy 3600
       Set.null cleared `shouldBe` True
       remaining <- thinkingSessions broker
       remaining `shouldBe` Set.fromList [mkSid "fresh"]
@@ -217,19 +220,85 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
       ref <- newIORef ([] :: [BrokerEvent])
       void $ subscribeTest broker (mkSid "stale") (\e -> modifyIORef' ref (e :))
       setThinking broker (mkSid "stale") True
-      now <- getCurrentTime
-      atomically $ writeTVar (sbThinking broker)
-        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
-      void $ reconcileStaleThinking broker 60
+      backdateThinking broker (mkSid "stale") 120
+      void $ reconcileStaleThinking broker notBusy 60
       events <- readIORef ref
       -- BeActivity is all-subscriber, so the subscriber focused on "stale"
       -- receives the idle event.
       any isIdleActivity events `shouldBe` True
-      where
-        isIdleActivity (BeActivity _ payload) =
-          case payload of
-            A.Object o -> case KM.lookup "status" o of
-              Just (A.String "idle") -> True
-              _ -> False
-            _ -> False
-        isIdleActivity _ = False
+
+    -- The reported bug: a long turn that keeps producing output must not be
+    -- declared idle just because the turn itself is old. Every
+    -- session-scoped broadcast refreshes the stamp, so the sweep measures
+    -- silence, not turn duration.
+    it "does NOT clear a silent-looking session that just produced activity" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "busy") True
+      backdateThinking broker (mkSid "busy") 120
+      -- A tool-call activity: what a running turn emits constantly.
+      broadcast broker (BeActivity (mkSid "busy") (object
+        [ "kind" .= ("tool-call" :: T.Text)
+        , "tool" .= ("BASH" :: T.Text)
+        ]))
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+      remaining <- thinkingSessions broker
+      remaining `shouldBe` Set.fromList [mkSid "busy"]
+
+    it "counts a recorded transcript entry as activity" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "busy") True
+      backdateThinking broker (mkSid "busy") 120
+      broadcast broker (BeEntryRecorded (mkSid "busy") (object ["id" .= ("e1" :: T.Text)]))
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+
+    -- Second guard: the caller's busy predicate (turn in flight, or
+    -- background children still running). A session parked on a long silent
+    -- sub-agent run is alive, not stale.
+    it "does NOT clear a silent session the caller reports as busy" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "parked") True
+      backdateThinking broker (mkSid "parked") 120
+      cleared <- reconcileStaleThinking broker (\_ -> pure True) 60
+      Set.null cleared `shouldBe` True
+      remaining <- thinkingSessions broker
+      remaining `shouldBe` Set.fromList [mkSid "parked"]
+
+    it "restarts the clock of a busy session so a later sweep leaves it alone" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "parked") True
+      backdateThinking broker (mkSid "parked") 120
+      void (reconcileStaleThinking broker (\_ -> pure True) 60)
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+
+    -- An entry frame arriving after the idle broadcast must not resurrect
+    -- the session in the thinking set (there is nothing to keep alive).
+    it "does not re-add a session that already broadcast idle" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "done") True
+      setThinking broker (mkSid "done") False
+      broadcast broker (BeEntryRecorded (mkSid "done") (object ["id" .= ("e1" :: T.Text)]))
+      remaining <- thinkingSessions broker
+      Set.null remaining `shouldBe` True
+    where
+      notBusy :: SessionId -> IO Bool
+      notBusy _ = pure False
+
+      -- Backdate a thinking session's last-activity stamp so it looks
+      -- silent to the sweep.
+      backdateThinking :: StreamBroker -> SessionId -> Int -> IO ()
+      backdateThinking broker sid secondsAgo = do
+        now <- getCurrentTime
+        atomically $ modifyTVar' (sbThinking broker)
+          (Map.adjust (const (addUTCTime (negate (fromIntegral secondsAgo)) now)) sid)
+
+      isIdleActivity :: BrokerEvent -> Bool
+      isIdleActivity (BeActivity _ payload) =
+        case payload of
+          A.Object o -> case KM.lookup "status" o of
+            Just (A.String "idle") -> True
+            _                      -> False
+          _ -> False
+      isIdleActivity _ = False

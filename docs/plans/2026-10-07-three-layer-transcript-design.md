@@ -1,6 +1,11 @@
 # Three-Layer Transcript Rendering Architecture
 
-## Status: Draft — Design Review Gate Round 2
+## Status: Partially implemented (scroll layer only)
+<!-- 2026-11-04: the scroll/view half of this design landed incrementally in
+     docs/plans/2026-11-04-transcript-scroll-purity-plan.md — window extent
+     (atStart/atEnd) in a pure reducer, a single scroll intent driven by a
+     pure reducer, and pure virtual-window math. The Layer 1 data cache and
+     Layer 2 message cache below are still unimplemented. -->
 ## Issue: TBD (created after design approval)
 
 ## Problem

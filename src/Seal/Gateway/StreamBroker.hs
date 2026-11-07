@@ -24,6 +24,7 @@ module Seal.Gateway.StreamBroker
   , subscriberCount
   , thinkingSessions
   , setThinking
+  , touchThinking
   , reconcileStaleThinking
   ) where
 
@@ -36,11 +37,16 @@ import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import System.Timeout (timeout)
 
+import Katip (Severity (..), ls)
+
+import Seal.Core.Types (sessionIdText)
 import Seal.Gateway.Types.Core (SessionId)
 import Seal.Gateway.Types.Stream (BrokerEvent (..))
+import Seal.Logging.Global (globalLogIO)
 
 -- | The per-subscriber state: the focused session (via an 'TVar' so the
 -- connection thread can update it on focus without re-subscribing), a
@@ -60,9 +66,11 @@ data Subscriber = Subscriber
 -- a freshly-connected web client can hydrate its sidebar without waiting
 -- for the next harness-status event (which would only arrive at the next
 -- turn boundary — leaving a mid-turn refresh stuck on Idle). The thinking
--- map records /when/ thinking started so 'reconcileStaleThinking' can
--- detect sessions stuck longer than a threshold (e.g. an unanswered
--- ASK_HUMAN blocking the turn indefinitely).
+-- map records /when the session was last seen doing something/ (turn
+-- start via 'setThinking', then every session-scoped broadcast via
+-- 'touchThinking') so 'reconcileStaleThinking' can tell a quiet session
+-- from a stalled one — a long turn that keeps emitting tool calls is
+-- working, not stuck.
 data StreamBroker = StreamBroker
   { sbSubs :: TVar [Subscriber]
   , sbCap :: Int
@@ -149,8 +157,14 @@ updateSubscriberSession ref sid = atomically (writeTVar ref sid)
 -- The close action is best-effort (swallowed if it throws) so a failure
 -- during cleanup never propagates to the caller (e.g. a @seal serve@
 -- request thread running 'triggerBroadcast' after a slash command).
+--
+-- Every session-scoped event is also proof of life for that session's
+-- turn: it refreshes the session's last-activity stamp (see
+-- 'touchThinking') so the stale-thinking sweep measures /silence/, not
+-- turn duration.
 broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
+  forM_ (eventSession event) (touchThinking broker)
   subs <- readTVarIO (sbSubs broker)
   live <- filterM (deliverTo event) subs
   -- Drop any subscribers whose send threw OR timed out (dead / slow
@@ -207,6 +221,24 @@ broadcast broker event = do
       subSid <- readTVarIO (subSessionRef s)
       pure (subSid == sid)
 
+-- | The session a broker event pertains to, if any. Used by 'broadcast'
+-- to refresh the session's last-activity stamp. 'BeListsSnapshot' and the
+-- three global invalidation signals are not session-scoped; the legacy
+-- 'BeHarnessStatus' (never emitted by the current dispatch path) carries
+-- no session id either.
+eventSession :: BrokerEvent -> Maybe SessionId
+eventSession = \case
+  BeEntryRecorded sid _ -> Just sid
+  BeEntryUpdate sid _   -> Just sid
+  BeAsk sid _           -> Just sid
+  BeAskResolved sid _   -> Just sid
+  BeActivity sid _      -> Just sid
+  BeHarnessStatus _     -> Nothing
+  BeListsSnapshot _     -> Nothing
+  BeAgentDefsChanged    -> Nothing
+  BeSkillsChanged       -> Nothing
+  BeReposChanged        -> Nothing
+
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()
 broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)
@@ -238,41 +270,92 @@ thinkingSessions broker =
 
 -- | Add ('True') or remove ('False') a session from the thinking set.
 -- Idempotent. Called by 'broadcastHarnessStatus' so the broker's
--- in-memory state mirrors the events it fans out. When adding, records
--- the current time so 'reconcileStaleThinking' can detect sessions that
--- have been stuck thinking longer than a threshold (e.g. an unanswered
--- ASK_HUMAN blocking the turn indefinitely — session
--- 20260912-183908-767 issue #3).
+-- in-memory state mirrors the events it fans out. When adding, stamps the
+-- session with the current time (its first "sign of life"); every later
+-- session-scoped broadcast refreshes it via 'touchThinking'.
 setThinking :: StreamBroker -> SessionId -> Bool -> IO ()
 setThinking broker sid thinking = do
   now <- getCurrentTime
   atomically $ modifyTVar' (sbThinking broker)
     (\m -> if thinking then Map.insert sid now m else Map.delete sid m)
 
--- | Remove sessions that have been in the thinking set longer than the
--- given threshold (in seconds). Returns the set of sessions that were
--- cleared. Broadcasts an @idle@ harness-status for each cleared session
--- so the web frontend updates. This is a safety net: a session blocked
--- on an unanswered ASK_HUMAN (or a dead provider connection that slipped
--- past the stream timeout) leaves the session permanently thinking in
--- the broker's in-memory state. Without reconciliation, a page refresh
--- shows the session as thinking forever.
-reconcileStaleThinking :: StreamBroker -> Int -> IO (Set SessionId)
-reconcileStaleThinking broker maxAgeSec = do
+-- | Refresh a thinking session's last-activity stamp. Called by
+-- 'broadcast' for every session-scoped event (a recorded entry, an entry
+-- update, a tool-call activity, an ask), so the stale-thinking sweep
+-- measures /silence/ rather than turn length. A session that is not in
+-- the thinking set is left untouched: there is nothing to keep alive.
+touchThinking :: StreamBroker -> SessionId -> IO ()
+touchThinking broker sid = do
   now <- getCurrentTime
-  let threshold = fromIntegral maxAgeSec :: Double
-  stale <- atomically $ do
+  atomically $ modifyTVar' (sbThinking broker) (Map.adjust (const now) sid)
+
+-- | Clear thinking sessions that have gone silent for longer than the
+-- given threshold (in seconds) /and/ that the caller reports as not busy,
+-- broadcasting an @idle@ harness-status for each. Returns the cleared
+-- set. This is a safety net for a turn that died without its bracket
+-- cleanup broadcasting @idle@ (a process killed mid-turn, an exception
+-- that escaped the bracket), so a page refresh does not show a dead
+-- session as thinking forever.
+--
+-- It must NEVER fire for a session that is still working. Every consumer
+-- of @harness-status idle@ treats it as "the turn is over": the web
+-- sidebar flips the tab to idle-unread (which sorts to the TOP of Active
+-- Tabs), the chat channels' @\/watch@ set drops it, and a @\/bg@
+-- conversation closes its connection. A mid-turn idle is therefore a
+-- user-visible lie, and the turn's remaining output streams into a tab
+-- that claims to be finished. (Observed: a 34-minute turn was cleared at
+-- the 30-minute mark while it was still emitting tool calls.)
+--
+-- Two independent guards, both of which must say "quiet" for a session to
+-- be cleared:
+--
+-- 1. /Silence./ The stamp is refreshed by 'touchThinking' on every
+--    session-scoped broadcast, so this measures the gap since the last
+--    entry / tool call / status change, not the age of the turn.
+-- 2. /The caller's busy predicate./ The gateway passes "a turn is in
+--    flight for this session, or it still has running background
+--    children" — a parent parked on a long, silent sub-agent run is alive,
+--    not stale. A busy session's stamp is restarted instead, so the next
+--    sweep leaves it alone.
+reconcileStaleThinking
+  :: StreamBroker
+  -> (SessionId -> IO Bool)
+     -- ^ is this session busy? (turn in flight, or running children)
+  -> Int
+     -- ^ max silence (seconds) before a thinking session is cleared
+  -> IO (Set SessionId)
+reconcileStaleThinking broker isBusy maxIdleSec = do
+  now <- getCurrentTime
+  let threshold = fromIntegral maxIdleSec :: Double
+      silentEnough t = realToFrac (now `diffUTCTime` t) >= threshold
+  candidates <- Map.filter silentEnough <$> readTVarIO (sbThinking broker)
+  -- The busy check is IO (session locks + agent registry), so it is asked
+  -- outside STM, per silent candidate.
+  busy <- filterM (isBusy . fst) (Map.toList candidates)
+  let busySids = Set.fromList (map fst busy)
+      silentSids = Map.keysSet candidates `Set.difference` busySids
+  -- A busy session is alive, just quiet: restart its clock so it stops
+  -- being a candidate for the next sweeps.
+  forM_ (Set.toList busySids) (touchThinking broker)
+  -- Re-check under STM before deleting: a wake-up turn may have
+  -- re-broadcast @thinking@ (a fresh stamp) since the snapshot above.
+  cleared <- atomically $ do
     m <- readTVar (sbThinking broker)
-    let isStale t = realToFrac (now `diffUTCTime` t) >= threshold
-        staleMap = Map.filter isStale m
-        staleSids = Map.keysSet staleMap
-    unless (Set.null staleSids) $
-      writeTVar (sbThinking broker) (Map.difference m staleMap)
-    pure staleSids
+    let doomed = Map.filterWithKey
+          (\sid t -> Set.member sid silentSids && silentEnough t) m
+    unless (Map.null doomed) $
+      writeTVar (sbThinking broker) (m `Map.difference` doomed)
+    pure (Map.keysSet doomed)
+  unless (Set.null cleared) $
+    globalLogIO WarningS (ls ("[idle-diag] reconcileStaleThinking: clearing "
+      <> T.pack (show (Set.size cleared))
+      <> " session(s) silent for >= " <> T.pack (show maxIdleSec)
+      <> "s and not busy — broadcasting idle: "
+      <> T.intercalate "," (map sessionIdText (Set.toList cleared))))
   -- Broadcast idle for each cleared session so the frontend updates.
-  forM_ (Set.toList stale) $ \sid ->
+  forM_ (Set.toList cleared) $ \sid ->
     broadcast broker (BeActivity sid (object
       [ "kind" .= ("harness-status" :: Text)
       , "status" .= ("idle" :: Text)
       ]))
-  pure stale
+  pure cleared

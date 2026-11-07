@@ -30,6 +30,7 @@ module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
   , agentDefManageOp
   , agentManageOp
+  , AgentHandoffDeps (..)
   , agentDefReadOp
   , agentDefListOp
   , agentDefDeleteOp
@@ -47,13 +48,14 @@ module Seal.ISA.Ops.Agent
   , authorizeStart
   , encodeForegroundResults
   , encodeSpawnInfos
+  , encodeHandoffSpawnInfos
   , completionMessage
   , killSwitchMsg
   , leafMsg
   , allowSpawnBlockedMsg
   ) where
 
-import Control.Monad (join, forM_)
+import Control.Monad (join, forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
@@ -71,13 +73,14 @@ import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
   , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
   )
-import Seal.Agent.Runtime.Delegation.Worker ()
+import Seal.Agent.Runtime.Delegation.Worker (handoffRepo)
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , AgentCompletionCallback
   , SpawnCallback
   , ChildResult (..)
   , ChildTask (..)
+  , RepoSpec (..)
   , DelegationConfig
   , DelegateInput (..)
   , SpawnInfo (..)
@@ -103,8 +106,11 @@ import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
+import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..))
+import Seal.Session.Meta (readSessionMeta)
+import Seal.Tools.Args (branchNameText, mkBranchName)
 
 -- ---------------------------------------------------------------------------
 -- Worker-builder type
@@ -567,6 +573,19 @@ data AgentStartWiring = AgentStartWiring
     -- wiring time.
   }
 
+-- | Handoff-specific dependencies for @AGENT_MANAGE action=handoff@.
+-- Grouped separately from 'AgentStartWiring' to avoid adding fields to
+-- the already-large start wiring (which is constructed in many places).
+-- The 'ahdEnsureTab' callback creates a frontend tab for the new
+-- top-level session; 'Nothing' in test wirings.
+data AgentHandoffDeps = AgentHandoffDeps
+  { ahdWorker     :: !AgentWorkerBuilder
+    -- ^ The worker builder for top-level sessions (uses @dwdTopLevel = True@).
+  , ahdEnsureTab  :: !(Maybe (SessionId -> IO ()))
+    -- ^ When 'Just', called with the new session id to create an active
+    -- tab in the frontend (unless the caller passes @active_tab = false@).
+  }
+
 -- | The role/switch condition the nested AGENT_START enforces before it
 -- will spawn. Leaf children (and orchestrator children while the kill
 -- switch is off) get a present-but-rejecting op whose authorize returns
@@ -615,7 +634,7 @@ parseInput v =
           mGoal  = textFieldMaybe "goal" v
       case (mDefId, mGoal) of
         (Just defId, Just goal) | not (T.null goal) ->
-          pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir")))))
+          pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir")) Nothing)))
         (Just _, Just _) -> pure (Left "AGENT_START requires a non-empty 'goal'.")
         (Just _, Nothing) -> pure (Left "AGENT_START single-task mode requires a 'goal'.")
         (Nothing, _) -> pure (Left "AGENT_START requires an 'id' (agent def id) in single-task mode, or a 'tasks' array in batch mode.")
@@ -629,7 +648,7 @@ parseTask v =
       case textFieldMaybe "goal" v of
         Nothing -> pure (Left "Each task requires a 'goal'.")
         Just goal | T.null goal -> pure (Left "Each task requires a non-empty 'goal'.")
-                 | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir"))))
+                 | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v) (fromMaybe False (boolField v "isolate_workdir")) Nothing))
 
 -- | Resolve a task to its def + worker. Returns Left if the def id is
 -- invalid or the def doesn't exist. The role/kill-switch gate is enforced
@@ -683,6 +702,7 @@ allowSpawnBlockedMsg =
 data AgentAction
   = AgInstances
   | AgStart
+  | AgHandoff
   | AgStatus
   | AgStop
   | AgInterrupt
@@ -693,6 +713,7 @@ parseAgentAction v =
     Just t -> case t :: Text of
       "instances" -> Right AgInstances
       "start"     -> Right AgStart
+      "handoff"   -> Right AgHandoff
       "status"    -> Right AgStatus
       "stop"      -> Right AgStop
       "interrupt" -> Right AgInterrupt
@@ -730,9 +751,23 @@ authorizeAgentManage wiring v =
     Right action -> case action of
       AgInstances -> Right ()
       AgStart     -> authorizeStart wiring v
+      AgHandoff   -> authorizeHandoff wiring v
       AgStatus    -> maybe (Left "status requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgStop      -> maybe (Left "stop requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
       AgInterrupt -> maybe (Left "interrupt requires {subagent_id:string}") (const (Right ())) . subagentIdField $ v
+-- | Authorize gate for the @handoff@ action. Requires @id@ and @goal@
+-- (single-task only — no batch mode). The role/kill-switch gate is NOT
+-- applied: a handoff creates a top-level session (operator-authorized),
+-- so the gate is always open regardless of the caller's role.
+authorizeHandoff :: AgentStartWiring -> Value -> Either Text ()
+authorizeHandoff _wiring v =
+  let mId = idField v
+      mGoal = textFieldMaybe "goal" v
+  in case (mId, mGoal) of
+       (Just _, Just g) | not (T.null g) -> Right ()
+       (Just _, Just _)                  -> Left "AGENT_MANAGE handoff requires a non-empty 'goal'."
+       (Just _, Nothing)                 -> Left "AGENT_MANAGE handoff requires a 'goal'."
+       (Nothing, _)                      -> Left "AGENT_MANAGE handoff requires an 'id' (agent def id)."
 
 -- | Handle the instances action (shared with the legacy AGENT_INSTANCES shim).
 handleInstances :: AgentRuntime -> App OpResult
@@ -866,6 +901,133 @@ handleStartBackground wiring _v di = do
           pure (OpResult [TrpText (encodeSpawnInfos spawnInfos)] False
                  (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
 
+-- | Handle the @handoff@ action: spawn a new **top-level** agent session
+-- (not a child of the caller). The new session:
+--
+--   * Lives at @sessions/\<sid\>@ (visible to @SESSION_LIST@).
+--   * Has @smParent = Nothing@ (no parent in metadata).
+--   * Has lineage @[sid]@ only (no chain back to the caller).
+--   * Runs at delegation depth 0 (top-level).
+--   * Gets a full session registry (all opcodes, like a top-level session).
+--   * Gets its OWN workdir (@ctIsolateWorkdir = True@) — a top-level peer
+--     never shares the caller's workspace.
+--   * Carries a repo and a branch: the caller's @repo@/@branch@ arguments
+--     when given (validated), else the calling session's own repo *and*
+--     branch. The worker records both in the new session's @session.json@
+--     and clones with the audited 'SETUP_REPO' opcode — same arguments the
+--     creating session used — before the first turn.
+--
+-- Completion is fire-and-forget: the result is registered in the
+-- 'AgentRuntime' (visible via @AGENT_INSTANCES@ / @AGENT_STATUS@) but NO
+-- completion message is appended to the caller's transcript. The caller
+-- can later read the handoff session's transcript via @SESSION_GET@
+-- (it's not in the caller's lineage, so the self/ancestor read guard
+-- doesn't block it).
+--
+-- Single-task only (no batch mode). Always async (no foreground mode).
+handleHandoff :: AgentStartWiring -> AgentHandoffDeps -> Value -> App OpResult
+handleHandoff wiring handoffDeps v = do
+  let mDefId = idField v
+      mGoal    = textFieldMaybe "goal" v
+      activeTab = fromMaybe True (boolField v "active_tab")
+  case (mDefId, mGoal) of
+    (Just defId, Just goal) | not (T.null goal) ->
+      case explicitHandoffRepo v of
+        Left err -> pure (OpResult [TrpText err] True (object []))
+        Right (mExplicitUrl, mExplicitBranch) -> do
+          -- Resolve the repo ONCE, against the caller's own meta: the
+          -- explicit values win, else the caller's persisted repo AND
+          -- branch. The same pure rule runs again in the worker (it writes
+          -- the meta and performs the clone), so the result text and the new
+          -- session can never disagree.
+          mCallerMeta <- liftIO (readSessionMeta (aswPaths wiring) (aswParentSession wiring))
+          let effectiveRepo = handoffRepo mExplicitUrl mExplicitBranch mCallerMeta
+          cfg <- liftIO (aswConfig wiring)
+          let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
+              runtime = aswRuntime wiring
+              -- Handoff sessions are top-level peers: their own workdir
+              -- (ctIsolateWorkdir) and their own repo checkout.
+              task = ChildTask defId goal (textFieldMaybe "context" v) Nothing True effectiveRepo
+              callback :: AgentCompletionCallback
+              callback result = do
+                registerCompletedAgentResult runtime (crSubagentId result) result
+                globalLogIO DebugS (ls ("[handoff] completion registered: subagent=" <> subagentIdText (crSubagentId result)
+                  <> " session=" <> maybe "none" sessionIdText (crChildSession result)))
+              spawnCb :: SpawnCallback
+              spawnCb sid def childSid =
+                registerRunningAgent runtime (adId def) sid childSid childSid 0
+          eSpawnInfos <- liftIO (runDelegateAsync
+                                   cfg
+                                   (aswPauseFlag wiring)
+                                   (aswParentActivity wiring)
+                                   0
+                                   (DiSingle task)
+                                   (resolveTask (aswDefBackend wiring)
+                                                runtime
+                                                0
+                                                orchEnabled
+                                                (ahdWorker handoffDeps))
+                                   callback
+                                   spawnCb
+                                   (aswMintSession wiring))
+          case eSpawnInfos of
+            Left err -> pure (OpResult [TrpText err] True (object []))
+            Right spawnInfos -> do
+              when activeTab $
+                forM_ (ahdEnsureTab handoffDeps) $ \ensureTab ->
+                  liftIO (mapM_ (ensureTab . siChildSession) spawnInfos)
+              pure (OpResult [TrpText (encodeHandoffSpawnInfos effectiveRepo spawnInfos)] False
+                     (object ["results" .= fmap toJSONSpawnInfo spawnInfos]))
+    (Just _, Just _) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires a non-empty 'goal'."] True (object []))
+    (Just _, Nothing) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires a 'goal'."] True (object []))
+    (Nothing, _) -> pure (OpResult [TrpText "AGENT_MANAGE handoff requires an 'id' (agent def id)."] True (object []))
+
+-- | Parse and validate the optional @repo@ and @branch@ fields of a handoff:
+-- 'Right' the normalised (trimmed) values — exactly what 'validateRepoUrl'
+-- and 'mkBranchName' accept — or 'Left' an actionable error. An absent or
+-- blank field means "inherit the caller's".
+--
+-- The repo is a git URL only (no registry-id lookup): the handoff is
+-- model-invoked and the model has no repo-id surface. A branch on its own is
+-- allowed — it asks for a different branch of the inherited repo.
+explicitHandoffRepo :: Value -> Either Text (Maybe Text, Maybe Text)
+explicitHandoffRepo v = do
+  mUrl <- case textFieldMaybe "repo" v of
+    Nothing -> Right Nothing
+    Just raw
+      | T.null (T.strip raw) -> Right Nothing
+      | otherwise -> case validateRepoUrl raw of
+          Left err  -> Left ("AGENT_MANAGE handoff: invalid 'repo': " <> err)
+          Right url -> Right (Just url)
+  mBranch <- case textFieldMaybe "branch" v of
+    Nothing -> Right Nothing
+    Just raw
+      | T.null (T.strip raw) -> Right Nothing
+      | otherwise -> case mkBranchName raw of
+          Left err  -> Left ("AGENT_MANAGE handoff: invalid 'branch': " <> err)
+          Right bn  -> Right (Just (branchNameText bn))
+  pure (mUrl, mBranch)
+
+-- | Encode handoff 'SpawnInfo' as a text block for the model. Similar to
+-- 'encodeSpawnInfos' but with a handoff-specific message (no completion
+-- notification — the caller should use SESSION_GET to check the result).
+-- The repo and branch the new session carries (explicit or inherited) are
+-- named so the caller can confirm the handoff kept them.
+encodeHandoffSpawnInfos :: Maybe RepoSpec -> [SpawnInfo] -> Text
+encodeHandoffSpawnInfos _ [] = "(no handoff session spawned)"
+encodeHandoffSpawnInfos mRepo infos = T.intercalate "\n" (map renderOne infos)
+  <> "\n\nHandoff session(s) are running independently in the background.\
+  \ No completion notification will be delivered to you — the new session\
+  \ is a top-level peer, not a child. Use SESSION_GET with the session_id\
+  \ to read its transcript when needed, or AGENT_MANAGE action=status with\
+  \ the subagent_id to check its status."
+  where
+    renderOne si =
+      subagentIdText (siSubagentId si) <> " | " <>
+      sessionIdText (siChildSession si) <> " | running (handoff)" <>
+      " | repo: " <> maybe "none" renderRepo mRepo
+    renderRepo spec = rsUrl spec <> maybe "" ("@" <>) (rsBranch spec)
+
 -- | Handle the status action (shared with the legacy AGENT_STATUS shim).
 -- Enriched: when the registry has a completed entry with aiResult, the
 -- response includes summary, child_session, exit_reason, and duration.
@@ -927,17 +1089,17 @@ handleInterrupt runtime v = do
 -- @status@, @stop@, and @interrupt@. The @start@ action carries the full
 -- 'AgentStartWiring' (delegation config, worker builder, role/kill-switch
 -- gate, batch mode).
-agentManageOp :: AgentStartWiring -> Opcode
-agentManageOp wiring = TrustedOpcode
+agentManageOp :: AgentStartWiring -> AgentHandoffDeps -> Opcode
+agentManageOp wiring handoffDeps = TrustedOpcode
   { toName = OpName "AGENT_MANAGE"
   , toTrust = Trusted
-  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
+  , toDesc = "Manage agent runtime. Use action to select: instances (list running), start (spawn child agents — background mode delivers completion automatically via push notification; do NOT poll status for completion), handoff (spawn a new top-level agent session — fire-and-forget; the new session is independent, gets its OWN workdir, and carries the caller's repo AND branch — cloned into it with SETUP_REPO before its first turn — unless `repo`/`branch` override them; returns session_id + subagent_id), status (for debugging/observability only — NOT for completion checking; completion is delivered automatically), stop (kill agent), interrupt (cooperative stop). For start: mode=\"foreground\" blocks and returns results in-band; mode=\"background\" (default) returns immediately and delivers completion via push notification."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "action" .= object
               [ "type" .= ("string" :: Text)
-              , "enum" .= (["instances", "start", "status", "stop", "interrupt"] :: [Text])
+              , "enum" .= (["instances", "start", "handoff", "status", "stop", "interrupt"] :: [Text])
               , "description" .= ("Operation to perform." :: Text)
               ]
           , fromText "mode" .= object
@@ -947,15 +1109,15 @@ agentManageOp wiring = TrustedOpcode
               ]
           , fromText "id" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Agent def id (start, single-task)." :: Text)
+              , "description" .= ("Agent def id (start single-task, or handoff)." :: Text)
               ]
           , fromText "goal" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Task goal (start, single-task)." :: Text)
+              , "description" .= ("Task goal (start single-task, or handoff)." :: Text)
               ]
           , fromText "context" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Background context (start)." :: Text)
+              , "description" .= ("Background context (start, handoff)." :: Text)
               ]
           , fromText "role" .= object
               [ "type" .= ("string" :: Text)
@@ -969,6 +1131,18 @@ agentManageOp wiring = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "description" .= ("Subagent id (status/stop/interrupt)." :: Text)
               ]
+          , fromText "active_tab" .= object
+              [ "type" .= ("boolean" :: Text)
+              , "description" .= ("When true (default), create an active frontend tab for the new session. Only meaningful for handoff." :: Text)
+              ]
+          , fromText "repo" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Handoff only: git URL for the new session's repo (https://, http://, git://, ssh://, or git@host:path). Cloned into the new session's own workdir via SETUP_REPO before its first turn. Omit to inherit the calling session's repo." :: Text)
+              ]
+          , fromText "branch" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Handoff only: branch or tag to check out (SETUP_REPO's `branch` argument). Omit to inherit the calling session's branch when the repo is inherited, or to use the remote's default branch when `repo` is given." :: Text)
+              ]
           ]
       , "required" .= (["action"] :: [Text])
       ]
@@ -981,6 +1155,7 @@ agentManageOp wiring = TrustedOpcode
         Right action -> case action of
           AgInstances -> handleInstances (aswRuntime wiring)
           AgStart     -> handleStart wiring v
+          AgHandoff   -> handleHandoff wiring handoffDeps v
           AgStatus    -> handleStatus (aswRuntime wiring) v
           AgStop      -> handleStop (aswRuntime wiring) v
           AgInterrupt -> handleInterrupt (aswRuntime wiring) v

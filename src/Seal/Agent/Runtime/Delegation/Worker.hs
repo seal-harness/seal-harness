@@ -18,16 +18,22 @@ module Seal.Agent.Runtime.Delegation.Worker
   , filterBlocklistedWith
   , narrowAllowList
   , narrowAllowListWith
+  , handoffRepo
+  , handoffRepoRegistry
+  , dispatchHandoffRepo
   , DelegationWorkerDeps (..)
   ) where
 
 import Control.Exception (SomeException, catch)
+import Control.Monad.IO.Class (liftIO)
+import Data.Aeson (object, (.=))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import Katip (Severity (..), ls)
+import System.Directory (createDirectoryIfMissing)
 
 import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..))
@@ -38,26 +44,32 @@ import Seal.Agent.Runtime.Delegation
   , ChildExitReason (..)
   , ChildTask (..)
   , ChildWorkerOutcome (..)
+  , RepoSpec (..)
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
-import Seal.Config.Paths (SealPaths, agentSessionDir, sessionMetaPath)
+import Seal.Config.Paths (SealPaths, agentSessionDir, sessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
-import Seal.Handles.Transcript (withIndexedTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle, withIndexedTranscript)
+import Seal.ISA.Dispatch (dispatch, recordSetupRepoResult)
 import Seal.ISA.Opcode (localBackend)
-import Seal.ISA.Registry (Registry)
+import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Registry (Registry, mkRegistry)
 import Seal.ISA.RepeatDetect (RepeatTrack)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
-import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (saveChildSessionMeta)
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
+import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
+import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Args (branchNameText, mkBranchName)
 import Seal.Tools.Exec.Abort (AbortFlag)
-import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv, runUIOWithEnv)
+import Seal.Tools.Exec.UIOGit (uioCdCloneDeps)
 import Seal.Tools.Timeout (ToolTimeoutConfig)
-import Seal.Types.App (runApp)
+import Seal.Types.App (App, runApp)
 import Seal.Types.Env (Env)
-import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | Opcodes that a child agent must NEVER have access to. Mirrors Hermes'
 -- @DELEGATE_BLOCKED_TOOLS@. Stripping these means a child cannot:
@@ -246,6 +258,13 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config, inherited from the parent
     -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
+  , dwdTopLevel :: !Bool
+    -- ^ When 'True', the worker creates a **top-level** session (used by
+    -- @AGENT_MANAGE action=handoff@) instead of a child session nested
+    -- under the parent's @agents\/@ directory. The session directory
+    -- becomes @sessions\/\<sid\>@ (visible to @SESSION_LIST@), the
+    -- metadata has @smParent = Nothing@, the lineage is @[sid]@ only,
+    -- and the delegation depth is 0.
   }
 
 -- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
@@ -259,8 +278,11 @@ data DelegationWorkerDeps = DelegationWorkerDeps
 -- prompt the human — that would deadlock the parent).
 mkDelegateWorker :: DelegationWorkerDeps -> AgentWorkerBuilder
 mkDelegateWorker deps agentDef childSid task _hooks = do
-  let childDir = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
-      childDepth = dwdParentDepth deps + 1
+  let topLevel = dwdTopLevel deps
+      childDir = if topLevel
+                   then sessionDir (dwdPaths deps) childSid
+                   else agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
+      childDepth = if topLevel then 0 else dwdParentDepth deps + 1
   createDirectoryIfMissing True childDir
   let resolve = case dwdResolveProviderOverride deps of
         Just testResolve -> testResolve agentDef
@@ -272,7 +294,11 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                        CerError 0 0 (Just childSid))
     Right (prov, model) ->
       withIndexedTranscript childDir $ \childTHandle -> do
-        writeChildMeta deps childSid
+        -- Top-level (handoff): write the session's own meta and resolve the
+        -- repo it carries (explicit @ctRepoUrl@ else the caller's).
+        mRepo <- if topLevel
+                   then writeHandoffMeta deps childSid agentDef (ctRepo task)
+                   else writeChildMeta deps childSid >> pure Nothing
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
         let capturingCaps = def
@@ -282,7 +308,10 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         -- The child's full lineage, self first: the child's own id
         -- prepended to the parent's baked chain. Passed into the
         -- registry seam so the child's session ops get the whole chain.
-        let childLineage = childSid : dwdParentLineage deps
+        -- For top-level (handoff): lineage is just [childSid] — no parent chain.
+        let childLineage = if topLevel
+                             then [childSid]
+                             else childSid : dwdParentLineage deps
         childReg <- dwdChildRegistry deps childLineage agentDef childDepth
                                       (effectiveRole (adRole agentDef) (ctRole task))
                                       childSid capturingCaps
@@ -291,6 +320,21 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         childSystem <- dwdChildSystemPrompt deps agentDef task
         childAbortFlag <- dwdAbortFlag deps childSid
         childRepeatTrack <- dwdRepeatTrack deps childSid
+        -- Handoff: materialize the session's repo in its OWN workdir (the
+        -- task set @ctIsolateWorkdir@, so @dwdMkUIOEnv@ above built a fresh
+        -- per-session workdir) through the audited SETUP_REPO opcode — the
+        -- same op the gateway's setup-repo endpoint and @/new -r@ dispatch.
+        -- It gets the same arguments the creating session used (url +
+        -- branch). Runs BEFORE the first turn so the goal sees a checkout.
+        case mRepo of
+          Nothing -> pure ()
+          Just repo -> do
+            cloneDeps <- runUIOWithEnv childUioEnv uioCdCloneDeps
+            runApp (dwdAppEnv deps) $
+              dispatchHandoffRepo childTHandle
+                (handoffRepoRegistry cloneDeps (dwdAutonomy deps))
+                childUioEnv (dwdToolTimeout deps) childAbortFlag
+                repo (Just (dwdChannel deps))
         -- Capture the final answer via 'aeOnStop': the loop's
         -- final-answer path calls 'notifyStop' (the replyFanout hook)
         -- rather than 'ccSend' — the double-delivery fix. The
@@ -369,15 +413,132 @@ writeChildMeta deps childSid = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smRepoBranch = Nothing
     , smCreatedAt = now
     , smLastActive = now
     }
 
--- | Load the parent session's 'SessionMeta', if readable. Local mirror of
--- the engine's @loadSessionMeta@ (the worker cannot import the engine
--- without an import cycle).
+-- | Load the calling session's 'SessionMeta' through the shared leaf reader
+-- ("Seal.Session.Meta"), if readable.
 loadParentMeta :: DelegationWorkerDeps -> IO (Maybe SessionMeta)
-loadParentMeta deps = do
-  let mp = sessionMetaPath (dwdPaths deps) (dwdParentSid deps)
-  exists <- doesFileExist mp
-  if not exists then pure Nothing else decodeFileStrict mp
+loadParentMeta deps = readSessionMeta (dwdPaths deps) (dwdParentSid deps)
+
+-- | The repo checkout a handoff session carries, from the caller's optional
+-- overrides and the calling session's own record. Pure, and used by BOTH the
+-- opcode (to name it in the result text) and the worker (to write the meta
+-- and dispatch the clone) -- one rule, applied twice, so the two never
+-- disagree.
+--
+-- * With no explicit repo, the caller's 'smRepoUrl' *and* 'smRepoBranch' are
+--   inherited: the handoff session gets the same repo and the same branch as
+--   the session that handed off.
+-- * An explicit branch overrides the inherited one (same repo, different
+--   branch).
+-- * An explicit repo stands alone: its branch is whatever the caller passed
+--   (or the remote default). A branch belonging to a different repo is never
+--   carried across.
+-- * A blank value on either side counts as absent; an inherited branch that
+--   no longer validates (a hand-edited @session.json@) is dropped rather
+--   than failing the handoff.
+handoffRepo :: Maybe Text -> Maybe Text -> Maybe SessionMeta -> Maybe RepoSpec
+handoffRepo explicitUrl explicitBranch mParent = case nonBlank explicitUrl of
+  Just url -> Just (RepoSpec url (validBranch (nonBlank explicitBranch)))
+  Nothing  -> do
+    url <- mParent >>= nonBlank . smRepoUrl
+    let inherited = mParent >>= validBranch . smRepoBranch
+        branch = validBranch (nonBlank explicitBranch)
+    pure (RepoSpec url (pick branch inherited))
+  where
+    nonBlank :: Maybe Text -> Maybe Text
+    nonBlank Nothing  = Nothing
+    nonBlank (Just t)
+      | T.null (T.strip t) = Nothing
+      | otherwise          = Just (T.strip t)
+    -- A branch is only carried when it still parses as one.
+    validBranch :: Maybe Text -> Maybe Text
+    validBranch Nothing  = Nothing
+    validBranch (Just b) = case mkBranchName b of
+      Right bn -> Just (branchNameText bn)
+      Left _   -> Nothing
+    pick (Just x) _ = Just x
+    pick Nothing y  = y
+
+-- | The registry the handoff session's pre-turn repo checkout dispatches
+-- through: exactly one opcode, the real 'SETUP_REPO', with the child's own
+-- 'CloneDeps' and the caller's autonomy level.
+--
+-- Deliberately NOT the session's own (def-narrowed) registry: a definition's
+-- @tools@ allow-list is intersected into that one, so a def that does not
+-- list 'SETUP_REPO' would silently skip the checkout. Only that allow-list
+-- is bypassed — no blocklist control is skipped ('SETUP_REPO' is not in
+-- 'delegationBlocklist').
+handoffRepoRegistry :: CloneDeps -> AutonomyLevel -> Registry
+handoffRepoRegistry cloneDeps autonomy = mkRegistry [setupRepoOp cloneDeps autonomy]
+
+-- | Dispatch 'SETUP_REPO' into the handoff session's transcript and record
+-- its result for the user (the clone / no-op / conflict / failure text),
+-- exactly as the gateway's @POST /api/sessions/:id/setup-repo@ endpoint and
+-- @/new -r@ do. ACK-before-execute: 'dispatch' durably records the
+-- invocation before the clone runs. A dispatch failure is logged; a clone
+-- failure is recorded in the transcript. Neither aborts the session — the
+-- goal may not need the files.
+dispatchHandoffRepo
+  :: IndexedTranscriptHandle -> Registry -> UIOEnv -> ToolTimeoutConfig
+  -> AbortFlag -> RepoSpec -> Maybe Text -> App ()
+dispatchHandoffRepo h reg uioEnv toolTimeout abortFlag repo mChannel = do
+  -- Same argument shape the creating session used: @{url, branch?}@. The
+  -- branch key is omitted (never null) when there is none, so the opcode
+  -- asks for the remote's default branch.
+  let input = object
+        ([ "url" .= rsUrl repo ]
+         <> maybe [] (\b -> ["branch" .= b]) (rsBranch repo))
+  res <- dispatch reg h localBackend uioEnv toolTimeout abortFlag
+                    (OpName "SETUP_REPO") input
+  case res of
+    Left dErr ->
+      liftIO (globalLogIO WarningS
+               (ls ("[handoff] SETUP_REPO dispatch failed for " <> rsUrl repo
+                    <> ": " <> T.pack (show dErr))))
+    Right opRes ->
+      liftIO (recordSetupRepoResult h (OpName "SETUP_REPO") input opRes mChannel)
+
+-- | Write a 'SessionMeta' for a top-level handoff session into its
+-- top-level dir (@sessions\/\<sid\>\/session.json@): the session's own id,
+-- the originating session's provider/model (for audit trail), channel
+-- @"agent"@, 'smParent' = 'Nothing' (top-level — no parent), the def the
+-- session runs (so a resume keeps its agent), and the repo it carries
+-- (the task's @ctRepo@ when the opcode resolved one — the caller's explicit
+-- values, else the calling session's own repo *and* branch; see
+-- 'handoffRepo', which is idempotent and also covers a worker invoked with
+-- no task repo at all). The handoff session IS visible to
+-- 'Seal.Session.Store.listSessions' (it's a top-level dir, not nested under
+-- @agents\/@). Returns the effective checkout, which the caller dispatches.
+writeHandoffMeta
+  :: DelegationWorkerDeps -> SessionId -> AgentDef -> Maybe RepoSpec
+  -> IO (Maybe RepoSpec)
+writeHandoffMeta deps childSid agentDef taskRepo = do
+  mParent <- loadParentMeta deps
+  now <- getCurrentTime
+  let (provider, model) = case mParent of
+        Just pm -> (smProvider pm, smModel pm)
+        Nothing -> ("unknown", "unknown")
+      repo = handoffRepo (rsUrl <$> taskRepo) (taskRepo >>= rsBranch) mParent
+      agentName = let n = T.strip (adName agentDef)
+                  in if T.null n then Nothing else Just n
+  saveSessionMeta (dwdPaths deps) SessionMeta
+    { smId = childSid
+    , smProvider = provider
+    , smModel = model
+    , smChannel = "agent"
+    , smParent = Nothing
+    , smAgent = Just (adId agentDef)
+    , smSystemOverride = Nothing
+    , smAgentName = agentName
+    , smDescription = Nothing
+    , smSealFrontMatter = True
+    , smRepoUrl = rsUrl <$> repo
+    , smRepoBranch = repo >>= rsBranch
+    , smCreatedAt = now
+    , smLastActive = now
+    }
+  pure repo
