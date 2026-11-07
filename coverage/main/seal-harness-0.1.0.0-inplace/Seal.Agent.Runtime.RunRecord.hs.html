@@ -1,0 +1,734 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>-- | The durable sub-agent run record registry. Tracks every spawned child's
+<span class="lineno">    4 </span>-- full lifecycle from creation through completion (or cancellation), with
+<span class="lineno">    5 </span>-- generation tokens to prevent stale completions, lifecycle hook emission,
+<span class="lineno">    6 </span>-- session cleanup, and disk persistence for restart recovery.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- This module is the foundation for push-based completion notification:
+<span class="lineno">    9 </span>-- instead of the parent polling @AGENT_MANAGE status@, the harness tracks
+<span class="lineno">   10 </span>-- each child run in a 'SubagentRunRecord' and delivers completion
+<span class="lineno">   11 </span>-- automatically via the sidecar mechanism (see 'Seal.Handles.Transcript').
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- The registry is STM-backed (like 'Seal.Agent.Runtime.Registry') and
+<span class="lineno">   14 </span>-- thread-safe. Records are keyed by run id (the 'SubagentId' text).
+<span class="lineno">   15 </span>module Seal.Agent.Runtime.RunRecord
+<span class="lineno">   16 </span>  ( -- * Record type
+<span class="lineno">   17 </span>    SubagentRunRecord (..)
+<span class="lineno">   18 </span>  , RunId
+<span class="lineno">   19 </span>  , RunOutcome (..)
+<span class="lineno">   20 </span>  , EndReason (..)
+<span class="lineno">   21 </span>  , SpawnMode (..)
+<span class="lineno">   22 </span>  , CleanupMode (..)
+<span class="lineno">   23 </span>  , GenerationToken (..)
+<span class="lineno">   24 </span>    -- * Registry
+<span class="lineno">   25 </span>  , RunRecordRegistry
+<span class="lineno">   26 </span>  , newRunRecordRegistry
+<span class="lineno">   27 </span>    -- * Operations
+<span class="lineno">   28 </span>  , createRun
+<span class="lineno">   29 </span>  , completeRun
+<span class="lineno">   30 </span>  , listRunsForParent
+<span class="lineno">   31 </span>  , findLatestRunForChild
+<span class="lineno">   32 </span>  , countPendingDescendants
+<span class="lineno">   33 </span>  , descendantSettled
+<span class="lineno">   34 </span>  , shouldDeferDelivery
+<span class="lineno">   35 </span>  , maxAnnounceRetries
+<span class="lineno">   36 </span>  , computeAnnounceBackoff
+<span class="lineno">   37 </span>  , announceRetriesExhausted
+<span class="lineno">   38 </span>  , recordAnnounceAttempt
+<span class="lineno">   39 </span>    -- * Completion signal (WU-7 dual-path)
+<span class="lineno">   40 </span>  , CompletionSignal
+<span class="lineno">   41 </span>  , registerCompletionSignal
+<span class="lineno">   42 </span>  , awaitCompletion
+<span class="lineno">   43 </span>  , cancelRunsForParent
+<span class="lineno">   44 </span>    -- * Lifecycle hooks
+<span class="lineno">   45 </span>  , registerEndedHook
+<span class="lineno">   46 </span>    -- * Persistence
+<span class="lineno">   47 </span>  , runRecordPath
+<span class="lineno">   48 </span>  , saveRunRecordToDisk
+<span class="lineno">   49 </span>  , loadRunRecord
+<span class="lineno">   50 </span>  ) where
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>import Control.Concurrent.STM
+<span class="lineno">   53 </span>import Control.Exception (try, IOException)
+<span class="lineno">   54 </span>import Control.Monad (forM_)
+<span class="lineno">   55 </span>import Data.Aeson
+<span class="lineno">   56 </span>import Data.ByteString qualified as BS
+<span class="lineno">   57 </span>import Data.ByteString.Lazy qualified as BSL
+<span class="lineno">   58 </span>import Data.IORef
+<span class="lineno">   59 </span>import Data.Map.Strict (Map)
+<span class="lineno">   60 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   61 </span>import Data.Maybe (isNothing, isJust)
+<span class="lineno">   62 </span>import Data.Text (Text)
+<span class="lineno">   63 </span>import Data.Text qualified as T
+<span class="lineno">   64 </span>import Data.Time.Clock (UTCTime, getCurrentTime)
+<span class="lineno">   65 </span>import GHC.Generics (Generic)
+<span class="lineno">   66 </span>import System.Directory
+<span class="lineno">   67 </span>  (createDirectoryIfMissing, doesFileExist, renameFile)
+<span class="lineno">   68 </span>import System.FilePath ((&lt;/&gt;), takeDirectory, (&lt;.&gt;))
+<span class="lineno">   69 </span>import System.Random (randomRIO)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>import Seal.Agent.Runtime.Delegation
+<span class="lineno">   72 </span>  (SubagentId (..), subagentIdText, ChildResult (..), ChildStatus (..))
+<span class="lineno">   73 </span>import Seal.Core.Types (SessionId, mkSystemSessionId, sessionIdText)
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>----------------------------------------------------------------------------
+<span class="lineno">   76 </span>-- Types
+<span class="lineno">   77 </span>----------------------------------------------------------------------------
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Unique run identifier. Currently the 'SubagentId' text, but kept as a
+<span class="lineno">   80 </span>-- distinct type for clarity and future evolution.
+<span class="lineno">   81 </span>type RunId = Text
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | The terminal outcome of a run.
+<span class="lineno">   84 </span>data RunOutcome
+<span class="lineno">   85 </span>  = OutcomeOk
+<span class="lineno">   86 </span>  | OutcomeError
+<span class="lineno">   87 </span>  | OutcomeTimeout
+<span class="lineno">   88 </span>  | OutcomeKilled
+<span class="lineno">   89 </span>  | OutcomeUnknown
+<span class="lineno">   90 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON RunOutcome</span></span></span></span></span></span></span></span> where
+<span class="lineno">   93 </span>  <span class="decl"><span class="istickedoff">toJSON = \case</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">OutcomeOk      -&gt; <span class="nottickedoff">&quot;ok&quot;</span></span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">OutcomeError   -&gt; <span class="nottickedoff">&quot;error&quot;</span></span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">OutcomeTimeout -&gt; <span class="nottickedoff">&quot;timeout&quot;</span></span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">OutcomeKilled  -&gt; <span class="nottickedoff">&quot;killed&quot;</span></span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">OutcomeUnknown -&gt; &quot;unknown&quot;</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON RunOutcome</span></span></span></span> where
+<span class="lineno">  101 </span>  <span class="decl"><span class="istickedoff">parseJSON = withText <span class="nottickedoff">&quot;RunOutcome&quot;</span> $ \case</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">&quot;ok&quot;      -&gt; <span class="nottickedoff">pure OutcomeOk</span></span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">&quot;error&quot;   -&gt; <span class="nottickedoff">pure OutcomeError</span></span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">&quot;timeout&quot; -&gt; <span class="nottickedoff">pure OutcomeTimeout</span></span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">&quot;killed&quot;  -&gt; <span class="nottickedoff">pure OutcomeKilled</span></span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">&quot;unknown&quot; -&gt; pure OutcomeUnknown</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">other     -&gt; <span class="nottickedoff">fail (&quot;unknown RunOutcome: &quot; &lt;&gt; T.unpack other)</span></span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Why the run ended.
+<span class="lineno">  110 </span>data EndReason
+<span class="lineno">  111 </span>  = EndComplete
+<span class="lineno">  112 </span>  | EndError
+<span class="lineno">  113 </span>  | EndTimeout
+<span class="lineno">  114 </span>  | EndKilled
+<span class="lineno">  115 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON EndReason</span></span></span></span></span></span></span></span> where
+<span class="lineno">  118 </span>  <span class="decl"><span class="nottickedoff">toJSON = \case</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="nottickedoff">EndComplete -&gt; &quot;complete&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="nottickedoff">EndError    -&gt; &quot;error&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="nottickedoff">EndTimeout  -&gt; &quot;timeout&quot;</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="nottickedoff">EndKilled   -&gt; &quot;killed&quot;</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON EndReason</span></span></span></span> where
+<span class="lineno">  125 </span>  <span class="decl"><span class="nottickedoff">parseJSON = withText &quot;EndReason&quot; $ \case</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="nottickedoff">&quot;complete&quot; -&gt; pure EndComplete</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="nottickedoff">&quot;error&quot;    -&gt; pure EndError</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="nottickedoff">&quot;timeout&quot;  -&gt; pure EndTimeout</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="nottickedoff">&quot;killed&quot;   -&gt; pure EndKilled</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="nottickedoff">other      -&gt; fail (&quot;unknown EndReason: &quot; &lt;&gt; T.unpack other)</span></span>
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>-- | How the child was spawned.
+<span class="lineno">  133 </span>data SpawnMode
+<span class="lineno">  134 </span>  = SpawnForeground
+<span class="lineno">  135 </span>  | SpawnBackground
+<span class="lineno">  136 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON SpawnMode</span></span></span></span></span></span></span></span> where
+<span class="lineno">  139 </span>  <span class="decl"><span class="istickedoff">toJSON SpawnForeground = <span class="nottickedoff">&quot;foreground&quot;</span></span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">toJSON SpawnBackground = &quot;background&quot;</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON SpawnMode</span></span></span></span> where
+<span class="lineno">  143 </span>  <span class="decl"><span class="istickedoff">parseJSON = withText <span class="nottickedoff">&quot;SpawnMode&quot;</span> $ \case</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">&quot;foreground&quot; -&gt; <span class="nottickedoff">pure SpawnForeground</span></span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">&quot;background&quot; -&gt; pure SpawnBackground</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">other        -&gt; <span class="nottickedoff">fail (&quot;unknown SpawnMode: &quot; &lt;&gt; T.unpack other)</span></span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | What to do with the child session on completion.
+<span class="lineno">  149 </span>data CleanupMode
+<span class="lineno">  150 </span>  = CleanupDelete
+<span class="lineno">  151 </span>  | CleanupKeep
+<span class="lineno">  152 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  153 </span>
+<span class="lineno">  154 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CleanupMode</span></span></span></span></span></span></span></span> where
+<span class="lineno">  155 </span>  <span class="decl"><span class="istickedoff">toJSON CleanupDelete = &quot;delete&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">toJSON CleanupKeep   = <span class="nottickedoff">&quot;keep&quot;</span></span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CleanupMode</span></span></span></span> where
+<span class="lineno">  159 </span>  <span class="decl"><span class="istickedoff">parseJSON = withText <span class="nottickedoff">&quot;CleanupMode&quot;</span> $ \case</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">&quot;delete&quot; -&gt; pure CleanupDelete</span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">&quot;keep&quot;   -&gt; <span class="nottickedoff">pure CleanupKeep</span></span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">other    -&gt; <span class="nottickedoff">fail (&quot;unknown CleanupMode: &quot; &lt;&gt; T.unpack other)</span></span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | A generation token prevents stale completions from corrupting re-spawned
+<span class="lineno">  165 </span>-- jobs. Each 'createRun' mints a fresh token; 'completeRun' rejects calls
+<span class="lineno">  166 </span>-- whose token doesn't match the current record's token.
+<span class="lineno">  167 </span>newtype GenerationToken = GenerationToken Int
+<span class="lineno">  168 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  169 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | The core tracking record for each spawned child. Stored in the in-memory
+<span class="lineno">  172 </span>-- registry AND persisted to disk so completion can be recovered after
+<span class="lineno">  173 </span>-- restarts. See the design doc for the full field-by-field rationale.
+<span class="lineno">  174 </span>data SubagentRunRecord = SubagentRunRecord
+<span class="lineno">  175 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrRunId</span></span></span>                    :: !RunId
+<span class="lineno">  176 </span>    -- ^ Unique run identifier (the 'SubagentId' text).
+<span class="lineno">  177 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrSubagentId</span></span></span>               :: !SubagentId
+<span class="lineno">  178 </span>    -- ^ The 'SubagentId' for cross-referencing with 'AgentRuntime'.
+<span class="lineno">  179 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrChildSessionKey</span></span></span>          :: !SessionId
+<span class="lineno">  180 </span>    -- ^ The child's session ID.
+<span class="lineno">  181 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrParentSessionKey</span></span></span>         :: !SessionId
+<span class="lineno">  182 </span>    -- ^ The parent's session ID.
+<span class="lineno">  183 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrControllerSessionKey</span></span></span>     :: !SessionId
+<span class="lineno">  184 </span>    -- ^ Who controls this run (usually the parent).
+<span class="lineno">  185 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrStartedAt</span></span></span>                :: !UTCTime
+<span class="lineno">  186 </span>    -- ^ When the run was created.
+<span class="lineno">  187 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrEndedAt</span></span></span>                  :: !(Maybe UTCTime)
+<span class="lineno">  188 </span>    -- ^ Set when the run reaches a terminal state.
+<span class="lineno">  189 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrOutcome</span></span></span>                  :: !RunOutcome
+<span class="lineno">  190 </span>    -- ^ Terminal outcome (ok \/ error \/ timeout \/ killed \/ unknown).
+<span class="lineno">  191 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrEndedReason</span></span></span>              :: !(Maybe EndReason)
+<span class="lineno">  192 </span>    -- ^ Why the run ended.
+<span class="lineno">  193 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrExpectsCompletionMessage</span></span></span> :: !Bool
+<span class="lineno">  194 </span>    -- ^ Does the parent want push notification? 'False' for foreground mode.
+<span class="lineno">  195 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrFrozenResultText</span></span></span>         :: !(Maybe Text)
+<span class="lineno">  196 </span>    -- ^ The child's final output, captured at completion.
+<span class="lineno">  197 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrAnnounceRetryCount</span></span></span>       :: !Int
+<span class="lineno">  198 </span>    -- ^ Delivery retry counter.
+<span class="lineno">  199 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrLastAnnounceRetryAt</span></span></span>      :: !(Maybe UTCTime)
+<span class="lineno">  200 </span>    -- ^ When the last delivery retry was attempted.
+<span class="lineno">  201 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrSpawnMode</span></span></span>                :: !SpawnMode
+<span class="lineno">  202 </span>    -- ^ Foreground (blocking) or background (async with push).
+<span class="lineno">  203 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrCleanup</span></span></span>                  :: !CleanupMode
+<span class="lineno">  204 </span>    -- ^ Whether to delete or keep the child session on completion.
+<span class="lineno">  205 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrDepth</span></span></span>                    :: !Int
+<span class="lineno">  206 </span>    -- ^ Spawn depth (guard against runaway recursion).
+<span class="lineno">  207 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrWakeOnDescendantSettle</span></span></span>   :: !Bool
+<span class="lineno">  208 </span>    -- ^ Re-invoke the child after its own descendants finish.
+<span class="lineno">  209 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrCleanupHandled</span></span></span>           :: !Bool
+<span class="lineno">  210 </span>    -- ^ Has session cleanup been performed?
+<span class="lineno">  211 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrCleanupCompletedAt</span></span></span>       :: !(Maybe UTCTime)
+<span class="lineno">  212 </span>    -- ^ When cleanup was completed.
+<span class="lineno">  213 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrEndedHookEmittedAt</span></span></span>       :: !(Maybe UTCTime)
+<span class="lineno">  214 </span>    -- ^ When the @subagent_ended@ hook was emitted (idempotency guard).
+<span class="lineno">  215 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrSuppressAnnounceReason</span></span></span>   :: !(Maybe Text)
+<span class="lineno">  216 </span>    -- ^ If set, completion announcement is suppressed (e.g. \&quot;killed\&quot;).
+<span class="lineno">  217 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrGenerationToken</span></span></span>          :: !(Maybe GenerationToken)
+<span class="lineno">  218 </span>    -- ^ Unique per-spawn token; stale tokens are rejected by 'completeRun'.
+<span class="lineno">  219 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  220 </span>    deriving (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">  221 </span>
+<span class="lineno">  222 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON SubagentRunRecord</span></span></span></span></span></span></span></span> where
+<span class="lineno">  223 </span>  <span class="decl"><span class="istickedoff">toJSON r = object</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;run_id&quot;                     .= rrrRunId r</span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">, &quot;subagent_id&quot;                .= subagentIdText (rrrSubagentId r)</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">, &quot;child_session_key&quot;          .= sessionIdText (rrrChildSessionKey r)</span>
+<span class="lineno">  227 </span><span class="spaces">    </span><span class="istickedoff">, &quot;parent_session_key&quot;         .= sessionIdText (rrrParentSessionKey r)</span>
+<span class="lineno">  228 </span><span class="spaces">    </span><span class="istickedoff">, &quot;controller_session_key&quot;     .= sessionIdText (rrrControllerSessionKey r)</span>
+<span class="lineno">  229 </span><span class="spaces">    </span><span class="istickedoff">, &quot;started_at&quot;                 .= rrrStartedAt r</span>
+<span class="lineno">  230 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ended_at&quot;                   .= rrrEndedAt r</span>
+<span class="lineno">  231 </span><span class="spaces">    </span><span class="istickedoff">, &quot;outcome&quot;                    .= rrrOutcome r</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ended_reason&quot;               .= rrrEndedReason r</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">, &quot;expects_completion_message&quot; .= rrrExpectsCompletionMessage r</span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">, &quot;frozen_result_text&quot;         .= rrrFrozenResultText r</span>
+<span class="lineno">  235 </span><span class="spaces">    </span><span class="istickedoff">, &quot;announce_retry_count&quot;       .= rrrAnnounceRetryCount r</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="istickedoff">, &quot;last_announce_retry_at&quot;     .= rrrLastAnnounceRetryAt r</span>
+<span class="lineno">  237 </span><span class="spaces">    </span><span class="istickedoff">, &quot;spawn_mode&quot;                 .= rrrSpawnMode r</span>
+<span class="lineno">  238 </span><span class="spaces">    </span><span class="istickedoff">, &quot;cleanup&quot;                    .= rrrCleanup r</span>
+<span class="lineno">  239 </span><span class="spaces">    </span><span class="istickedoff">, &quot;depth&quot;                      .= rrrDepth r</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">, &quot;wake_on_descendant_settle&quot;  .= rrrWakeOnDescendantSettle r</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">, &quot;cleanup_handled&quot;            .= rrrCleanupHandled r</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">, &quot;cleanup_completed_at&quot;       .= rrrCleanupCompletedAt r</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ended_hook_emitted_at&quot;      .= rrrEndedHookEmittedAt r</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">, &quot;suppress_announce_reason&quot;   .= rrrSuppressAnnounceReason r</span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="istickedoff">, &quot;generation_token&quot;           .= rrrGenerationToken r</span>
+<span class="lineno">  246 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON SubagentRunRecord</span></span></span></span> where
+<span class="lineno">  249 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;SubagentRunRecord&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  250 </span><span class="spaces">    </span><span class="istickedoff">runId          &lt;- o .:  &quot;run_id&quot;</span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">subagentIdT    &lt;- o .:  &quot;subagent_id&quot;</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">childSessionT  &lt;- o .:  &quot;child_session_key&quot;</span>
+<span class="lineno">  253 </span><span class="spaces">    </span><span class="istickedoff">parentSessionT &lt;- o .:  &quot;parent_session_key&quot;</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">controllerT    &lt;- o .:  &quot;controller_session_key&quot;</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">startedAt      &lt;- o .:  &quot;started_at&quot;</span>
+<span class="lineno">  256 </span><span class="spaces">    </span><span class="istickedoff">endedAt        &lt;- o .:? &quot;ended_at&quot;</span>
+<span class="lineno">  257 </span><span class="spaces">    </span><span class="istickedoff">outcome        &lt;- o .:  &quot;outcome&quot;</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">endedReason    &lt;- o .:? &quot;ended_reason&quot;</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">expectsMsg     &lt;- o .:  &quot;expects_completion_message&quot;</span>
+<span class="lineno">  260 </span><span class="spaces">    </span><span class="istickedoff">frozenResult   &lt;- o .:? &quot;frozen_result_text&quot;</span>
+<span class="lineno">  261 </span><span class="spaces">    </span><span class="istickedoff">retryCount     &lt;- o .:  &quot;announce_retry_count&quot;</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">lastRetryAt    &lt;- o .:? &quot;last_announce_retry_at&quot;</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">spawnMode      &lt;- o .:  &quot;spawn_mode&quot;</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">cleanup        &lt;- o .:  &quot;cleanup&quot;</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">depth          &lt;- o .:  &quot;depth&quot;</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">wakeOnSettle   &lt;- o .:  &quot;wake_on_descendant_settle&quot;</span>
+<span class="lineno">  267 </span><span class="spaces">    </span><span class="istickedoff">cleanupHandled &lt;- o .:  &quot;cleanup_handled&quot;</span>
+<span class="lineno">  268 </span><span class="spaces">    </span><span class="istickedoff">cleanupDoneAt  &lt;- o .:? &quot;cleanup_completed_at&quot;</span>
+<span class="lineno">  269 </span><span class="spaces">    </span><span class="istickedoff">hookEmittedAt  &lt;- o .:? &quot;ended_hook_emitted_at&quot;</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">suppressReason &lt;- o .:? &quot;suppress_announce_reason&quot;</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">genToken       &lt;- o .:? &quot;generation_token&quot;</span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">pure SubagentRunRecord</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">{ rrrRunId                    = runId</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">, rrrSubagentId               = SubagentId subagentIdT</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">, rrrChildSessionKey          = mkSystemSessionId childSessionT</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">, rrrParentSessionKey         = mkSystemSessionId parentSessionT</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">, rrrControllerSessionKey     = mkSystemSessionId controllerT</span>
+<span class="lineno">  278 </span><span class="spaces">      </span><span class="istickedoff">, rrrStartedAt                = startedAt</span>
+<span class="lineno">  279 </span><span class="spaces">      </span><span class="istickedoff">, rrrEndedAt                  = endedAt</span>
+<span class="lineno">  280 </span><span class="spaces">      </span><span class="istickedoff">, rrrOutcome                  = outcome</span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="istickedoff">, rrrEndedReason              = endedReason</span>
+<span class="lineno">  282 </span><span class="spaces">      </span><span class="istickedoff">, rrrExpectsCompletionMessage = expectsMsg</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">, rrrFrozenResultText         = frozenResult</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">, rrrAnnounceRetryCount       = retryCount</span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="istickedoff">, rrrLastAnnounceRetryAt      = lastRetryAt</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">, rrrSpawnMode                = spawnMode</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">, rrrCleanup                  = cleanup</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">, rrrDepth                    = depth</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">, rrrWakeOnDescendantSettle   = wakeOnSettle</span>
+<span class="lineno">  290 </span><span class="spaces">      </span><span class="istickedoff">, rrrCleanupHandled           = cleanupHandled</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">, rrrCleanupCompletedAt       = cleanupDoneAt</span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff">, rrrEndedHookEmittedAt       = hookEmittedAt</span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff">, rrrSuppressAnnounceReason   = suppressReason</span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff">, rrrGenerationToken          = genToken</span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  296 </span>
+<span class="lineno">  297 </span>----------------------------------------------------------------------------
+<span class="lineno">  298 </span>-- Registry
+<span class="lineno">  299 </span>----------------------------------------------------------------------------
+<span class="lineno">  300 </span>
+<span class="lineno">  301 </span>-- | The STM-backed registry of run records, keyed by 'RunId'. Thread-safe.
+<span class="lineno">  302 </span>-- Lifecycle hooks are stored in an 'IORef' list (appended on registration).
+<span class="lineno">  303 </span>-- Completion signals (WU-7 Path A) are per-run @TMVar@s stored in a
+<span class="lineno">  304 </span>-- separate @TVar@ map; 'awaitCompletion' blocks on the @TMVar@ while
+<span class="lineno">  305 </span>-- 'completeRun' and 'cancelRunsForParent' fill it.
+<span class="lineno">  306 </span>data RunRecordRegistry = RunRecordRegistry
+<span class="lineno">  307 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrRegistry</span></span></span>  :: !(TVar (Map RunId SubagentRunRecord))
+<span class="lineno">  308 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrHooks</span></span></span>     :: !(IORef [SubagentRunRecord -&gt; IO ()])
+<span class="lineno">  309 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrrSignals</span></span></span>   :: !(TVar (Map RunId (TMVar SubagentRunRecord)))
+<span class="lineno">  310 </span>  }
+<span class="lineno">  311 </span>
+<span class="lineno">  312 </span>-- | Build an empty registry.
+<span class="lineno">  313 </span>newRunRecordRegistry :: IO RunRecordRegistry
+<span class="lineno">  314 </span><span class="decl"><span class="istickedoff">newRunRecordRegistry = do</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">tv &lt;- newTVarIO Map.empty</span>
+<span class="lineno">  316 </span><span class="spaces">  </span><span class="istickedoff">hooksRef &lt;- newIORef []</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">signalsTv &lt;- newTVarIO Map.empty</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="istickedoff">pure (RunRecordRegistry tv hooksRef signalsTv)</span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>----------------------------------------------------------------------------
+<span class="lineno">  321 </span>-- Operations
+<span class="lineno">  322 </span>----------------------------------------------------------------------------
+<span class="lineno">  323 </span>
+<span class="lineno">  324 </span>-- | Create a new run record and store it in the registry. The generation
+<span class="lineno">  325 </span>-- token is freshly minted; 'completeRun' will reject calls with a
+<span class="lineno">  326 </span>-- different token.
+<span class="lineno">  327 </span>createRun
+<span class="lineno">  328 </span>  :: RunRecordRegistry
+<span class="lineno">  329 </span>  -&gt; SubagentId
+<span class="lineno">  330 </span>  -&gt; SessionId
+<span class="lineno">  331 </span>     -- ^ child session
+<span class="lineno">  332 </span>  -&gt; SessionId
+<span class="lineno">  333 </span>     -- ^ parent session (also the controller by default)
+<span class="lineno">  334 </span>  -&gt; Int
+<span class="lineno">  335 </span>     -- ^ spawn depth
+<span class="lineno">  336 </span>  -&gt; SpawnMode
+<span class="lineno">  337 </span>  -&gt; IO SubagentRunRecord
+<span class="lineno">  338 </span><span class="decl"><span class="istickedoff">createRun reg subagentId childSid parentSid depth mode = do</span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">token &lt;- GenerationToken &lt;$&gt; randomRIO (1, maxBound :: Int)</span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="istickedoff">let runId = subagentIdText subagentId</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">expectsMsg = case mode of</span>
+<span class="lineno">  343 </span><span class="spaces">        </span><span class="istickedoff">SpawnForeground -&gt; False</span>
+<span class="lineno">  344 </span><span class="spaces">        </span><span class="istickedoff">SpawnBackground -&gt; True</span>
+<span class="lineno">  345 </span><span class="spaces">      </span><span class="istickedoff">rec = SubagentRunRecord</span>
+<span class="lineno">  346 </span><span class="spaces">        </span><span class="istickedoff">{ rrrRunId                    = runId</span>
+<span class="lineno">  347 </span><span class="spaces">        </span><span class="istickedoff">, rrrSubagentId               = subagentId</span>
+<span class="lineno">  348 </span><span class="spaces">        </span><span class="istickedoff">, rrrChildSessionKey          = childSid</span>
+<span class="lineno">  349 </span><span class="spaces">        </span><span class="istickedoff">, rrrParentSessionKey         = parentSid</span>
+<span class="lineno">  350 </span><span class="spaces">        </span><span class="istickedoff">, rrrControllerSessionKey     = parentSid</span>
+<span class="lineno">  351 </span><span class="spaces">        </span><span class="istickedoff">, rrrStartedAt                = now</span>
+<span class="lineno">  352 </span><span class="spaces">        </span><span class="istickedoff">, rrrEndedAt                  = Nothing</span>
+<span class="lineno">  353 </span><span class="spaces">        </span><span class="istickedoff">, rrrOutcome                  = OutcomeUnknown</span>
+<span class="lineno">  354 </span><span class="spaces">        </span><span class="istickedoff">, rrrEndedReason              = Nothing</span>
+<span class="lineno">  355 </span><span class="spaces">        </span><span class="istickedoff">, rrrExpectsCompletionMessage = expectsMsg</span>
+<span class="lineno">  356 </span><span class="spaces">        </span><span class="istickedoff">, rrrFrozenResultText         = Nothing</span>
+<span class="lineno">  357 </span><span class="spaces">        </span><span class="istickedoff">, rrrAnnounceRetryCount       = 0</span>
+<span class="lineno">  358 </span><span class="spaces">        </span><span class="istickedoff">, rrrLastAnnounceRetryAt      = Nothing</span>
+<span class="lineno">  359 </span><span class="spaces">        </span><span class="istickedoff">, rrrSpawnMode                = mode</span>
+<span class="lineno">  360 </span><span class="spaces">        </span><span class="istickedoff">, rrrCleanup                  = CleanupDelete</span>
+<span class="lineno">  361 </span><span class="spaces">        </span><span class="istickedoff">, rrrDepth                    = depth</span>
+<span class="lineno">  362 </span><span class="spaces">        </span><span class="istickedoff">, rrrWakeOnDescendantSettle   = False</span>
+<span class="lineno">  363 </span><span class="spaces">        </span><span class="istickedoff">, rrrCleanupHandled           = False</span>
+<span class="lineno">  364 </span><span class="spaces">        </span><span class="istickedoff">, rrrCleanupCompletedAt       = Nothing</span>
+<span class="lineno">  365 </span><span class="spaces">        </span><span class="istickedoff">, rrrEndedHookEmittedAt       = Nothing</span>
+<span class="lineno">  366 </span><span class="spaces">        </span><span class="istickedoff">, rrrSuppressAnnounceReason   = Nothing</span>
+<span class="lineno">  367 </span><span class="spaces">        </span><span class="istickedoff">, rrrGenerationToken          = Just token</span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  369 </span><span class="spaces">  </span><span class="istickedoff">atomically $ modifyTVar' (rrrRegistry reg) (Map.insert runId rec)</span>
+<span class="lineno">  370 </span><span class="spaces">  </span><span class="istickedoff">pure rec</span></span>
+<span class="lineno">  371 </span>
+<span class="lineno">  372 </span>-- | Mark a run as completed. Checks the generation token — if the token
+<span class="lineno">  373 </span>-- doesn't match (or is 'Nothing' when the record has one), the call is
+<span class="lineno">  374 </span>-- rejected (returns 'Nothing'). This prevents stale completions from
+<span class="lineno">  375 </span>-- corrupting re-spawned jobs. Idempotent: completing an already-completed
+<span class="lineno">  376 </span>-- run returns 'Nothing'. Emits the @subagent_ended@ lifecycle hook exactly
+<span class="lineno">  377 </span>-- once (guarded by 'rrrEndedHookEmittedAt').
+<span class="lineno">  378 </span>completeRun
+<span class="lineno">  379 </span>  :: RunRecordRegistry
+<span class="lineno">  380 </span>  -&gt; RunId
+<span class="lineno">  381 </span>  -&gt; Maybe GenerationToken
+<span class="lineno">  382 </span>  -&gt; ChildResult
+<span class="lineno">  383 </span>  -&gt; UTCTime
+<span class="lineno">  384 </span>  -&gt; IO (Maybe SubagentRunRecord)
+<span class="lineno">  385 </span><span class="decl"><span class="istickedoff">completeRun reg runId mToken result now = do</span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="istickedoff">mRec &lt;- atomically $ do</span>
+<span class="lineno">  387 </span><span class="spaces">    </span><span class="istickedoff">records &lt;- readTVar (rrrRegistry reg)</span>
+<span class="lineno">  388 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup runId records of</span>
+<span class="lineno">  389 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  390 </span><span class="spaces">      </span><span class="istickedoff">Just rec</span>
+<span class="lineno">  391 </span><span class="spaces">        </span><span class="istickedoff">| isJust (rrrEndedAt rec) -&gt; pure Nothing</span>
+<span class="lineno">  392 </span><span class="spaces">            </span><span class="istickedoff">-- Already completed — idempotent no-op.</span>
+<span class="lineno">  393 </span><span class="spaces">        </span><span class="istickedoff">| tokenMismatch (rrrGenerationToken rec) mToken -&gt; pure Nothing</span>
+<span class="lineno">  394 </span><span class="spaces">            </span><span class="istickedoff">-- Stale token — reject.</span>
+<span class="lineno">  395 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; do</span>
+<span class="lineno">  396 </span><span class="spaces">            </span><span class="istickedoff">let (outcome, endReason) = outcomeForResult result</span>
+<span class="lineno">  397 </span><span class="spaces">                </span><span class="istickedoff">rec' = rec</span>
+<span class="lineno">  398 </span><span class="spaces">                  </span><span class="istickedoff">{ rrrEndedAt = Just <span class="nottickedoff">now</span></span>
+<span class="lineno">  399 </span><span class="spaces">                  </span><span class="istickedoff">, rrrOutcome = outcome</span>
+<span class="lineno">  400 </span><span class="spaces">                  </span><span class="istickedoff">, rrrEndedReason = Just <span class="nottickedoff">endReason</span></span>
+<span class="lineno">  401 </span><span class="spaces">                  </span><span class="istickedoff">, rrrFrozenResultText = frozenText result</span>
+<span class="lineno">  402 </span><span class="spaces">                  </span><span class="istickedoff">, rrrEndedHookEmittedAt = Just <span class="nottickedoff">now</span></span>
+<span class="lineno">  403 </span><span class="spaces">                  </span><span class="istickedoff">}</span>
+<span class="lineno">  404 </span><span class="spaces">            </span><span class="istickedoff">writeTVar (rrrRegistry reg) (Map.insert runId rec' records)</span>
+<span class="lineno">  405 </span><span class="spaces">            </span><span class="istickedoff">fillCompletionSignal reg rec'  -- WU-7 Path A</span>
+<span class="lineno">  406 </span><span class="spaces">            </span><span class="istickedoff">pure (Just rec')</span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">-- Emit lifecycle hooks OUTSIDE the STM transaction (callbacks are IO).</span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">forM_ mRec $ \rec -&gt; do</span>
+<span class="lineno">  409 </span><span class="spaces">    </span><span class="istickedoff">hooks &lt;- readIORef (rrrHooks reg)</span>
+<span class="lineno">  410 </span><span class="spaces">    </span><span class="istickedoff">forM_ hooks $ \hook -&gt; hook <span class="nottickedoff">rec</span></span>
+<span class="lineno">  411 </span><span class="spaces">  </span><span class="istickedoff">pure mRec</span></span>
+<span class="lineno">  412 </span>
+<span class="lineno">  413 </span>-- | List all runs for a given parent session.
+<span class="lineno">  414 </span>listRunsForParent :: RunRecordRegistry -&gt; SessionId -&gt; IO [SubagentRunRecord]
+<span class="lineno">  415 </span><span class="decl"><span class="istickedoff">listRunsForParent reg parentSid = do</span>
+<span class="lineno">  416 </span><span class="spaces">  </span><span class="istickedoff">records &lt;- readTVarIO (rrrRegistry reg)</span>
+<span class="lineno">  417 </span><span class="spaces">  </span><span class="istickedoff">pure (filter (\r -&gt; rrrParentSessionKey r == parentSid)</span>
+<span class="lineno">  418 </span><span class="spaces">               </span><span class="istickedoff">(Map.elems records))</span></span>
+<span class="lineno">  419 </span>
+<span class="lineno">  420 </span>-- | Find the latest run for a given child session (most recently created).
+<span class="lineno">  421 </span>findLatestRunForChild
+<span class="lineno">  422 </span>  :: RunRecordRegistry -&gt; SessionId -&gt; IO (Maybe SubagentRunRecord)
+<span class="lineno">  423 </span><span class="decl"><span class="istickedoff">findLatestRunForChild reg childSid = do</span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">records &lt;- readTVarIO (rrrRegistry reg)</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">let matching = filter (\r -&gt; rrrChildSessionKey r == childSid)</span>
+<span class="lineno">  426 </span><span class="spaces">                         </span><span class="istickedoff">(Map.elems records)</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">pure (case matching of</span>
+<span class="lineno">  428 </span><span class="spaces">          </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  429 </span><span class="spaces">          </span><span class="istickedoff">xs -&gt; Just (latestByStartedAt xs))</span>
+<span class="lineno">  430 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  431 </span><span class="spaces">    </span><span class="istickedoff">latestByStartedAt = foldr1 <span class="nottickedoff">(\a b -&gt;</span></span>
+<span class="lineno">  432 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">if rrrStartedAt a &gt;= rrrStartedAt b then a else b)</span></span></span>
+<span class="lineno">  433 </span>
+<span class="lineno">  434 </span>-- | Count non-terminal (pending) runs for a given session as parent.
+<span class="lineno">  435 </span>countPendingDescendants :: RunRecordRegistry -&gt; SessionId -&gt; IO Int
+<span class="lineno">  436 </span><span class="decl"><span class="istickedoff">countPendingDescendants reg parentSid = do</span>
+<span class="lineno">  437 </span><span class="spaces">  </span><span class="istickedoff">records &lt;- readTVarIO (rrrRegistry reg)</span>
+<span class="lineno">  438 </span><span class="spaces">  </span><span class="istickedoff">pure (length (filter (\r -&gt; rrrParentSessionKey r == parentSid</span>
+<span class="lineno">  439 </span><span class="spaces">                          </span><span class="istickedoff">&amp;&amp; isNothing (rrrEndedAt r))</span>
+<span class="lineno">  440 </span><span class="spaces">                       </span><span class="istickedoff">(Map.elems records)))</span></span>
+<span class="lineno">  441 </span>
+<span class="lineno">  442 </span>-- | Check whether a session has any pending (non-terminal) descendants.
+<span class="lineno">  443 </span>-- Returns 'True' when there are pending runs whose parent is this session.
+<span class="lineno">  444 </span>descendantSettled :: RunRecordRegistry -&gt; SessionId -&gt; IO Bool
+<span class="lineno">  445 </span><span class="decl"><span class="istickedoff">descendantSettled reg sid = do</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">n &lt;- countPendingDescendants reg sid</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">pure (n == 0)</span></span>
+<span class="lineno">  448 </span>
+<span class="lineno">  449 </span>-- | Check whether a child's completion delivery should be deferred until
+<span class="lineno">  450 </span>-- its descendants settle. Returns 'True' when the child session still has
+<span class="lineno">  451 </span>-- pending descendants (the child's results would be partial). Once all
+<span class="lineno">  452 </span>-- descendants reach a terminal state, this returns 'False' and the child's
+<span class="lineno">  453 </span>-- completion can be delivered upward.
+<span class="lineno">  454 </span>shouldDeferDelivery :: RunRecordRegistry -&gt; SessionId -&gt; IO Bool
+<span class="lineno">  455 </span><span class="decl"><span class="istickedoff">shouldDeferDelivery reg childSid = do</span>
+<span class="lineno">  456 </span><span class="spaces">  </span><span class="istickedoff">settled &lt;- descendantSettled reg childSid</span>
+<span class="lineno">  457 </span><span class="spaces">  </span><span class="istickedoff">pure (not settled)</span></span>
+<span class="lineno">  458 </span>
+<span class="lineno">  459 </span>----------------------------------------------------------------------------
+<span class="lineno">  460 </span>-- Announce retry / backoff (WU-6)
+<span class="lineno">  461 </span>----------------------------------------------------------------------------
+<span class="lineno">  462 </span>
+<span class="lineno">  463 </span>-- | The maximum number of announce retry attempts before the completion
+<span class="lineno">  464 </span>-- is stored for delivery on parent reactivation.
+<span class="lineno">  465 </span>maxAnnounceRetries :: Int
+<span class="lineno">  466 </span><span class="decl"><span class="istickedoff">maxAnnounceRetries = 3</span></span>
+<span class="lineno">  467 </span>
+<span class="lineno">  468 </span>-- | The base backoff delay (seconds) for the first retry. Subsequent
+<span class="lineno">  469 </span>-- retries double the delay (exponential backoff: 1s, 2s, 4s).
+<span class="lineno">  470 </span>announceBackoffBase :: Double
+<span class="lineno">  471 </span><span class="decl"><span class="istickedoff">announceBackoffBase = 1.0</span></span>
+<span class="lineno">  472 </span>
+<span class="lineno">  473 </span>-- | Compute the exponential backoff delay (seconds) for a given attempt
+<span class="lineno">  474 </span>-- number. Attempt 0 = base, attempt 1 = base * 2, attempt 2 = base * 4,
+<span class="lineno">  475 </span>-- etc. Capped to avoid overflow on very large attempt counts.
+<span class="lineno">  476 </span>computeAnnounceBackoff :: Int -&gt; Double
+<span class="lineno">  477 </span><span class="decl"><span class="istickedoff">computeAnnounceBackoff attempt =</span>
+<span class="lineno">  478 </span><span class="spaces">  </span><span class="istickedoff">announceBackoffBase * (2 ^ safeAttempt)</span>
+<span class="lineno">  479 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  480 </span><span class="spaces">    </span><span class="istickedoff">safeAttempt = min attempt 30</span></span>  -- cap to prevent overflow
+<span class="lineno">  481 </span>
+<span class="lineno">  482 </span>-- | Check whether the announce retries are exhausted (the retry count has
+<span class="lineno">  483 </span>-- reached or exceeded 'maxAnnounceRetries').
+<span class="lineno">  484 </span>announceRetriesExhausted :: Int -&gt; Bool
+<span class="lineno">  485 </span><span class="decl"><span class="istickedoff">announceRetriesExhausted n = n &gt;= maxAnnounceRetries</span></span>
+<span class="lineno">  486 </span>
+<span class="lineno">  487 </span>-- | Record an announce attempt: increment the retry counter and record
+<span class="lineno">  488 </span>-- the timestamp. Returns the updated record, or 'Nothing' if the run id
+<span class="lineno">  489 </span>-- is not found. This is used by the delivery retry loop to track how many
+<span class="lineno">  490 </span>-- attempts have been made and when the last one occurred.
+<span class="lineno">  491 </span>recordAnnounceAttempt
+<span class="lineno">  492 </span>  :: RunRecordRegistry
+<span class="lineno">  493 </span>  -&gt; RunId
+<span class="lineno">  494 </span>  -&gt; UTCTime
+<span class="lineno">  495 </span>  -&gt; IO (Maybe SubagentRunRecord)
+<span class="lineno">  496 </span><span class="decl"><span class="istickedoff">recordAnnounceAttempt reg runId now = do</span>
+<span class="lineno">  497 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  498 </span><span class="spaces">    </span><span class="istickedoff">records &lt;- readTVar (rrrRegistry reg)</span>
+<span class="lineno">  499 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup runId records of</span>
+<span class="lineno">  500 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  501 </span><span class="spaces">      </span><span class="istickedoff">Just rec -&gt; do</span>
+<span class="lineno">  502 </span><span class="spaces">        </span><span class="istickedoff">let rec' = rec</span>
+<span class="lineno">  503 </span><span class="spaces">              </span><span class="istickedoff">{ rrrAnnounceRetryCount = rrrAnnounceRetryCount rec + 1</span>
+<span class="lineno">  504 </span><span class="spaces">              </span><span class="istickedoff">, rrrLastAnnounceRetryAt = Just now</span>
+<span class="lineno">  505 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  506 </span><span class="spaces">        </span><span class="istickedoff">writeTVar (rrrRegistry reg) (Map.insert runId rec' records)</span>
+<span class="lineno">  507 </span><span class="spaces">        </span><span class="istickedoff">pure <span class="nottickedoff">(Just rec')</span></span></span>
+<span class="lineno">  508 </span>
+<span class="lineno">  509 </span>----------------------------------------------------------------------------
+<span class="lineno">  510 </span>-- Completion signal (WU-7 dual-path detection)
+<span class="lineno">  511 </span>----------------------------------------------------------------------------
+<span class="lineno">  512 </span>
+<span class="lineno">  513 </span>-- | A completion signal (WU-7 Path A): a @TMVar@ that is filled exactly
+<span class="lineno">  514 </span>-- once when a run reaches a terminal state. A watcher thread can block on
+<span class="lineno">  515 </span>-- 'awaitCompletion' to detect completion without polling.
+<span class="lineno">  516 </span>newtype CompletionSignal = CompletionSignal (TMVar SubagentRunRecord)
+<span class="lineno">  517 </span>
+<span class="lineno">  518 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show CompletionSignal</span></span></span></span> where
+<span class="lineno">  519 </span>  <span class="decl"><span class="nottickedoff">show _ = &quot;CompletionSignal&quot;</span></span>
+<span class="lineno">  520 </span>
+<span class="lineno">  521 </span>-- | Register a completion signal for a run. Returns 'Just' the signal if
+<span class="lineno">  522 </span>-- the run exists, or 'Nothing' if the run id is not found. The signal is
+<span class="lineno">  523 </span>-- filled by 'completeRun' or 'cancelRunsForParent' when the run reaches a
+<span class="lineno">  524 </span>-- terminal state. Registering twice for the same run returns the same
+<span class="lineno">  525 </span>-- 'TMVar' (idempotent).
+<span class="lineno">  526 </span>registerCompletionSignal
+<span class="lineno">  527 </span>  :: RunRecordRegistry
+<span class="lineno">  528 </span>  -&gt; RunId
+<span class="lineno">  529 </span>  -&gt; IO (Maybe CompletionSignal)
+<span class="lineno">  530 </span><span class="decl"><span class="istickedoff">registerCompletionSignal reg runId = do</span>
+<span class="lineno">  531 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  532 </span><span class="spaces">    </span><span class="istickedoff">records &lt;- readTVar (rrrRegistry reg)</span>
+<span class="lineno">  533 </span><span class="spaces">    </span><span class="istickedoff">if <span class="tickonlytrue">Map.member runId records</span></span>
+<span class="lineno">  534 </span><span class="spaces">      </span><span class="istickedoff">then do</span>
+<span class="lineno">  535 </span><span class="spaces">        </span><span class="istickedoff">signals &lt;- readTVar (rrrSignals reg)</span>
+<span class="lineno">  536 </span><span class="spaces">        </span><span class="istickedoff">case Map.lookup runId signals of</span>
+<span class="lineno">  537 </span><span class="spaces">          </span><span class="istickedoff">Just tmv -&gt; <span class="nottickedoff">pure (Just (CompletionSignal tmv))</span></span>
+<span class="lineno">  538 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  539 </span><span class="spaces">            </span><span class="istickedoff">tmv &lt;- newEmptyTMVar</span>
+<span class="lineno">  540 </span><span class="spaces">            </span><span class="istickedoff">writeTVar (rrrSignals reg) (Map.insert runId tmv signals)</span>
+<span class="lineno">  541 </span><span class="spaces">            </span><span class="istickedoff">pure (Just (CompletionSignal tmv))</span>
+<span class="lineno">  542 </span><span class="spaces">      </span><span class="istickedoff">else <span class="nottickedoff">pure Nothing</span></span></span>
+<span class="lineno">  543 </span>
+<span class="lineno">  544 </span>-- | Block until the completion signal is filled, or the timeout (micro-
+<span class="lineno">  545 </span>-- seconds) elapses. Returns 'Just' the terminal record on completion, or
+<span class="lineno">  546 </span>-- 'Nothing' on timeout. Uses 'registerDelay' + 'readTMVar' racing for a
+<span class="lineno">  547 </span>-- pure STM timeout (no forked threads needed).
+<span class="lineno">  548 </span>awaitCompletion :: CompletionSignal -&gt; Int -&gt; IO (Maybe SubagentRunRecord)
+<span class="lineno">  549 </span><span class="decl"><span class="istickedoff">awaitCompletion (CompletionSignal tmv) timeoutMicros = do</span>
+<span class="lineno">  550 </span><span class="spaces">  </span><span class="istickedoff">timer &lt;- registerDelay timeoutMicros</span>
+<span class="lineno">  551 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">mRec &lt;- tryReadTMVar tmv</span>
+<span class="lineno">  553 </span><span class="spaces">    </span><span class="istickedoff">case mRec of</span>
+<span class="lineno">  554 </span><span class="spaces">      </span><span class="istickedoff">Just rec -&gt; pure (Just rec)</span>
+<span class="lineno">  555 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  556 </span><span class="spaces">        </span><span class="istickedoff">expired &lt;- readTVar timer</span>
+<span class="lineno">  557 </span><span class="spaces">        </span><span class="istickedoff">if expired</span>
+<span class="lineno">  558 </span><span class="spaces">          </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  559 </span><span class="spaces">          </span><span class="istickedoff">else retry</span></span>
+<span class="lineno">  560 </span>
+<span class="lineno">  561 </span>-- | Fill the completion signal for a run (called by 'completeRun' and
+<span class="lineno">  562 </span>-- 'cancelRunsForParent'). If no signal is registered, this is a no-op.
+<span class="lineno">  563 </span>-- If the signal is already filled, this is a no-op (idempotent — the
+<span class="lineno">  564 </span>-- first completion wins).
+<span class="lineno">  565 </span>fillCompletionSignal :: RunRecordRegistry -&gt; SubagentRunRecord -&gt; STM ()
+<span class="lineno">  566 </span><span class="decl"><span class="istickedoff">fillCompletionSignal reg rec = do</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">signals &lt;- readTVar (rrrSignals reg)</span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup (rrrRunId rec) signals of</span>
+<span class="lineno">  569 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span>  -- no signal registered</span>
+<span class="lineno">  570 </span><span class="spaces">    </span><span class="istickedoff">Just tmv -&gt; do</span>
+<span class="lineno">  571 </span><span class="spaces">      </span><span class="istickedoff">mExisting &lt;- tryReadTMVar tmv</span>
+<span class="lineno">  572 </span><span class="spaces">      </span><span class="istickedoff">case mExisting of</span>
+<span class="lineno">  573 </span><span class="spaces">        </span><span class="istickedoff">Just _  -&gt; <span class="nottickedoff">pure ()</span>  -- already filled — first wins</span>
+<span class="lineno">  574 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; putTMVar tmv rec</span></span>
+<span class="lineno">  575 </span>
+<span class="lineno">  576 </span>-- | Cancel all pending runs for a parent session, recursively walking the
+<span class="lineno">  577 </span>-- parent→child linkage so grandchildren (and deeper descendants) are also
+<span class="lineno">  578 </span>-- cancelled. Marks each cancelled run as killed and sets the suppress
+<span class="lineno">  579 </span>-- reason. Returns all cancelled records (the full subtree). Already-
+<span class="lineno">  580 </span>-- completed runs are not affected and are not traversed through — only
+<span class="lineno">  581 </span>-- pending runs whose child session may itself be a parent of further
+<span class="lineno">  582 </span>-- pending runs are followed.
+<span class="lineno">  583 </span>cancelRunsForParent
+<span class="lineno">  584 </span>  :: RunRecordRegistry
+<span class="lineno">  585 </span>  -&gt; SessionId
+<span class="lineno">  586 </span>  -&gt; UTCTime
+<span class="lineno">  587 </span>  -&gt; Text
+<span class="lineno">  588 </span>     -- ^ suppress reason (e.g. \&quot;killed\&quot;)
+<span class="lineno">  589 </span>  -&gt; IO [SubagentRunRecord]
+<span class="lineno">  590 </span><span class="decl"><span class="istickedoff">cancelRunsForParent reg parentSid now reason = do</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">cancelled &lt;- atomically $ do</span>
+<span class="lineno">  592 </span><span class="spaces">    </span><span class="istickedoff">records &lt;- readTVar (rrrRegistry reg)</span>
+<span class="lineno">  593 </span><span class="spaces">    </span><span class="istickedoff">-- BFS/DFS over the parent→child linkage. Start with runs whose parent</span>
+<span class="lineno">  594 </span><span class="spaces">    </span><span class="istickedoff">-- is the cancelled session; for each cancelled child, follow its child</span>
+<span class="lineno">  595 </span><span class="spaces">    </span><span class="istickedoff">-- session key to find runs where THAT session is the parent.</span>
+<span class="lineno">  596 </span><span class="spaces">    </span><span class="istickedoff">let allRecs = Map.elems records</span>
+<span class="lineno">  597 </span><span class="spaces">        </span><span class="istickedoff">-- Index pending runs by their parent session key for O(1) lookup.</span>
+<span class="lineno">  598 </span><span class="spaces">        </span><span class="istickedoff">pendingByParent :: Map.Map SessionId [SubagentRunRecord]</span>
+<span class="lineno">  599 </span><span class="spaces">        </span><span class="istickedoff">pendingByParent = Map.fromListWith (++)</span>
+<span class="lineno">  600 </span><span class="spaces">          </span><span class="istickedoff">[ (rrrParentSessionKey r, [r])</span>
+<span class="lineno">  601 </span><span class="spaces">          </span><span class="istickedoff">| r &lt;- allRecs, isNothing (rrrEndedAt r)</span>
+<span class="lineno">  602 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  603 </span><span class="spaces">        </span><span class="istickedoff">-- Collect the full subtree of pending runs reachable from parentSid.</span>
+<span class="lineno">  604 </span><span class="spaces">        </span><span class="istickedoff">collect :: [SessionId] -&gt; [SubagentRunRecord] -&gt; [SubagentRunRecord]</span>
+<span class="lineno">  605 </span><span class="spaces">        </span><span class="istickedoff">collect [] acc = acc</span>
+<span class="lineno">  606 </span><span class="spaces">        </span><span class="istickedoff">collect (sid : rest) acc =</span>
+<span class="lineno">  607 </span><span class="spaces">          </span><span class="istickedoff">case Map.lookup sid pendingByParent of</span>
+<span class="lineno">  608 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; collect rest acc</span>
+<span class="lineno">  609 </span><span class="spaces">            </span><span class="istickedoff">Just children -&gt;</span>
+<span class="lineno">  610 </span><span class="spaces">              </span><span class="istickedoff">let newAcc = acc ++ children</span>
+<span class="lineno">  611 </span><span class="spaces">                  </span><span class="istickedoff">-- Each cancelled child's session becomes a new parent to</span>
+<span class="lineno">  612 </span><span class="spaces">                  </span><span class="istickedoff">-- explore (its child_session_key is where grandchildren</span>
+<span class="lineno">  613 </span><span class="spaces">                  </span><span class="istickedoff">-- attach as parent_session_key).</span>
+<span class="lineno">  614 </span><span class="spaces">                  </span><span class="istickedoff">newFront = map rrrChildSessionKey children ++ rest</span>
+<span class="lineno">  615 </span><span class="spaces">              </span><span class="istickedoff">in collect newFront newAcc</span>
+<span class="lineno">  616 </span><span class="spaces">        </span><span class="istickedoff">pending = collect [parentSid] []</span>
+<span class="lineno">  617 </span><span class="spaces">        </span><span class="istickedoff">updated = map (\r -&gt; r { rrrEndedAt = Just <span class="nottickedoff">now</span></span>
+<span class="lineno">  618 </span><span class="spaces">                               </span><span class="istickedoff">, rrrOutcome = OutcomeKilled</span>
+<span class="lineno">  619 </span><span class="spaces">                               </span><span class="istickedoff">, rrrEndedReason = Just <span class="nottickedoff">EndKilled</span></span>
+<span class="lineno">  620 </span><span class="spaces">                               </span><span class="istickedoff">, rrrSuppressAnnounceReason = Just reason</span>
+<span class="lineno">  621 </span><span class="spaces">                               </span><span class="istickedoff">, rrrEndedHookEmittedAt = Just <span class="nottickedoff">now</span></span>
+<span class="lineno">  622 </span><span class="spaces">                               </span><span class="istickedoff">})</span>
+<span class="lineno">  623 </span><span class="spaces">                      </span><span class="istickedoff">pending</span>
+<span class="lineno">  624 </span><span class="spaces">        </span><span class="istickedoff">newMap = foldr (\r m -&gt; Map.insert (rrrRunId r) r m) records updated</span>
+<span class="lineno">  625 </span><span class="spaces">    </span><span class="istickedoff">writeTVar (rrrRegistry reg) newMap</span>
+<span class="lineno">  626 </span><span class="spaces">    </span><span class="istickedoff">-- Fill completion signals for all cancelled runs (WU-7 Path A)</span>
+<span class="lineno">  627 </span><span class="spaces">    </span><span class="istickedoff">forM_ updated (fillCompletionSignal reg)</span>
+<span class="lineno">  628 </span><span class="spaces">    </span><span class="istickedoff">pure updated</span>
+<span class="lineno">  629 </span><span class="spaces">  </span><span class="istickedoff">-- Emit hooks for cancelled runs</span>
+<span class="lineno">  630 </span><span class="spaces">  </span><span class="istickedoff">hooks &lt;- readIORef (rrrHooks reg)</span>
+<span class="lineno">  631 </span><span class="spaces">  </span><span class="istickedoff">forM_ cancelled $ \rec -&gt; forM_ hooks $ <span class="nottickedoff">\hook -&gt; hook rec</span></span>
+<span class="lineno">  632 </span><span class="spaces">  </span><span class="istickedoff">pure cancelled</span></span>
+<span class="lineno">  633 </span>
+<span class="lineno">  634 </span>----------------------------------------------------------------------------
+<span class="lineno">  635 </span>-- Lifecycle hooks
+<span class="lineno">  636 </span>----------------------------------------------------------------------------
+<span class="lineno">  637 </span>
+<span class="lineno">  638 </span>-- | Register a callback to be invoked when a run reaches a terminal state
+<span class="lineno">  639 </span>-- (completion or cancellation). The callback receives the final
+<span class="lineno">  640 </span>-- 'SubagentRunRecord'. Callbacks are called outside STM transactions.
+<span class="lineno">  641 </span>registerEndedHook
+<span class="lineno">  642 </span>  :: RunRecordRegistry -&gt; (SubagentRunRecord -&gt; IO ()) -&gt; IO ()
+<span class="lineno">  643 </span><span class="decl"><span class="istickedoff">registerEndedHook reg hook =</span>
+<span class="lineno">  644 </span><span class="spaces">  </span><span class="istickedoff">atomicModifyIORef' (rrrHooks reg) (\hooks -&gt; (hooks ++ [hook], ()))</span></span>
+<span class="lineno">  645 </span>
+<span class="lineno">  646 </span>----------------------------------------------------------------------------
+<span class="lineno">  647 </span>-- Persistence
+<span class="lineno">  648 </span>----------------------------------------------------------------------------
+<span class="lineno">  649 </span>
+<span class="lineno">  650 </span>-- | The file path for a run record on disk.
+<span class="lineno">  651 </span>runRecordPath :: FilePath -&gt; RunId -&gt; FilePath
+<span class="lineno">  652 </span><span class="decl"><span class="istickedoff">runRecordPath sessionDirPath runId =</span>
+<span class="lineno">  653 </span><span class="spaces">  </span><span class="istickedoff">sessionDirPath &lt;/&gt; &quot;agents&quot; &lt;/&gt; T.unpack runId &lt;/&gt; &quot;run-record.json&quot;</span></span>
+<span class="lineno">  654 </span>
+<span class="lineno">  655 </span>-- | Save a run record to disk as JSON (atomic write). Creates the parent
+<span class="lineno">  656 </span>-- directory if needed. Best-effort: IO errors are swallowed.
+<span class="lineno">  657 </span>saveRunRecordToDisk :: FilePath -&gt; SubagentRunRecord -&gt; IO ()
+<span class="lineno">  658 </span><span class="decl"><span class="istickedoff">saveRunRecordToDisk sessionDirPath rec = do</span>
+<span class="lineno">  659 </span><span class="spaces">  </span><span class="istickedoff">let path = runRecordPath sessionDirPath (rrrRunId rec)</span>
+<span class="lineno">  660 </span><span class="spaces">      </span><span class="istickedoff">tmp  = path &lt;.&gt; &quot;tmp&quot;</span>
+<span class="lineno">  661 </span><span class="spaces">  </span><span class="istickedoff">eWrite &lt;- try @IOException $ do</span>
+<span class="lineno">  662 </span><span class="spaces">    </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">  663 </span><span class="spaces">    </span><span class="istickedoff">BS.writeFile tmp (BSL.toStrict (encode rec))</span>
+<span class="lineno">  664 </span><span class="spaces">    </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">  665 </span><span class="spaces">  </span><span class="istickedoff">case eWrite of</span>
+<span class="lineno">  666 </span><span class="spaces">    </span><span class="istickedoff">Left _err -&gt; <span class="nottickedoff">pure ()</span>  -- best-effort</span>
+<span class="lineno">  667 </span><span class="spaces">    </span><span class="istickedoff">Right _   -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  668 </span>
+<span class="lineno">  669 </span>-- | Load a run record from a JSON file. Returns 'Nothing' if the file
+<span class="lineno">  670 </span>-- doesn't exist or can't be parsed.
+<span class="lineno">  671 </span>loadRunRecord :: FilePath -&gt; RunId -&gt; IO (Maybe SubagentRunRecord)
+<span class="lineno">  672 </span><span class="decl"><span class="istickedoff">loadRunRecord sessionDirPath runId = do</span>
+<span class="lineno">  673 </span><span class="spaces">  </span><span class="istickedoff">let path = runRecordPath sessionDirPath runId</span>
+<span class="lineno">  674 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  675 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  676 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  677 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  678 </span><span class="spaces">      </span><span class="istickedoff">eRaw &lt;- try @IOException (BS.readFile path)</span>
+<span class="lineno">  679 </span><span class="spaces">      </span><span class="istickedoff">case eRaw of</span>
+<span class="lineno">  680 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  681 </span><span class="spaces">        </span><span class="istickedoff">Right raw -&gt; case eitherDecodeStrict' raw of</span>
+<span class="lineno">  682 </span><span class="spaces">          </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  683 </span><span class="spaces">          </span><span class="istickedoff">Right rec -&gt; pure (Just rec)</span></span>
+<span class="lineno">  684 </span>
+<span class="lineno">  685 </span>----------------------------------------------------------------------------
+<span class="lineno">  686 </span>-- Helpers
+<span class="lineno">  687 </span>----------------------------------------------------------------------------
+<span class="lineno">  688 </span>
+<span class="lineno">  689 </span>-- | Check whether a provided token matches the record's token.
+<span class="lineno">  690 </span>tokenMismatch :: Maybe GenerationToken -&gt; Maybe GenerationToken -&gt; Bool
+<span class="lineno">  691 </span><span class="decl"><span class="istickedoff">tokenMismatch (Just expected) (Just provided) = expected /= provided</span>
+<span class="lineno">  692 </span><span class="spaces"></span><span class="istickedoff">tokenMismatch (Just _)        Nothing         = <span class="nottickedoff">True</span></span>
+<span class="lineno">  693 </span><span class="spaces"></span><span class="istickedoff">tokenMismatch Nothing         _               = <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  694 </span>
+<span class="lineno">  695 </span>-- | Map a 'ChildResult' to its 'RunOutcome' and 'EndReason'.
+<span class="lineno">  696 </span>outcomeForResult :: ChildResult -&gt; (RunOutcome, EndReason)
+<span class="lineno">  697 </span><span class="decl"><span class="istickedoff">outcomeForResult result =</span>
+<span class="lineno">  698 </span><span class="spaces">  </span><span class="istickedoff">case crStatus result of</span>
+<span class="lineno">  699 </span><span class="spaces">    </span><span class="istickedoff">CsCompleted   -&gt; (OutcomeOk, <span class="nottickedoff">EndComplete</span>)</span>
+<span class="lineno">  700 </span><span class="spaces">    </span><span class="istickedoff">CsFailed      -&gt; <span class="nottickedoff">(OutcomeOk, EndComplete)</span></span>
+<span class="lineno">  701 </span><span class="spaces">    </span><span class="istickedoff">CsTimeout     -&gt; (OutcomeTimeout, <span class="nottickedoff">EndTimeout</span>)</span>
+<span class="lineno">  702 </span><span class="spaces">    </span><span class="istickedoff">CsInterrupted -&gt; <span class="nottickedoff">(OutcomeKilled, EndKilled)</span></span>
+<span class="lineno">  703 </span><span class="spaces">    </span><span class="istickedoff">CsError       -&gt; (OutcomeError, <span class="nottickedoff">EndError</span>)</span></span>
+<span class="lineno">  704 </span>
+<span class="lineno">  705 </span>-- | Extract the frozen result text from a 'ChildResult'. Prefers the
+<span class="lineno">  706 </span>-- summary; falls back to the error message.
+<span class="lineno">  707 </span>frozenText :: ChildResult -&gt; Maybe Text
+<span class="lineno">  708 </span><span class="decl"><span class="istickedoff">frozenText result =</span>
+<span class="lineno">  709 </span><span class="spaces">  </span><span class="istickedoff">case crSummary result of</span>
+<span class="lineno">  710 </span><span class="spaces">    </span><span class="istickedoff">Just s  -&gt; Just <span class="nottickedoff">s</span></span>
+<span class="lineno">  711 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">crError result</span></span></span>
+
+</pre>
+</body>
+</html>

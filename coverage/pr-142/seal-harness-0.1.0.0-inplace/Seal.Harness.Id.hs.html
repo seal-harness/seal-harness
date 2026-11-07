@@ -1,0 +1,81 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | A UUID-backed durable harness identity (the registry key). Minted at
+<span class="lineno">    4 </span>-- spawn time; stamped as a tmux @seal_id marker on the harness window so a
+<span class="lineno">    5 </span>-- window can be re-identified after a rename or reconnect. The UUID is
+<span class="lineno">    6 </span>-- generated in-repo from 'System.Random' (the repo has @uuid-types@ but
+<span class="lineno">    7 </span>-- not the full @uuid@ package, so v4 generation is hand-rolled from two
+<span class="lineno">    8 </span>-- random 'Word64's with the v4 version/variant bits set).
+<span class="lineno">    9 </span>module Seal.Harness.Id
+<span class="lineno">   10 </span>  ( HarnessId (..)
+<span class="lineno">   11 </span>  , newHarnessId
+<span class="lineno">   12 </span>  , parseHarnessId
+<span class="lineno">   13 </span>  , harnessIdToText
+<span class="lineno">   14 </span>  , isValidHarnessIdText
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   18 </span>import Data.Bits ((.&amp;.), (.|.), complement)
+<span class="lineno">   19 </span>import Data.Text (Text)
+<span class="lineno">   20 </span>import Data.Text qualified as T
+<span class="lineno">   21 </span>import Data.UUID.Types qualified as U
+<span class="lineno">   22 </span>import Data.Word (Word64)
+<span class="lineno">   23 </span>import GHC.Generics (Generic)
+<span class="lineno">   24 </span>import System.Random (randomIO)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | A UUID-backed durable harness identity.
+<span class="lineno">   27 </span>newtype HarnessId = HarnessId Text
+<span class="lineno">   28 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   29 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | Mint a fresh random HarnessId (UUID v4). IO because it reads randomness.
+<span class="lineno">   32 </span>newHarnessId :: IO HarnessId
+<span class="lineno">   33 </span><span class="decl"><span class="istickedoff">newHarnessId = do</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">w1 &lt;- randomIO</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">w2 &lt;- randomIO</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">-- Set version (4) in the high nibble of byte 6 (bits 48-51 of w1) and</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">-- variant (10) in the high bits of byte 8 (bits 56-57 of w2).</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">let v1 = (w1 .&amp;. complement 0x0000F000) .|. (0x4000 :: Word64)   -- version 4</span>
+<span class="lineno">   39 </span><span class="spaces">      </span><span class="istickedoff">v2 = (w2 .|. 0x8000000000000000) .&amp;. complement 0x4000000000000000  -- variant 10</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">pure (HarnessId (T.pack (U.toString (U.fromWords64 v1 v2))))</span></span>
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | The text form (a UUID string) — the value stamped as the @seal_id marker.
+<span class="lineno">   43 </span>harnessIdToText :: HarnessId -&gt; Text
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">harnessIdToText (HarnessId t) = t</span></span>
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | Parse a HarnessId from its text form. 'Left' on malformed input.
+<span class="lineno">   47 </span>parseHarnessId :: Text -&gt; Either Text HarnessId
+<span class="lineno">   48 </span><span class="decl"><span class="istickedoff">parseHarnessId t</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">| isValidHarnessIdText t = Right (HarnessId t)</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>              = Left <span class="nottickedoff">(&quot;invalid HarnessId: &quot; &lt;&gt; t)</span></span></span>
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | True if the text is a valid UUID (8-4-4-4-12 hex, case-insensitive).
+<span class="lineno">   53 </span>-- Used to defend the @seal_id marker stamp against a malformed id.
+<span class="lineno">   54 </span>isValidHarnessIdText :: Text -&gt; Bool
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">isValidHarnessIdText t =</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">case U.fromString (T.unpack t) of</span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; True</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; False</span></span>
+
+</pre>
+</body>
+</html>

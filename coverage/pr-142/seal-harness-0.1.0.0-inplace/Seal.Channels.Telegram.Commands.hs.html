@@ -1,0 +1,106 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Derive Telegram BotCommand menu entries from the Seal command 'Registry'.
+<span class="lineno">    3 </span>-- Each 'CommandSpec' becomes a 'BotCommand' (name + short description) so
+<span class="lineno">    4 </span>-- Telegram's native @\/@-command auto-completion menu is populated from the
+<span class="lineno">    5 </span>-- same single source of truth that drives @\/help@ and the CLI dispatch.
+<span class="lineno">    6 </span>-- Mirrors hermes-agent's @telegram_bot_commands()@ approach: one menu entry
+<span class="lineno">    7 </span>-- per canonical command (aliases skipped), names sanitized for Telegram's
+<span class="lineno">    8 </span>-- charset, descriptions truncated to Telegram's 256-char limit.
+<span class="lineno">    9 </span>module Seal.Channels.Telegram.Commands
+<span class="lineno">   10 </span>  ( telegramBotCommands
+<span class="lineno">   11 </span>  , sanitizeTelegramName
+<span class="lineno">   12 </span>  , maxTelegramCommandNameLen
+<span class="lineno">   13 </span>  , maxTelegramDescriptionLen
+<span class="lineno">   14 </span>  ) where
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Data.Char (isAscii, isLower, isDigit)
+<span class="lineno">   17 </span>import Data.Text (Text)
+<span class="lineno">   18 </span>import Data.Text qualified as T
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Channels.Telegram.Transport (BotCommand (..))
+<span class="lineno">   21 </span>import Seal.Command.Spec
+<span class="lineno">   22 </span>  ( CommandName (..), CommandSpec (..)
+<span class="lineno">   23 </span>  , Registry (..), registrySpecs )
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>-- | Telegram's limits: command names ≤ 32 chars (lowercase @a-z0-9_@),
+<span class="lineno">   26 </span>-- descriptions ≤ 256 chars.
+<span class="lineno">   27 </span>maxTelegramCommandNameLen :: Int
+<span class="lineno">   28 </span><span class="decl"><span class="istickedoff">maxTelegramCommandNameLen = 32</span></span>
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>maxTelegramDescriptionLen :: Int
+<span class="lineno">   31 </span><span class="decl"><span class="istickedoff">maxTelegramDescriptionLen = 256</span></span>
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | Derive the BotCommand menu from the Registry. Includes all commands
+<span class="lineno">   34 </span>-- (both 'AlwaysAvailable' and 'InteractiveOnly') — interactive commands
+<span class="lineno">   35 </span>-- still work over Telegram: their handlers respond with usage text or
+<span class="lineno">   36 </span>-- defer via 'ChannelCaps' when selected. Skips aliases, sanitizes names
+<span class="lineno">   37 </span>-- for Telegram's charset, and truncates descriptions. The synthetic
+<span class="lineno">   38 </span>-- @\/help@ is always included first.
+<span class="lineno">   39 </span>telegramBotCommands :: Registry -&gt; [BotCommand]
+<span class="lineno">   40 </span><span class="decl"><span class="istickedoff">telegramBotCommands reg =</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">helpCommand : map specToBotCommand (filter isMenuEligible (registrySpecs reg))</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="istickedoff">isMenuEligible spec = isTelegramSafeName (csName spec)</span>
+<span class="lineno">   44 </span><span class="spaces">    </span><span class="istickedoff">helpCommand = BotCommand</span>
+<span class="lineno">   45 </span><span class="spaces">      </span><span class="istickedoff">{ bcName = &quot;help&quot;</span>
+<span class="lineno">   46 </span><span class="spaces">      </span><span class="istickedoff">, bcDescription = &quot;Show available commands&quot;</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Convert a CommandSpec to a BotCommand.
+<span class="lineno">   50 </span>specToBotCommand :: CommandSpec -&gt; BotCommand
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">specToBotCommand spec =</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">let CommandName n = csName spec</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">in BotCommand</span>
+<span class="lineno">   54 </span><span class="spaces">       </span><span class="istickedoff">{ bcName = sanitizeTelegramName n</span>
+<span class="lineno">   55 </span><span class="spaces">       </span><span class="istickedoff">, bcDescription = T.take maxTelegramDescriptionLen (csSynopsis spec)</span>
+<span class="lineno">   56 </span><span class="spaces">       </span><span class="istickedoff">}</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Sanitize a command name for Telegram: lowercase, replace @-@ with @_@,
+<span class="lineno">   59 </span>-- strip invalid chars (only @a-z0-9_@ allowed), collapse double underscores,
+<span class="lineno">   60 </span>-- trim leading/trailing underscores, clamp to 32 chars.
+<span class="lineno">   61 </span>sanitizeTelegramName :: Text -&gt; Text
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">sanitizeTelegramName =</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">clampName</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">. T.dropWhileEnd (== '_')</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">. T.dropWhile (== '_')</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">. collapseUnderscores</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">. T.filter isValidChar</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">. T.toLower</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">. T.replace &quot;-&quot; &quot;_&quot;</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">isValidChar c = (isAscii c &amp;&amp; isLower c) || isDigit c || c == '_'</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">collapseUnderscores = T.intercalate &quot;_&quot; . T.splitOn &quot;__&quot;</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">clampName t =</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">if T.length t &gt; maxTelegramCommandNameLen</span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">then T.take maxTelegramCommandNameLen t</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">else t</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | Check if a command name is safe for Telegram (after sanitization it would
+<span class="lineno">   79 </span>-- be non-empty). The terse grammar @\/N@ is excluded (single uppercase letter
+<span class="lineno">   80 </span>-- doesn't sanitize to a meaningful command).
+<span class="lineno">   81 </span>isTelegramSafeName :: CommandName -&gt; Bool
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">isTelegramSafeName (CommandName n) =</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">not (T.null (sanitizeTelegramName n)) &amp;&amp; n /= &quot;N&quot;</span></span>
+
+</pre>
+</body>
+</html>

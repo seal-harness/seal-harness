@@ -1,0 +1,98 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | A name-indexed opcode set; derives the provider tool-definition list the
+<span class="lineno">    3 </span>-- agent is offered each turn. Tool definitions preserve registration order
+<span class="lineno">    4 </span>-- (not alphabetical) so the wiring layer controls which tools the model sees
+<span class="lineno">    5 </span>-- first — many LLMs bias toward the first tool whose description matches,
+<span class="lineno">    6 </span>-- so the order is a lever for steering tool selection (e.g. WEB_FETCH before
+<span class="lineno">    7 </span>-- BROWSER_OPEN for simple page fetches).
+<span class="lineno">    8 </span>module Seal.ISA.Registry
+<span class="lineno">    9 </span>  ( Registry
+<span class="lineno">   10 </span>  , mkRegistry
+<span class="lineno">   11 </span>  , lookupOp
+<span class="lineno">   12 </span>  , registryToolDefs
+<span class="lineno">   13 </span>  , registryToolDefs'
+<span class="lineno">   14 </span>  , stubSchema
+<span class="lineno">   15 </span>  , secretOpNames
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.Map.Strict (Map)
+<span class="lineno">   19 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   20 </span>import Data.Set (Set)
+<span class="lineno">   21 </span>import Data.Set qualified as Set
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   24 </span>import Seal.Providers.Class (ToolDefinition (..), stubSchema)
+<span class="lineno">   25 </span>import Seal.ISA.Opcode
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- | The registry carries both a name-indexed 'Map' (O(log n) dispatch
+<span class="lineno">   28 </span>-- lookup) and the registration-ordered opcode list (for tool-definition
+<span class="lineno">   29 </span>-- emission in a stable, wiring-controlled order).
+<span class="lineno">   30 </span>data Registry = Registry (Map OpName Opcode) [Opcode]
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>mkRegistry :: [Opcode] -&gt; Registry
+<span class="lineno">   33 </span><span class="decl"><span class="istickedoff">mkRegistry ops = Registry (Map.fromList [(opName o, o) | o &lt;- ops]) ops</span></span>
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>lookupOp :: Registry -&gt; OpName -&gt; Maybe Opcode
+<span class="lineno">   36 </span><span class="decl"><span class="istickedoff">lookupOp (Registry m _) n = Map.lookup n m</span></span>
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | The tool definitions the provider is offered each turn, in registration
+<span class="lineno">   39 </span>-- order (the order 'mkRegistry' received). NOT alphabetical — the wiring
+<span class="lineno">   40 </span>-- layer controls the order so it can steer which tools the model tries first.
+<span class="lineno">   41 </span>registryToolDefs :: Registry -&gt; [ToolDefinition]
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">registryToolDefs = registryToolDefs' False</span></span>
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Like 'registryToolDefs' but with a flag to swap full @input_schema@s for
+<span class="lineno">   45 </span>-- a minimal stub. When @useStub@ is 'True', each tool definition carries
+<span class="lineno">   46 </span>-- 'stubSchema' instead of the opcode's real 'opInSchema' — the name and
+<span class="lineno">   47 </span>-- description are preserved so the model still knows what tools exist, but
+<span class="lineno">   48 </span>-- the per-opcode schema JSON (the bulk of the tokens) is omitted. The model
+<span class="lineno">   49 </span>-- is expected to call the @OPCODE_DESCRIBE@ opcode to retrieve a tool's full
+<span class="lineno">   50 </span>-- schema before calling it. When @useStub@ is 'False' this is identical to
+<span class="lineno">   51 </span>-- 'registryToolDefs'. The provider encoders OMIT the @input_schema@ field
+<span class="lineno">   52 </span>-- entirely when it equals 'stubSchema' (see 'Seal.Providers.Class'), so the
+<span class="lineno">   53 </span>-- stub costs zero tokens on the wire rather than the few a real stub object
+<span class="lineno">   54 </span>-- would cost.
+<span class="lineno">   55 </span>registryToolDefs' :: Bool -&gt; Registry -&gt; [ToolDefinition]
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">registryToolDefs' useStub (Registry _ order) =</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">[ ToolDefinition (opName o) (opDesc o) (if useStub then stubSchema else opInSchema o)</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">| o &lt;- order</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | The set of opcode names whose tool results may carry secrets and must be
+<span class="lineno">   62 </span>-- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a
+<span class="lineno">   63 </span>-- vault secret value in 'orParts' belong here — currently just 'SECRET_GET'.
+<span class="lineno">   64 </span>-- Other opcodes (MEMORY_RECALL, FILE_READ, SHELL_EXEC, etc.) return
+<span class="lineno">   65 </span>-- agent-visible data that is safe to persist verbatim and display in the
+<span class="lineno">   66 </span>-- frontend. Using trust level as a proxy was wrong: MEMORY_RECALL is Trusted
+<span class="lineno">   67 </span>-- but returns memory content (not vault secrets), so redacting it hid
+<span class="lineno">   68 </span>-- harmless output behind @&lt;redacted:secret&gt;@.
+<span class="lineno">   69 </span>secretOpNames :: Registry -&gt; Set OpName
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">secretOpNames (Registry m _) =</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">Set.fromList [ opName o | o &lt;- Map.elems m, opName o `Set.member` secretOpcodes ]</span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | The static set of opcode names that return secret values in 'orParts'.
+<span class="lineno">   74 </span>secretOpcodes :: Set OpName
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">secretOpcodes = Set.fromList [ OpName &quot;SECRET_GET&quot; ]</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The engram embedding backend — a subprocess-based 'EmbeddingBackend'
+<span class="lineno">    3 </span>-- that shells out to the @engram@ CLI for semantic search. engram uses
+<span class="lineno">    4 </span>-- SQLite-vec with ollama/nomic-embed-text embeddings under the hood.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- The memory system uses a separate engram index (e.g.
+<span class="lineno">    7 </span>-- @~\/.seal\/memory\/engram.db@) from the KB index (@~\/.engram\/index.db@)
+<span class="lineno">    8 </span>-- via engram's @--index@ flag.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- The engram CLI commands used:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>--   * @engram add &lt;file&gt; --index &lt;path&gt; --no-progress@ — index a file
+<span class="lineno">   13 </span>--   * @engram remove &lt;file&gt; --index &lt;path&gt;@ — remove a file from the index
+<span class="lineno">   14 </span>--   * @engram search &quot;&lt;query&gt;&quot; --limit N --index &lt;path&gt; --json@ — search (JSON output)
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- JSON search output format:
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- @
+<span class="lineno">   19 </span>-- [
+<span class="lineno">   20 </span>--   { &quot;path&quot;: &quot;\/path\/to\/file.md&quot;, &quot;snippet&quot;: &quot;...&quot;, &quot;distance&quot;: 0.68 }
+<span class="lineno">   21 </span>-- ]
+<span class="lineno">   22 </span>-- @
+<span class="lineno">   23 </span>--
+<span class="lineno">   24 </span>-- The @distance@ is converted to a relevance score via @1 - distance@.
+<span class="lineno">   25 </span>module Seal.Memory.EngramBackend
+<span class="lineno">   26 </span>  ( engramEmbeddingBackend
+<span class="lineno">   27 </span>  , resolveEmbeddingBackend
+<span class="lineno">   28 </span>  ) where
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Data.Aeson (FromJSON (..), decode, withObject, (.:))
+<span class="lineno">   31 </span>import Data.ByteString qualified as BS
+<span class="lineno">   32 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   33 </span>import Data.Foldable (for_)
+<span class="lineno">   34 </span>import Data.Maybe (mapMaybe)
+<span class="lineno">   35 </span>import Data.Text (Text)
+<span class="lineno">   36 </span>import Data.Text qualified as T
+<span class="lineno">   37 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   38 </span>import System.Directory (doesFileExist)
+<span class="lineno">   39 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   40 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   41 </span>import System.IO (hClose)
+<span class="lineno">   42 </span>import System.Process
+<span class="lineno">   43 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess
+<span class="lineno">   44 </span>  , withCreateProcess )
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>import Seal.Config.File (EmbeddingConfig (..))
+<span class="lineno">   47 </span>import Seal.Memory.Embedding
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Construct an 'EmbeddingBackend' backed by the engram CLI.
+<span class="lineno">   50 </span>--
+<span class="lineno">   51 </span>-- @binaryPath@ is the absolute path to the engram binary (e.g.
+<span class="lineno">   52 </span>-- @~\/.local\/bin\/engram@). @indexPath@ is the path to the SQLite index
+<span class="lineno">   53 </span>-- file (e.g. @~\/.seal\/memory\/engram.db@). The index is created on first
+<span class="lineno">   54 </span>-- use by engram itself.
+<span class="lineno">   55 </span>engramEmbeddingBackend :: Text -&gt; FilePath -&gt; EmbeddingBackend
+<span class="lineno">   56 </span><span class="decl"><span class="nottickedoff">engramEmbeddingBackend binaryPath indexPath = EmbeddingBackend</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="nottickedoff">{ ebIndex = \filePath content -&gt; do</span>
+<span class="lineno">   58 </span><span class="spaces">      </span><span class="nottickedoff">-- Write content to the file so engram can index it by path.</span>
+<span class="lineno">   59 </span><span class="spaces">      </span><span class="nottickedoff">BS.writeFile filePath (TE.encodeUtf8 content)</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- runEngram binaryPath indexPath [&quot;add&quot;, filePath, &quot;--no-progress&quot;]</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="nottickedoff">, ebUnindex = \filePath -&gt; do</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- runEngram binaryPath indexPath [&quot;remove&quot;, filePath]</span>
+<span class="lineno">   64 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="nottickedoff">, ebSearch = \query limit -&gt; do</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="nottickedoff">let limitStr = show limit</span>
+<span class="lineno">   67 </span><span class="spaces">          </span><span class="nottickedoff">queryStr = T.unpack query</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="nottickedoff">result &lt;- runEngram binaryPath indexPath</span>
+<span class="lineno">   69 </span><span class="spaces">        </span><span class="nottickedoff">[&quot;search&quot;, queryStr, &quot;--limit&quot;, limitStr, &quot;--json&quot;]</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="nottickedoff">case result of</span>
+<span class="lineno">   71 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; pure []</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="nottickedoff">Right output -&gt; pure (parseEngramResults output)</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="nottickedoff">, ebBackendName = &quot;engram&quot;</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Run an engram command with fixed argv (no shell). Returns the stdout
+<span class="lineno">   77 </span>-- on success, or an error message on failure. Best-effort — a failed
+<span class="lineno">   78 </span>-- engram command returns 'Left' and the caller (the opcode) falls back
+<span class="lineno">   79 </span>-- to substring search.
+<span class="lineno">   80 </span>runEngram :: Text -&gt; FilePath -&gt; [String] -&gt; IO (Either Text BS.ByteString)
+<span class="lineno">   81 </span><span class="decl"><span class="nottickedoff">runEngram binaryPath indexPath args = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="nottickedoff">let binStr = T.unpack binaryPath</span>
+<span class="lineno">   83 </span><span class="spaces">      </span><span class="nottickedoff">fullArgs = args &lt;&gt; [&quot;--index&quot;, indexPath]</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="nottickedoff">cp = (proc binStr fullArgs)</span>
+<span class="lineno">   85 </span><span class="spaces">        </span><span class="nottickedoff">{ std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="nottickedoff">withCreateProcess cp $ \mIn mOut mErr ph -&gt; do</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="nottickedoff">for_ mIn hClose</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="nottickedoff">out &lt;- maybe (pure BS.empty) BS.hGetContents mOut</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="nottickedoff">_err &lt;- maybe (pure BS.empty) BS.hGetContents mErr</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="nottickedoff">ec &lt;- waitForProcess ph</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="nottickedoff">let !_ = BS.length out</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="nottickedoff">case ec of</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="nottickedoff">ExitSuccess -&gt; pure (Right out)</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="nottickedoff">ExitFailure _ -&gt; pure (Left (&quot;engram command failed: &quot; &lt;&gt; T.pack (unwords (binStr : fullArgs))))</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | The JSON shape of one engram search result (from @engram search --json@).
+<span class="lineno">   97 </span>data EngramResult = EngramResult
+<span class="lineno">   98 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">erPath</span></span></span>     :: Text
+<span class="lineno">   99 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">erSnippet</span></span></span>  :: Text
+<span class="lineno">  100 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">erDistance</span></span></span> :: Double
+<span class="lineno">  101 </span>  }
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON EngramResult</span></span></span></span> where
+<span class="lineno">  104 </span>  <span class="decl"><span class="nottickedoff">parseJSON = withObject &quot;EngramResult&quot; $ \o -&gt;</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="nottickedoff">EngramResult</span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="nottickedoff">&lt;$&gt; o .: &quot;path&quot;</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="nottickedoff">&lt;*&gt; o .: &quot;snippet&quot;</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="nottickedoff">&lt;*&gt; o .: &quot;distance&quot;</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Parse engram's @--json@ search output into a list of 'SearchResult'.
+<span class="lineno">  111 </span>-- The @distance@ is converted to a relevance score via @1 - distance@
+<span class="lineno">  112 </span>-- (engram reports distance; we invert so higher score = more relevant).
+<span class="lineno">  113 </span>-- Malformed entries are skipped (defensive parsing).
+<span class="lineno">  114 </span>parseEngramResults :: BS.ByteString -&gt; [SearchResult]
+<span class="lineno">  115 </span><span class="decl"><span class="nottickedoff">parseEngramResults output =</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="nottickedoff">case decode (BL.fromStrict output) :: Maybe [EngramResult] of</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="nottickedoff">Just results -&gt; mapMaybe toSearchResult results</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="nottickedoff">Nothing      -&gt; []</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="nottickedoff">toSearchResult er =</span>
+<span class="lineno">  121 </span><span class="spaces">      </span><span class="nottickedoff">Just SearchResult</span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="nottickedoff">{ srPath = erPath er</span>
+<span class="lineno">  123 </span><span class="spaces">        </span><span class="nottickedoff">, srContent = erSnippet er</span>
+<span class="lineno">  124 </span><span class="spaces">        </span><span class="nottickedoff">, srScore = 1.0 - erDistance er</span>
+<span class="lineno">  125 </span><span class="spaces">        </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Resolve an 'EmbeddingBackend' from the optional config and seal paths.
+<span class="lineno">  128 </span>-- If the config is absent or @backend@ is @&quot;null&quot;@ (or absent), returns
+<span class="lineno">  129 </span>-- 'nullEmbeddingBackend'. If @backend@ is @&quot;engram&quot;@, constructs an
+<span class="lineno">  130 </span>-- 'engramEmbeddingBackend' with the configured (or default) binary path
+<span class="lineno">  131 </span>-- and index path.
+<span class="lineno">  132 </span>resolveEmbeddingBackend
+<span class="lineno">  133 </span>  :: Maybe EmbeddingConfig
+<span class="lineno">  134 </span>  -&gt; FilePath
+<span class="lineno">  135 </span>  -&gt; IO EmbeddingBackend
+<span class="lineno">  136 </span><span class="decl"><span class="nottickedoff">resolveEmbeddingBackend mCfg sealHome =</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="nottickedoff">case mCfg of</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure nullEmbeddingBackend</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="nottickedoff">Just cfg -&gt; case ecBackend cfg of</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="nottickedoff">Just b | b == &quot;engram&quot; -&gt; do</span>
+<span class="lineno">  141 </span><span class="spaces">        </span><span class="nottickedoff">let binPath = maybe &quot;~/.local/bin/engram&quot; T.unpack (ecBinaryPath cfg)</span>
+<span class="lineno">  142 </span><span class="spaces">            </span><span class="nottickedoff">indexPath = maybe (sealHome &lt;/&gt; &quot;memory&quot; &lt;/&gt; &quot;engram.db&quot;)</span>
+<span class="lineno">  143 </span><span class="spaces">                             </span><span class="nottickedoff">T.unpack (ecIndexPath cfg)</span>
+<span class="lineno">  144 </span><span class="spaces">        </span><span class="nottickedoff">exists &lt;- doesFileExist binPath</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="nottickedoff">if exists</span>
+<span class="lineno">  146 </span><span class="spaces">          </span><span class="nottickedoff">then pure (engramEmbeddingBackend (T.pack binPath) indexPath)</span>
+<span class="lineno">  147 </span><span class="spaces">          </span><span class="nottickedoff">else pure nullEmbeddingBackend</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; pure nullEmbeddingBackend</span></span>
+
+</pre>
+</body>
+</html>

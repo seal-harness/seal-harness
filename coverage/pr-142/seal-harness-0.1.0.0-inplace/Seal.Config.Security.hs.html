@@ -1,0 +1,259 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE CPP #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The security-critical, boot-only configuration that lives in
+<span class="lineno">    4 </span>-- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
+<span class="lineno">    5 </span>-- the agent/operator-tunable 'RuntimeConfig'). This file is read once at boot
+<span class="lineno">    6 </span>-- and never re-read; it is not exposed via any opcode or the HTTP Gateway.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- Moving @untrusted_execution@ and the vault settings here means a future
+<span class="lineno">    9 </span>-- @CONFIG_UPDATE@ opcode (which operates on 'RuntimeConfig') and the Gateway's
+<span class="lineno">   10 </span>-- @updateRuntimeConfig@ caller physically cannot express a change to these
+<span class="lineno">   11 </span>-- fields — the type split makes it a compile error (design §4 Approach E).
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- Every field is optional; a missing key decodes as 'Nothing' and a
+<span class="lineno">   14 </span>-- 'Nothing' value is omitted from the encoded output.
+<span class="lineno">   15 </span>module Seal.Config.Security
+<span class="lineno">   16 </span>  ( SecurityConfig (..)
+<span class="lineno">   17 </span>  , UntrustedExecFileConfig (..)
+<span class="lineno">   18 </span>  , UntrustedExecRemoteFileConfig (..)
+<span class="lineno">   19 </span>  , defaultSecurityConfig
+<span class="lineno">   20 </span>  , securityConfigCodec
+<span class="lineno">   21 </span>  , loadSecurityConfig
+<span class="lineno">   22 </span>  , saveSecurityConfig
+<span class="lineno">   23 </span>  , updateSecurityConfig
+<span class="lineno">   24 </span>  , untrustedExecConfigFromSecurity
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+<span class="lineno">   28 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   31 </span>import System.Directory (doesFileExist, renameFile)
+<span class="lineno">   32 </span>import System.IO.Unsafe (unsafePerformIO)
+<span class="lineno">   33 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   34 </span>import Validation (Validation (..))
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import Toml ((.=))
+<span class="lineno">   37 </span>import Toml qualified
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Seal.Tools.Exec.Types
+<span class="lineno">   40 </span>  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
+<span class="lineno">   41 </span>import Seal.Tools.Exec.Untrusted
+<span class="lineno">   42 </span>  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | The boot-only, agent-immutable security configuration. Carries the
+<span class="lineno">   45 </span>-- @untrusted_execution@ section (remote-only enforcement) and the vault
+<span class="lineno">   46 </span>-- settings. Loaded once at boot from @security.toml@; never passed to any
+<span class="lineno">   47 </span>-- opcode or the Gateway.
+<span class="lineno">   48 </span>data SecurityConfig = SecurityConfig
+<span class="lineno">   49 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultPath</span></span></span> :: Maybe Text
+<span class="lineno">   50 </span>    -- ^ Absolute path to the vault file (default: @~\/.seal\/config\/vault\/vault.age@).
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultRecipient</span></span></span> :: Maybe Text
+<span class="lineno">   52 </span>    -- ^ age public key: @age1…@ or @age1yubikey1…@.
+<span class="lineno">   53 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultIdentity</span></span></span> :: Maybe Text
+<span class="lineno">   54 </span>    -- ^ Path to the identity file under @keys\/@, or a user-supplied path.
+<span class="lineno">   55 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultUnlock</span></span></span> :: Maybe Text
+<span class="lineno">   56 </span>    -- ^ @\&quot;startup\&quot;@ | @\&quot;on_demand\&quot;@ | @\&quot;per_access\&quot;@.
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultKeyType</span></span></span> :: Maybe Text
+<span class="lineno">   58 </span>    -- ^ Display label: @\&quot;x25519\&quot;@ | @\&quot;yubikey\&quot;@ | @\&quot;user\&quot;@.
+<span class="lineno">   59 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scUntrustedExec</span></span></span> :: Maybe UntrustedExecFileConfig
+<span class="lineno">   60 </span>    -- ^ Optional @[untrusted_execution]@ section (remote-only untrusted
+<span class="lineno">   61 </span>    -- execution). Absent means @mode=local@ (default). @mode=remote@
+<span class="lineno">   62 </span>    -- fail-closes at call time when the remote block is absent or
+<span class="lineno">   63 </span>    -- unreachable (boot still succeeds).
+<span class="lineno">   64 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
+<span class="lineno">   67 </span>-- @\&quot;local\&quot;@ (default) or @\&quot;remote\&quot;@ (fail-closed). The optional
+<span class="lineno">   68 </span>-- @[untrusted_execution.remote]@ sub-table carries the SSH coordinates;
+<span class="lineno">   69 </span>-- absent under @mode=local@ (no remote needed), and @mode=remote@ parses
+<span class="lineno">   70 </span>-- OK without it (fail-closed is at call time, not parse time — spec §7
+<span class="lineno">   71 </span>-- row 1).
+<span class="lineno">   72 </span>data UntrustedExecFileConfig = UntrustedExecFileConfig
+<span class="lineno">   73 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uefcMode</span></span></span>   :: Text
+<span class="lineno">   74 </span>    -- ^ @\&quot;local\&quot;@ | @\&quot;remote\&quot;@
+<span class="lineno">   75 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uefcRemote</span></span></span> :: Maybe UntrustedExecRemoteFileConfig
+<span class="lineno">   76 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | The @[untrusted_execution.remote]@ sub-table (spec §5). Every field is
+<span class="lineno">   79 </span>-- optional at the TOML layer; the call site validates that the required
+<span class="lineno">   80 </span>-- fields (@host@/@user@/@known_hosts@/@workspace@) are present when
+<span class="lineno">   81 </span>-- @mode=remote@ (absent ⇒ fail-closed at call time).
+<span class="lineno">   82 </span>data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
+<span class="lineno">   83 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcHost</span></span></span>       :: Maybe Text
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcUser</span></span></span>       :: Maybe Text
+<span class="lineno">   85 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcPort</span></span></span>       :: Maybe Int
+<span class="lineno">   86 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcIdentity</span></span></span>   :: Maybe FilePath
+<span class="lineno">   87 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcKnownHosts</span></span></span> :: Maybe FilePath
+<span class="lineno">   88 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcWorkspace</span></span></span>  :: Maybe Text
+<span class="lineno">   89 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | Starting state: all fields absent.
+<span class="lineno">   92 </span>defaultSecurityConfig :: SecurityConfig
+<span class="lineno">   93 </span><span class="decl"><span class="istickedoff">defaultSecurityConfig = SecurityConfig</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">{ scVaultPath      = Nothing</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">, scVaultRecipient = Nothing</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">, scVaultIdentity  = Nothing</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">, scVaultUnlock    = Nothing</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">, scVaultKeyType   = Nothing</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">, scUntrustedExec  = Nothing</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  103 </span>-- Codec
+<span class="lineno">  104 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>-- | Bidirectional tomland codec for 'SecurityConfig'.
+<span class="lineno">  107 </span>securityConfigCodec :: Toml.TomlCodec SecurityConfig
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">securityConfigCodec = SecurityConfig</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;vault_path&quot;)     .= scVaultPath</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_recipient&quot;) .= scVaultRecipient</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_identity&quot;)  .= scVaultIdentity</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_unlock&quot;)    .= scVaultUnlock</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_key_type&quot;)  .= scVaultKeyType</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.table untrustedExecConfigCodec &quot;untrusted_execution&quot;) .= scUntrustedExec</span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
+<span class="lineno">  117 </span>untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">untrustedExecConfigCodec = UntrustedExecFileConfig</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.text &quot;mode&quot; .= uefcMode</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec &quot;remote&quot;) .= uefcRemote</span></span>
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
+<span class="lineno">  123 </span>-- sub-table. Every field is optional at the TOML layer.
+<span class="lineno">  124 </span>untrustedExecRemoteConfigCodec :: Toml.TomlCodec UntrustedExecRemoteFileConfig
+<span class="lineno">  125 </span><span class="decl"><span class="istickedoff">untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;host&quot;)        .= uerfcHost</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;user&quot;)        .= uerfcUser</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.int &quot;port&quot;)         .= uerfcPort</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.string &quot;identity&quot;)  .= uerfcIdentity</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.string &quot;known_hosts&quot;) .= uerfcKnownHosts</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;workspace&quot;)   .= uerfcWorkspace</span></span>
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  134 </span>-- Public API
+<span class="lineno">  135 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | Load the security config file at @path@.
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Load the security config file at @path@.
+<span class="lineno">  140 </span>--
+<span class="lineno">  141 </span>-- * File absent  → @Right 'defaultSecurityConfig'@
+<span class="lineno">  142 </span>-- * Parse error  → @Left@ with the rendered tomland diagnostics
+<span class="lineno">  143 </span>loadSecurityConfig :: FilePath -&gt; IO (Either Text SecurityConfig)
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">loadSecurityConfig path = do</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right defaultSecurityConfig)</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">contents &lt;- TIO.readFile path</span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">pure $ case Toml.parse contents of</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="istickedoff">Left err   -&gt; Left <span class="nottickedoff">(Toml.unTomlParseError err)</span></span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec securityConfigCodec toml of</span>
+<span class="lineno">  153 </span><span class="spaces">          </span><span class="istickedoff">Success cfg  -&gt; Right cfg</span>
+<span class="lineno">  154 </span><span class="spaces">          </span><span class="istickedoff">Failure errs -&gt; <span class="nottickedoff">Left (Toml.prettyTomlDecodeErrors errs)</span></span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- | Save @cfg@ to @path@ atomically: write @.tmp@, chmod 0600, rename over
+<span class="lineno">  157 </span>-- @path@. The file is chmod-restricted because @security.toml@ carries the
+<span class="lineno">  158 </span>-- vault recipient/identity (security-critical, agent-immutable).
+<span class="lineno">  159 </span>saveSecurityConfig :: FilePath -&gt; SecurityConfig -&gt; IO ()
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">saveSecurityConfig path cfg = do</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">let encoded = Toml.encode securityConfigCodec cfg</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">tmp     = path &lt;&gt; &quot;.tmp&quot;</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">TIO.writeFile tmp encoded</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | Process-wide lock serializing security config writes (design V7).
+<span class="lineno">  168 </span>{-# NOINLINE securityWriteLock #-}
+<span class="lineno">  169 </span>securityWriteLock :: MVar ()
+<span class="lineno">  170 </span><span class="decl"><span class="nottickedoff">securityWriteLock = unsafePerformIO (newMVar ())</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | Load the security config at @path@, apply @f@, save. Propagates any load
+<span class="lineno">  173 </span>-- error as @Left Text@ without writing. This is the admin/boot path (e.g.
+<span class="lineno">  174 </span>-- @\/vault setup@); it is NEVER called by an opcode or the HTTP Gateway
+<span class="lineno">  175 </span>-- (those operate on 'RuntimeConfig' and physically cannot reach
+<span class="lineno">  176 </span>-- 'SecurityConfig' — design §4 E). Serialized behind 'securityWriteLock'
+<span class="lineno">  177 </span>-- to prevent lost-update races (design V7).
+<span class="lineno">  178 </span>updateSecurityConfig :: FilePath -&gt; (SecurityConfig -&gt; SecurityConfig) -&gt; IO (Either Text ())
+<span class="lineno">  179 </span><span class="decl"><span class="nottickedoff">updateSecurityConfig path f = withMVar securityWriteLock $ \_ -&gt; do</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- loadSecurityConfig path</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="nottickedoff">Left err  -&gt; pure (Left err)</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="nottickedoff">Right cfg -&gt; saveSecurityConfig path (f cfg) &gt;&gt; pure (Right ())</span></span>
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>-- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the
+<span class="lineno">  186 </span>-- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
+<span class="lineno">  187 </span>-- 'Nothing' when the section is absent OR @mode=local@ (the default —
+<span class="lineno">  188 </span>-- no remote needed, the local executor is wired by the call site).
+<span class="lineno">  189 </span>-- Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
+<span class="lineno">  190 </span>-- with the remote 'SshConfig' if the remote block is fully present
+<span class="lineno">  191 </span>-- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
+<span class="lineno">  192 </span>-- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
+<span class="lineno">  193 </span>-- — fail-closed is at call time (spec §7 row 1), not at config resolution.
+<span class="lineno">  194 </span>untrustedExecConfigFromSecurity :: SecurityConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">untrustedExecConfigFromSecurity cfg =</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">resolveByMode =&lt;&lt; scUntrustedExec cfg</span></span>
+<span class="lineno">  197 </span>
+<span class="lineno">  198 </span>resolveByMode :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  199 </span><span class="decl"><span class="istickedoff">resolveByMode uec =</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">let mode = if uefcMode uec == &quot;remote&quot; then UemRemote else UemLocal</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">in case mode of</span>
+<span class="lineno">  202 </span><span class="spaces">       </span><span class="istickedoff">UemRemote -&gt; Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))</span>
+<span class="lineno">  203 </span><span class="spaces">       </span><span class="istickedoff">UemLocal  -&gt; localModeResult <span class="nottickedoff">uec</span></span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>-- | Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
+<span class="lineno">  206 </span>-- Shared by both the UemRemote branch and the hardened-build localModeResult.
+<span class="lineno">  207 </span>resolveRemoteSsh :: UntrustedExecFileConfig -&gt; Maybe SshConfig
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">resolveRemoteSsh uec = uefcRemote uec &gt;&gt;= \r -&gt;</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">uerfcHost r &gt;&gt;= \host -&gt;</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">uerfcUser r &gt;&gt;= \user -&gt;</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">uerfcKnownHosts r &gt;&gt;= \knownHosts -&gt;</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">uerfcWorkspace r &gt;&gt;= \workspace -&gt;</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">let port = fromMaybe 22 (uerfcPort r)</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">identity = uerfcIdentity r</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">in case ( mkSshHost host</span>
+<span class="lineno">  216 </span><span class="spaces">          </span><span class="istickedoff">, mkSshUser user</span>
+<span class="lineno">  217 </span><span class="spaces">          </span><span class="istickedoff">, mkRemotePath workspace</span>
+<span class="lineno">  218 </span><span class="spaces">          </span><span class="istickedoff">) of</span>
+<span class="lineno">  219 </span><span class="spaces">       </span><span class="istickedoff">(Right h, Right u, Right w) -&gt; Just SshConfig</span>
+<span class="lineno">  220 </span><span class="spaces">         </span><span class="istickedoff">{ scHost       = h</span>
+<span class="lineno">  221 </span><span class="spaces">         </span><span class="istickedoff">, scUser       = u</span>
+<span class="lineno">  222 </span><span class="spaces">         </span><span class="istickedoff">, scPort       = port</span>
+<span class="lineno">  223 </span><span class="spaces">         </span><span class="istickedoff">, scIdentity   = identity</span>
+<span class="lineno">  224 </span><span class="spaces">         </span><span class="istickedoff">, scKnownHosts = knownHosts</span>
+<span class="lineno">  225 </span><span class="spaces">         </span><span class="istickedoff">, scWorkspace  = w</span>
+<span class="lineno">  226 </span><span class="spaces">         </span><span class="istickedoff">}</span>
+<span class="lineno">  227 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>#if defined(REMOTE_ONLY_UNTRUSTED)
+<span class="lineno">  230 </span>localModeResult :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  231 </span>localModeResult uec =
+<span class="lineno">  232 </span>  Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
+<span class="lineno">  233 </span>#else
+<span class="lineno">  234 </span>localModeResult :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  235 </span><span class="decl"><span class="istickedoff">localModeResult _ = Nothing</span></span>
+<span class="lineno">  236 </span>#endif
+
+</pre>
+</body>
+</html>

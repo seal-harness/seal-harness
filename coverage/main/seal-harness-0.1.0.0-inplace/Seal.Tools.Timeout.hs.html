@@ -1,0 +1,183 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure configuration types and retry logic for tool-call timeout/abort/retry.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- This module is pure (no IO) and has no dependency on 'App'/'Env'. The
+<span class="lineno">    5 </span>-- IO-level race wrapper lives in 'Seal.Tools.Exec.Timeout'; this module
+<span class="lineno">    6 </span>-- provides the config types, the 'ToolError' ADT, the per-call timeout
+<span class="lineno">    7 </span>-- extraction (from the LLM-facing JSON, where the @timeout@ field is in
+<span class="lineno">    8 </span>-- SECONDS — converted to microseconds internally via the 'Microseconds'
+<span class="lineno">    9 </span>-- newtype), the retry-delay computation, the retry predicate, and the
+<span class="lineno">   10 </span>-- model-visible error rendering.
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- The JSON wire unit is seconds (matching Claude Code / OpenCode); the
+<span class="lineno">   13 </span>-- internal 'Microseconds' newtype carries the unit in the type to prevent
+<span class="lineno">   14 </span>-- micros/seconds confusion across the boundary.
+<span class="lineno">   15 </span>module Seal.Tools.Timeout
+<span class="lineno">   16 </span>  ( Microseconds (..)
+<span class="lineno">   17 </span>  , ToolTimeoutConfig (..)
+<span class="lineno">   18 </span>  , ToolError (..)
+<span class="lineno">   19 </span>  , defaultToolTimeoutConfig
+<span class="lineno">   20 </span>  , extractPerCallTimeout
+<span class="lineno">   21 </span>  , computeRetryDelay
+<span class="lineno">   22 </span>  , shouldRetry
+<span class="lineno">   23 </span>  , errorClass
+<span class="lineno">   24 </span>  , renderToolError
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Data.Aeson (Value)
+<span class="lineno">   28 </span>import Data.Aeson qualified as A
+<span class="lineno">   29 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   30 </span>import Data.Text (Text)
+<span class="lineno">   31 </span>import Data.Text qualified as T
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | A timeout value in microseconds. The newtype carries the unit in the
+<span class="lineno">   36 </span>-- type to prevent micros/seconds confusion across the JSON boundary (the
+<span class="lineno">   37 </span>-- JSON @timeout@ field is in seconds; this is the internal representation).
+<span class="lineno">   38 </span>newtype Microseconds = Microseconds
+<span class="lineno">   39 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">unMicroseconds</span></span></span> :: Int
+<span class="lineno">   40 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | Configuration for tool call timeout/retry behavior. Loaded from
+<span class="lineno">   43 </span>-- @config.toml@ under @[tool_timeout]@ (in 'Seal.Config.File.RuntimeConfig').
+<span class="lineno">   44 </span>data ToolTimeoutConfig = ToolTimeoutConfig
+<span class="lineno">   45 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcDefaultSeconds</span></span></span>  :: !Int    -- ^ default per-call timeout (default: 120)
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcMaxSeconds</span></span></span>      :: !Int    -- ^ hard cap (default: 600)
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcRetryMax</span></span></span>        :: !Int    -- ^ max retry attempts (default: 3)
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcRetryBaseMicros</span></span></span> :: !Int   -- ^ base delay between retries (default: 2_000_000 = 2s)
+<span class="lineno">   49 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcRetryFactor</span></span></span>     :: !Double -- ^ backoff multiplier (default: 2.0)
+<span class="lineno">   50 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ttcKillGraceMicros</span></span></span> :: !Int   -- ^ SIGTERM→SIGKILL grace period (default: 5_000_000 = 5s)
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcMaxOutputBytes</span></span></span>  :: !Int    -- ^ bounded output cap (default: 50_000)
+<span class="lineno">   52 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttcAbortPollMicros</span></span></span> :: !Int   -- ^ abort-poll interval (default: 100_000 = 100ms)
+<span class="lineno">   53 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | The default config — matches the design doc defaults.
+<span class="lineno">   56 </span>defaultToolTimeoutConfig :: ToolTimeoutConfig
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">defaultToolTimeoutConfig = ToolTimeoutConfig</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">{ ttcDefaultSeconds  = 120</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">, ttcMaxSeconds      = 600</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">, ttcRetryMax        = 3</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">, ttcRetryBaseMicros = 2_000_000</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">, ttcRetryFactor     = 2.0</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">, ttcKillGraceMicros = 5_000_000</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">, ttcMaxOutputBytes  = 50_000</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">, ttcAbortPollMicros = 100_000</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | The error type for the timeout/abort/retry lifecycle. Kept separate
+<span class="lineno">   69 </span>-- from 'Seal.ISA.Dispatch.DispatchError' (which is about the dispatch
+<span class="lineno">   70 </span>-- decision — op not found, denied, exec failed); 'ToolError' is about
+<span class="lineno">   71 </span>-- the execution lifecycle (timeout, abort, retry). The dispatcher maps
+<span class="lineno">   72 </span>-- 'ToolError' → 'DispatchError (ExecFailed (renderToolError ...))' at the
+<span class="lineno">   73 </span>-- boundary.
+<span class="lineno">   74 </span>data ToolError
+<span class="lineno">   75 </span>  = ToolTimeout Int          -- ^ the timeout that was in effect (seconds, for display)
+<span class="lineno">   76 </span>  | ToolAborted              -- ^ user/session cancellation
+<span class="lineno">   77 </span>  | ToolIOError Text         -- ^ transient IO failure (error class only in audit log — see 'errorClass')
+<span class="lineno">   78 </span>  | ToolRetriesExhausted ToolError  -- ^ wrapper after max retries
+<span class="lineno">   79 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Extract the per-call timeout from the tool input JSON. The @timeout@
+<span class="lineno">   82 </span>-- field is in SECONDS (the JSON wire unit; converted to microseconds
+<span class="lineno">   83 </span>-- internally). Validation:
+<span class="lineno">   84 </span>--
+<span class="lineno">   85 </span>--   * absent / null / non-integer (string, float, bool) → default
+<span class="lineno">   86 </span>--   * negative / zero → default
+<span class="lineno">   87 </span>--   * positive &gt; max → clamp to max
+<span class="lineno">   88 </span>--   * positive in [1, max] → as-is (× 1_000_000)
+<span class="lineno">   89 </span>--
+<span class="lineno">   90 </span>-- The output is always in @[1_000_000, max * 1_000_000]@ (1s to max) — never
+<span class="lineno">   91 </span>-- negative, never zero (which would cause an instant-timeout DoS or a
+<span class="lineno">   92 </span>-- @threadDelay@ crash).
+<span class="lineno">   93 </span>extractPerCallTimeout :: Value -&gt; ToolTimeoutConfig -&gt; Microseconds
+<span class="lineno">   94 </span><span class="decl"><span class="istickedoff">extractPerCallTimeout input cfg =</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (A.withObject <span class="nottickedoff">&quot;input&quot;</span> (A..: &quot;timeout&quot;)) input of</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; defaultMicros</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">Just v -&gt; case A.fromJSON @Int v of</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">A.Error _ -&gt; defaultMicros</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">A.Success n</span>
+<span class="lineno">  100 </span><span class="spaces">        </span><span class="istickedoff">| n &lt;= 0    -&gt; defaultMicros</span>
+<span class="lineno">  101 </span><span class="spaces">        </span><span class="istickedoff">| n &gt; maxS  -&gt; maxMicros</span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Microseconds (n * 1_000_000)</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">maxS = ttcMaxSeconds cfg</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">defaultMicros = Microseconds (ttcDefaultSeconds cfg * 1_000_000)</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">maxMicros = Microseconds (maxS * 1_000_000)</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>-- | Compute the retry delay: @base * factor^attempt@. Pure, overflow-safe
+<span class="lineno">  109 </span>-- (guards against Int overflow at large attempt counts). For @factor &gt;= 1.0@
+<span class="lineno">  110 </span>-- the result is monotonically increasing in the attempt number.
+<span class="lineno">  111 </span>computeRetryDelay :: ToolTimeoutConfig -&gt; Int -&gt; Microseconds
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">computeRetryDelay cfg attempt =</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">let base = fromIntegral (ttcRetryBaseMicros cfg) :: Double</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="istickedoff">factor = ttcRetryFactor cfg</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">raw = base * factor ^ attempt</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">-- Guard against Int overflow: clamp to maxBound if the Double exceeds it.</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">clamped = if <span class="tickonlyfalse">raw &gt; fromIntegral (maxBound :: Int)</span></span>
+<span class="lineno">  118 </span><span class="spaces">                </span><span class="istickedoff">then <span class="nottickedoff">maxBound</span></span>
+<span class="lineno">  119 </span><span class="spaces">                </span><span class="istickedoff">else round raw</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">in Microseconds clamped</span></span>
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- | Whether to retry on a given 'ToolError'. Retry only on transient
+<span class="lineno">  123 </span>-- failures (timeout, IO error). Do NOT retry on abort (user cancelled —
+<span class="lineno">  124 </span>-- respect immediately) or on retries-exhausted (already exhausted).
+<span class="lineno">  125 </span>shouldRetry :: ToolError -&gt; Bool
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">shouldRetry (ToolTimeout _)        = True</span>
+<span class="lineno">  127 </span><span class="spaces"></span><span class="istickedoff">shouldRetry (ToolIOError _)         = True</span>
+<span class="lineno">  128 </span><span class="spaces"></span><span class="istickedoff">shouldRetry ToolAborted             = False</span>
+<span class="lineno">  129 </span><span class="spaces"></span><span class="istickedoff">shouldRetry (ToolRetriesExhausted _) = False</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Render the error CLASS for the audit log. Returns ONLY the class
+<span class="lineno">  132 </span>-- string — never the full 'ToolIOError' Text payload (which could contain
+<span class="lineno">  133 </span>-- paths/host info from an IO error). The audit log ('orRecorded') carries
+<span class="lineno">  134 </span>-- this class string; the model-visible error text ('renderToolError') is
+<span class="lineno">  135 </span>-- separate.
+<span class="lineno">  136 </span>errorClass :: ToolError -&gt; Text
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">errorClass (ToolTimeout _)          = &quot;timeout&quot;</span>
+<span class="lineno">  138 </span><span class="spaces"></span><span class="istickedoff">errorClass ToolAborted              = &quot;aborted&quot;</span>
+<span class="lineno">  139 </span><span class="spaces"></span><span class="istickedoff">errorClass (ToolIOError _)          = &quot;io&quot;</span>
+<span class="lineno">  140 </span><span class="spaces"></span><span class="istickedoff">errorClass (ToolRetriesExhausted _) = &quot;retries_exhausted&quot;</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | Render a model-visible error message. The timeout value is rendered
+<span class="lineno">  143 </span>-- in seconds (not microseconds) so the model can reason about it. The
+<span class="lineno">  144 </span>-- message is actionable: the timeout case tells the model how to retry
+<span class="lineno">  145 </span>-- with a larger timeout.
+<span class="lineno">  146 </span>renderToolError :: OpName -&gt; ToolError -&gt; Text
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">renderToolError (OpName name) = \case</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">ToolTimeout s -&gt;</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">name &lt;&gt; &quot; timed out after &quot; &lt;&gt; T.pack (show s) &lt;&gt; &quot;s. If this command is expected to take longer, retry with a larger timeout value.&quot;</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">ToolAborted -&gt;</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">name &lt;&gt; &quot; was aborted by the user.&quot;</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">ToolIOError msg -&gt;</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">name &lt;&gt; &quot; failed with an IO error: &quot; &lt;&gt; msg</span></span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">ToolRetriesExhausted innerErr -&gt;</span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">name &lt;&gt; &quot; failed after &quot; &lt;&gt; T.pack (show (ttcRetryMax defaultToolTimeoutConfig)) &lt;&gt; &quot; retries (last error: &quot; &lt;&gt; innerRender innerErr &lt;&gt; &quot;).&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">innerRender (ToolTimeout s)    = &quot;timed out after &quot; &lt;&gt; T.pack (show s) &lt;&gt; &quot;s&quot;</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">innerRender (ToolIOError m)    = <span class="nottickedoff">&quot;IO error: &quot; &lt;&gt; m</span></span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">innerRender ToolAborted        = <span class="nottickedoff">&quot;aborted&quot;</span></span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">innerRender (ToolRetriesExhausted _) = <span class="nottickedoff">&quot;retries exhausted&quot;</span></span></span>
+
+</pre>
+</body>
+</html>
