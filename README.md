@@ -221,6 +221,28 @@ From a running frontend, start a session with the `/new` command:
 Provider credentials are read from the vault (set them with
 `seal vault save`). Resume old sessions with `/session` and `/tab`.
 
+## Configuration files
+
+The first run writes two documented files and never overwrites either: an
+existing one is yours, and is left byte-for-byte alone (so an upgrade does not
+re-hand you a template — copy one out of `config/templates/` in the repository
+if you want to see it next to a file you already have).
+
+* `~/.seal/config/config.toml` — the runtime options: session defaults, the
+  gateway, tool timeouts, sub-agents, web tools, prompt sections, memory search,
+  chat channels. Also a git repository (`~/.seal/config`), so edits are diffable
+  and revertable.
+* `~/.seal/security.toml` — boot-only, agent-immutable settings: the vault, where
+  untrusted code runs, and passkey access control. No opcode, tool or agent can
+  read or write it.
+
+Both files spell out the default for every option. A key is written out only
+where writing it resolves to exactly what leaving it out resolves to;
+everything else is commented out with its default named in the comment — an
+unset value, a name only you know, a machine-absolute path, or a value derived
+from another key. Seal re-encodes a file when it changes it (a `/provider`
+change, `/vault setup`), and a re-encode does not keep comments.
+
 ## Web Access Control (passkeys)
 
 `seal serve` exposes the whole agent surface — sending messages (which the
@@ -292,12 +314,20 @@ device, Seal asks you to confirm with an existing passkey (a 120 s grant), then
 runs the create prompt. `disable` and `reset` require the daemon stopped —
 `serve.lock` is an advisory kernel lock, so a crashed daemon never blocks them.
 
-Passkeys need a **secure context**: `http://localhost`, or HTTPS. The gateway
-can terminate TLS itself, so no reverse proxy is required:
+Passkeys need a **secure context**: `http://localhost`, or HTTPS. That is why the
+gateway's default `[gateway] host` is `localhost` — it is the origin Seal
+verifies, the origin it allows for the WebSocket, and the one name every browser
+treats as a secure context. `host` is authoritative: Seal passes it to the
+listener, so a loopback default really does bind loopback, and an address that
+cannot be bound refuses to start before anything listens.
+
+The gateway can terminate TLS itself, so no reverse proxy is required:
 
 ```toml
 # ~/.seal/config/config.toml
 [gateway]
+# "localhost" (the default) is loopback-only. Bind a specific address, or
+# 0.0.0.0 to listen on every IPv4 interface, when clients are elsewhere.
 host = "0.0.0.0"
 port = 8443
 tls  = true                       # serves ~/.seal/keys/tls/{cert,key}.pem

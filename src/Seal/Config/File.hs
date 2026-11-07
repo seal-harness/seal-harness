@@ -192,7 +192,7 @@ data DelegationFileConfig = DelegationFileConfig
   , dfcChildTimeoutSeconds  :: Maybe Double
     -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
   , dfcMaxSpawnDepth         :: Maybe Int
-    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+    -- ^ Max delegation tree depth. Default 3, clamped to [1,3].
   , dfcOrchestratorEnabled   :: Maybe Bool
     -- ^ Kill switch for the orchestrator role. Default True.
   , dfcProvider              :: Maybe Text

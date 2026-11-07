@@ -3,7 +3,7 @@
 # Boot-only and agent-immutable: no opcode, tool or agent can read or write this
 # file, and it deliberately does not live inside ~/.seal/config (which is a git
 # repository an agent may commit to). Only human-driven admin commands change
-# it: `seal vault setup`, and the `seal access-control ...` commands.
+# it: `/vault setup` (interactive) and the `seal access-control ...` commands.
 #
 # Seal writes this file once, on first run, and never overwrites it: edit it
 # freely. Every key is optional. A commented key is commented out on purpose -
@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------------------
 # Vault
 # ---------------------------------------------------------------------------
-# `seal vault setup` fills these in. The vault file defaults to
+# `/vault setup` fills these in. The vault file defaults to
 # <seal home>/config/vault/vault.age and the age identity stays under keys/,
 # which is outside the git-versioned config tree.
 

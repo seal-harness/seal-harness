@@ -2,6 +2,58 @@
 
 ## 0.1.0.0 — unreleased
 
+* **`[gateway] host` now actually binds, and defaults to `localhost`.**
+  The `host` value never reached the listener: `runGateway` set only the port
+  on Warp's `Settings`, and Warp's default host preference is the IPv4
+  wildcard, so the gateway bound every interface while the banner, the derived
+  WebSocket/WebAuthn origins and the "reachable from another machine" warning
+  all described a loopback listener. `warpSettingsFor` passes the host through,
+  so the warning now corresponds to reality. The default changes from
+  `127.0.0.1` to `localhost` because that is the origin a passkey ceremony is
+  verified against (and the one name browsers treat as a secure context) — with
+  the literal address the printed boot URL named an origin a browser would never
+  send (`canonicalOriginFor` canonicalises loopback to `localhost`), so the
+  address the operator was told to open was not the origin being verified, and
+  neither matched the interface set actually bound. A `[gateway] host` that cannot bind (blank,
+  whitespace, a URL or path, a bracketed IPv6 literal) or does not resolve is
+  now refused at boot, with a message naming the key, instead of failing inside
+  Warp after the banner.
+
+  **Upgrading:**
+  - A gateway that was reachable from another machine only because of the
+    implicit wildcard bind is now loopback-only. Set `host = "0.0.0.0"` (or a
+    specific address) to expose it again.
+  - `host = "*"` — a spelling the old code accepted because `host` was cosmetic
+    — is refused as unresolvable. Use `"0.0.0.0"` or `"::"`.
+  - `http://127.0.0.1:<port>` no longer matches the WebSocket Origin allowlist
+    (only `http://localhost:<port>` does). In passkey mode it would not have
+    authenticated anyway: the session cookie is host-scoped. `localhost` may
+    resolve to `::1` first, so a client hardcoded to `127.0.0.1` may need the
+    name.
+
+* **The first run writes documented `config.toml` and `security.toml`
+  templates.** A fresh install had neither file, and both loaders treat "absent"
+  as "use the built-in defaults" — Seal worked, but every option was invisible
+  until someone read the source. Both files now spell out the default for every
+  option, written out where that resolves identically to leaving the key out and
+  commented out otherwise (an unset value, a name only the operator knows, a
+  machine-absolute path, or a value derived from another key). `security.toml`
+  stays almost entirely comments on purpose: absence of `[access_control]` is
+  what keeps the gateway fail-closed, and `[untrusted_execution]` does not mean
+  the same thing in a `-f remote-only-untrusted` build. The templates are
+  embedded in the binary, so they are always the version it shipped with.
+
+  **Upgrading:**
+  - An existing `config.toml` or `security.toml` is never overwritten, so an
+    install that already has one gets no template. To see it anyway, copy the
+    templates out of the repository (`config/templates/`) rather than deleting
+    your file: `security.toml` holds your vault and untrusted-execution
+    settings, and no template can restore those for you.
+  - The scaffolder defers `security.toml` while `config.toml` still holds
+    pre-split vault fields, so the one-time migration still moves them.
+  - A re-encode (any `seal access-control …` write, `/vault setup`, a `/provider`
+    change) does not preserve comments, then or now.
+
 * **Web access control (passkeys).** `seal serve` gates its HTTP API and
   WebSocket stream behind WebAuthn passkeys, configured in
   `~/.seal/security.toml` under `[access_control]`. Three states: absent →

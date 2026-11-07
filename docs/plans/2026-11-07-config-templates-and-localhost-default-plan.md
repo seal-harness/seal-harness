@@ -42,7 +42,7 @@ runSettings warpSettings app              -- :313
 ```
 
 Warp's `defaultSettings` host preference is the IPv4 wildcard (`*4`), so the
-gateway binds every interface regardless of `[gateway] host`. Today `host` feeds
+gateway bound every interface regardless of `[gateway] host`, and `host` fed
 only: the printed boot URL (`Server.hs:299-303`), the derived WS/WebAuthn
 origins, `isExposedBind`'s warning (call at `:302`, predicate at `:321`), the
 passkey boot matrix's loopback check, and the generated certificate's SAN list
