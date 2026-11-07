@@ -57,7 +57,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
-  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs
+  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs, defaultMaxModelRetries, defaultModelRetryBaseDelayMs
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
@@ -1023,14 +1023,14 @@ modelRetriesFromConfig :: Either a RuntimeConfig -> Int
 modelRetriesFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcMaxModelRetries cfg -> n
-    _ -> 3
+    _ -> defaultMaxModelRetries
 
 -- | Extract model_retry_base_delay_ms from config (default 1000).
 retryBaseDelayFromConfig :: Either a RuntimeConfig -> Int
 retryBaseDelayFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcRetryBaseDelayMs cfg -> n
-    _ -> 1000
+    _ -> defaultModelRetryBaseDelayMs
 
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or

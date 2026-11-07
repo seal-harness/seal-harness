@@ -61,6 +61,7 @@ import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.BootPlan
   ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
 import Seal.Config.Security
@@ -152,6 +153,13 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- newest N entries, drop the rest. Best-effort — failures are ignored.
   gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN
   migrateSecurityConfig paths
+  -- First-run scaffolding, after the migration so the security template cannot
+  -- pre-empt it (see 'Seal.Config.Templates.seedSecurity'). Never overwrites and
+  -- never fatal: a missing template must not keep the harness from booting.
+  (createdTemplates, templateWarnings) <- ensureConfigTemplates paths
+  forM_ templateWarnings (logIO logger WarningS . ls)
+  forM_ createdTemplates $ \fp ->
+    logIO logger InfoS ("wrote a documented config template at " <> ls (T.pack fp))
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

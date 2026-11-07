@@ -22,11 +22,12 @@ import Data.Text.IO qualified as TIO
 import System.Exit (ExitCode (..))
 import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
 import Data.Maybe (fromMaybe, isJust)
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Data.Time (diffUTCTime, getCurrentTime)
 import System.Directory (doesFileExist, removeFile)
 
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
+import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Credentials
   ( MigrationOutcome (..), migrateLegacyCredentials )
 import Seal.Config.Paths
@@ -51,7 +52,18 @@ import Seal.Types.Command (AccessControlAction (..), EnrollOptions (..))
 
 -- | Entry point for @seal access-control@.
 runAccessControl :: AccessControlAction -> IO ExitCode
-runAccessControl action = getSealPaths >>= \paths -> runAccessControlWith paths action
+runAccessControl action = do
+  paths <- getSealPaths
+  -- Scaffold the two config files on first use, exactly as `serve` and `tui` do.
+  -- This is not decorative here: `disable`, `reset` and `migrate-credentials`
+  -- write security.toml, and 'Seal.Config.Security.saveSecurityConfig' creates it
+  -- when absent — so without this a fresh install that runs one of those first
+  -- would keep a comment-free file and never see the template.
+  (created, warnings) <- ensureConfigTemplates paths
+  forM_ created $ \fp ->
+    hPutStrLn stderr ("[seal] wrote a documented config template at " <> fp)
+  forM_ warnings $ \w -> hPutStrLn stderr ("[seal] " <> T.unpack w)
+  runAccessControlWith paths action
 
 -- | 'runAccessControl' against an explicit 'SealPaths'.
 --

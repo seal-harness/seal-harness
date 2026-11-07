@@ -1,4 +1,10 @@
 cabal-version: 3.0
+extra-source-files:
+    -- Inputs for the `file-embed` splices in Seal.Config.Templates, and what
+    -- makes a source distribution buildable.
+    config/templates/config.toml
+    config/templates/security.toml
+
 name: seal-harness
 version: 0.1.0.0
 synopsis: A harness for secure AI agent execution around the SealOp ISA
@@ -181,6 +187,7 @@ library
         Seal.Config.Migrate
         Seal.Config.Paths
         Seal.Config.Security
+        Seal.Config.Templates
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
@@ -401,6 +408,7 @@ test-suite tests
       , crypton-x509-store
       , ram
       , file-embed
+      , template-haskell
        , hspec
       , hspec-core
        , http-client
@@ -556,6 +564,7 @@ test-suite tests
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
+        Seal.Config.TemplatesSpec
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec

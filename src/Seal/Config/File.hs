@@ -20,10 +20,13 @@ module Seal.Config.File
   , WorkdirConfig (..)
   , SkillsConfig (..)
   , AgentConfig (..)
+  , ToolTimeoutFileConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
   , defaultMaxTurns
+  , defaultMaxModelRetries
+  , defaultModelRetryBaseDelayMs
   , defaultDelegationConfig
   , defaultWebConfig
   , emptyProviderConfig
@@ -398,6 +401,18 @@ defaultDelegationConfig = DelegationFileConfig
 -- @[retrieval]@ section is absent or its @max_scan_bytes@ key is missing.
 defaultRetrievalMaxScanBytes :: Int
 defaultRetrievalMaxScanBytes = 131072   -- 128 KiB
+
+-- | The compiled-in default for @max_model_retries@: how many times a failed
+-- model call is retried before the turn gives up. Used by
+-- 'Seal.Core.TurnEngine.modelRetriesFromConfig' and written out by the
+-- first-run @config.toml@ template, so a change lands in both.
+defaultMaxModelRetries :: Int
+defaultMaxModelRetries = 3
+
+-- | The compiled-in default for @model_retry_base_delay_ms@: the delay before
+-- the first retry. Same two consumers as 'defaultMaxModelRetries'.
+defaultModelRetryBaseDelayMs :: Int
+defaultModelRetryBaseDelayMs = 1000
 
 -- | The compiled-in default for the maximum tool-use iterations per turn.
 -- Used when the @max_turns@ key is absent (or the whole config is absent).

@@ -63,6 +63,7 @@ import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
+import qualified Seal.Config.TemplatesSpec
 import qualified Seal.Security.CryptoSpec
 import qualified Seal.Security.WebAuthnSpec
 import qualified Seal.Security.TlsCertSpec
@@ -273,6 +274,7 @@ specs = do
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
+  Seal.Config.TemplatesSpec.spec
   Seal.Security.CryptoSpec.spec
   Seal.Security.WebAuthnSpec.spec
   Seal.Security.TlsCertSpec.spec

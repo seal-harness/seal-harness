@@ -9,6 +9,7 @@
 -- next boot).
 module Seal.Config.Migrate
   ( migrateSecurityConfig
+  , configHasLegacySecurityFields
   ) where
 
 import Control.Exception (try, SomeException)
@@ -53,7 +54,7 @@ migrateSecurityConfig paths = do
     -- Case 1 & 2: config.toml exists — check for legacy fields.
     (secExists', True) -> do
       contents <- TIO.readFile cfgPath
-      let hasLegacy = any (`T.isInfixOf` contents) legacyMarkers
+      let hasLegacy = configHasLegacySecurityFields contents
       if not hasLegacy
         then pure ()  -- Case 3 (clean): no-op.
         else do
@@ -68,6 +69,16 @@ migrateSecurityConfig paths = do
             else do
               -- Case 1: security.toml absent → migrate.
               migrateFields cfgPath secPath contents
+
+-- | Do these @config.toml@ bytes still carry the pre-split security fields?
+--
+-- The same substring scan 'migrateSecurityConfig' uses, exported because the
+-- first-run scaffolder ('Seal.Config.Templates.ensureConfigTemplates') has to
+-- know: creating @security.toml@ while these fields are still in @config.toml@
+-- would move the install onto the "security.toml wins" branch below, which
+-- strips the fields from @config.toml@ without moving their values.
+configHasLegacySecurityFields :: Text -> Bool
+configHasLegacySecurityFields contents = any (`T.isInfixOf` contents) legacyMarkers
 
 -- | Lines/tokens that indicate legacy security fields are present in config.toml.
 legacyMarkers :: [Text]
