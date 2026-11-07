@@ -154,7 +154,7 @@ stubHandle = ChannelHandle
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -1049,7 +1049,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1079,7 +1079,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1110,7 +1110,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1133,7 +1133,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1173,7 +1173,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1665,7 +1665,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1700,7 +1700,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0))
                   { smDescription = Just "old name" }
@@ -1728,7 +1728,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1745,7 +1745,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1825,7 +1825,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1856,7 +1856,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1881,7 +1881,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1907,7 +1907,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1946,7 +1946,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1964,7 +1964,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1989,7 +1989,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2007,7 +2007,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2040,7 +2040,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2067,7 +2067,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2092,7 +2092,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2120,7 +2120,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2144,7 +2144,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2174,7 +2174,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2192,7 +2192,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2215,7 +2215,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
@@ -2242,7 +2242,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "You are a helpful agent with no frontmatter."
@@ -2267,7 +2267,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta

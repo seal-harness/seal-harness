@@ -37,6 +37,7 @@ module Seal.Handles.Transcript
   , appendConversationMessage
   , appendCompletionToSidecar
   , readAndClearCompletions
+  , readEntries
   , redactMessages
   ) where
 
@@ -639,6 +640,8 @@ withIndexedTranscript dir action = do
           }
 
 -- | Read back the entries file, skipping malformed lines.
+-- Exported for callers that inspect a session's audit log by path (the
+-- delegation worker's handoff checkout ordering, tests).
 readEntries :: FilePath -> IO [EntryRecord]
 readEntries path = do
   exists <- doesFileExist path

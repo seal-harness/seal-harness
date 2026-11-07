@@ -45,6 +45,7 @@ stubMeta = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  , smRepoBranch = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
   }
@@ -389,6 +390,7 @@ metaWithDescription sid mDesc = SessionMeta
   , smDescription = mDesc
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  , smRepoBranch = Nothing
   , smCreatedAt = testTime, smLastActive = testTime
   }
   where

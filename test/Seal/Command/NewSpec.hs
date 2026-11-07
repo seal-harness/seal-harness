@@ -119,6 +119,7 @@ spec = describe "Seal.Command.New" $ do
         , smDescription = Nothing
         , smSealFrontMatter = True
         , smRepoUrl = Nothing
+        , smRepoBranch = Nothing
         , smCreatedAt = error "unused"
         , smLastActive = error "unused"
         }

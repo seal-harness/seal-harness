@@ -722,6 +722,7 @@ spec = do
                 , smDescription = Nothing
                 , smSealFrontMatter = True
                 , smRepoUrl = Nothing
+                , smRepoBranch = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
           pure meta
@@ -767,6 +768,7 @@ spec = do
             , smDescription = Nothing
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
+            , smRepoBranch = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta
       fs <- mkFs tmp

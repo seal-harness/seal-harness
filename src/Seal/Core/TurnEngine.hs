@@ -29,9 +29,8 @@ module Seal.Core.TurnEngine
   ) where
 
 import Control.Exception (bracket, catch)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Aeson (Value)
-import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -42,7 +41,6 @@ import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath ((</>))
 import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -108,7 +106,7 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput, setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -131,10 +129,10 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
-  , updateSessionRepoUrl )
+  , updateSessionRepo )
 import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -159,10 +157,10 @@ import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
+import Seal.Tools.Args (branchNameText)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
@@ -311,7 +309,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
+      , setupRepoOp cloneDeps autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
      , browserManageOp securityPolicy
@@ -922,13 +920,12 @@ mkCloneDepsTurn td = do
 -- the session directory or @session.json@ is missing or undecodable. The
 -- engine uses this to re-read meta after 'autoBindRepoAgent' may have
 -- rebound 'smAgent'.
+--
+-- Thin re-export of 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the engine's many call sites stay
+-- unchanged while the gateway / delegation worker share the same code.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid System.FilePath.</> "session.json"
-  exists <- System.Directory.doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp
+loadSessionMeta = readSessionMeta
 
 -- | Should 'runSessionTurn' auto-tab the session after a turn? 'True' for
 -- normal turns (every channel-originated session is visible in the sidebar).
@@ -1129,13 +1126,16 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
-              -- Persist the cloned repo URL to session.json so the sidebar
-              -- can display it. The URL comes from the opcode's input
-              -- value.
-              let mRepoUrl =
-                    AT.parseMaybe
-                      (AT.withObject "SETUP_REPO input" (AT..: "url")) val
-              _ <- updateSessionRepoUrl paths sid mRepoUrl
+              -- Persist the cloned repo URL *and* the branch (or tag) to
+              -- session.json, so the sidebar can display the repo and a
+              -- later clone — a handoff's pre-turn checkout, say — can
+              -- repeat exactly this checkout. Parsed with the opcode's own
+              -- input parser: what is recorded is exactly what was cloned.
+              case parseSetupRepoInput val of
+                Left _ -> pure ()   -- unreachable: the opcode just ran
+                Right (repoUrl, mBranch) ->
+                  void (updateSessionRepo paths sid
+                          (Just repoUrl) (branchNameText <$> mBranch))
               invalidateWorkdirScan (tdExecCache td) sid
               freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
@@ -1340,6 +1340,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
@@ -1390,7 +1391,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , fileWriteOp childWsRoot operatorCeiling
         , filePatchOp childWsRoot
         , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps childWsRoot (tdAutonomy td)
+        , setupRepoOp childCloneDeps (tdAutonomy td)
         , binExecOp childWsRoot securityPolicy Nothing
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg

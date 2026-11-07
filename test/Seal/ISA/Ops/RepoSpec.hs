@@ -182,7 +182,7 @@ withSetupRepoOp :: AutonomyLevel -> (Opcode -> IO a) -> IO a
 withSetupRepoOp autonomy k =
   withSystemTempDirectory "seal-setuprepospec" $ \d -> do
     deps <- mkTestCloneDeps (d </> "keys")
-    k (setupRepoOp deps (WorkspaceRoot d) autonomy)
+    k (setupRepoOp deps autonomy)
 
 -- | A recorded shell call: which 'UntrustedIO' arm ran, the env extras it
 -- carried, and the command text.

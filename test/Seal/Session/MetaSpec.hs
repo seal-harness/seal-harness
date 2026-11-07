@@ -22,6 +22,7 @@ sampleMeta =
        , smDescription = Nothing
        , smSealFrontMatter = True
        , smRepoUrl = Nothing
+       , smRepoBranch = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 spec :: Spec
@@ -107,6 +108,20 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smRepoUrl (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smRepoBranch = Just t" $ do
+    let m = sampleMeta { smRepoBranch = Just "release/1.2" }
+    fmap smRepoBranch (decode (encode m)) `shouldBe` Just (Just "release/1.2")
+
+  it "defaults smRepoBranch to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "repo_url" .= ("https://github.com/seal-harness/seal-harness.git" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smRepoBranch (decode (encode j)) `shouldBe` Just Nothing
 
   it "round-trips smSealFrontMatter = False" $ do
     let m = sampleMeta { smSealFrontMatter = False }
