@@ -96,6 +96,13 @@ function installFetch() {
     }
     if (url.includes('/api/auth/credentials/')) {
       const id = url.split('/').pop()!
+      if ((init?.method ?? 'GET') === 'PUT') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { label?: string }
+        // The gateway trims and bounds the label; the fake mirrors the trim.
+        const label = (body.label ?? '').trim()
+        creds = creds.map((c) => (c.id === id ? { ...c, label } : c))
+        return ok({ ok: true, id, label })
+      }
       creds = creds.filter((c) => c.id !== id)
       return ok({ ok: true })
     }
@@ -157,7 +164,6 @@ describe('AccessView', () => {
     expect(screen.getByText(/added from the terminal/)).toBeInTheDocument()
     expect(screen.getByText(/migrated/)).toBeInTheDocument()
     expect(screen.getByText(/cannot sign you in here — safe to remove/)).toBeInTheDocument()
-    expect(screen.getByTestId('passkey-mode')).toHaveTextContent('passkey · http://localhost:8080')
     expect(screen.getByText(/Select a passkey to view it/)).toBeInTheDocument()
   })
 
@@ -169,6 +175,7 @@ describe('AccessView', () => {
     expect(screen.getByTestId('passkey-detail-id')).toHaveTextContent('usable')
     expect(screen.getByTestId('passkey-detail-sign-count')).toHaveTextContent('3×')
     expect(screen.getByText('2026-10-30')).toBeInTheDocument()
+    expect(screen.getByLabelText('Name')).toHaveValue('laptop')
     expect(screen.getByTestId('passkey-delete')).toBeDisabled()
     expect(screen.getByTestId('passkey-last-usable-hint'))
       .toHaveTextContent(/last passkey that can sign in here/)
@@ -285,6 +292,36 @@ describe('AccessView', () => {
       .toHaveTextContent(/Access control is off/)
     expect(screen.getByTestId('access-rp-mismatch-banner'))
       .toHaveTextContent(/registered for a different address/)
-    expect(screen.getByTestId('passkey-mode')).toHaveTextContent('open · http://localhost:8080')
+  })
+
+  it('renames a passkey from its detail pane', async () => {
+    render(<AccessView />)
+    fireEvent.click(await screen.findByText('laptop'))
+
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: '  work laptop  ' } })
+    fireEvent.click(screen.getByTestId('passkey-save'))
+
+    // The list row is what the name is for, so that is what the assertion reads.
+    await waitFor(() =>
+      expect(screen.getByTestId('passkey-row-usable')).toHaveTextContent('work laptop'),
+    )
+    // The stored (trimmed) name comes back from the gateway and seeds the field.
+    expect(screen.getByLabelText('Name')).toHaveValue('work laptop')
+    expect(calls).toContain('/api/auth/credentials/usable')
+  })
+
+  it('will not save a passkey with a blank name', async () => {
+    render(<AccessView />)
+    fireEvent.click(await screen.findByText('laptop'))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: '   ' } })
+    expect(screen.getByTestId('passkey-save')).toBeDisabled()
+  })
+
+  it('reverts an unsaved name on Cancel', async () => {
+    render(<AccessView />)
+    fireEvent.click(await screen.findByText('laptop'))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'typo' } })
+    fireEvent.click(screen.getByTestId('passkey-revert'))
+    expect(screen.getByLabelText('Name')).toHaveValue('laptop')
   })
 })

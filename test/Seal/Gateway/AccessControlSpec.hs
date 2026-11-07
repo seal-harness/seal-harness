@@ -27,7 +27,8 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Network.HTTP.Types (Header, Status, methodDelete, methodGet, methodPost, status409)
+import Network.HTTP.Types
+  ( Header, Status, methodDelete, methodGet, methodPost, methodPut, status409 )
 import Network.HTTP.Types.Header (hSetCookie)
 import Network.Wai
   ( Application, Request, Response, defaultRequest, pathInfo
@@ -49,7 +50,7 @@ import Seal.Config.BootPlan
   ( BindCoordinates (..), BootInputs (..), BootPlan (..), CredentialsPresence (..)
   , bootPlan )
 import Seal.Config.Credentials
-  ( CredentialsFile (..), credentialsVersion, saveCredentials )
+  ( CredentialsFile (..), credentialsVersion, loadCredentials, saveCredentials )
 import Seal.Config.Paths
   ( SealPaths (..), credentialsFilePath, enrollmentGrantPath, enrollmentTokenPath
   , securityFilePath )
@@ -57,6 +58,7 @@ import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
   , WriteMode (PreserveCredentials), defaultSecurityConfig, saveSecurityConfig )
 import Seal.Gateway.AccessControl
+import Seal.Gateway.Audit (auditLogPath)
 import Seal.Security.EnrollmentGrant
   ( Grant (..), GrantSource (..), MintedGrant (..), enrollGrant, loadGrantFile )
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
@@ -640,6 +642,77 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         st `shouldBe` status403'
         jsonField body "code" `shouldBe` Just (String "grant_required")
 
+  -- The label is the only part of a credential the operator names, and renaming
+  -- it is the only credential mutation that cannot lock anyone out — hence no
+  -- last-usable guard, but the same write lock, round-trip check and audit.
+  describe "credential rename" $ do
+    it "renames a credential, persists it, and audits the change" $
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection)
+          (Map.union orphanCred passkeyCreds)
+        -- The orphan is unusable here; renaming it must still work, because the
+        -- label takes no part in authentication.
+        let cid = b64 (BS.replicate 16 0x77)
+        req <- putJson ["api", "auth", "credentials", cid]
+                 (object ["label" .= ("  my phone " :: Text)])
+        (st, _, body) <- runApp (gated na) req
+        st `shouldBe` status200'
+        -- Normalised on the way in, and echoed back.
+        jsonField body "label" `shouldBe` Just (String "my phone")
+
+        -- The list the UI reads reflects it...
+        (stList, _, listed) <- runApp (gated na) (getReq ["api", "auth", "credentials"])
+        stList `shouldBe` status200'
+        credentialLabelOf cid listed `shouldBe` Just "my phone"
+
+        -- ...and so does the store on disk.
+        saved <- loadCredentials (credentialsFilePath paths)
+        case saved of
+          Right (Just file) ->
+            (cfcLabel <$> Map.lookup cid (crdCredentials file))
+              `shouldBe` Just "my phone"
+          _ -> expectationFailure "the credential store did not load"
+
+        -- A rename is a state change to an agent-immutable file, so it is in the
+        -- audit log with the credential it named.
+        logged <- BS.readFile (auditLogPath paths)
+        logged `shouldSatisfy` BS.isInfixOf "event=credential_relabeled"
+        logged `shouldSatisfy` BS.isInfixOf ("credential_id=" <> TE.encodeUtf8 cid)
+        logged `shouldSatisfy` BS.isInfixOf "label=my%20phone"
+
+    it "refuses an empty label without touching the store" $
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection) passkeyCreds
+        let cid = b64 (BS.replicate 16 0x11)
+        req <- putJson ["api", "auth", "credentials", cid]
+                 (object ["label" .= ("   " :: Text)])
+        (st, _, body) <- runApp (gated na) req
+        st `shouldBe` status400'
+        jsonField body "code" `shouldBe` Just (String "invalid_label")
+        saved <- loadCredentials (credentialsFilePath paths)
+        case saved of
+          Right (Just file) ->
+            (cfcLabel <$> Map.lookup cid (crdCredentials file))
+              `shouldBe` Just "test key"
+          _ -> expectationFailure "the credential store did not load"
+
+    it "reports an unknown credential id as not found" $
+      withHome (Just openSection) $ \paths -> do
+        na <- bootHandle paths (Just openSection) passkeyCreds
+        req <- putJson ["api", "auth", "credentials", b64 (BS.replicate 16 0x99)]
+                 (object ["label" .= ("ghost" :: Text)])
+        (st, _, body) <- runApp (gated na) req
+        st `shouldBe` status404'
+        jsonField body "code" `shouldBe` Just (String "not_found")
+
+    it "refuses a sessionless client in passkey mode" $
+      withHome (Just passkeySection) $ \paths -> do
+        na <- bootHandle paths (Just passkeySection) passkeyCreds
+        req <- putJson ["api", "auth", "credentials", b64 (BS.replicate 16 0x11)]
+                 (object ["label" .= ("my laptop" :: Text)])
+        (st, _, body) <- runApp (gated na) req
+        st `shouldBe` status403'
+        jsonField body "code" `shouldBe` Just (String "grant_required")
 
   -- Design §11 / §16.14: the banner's sink and TTY decision are arguments, so
   -- every branch is assertable without a terminal.
@@ -708,11 +781,12 @@ spec = describe "Seal.Gateway.AccessControl" $ do
 
 -- Helpers ------------------------------------------------------------------
 
-status200', status400', status401', status403', status429' :: Status
+status200', status400', status401', status403', status404', status429' :: Status
 status200' = toEnum 200
 status400' = toEnum 400
 status401' = toEnum 401
 status403' = toEnum 403
+status404' = toEnum 404
 status429' = toEnum 429
 
 -- | Mirror the production placement: the gate wraps only the @\/api\/*@ branch,
@@ -803,6 +877,25 @@ postJson segs body = do
         []     -> ([], BS.empty)
         (c:cs) -> (cs, c)
   pure (setRequestBodyChunks nextChunk (postReq segs [("Content-Type", "application/json")]))
+
+-- | A @PUT@ with a JSON body: the same one-shot chunk source, different method.
+putJson :: [Text] -> Value -> IO Request
+putJson segs body = do
+  req <- postJson segs body
+  pure (req { requestMethod = methodPut })
+
+-- | The label the credential list reports for @cid@, if it lists it at all.
+credentialLabelOf :: Text -> BL.ByteString -> Maybe Text
+credentialLabelOf cid raw = case A.decode raw of
+  Just (Array xs) -> case
+    [ label
+    | Object o <- toList xs
+    , KeyMap.lookup (Key.fromText "id") o == Just (String cid)
+    , Just (String label) <- [KeyMap.lookup (Key.fromText "label") o]
+    ] of
+      (label : _) -> Just label
+      []          -> Nothing
+  _ -> Nothing
 
 -- | Build a handle the way @seal serve@ does: gather the boot inputs, run the
 -- §10 decision, then construct from the plan. Tests that want a handle in a

@@ -31,7 +31,8 @@ import Seal.Config.Security
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), canonicalOriginFor, credentialAvailability
   , isIpLiteral, resolveCoordinates
-  , credentialFromFile, credentialToFile, parseIsoTime, rpMismatch )
+  , credentialFromFile, credentialToFile, credentialLabelMaxLength
+  , mkCredentialLabel, parseIsoTime, rpMismatch )
 import Seal.Security.WebAuthn.Types
   ( AccessMode (..), CosePublicKey (..), Credential (..) )
 
@@ -184,6 +185,28 @@ spec = describe "Seal.Config.Security access_control" $ do
       case credentialFromFile (credIdText, sampleCredential) of
         Left e -> expectationFailure (T.unpack e)
         Right (_, cred) -> credentialToFile cred `shouldBe` sampleCredential
+
+  -- A passkey's label is display-only, but it is stored in credentials.toml,
+  -- rendered in the web UI and echoed into the audit log, so it is normalised
+  -- once instead of at each reader.
+  describe "mkCredentialLabel" $ do
+    it "trims surrounding whitespace" $
+      mkCredentialLabel "  my laptop \n" `shouldBe` Right "my laptop"
+
+    it "rejects an empty or whitespace-only label" $ do
+      mkCredentialLabel "" `shouldSatisfy` isLeft
+      mkCredentialLabel "   " `shouldSatisfy` isLeft
+
+    it "rejects control characters" $
+      mkCredentialLabel "lap\ntop" `shouldSatisfy` isLeft
+
+    it "accepts a label of exactly the maximum length and rejects one over it" $ do
+      let longest = T.replicate credentialLabelMaxLength "a"
+      mkCredentialLabel longest `shouldBe` Right longest
+      mkCredentialLabel (longest <> "a") `shouldSatisfy` isLeft
+
+    it "keeps non-ASCII labels as typed" $
+      mkCredentialLabel "téléphone" `shouldBe` Right "téléphone"
 
   describe "canonicalOriginFor" $ do
     it "canonicalises a loopback bind to localhost" $ do

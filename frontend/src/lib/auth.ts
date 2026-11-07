@@ -451,6 +451,23 @@ export function removeCredential(id: string) {
   return authRequest(`credentials/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+/** What a rename answers with: the stored (normalised) label. */
+export interface RenameOutcome {
+  ok: boolean
+  id: string
+  label: string
+}
+
+/** Rename a credential — the display label only; it never takes part in
+ *  authentication. The gateway trims and bounds it, so the stored label can
+ *  differ from what was typed, and the answer is authoritative. */
+export function renameCredential(id: string, label: string): Promise<AuthResult<RenameOutcome>> {
+  return authRequest<RenameOutcome>(`credentials/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: { label },
+  })
+}
+
 // ── JSON shapes sent to navigator.credentials (camelCase, verbatim) ──────
 
 interface PublicKeyCredentialCreationOptionsJSON {

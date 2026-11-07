@@ -64,6 +64,7 @@ import Seal.Security.EnrollmentGrant (GrantSource, grantSourceText)
 data AuditEvent
   = CredentialAdded
   | CredentialRemoved
+  | CredentialRelabeled
   | GrantMinted
   | GrantConsumed
   | GrantRefused
@@ -73,13 +74,14 @@ data AuditEvent
 
 auditEventText :: AuditEvent -> Text
 auditEventText event = case event of
-  CredentialAdded   -> "credential_added"
+  CredentialAdded -> "credential_added"
   CredentialRemoved -> "credential_removed"
-  GrantMinted       -> "grant_minted"
-  GrantConsumed     -> "grant_consumed"
-  GrantRefused      -> "grant_refused"
-  ModeEnabled       -> "mode_enabled"
-  ModeDisabled      -> "mode_disabled"
+  CredentialRelabeled -> "credential_relabeled"
+  GrantMinted -> "grant_minted"
+  GrantConsumed -> "grant_consumed"
+  GrantRefused -> "grant_refused"
+  ModeEnabled -> "mode_enabled"
+  ModeDisabled -> "mode_disabled"
 
 -- | The closed field set.
 data AuditFields = AuditFields

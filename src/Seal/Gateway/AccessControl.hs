@@ -51,7 +51,7 @@ import Data.Time
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, hCookie, methodDelete, methodGet, methodOptions
-  , methodPost, status200, status400, status401, status403, status404
+  , methodPost, methodPut, status200, status400, status401, status403, status404
   , status409, status413, status429, status500 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
@@ -74,7 +74,8 @@ import Seal.Gateway.Audit qualified as Audit
 import Seal.Gateway.Audit
   ( AuditFields (..), admitRefusal, appendAudit, emptyAuditFields, newAuditGate )
 import Seal.Security.AccessControl
-  ( CredentialAvailability (..), credentialAvailability, credentialToFile, rpMismatch )
+  ( CredentialAvailability (..), credentialAvailability, credentialToFile
+  , mkCredentialLabel, rpMismatch )
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
 import Seal.Security.WebAuthn
   ( AssertionInput (..), RegistrationInput (..), RegistrationResult (..)
@@ -643,6 +644,10 @@ authApp h req respond =
 
     (m, ["api", "auth", "credentials", cid]) | m == methodDelete -> do
       result <- withCredentialAdmin h req (const (deleteCredential h cid))
+      respond (respondResult [] result)
+
+    (m, ["api", "auth", "credentials", cid]) | m == methodPut -> do
+      result <- withCredentialAdmin h req (renameCredential h cid)
       respond (respondResult [] result)
 
     _ -> respond (authError status404 "not_found" "no such endpoint")
@@ -1404,6 +1409,49 @@ deleteCredential h cid = do
         , afOrigin = acsOrigin st
         }
       pure (Right (object ["ok" .= True, "removed" .= cid]))
+
+-- | Rename one credential: the label the operator sees, nothing else.
+--
+-- The label never takes part in authentication, so this is the one credential
+-- mutation that cannot lock anyone out and the last-usable-credential guard
+-- does not apply. It is still a change to @credentials.toml@, so it is written
+-- through 'updateCredentialsFile' (write lock, round-trip check) and audited.
+--
+-- Membership is decided against the handle's map — the same map the list came
+-- from — because the handle never re-reads the store (design §5). A write that
+-- then fails is a store error, not a missing credential.
+renameCredential :: AccessControlHandle -> Text -> Request -> IO (Either AuthErr Value)
+renameCredential h cid req = do
+  body <- readJsonBody req
+  case body of
+    Left e -> pure (Left e)
+    Right obj -> case field obj "label" of
+      Nothing -> pure (Left (AuthErr status400 "malformed_request"
+                       "missing field \"label\""))
+      Just raw -> case mkCredentialLabel raw of
+        Left err -> pure (Left (AuthErr status400 "invalid_label" err))
+        Right label -> do
+          st <- withMVar (achState h) pure
+          if not (Map.member cid (acsCredentials st))
+            then pure (Left (AuthErr status404 "not_found"
+                             ("no credential \"" <> cid <> "\"")))
+            else do
+              written <- updateCredentialsFile (credentialsFilePath (achPaths h)) $
+                Right . Map.adjust (\c -> c { cfcLabel = label }) cid
+              case written of
+                Left err -> pure (Left (AuthErr status500 "write_failed" err))
+                Right () -> do
+                  modifyMVar_ (achState h) $ \s ->
+                    pure s { acsCredentials =
+                               Map.adjust (\c -> c { credLabel = label }) cid
+                                 (acsCredentials s) }
+                  auditEvent h (emptyAuditFields Audit.CredentialRelabeled)
+                    { afCredentialId = Just cid
+                    , afLabel = Just label
+                    , afRpId = acsRpId st
+                    , afOrigin = acsOrigin st
+                    }
+                  pure (Right (object ["ok" .= True, "id" .= cid, "label" .= label]))
 
 
 -- | Consume every outstanding grant after a successful enrollment.

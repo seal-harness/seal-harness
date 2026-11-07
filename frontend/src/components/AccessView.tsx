@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   addedViaCopy,
   createPasskey,
   fetchAuthStatus,
   listCredentials,
   removeCredential,
+  renameCredential,
   stepUpPasskey,
   verifyRegistration,
   type AuthStatus,
@@ -129,6 +130,9 @@ export function AccessView() {
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
+  // The one editable field on a passkey: the name it is listed under.
+  const [name, setName] = useState('')
+
   // The new-passkey form's state: the armed link, plus its failure/feedback.
   const [link, setLink] = useState<ArmedLink | null>(null)
   const [grantOutstanding, setGrantOutstanding] = useState(false)
@@ -168,6 +172,17 @@ export function AccessView() {
     () => (selectedId ? creds.find((c) => c.id === selectedId) ?? null : null),
     [selectedId, creds],
   )
+
+  // Ref holding the latest list so the seed effect can read it without
+  // re-running on every reload — that would overwrite what is being typed.
+  const credsRef = useRef(creds)
+  credsRef.current = creds
+
+  // Seed the name field only when the selection changes.
+  useEffect(() => {
+    setName(selectedId ? credsRef.current.find((c) => c.id === selectedId)?.label ?? '' : '')
+    setFormError(null)
+  }, [selectedId])
 
   // Design §9.4: the last *usable* credential cannot be removed. A credential
   // for another address is a safe removal even when it is the only one listed.
@@ -246,6 +261,27 @@ export function AccessView() {
       setNotice('Copy failed — the link is selected; copy it by hand.')
     }
   }, [link])
+
+  /** Save the one editable field: the name the passkey is listed under. */
+  const handleSaveName = async () => {
+    if (!selected) return
+    const trimmed = name.trim()
+    if (trimmed.length === 0) {
+      setFormError('A passkey needs a name.')
+      return
+    }
+    setSubmitting(true)
+    setFormError(null)
+    setNotice(null)
+    const res = await renameCredential(selected.id, trimmed)
+    setSubmitting(false)
+    if (!res.ok) {
+      setFormError(res.error)
+      return
+    }
+    setName(res.data.label)
+    await load()
+  }
 
   const handleDelete = async (id: string) => {
     setFormError(null)
@@ -341,16 +377,6 @@ export function AccessView() {
               >
                 +
               </button>
-            </div>
-            {/* The gateway's standing description: passkeys are bound to this
-                address, so it stays visible next to the list. */}
-            <div
-              className="text-xs mt-1 truncate"
-              style={{ color: 'var(--text-faint)' }}
-              title={status?.origin ? `Passkeys are bound to ${status.origin}` : undefined}
-              data-testid="passkey-mode"
-            >
-              {status ? `${status.state}${status.origin ? ` · ${status.origin}` : ''}` : '…'}
             </div>
           </div>
 
@@ -558,6 +584,24 @@ export function AccessView() {
               {!creating && selected && (
                 <>
                   <Row
+                    label="Name"
+                    htmlFor="passkey-name"
+                    hint="Shown in the list. It is a label only — it never affects how the passkey signs in."
+                  >
+                    <input
+                      id="passkey-name"
+                      type="text"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      maxLength={64}
+                      style={inputStyle}
+                      placeholder="e.g. my laptop"
+                      autoComplete="off"
+                      data-testid="passkey-name-input"
+                    />
+                  </Row>
+
+                  <Row
                     label="Id"
                     htmlFor=""
                     hint={<>The credential id the gateway stores. <code>seal access-control status</code> prints its first eight characters.</>}
@@ -665,6 +709,32 @@ export function AccessView() {
                       {submitting ? 'Waiting for your passkey…' : grantOutstanding ? 'Replace link' : 'Create link'}
                     </button>
                   ))}
+                  {!creating && selected && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
+                        onClick={() => { void handleSaveName() }}
+                        disabled={submitting || name.trim().length === 0}
+                        aria-label="Save passkey name"
+                        data-testid="passkey-save"
+                      >
+                        {submitting ? 'Saving…' : 'Save'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                        onClick={() => {
+                          setName(selected.label)
+                          setFormError(null)
+                        }}
+                        aria-label="Revert the passkey name"
+                        data-testid="passkey-revert"
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  )}
                   {creating && link && (
                     <button
                       type="button"

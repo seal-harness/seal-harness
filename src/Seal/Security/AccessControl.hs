@@ -19,6 +19,8 @@ module Seal.Security.AccessControl
   , originHostOf
   , credentialFromFile
   , credentialToFile
+  , mkCredentialLabel
+  , credentialLabelMaxLength
   , parseIsoTime
   , formatIsoTime
   , CredentialAvailability (..)
@@ -258,6 +260,33 @@ credentialToFile cred = CredentialFileConfig
   }
   where
     unCose (CosePublicKey b) = b
+
+-- | Longest accepted label.
+--
+-- The audit log caps a rendered label at the same length
+-- ("Seal.Gateway.Audit.auditLine"), so a stored label always fits there whole.
+credentialLabelMaxLength :: Int
+credentialLabelMaxLength = 64
+
+-- | Normalise and validate an operator-chosen credential label.
+--
+-- The label is display-only — it never takes part in authentication — but it is
+-- stored in @credentials.toml@, rendered in the web UI, and echoed into the
+-- audit log, so it is normalised once here rather than at each of those three
+-- readers: trimmed, non-empty, bounded, and free of control characters (which
+-- would corrupt both a list row and a log line). Uniqueness is deliberately
+-- not required: two devices may honestly be called the same thing, and the
+-- credential id still tells them apart.
+mkCredentialLabel :: Text -> Either Text Text
+mkCredentialLabel raw
+  | T.null label = Left "the label must not be empty"
+  | T.length label > credentialLabelMaxLength =
+      Left ("the label must be at most " <> tshow credentialLabelMaxLength <> " characters")
+  | T.any isControl label = Left "the label must not contain control characters"
+  | otherwise = Right label
+  where
+    label = T.strip raw
+    isControl c = c < ' ' || c == '\DEL'
 
 -- ---------------------------------------------------------------------------
 -- Small helpers
