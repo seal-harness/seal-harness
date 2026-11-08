@@ -42,7 +42,7 @@ import Seal.Command.Spec
   , commandAction, mkRegistry )
 import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), telegramVaultKeyFor)
 import Seal.Core.ChannelKind (ChannelKind (..))
-import Seal.Telegram.Config (defaultTelegramConfig)
+import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
@@ -4760,6 +4760,128 @@ spec = describe "Seal.Gateway.API" $ do
         _ -> pure ()
 
 
+
+  -- ── Channel CRUD integration (W6) ────────────────────────────────
+
+  it "channel CRUD integration: full lifecycle create → list → update → delete" $
+    withSystemTempDirectory "seal-chan-int" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "lifecycle-sig")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("lifecycle-sig" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+15555550123" :: T.Text)
+          ]))
+      (cStatus, _) <- runAppBody app req
+      cStatus `shouldBe` 201
+      -- list → present
+      (_, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` any hasId
+        Nothing -> expectationFailure "expected array after create"
+      -- update
+      uReq <- testPut ["api", "channels", "lifecycle-sig"]
+        (A.encode (A.object [ "label" .= ("Updated" :: T.Text) ]))
+      (uStatus, _) <- runAppBody app uReq
+      uStatus `shouldBe` 200
+      -- delete
+      (dStatus, _) <- runAppBody app (testRequest methodDelete ["api", "channels", "lifecycle-sig"])
+      dStatus `shouldBe` 204
+      -- list → absent
+      (_, gBody2) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody2 :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` not . any hasId
+        Nothing -> expectationFailure "expected array after delete"
+
+  it "channel CRUD integration: multiple channels of same type coexist" $
+    withSystemTempDirectory "seal-chan-multi" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create sig1
+      r1 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig1" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+1111" :: T.Text) ]))
+      (s1, _) <- runAppBody app r1
+      s1 `shouldBe` 201
+      -- create sig2 (same kind, different id)
+      r2 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig2" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+2222" :: T.Text) ]))
+      (s2, _) <- runAppBody app r2
+      s2 `shouldBe` 201
+      -- GET → both present
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode body :: Maybe [A.Value] of
+        Just xs -> length xs `shouldBe` 2
+        Nothing -> expectationFailure "expected array with 2 channels"
+
+  it "channel CRUD integration: legacy [telegram] with vault token migrates" $
+    withSystemTempDirectory "seal-chan-leg" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with no tcToken, token in vault
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig })
+      vault <- makeFakeVaultRuntime
+        [("TELEGRAM_BOT_TOKEN", "999:legacy-token")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      -- the migrated "telegram" channel appears
+      let found = any hasTelegramId arr
+      found `shouldBe` True
+      -- authStatus is "configured" (vault has the token)
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
+
+  it "channel CRUD integration: legacy [telegram] with tcToken in config migrates" $
+    withSystemTempDirectory "seal-chan-leg2" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with tcToken (config-level token)
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig
+            { tcToken = Just "888:config-token" } })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      arr `shouldSatisfy` any hasTelegramId
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
 
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT
