@@ -92,6 +92,7 @@ import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
+import Seal.Gateway.OriginGuard (GuardVerdict (..), guardHeadersFrom, sameOriginVerdict)
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
@@ -170,12 +171,39 @@ data ApiDeps = ApiDeps
     -- a fixture repo's @.agents/agents.md@, so repo-agent discovery is
     -- exercised without a live SSH connection. 'Nothing' in production
     -- (the handler builds the real 'SessionExec' via 'mkSessionExec').
+  , adCanonicalOrigin  :: Maybe Text
+    -- ^ The origin the boot plan resolved for this gateway
+    -- (@http://localhost:8080@ for a loopback bind), or 'Nothing' when access
+    -- control is off on a wildcard bind and no origin could be resolved. The
+    -- mutation guard compares each mutating request's @Origin@ against it; it is
+    -- the same value WebAuthn verifies @clientDataJSON.origin@ against, so the
+    -- HTTP and WebSocket surfaces share one trust anchor.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   }
 
 -- | The REST API as a WAI Application.
 apiApp :: ApiDeps -> Application
-apiApp deps req respond =
+apiApp deps req respond
+  -- The mutation guard runs before the route table: a cross-origin request that
+  -- would change state is refused here, so no handler (present or future) can
+  -- forget the check.
+  | guardApplies req
+  , Rejected why <- sameOriginVerdict (adCanonicalOrigin deps) (guardHeadersFrom req) =
+      respond (errJson status403 ("cross-origin request rejected: " <> why))
+  | otherwise = dispatchApi deps req respond
+
+-- | Which requests the mutation guard covers: every method that can change
+-- state, plus the setup status probe (whose body describes system state).
+-- Reads and @OPTIONS@ preflights are not guarded — the CORS removal is what
+-- protects them from a hostile page reading the response.
+guardApplies :: Request -> Bool
+guardApplies req =
+  requestMethod req `elem` [methodPost, methodPut, methodDelete]
+    || pathInfo req == ["api", "setup"]
+
+-- | The route table.
+dispatchApi :: ApiDeps -> Application
+dispatchApi deps req respond =
   case (requestMethod req, pathInfo req) of
     (m', ["api", "health"]) | m' == methodGet ->
       do
@@ -688,8 +716,10 @@ apiApp deps req respond =
       respond (jsonLBS status200 encodeOpenApi)
     (m', ["api", "openapi"]) | m' == methodGet ->
       respond (responseLBS status200 [("Content-Type", "text/html")] swaggerUiHtml)
-    (m', _) | m' == methodOptions ->
-      respond (responseLBS status200 corsHeaders "")
+    -- A preflight for a mutation no longer gets a CORS grant (see below), so a
+    -- cross-origin ``simple'' request never reaches the handler either.
+    (_m', _) | requestMethod req == methodOptions ->
+      respond (responseLBS status204 [] "")
     _ -> respond (responseLBS status404 [("Content-Type", "application/json")] "{\"error\":\"not found\"}")
 
 -- | A static Swagger UI page that fetches @\/api\/openapi.json@ and renders
@@ -2205,7 +2235,7 @@ handleTranscript deps sidTxt req =
           timingHeader = (mkHN "Server-Timing", renderServerTiming tt)
           hasMoreHdr = (mkHN "X-Has-More", if hasMore then "true" else "false")
           totalCountHdr = (mkHN "X-Total-Count", BC.pack (show totalCount))
-      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader, hasMoreHdr, totalCountHdr]) body)
+      pure (responseLBS status200 [jsonHeader, timingHeader, hasMoreHdr, totalCountHdr] body)
   where
     msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
 
@@ -2306,7 +2336,7 @@ skillInfoJson s = A.object
 
 -- | A 201 Created with a JSON body + CORS headers.
 jsonCreated :: Value -> Response
-jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
+jsonCreated v = responseLBS status201 [jsonHeader] (A.encode v)
 
 -- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
 -- emits @name@ + @configured@ (membership in the configured-provider set);
@@ -2588,15 +2618,15 @@ jsonOk v = jsonLBS status200 (A.encode v)
 
 -- | A response with a raw JSON bytestring + CORS headers.
 jsonLBS :: Status -> BL.ByteString -> Response
-jsonLBS st = responseLBS st (corsHeaders <> [jsonHeader])
+jsonLBS st = responseLBS st [jsonHeader]
 
 -- | A 204 No Content (no body).
 noContent :: Response
-noContent = responseLBS status204 corsHeaders ""
+noContent = responseLBS status204 [] ""
 
 -- | A JSON error response with a status code.
 errJson :: Status -> Text -> Response
-errJson st msg = responseLBS st (corsHeaders <> [jsonHeader])
+errJson st msg = responseLBS st [jsonHeader]
   (A.encode (object ["error" .= msg]))
 
 ----------------------------------------------------------------------------
@@ -2818,13 +2848,6 @@ randomByteString n = BS.pack <$> replicateM n (randomRIO (0, 255))
 
 ----------------------------------------------------------------------------
 -- CORS headers
-corsHeaders :: [Header]
-corsHeaders =
-  [ (mkHN "Access-Control-Allow-Origin", "*")
-  , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-  , (mkHN "Access-Control-Allow-Headers", "Content-Type")
-  ]
-
 jsonHeader :: Header
 jsonHeader = (mkHN "Content-Type", "application/json")
 

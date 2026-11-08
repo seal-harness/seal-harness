@@ -112,7 +112,7 @@ mkDeps = do
     , adRepoRegistry = repoRegH
     , adAgentRegistry = agentRegH
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)

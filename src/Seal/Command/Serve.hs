@@ -502,6 +502,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = repo
         , adVault            = rt
+        , adCanonicalOrigin = naOrigin access
         , adPaths            = paths
         , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg

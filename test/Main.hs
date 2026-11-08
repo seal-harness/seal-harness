@@ -16,6 +16,7 @@ import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.AccessControlSpec
 import qualified Seal.Gateway.OriginGuardSpec
+import qualified Seal.Gateway.MutationGuardSpec
 import qualified Seal.Gateway.AuditSpec
 import qualified Seal.Command.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
@@ -228,6 +229,7 @@ specs = do
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.AccessControlSpec.spec
   Seal.Gateway.OriginGuardSpec.spec
+  Seal.Gateway.MutationGuardSpec.spec
   Seal.Gateway.AuditSpec.spec
   Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec

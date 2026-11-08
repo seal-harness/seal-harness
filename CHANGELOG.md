@@ -2,6 +2,37 @@
 
 ## 0.1.0.0 — unreleased
 
+* **Mutating API requests must come from the gateway's own origin.** The REST
+  API was reachable from any page in the operator's browser: the router
+  answered `OPTIONS` for every path with `Access-Control-Allow-Origin: *`, so a
+  cross-origin JSON POST landed, and any cross-origin page could *read*
+  `GET /api/sessions` and every transcript. A passkey session does not fix this
+  on its own — the cookie travels on cross-origin requests, so a hostile page
+  can drive cookie-authenticated mutations (CSRF).
+
+  Every `POST`/`PUT`/`DELETE` (and `GET /api/setup`) now requires `Origin` to
+  match the origin the boot plan resolved for the gateway — the same value
+  WebAuthn verifies `clientDataJSON.origin` against. When that origin is
+  loopback, any loopback alias is accepted, on any port: the SPA is reached at
+  `http://127.0.0.1:<port>` in the e2e harness and `http://localhost:5173`
+  behind the vite dev proxy, while the boot plan canonicalises a loopback bind
+  to `http://localhost:<port>`. Clients that send no `Origin` at all (curl, the
+  chat channels, the test suite) are unaffected unless they also declare
+  `Sec-Fetch-Site: cross-site`.
+
+  With `access_control.mode = "none"` on a wildcard bind there is no resolvable
+  origin and no gate: mutating requests are allowed from anywhere, as before.
+
+* **The API no longer sends permissive CORS headers.** `Access-Control-Allow-Origin: *`
+  is gone from every response, and `OPTIONS` answers `204` with no grant (the
+  passkey endpoints already sent none). Nothing in the repository depended on
+  it — the SPA and the Swagger page are same-origin and the chat channels are
+  HTTP clients — but any out-of-tree browser client that relied on reading the
+  API cross-origin will stop working. Note that the WebSocket allowlist is
+  still exact (`http://localhost:<port>`), so a browser opened at
+  `http://127.0.0.1:<port>` can use the REST API but not the live stream; open
+  the gateway at the URL its banner prints.
+
 * **`[gateway] host` now actually binds, and defaults to `localhost`.**
   The `host` value never reached the listener: `runGateway` set only the port
   on Warp's `Settings`, and Warp's default host preference is the IPv4

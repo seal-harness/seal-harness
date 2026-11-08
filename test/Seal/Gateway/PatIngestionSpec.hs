@@ -268,7 +268,7 @@ mkVaultDeps vr tmp = do
         , adRepoRegistry     = repoRegH
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-        , adVault            = vr
+        , adVault            = vr, adCanonicalOrigin = Nothing
         , adPaths            = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)

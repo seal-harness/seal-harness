@@ -535,7 +535,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adRepoRegistry = repoRegH
         , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
-        , adVault = rt
+        , adVault = rt, adCanonicalOrigin = Nothing
         , adPaths = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)
