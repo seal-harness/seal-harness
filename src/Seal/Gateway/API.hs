@@ -85,7 +85,7 @@ import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Agent.Runtime.RunRecord (cancelRunsForParent)
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
-  , handleAskCancel, handleSend
+  , handleAskCancel, handleSend, parseSendBody
   , handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
@@ -244,11 +244,11 @@ apiApp deps req respond =
       case adSend deps of
         Nothing -> respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
         Just sendDeps -> do
-          let msg = parseSendMessage body
+          let (msg, mSrc) = parseSendBody body
           case mkSessionId sid of
             Left e   -> respond (errJson status400 ("invalid session id: " <> e))
             Right sId -> do
-              outcome <- handleSend sendDeps sId msg
+              outcome <- handleSend sendDeps sId mSrc msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
     -- POST /api/sessions/:id/stop — abort the session's in-flight tool call
@@ -727,17 +727,6 @@ triggerBroadcast deps =
   case adBroker deps of
     Nothing      -> pure ()
     Just broker  -> broadcastListsSnapshot broker (adTabsHandle deps) (srPaths (adSessionRuntime deps))
-
--- | Parse the @message@ field from a POST /send body. Returns "" on a
--- missing/invalid body so the agent loop receives an empty turn (the routing
--- grammar treats empty input as 'Plain ""').
-parseSendMessage :: BL.ByteString -> Text
-parseSendMessage body =
-  case A.decode body :: Maybe A.Value of
-    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "message") o of
-      Just (A.String t) -> t
-      _                 -> ""
-    _ -> ""
 
 -- | Parse the @url@ (required) and @branch@ (optional) fields from a POST
 -- /setup-repo body. 'Nothing' when the body is not a JSON object or @url@

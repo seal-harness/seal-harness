@@ -15,7 +15,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, isJust)
+import Data.Maybe (fromJust, isJust, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -4999,7 +4999,11 @@ spec = describe "Seal.Gateway.API" $ do
         Just sidTxt -> do
           -- 2. Send a message.
           sendReq <- testPost ["api", "sessions", sidTxt, "send"]
-            (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+            (A.encode (A.object
+              [ "message" .= ("hello" :: T.Text)
+              , "channel" .= ("telegram" :: T.Text)
+              , "userId" .= ("12345" :: T.Text)
+              , "conversationId" .= ("tg:12345" :: T.Text) ]))
           (sendStatus, _sendBody) <- runAppBody app sendReq
           sendStatus `shouldBe` 200
           -- 3. Poll the transcript; the turn runs async so the reply
@@ -5018,6 +5022,23 @@ spec = describe "Seal.Gateway.API" $ do
                     pure hasReply
           replyFound <- waitForPoll 5000000 pollTranscript id
           replyFound `shouldBe` True
+          -- The request entry's metadata carries the channel + sender id
+          -- forwarded from the /send body. This proves the API handler threads
+          -- the parsed MessageSource into handleSend (passing Nothing there
+          -- would leave channel "web" and no userId).
+          case mkSessionId sidTxt of
+            Left _ -> expectationFailure "bad session id"
+            Right sid' -> do
+              raw <- BC.readFile (sessionDir paths sid' </> "entries.jsonl")
+              let entries = mapMaybe (A.decode . BL.fromStrict) (BC.lines raw)
+                  metas = [ m | Just (A.Object o) <- entries
+                              , Just (A.Object m) <- [KeyMap.lookup (Key.fromText "meta") o] ]
+              case metas of
+                (m : _) -> do
+                  KeyMap.lookup (Key.fromText "channel") m `shouldBe` Just (A.String "telegram")
+                  KeyMap.lookup (Key.fromText "userId") m `shouldBe` Just (A.String "12345")
+                  KeyMap.lookup (Key.fromText "conversationId") m `shouldBe` Just (A.String "tg:12345")
+                [] -> expectationFailure "no request entry with meta"
 
   -- ── Regression: subscribed chat channels must receive the final reply
   -- EXACTLY ONCE after a web-originated turn ──────────────────────────────
