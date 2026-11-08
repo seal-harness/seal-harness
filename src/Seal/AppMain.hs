@@ -44,7 +44,7 @@ dispatch cfg =
     runApp env $ case _config_command cfg of
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
-      CommandServe autonomy mStaticDir -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir logger)
+      CommandServe autonomy mStaticDir noEnrollToken -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir noEnrollToken logger)
       CommandAccessControl action -> do
         -- The command returns its code; exiting stays here so every code is
         -- assertable in-process (design §12).

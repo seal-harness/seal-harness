@@ -63,7 +63,8 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.BootPlan
-  ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
+  ( BindCoordinates (..), BootPlan (bpOrigin, bpMintGrant), bootPlan, bootRefusalMessage, preflight )
+import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
@@ -126,17 +127,17 @@ import Seal.Web.UiState (newUiStateHandle)
 -- main thread, which 'handleServeInterrupt' turns into a shutdown log line
 -- naming the live sub-agents (whose forked threads die with this process)
 -- followed by exit 130.
-runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
-runServeMain autonomy mCliStaticDir logger = do
+runServeMain :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IO ()
+runServeMain autonomy mCliStaticDir noEnrollToken logger = do
   -- Filled in once the backends exist; 'Nothing' means an interrupt landed
   -- during startup, before there was a runtime to report on.
   runtimeRef <- newIORef Nothing
-  runServeMainInner autonomy mCliStaticDir logger runtimeRef
+  runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef
     `catch` handleServeInterrupt logger runtimeRef
 
 runServeMainInner
-  :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
-runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
+  :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
+runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
   -- Claim this SEAL_HOME for the life of the process before anything else
@@ -274,7 +275,16 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       Just err -> do
         logIO logger ErrorS ("gateway: " <> ls err)
         ioError (userError (T.unpack err))
-      Nothing -> newAccessControlHandle paths plan
+      Nothing -> do
+        -- @--no-enrollment-token@: the operator asserts the network is
+        -- secured (firewall/VPN), so a 'CliWindow' grant (no secret) is
+        -- minted instead of a 'CliToken' grant. The browser can enroll a
+        -- passkey without pasting a token. Passkey auth stays enabled —
+        -- this is not @mode = "none"@.
+        let adjustedPlan = if noEnrollToken
+              then plan { bpMintGrant = CliWindow <$ bpMintGrant plan }
+              else plan
+        newAccessControlHandle paths adjustedPlan
   printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle

@@ -19,7 +19,7 @@ import Seal.Security.Policy (AutonomyLevel (..))
 data Command
   = CommandNoOp
   | CommandTui AutonomyLevel
-  | CommandServe AutonomyLevel (Maybe FilePath)
+  | CommandServe AutonomyLevel (Maybe FilePath) Bool
   | CommandAccessControl AccessControlAction
   | CommandGenOpenApi
   deriving (Eq, Show)
@@ -61,7 +61,7 @@ pCommand :: Parser Command
 pCommand = hsubparser
   $  command "tui" (info (CommandTui <$> pAutonomy)
                          (progDesc "Start the interactive terminal UI (TUI)"))
-  <> command "serve" (info (CommandServe <$> pAutonomy <*> pStaticDir)
+  <> command "serve" (info (CommandServe <$> pAutonomy <*> pStaticDir <*> pNoEnrollmentToken)
                             (progDesc "Run the web gateway server"))
   <> command "access-control"
        (info (pAccessControl <**> helper)
@@ -158,3 +158,13 @@ pStaticDir = optional (strOption
   <> metavar "DIR"
   <> help "Serve static UI assets from DIR instead of the embedded bundle (dev mode)"
   ))
+
+-- | @--no-enrollment-token@ mints a 'CliWindow' grant at boot instead of a
+-- 'CliToken' grant: the browser can enroll a passkey without pasting a token.
+-- The operator asserts the network is secured (firewall/VPN) — the token's
+-- purpose is to prevent a remote attacker from enrolling first.
+pNoEnrollmentToken :: Parser Bool
+pNoEnrollmentToken = switch
+  ( long "no-enrollment-token"
+  <> help "Skip the enrollment token on first run (for a gateway behind a firewall/VPN)"
+  )
