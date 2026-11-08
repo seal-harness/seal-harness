@@ -420,6 +420,7 @@ test-suite tests
         Seal.Gateway.EmbeddedSpec
         Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
+        Seal.Gateway.ApiFilesSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
         Seal.Gateway.BroadcastSpec

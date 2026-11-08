@@ -23,6 +23,7 @@ data GatewayConfig = GatewayConfig
   , gcHost           :: Text       -- ^ default "127.0.0.1"
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+  , gcAllowRemoteFileExplorer :: Maybe Bool -- ^ opt-in to expose the file explorer on non-loopback (default False)
   } deriving stock (Eq, Show)
 
 -- | The compiled-in default. Loopback + port 8080 + the local origin.
@@ -33,6 +34,7 @@ defaultGatewayConfig = GatewayConfig
   , gcHost = "127.0.0.1"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
+  , gcAllowRemoteFileExplorer = Nothing
   }
 
 -- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
@@ -47,6 +49,7 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
+  <*> Toml.dioptional (Toml.bool "allow_remote_file_explorer") .= pgcAllowRemoteFileExplorer
 
 -- | A partial gateway config where every field is optional. 'withGatewayDefaults'
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
@@ -56,6 +59,7 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
+  , pgcAllowRemoteFileExplorer :: Maybe Bool
   } deriving stock (Eq, Show)
 
 -- | Merge a partial gateway config with the compiled-in defaults, producing
@@ -72,6 +76,7 @@ withGatewayDefaults p = GatewayConfig
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)
                          then gcAllowedOrigins defaultGatewayConfig
                          else pgcAllowedOrigins p
+  , gcAllowRemoteFileExplorer = pgcAllowRemoteFileExplorer p
   }
 
 -- | Codec for the @allowed_origins@ array (a TOML array of strings).

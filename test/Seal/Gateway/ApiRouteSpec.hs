@@ -11,7 +11,7 @@ import Seal.Gateway.Route (allRoutes)
 
 -- | The expected route count from the §3.2 table (54 routes).
 expectedRouteCount :: Int
-expectedRouteCount = 62
+expectedRouteCount = 65
 
 spec :: Spec
 spec = do

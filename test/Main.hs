@@ -17,6 +17,7 @@ import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.ApiFilesSpec
 import qualified Seal.Gateway.BroadcastSpec
 import qualified Seal.Gateway.EntryCursorSpec
 import qualified Seal.Gateway.OpenApiSpec
@@ -214,6 +215,7 @@ specs = do
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.ApiSpec.spec
+  Seal.Gateway.ApiFilesSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
   Seal.Gateway.BroadcastSpec.spec

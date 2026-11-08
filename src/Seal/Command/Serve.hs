@@ -63,6 +63,8 @@ import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (.
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+import Seal.Tools.Exec.FileExplorer (mkLocalFileExplorer, mkRemoteFileExplorer, mkFailClosedFileExplorer)
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
@@ -89,6 +91,7 @@ import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
+import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Telegram.Config (resolveTelegramConfig)
@@ -350,6 +353,20 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- (port already in use) still advertised the dead port, so the frontend
   -- connected to a non-WebSocket port and its transcript froze.
   wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
+  -- File explorer: enabled when the gateway host is loopback OR the
+  -- operator has explicitly opted in via [gateway]
+  -- allow_remote_file_explorer. The handle is built from the security
+  -- config: local mode → mkLocalFileExplorer, remote mode with SSH →
+  -- mkRemoteFileExplorer, remote mode without SSH → mkFailClosedFileExplorer
+  -- (fail-closed — NOT a local fallback, per architect review).
+  let isLoopback = gcHost gwCfg `elem` ["127.0.0.1", "::1", "localhost"]
+      fileExplorerEnabled = isLoopback
+        || fromMaybe False (gcAllowRemoteFileExplorer gwCfg)
+  fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
+    Nothing -> pure (mkLocalFileExplorer maxScanBytes)
+    Just uec -> case uecRemote uec of
+      Nothing -> pure mkFailClosedFileExplorer
+      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -377,6 +394,8 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
+        , adFileExplorer     = fileExplorer
+        , adFileExplorerEnabled = fileExplorerEnabled
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

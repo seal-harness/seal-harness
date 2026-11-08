@@ -151,6 +151,10 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
   -- Adopt
   RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+  -- Files (machine-level file explorer)
+  RouteFilesList     :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesContent  :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesDownload :: SealRoute '[] '[] Bodyless Resp
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
@@ -225,6 +229,9 @@ routeMeta = \case
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteFilesList -> Meta (match "files" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesContent -> Meta (match "files" ./ match "content" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesDownload -> Meta (match "files" ./ match "download" ./ end) qend bodyless (resp (one respCodec)) M.get
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -293,6 +300,9 @@ allRoutes =
   , Constructed RouteUiCustomModels
   , Constructed RouteUiRepos
   , Constructed RouteAdopt
+  , Constructed RouteFilesList
+  , Constructed RouteFilesContent
+  , Constructed RouteFilesDownload
   ]
 
 -- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.
