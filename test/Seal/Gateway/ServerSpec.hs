@@ -43,6 +43,7 @@ import Seal.Logging.Logger (SealLogger, testSealLogger)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -112,7 +113,7 @@ mkDeps = do
     , adRepoRegistry = repoRegH
     , adAgentRegistry = agentRegH
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)

@@ -90,6 +90,7 @@ import Seal.Config.Security
   , WriteMode (PreserveCredentials), saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -535,7 +536,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adRepoRegistry = repoRegH
         , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
-        , adVault = rt, adCanonicalOrigin = Nothing
+        , adVault = rt, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)

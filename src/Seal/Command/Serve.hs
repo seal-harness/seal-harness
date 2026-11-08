@@ -78,6 +78,7 @@ import Seal.Gateway.Config
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
   , effectiveTlsPaths, withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
+import Seal.Gateway.Setup (SetupDeps (..))
 
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
@@ -87,7 +88,7 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (configuredProviders)
+import Seal.Providers.Registry (configuredProviders, resolveProvider)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
@@ -113,6 +114,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -503,6 +505,19 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adConfigRepo       = repo
         , adVault            = rt
         , adCanonicalOrigin = naOrigin access
+        -- The setup endpoints' real seams: the provisioning core and a
+        -- provider resolver that re-reads config.toml + the vault handle on
+        -- every call (so a provider saved during setup is what a
+        -- Test-connection ping actually reaches).
+        , adSetup = SetupDeps
+            { sdProvision = defaultProvisionDeps paths
+            , sdResolveProvider = \kp model -> do
+                mh' <- readIORef (vrHandleRef rt)
+                cfg' <- loadRuntimeConfig cfgPath
+                case cfg' of
+                  Left err -> pure (Left err)
+                  Right rc' -> resolveProvider mh' mgr rc' kp model callCounter
+            }
         , adPaths            = paths
         , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg

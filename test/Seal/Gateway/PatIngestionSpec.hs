@@ -57,6 +57,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun)
@@ -268,7 +269,7 @@ mkVaultDeps vr tmp = do
         , adRepoRegistry     = repoRegH
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-        , adVault            = vr, adCanonicalOrigin = Nothing
+        , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths            = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)

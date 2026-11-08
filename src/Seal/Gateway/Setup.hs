@@ -1,11 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Shared plumbing for the setup endpoints: the body cap and the JSON/error
--- helpers they answer with.
+-- | Shared plumbing for the setup endpoints: the body cap, the JSON/error
+-- helpers they answer with, and the injected seams the vault/provisioning
+-- handlers depend on.
 --
--- This module deliberately holds no handlers yet (they arrive with the setup
--- wizard, issue #303). It exists now because the bounded body reader is part of
--- the mutation-guard change: every future setup handler must read its body
--- through 'collectBodyLimited' rather than the unbounded 'Seal.Gateway.API.collectBody'.
+-- The handlers themselves arrive with WU5 (plan rev 3). This module exists
+-- earlier because the bounded body reader is part of the mutation-guard change
+-- (PR A) and because the dependency record is what 'ApiDeps' carries from WU1
+-- onwards.
 --
 -- @Seal.Gateway.Setup@ never imports @Seal.Gateway.API@ (that module imports
 -- this one), so the helpers are self-contained.
@@ -14,6 +15,8 @@ module Seal.Gateway.Setup
   , collectBodyLimited
   , setupJson
   , setupErr
+  , SetupDeps (..)
+  , stubSetupDeps
   ) where
 
 import Data.Aeson (Value, object, (.=))
@@ -25,6 +28,52 @@ import Data.CaseInsensitive qualified as CI
 import Data.Text (Text)
 import Network.HTTP.Types (Header, HeaderName, Status)
 import Network.Wai (Request, Response, getRequestBodyChunk, responseLBS)
+
+import Seal.Core.Types (ModelId)
+import Seal.Providers.Class (SomeProvider)
+import Seal.Providers.Registry (KnownProvider)
+import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Vault.Provision
+  ( ProvisionDeps (..), ProvisionError (ProvisionInvalidInput)
+  , SetupEncryptor (..), SetupKeygen (..) )
+
+-- | The setup endpoints' injected dependencies.
+--
+-- Two seams, both of which have to be injected rather than imported so the
+-- handlers stay testable: the provisioning core (which shells out to
+-- @age-keygen@ / @age-plugin-yubikey@ / @age@) and the provider resolver (which
+-- needs a 'Network.HTTP.Client.Manager' and a vault handle).
+data SetupDeps = SetupDeps
+  { sdProvision       :: ProvisionDeps
+  , sdResolveProvider :: KnownProvider -> ModelId -> IO (Either Text SomeProvider)
+    -- ^ Re-reads @config.toml@ and the vault handle on every call, so a
+    -- provider saved during setup (including a new ollama base URL) is what
+    -- "Test connection" actually pings.
+  }
+
+-- | Inert dependencies for the 'ApiDeps' literals in tests that do not
+-- exercise the setup endpoints. Every seam fails closed with a message that
+-- names the stub, so a test that accidentally reaches one says so.
+stubSetupDeps :: SetupDeps
+stubSetupDeps = SetupDeps
+  { sdProvision = ProvisionDeps
+      { pdKeygen = SetupKeygen
+          { skLocal = pure (Left stubError)
+          , skYubi  = \_ _ _ -> pure (Left stubError)
+          , skUser  = \_ _ -> Left "stub setup deps"
+          }
+      , pdEncryptor = SetupEncryptor
+          { seMk     = \_ _ -> pure (Left (VaultBackendError "stub setup deps"))
+          , seVerify = \_ -> pure (Left "stub setup deps")
+          }
+      , pdWriteConfig = \_ -> pure (Left "stub setup deps")
+      -- A path that cannot exist: a stub must never take a real setup lock.
+      , pdLockPath = "/nonexistent/seal-stub-setup.lock"
+      }
+  , sdResolveProvider = \_ _ -> pure (Left "stub setup deps")
+  }
+  where
+    stubError = ProvisionInvalidInput "stub setup deps"
 
 -- | Setup request bodies are small JSON documents (a backend tag, a recipient,
 -- a path). 8 KiB is two orders of magnitude above the largest legitimate body

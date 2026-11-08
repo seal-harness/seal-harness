@@ -93,6 +93,7 @@ import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
 import Seal.Gateway.OriginGuard (GuardVerdict (..), guardHeadersFrom, sameOriginVerdict)
+import Seal.Gateway.Setup (SetupDeps)
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
@@ -178,6 +179,10 @@ data ApiDeps = ApiDeps
     -- mutation guard compares each mutating request's @Origin@ against it; it is
     -- the same value WebAuthn verifies @clientDataJSON.origin@ against, so the
     -- HTTP and WebSocket surfaces share one trust anchor.
+  , adSetup            :: SetupDeps
+    -- ^ The setup endpoints' injected seams (vault provisioning + provider
+    -- resolution). Real wiring in 'Seal.Command.Serve'; 'stubSetupDeps' in the
+    -- test literals, which fail closed rather than touching the filesystem.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   }
 
