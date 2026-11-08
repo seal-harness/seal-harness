@@ -102,7 +102,7 @@ continuationPrompt =
 requestMeta :: Text -> Maybe MessageSource -> Map.Map Text Value
 requestMeta fallbackChannel mSrc =
   Map.fromList $
-    [ ("channel", String effectiveChannel) ] <> conversationIdField <> userIdField
+    [ ("channel", String effectiveChannel) ] <> conversationIdField <> userIdField <> openFields
   where
     effectiveChannel = case mSrc of
       Nothing -> fallbackChannel
@@ -113,6 +113,9 @@ requestMeta fallbackChannel mSrc =
     userIdField = case mSrc >>= msUserId of
       Nothing -> []
       Just u  -> [("userId", String (userIdText u))]
+    openFields = case mSrc of
+      Nothing -> []
+      Just ms -> [ (k, String v) | (k,v) <- Map.toList (msOpen ms) ]
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do

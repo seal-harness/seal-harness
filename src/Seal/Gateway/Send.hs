@@ -14,6 +14,7 @@ module Seal.Gateway.Send
   , sendOutcomeJson
   , handleSend
   , mkSendMessageSource
+  , mkWebMessageSource
   , parseSendBody
   , plainTurn
   , plainTurnWithCaps
@@ -553,6 +554,24 @@ mkSendMessageSource mChannel mUserId mConversationId = do
     Nothing     -> Just Nothing
     Just uidTxt -> Just <$> either (const Nothing) Just (mkUserId uidTxt)
   either (const Nothing) Just (mkMessageSource cid kind uid mempty)
+
+-- | Mint a 'web'-channel 'MessageSource' for a POST /send that did not carry
+-- explicit provenance. The conversation id is server-derived from the session
+-- id, the (optional) authenticated passkey id is recorded as the user id, and
+-- the client IP (when known) rides in the open metadata map under
+-- @"clientIp"@. Returns 'Nothing' when the session id cannot be turned
+-- into a valid conversation id (should not happen in practice).
+mkWebMessageSource :: SessionId -> Maybe Text -> Maybe Text -> Maybe MessageSource
+mkWebMessageSource sid mPasskey mIp = do
+  cid <- either (const Nothing) Just (mkConversationId ("web:" <> sessionIdText sid))
+  kind <- channelKindFromText "web"
+  uid <- case mPasskey of
+    Nothing -> Just Nothing
+    Just p  -> Just <$> either (const Nothing) Just (mkUserId p)
+  let open = case mIp of
+        Nothing -> Map.empty
+        Just ip -> Map.singleton "clientIp" ip
+  either (const Nothing) Just (mkMessageSource cid kind uid open)
 
 -- | Parse a POST /send body into its message text and (optional) inbound
 -- 'MessageSource'. A missing message reads as @""@ (the routing grammar

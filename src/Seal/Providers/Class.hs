@@ -97,12 +97,14 @@ data MessageOrigin = MessageOrigin
   { moChannel :: Text
   , moUserId :: Maybe Text
   , moConversationId :: Maybe Text
+  , moPasskeyId :: Maybe Text
+  , moClientIp :: Maybe Text
   } deriving stock (Eq, Show, Generic)
 
 -- JSON keys: @channel@, @userId@, @conversationId@; absent fields are omitted
 -- (not null) so a per-message origin stays compact.
 instance ToJSON MessageOrigin where
-  toJSON o = object $ ["channel" .= moChannel o] <> userIdField <> conversationIdField
+  toJSON o = object $ ["channel" .= moChannel o] <> userIdField <> conversationIdField <> passkeyIdField <> clientIpField
     where
       userIdField = case moUserId o of
         Nothing -> []
@@ -110,12 +112,20 @@ instance ToJSON MessageOrigin where
       conversationIdField = case moConversationId o of
         Nothing -> []
         Just c  -> ["conversationId" .= c]
+      passkeyIdField = case moPasskeyId o of
+        Nothing -> []
+        Just p  -> ["passkeyId" .= p]
+      clientIpField = case moClientIp o of
+        Nothing -> []
+        Just i  -> ["clientIp" .= i]
 
 instance FromJSON MessageOrigin where
   parseJSON = withObject "MessageOrigin" $ \o -> MessageOrigin
     <$> o .: "channel"
     <*> o .:? "userId"
     <*> o .:? "conversationId"
+    <*> o .:? "passkeyId"
+    <*> o .:? "clientIp"
 
 -- | One conversation message: a role, its content blocks, and — for a message
 -- that arrived from an authenticated chat channel — its 'MessageOrigin'.

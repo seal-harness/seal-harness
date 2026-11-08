@@ -24,6 +24,7 @@ module Seal.Transcript.Origin
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Data.Map.Strict qualified as Map
 import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText, userIdText )
@@ -42,6 +43,14 @@ originFromSource ms = MessageOrigin
   { moChannel = channelKindToText (msChannelKind ms)
   , moUserId = userIdText <$> msUserId ms
   , moConversationId = Just (conversationIdText (msConversationId ms))
+  , moPasskeyId = if channelKindToText (msChannelKind ms) == "web"
+      then case userIdText <$> msUserId ms of
+             Just u  -> Just u
+             Nothing -> Map.lookup "passkeyId" (msOpen ms)
+      else Map.lookup "passkeyId" (msOpen ms)
+  , moClientIp = case Map.lookup "clientIp" (msOpen ms) of
+      Just i  -> Just i
+      Nothing -> Map.lookup "ip" (msOpen ms)
   }
 
 -- | The tag a message's origin renders to: @[channel:userId]@ when the

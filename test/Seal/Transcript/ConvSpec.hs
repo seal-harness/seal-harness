@@ -77,7 +77,7 @@ spec = describe "Seal.Transcript.Conv" $ do
       -- column in entries.jsonl.
       let m = (textMsgSimple "hi")
                 { msgOrigin = Just (MessageOrigin "signal" (Just "+15551234567")
-                                     (Just "sig:+15551234567:abc")) }
+                                     (Just "sig:+15551234567:abc") Nothing Nothing) }
       readConversation (roundTripBody [m]) `shouldBe` [m]
 
     it "keeps messages without an origin origin-less" $

@@ -16,7 +16,7 @@ import Seal.TestHelpers.Arbitrary ()
 -- | A user message that arrived from Telegram user 12345.
 telegramMessage :: Message
 telegramMessage = (textMsg User "hi")
-  { msgOrigin = Just (MessageOrigin "telegram" (Just "12345") (Just "tg:12345")) }
+  { msgOrigin = Just (MessageOrigin "telegram" (Just "12345") (Just "tg:12345") Nothing Nothing) }
 
 -- | Look up a key in a JSON object.
 field :: Key.Key -> Value -> Maybe Value
@@ -44,7 +44,7 @@ spec = describe "Seal.Providers.Class" $ do
         `shouldBe` Just (Just (String "tg:12345"))
 
     it "omits absent origin fields instead of emitting nulls" $ do
-      let m = (textMsg User "hi") { msgOrigin = Just (MessageOrigin "signal" Nothing Nothing) }
+      let m = (textMsg User "hi") { msgOrigin = Just (MessageOrigin "signal" Nothing Nothing Nothing Nothing) }
           origin = field "origin" (toJSON m)
       field "userId" <$> origin `shouldBe` Just Nothing
       field "conversationId" <$> origin `shouldBe` Just Nothing

@@ -41,7 +41,7 @@ stripOrigins :: [Message] -> [Message]
 stripOrigins = map (\m -> m { msgOrigin = Nothing })
 
 originOf :: Text -> Message -> Message
-originOf ch m = m { msgOrigin = Just (MessageOrigin ch Nothing Nothing) }
+originOf ch m = m { msgOrigin = Just (MessageOrigin ch Nothing Nothing Nothing Nothing) }
 
 toolResultOnly :: Message
 toolResultOnly = Message User [CbToolResult (ToolCallId "t1") [TrpText "r"] False]
@@ -51,19 +51,19 @@ spec = describe "Seal.Transcript.Origin" $ do
   describe "originFromSource" $ do
     it "carries the channel tag, the sender id, and the conversation id" $
       originFromSource (telegramSource (Just "12345"))
-        `shouldBe` MessageOrigin "telegram" (Just "12345") (Just "tg:12345")
+        `shouldBe` MessageOrigin "telegram" (Just "12345") (Just "tg:12345") Nothing Nothing
 
     it "carries no sender when the channel authenticated none" $
       originFromSource (telegramSource Nothing)
-        `shouldBe` MessageOrigin "telegram" Nothing (Just "tg:12345")
+        `shouldBe` MessageOrigin "telegram" Nothing (Just "tg:12345") Nothing Nothing
 
   describe "renderOriginTag" $ do
     it "renders channel and sender as [channel:userId]" $
-      renderOriginTag (MessageOrigin "signal" (Just "+15551234567") Nothing)
+      renderOriginTag (MessageOrigin "signal" (Just "+15551234567") Nothing Nothing Nothing)
         `shouldBe` "[signal:+15551234567]"
 
     it "renders just the channel when there is no sender" $
-      renderOriginTag (MessageOrigin "signal" Nothing Nothing)
+      renderOriginTag (MessageOrigin "signal" Nothing Nothing Nothing Nothing)
         `shouldBe` "[signal]"
 
   describe "annotateOrigins" $ do
@@ -72,8 +72,8 @@ spec = describe "Seal.Transcript.Origin" $ do
         `shouldBe` [originOf "telegram" (textMsg User "[telegram] hello")]
 
     it "gives each message in a group chat its own sender tag" $ do
-      let firstSender  = (textMsg User "from one") { msgOrigin = Just (MessageOrigin "signal" (Just "+1") Nothing) }
-          secondSender = (textMsg User "from two") { msgOrigin = Just (MessageOrigin "signal" (Just "+2") Nothing) }
+      let firstSender  = (textMsg User "from one") { msgOrigin = Just (MessageOrigin "signal" (Just "+1") Nothing Nothing Nothing) }
+          secondSender = (textMsg User "from two") { msgOrigin = Just (MessageOrigin "signal" (Just "+2") Nothing Nothing Nothing) }
       map texts (annotateOrigins [firstSender, secondSender])
         `shouldBe` [["[signal:+1] from one"], ["[signal:+2] from two"]]
 

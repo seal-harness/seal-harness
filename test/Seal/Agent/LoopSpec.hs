@@ -255,7 +255,7 @@ spec = describe "Seal.Agent.Loop" $ do
               Right m -> do
                 msgContent m `shouldBe` [CbText "hi"]
                 msgOrigin m `shouldBe`
-                  Just (MessageOrigin "telegram" (Just "12345") (Just "tg:12345"))
+                  Just (MessageOrigin "telegram" (Just "12345") (Just "tg:12345") Nothing Nothing)
 
   describe "stripToolCallXml" $ do
     it "removes a complete <invoke> block" $ do
