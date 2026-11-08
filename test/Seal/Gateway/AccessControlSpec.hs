@@ -56,7 +56,8 @@ import Seal.Config.Paths
   , securityFilePath )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), CredentialFileConfig (..), SecurityConfig (..)
-  , WriteMode (PreserveCredentials), defaultSecurityConfig, saveSecurityConfig )
+  , WriteMode (PreserveCredentials), defaultSecurityConfig
+  , loadSecurityConfig, saveSecurityConfig )
 import Seal.Gateway.AccessControl
 import Seal.Gateway.Audit (auditLogPath)
 import Seal.Security.EnrollmentGrant
@@ -245,20 +246,38 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         jsonField body "setup_required" `shouldBe` Just (Bool False)
         jsonField body "rp_id" `shouldBe` Just (String "localhost")
 
-  -- Design §8.1: disabling access control is CLI-only, so no HTTP request can
-  -- do it. The endpoint is gone rather than guarded.
-  describe "waive is removed" $ do
-    it "has no waive endpoint" $ withHome Nothing $ \paths -> do
-      na <- bootHandle paths Nothing Map.empty
-      code <- setupCodeOf na
-      (st, _, _) <- runApp (gated na)
-        (postReq ["api", "auth", "waive"] [("X-Seal-Enroll-Token", code)])
-      st `shouldBe` toEnum 404
-
-    it "leaves the mode untouched when the old endpoint is called" $
+  -- POST /api/auth/waive: write mode = "none" to security.toml from the
+  -- browser. Gated on the enrollment token (or a CliWindow grant from
+  -- --no-enrollment-token), so a remote attacker cannot waive without the
+  -- token.
+  describe "waive" $ do
+    it "writes mode = none with a valid enrollment token" $
       withHome Nothing $ \paths -> do
         na <- bootHandle paths Nothing Map.empty
-        _ <- runApp (gated na) (postReq ["api", "auth", "waive"] [])
+        code <- setupCodeOf na
+        (st, _, body) <- runApp (gated na)
+          (postReq ["api", "auth", "waive"] [("X-Seal-Enroll-Token", code)])
+        st `shouldBe` status200'
+        jsonField body "ok" `shouldBe` Just (Bool True)
+        -- security.toml now says mode = "none"
+        loaded <- loadSecurityConfig (securityFilePath paths)
+        case loaded of
+          Right cfg -> (scAccessControl cfg >>= acfcMode) `shouldBe` Just "none"
+          Left _    -> expectationFailure "security.toml did not parse after waive"
+
+    it "refuses waive without an enrollment token" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths Nothing Map.empty
+        (st, _, _) <- runApp (gated na) (postReq ["api", "auth", "waive"] [])
+        st `shouldBe` toEnum 403
+        accessControlMode (naHandle na) `shouldReturn` AccessUnconfigured
+
+    it "refuses waive with a wrong enrollment token" $
+      withHome Nothing $ \paths -> do
+        na <- bootHandle paths Nothing Map.empty
+        (st, _, _) <- runApp (gated na)
+          (postReq ["api", "auth", "waive"] [("X-Seal-Enroll-Token", "wrong")])
+        st `shouldBe` toEnum 403
         accessControlMode (naHandle na) `shouldReturn` AccessUnconfigured
 
   describe "passkey mode" $ do

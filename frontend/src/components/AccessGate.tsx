@@ -3,6 +3,7 @@ import {
   clearEnrollToken,
   createPasskey,
   fetchAuthStatus,
+  waiveAccess,
   getPasskey,
   hasWebAuthn,
   isSecureContextOk,
@@ -49,6 +50,9 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [recovery, setRecovery] = useState(false)
+  const [waiveBusy, setWaiveBusy] = useState(false)
+  const [waiveError, setWaiveError] = useState<string | null>(null)
+  const [waiveDone, setWaiveDone] = useState(false)
   const steppedUp = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -170,6 +174,20 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       await refresh()
     }
   }, [runCeremony, refresh])
+
+  const waive = useCallback(async () => {
+    setWaiveBusy(true)
+    setWaiveError(null)
+    const res = await waiveAccess(effectiveToken)
+    setWaiveBusy(false)
+    if (!res.ok) {
+      setWaiveError(res.error ?? 'waive failed')
+      return
+    }
+    setWaiveDone(true)
+    setStatus(null)
+    await refresh()
+  }, [effectiveToken, refresh])
 
   if (loadFailed) {
     return (
@@ -367,10 +385,33 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
         </button>
       </div>
 
-      <p className="agate-hint">
-        Prefer to run without access control? Stop <code>seal serve</code> and run
-        <code> seal access-control disable --yes</code>. Only the terminal can turn it off.
-      </p>
+      {waiveDone ? (
+        <p className="agate-hint">
+          Access control waived. Restart <code>seal serve</code> for it to take effect.
+        </p>
+      ) : (
+        <details className="agate-waive">
+          <summary>Run without access control</summary>
+          <p className="agate-text">
+            Anyone who can reach this gateway will have full control of every session.
+            This is appropriate only when the gateway is behind a firewall or VPN.
+          </p>
+          {waiveError && <p className="agate-error">{waiveError}</p>}
+          <button
+            className="agate-secondary"
+            disabled={waiveBusy || effectiveToken === null}
+            onClick={() => { void waive() }}
+          >
+            {waiveBusy ? 'Waiving…' : 'Waive access control'}
+          </button>
+          {effectiveToken === null && (
+            <p className="agate-hint">
+              An enrollment token is required to waive. Paste one above, or run
+              <code> seal serve --no-enrollment-token</code> to skip the token entirely.
+            </p>
+          )}
+        </details>
+      )}
     </Panel>
   )
 }
