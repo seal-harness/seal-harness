@@ -610,6 +610,7 @@ mkSetupRepoFakeRunner markerPath ref = do
     { runRemote      = (`record` Nothing)
     , runRemoteStdin = \argv stdin -> record argv (Just stdin)
     , runRemoteEnv   = \_env argv -> record argv Nothing
+    , runRemoteBytes = \argv -> record argv Nothing >> pure (Right ("", False))
     }
 
 -- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').

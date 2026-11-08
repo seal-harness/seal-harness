@@ -211,6 +211,7 @@ library
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
+          Seal.Tools.Exec.FileExplorer
           Seal.Tools.Exec.UIO
           Seal.Tools.Exec.UIO.Internal
           Seal.Tools.Exec.UIOGit
@@ -557,6 +558,7 @@ test-suite tests
           Seal.Tools.Exec.UIOSpec
           Seal.Tools.Exec.UIOParitySpec
           Seal.Tools.Exec.WorkdirFsSpec
+          Seal.Tools.Exec.FileExplorerSpec
           Seal.Tools.Exec.LogRedactionSpec
          Seal.ISA.Ops.UIOUnrestrictedFailSpec
          Seal.ISA.Ops.UIOConstructionFailSpec

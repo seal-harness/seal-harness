@@ -44,6 +44,7 @@ import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
+import qualified Seal.Tools.Exec.FileExplorerSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
@@ -248,6 +249,7 @@ specs = do
   Seal.Tools.Exec.UIOSpec.spec
   Seal.Tools.Exec.UIOParitySpec.spec
   Seal.Tools.Exec.WorkdirFsSpec.spec
+  Seal.Tools.Exec.FileExplorerSpec.spec
   Seal.ISA.Ops.UIOUnrestrictedFailSpec.spec
   Seal.ISA.Ops.UIOConstructionFailSpec.spec
   Seal.Web.SearchSpec.spec
