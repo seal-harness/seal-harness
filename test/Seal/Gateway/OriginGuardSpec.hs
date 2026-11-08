@@ -47,6 +47,16 @@ spec = describe "Seal.Gateway.OriginGuard.sameOriginVerdict" $ do
                  (GuardHeaders (Just "http://seal.lan:9999") Nothing))
         `shouldBe` False
 
+  describe "a loopback canonical origin compares the scheme" $ do
+    it "rejects an https origin against an http canonical" $
+      allowed (sameOriginVerdict (Just "http://localhost:8080")
+                 (GuardHeaders (Just "https://localhost:8080") Nothing))
+        `shouldBe` False
+    it "rejects an http origin against an https canonical" $
+      allowed (sameOriginVerdict (Just "https://localhost:8080")
+                 (GuardHeaders (Just "http://localhost:8080") Nothing))
+        `shouldBe` False
+
   describe "a loopback canonical origin accepts any loopback alias" $ do
     it "accepts 127.0.0.1 on a different port (e2e harness, vite dev)" $
       allowed (sameOriginVerdict (Just "http://localhost:8080")
@@ -138,13 +148,14 @@ pickCanon n = case n `mod` 3 of
   _ -> Just "http://seal.lan:8080"
 
 pickOrigin :: Int -> Maybe Text
-pickOrigin n = case n `mod` 6 of
+pickOrigin n = case n `mod` 7 of
   0 -> Nothing
   1 -> Just "http://localhost:8080"
   2 -> Just "http://127.0.0.1:9999"
   3 -> Just "http://seal.lan:8080"
   4 -> Just "https://evil.example"
-  _ -> Just "null"
+  5 -> Just "null"
+  _ -> Just "https://localhost:8080"
 
 pickFetch :: Int -> Maybe Text
 pickFetch n = case n `mod` 4 of
@@ -161,7 +172,11 @@ acceptable canon (GuardHeaders mOrigin mSfs) = case (canon, mOrigin) of
   (Just _, Nothing) -> mSfs `notElem` [Just "cross-site", Just "same-site"]
   (Just c, Just o) ->
     httpish o
-      && (lower o == lower c || (loopbackCanon c && loopbackHost (hostOf o)))
+      && (lower o == lower c
+            || (schemeOf o == schemeOf c && loopbackCanon c && loopbackHost (hostOf o)))
+
+schemeOf :: Text -> Text
+schemeOf t = lower (T.takeWhile (/= ':') t)
 
 httpish :: Text -> Bool
 httpish t = "http://" `T.isPrefixOf` lower t || "https://" `T.isPrefixOf` lower t

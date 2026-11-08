@@ -8,8 +8,10 @@
 -- module decides whether the *request origin* is the gateway's own.
 --
 -- The canonical origin is resolved once at boot by 'Seal.Config.BootPlan' and is
--- the same value WebAuthn verifies @clientDataJSON.origin@ against, so there is
--- exactly one trust anchor and the HTTP and WebSocket surfaces cannot drift.
+-- the same value WebAuthn verifies @clientDataJSON.origin@ against. The
+-- WebSocket allowlist is derived separately, from @[gateway] host@ + @port@, and
+-- is exact: a browser opened at @http:\/\/127.0.0.1:<port>@ can use the REST API
+-- here but not the live stream. Open the URL the boot banner prints.
 --
 -- Pure on purpose: the whole verdict (including the loopback-alias cases that
 -- keep @vite dev@ and the e2e harness working) is testable without a socket.
@@ -18,10 +20,8 @@ module Seal.Gateway.OriginGuard
   , GuardVerdict (..)
   , sameOriginVerdict
   , guardHeadersFrom
-  , isLoopbackHost
   ) where
 
-import Data.CaseInsensitive qualified as CI
 import Data.Char (isDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -44,9 +44,9 @@ data GuardVerdict = Allowed | Rejected !Text
   deriving stock (Eq, Show)
 
 -- | @Sec-Fetch-Site@ has no constant in @http-types@; header names are
--- case-insensitive, and @CI.mk@ lowercases.
+-- case-insensitive and @HeaderName@ is @IsString@ over the lowercased form.
 hSecFetchSite :: HeaderName
-hSecFetchSite = CI.mk "sec-fetch-site"
+hSecFetchSite = "sec-fetch-site"
 
 -- | Decide whether a request may mutate state.
 --
@@ -71,7 +71,9 @@ sameOriginVerdict (Just canonical) headers =
       | otherwise -> case (parseOrigin canonical, parseOrigin raw) of
           (Just canon, Just origin)
             | identicalOrigin canon origin -> Allowed
-            | isLoopbackHost (poHost canon) && isLoopbackHost (poHost origin) -> Allowed
+            | poScheme canon == poScheme origin
+            , isLoopbackHost (poHost canon)
+            , isLoopbackHost (poHost origin) -> Allowed
             | otherwise ->
                 Rejected ("origin does not match the gateway origin (" <> raw <> ")")
           _ -> Rejected "Origin header is not a well-formed http(s) origin"

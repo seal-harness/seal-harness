@@ -176,8 +176,8 @@ Branch: `feat/gateway-mutation-guard-<NN>` off `gateway/passkey-access-control`.
    `guardHeadersFrom :: Request -> GuardHeaders`. Pure — no IO, no config.
 2. cabal + `test/Main.hs`.
 
-**DoD**: 1–10 green; the module's imports are limited to `Data.Text`,
-`Data.Text.Encoding`, `Network.Wai` and `Network.HTTP.Types` (no IO).
+**DoD**: 1–10 green; the module performs no IO (imports: `Data.Char`,
+`Data.Text`, `Data.Text.Encoding`, `Network.Wai`, `Network.HTTP.Types`).
 
 ## WU4 — wiring, CORS removal, bounded body reader
 

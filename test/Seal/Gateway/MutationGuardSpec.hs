@@ -16,17 +16,19 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive (mk)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Types
-  ( Header, methodDelete, methodOptions, methodPost, methodPut, statusCode )
+  ( Header, Status, methodDelete, methodOptions, methodPost, methodPut, statusCode )
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestHeaders, requestMethod
-  , responseHeaders, responseStatus, setRequestBodyChunks )
+  , responseHeaders, responseStatus, responseToStream, setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
@@ -57,10 +59,12 @@ spec :: Spec
 spec = describe "Seal.Gateway mutation guard" $ do
 
   describe "with a canonical origin (http://localhost:8080)" $ do
-    it "rejects a foreign Origin on a mutation" $ do
+    it "rejects a foreign Origin on a mutation, with the error envelope" $ do
       app <- mkApp (Just canonical)
-      resp <- runApp app (request methodPost stopPath [origin "https://evil.example"])
-      statusCode (responseStatus resp) `shouldBe` 403
+      (status, body) <- runAppBody app (request methodPost ["api", "providers"] [origin "https://evil.example"])
+      statusCode status `shouldBe` 403
+      -- The shared error envelope is what the frontend parses.
+      T.unpack (TE.decodeUtf8Lenient (BL.toStrict body)) `shouldContain` "\"error\""
 
     it "accepts the SPA's own loopback origin (127.0.0.1 vs localhost)" $ do
       app <- mkApp (Just canonical)
@@ -77,10 +81,13 @@ spec = describe "Seal.Gateway mutation guard" $ do
       resp <- runApp app (request methodPost stopPath [])
       statusCode (responseStatus resp) `shouldBe` 200
 
-    it "guards POST, PUT and DELETE alike" $ do
+    it "guards POST, PUT and DELETE on existing mutating routes" $ do
       app <- mkApp (Just canonical)
-      forM_ [methodPost, methodPut, methodDelete] $ \mth -> do
-        resp <- runApp app (request mth ["api", "providers", "default"] [origin "https://evil.example"])
+      forM_ [ (methodPost, ["api", "providers"])
+            , (methodPut, ["api", "providers", "default"])
+            , (methodDelete, ["api", "secrets", "SOME_KEY"])
+            ] $ \(mth, path) -> do
+        resp <- runApp app (request mth path [origin "https://evil.example"])
         statusCode (responseStatus resp) `shouldBe` 403
 
     it "does not guard reads" $ do
@@ -108,6 +115,11 @@ spec = describe "Seal.Gateway mutation guard" $ do
       resp <- runApp app (request methodPost stopPath [origin "https://evil.example"])
       hasAcao resp `shouldBe` False
       statusCode (responseStatus resp) `shouldBe` 403
+
+    it "sets no Access-Control-Allow-Origin on a list response (jsonLBS)" $ do
+      app <- mkApp (Just canonical)
+      resp <- runApp app (request "GET" ["api", "lists"] [])
+      hasAcao resp `shouldBe` False
 
     it "answers OPTIONS without a CORS grant" $ do
       app <- mkApp (Just canonical)
@@ -153,6 +165,21 @@ runApp :: Application -> Request -> IO Response
 runApp app req = do
   mv <- newEmptyMVar
   _ <- app req (\resp -> putMVar mv resp >> pure ResponseReceived)
+  takeMVar mv
+
+-- | Run the app and capture the status plus the full body, for the cases that
+-- assert on the error envelope.
+runAppBody :: Application -> Request -> IO (Status, BL.ByteString)
+runAppBody app req = do
+  mv <- newEmptyMVar
+  _ <- app req $ \resp -> do
+    let (st, _hdrs, withBody) = responseToStream resp
+    ref <- newIORef []
+    withBody $ \streamingBody ->
+      streamingBody (\builder -> modifyIORef' ref (builder :)) (pure ())
+    builders <- readIORef ref
+    putMVar mv (st, BSB.toLazyByteString (mconcat (reverse builders)))
+    pure ResponseReceived
   takeMVar mv
 
 hasAcao :: Response -> Bool
