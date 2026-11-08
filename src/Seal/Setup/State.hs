@@ -35,7 +35,6 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Char (isAsciiLower)
 import System.FilePath (takeDirectory, takeFileName)
 
 import Seal.Config.File
@@ -44,7 +43,8 @@ import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Registry
-  ( KnownProvider, defaultModelFor, knownProviders, parseProvider, providerLabel )
+  ( KnownProvider (..), defaultModelFor, knownProviders, parseProvider
+  , providerLabel )
 import Seal.Security.Vault (VaultHandle (vhStatus), VaultStatus (..))
 
 -- | The three states a wizard row can be in. There is deliberately no
@@ -279,7 +279,7 @@ providerCards :: SetupInputs -> Set Text -> [ProviderCard]
 providerCards inputs configured =
   [ ProviderCard
       { pcId = providerLabel known
-      , pcLabel = capitalise (providerLabel known)
+      , pcLabel = providerDisplayName known
       , pcConfigured = Set.member (providerLabel known) configured
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
@@ -287,15 +287,13 @@ providerCards inputs configured =
   | known <- knownProviders
   ]
 
--- | @anthropic@ → @Anthropic@ (the design's card label).
-capitalise :: Text -> Text
-capitalise t = case T.uncons t of
-  Nothing -> t
-  Just (c, rest) -> T.cons (toUpperAscii c) rest
-  where
-    toUpperAscii ch
-      | isAsciiLower ch = toEnum (fromEnum ch - 32)
-      | otherwise = ch
+-- | The card's display name. Branding is explicit rather than derived: a
+-- mechanical capitalise turns @openrouter@ into "Openrouter".
+providerDisplayName :: KnownProvider -> Text
+providerDisplayName known = case known of
+  AnthropicProvider  -> "Anthropic"
+  OllamaProvider     -> "Ollama"
+  OpenRouterProvider -> "OpenRouter"
 
 isYubiKeyVault :: SetupInputs -> Bool
 isYubiKeyVault inputs = scVaultKeyType (siSecurity inputs) == Just "yubikey"

@@ -115,6 +115,8 @@ spec = describe "Seal.Setup.State" $ do
       map pcId (ssProviders state)
         `shouldBe` ["anthropic", "ollama", "openrouter"]
       map pcConfigured (ssProviders state) `shouldBe` [False, False, False]
+      -- Branding is a display name, not a mechanical capitalise.
+      map pcLabel (ssProviders state) `shouldBe` ["Anthropic", "Ollama", "OpenRouter"]
 
   describe "provider step" $ do
 
