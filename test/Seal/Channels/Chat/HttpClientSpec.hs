@@ -23,7 +23,12 @@ import Seal.Channels.Chat.HttpClient
   , setupRepoBody
   , TabJson (..)
   , parseJsonBody
+  , sendBodyJson
   )
+
+import Seal.Gateway.Types.ChannelKind (ChannelKind (..))
+import Seal.Gateway.Types.MessageSource
+  (MessageSource, mkConversationId, mkMessageSource, mkUserId)
 
 spec :: Spec
 spec = do
@@ -74,6 +79,23 @@ spec = do
 
     it "returns Left for invalid JSON" $
       parseSendResult "not json" `shouldBe` Left "failed to parse send response JSON"
+
+  describe "sendBodyJson" $ do
+    it "sends only the message when there is no source" $
+      sendBodyJson Nothing "hi" `shouldBe` A.object ["message" .= ("hi" :: Text)]
+
+    it "carries channel, user id, and conversation id when a source is present" $
+      sendBodyJson (Just (sampleSource (Just "12345"))) "hi" `shouldBe` A.object
+        [ "message"        .= ("hi" :: Text)
+        , "channel"        .= ("telegram" :: Text)
+        , "userId"         .= ("12345" :: Text)
+        , "conversationId" .= ("tg:12345" :: Text) ]
+
+    it "omits userId when the channel carried no sender id" $
+      sendBodyJson (Just (sampleSource Nothing)) "hi" `shouldBe` A.object
+        [ "message"        .= ("hi" :: Text)
+        , "channel"        .= ("telegram" :: Text)
+        , "conversationId" .= ("tg:12345" :: Text) ]
 
   describe "parseJsonBody" $ do
     it "parses valid JSON" $
@@ -197,3 +219,14 @@ spec = do
     it "falls back to HTTP <code> for an empty error string" $
       parseErrorBody 500 (A.encode (A.object ["error" .= ("" :: Text)]))
         `shouldBe` "HTTP 500"
+
+-- | A Telegram 'MessageSource' for the send-body tests.
+sampleSource :: Maybe Text -> MessageSource
+sampleSource mUid =
+  case mkConversationId "tg:12345" of
+    Left _ -> error "sendBodyJson test: bad conversation id"
+    Right cid ->
+      case mkMessageSource cid Telegram
+             (mUid >>= either (const Nothing) Just . mkUserId) mempty of
+        Left _   -> error "sendBodyJson test: bad message source"
+        Right ms -> ms

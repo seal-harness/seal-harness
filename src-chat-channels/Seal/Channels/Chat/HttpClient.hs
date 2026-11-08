@@ -6,6 +6,7 @@
 module Seal.Channels.Chat.HttpClient
   ( -- * Send a message
     httpSend
+  , sendBodyJson
   , SendResult (..)
   , parseSendResult
     -- * Tabs
@@ -52,7 +53,10 @@ import Network.HTTP.Client
   (Manager, Request (..), Response, HttpException, httpLbs,
    parseRequest, RequestBody (..), responseBody, responseStatus)
 import Network.HTTP.Types (Method, statusCode, methodPost, methodGet)
+import Seal.Gateway.Types.ChannelKind (channelKindToText)
 import Seal.Gateway.Types.Core (SessionId, sessionIdText)
+import Seal.Gateway.Types.MessageSource
+  (MessageSource (..), conversationIdText, userIdText)
 
 -- | The result of a @POST /api/sessions/:id/send@ call.
 data SendResult = SendResult
@@ -94,13 +98,32 @@ data ListsJson = ListsJson
   , ljThinkingSessionIds :: [Text]
   } deriving stock (Eq, Show)
 
--- | @POST /api/sessions/:id/send@ — send a message to a session.
-httpSend :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
-httpSend mgr apiBase sid message = do
+-- | @POST /api/sessions/:id/send@ — send a message to a session. When a
+-- 'MessageSource' is present (a chat channel), its channel name, sender user
+-- id, and conversation id travel with the message so the gateway can stamp
+-- them into the turn's transcript metadata.
+httpSend
+  :: Manager -> Text -> SessionId -> Maybe MessageSource -> Text
+  -> IO (Either Text SendResult)
+httpSend mgr apiBase sid mSrc message = do
   let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid) <> "/send"
-  doRequest mgr url methodPost (Just (A.object ["message" .= message])) >>= \case
+  doRequest mgr url methodPost (Just (sendBodyJson mSrc message)) >>= \case
     Left e -> pure (Left e)
     Right body -> pure (parseSendResult body)
+
+-- | Build the JSON body of a @POST /api/sessions/:id/send@ request. Always
+-- carries @message@; a present 'MessageSource' adds @channel@, @userId@
+-- (only when the channel identified the sender), and @conversationId@.
+-- Absent fields are omitted entirely — never sent as JSON @null@.
+sendBodyJson :: Maybe MessageSource -> Text -> Value
+sendBodyJson mSrc message = A.object $
+  [ "message" .= message ]
+  <> case mSrc of
+       Nothing -> []
+       Just ms ->
+         [ "channel" .= channelKindToText (msChannelKind ms) ]
+         <> maybe [] (\u -> ["userId" .= userIdText u]) (msUserId ms)
+         <> [ "conversationId" .= conversationIdText (msConversationId ms) ]
 
 -- | @GET /api/tabs@ — list all tabs.
 httpGetTabs :: Manager -> Text -> IO (Either Text [TabJson])

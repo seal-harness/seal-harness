@@ -9,6 +9,7 @@ module Seal.Channels.Chat.Loop
   , WsConn
     -- * Event handlers (for testing)
   , handleInbound
+  , handleInboundWithSource
   , handleFocus
   , handleServerEvent
   , handleCallback
@@ -346,7 +347,7 @@ data ChatChannelConfig = ChatChannelConfig
   , cccGetRepos :: Manager -> Text -> IO (Either Text [Value])
     -- ^ @GET /api/repos@. The seam @/new -r@ uses to resolve a registered
     -- repo id to its URL; the default is 'httpGetRepos'.
-  , cccSendMessage :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
+  , cccSendMessage :: Manager -> Text -> SessionId -> Maybe MessageSource -> Text -> IO (Either Text SendResult)
     -- ^ @POST /api/sessions/:id/send@. The seam the @/bg@ handler uses to
     -- deliver the prompt; the default is 'httpSend'.
   , cccStartWs :: Text -> Int -> WsEventCallback -> IO (Either Text WsClient)
@@ -408,10 +409,12 @@ runChatChannel cfg chan watchState = do
               handleCallback cfg chan sessions pendingAsks bgSessions key src cbData
             Nothing ->
               -- Regular text message: route normally.
-              handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker ws tt key body
+              handleInboundWithSource cfg chan sessions wsConns pendingAsks bgSessions tabTracker ws tt key (Just src) body
           loop sessions wsConns pendingAsks bgSessions tabTracker ws tt
 
--- | Handle one inbound message: resolve the session, route, and dispatch.
+-- | 'handleInbound' with no channel provenance (for the tests and any caller
+-- that has no 'MessageSource'). The live loop calls
+-- 'handleInboundWithSource' with the inbound message's source.
 handleInbound
   :: ChatChannel c
   => ChatChannelConfig -> c -> SessionMap
@@ -423,7 +426,25 @@ handleInbound
   -> ThinkingTabs
   -> ConversationKey -> Text
   -> IO ()
-handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body = do
+handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key =
+  handleInboundWithSource cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key Nothing
+
+-- | Handle one inbound message with its authenticated channel provenance:
+-- resolve the session, route, and dispatch. The source (when present) rides
+-- along to the HTTP send so the gateway stamps the channel + user id into the
+-- turn's transcript metadata.
+handleInboundWithSource
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> SessionMap
+  -> TVar (Map ConversationKey WsConn)
+  -> PendingAsks
+  -> BgSessions
+  -> TVar (Map ConversationKey (SessionId, [TabJson]))
+  -> WatchState
+  -> ThinkingTabs
+  -> ConversationKey -> Maybe MessageSource -> Text
+  -> IO ()
+handleInboundWithSource cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc body = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   -- Intercept /watch (and /watch on|off) before normal routing — it
@@ -449,13 +470,13 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
       Right (ChatInject idx payload) -> do
         -- Send the payload to the target tab's session WITHOUT changing
         -- the focused tab (no FocusOp, no "focused tab N" confirmation).
-        handleInject cfg chan idx payload
+        handleInject cfg chan mSrc idx payload
       Right ChatCurrentTab -> do
         -- Send the current tab info via HTTP (the gateway routes /tab).
         mSid <- sessionLookup sessions key
         case mSid of
           Just sid -> do
-            eResult <- cccSendMessage cfg mgr apiBase sid "/tab"
+            eResult <- cccSendMessage cfg mgr apiBase sid Nothing "/tab"
             case eResult of
               Right sr -> ccSend chan (srResponse sr)
               Left e -> ccSend chan ("error: " <> e)
@@ -466,12 +487,12 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
       Right (ChatBackground prompt) -> do
         -- Run the prompt in a freshly minted headless session. The
         -- conversation's focused session and tab list are untouched.
-        handleBackground cfg chan pendingAsks bgSessions key prompt
+        handleBackground cfg chan pendingAsks bgSessions key mSrc prompt
       Right (ChatSlash _cmd) ->
-        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
+        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc body
       Right (ChatTabCommand _) ->
         -- Tab commands go through the HTTP API (the gateway routes them).
-        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key body
+        sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc body
       Right ChatTabList -> handleTabList cfg chan
       Right (ChatPlain text) -> do
         -- A plain message answers a pending ask from one of this
@@ -483,7 +504,7 @@ handleInbound cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchS
         -- see 'answerPendingBgAsk'.)
         consumed <- answerPendingBgAsk cfg chan pendingAsks bgSessions key text
         unless consumed $
-          sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text
+          sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc text
       Left _ -> ccSend chan "error: invalid command"
 
 -- | Handle a focus command: resolve the tab index to a session id via
@@ -535,9 +556,9 @@ handleFocus cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchSta
 -- visible when the user later focuses on that tab.
 handleInject
   :: ChatChannel c
-  => ChatChannelConfig -> c -> TabIndex -> Text
+  => ChatChannelConfig -> c -> Maybe MessageSource -> TabIndex -> Text
   -> IO ()
-handleInject cfg chan idx payload = do
+handleInject cfg chan mSrc idx payload = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
   eTabs <- httpGetTabs mgr apiBase
@@ -556,7 +577,7 @@ handleInject cfg chan idx payload = do
                 -- Do NOT update the session map, send a FocusOp, or
                 -- send a focus confirmation — the current focused tab
                 -- is unchanged.
-                eResult <- cccSendMessage cfg mgr apiBase sid payload
+                eResult <- cccSendMessage cfg mgr apiBase sid mSrc payload
                 case eResult of
                   Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
                   Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -611,9 +632,9 @@ maxBgSessions = 4
 handleBackground
   :: ChatChannel c
   => ChatChannelConfig -> c -> PendingAsks -> BgSessions
-  -> ConversationKey -> Text
+  -> ConversationKey -> Maybe MessageSource -> Text
   -> IO ()
-handleBackground cfg chan pendingAsks bgSessions key prompt
+handleBackground cfg chan pendingAsks bgSessions key mSrc prompt
   | T.null (T.strip prompt) = ccSend chan bgUsage
   | isBgHelpArg prompt      = ccSend chan bgHelp
   | otherwise               = do
@@ -643,7 +664,7 @@ handleBackground cfg chan pendingAsks bgSessions key prompt
               bgInsert bgSessions key BgSession { bgSid = bgSid, bgWs = ws }
               -- (f) run the prompt on the bg session (never on the
               -- conversation's session) and confirm.
-              eSent <- cccSendMessage cfg mgr apiBase bgSid prompt
+              eSent <- cccSendMessage cfg mgr apiBase bgSid mSrc prompt
               case eSent of
                 Right sr | srKind sr /= "error" ->
                   ccSend chan ("bg session " <> shortSessionId bgSid <> " started")
@@ -1244,13 +1265,13 @@ sendPlain
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
-  -> ConversationKey -> Text
+  -> ConversationKey -> Maybe MessageSource -> Text
   -> IO ()
-sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key text = do
+sendPlain cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc text = do
   sid <- resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eResult <- cccSendMessage cfg mgr apiBase sid text
+  eResult <- cccSendMessage cfg mgr apiBase sid mSrc text
   case eResult of
     Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
     Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
@@ -1263,7 +1284,7 @@ sendSlash
   => ChatChannelConfig -> c -> SessionMap -> TVar (Map ConversationKey WsConn)
   -> PendingAsks -> BgSessions -> TVar (Map ConversationKey (SessionId, [TabJson]))
   -> WatchState -> ThinkingTabs
-  -> ConversationKey -> Text
+  -> ConversationKey -> Maybe MessageSource -> Text
   -> IO ()
 sendSlash = sendPlain  -- same mechanism; the gateway routes slash commands
 
