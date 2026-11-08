@@ -2,6 +2,37 @@
 
 ## 0.1.0.0 — unreleased
 
+* **A first run can now be completed in the browser.** `seal serve` serves a
+  guided wizard before the app: create the vault (local `age-keygen` key,
+  YubiKey, or your own age identity), then add an LLM provider. It reaches
+  parity with the CLI's `/vault setup` for the three backends, writes only the
+  three vault-key fields, and never returns key material to the browser. The
+  gate is blocking — there is no skip — and the two routes it uses
+  (`GET /api/setup`, `POST /api/setup/vault`, plus `POST /api/setup/vault/reopen`
+  and `POST /api/providers/:name/test`) sit behind the passkey middleware and
+  the mutation origin guard. The CLI remains the way to rotate a key.
+
+* **A `startup`-mode vault needs one `reopen` after a first-run setup.** A
+  vault created from the wizard is opened in `on_demand` mode for the rest of
+  the process. If `security.toml` asks for `startup`, the wizard's vault step
+  reports "locked" with a Reopen action (which unlocks it) until that is done —
+  `seal serve` does not unlock at boot. Nothing is lost: the vault is on disk
+  and `seal tui`'s `/vault unlock` does the same thing.
+
+* **`age` is now invoked with single-token option forms.** The vault encryptor
+  passes `--decrypt --identity=<path>` and `--encrypt --recipient=<value>`
+  rather than separating the value, so a stored value that begins with `-` can
+  never be read as a flag (AGENTS.md invariant 2).
+
+* **`mkAgeEncryptor` rejects a malformed recipient or identity path.** Both
+  credentials are validated at the single choke point every caller goes
+  through (CLI, gateway, a hand-edited `security.toml`), so a vault configured
+  with a broken value now fails loudly at open time with "invalid recipient" /
+  "invalid identity path" instead of failing later inside `age`. This is a
+  behaviour change for the CLI: a config that used to limp along now refuses to
+  open the vault.
+
+
 * **Mutating API requests must come from the gateway's own origin.** The REST
   API was reachable from any page in the operator's browser: the router
   answered `OPTIONS` for every path with `Access-Control-Allow-Origin: *`, so a

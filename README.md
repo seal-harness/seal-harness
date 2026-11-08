@@ -221,6 +221,40 @@ From a running frontend, start a session with the `/new` command:
 Provider credentials are read from the vault (set them with
 `seal vault save`). Resume old sessions with `/session` and `/tab`.
 
+## First run
+
+There are two gates, in this order, and both are blocking.
+
+1. **Access control** (passkey). `seal serve` mints an enrollment token on
+   first boot and prints it; the web UI walks you through enrolling a passkey.
+   If you explicitly waive it (`[access_control] mode = "none"`), that waiver
+   is a decision you wrote down, not a default.
+2. **Setup** (`vault` then `provider`). The wizard asks for:
+
+   * a vault — a local `age` key (`age-keygen` on the gateway's `PATH`), a
+     YubiKey (`age-plugin-yubikey` on `PATH`; the plugin needs a terminal for
+     key generation, so the wizard hands you the exact command and a Re-check
+     button), or an existing age identity (a recipient plus the path to the
+     identity file);
+   * an LLM provider — Anthropic, OpenRouter, or Ollama, plus its credential.
+
+   The vault step writes exactly three values to `~/.seal/security.toml`
+   (`vault_recipient`, `vault_identity`, `vault_key_type`) and creates
+   `~/.seal/config/vault/vault.age`. The provider step writes
+   `config.toml` as before. Key material is generated server-side and never
+   sent to the browser; responses carry the public recipient and a key-type
+   label only.
+
+Everything after that is the CLI's job: `/vault setup` rotates a vault key (the
+wizard only creates one), and `seal tui` is where you fix a state the wizard
+can only describe — an orphan vault file, an unreadable identity, or a vault
+file written by a different key.
+
+The four endpoints behind the wizard are `GET /api/setup`,
+`POST /api/setup/vault`, `POST /api/setup/vault/reopen`, and
+`POST /api/providers/:name/test`. All are origin-guarded and passkey-gated;
+`GET /api/setup` is `no-store` and path-free.
+
 ## Configuration files
 
 The first run writes two documented files and never overwrites either: an

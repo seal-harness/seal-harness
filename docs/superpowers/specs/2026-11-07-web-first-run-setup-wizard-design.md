@@ -578,7 +578,13 @@ here when it appears.
 
 ## 7. Security design
 
-### 7.1 `Seal.Gateway.OriginGuard` + `GuardPolicy`
+### 7.1 `Seal.Gateway.OriginGuard` — one pure verdict
+
+> **Superseded in part.** The `GuardPolicy`/`GuardHosts`/peer-address design in
+> the revision-logged text below was dropped before implementation; §0.2 is
+> normative. What shipped is the two-type, no-config-input verdict described
+> below, in `src/Seal/Gateway/OriginGuard.hs`, called from `apiApp` ahead of
+> the route table.
 
 **Verified context.** `API.hs:2821-2826` attaches `Access-Control-Allow-Origin: *`
 to every JSON response and `API.hs:691-692` answers `OPTIONS` for every path with
@@ -686,12 +692,20 @@ Order (every partial state is benign **and** resumable):
 4. Build the encryptor and **round-trip verify** (encrypt+decrypt a nonce),
    under `System.Timeout` (a YubiKey identity can block on a PIN prompt;
    `readProcessNoInput` has no timeout).
-5. **CAS the config write** via
-   `updateSecurityConfigEither :: FilePath -> (SecurityConfig -> Either e SecurityConfig) -> IO (Either Text (Either e ()))`
+5. **CAS the config write** via the second narrow writer
+   `updateVaultKeySection :: FilePath -> (SecurityConfig -> Either e VaultKeyFields) -> IO (Either Text (Either e VaultKeyFields))`
    (inside `securityWriteLock`): the callback returns
    `Left ProvisionAlreadyExists` when a recipient is already recorded, which the
    handler maps to `409`; only a load/parse failure becomes
    `ProvisionConfigWriteFailed`/`500`. `resume` skips this step.
+
+   *Implementation note (supersedes this section's `updateSecurityConfigEither`):*
+   the base branch guarantees that `updateAccessControlSection` is a narrow
+   writer whose callback cannot name vault fields. A general
+   `updateSecurityConfigEither` would have removed that guarantee, so the
+   implementation kept it and added a **second** narrow writer instead. Neither
+   callback can express the other's fields, and both verify the re-encoded
+   document before committing.
 6. `vhInit` the vault at the configured path (`VaultAlreadyExists` → `409`
    unless `resume`).
 7. **Decrypt-verify**: `vhList` the freshly created vault; if it fails, the file
@@ -743,7 +757,9 @@ HTTP Gateway" and that `updateSecurityConfig` is "NEVER called by … the HTTP
 Gateway". In this PR: both docstrings are rewritten to describe the
 loopback-only, origin-guarded setup API and the restricted field set
 (`vault_recipient`, `vault_identity`, `vault_key_type` only);
-`updateSecurityConfigEither` is added and documented; `untrusted_execution` /
+a second narrow writer (`updateVaultKeySection`) is added and documented next
+to `updateAccessControlSection` — **not** a general
+`updateSecurityConfigEither` (see §7.4 step 5); `untrusted_execution` /
 remote-mode decisions keep using the boot-time `adSecurityConfig` snapshot and
 the per-turn re-read in `TurnEngine`; `AGENTS.md`'s trusted-binary exception list
 gains `age-keygen` and `age-plugin-yubikey`; and

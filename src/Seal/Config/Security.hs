@@ -4,12 +4,26 @@
 -- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
 -- the agent/operator-tunable 'RuntimeConfig'). No opcode can reach this module.
 --
--- It is re-read in one narrow case only: 'updateAccessControlSection', which
--- rewrites the @[access_control]@ table when the operator enrolls a passkey,
--- waives the requirement, or manages credentials from the authenticated web
--- UI. That writer's callback sees only 'AccessControlFileConfig', so it
--- physically cannot express a change to any other section — the type split
--- (design §4 Approach E) keeps its guarantee.
+-- It is re-read through exactly two narrow writers, both reachable from the
+-- gateway and from the CLI:
+--
+-- * 'updateAccessControlSection' rewrites the @[access_control]@ table when the
+--   operator enrolls a passkey, waives the requirement, or manages credentials
+--   from the authenticated web UI. Its callback sees only
+--   'AccessControlFileConfig'.
+-- * 'updateVaultKeySection' records the three vault-key fields
+--   (@vault_recipient@, @vault_identity@, @vault_key_type@) when a vault is
+--   created from the web setup wizard. Its callback sees the current
+--   'SecurityConfig' but may only return 'VaultKeyFields'.
+--
+-- Neither callback can express a change to the other's section, nor to
+-- @untrusted_execution@: the type split (design §4 Approach E) keeps its
+-- guarantee, and it is a compile error, not a convention. Both run under
+-- 'securityWriteLock' and verify the re-encoded document before committing.
+--
+-- The file is therefore reachable from the HTTP gateway — but only through
+-- those two writers, only on a loopback-origin-guarded route, and only behind
+-- the passkey middleware (default-deny). Nothing here is an opcode surface.
 --
 -- Moving @untrusted_execution@ and the vault settings here means a future
 -- @CONFIG_UPDATE@ opcode (which operates on 'RuntimeConfig') and the Gateway's
