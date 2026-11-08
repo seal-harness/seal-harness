@@ -18,15 +18,20 @@ import { test, expect } from '@playwright/test'
 test('first-run setup wizard — vault then provider', async ({ page }) => {
   await page.goto('/')
 
-  // The wizard, not the app: the vault step is current.
+  // The wizard, not the app. It says what it is before it asks anything.
+  await expect(
+    page.getByRole('heading', { level: 1, name: 'Seal Harness Setup Wizard' }),
+  ).toBeVisible({ timeout: 20_000 })
+
+  // The vault step is current.
   await expect(page.getByRole('heading', { name: 'Create your vault' })).toBeVisible({
     timeout: 20_000,
   })
   await expect(page.getByRole('navigation', { name: 'Setup steps' })).toBeVisible()
 
   // ── Vault: local age key ──────────────────────────────────────────────
-  await page.getByRole('button', { name: /local age key/i }).click()
-  await page.getByRole('button', { name: /create the vault/i }).click()
+  await page.getByRole('button', { name: /local key/i }).click()
+  await page.getByRole('button', { name: /^create vault$/i }).click()
 
   // The step flips to ready and the wizard advances to the provider step.
   await expect(page.getByRole('heading', { name: 'Choose an LLM provider' })).toBeVisible({

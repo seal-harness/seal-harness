@@ -9,6 +9,7 @@ import {
 } from '../../lib/setupSteps'
 import { ProviderStep } from './ProviderStep'
 import { SetupComplete } from './SetupComplete'
+import * as s from './styles'
 import { VaultStep } from './VaultStep'
 
 /**
@@ -92,42 +93,40 @@ export function SetupWizard({
   }
 
   return (
-    <main className="mx-auto flex max-w-5xl gap-8 p-8">
-      <nav aria-label="Setup steps" className="w-64 shrink-0">
-        <ol className="space-y-2">
+    <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start' }}>
+      <nav aria-label="Setup steps" style={s.railStyle}>
+        <ol>
           {rail.map((item, i) => (
             <li key={item.id}>
               <button
                 type="button"
                 aria-current={i === index ? 'step' : undefined}
                 onClick={() => setIndex(i)}
-                className={`w-full rounded px-3 py-2 text-left text-sm ${
-                  i === index ? 'bg-slate-700 text-slate-100' : 'text-slate-400'
-                }`}
+                style={s.railItemStyle(i === index)}
               >
-                <span className="block font-medium">{item.title}</span>
-                <span className="block text-xs">{item.step.status}</span>
+                <span style={{ display: 'block', fontSize: 13, fontWeight: 500 }}>
+                  {i + 1}. {item.title}
+                </span>
+                <span style={{ display: 'block', fontSize: 11, color: 'var(--text-faint)', marginTop: 2 }}>
+                  {item.step.status}
+                </span>
               </button>
             </li>
           ))}
         </ol>
       </nav>
 
-      <section className="min-w-0 flex-1">
-        <h1
-          ref={headingRef}
-          tabIndex={-1}
-          className="text-xl font-semibold text-slate-100 outline-none"
-        >
+      <section style={{ ...s.cardStyle, flex: 1, minWidth: 0 }}>
+        <h2 ref={headingRef} tabIndex={-1} style={s.sectionTitleStyle}>
           {entry.title}
-        </h1>
+        </h2>
         {entry.step.detail !== null ? (
-          <p className="mt-2 text-sm text-slate-300" aria-live="polite">
+          <p style={{ ...s.mutedStyle, marginTop: 6 }} aria-live="polite">
             {entry.step.detail}
           </p>
         ) : null}
         {entry.step.status === 'blocked' ? (
-          <p role="alert" className="mt-2 text-sm text-amber-300">
+          <p role="alert" style={{ ...s.warningStyle, marginTop: 6 }}>
             This step needs attention before you can continue.
           </p>
         ) : null}
@@ -139,43 +138,48 @@ export function SetupWizard({
           <ProviderStep step={entry.step} providers={state.providers} onDone={refresh} />
         ) : null}
         {!entry.registered ? (
-          <div className="mt-4 rounded border border-slate-700 p-4 text-sm text-slate-300">
-            <p>
-              The gateway reports a step this build does not know how to render
-              (<code>{entry.id}</code>). Finish it in the terminal with
-              <code> seal tui</code>, then press Re-check.
-            </p>
-          </div>
+          <p style={{ ...s.mutedStyle, marginTop: 12 }}>
+            The gateway reports a step this build does not know how to render
+            (<code style={{ fontFamily: 'var(--font-mono)' }}>{entry.id}</code>).
+            Finish it in the terminal with{' '}
+            <code style={{ fontFamily: 'var(--font-mono)' }}>seal tui</code>, then
+            press Re-check.
+          </p>
         ) : null}
 
         {reopenError !== null ? (
-          <div role="alert" className="mt-4 rounded border border-red-700 p-4 text-sm text-red-200">
-            <p className="font-medium">The vault file cannot be opened with the recorded key.</p>
-            <p className="mt-2">{reopenError}</p>
-            <p className="mt-2">
+          <div role="alert" style={{ marginTop: 16 }}>
+            <p style={{ ...s.errorStyle, fontWeight: 500 }}>
+              The vault file cannot be opened with the recorded key.
+            </p>
+            <p style={{ ...s.mutedStyle, marginTop: 6 }}>{reopenError}</p>
+            <p style={{ ...s.mutedStyle, marginTop: 6 }}>
               It was probably written by a different key. If it holds no secrets yet:
             </p>
-            <pre className="mt-2 overflow-x-auto rounded bg-slate-900 p-2 text-xs">
+            <pre style={{ ...s.monoStyle, marginTop: 8 }}>
               mv ~/.seal/config/vault/vault.age ~/.seal/config/vault/vault.age.bak
             </pre>
-            <p className="mt-2">Then press Re-check. If it does hold secrets, restore the matching identity file.</p>
+            <p style={{ ...s.mutedStyle, marginTop: 6 }}>
+              Then press Re-check. If it does hold secrets, restore the matching
+              identity file.
+            </p>
           </div>
         ) : null}
 
-        <div className="mt-6 flex gap-2">
+        <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
           {barActions(entry.step).map((verb) => (
             <button
               key={verb}
               type="button"
               disabled={busy}
               onClick={() => { void dispatch(verb) }}
-              className="rounded bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              className={s.primaryButtonClass}
             >
               {actionLabel(verb)}
             </button>
           ))}
         </div>
       </section>
-    </main>
+    </div>
   )
 }

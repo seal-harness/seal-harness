@@ -31,7 +31,10 @@ describe('SetupGate', () => {
   it('shows the wizard when required_complete is false', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, setupPayload))
     render(<SetupGate><div>the app</div></SetupGate>)
-    await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
+    await waitFor(() => expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Create your vault'))
+    // The page says what it is, above the step (design review: a first-run
+    // operator landing on a bare card had no idea which screen this was).
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Seal Harness Setup Wizard')
     expect(screen.queryByText('the app')).toBeNull()
   })
 
@@ -52,7 +55,7 @@ describe('SetupGate', () => {
     expect(screen.queryByText('the app')).toBeNull()
     fetchMock.mockResolvedValueOnce(jsonResponse(200, setupPayload))
     fireEvent.click(screen.getByRole('button', { name: /retry/i }))
-    await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
+    await waitFor(() => expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Create your vault'))
   })
 
   it('does not reveal the app merely because the steps completed', async () => {
@@ -73,12 +76,12 @@ describe('SetupGate', () => {
     }
     fetchMock.mockResolvedValueOnce(jsonResponse(200, incomplete))
     render(<SetupGate><div>the app</div></SetupGate>)
-    await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
+    await waitFor(() => expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Create your vault'))
 
     // Re-check re-probes; the server now says everything is ready.
     fetchMock.mockResolvedValueOnce(jsonResponse(200, complete))
     fireEvent.click(screen.getByRole('button', { name: /re-check/i }))
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Setup complete' })).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('heading', { level: 2, name: 'Setup complete' })).toBeInTheDocument())
     expect(screen.queryByText('the app')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /start chatting/i }))
@@ -93,7 +96,7 @@ describe('SetupGate', () => {
       return jsonResponse(500, { error: 'sessions exploded' })
     })
     render(<SetupGate><div>the app</div></SetupGate>)
-    await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
+    await waitFor(() => expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Create your vault'))
     for (const [url] of fetchMock.mock.calls as [string][]) {
       expect(url).toBe('/api/setup')
     }

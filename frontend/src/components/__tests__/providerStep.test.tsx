@@ -94,6 +94,43 @@ describe('ProviderStep', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/vault is not open/i))
   })
 
+  it('lets an already-configured provider become the default', async () => {
+    // A keyless local Ollama is `configured` on a fresh install, so there is
+    // no credential to save. Before this, the step offered a permanently
+    // disabled Save button and no way forward.
+    const onDone = vi.fn()
+    fetchMock.mockResolvedValue(jsonResponse(200, { default_provider: 'ollama' }))
+    render(
+      <ProviderStep
+        step={step({ detail: 'Choose which provider new sessions should use.' })}
+        providers={[
+          card({ id: 'ollama', label: 'Ollama', configured: true }),
+          card({ id: 'anthropic', configured: false }),
+        ]}
+        onDone={onDone}
+      />,
+    )
+    const useBtn = screen.getByRole('button', { name: /use ollama/i })
+    expect(useBtn).toBeEnabled()
+    fireEvent.click(useBtn)
+    await waitFor(() => expect(onDone).toHaveBeenCalled())
+    expect(fetchMock).toHaveBeenCalledWith('/api/providers/default', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ provider: 'ollama' }),
+    }))
+  })
+
+  it('offers no save action when the provider is already the default', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, isDefault: true })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: /is the default/i })).toBeDisabled()
+  })
+
   it('renders an inline failure and the partial-default message', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { ok: false, error: 'invalid key' }))
     render(

@@ -33,11 +33,11 @@ function jsonResponse(status: number, body: unknown) {
 describe('VaultStep', () => {
   it('shows the backend cards only for create', () => {
     const { rerender } = render(<VaultStep step={step()} onDone={() => {}} />)
-    expect(screen.getByRole('button', { name: /local age key/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /local key/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /yubikey/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /my own key/i })).toBeInTheDocument()
     rerender(<VaultStep step={step({ status: 'blocked', actions: ['reopen'] })} onDone={() => {}} />)
-    expect(screen.queryByRole('button', { name: /local age key/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /local key/i })).toBeNull()
   })
 
   it('shows the YubiKey waiting state and policy in the hint', async () => {
@@ -98,15 +98,15 @@ describe('VaultStep', () => {
       hint: 'use the "resume" backend',
     }))
     const { rerender } = render(<VaultStep step={step()} onDone={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: /local age key/i }))
-    fireEvent.click(screen.getByRole('button', { name: /create the vault/i }))
+    fireEvent.click(screen.getByRole('button', { name: /local key/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
     await waitFor(() => expect(screen.getByText(/already recorded/i)).toBeInTheDocument())
     expect(screen.getByText(/use the "resume" backend/i)).toBeInTheDocument()
 
     fetchMock.mockResolvedValue(jsonResponse(415, {}))
     rerender(<VaultStep step={step()} onDone={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: /local age key/i }))
-    fireEvent.click(screen.getByRole('button', { name: /create the vault/i }))
+    fireEvent.click(screen.getByRole('button', { name: /local key/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
     await waitFor(() => expect(screen.getByText(/unexpected response \(415\)/i)).toBeInTheDocument())
     expect(screen.getByText(/looks like a bug/i)).toBeInTheDocument()
   })

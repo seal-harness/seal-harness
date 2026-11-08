@@ -64,6 +64,14 @@ export function reopenVault(): Promise<SetupResult> {
   return postJson('/api/setup/vault/reopen', {})
 }
 
+export function setDefaultProvider(name: string): Promise<SetupResult> {
+  return call('/api/providers/default', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: name }),
+  })
+}
+
 export function testProvider(name: string, model?: string): Promise<SetupResult> {
   return postJson(`/api/providers/${encodeURIComponent(name)}/test`,
     model === undefined ? {} : { model })

@@ -46,11 +46,12 @@ export interface ParsedSetupState extends SetupState {
 
 const KNOWN_STATUSES: SetupStatus[] = ['ready', 'pending', 'blocked']
 
-/** Actions that get a button in the wizard's action bar. Anything else (the
- *  provider step's `configure`, or a verb from a newer server) renders no
- *  button — the step's own body owns that interaction. */
+/** Actions that get a button in the wizard's action bar. Anything else —
+ *  `create` (the vault step's backend cards are the action, and a second
+ *  "Create vault" button next to them is a puzzle, not a choice), the
+ *  provider step's `configure`, or a verb from a newer server — renders no
+ *  button, because the step's own body owns that interaction. */
 const BAR_ACTIONS: Record<string, string> = {
-  create: 'Create vault',
   resume: 'Finish creating the vault',
   reopen: 'Reopen the vault',
   recheck: 'Re-check',

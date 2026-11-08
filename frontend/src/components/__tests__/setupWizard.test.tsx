@@ -54,12 +54,12 @@ describe('SetupWizard', () => {
   it('auto-advances when the current step becomes ready', () => {
     const first = parsed()
     const { rerender } = render(<SetupWizard state={first} refresh={() => {}} onComplete={() => {}} />)
-    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault')
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Create your vault')
     const advanced = parsed({
       steps: [step({ status: 'ready' }), step({ id: 'provider', actions: ['configure'] })],
     })
     rerender(<SetupWizard state={advanced} refresh={() => {}} onComplete={() => {}} />)
-    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Choose an LLM provider')
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Choose an LLM provider')
   })
 
   it('renders the action bar and dispatches resume/reopen/recheck', async () => {
@@ -176,7 +176,7 @@ describe('SetupWizard', () => {
     })
     render(<SetupWizard state={state} refresh={() => {}} onComplete={() => {}} />)
     // The unknown step is current (nothing else is left) and says so.
-    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Chat channels')
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Chat channels')
     expect(screen.getByText(/does not know how to render/i)).toBeInTheDocument()
   })
 
@@ -191,7 +191,7 @@ describe('SetupWizard', () => {
         onComplete={() => {}}
       />,
     )
-    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 2 }))
   })
 
   it('the rail exposes aria-current and errors are role=alert', () => {

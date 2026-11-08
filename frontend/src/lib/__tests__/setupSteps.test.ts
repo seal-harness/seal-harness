@@ -120,7 +120,7 @@ describe('resolveRail', () => {
 describe('action bar', () => {
   it('unknown action verbs render no bar button', () => {
     expect(actionLabel('frobnicate')).toBeNull()
-    const step: SetupStep = { ...wireSteps[0], actions: ['recheck', 'frobnicate', 'configure'] } as SetupStep
+    const step: SetupStep = { ...wireSteps[0], actions: ['recheck', 'frobnicate', 'configure', 'create'] } as SetupStep
     expect(barActions(step)).toEqual(['recheck'])
   })
 })

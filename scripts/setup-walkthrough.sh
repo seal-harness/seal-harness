@@ -62,6 +62,15 @@ call GET /api/setup; show
 say "7. POST /api/providers/anthropic/test (a failed ping is still 200)"
 call POST /api/providers/anthropic/test '{}'; show
 
+say "7b. PUT /api/providers/default {provider:ollama} (the keyless-ollama path)"
+call PUT /api/providers/default '{"provider":"ollama"}'; show
+
+say "7c. GET /api/setup (provider step now names the ollama default)"
+call GET /api/setup; show
+
+say "7d. PUT /api/providers/default back to anthropic"
+call PUT /api/providers/default '{"provider":"anthropic"}'; show
+
 say "8. POST /api/providers/nope/test (unknown provider: 400)"
 call POST /api/providers/nope/test '{}'; show
 

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { provisionVault, type SetupResult, type VaultBackend } from '../../hooks/useSetup'
 import type { SetupStep } from '../../lib/setupSteps'
+import * as s from './styles'
 
 type Choice = 'local' | 'yubikey' | 'user'
 
@@ -10,7 +11,10 @@ type Choice = 'local' | 'yubikey' | 'user'
  * Three properties are load-bearing:
  *
  * - the cards only appear for `create` (a recorded key shows `resume`, and a
- *   configured vault shows `reopen`; offering "create" there would be a 409);
+ *   configured vault shows `reopen`; offering "create" there would be a 409),
+ *   and `create` has no action-bar button of its own — these cards *are* the
+ *   action, and two "Create vault" buttons on one screen is a puzzle, not a
+ *   choice;
  * - no field is ever pre-filled from a previous attempt — a key path is not a
  *   value to remember and echo back;
  * - a 400 is attributed to the field it names, because "invalid request" with
@@ -42,14 +46,18 @@ export function VaultStep({
   }
 
   return (
-    <div className="mt-4 space-y-4">
+    <div style={{ marginTop: 16 }}>
       {canCreate ? (
-        <div className="grid gap-3 sm:grid-cols-3" role="group" aria-label="Vault backends">
+        <div
+          role="group"
+          aria-label="Vault backends"
+          style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}
+        >
           {(
             [
-              ['local', 'Local age key', 'A key file on this machine.'],
+              ['local', 'Local key', 'A key file generated on this machine.'],
               ['yubikey', 'YubiKey', 'The key stays on the token.'],
-              ['user', 'My own key', 'Bring an existing age identity.'],
+              ['user', 'My own key', 'Bring a key file you already have.'],
             ] as const
           ).map(([id, title, blurb]) => (
             <button
@@ -57,35 +65,41 @@ export function VaultStep({
               type="button"
               aria-pressed={choice === id}
               onClick={() => { setChoice(id); setResult(null) }}
-              className={`rounded border p-3 text-left text-sm ${
-                choice === id ? 'border-emerald-500 text-slate-100' : 'border-slate-700 text-slate-300'
-              }`}
+              style={s.choiceStyle(choice === id)}
             >
-              <span className="block font-medium">{title}</span>
-              <span className="block text-xs text-slate-400">{blurb}</span>
+              <span style={s.choiceTitleStyle}>{title}</span>
+              <span style={s.choiceBlurbStyle}>{blurb}</span>
             </button>
           ))}
         </div>
       ) : null}
 
       {choice === 'local' ? (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => { void submit({ backend: 'local' }) }}
-          className="rounded bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
-        >
-          Create the vault
-        </button>
+        <div style={{ marginTop: 16 }}>
+          <p style={s.mutedStyle}>
+            Seal generates the encryption key on this machine and keeps it in{' '}
+            <code style={{ fontFamily: 'var(--font-mono)' }}>~/.seal/keys/</code>.
+            Nothing leaves the machine.
+          </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => { void submit({ backend: 'local' }) }}
+            className={s.primaryButtonClass}
+            style={{ marginTop: 12 }}
+          >
+            Create vault
+          </button>
+        </div>
       ) : null}
 
       {choice === 'yubikey' ? (
-        <div className="space-y-3 text-sm text-slate-300">
-          <label className="flex items-center gap-2">
+        <div style={{ marginTop: 16 }}>
+          <label style={{ ...s.mutedStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
             <input type="checkbox" checked={touch} onChange={(e) => setTouch(e.target.checked)} />
             Require a touch to decrypt
           </label>
-          <label className="flex items-center gap-2">
+          <label style={{ ...s.mutedStyle, display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
             <input type="checkbox" checked={pin} onChange={(e) => setPin(e.target.checked)} />
             Require the PIN once per session
           </label>
@@ -93,20 +107,21 @@ export function VaultStep({
             type="button"
             disabled={busy}
             onClick={() => { void submit({ backend: 'yubikey', touch, pin }) }}
-            className="rounded bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+            className={s.primaryButtonClass}
+            style={{ marginTop: 12 }}
           >
             Generate on the token
           </button>
-          <p className="text-xs text-slate-400" aria-live="polite">
-            A token cannot answer a browser prompt: if the plugin needs a terminal,
-            you will get the exact command to run and a Re-check button.
+          <p style={{ ...s.faintStyle, marginTop: 10 }} aria-live="polite">
+            A token cannot answer a browser prompt: if the plugin needs a
+            terminal, you will get the exact command to run and a Re-check button.
           </p>
         </div>
       ) : null}
 
       {choice === 'user' ? (
         <form
-          className="space-y-3"
+          style={{ marginTop: 16 }}
           onSubmit={(e) => {
             e.preventDefault()
             void submit({ backend: 'user', recipient, identity_path: identityPath })
@@ -118,16 +133,19 @@ export function VaultStep({
             onChange={setRecipient}
             error={fieldError(result, 'recipient')}
           />
-          <Field
-            label="Identity file path"
-            value={identityPath}
-            onChange={setIdentityPath}
-            error={fieldError(result, 'identity_path')}
-          />
+          <div style={{ marginTop: 10 }}>
+            <Field
+              label="Identity file path"
+              value={identityPath}
+              onChange={setIdentityPath}
+              error={fieldError(result, 'identity_path')}
+            />
+          </div>
           <button
             type="submit"
             disabled={busy}
-            className="rounded bg-emerald-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+            className={s.primaryButtonClass}
+            style={{ marginTop: 14 }}
           >
             Use my key
           </button>
@@ -149,7 +167,7 @@ function fieldError(result: SetupResult | null, field: string): string | null {
 function VaultFailure({ result }: { result: SetupResult }) {
   if (result.status === 400) {
     return (
-      <p role="alert" className="text-sm text-red-300">
+      <p role="alert" style={{ ...s.errorStyle, marginTop: 14 }}>
         {result.error ?? 'The request was rejected.'}
         {result.hint !== null ? ` ${result.hint}` : ''}
       </p>
@@ -157,7 +175,7 @@ function VaultFailure({ result }: { result: SetupResult }) {
   }
   if (result.status === 409) {
     return (
-      <p role="alert" className="text-sm text-amber-300">
+      <p role="alert" style={{ ...s.warningStyle, marginTop: 14 }}>
         {result.error ?? 'A vault key is already recorded.'}
         {result.hint !== null ? ` ${result.hint}` : ''}
       </p>
@@ -165,20 +183,19 @@ function VaultFailure({ result }: { result: SetupResult }) {
   }
   if (result.status === 422) {
     return (
-      <div role="alert" className="space-y-2 text-sm text-amber-200">
-        <p>{result.error ?? 'This machine cannot complete the step.'}</p>
-        {result.hint !== null ? (
-          <pre className="overflow-x-auto rounded bg-slate-900 p-2 text-xs">{result.hint}</pre>
-        ) : null}
-        <p className="text-xs text-slate-400">
+      <div role="alert" style={{ marginTop: 14 }}>
+        <p style={s.warningStyle}>{result.error ?? 'This machine cannot complete the step.'}</p>
+        {result.hint !== null ? <pre style={{ ...s.monoStyle, marginTop: 8 }}>{result.hint}</pre> : null}
+        <p style={{ ...s.faintStyle, marginTop: 8 }}>
           Run that command in a terminal, then press Re-check.
         </p>
       </div>
     )
   }
   return (
-    <p role="alert" className="text-sm text-red-300">
-      Unexpected response ({result.status}). This looks like a bug — please report it with the code above.
+    <p role="alert" style={{ ...s.errorStyle, marginTop: 14 }}>
+      Unexpected response ({result.status}). This looks like a bug — please
+      report it with the code above.
     </p>
   )
 }
@@ -195,16 +212,18 @@ function Field({
   error: string | null
 }) {
   return (
-    <label className="block text-sm text-slate-300">
-      <span className="block">{label}</span>
+    <label style={s.labelStyle}>
+      {label}
       <input
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+        style={s.inputStyle}
       />
       {error !== null ? (
-        <span role="alert" className="mt-1 block text-xs text-red-300">{error}</span>
+        <span role="alert" style={{ ...s.errorStyle, display: 'block', marginTop: 4, fontSize: 12 }}>
+          {error}
+        </span>
       ) : null}
     </label>
   )
