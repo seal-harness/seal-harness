@@ -48,6 +48,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: null,
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
     ...overrides,
@@ -520,6 +521,7 @@ function conversationWithChannelLabel(): TranscriptEntry[] {
       id: 'ch1',
       direction: 'request',
       channel: 'telegram',
+      userId: '12345',
       payload: JSON.stringify({
         model: 'm',
         messages: [{ role: 'user', content: [{ type: 'text', text: 'from telegram' }] }],

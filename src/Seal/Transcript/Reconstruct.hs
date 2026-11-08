@@ -174,6 +174,14 @@ modelOf env = case envModel env of
 -- (used when the value is unchanged from the prior request, so the frontend
 -- skips the redundant row). Mirrors the old 'ToJSON CompletionRequest'
 -- encoding so a "view raw" reproduces the bytes the old format stored.
+--
+-- Messages are encoded exactly as stored. A user message that arrived over a
+-- chat channel carries its structured @origin@ (channel + sender id) here, but
+-- NOT the @[channel:userId]@ tag the model read: that tag is a rendering
+-- applied when the request is built
+-- ('Seal.Transcript.Origin.annotateOrigins'), and the bytes actually sent live
+-- in @requests.jsonl@. Keeping the tag out of the reconstructed payload keeps
+-- the user's own words intact in the transcript view and in search.
 requestPayload :: Envelope -> Maybe Text -> Maybe [ToolDefinition] -> [Message] -> Value
 requestPayload env sys mTools msgs = object $
   [ "model"      .= envModel env
