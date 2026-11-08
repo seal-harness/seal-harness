@@ -151,6 +151,12 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
   -- Adopt
   RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+  -- Setup (first-run wizard). The gate is blocking: these four are the only
+  -- routes the SPA may call before it hands control back to <App/>.
+  RouteSetupState    :: SealRoute '[] '[] Bodyless Resp
+  RouteSetupVault    :: SealRoute '[] '[] (Body Req) Resp
+  RouteSetupVaultReopen :: SealRoute '[] '[] (Body Req) Resp
+  RouteProviderTest  :: SealRoute '[Text] '[] (Body Req) Resp
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
@@ -225,6 +231,10 @@ routeMeta = \case
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSetupState -> Meta (match "setup" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteProviderTest -> Meta (match "providers" ./ capture textCapture ./ match "test" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -293,6 +303,10 @@ allRoutes =
   , Constructed RouteUiCustomModels
   , Constructed RouteUiRepos
   , Constructed RouteAdopt
+  , Constructed RouteSetupState
+  , Constructed RouteSetupVault
+  , Constructed RouteSetupVaultReopen
+  , Constructed RouteProviderTest
   ]
 
 -- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.

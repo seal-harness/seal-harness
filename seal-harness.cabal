@@ -649,6 +649,7 @@ test-suite tests
         Seal.Vault.BackendSpec
         Seal.Vault.ProvisionSpec
         Seal.Setup.StateSpec
+        Seal.Gateway.SetupApiSpec
         Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec

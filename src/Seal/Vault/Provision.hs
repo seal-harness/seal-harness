@@ -51,6 +51,7 @@ module Seal.Vault.Provision
   , ProvisionDeps (..)
   , parseVaultSpec
   , provisionVault
+  , withSetupLock
   , renderProvisionError
   , defaultProvisionDeps
   ) where
