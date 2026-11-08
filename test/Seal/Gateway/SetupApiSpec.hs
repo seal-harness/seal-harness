@@ -109,6 +109,19 @@ spec = describe "Seal.Gateway.Setup API" $ do
         -- Path-free: the temp home never appears in a web-readable body.
         body `shouldSatisfy` (not . contains (T.pack (spHome (hPaths h))))
 
+    it "includes requires_base_url on each provider card" $
+      withHarness defaultHarness $ \h -> do
+        (_, _, body) <- runAppBody (hApp h) =<< getReq "/api/setup" []
+        -- The generic OpenAI-compatible provider has no built-in endpoint,
+        -- so its card must carry requires_base_url:true — without it the
+        -- wizard never renders the endpoint field.
+        body `shouldSatisfy` contains "\"openai\""
+        body `shouldSatisfy` hasBoolField "requires_base_url" True
+        -- Providers with a built-in endpoint (anthropic, ollama, openrouter)
+        -- carry requires_base_url:false.
+        body `shouldSatisfy` contains "\"anthropic\""
+        body `shouldSatisfy` hasBoolField "requires_base_url" False
+
     it "never 500s on missing or undecodable files" $
       withHarness defaultHarness $ \h -> do
         let bad = "not = [valid toml"

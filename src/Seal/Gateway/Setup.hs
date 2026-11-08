@@ -191,6 +191,7 @@ setupStateJson state = object
       [ "id" .= pcId card
       , "label" .= pcLabel card
       , "configured" .= pcConfigured card
+      , "requires_base_url" .= pcRequiresBaseUrl card
       , "isDefault" .= pcIsDefault card
       , "default_model" .= pcDefaultModel card
       ]
