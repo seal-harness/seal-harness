@@ -63,7 +63,6 @@ import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), mkChannelId, ch
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Core.MessageSource (MessageSource (..), mkUserId)
-import qualified Data.Map.Strict as Map
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, deleteChannel)
