@@ -38,6 +38,8 @@ import Seal.Gateway.Transcript
   , readTranscriptEntries, readTranscriptEntriesTimed, ReadLimit (..)
   , ttEntryCount
   , reconEntryToFrontend
+  , teLineToFrontend
+  , convLineToFrontend
   , renderServerTiming
   , trailingConvEntries
   , firstUserMessageSnippetFast
@@ -148,8 +150,51 @@ getPayloadField k (A.Object o) =
     _ -> Nothing
 getPayloadField _ _ = Nothing
 
+-- | Extract a top-level field from a frontend TranscriptEntry JSON value.
+getTopField :: String -> A.Value -> Maybe Value
+getTopField k (A.Object o) = KeyMap.lookup (Key.fromString k) o
+getTopField _ _ = Nothing
+
 spec :: Spec
 spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
+  describe "userId in frontend entries" $ do
+    it "reconEntryToFrontend emits teMeta.userId and teMeta.channel" $ do
+      let te = (mkHarnessTe skillLoadPayload)
+            { teMeta = Map.fromList
+                [ ("channel", String "telegram")
+                , ("userId", String "12345") ] }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v -> do
+          getTopField "userId" v `shouldBe` Just (String "12345")
+          getTopField "channel" v `shouldBe` Just (String "telegram")
+
+    it "reconEntryToFrontend emits null userId when the entry carries none" $ do
+      let te = (mkHarnessTe skillLoadPayload)
+            { teMeta = Map.fromList [("channel", String "telegram")] }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "userId" v `shouldBe` Just Null
+
+    it "teLineToFrontend reads meta.userId from a legacy line" $ do
+      let raw = A.object
+            [ "id"        .= String "e1"
+            , "timestamp" .= String "t"
+            , "direction" .= String "request"
+            , "payload"   .= String "{}"
+            , "meta"      .= object
+                [ "channel" .= String "telegram"
+                , "userId"  .= String "12345" ] ]
+      case teLineToFrontend raw of
+        A.Object o ->
+          KeyMap.lookup (Key.fromText "userId") o `shouldBe` Just (String "12345")
+        _ -> expectationFailure "expected an object"
+
+    it "convLineToFrontend emits null userId (conversation-only fallback)" $ do
+      let raw = A.object [ "role" .= String "user", "content" .= ([] :: [Value]) ]
+          v = convLineToFrontend "m" [] "t" 0 raw
+      getTopField "userId" v `shouldBe` Just Null
+
   it "surfaces a SKILL_LOAD harness entry (whitelisted)" $ do
     let te = mkHarnessTe skillLoadPayload
     case reconEntryToFrontend 0 te of

@@ -24,6 +24,8 @@ module Seal.Gateway.Transcript
   , lastUserMessageAtFast
   , showIso
   , reconEntryToFrontend
+  , teLineToFrontend
+  , convLineToFrontend
   , trailingConvEntries
   ) where
 
@@ -482,6 +484,11 @@ teLineToFrontend rawLine =
           Just (A.String ch) -> Just ch
           _                  -> Nothing
         _ -> Nothing
+      mUserId = case KeyMap.lookup (k "meta") o of
+        Just (A.Object mo) -> case KeyMap.lookup (k "userId") mo of
+          Just (A.String u) -> Just u
+          _                 -> Nothing
+        _ -> Nothing
       mInternal = case KeyMap.lookup (k "meta") o of
         Just (A.Object mo) -> case KeyMap.lookup (k "internal") mo of
           Just (A.Bool b) -> Just b
@@ -495,6 +502,7 @@ teLineToFrontend rawLine =
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
      , "channel"   .= mChannel
+     , "userId"    .= mUserId
     , "internal"  .= mInternal
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
@@ -558,6 +566,7 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
        , "harness"   .= (Nothing :: Maybe Text)
        , "model"     .= model
        , "channel"   .= (Nothing :: Maybe Text)
+       , "userId"    .= (Nothing :: Maybe Text)
       , "internal"  .= (Nothing :: Maybe Bool)
       , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
       ]
@@ -722,6 +731,9 @@ reconEntryToFrontend idx te =
           mChannel = case Map.lookup "channel" (teMeta te) of
             Just (A.String ch) -> Just ch
             _                  -> Nothing
+          mUserId = case Map.lookup "userId" (teMeta te) of
+            Just (A.String u) -> Just u
+            _                 -> Nothing
           mInternal = case Map.lookup "internal" (teMeta te) of
             Just (A.Bool b) -> Just b
             _               -> Nothing
@@ -749,6 +761,7 @@ reconEntryToFrontend idx te =
          -- events, and legacy lines that never recorded one).
          , "model"     .= teModel te
          , "channel"   .= mChannel
+         , "userId"    .= mUserId
         , "internal"  .= mInternal
          -- The `raw` field carries the full rewritten payload with tool
          -- input_schemas preserved, so the frontend's "View raw JSON"
