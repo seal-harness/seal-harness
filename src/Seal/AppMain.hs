@@ -1,5 +1,6 @@
 module Seal.AppMain
   ( appMain
+  , reorderGlobalArgs
   , withDefaultArgs
   ) where
 
@@ -81,4 +82,46 @@ appMain :: IO ()
 appMain = do
   raiseFdLimit
   args <- getArgs
-  withArgs (withDefaultArgs args) (CUtils.runWithConfiguration programInfo dispatch)
+  withArgs (withDefaultArgs (reorderGlobalArgs args)) (CUtils.runWithConfiguration programInfo dispatch)
+
+-- | Move global options (those defined at the @pConfig@ level, outside any
+-- @hsubparser@) before the subcommand keyword. @Options.Applicative@'s
+-- @hsubparser@ creates a hard parser boundary: once the subcommand keyword
+-- (e.g. @serve@) is seen, only subcommand-specific options are recognised.
+-- A global option like @--log-level@ that appears after @serve@ is rejected.
+--
+-- This preprocessing lets @make serve ARGS="--yolo --log-level debug
+-- --no-enrollment-token"@ work: @--log-level@ is hoisted before @serve@,
+-- and the subcommand options (@--yolo@, @--no-enrollment-token@) stay after.
+-- Options that are already before the subcommand are left in place.
+-- @--flag=value@ syntax is a single token and passes through unchanged
+-- (it does not match the bare @--flag@ name).
+reorderGlobalArgs :: [String] -> [String]
+reorderGlobalArgs args =
+  case break isSubcommand args of
+    (_, []) -> args
+    (pre, cmd : post) -> pre ++ hoistGlobals post ++ [cmd] ++ stripGlobals post
+  where
+    subcommands = ["serve", "tui", "access-control", "gen-openapi"]
+    isSubcommand s = s `elem` subcommands
+
+    -- Global option names (defined in pConfig / pServerConfig, outside any
+    -- hsubparser). Each takes exactly one argument.
+    globalOpts = ["--log-level", "--server-host", "--server-port"]
+    isGlobalOpt s = s `elem` globalOpts
+
+    -- Extract global option pairs (flag + value) from the post-subcommand
+    -- args, preserving order, for hoisting before the subcommand keyword.
+    hoistGlobals = go []
+      where
+        go acc [] = reverse acc
+        go acc (f : v : rest) | isGlobalOpt f = go (v : f : acc) rest
+        go acc (_ : rest) = go acc rest
+
+    -- Remove global option pairs from the post-subcommand args, leaving
+    -- only subcommand-specific options.
+    stripGlobals = go
+      where
+        go [] = []
+        go (f : _v : rest) | isGlobalOpt f = go rest
+        go (x : rest) = x : go rest
