@@ -51,8 +51,8 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState<string | null>(null)
   const [recovery, setRecovery] = useState(false)
   const [waiveBusy, setWaiveBusy] = useState(false)
+  const [showWaiveConfirm, setShowWaiveConfirm] = useState(false)
   const [waiveError, setWaiveError] = useState<string | null>(null)
-  const [waiveDone, setWaiveDone] = useState(false)
   const steppedUp = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -178,13 +178,13 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const waive = useCallback(async () => {
     setWaiveBusy(true)
     setWaiveError(null)
+    setShowWaiveConfirm(false)
     const res = await waiveAccess(effectiveToken)
     setWaiveBusy(false)
     if (!res.ok) {
       setWaiveError(res.error ?? 'waive failed')
       return
     }
-    setWaiveDone(true)
     setStatus(null)
     await refresh()
   }, [effectiveToken, refresh])
@@ -395,34 +395,43 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
         >
           {busy ? 'Waiting for your passkey…' : 'Register a passkey'}
         </button>
+        <button
+          className="agate-secondary"
+          disabled={waiveBusy}
+          onClick={() => { setShowWaiveConfirm(true) }}
+        >
+          Waive access control
+        </button>
       </div>
 
-      {waiveDone ? (
-        <p className="agate-hint">
-          Access control waived. Restart <code>seal serve</code> for it to take effect.
-        </p>
-      ) : (
-        <details className="agate-waive">
-          <summary>Run without access control</summary>
-          <p className="agate-text">
-            Anyone who can reach this gateway will have full control of every session.
-            This is appropriate only when the gateway is behind a firewall or VPN.
-          </p>
-          {waiveError && <p className="agate-error">{waiveError}</p>}
-          <button
-            className="agate-secondary"
-            disabled={waiveBusy || (effectiveToken === null && !noTokenNeeded)}
-            onClick={() => { void waive() }}
-          >
-            {waiveBusy ? 'Waiving…' : 'Waive access control'}
-          </button>
-          {effectiveToken === null && !noTokenNeeded && (
-            <p className="agate-hint">
-              An enrollment token is required to waive. Paste one above, or run
-              <code> seal serve --no-enrollment-token</code> to skip the token entirely.
+      {showWaiveConfirm && (
+        <div className="agate-overlay" role="dialog" aria-modal="true">
+          <div className="agate-panel">
+            <h1 className="agate-title">Waive access control?</h1>
+            <p className="agate-text">
+              Anyone who can reach this gateway will have full control of every
+              session. This is appropriate only when the gateway is behind a
+              firewall or VPN.
             </p>
-          )}
-        </details>
+            {waiveError && <p className="agate-error">{waiveError}</p>}
+            <div className="agate-actions">
+              <button
+                className="agate-primary"
+                disabled={waiveBusy || (effectiveToken === null && !noTokenNeeded)}
+                onClick={() => { void waive() }}
+              >
+                {waiveBusy ? 'Waiving…' : 'Yes, waive access control'}
+              </button>
+              <button
+                className="agate-secondary"
+                disabled={waiveBusy}
+                onClick={() => { setShowWaiveConfirm(false); setWaiveError(null) }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </Panel>
   )
