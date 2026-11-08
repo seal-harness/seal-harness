@@ -265,6 +265,8 @@ library
         Seal.Types.Config
         Seal.Types.Env
         Seal.Vault.Backend
+
+        Seal.Vault.IdentityPath
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
