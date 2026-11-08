@@ -86,18 +86,18 @@ data AgentEnv = AgentEnv
     -- session is always created on the channel its messages arrive on).
     -- 'runTurn' stamps this into every request entry's @erMeta@ @channel@
     -- field so the frontend can attribute every user message to the
-    -- channel it came from. This is the single source of truth for channel
-    -- provenance — 'MessageSource' carries the finer-grained conversation
-    -- id + user id, but the channel label itself always comes from here.
+    -- channel it came from. When the turn carries a 'MessageSource' (a
+    -- chat channel), @requestMeta@ prefers its @msChannelKind@ and uses
+    -- this value only as the fallback (web/CLI, and turns with no source).
   , aeMessageSource :: Maybe MessageSource
     -- ^ The authenticated-transport identity of the inbound message this
     -- turn is answering. 'Nothing' for the CLI TUI and the web (which
     -- bypass 'MessageSource'); @'Just' ms@ for channels that carry one
-    -- (Signal, Telegram). 'runTurn' folds the 'msConversationId' into the
-    -- request 'EntryRecord's @erMeta@ @conversationId@ field. The
-    -- @channel@ field comes from 'aeChannel' (above), NOT from here, so
-    -- every channel — including those with no 'MessageSource' — is
-    -- attributed.
+    -- (Signal, Telegram). 'runTurn' stamps @msChannelKind@,
+    -- @msConversationId@, and (when present) @msUserId@ into the request
+    -- 'EntryRecord's @erMeta@ @channel@ / @conversationId@ / @userId@
+    -- fields, so every chat-channel message carries its channel name and
+    -- sender id.
   , aeAutonomy :: AutonomyLevel
     -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
     -- human-confirmation gate for Untrusted opcodes (they run immediately after

@@ -24,6 +24,8 @@ import qualified Data.Vector as V
 
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Core.MessageSource (MessageSource, mkConversationId, mkMessageSource, mkUserId)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript
@@ -170,6 +172,25 @@ lastRequestToolResults reqs = case reverse reqs of
 
 spec :: Spec
 spec = describe "Seal.Agent.Loop" $ do
+  describe "requestMeta" $ do
+    it "stamps the source's channel, conversation id, and user id" $ do
+      let ms = requestMetaSampleSource (Just "12345")
+      Map.lookup "channel" (requestMeta "web" (Just ms))
+        `shouldBe` Just (String "telegram")
+      Map.lookup "conversationId" (requestMeta "web" (Just ms))
+        `shouldBe` Just (String "tg:12345")
+      Map.lookup "userId" (requestMeta "web" (Just ms))
+        `shouldBe` Just (String "12345")
+
+    it "falls back to the arrival channel and stamps no id without a source" $
+      requestMeta "cli" Nothing `shouldBe` Map.fromList [("channel", String "cli")]
+
+    it "omits userId when the source carried no sender id" $ do
+      let ms = requestMetaSampleSource Nothing
+      Map.lookup "userId" (requestMeta "web" (Just ms)) `shouldBe` Nothing
+      Map.lookup "conversationId" (requestMeta "web" (Just ms))
+        `shouldBe` Just (String "tg:12345")
+
   describe "stripToolCallXml" $ do
     it "removes a complete <invoke> block" $ do
       let input = "before<invoke name=\"FILE_READ\"></invoke>after"
@@ -2819,3 +2840,14 @@ spec = describe "Seal.Agent.Loop" $ do
           resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
           tools = [b | b <- rsContent resp, case b of CbToolUse{} -> True; _ -> False]
       tools `shouldBe` []
+
+-- | A Telegram 'MessageSource' for the requestMeta tests.
+requestMetaSampleSource :: Maybe Text -> MessageSource
+requestMetaSampleSource mUid =
+  case mkConversationId "tg:12345" of
+    Left _ -> error "requestMeta test: bad conversation id"
+    Right cid ->
+      case mkMessageSource cid Telegram
+             (mUid >>= either (const Nothing) Just . mkUserId) mempty of
+        Left _   -> error "requestMeta test: bad message source"
+        Right ms -> ms
