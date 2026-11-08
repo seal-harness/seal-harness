@@ -10,6 +10,7 @@ function card(overrides: Partial<ProviderCard> = {}): ProviderCard {
     configured: false,
     isDefault: false,
     default_model: null,
+    requires_base_url: false,
     ...overrides,
   }
 }
@@ -118,6 +119,46 @@ describe('ProviderStep', () => {
       method: 'PUT',
       body: JSON.stringify({ provider: 'ollama' }),
     }))
+  })
+
+  it('requires a base URL for the generic OpenAI-compatible provider', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(201, { name: 'openai' }))
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true })]}
+        onDone={() => {}}
+      />,
+    )
+    const save = screen.getByRole('button', { name: /^save$/i })
+    // A key alone is not enough: this provider has no built-in endpoint.
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-local' } })
+    expect(save).toBeDisabled()
+    // ...and a non-URL is rejected before it reaches the server.
+    fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'localhost:8000' } })
+    expect(save).toBeDisabled()
+    fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'http://localhost:8000/v1' } })
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    expect(fetchMock).toHaveBeenCalledWith('/api/providers', expect.objectContaining({
+      body: JSON.stringify({
+        name: 'openai',
+        api_key: 'sk-local',
+        base_url: 'http://localhost:8000/v1',
+      }),
+    }))
+  })
+
+  it('sends no base_url for providers that have a built-in endpoint', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(201, { name: 'anthropic' }))
+    render(<ProviderStep step={step()} providers={[card()]} onDone={() => {}} />)
+    expect(screen.queryByLabelText(/api endpoint/i)).toBeNull()
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant' } })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = (fetchMock.mock.calls[0]?.[1] as RequestInit).body as string
+    expect(body).not.toContain('base_url')
   })
 
   it('offers no save action when the provider is already the default', () => {

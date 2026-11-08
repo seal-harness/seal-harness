@@ -2434,6 +2434,9 @@ providerAuthStatus mh cfg kp = case kp of
   OpenRouterProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
+  OpenAICompatibleProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenAICompatibleProvider)
 
 -- | Probe the vault for a single key and return the auth status string.
 probeVault :: VaultHandle -> Text -> IO Text
@@ -2636,6 +2639,9 @@ staticModelsFor AnthropicProvider =
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
 staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+-- | Empty on purpose: a generic endpoint owns its catalogue, and inventing
+-- model ids here would be a guess the UI would present as fact.
+staticModelsFor OpenAICompatibleProvider = []
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value

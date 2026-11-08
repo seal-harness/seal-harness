@@ -464,7 +464,7 @@ step is config-only so that rendering the wizard never prompts for a touch:
 | P1 | `default_provider` set and (**yubikey vault**, or the provider is in `adProviders`) | `Ready` | `anthropic · claude-opus-4-8` |
 | P2 | `default_provider` set, non-yubikey vault, credential missing | `Pending` | "Add credentials for `<provider>`." |
 | P3 | Some provider configured, no default | `Pending` | "Choose which provider new sessions should use." |
-| P4 | Nothing configured | `Pending` | "Add an LLM provider: anthropic, openrouter, or ollama." |
+| P4 | Nothing configured | `Pending` | "Add an LLM provider: anthropic, openrouter, ollama, or an OpenAI-compatible endpoint." |
 
 For a YubiKey vault, credential presence cannot be checked without a touch, so
 the row is `Ready` once a default is set; the credential is verified by the
@@ -868,7 +868,7 @@ Routes (four; `expectedRouteCount` 62 → **66**):
             "detail":"Create an encrypted vault for API keys and tokens.",
             "actions":["create"]},
            {"id":"provider","required":true,"status":"pending",
-            "detail":"Add an LLM provider: anthropic, openrouter, or ollama.",
+            "detail":"Add an LLM provider: anthropic, openrouter, ollama, or an OpenAI-compatible endpoint.",
             "actions":["configure"]}],
  "providers": [{"id":"anthropic","label":"Anthropic","configured":false,
                 "isDefault":false,"default_model":null}]}

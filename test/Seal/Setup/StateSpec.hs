@@ -113,10 +113,14 @@ spec = describe "Seal.Setup.State" $ do
       -- provider cards must still be emitted.
       state <- deriveSetupState (emptySetupInputs fakePaths)
       map pcId (ssProviders state)
-        `shouldBe` ["anthropic", "ollama", "openrouter"]
-      map pcConfigured (ssProviders state) `shouldBe` [False, False, False]
+        `shouldBe` ["anthropic", "ollama", "openrouter", "openai"]
+      map pcConfigured (ssProviders state) `shouldBe` [False, False, False, False]
       -- Branding is a display name, not a mechanical capitalise.
-      map pcLabel (ssProviders state) `shouldBe` ["Anthropic", "Ollama", "OpenRouter"]
+      map pcLabel (ssProviders state)
+        `shouldBe` ["Anthropic", "Ollama", "OpenRouter", "OpenAI-compatible"]
+      -- Only the generic endpoint needs a URL from the operator.
+      map pcRequiresBaseUrl (ssProviders state)
+        `shouldBe` [False, False, False, True]
 
   describe "provider step" $ do
 

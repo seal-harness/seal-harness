@@ -2,6 +2,22 @@
 
 ## 0.1.0.0 — unreleased
 
+* **A fourth provider: any OpenAI-compatible endpoint.** `openai` (label
+  "OpenAI-compatible") reuses the OpenRouter client — both speak
+  `/v1/chat/completions` — and differs in exactly one way: it has **no**
+  built-in base URL. The endpoint is required input (`[providers.openai]
+  base_url`, or the setup wizard's "API endpoint" field), and resolution fails
+  with an actionable message rather than defaulting to `api.openai.com`, so a
+  key meant for a self-hosted server is never sent to a third party. Its vault
+  credential is `OPENAI_API_KEY`; `/api/providers` now lists four providers.
+
+  Because "Test connection" is only useful if it actually reaches the endpoint,
+  the OpenAI-compatible client's `listModels` now asks the endpoint's
+  `/models` (it used to answer with one static id). That call backs the
+  wizard's Test button and `/model list`, so a wrong URL or a rejected key
+  surfaces as a real error instead of a cheerful "ok". With no credential the
+  call is skipped and the configured default is returned, as before.
+
 * **A first run can now be completed in the browser.** `seal serve` serves a
   guided wizard before the app: create the vault (local `age-keygen` key,
   YubiKey, or your own age identity), then add an LLM provider. It reaches

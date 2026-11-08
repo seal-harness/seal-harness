@@ -74,6 +74,11 @@ data ProviderCard = ProviderCard
   , pcConfigured   :: Bool
   , pcIsDefault    :: Bool
   , pcDefaultModel :: Maybe Text
+  , pcRequiresBaseUrl :: Bool
+    -- ^ True for providers with no built-in endpoint (the generic
+    -- OpenAI-compatible option): the wizard must collect the URL, and the
+    -- backend refuses to use the provider without one. Server-driven so the
+    -- wizard never has to know which provider is which.
   } deriving stock (Eq, Show)
 
 data SetupState = SetupState
@@ -256,7 +261,9 @@ classifyProvider inputs configured =
           pendingProvider "Choose which provider new sessions should use." ["configure"]
       -- P4
       | otherwise ->
-          pendingProvider "Add an LLM provider: anthropic, openrouter, or ollama."
+          pendingProvider
+            "Add an LLM provider: anthropic, openrouter, ollama, or an \
+            \OpenAI-compatible endpoint."
             ["configure"]
 
 -- | The model a session would actually use: the global default, else the
@@ -283,6 +290,9 @@ providerCards inputs configured =
       , pcConfigured = Set.member (providerLabel known) configured
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
+      , pcRequiresBaseUrl = case known of
+          OpenAICompatibleProvider -> True
+          _ -> False
       }
   | known <- knownProviders
   ]
@@ -294,6 +304,7 @@ providerDisplayName known = case known of
   AnthropicProvider  -> "Anthropic"
   OllamaProvider     -> "Ollama"
   OpenRouterProvider -> "OpenRouter"
+  OpenAICompatibleProvider -> "OpenAI-compatible"
 
 isYubiKeyVault :: SetupInputs -> Bool
 isYubiKeyVault inputs = scVaultKeyType (siSecurity inputs) == Just "yubikey"

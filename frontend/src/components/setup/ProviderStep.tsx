@@ -45,6 +45,10 @@ export function ProviderStep({
     defaultCard?.id ?? providers.find((p) => p.configured)?.id ?? firstProvider?.id ?? '',
   )
   const [apiKey, setApiKey] = useState('')
+  // Only used by providers with no built-in endpoint (the generic
+  // OpenAI-compatible option). Never pre-filled: the endpoint belongs to the
+  // operator, and echoing a guess back would be worse than an empty field.
+  const [baseUrl, setBaseUrl] = useState('')
   const [dirty, setDirty] = useState(false)
   const [save, setSave] = useState<SaveState>({ status: 'idle' })
   const [ping, setPing] = useState<SetupResult | null>(null)
@@ -61,18 +65,27 @@ export function ProviderStep({
   const fallback = defaultCard ?? providers.find((p) => p.configured) ?? firstProvider
   const effectiveId = providers.some((p) => p.id === selected) ? selected : fallback.id
   const card = providers.find((p) => p.id === effectiveId)
+  const needsBaseUrl = card?.requires_base_url === true
+  const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(baseUrl.trim())
+  const canSaveKey = dirty && baseUrlOk
+  const saveDisabled = save.status === 'saving' || !canSaveKey
 
   const saveKey = async (): Promise<void> => {
     setSave({ status: 'saving' })
     const res = await fetch('/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: effectiveId, api_key: apiKey }),
+      body: JSON.stringify({
+        name: effectiveId,
+        api_key: apiKey,
+        ...(needsBaseUrl ? { base_url: baseUrl.trim() } : {}),
+      }),
     })
     if (res.ok) {
       // The field is cleared: the key is now in the vault, and keeping it in
       // component state would be the only place it outlives the request.
       setApiKey('')
+      setBaseUrl('')
       setDirty(false)
       setSave({ status: 'saved' })
       onDone()
@@ -160,6 +173,24 @@ export function ProviderStep({
           />
         </label>
       ) : null}
+      {card !== undefined && needsBaseUrl ? (
+        <label style={{ ...s.labelStyle, marginTop: 14 }}>
+          API endpoint (base URL)
+          <input
+            type="url"
+            placeholder="https://api.openai.com/v1"
+            value={baseUrl}
+            onChange={(e) => { setBaseUrl(e.target.value); setDirty(true) }}
+            style={s.inputStyle}
+            aria-invalid={!baseUrlOk}
+          />
+          <span style={{ ...s.faintStyle, display: 'block', marginTop: 4 }}>
+            {baseUrlOk
+              ? 'The OpenAI-compatible endpoint, e.g. https://api.openai.com/v1 or http://localhost:8000/v1. Local servers usually accept any non-empty token as the key.'
+              : 'Enter an http:// or https:// URL.'}
+          </span>
+        </label>
+      ) : null}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
         {card !== undefined && card.configured ? (
@@ -176,7 +207,7 @@ export function ProviderStep({
         ) : (
           <button
             type="button"
-            disabled={save.status === 'saving' || !dirty}
+            disabled={saveDisabled}
             onClick={() => { void saveKey() }}
             className={s.primaryButtonClass}
           >

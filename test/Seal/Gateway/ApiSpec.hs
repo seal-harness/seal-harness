@@ -4197,7 +4197,7 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openrouter).
+    -- Every known provider is present (anthropic, ollama, openrouter, openai).
     length arr `shouldBe` length knownProviders
     -- Each entry has a name; build a name -> configured map.
     let entries = [ (n, c) | e <- arr, A.Object o <- [e]
@@ -4212,6 +4212,7 @@ spec = describe "Seal.Gateway.API" $ do
               [ ("anthropic", False)
               , ("ollama", True)
               , ("openrouter", False)
+              , ("openai", False)
               ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do

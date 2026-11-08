@@ -22,6 +22,7 @@
 module Seal.Providers.OpenRouter
   ( OpenRouter (..)
   , mkOpenRouter
+  , mkOpenAICompatible
   , defaultOpenRouterBaseUrl
   , openRouterBaseUrl
   , encodeRequest
@@ -30,10 +31,12 @@ module Seal.Providers.OpenRouter
   , bearerHeaders
   , sendChatCompletion
   , httpErrorText
+  , decodeModelIds
   ) where
 
 import Control.Exception (try)
-import Data.Aeson (Value (Null), eitherDecode, encode)
+import Data.Aeson (Value, Value (Null), eitherDecode, encode, withObject, (.:))
+import Data.Aeson.Types (parseMaybe)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
 import Data.String (fromString)
@@ -89,6 +92,19 @@ data OpenRouter = OpenRouter
 -- touching the network).
 mkOpenRouter :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenRouter
 mkOpenRouter mgr key base model = OpenRouter key base model mgr
+
+-- | Build a client for /any/ OpenAI-compatible @\/v1\/chat\/completions@
+-- endpoint. This is the same value 'mkOpenRouter' builds: OpenRouter is one
+-- instance of the protocol, and so is a self-hosted vLLM, an LM Studio, or
+-- api.openai.com. The only difference between them is the base URL the caller
+-- supplies, which is why 'Seal.Providers.Registry' routes both
+-- 'OpenRouterProvider' and 'OpenAICompatibleProvider' through here.
+--
+-- The key is still required ('Nothing' returns an actionable error instead of
+-- calling out with no credential), which keeps the fail-closed behaviour of
+-- 'mkOpenRouter'.
+mkOpenAICompatible :: Manager -> Maybe ApiKey -> Text -> ModelId -> OpenRouter
+mkOpenAICompatible = mkOpenRouter
 
 -- | Default base URL for OpenRouter (OpenAI-compatible endpoint).
 defaultOpenRouterBaseUrl :: Text
@@ -281,24 +297,69 @@ sendChatCompletion mgr baseUrl hdrs req = do
 -- keep the full response body (the body carries no secret).
 httpErrorText :: Int -> Text -> Text
 httpErrorText 429 _ =
-  "OpenRouter rate limit (HTTP 429) — the account behind this credential is \
-  \being throttled. Wait a moment and retry, or switch models with /model use."
+  "the provider is rate limiting this credential (HTTP 429) — wait a moment \
+  \and retry, or switch models with /model use."
 httpErrorText 401 _ =
-  "OpenRouter rejected the API key (HTTP 401) — run /provider remove openrouter \
-  \then /provider add openrouter to re-enter the key."
+  "the endpoint rejected the API key (HTTP 401) — re-enter it with \
+  \/provider remove and /provider add for this provider."
 httpErrorText code body =
-  "OpenRouter API returned HTTP " <> T.pack (show code) <> ": " <> body
+  -- Capped: an endpoint that answers with an HTML error page should not paste
+  -- the whole page into a CLI line or a wizard hint.
+  "the provider returned HTTP " <> T.pack (show code) <> ": " <> T.take 300 body
 
 -- Provider instance ---------------------------------------------------------
 
 instance Provider OpenRouter where
-  listModels prov = pure (Right [orDefaultModel prov])
+  -- The endpoint's live catalogue. Real, not a static guess: for a generic
+  -- OpenAI-compatible endpoint "is this URL right?" is answered here, and
+  -- OpenRouter's own catalogue changes over time. With no credential the call
+  -- is skipped and the configured default is returned, so a keyless caller
+  -- still gets an answer without touching the network.
+  listModels prov = case orApiKey prov of
+    Nothing -> pure (Right [orDefaultModel prov])
+    Just key ->
+      withApiKey key $ \bytes ->
+        listModelsHttp (orManager prov) (orBaseUrl prov) (bearerHeaders bytes)
+
   complete prov cr = case orApiKey prov of
     Nothing ->
       pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
     Just key ->
       withApiKey key $ \bytes ->
         sendChatCompletion (orManager prov) (orBaseUrl prov) (bearerHeaders bytes) (encodeRequest cr)
+
+-- | @GET {base}\/models@ — the OpenAI-compatible model-list endpoint.
+listModelsHttp :: Manager -> Text -> RequestHeaders -> IO (Either Text [ModelId])
+listModelsHttp mgr baseUrl hdrs = do
+  initReq <- parseRequest (T.unpack (trimTrailingSlash baseUrl <> "/models"))
+  let httpReq = initReq { requestHeaders = hdrs }
+  result <- try (httpLbs httpReq mgr)
+    :: IO (Either HttpException (Response BL.ByteString))
+  case result of
+    Left _e ->
+      pure (Left "the provider's model-list request failed (connection or transport error)")
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+      in if code >= 200 && code <= 299
+           then pure (decodeModelIds (responseBody resp))
+           else pure (Left (httpErrorText code
+                             (TE.decodeUtf8With TEE.lenientDecode
+                               (BL.toStrict (responseBody resp)))))
+
+trimTrailingSlash :: Text -> Text
+trimTrailingSlash = T.dropWhileEnd (== '/')
+
+-- | Decode the OpenAI-compatible model list: @{"data":[{"id":"…"}]}@.
+decodeModelIds :: BL.ByteString -> Either Text [ModelId]
+decodeModelIds body = case eitherDecode body of
+  Left err -> Left ("could not read the model list: " <> T.pack err)
+  Right value -> case parseMaybe (withObject "model list" (.: "data")) value of
+    Nothing -> Left "the endpoint returned no model list"
+    Just entries -> maybe (Left "the endpoint's model list has entries without an id")
+                           Right
+                           (traverse entryId (entries :: [Value]))
+  where
+    entryId v = ModelId <$> parseMaybe (withObject "model" (.: "id")) v
 
 -- Helpers --------------------------------------------------------------------
 

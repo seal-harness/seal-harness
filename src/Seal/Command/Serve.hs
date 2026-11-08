@@ -491,10 +491,15 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adSkills          = bSkills backends
         , adProviders       = do
             -- The configured-provider list is computed on each request so
-            -- newly-added credentials are reflected without a restart. The
-            -- vault handle is read from the same ref the commands use.
+            -- newly-added credentials are reflected without a restart. Both
+            -- inputs are re-read: the vault handle from the same ref the
+            -- commands use, and config.toml from disk — a provider whose
+            -- *credential* arrives through the vault, but whose *endpoint*
+            -- (`[providers.openai] base_url`) arrives through the config, is
+            -- only "configured" once both are visible.
             mh <- readIORef (vrHandleRef rt)
-            configuredProviders mh cfg
+            cfg' <- loadCfg
+            configuredProviders mh cfg'
         , adUiState         = uiState
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg

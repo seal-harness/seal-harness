@@ -236,7 +236,9 @@ There are two gates, in this order, and both are blocking.
      key generation, so the wizard hands you the exact command and a Re-check
      button), or an existing age identity (a recipient plus the path to the
      identity file);
-   * an LLM provider — Anthropic, OpenRouter, or Ollama, plus its credential.
+   * an LLM provider — Anthropic, OpenRouter, Ollama, or any
+     OpenAI-compatible endpoint (where you supply the base URL), plus its
+     credential.
 
    The vault step writes exactly three values to `~/.seal/security.toml`
    (`vault_recipient`, `vault_identity`, `vault_key_type`) and creates

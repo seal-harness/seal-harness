@@ -11,6 +11,7 @@ const LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
+  openai: 'OpenAI-compatible',
 }
 
 export function providerLabel(id: string): string {

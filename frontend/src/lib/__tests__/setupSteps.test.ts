@@ -30,7 +30,14 @@ const wireSteps: SetupStep[] = [
 ]
 
 const wireProviders: ProviderCard[] = [
-  { id: 'anthropic', label: 'Anthropic', configured: false, isDefault: false, default_model: null },
+  {
+    id: 'anthropic',
+    label: 'Anthropic',
+    configured: false,
+    isDefault: false,
+    default_model: null,
+    requires_base_url: false,
+  },
 ]
 
 const wire = { required_complete: false, steps: wireSteps, providers: wireProviders }
@@ -52,6 +59,8 @@ describe('parseSetupState', () => {
     expect(parsed.steps.map((s) => s.id)).toEqual(['vault', 'provider'])
     expect(parsed.steps[0]?.status).toBe('pending')
     expect(parsed.providers[0]?.label).toBe('Anthropic')
+    // The server decides which providers need an endpoint; the wizard obeys.
+    expect(parsed.providers[0]?.requires_base_url).toBe(false)
     expect(parsed.unknownStatuses).toEqual([])
   })
 
@@ -73,6 +82,13 @@ describe('parseSetupState', () => {
     expect(parseSetupState({ steps: [], providers: [] })).toBeNull()
     expect(parseSetupState({ ...wire, steps: [{ id: 'vault' }] })).toBeNull()
     expect(parseSetupState({ ...wire, providers: [{ id: 'x' }] })).toBeNull()
+    // An absent `requires_base_url` is `false`, not a parse failure: the field
+    // is additive on the wire.
+    const legacy = parseSetupState({
+      ...wire,
+      providers: [{ id: 'anthropic', label: 'Anthropic', configured: false, isDefault: false, default_model: null }],
+    })
+    expect(legacy?.providers[0]?.requires_base_url).toBe(false)
   })
 })
 
