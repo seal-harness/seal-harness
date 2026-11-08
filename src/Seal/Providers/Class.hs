@@ -1,5 +1,6 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# OPTIONS_GHC -Wno-partial-fields #-}
 -- | The provider-agnostic message/content/request/response model and the
 -- 'Provider' capability class. Concrete providers (Anthropic, …) implement it;
@@ -8,7 +9,9 @@ module Seal.Providers.Class
   ( Role (..)
   , ToolResultPart (..)
   , ContentBlock (..)
-  , Message (..)
+  , MessageOrigin (..)
+  , Message (msgRole, msgContent, msgOrigin)
+  , pattern Message
   , textMsg
   , ToolDefinition (..)
   , stubSchema
@@ -71,11 +74,87 @@ data ContentBlock
 instance ToJSON ContentBlock where toJSON = stripPrefixToJSON
 instance FromJSON ContentBlock where parseJSON = stripPrefixParseJSON
 
-data Message = Message { msgRole :: Role, msgContent :: [ContentBlock] }
-  deriving stock (Eq, Show, Generic)
--- JSON keys: @msgRole@→@role@, @msgContent@→@content@.
-instance ToJSON Message where toJSON = stripPrefixToJSON
-instance FromJSON Message where parseJSON = stripPrefixParseJSON
+-- | Provenance of a single conversation message: the channel it arrived on
+-- and, when that channel authenticates one, the sender.
+--
+-- This is transcript metadata, not provider payload: the concrete provider
+-- encoders ('Seal.Providers.Anthropic', 'Seal.Providers.Ollama',
+-- 'Seal.Providers.OpenRouter') pattern-match the role and content blocks
+-- only, so an origin never reaches the wire as a structured field. What the
+-- model sees instead is the rendered tag produced by
+-- 'Seal.Transcript.Origin.annotateOrigins' when the loop builds the request.
+--
+-- 'moChannel' is the lowercase channel tag (see
+-- 'Seal.Core.ChannelKind.channelKindToText': @\"signal\"@, @\"telegram\"@, …);
+-- 'moUserId' is the authenticated sender id exactly as the channel reported
+-- it (a Signal phone/UUID, a Telegram numeric id) — already validated and
+-- bounded by 'Seal.Core.MessageSource.mkMessageSource', never raw transport
+-- text; 'moConversationId' is the server-derived conversation key.
+--
+-- Every field is persisted in @conversation.jsonl@, so it must stay
+-- secret-free.
+data MessageOrigin = MessageOrigin
+  { moChannel :: Text
+  , moUserId :: Maybe Text
+  , moConversationId :: Maybe Text
+  } deriving stock (Eq, Show, Generic)
+
+-- JSON keys: @channel@, @userId@, @conversationId@; absent fields are omitted
+-- (not null) so a per-message origin stays compact.
+instance ToJSON MessageOrigin where
+  toJSON o = object $ ["channel" .= moChannel o] <> userIdField <> conversationIdField
+    where
+      userIdField = case moUserId o of
+        Nothing -> []
+        Just u  -> ["userId" .= u]
+      conversationIdField = case moConversationId o of
+        Nothing -> []
+        Just c  -> ["conversationId" .= c]
+
+instance FromJSON MessageOrigin where
+  parseJSON = withObject "MessageOrigin" $ \o -> MessageOrigin
+    <$> o .: "channel"
+    <*> o .:? "userId"
+    <*> o .:? "conversationId"
+
+-- | One conversation message: a role, its content blocks, and — for a message
+-- that arrived from an authenticated chat channel — its 'MessageOrigin'.
+--
+-- The 'Message' pattern is the two-argument view of this type, and it is what
+-- nearly every call site uses: it builds a message with no origin and matches
+-- one while ignoring the origin. Provider encoders, tool dispatch, and the
+-- content helpers therefore keep working unchanged — provenance rides
+-- alongside the payload, it is not part of it. Attach an origin with a record
+-- update (@m { msgOrigin = Just o }@), which needs no constructor access.
+data Message = MkMessage
+  { msgRole :: Role
+  , msgContent :: [ContentBlock]
+  , msgOrigin :: Maybe MessageOrigin
+  } deriving stock (Eq, Show, Generic)
+
+-- | Build (and match) a message with no origin.
+pattern Message :: Role -> [ContentBlock] -> Message
+pattern Message r c <- MkMessage r c _
+  where
+    Message r c = MkMessage r c Nothing
+
+{-# COMPLETE Message #-}
+
+-- JSON keys: @role@, @content@, and @origin@ when present. An origin-less
+-- message encodes exactly as it did before origins existed, so
+-- @conversation.jsonl@ lines written by an older binary still decode (a
+-- missing @origin@ means 'Nothing') and new web/CLI turns keep the old shape.
+instance ToJSON Message where
+  toJSON (MkMessage r c mo) = object $
+    ["role" .= r, "content" .= c] <> originField mo
+    where
+      originField = \case
+        Nothing -> []
+        Just o  -> ["origin" .= o]
+
+instance FromJSON Message where
+  parseJSON = withObject "Message" $ \o ->
+    MkMessage <$> o .: "role" <*> o .: "content" <*> o .:? "origin"
 
 textMsg :: Role -> Text -> Message
 textMsg r t = Message r [CbText t]

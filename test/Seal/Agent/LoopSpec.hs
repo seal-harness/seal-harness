@@ -191,6 +191,72 @@ spec = describe "Seal.Agent.Loop" $ do
       Map.lookup "conversationId" (requestMeta "web" (Just ms))
         `shouldBe` Just (String "tg:12345")
 
+  describe "message origin" $ do
+    -- The gap this closes: the agent must be able to tell several senders
+    -- apart in a group chat. entries.jsonl's erMeta only describes the
+    -- CURRENT turn's arrival, which is not what the model reads — it reads
+    -- conversation.jsonl. So the origin rides on the message itself (and is
+    -- persisted with it), and the loop renders it into the request text.
+    it "records the origin with the conversation line and tags the request" $
+      withSystemTempDirectory "seal-loop-origin" $ \dir -> do
+        approvals <- newApprovalCache
+        reqRef <- newIORef ([] :: [CompletionRequest])
+        scriptRef <- newIORef
+          [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
+        stopFanoutDoneRef <- newIORef False
+        withIndexedTranscript dir $ \h -> do
+          let env = AgentEnv
+                { aeProvider = SomeProvider (CapturingProvider (reqRef, scriptRef))
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                , aeCaps = def
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "telegram"
+                , aeMessageSource = Just (requestMetaSampleSource (Just "12345"))
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeDebugResponsePath = Nothing
+                , aeOnEntry = pure ()
+                , aeMaxModelRetries = 3
+                , aeRetryBaseDelayMs = 1000
+                , aeOnUserMessage = Nothing
+                , aeOnStop = Nothing
+                , aeStopFanoutDone = stopFanoutDoneRef
+                , aeOnToolCall = \_ _ -> pure ()
+                , aeOnTextDelta = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeRepeatTrack = testRepeatTrack
+                , aeToolTimeout = defaultToolTimeoutConfig
+                }
+          runTestApp (runTurn env "hi")
+        -- What the model reads: the tag in front of the user's words.
+        reqs <- readIORef reqRef
+        let sentUserTexts = [ t
+                            | req <- take 1 reqs
+                            , m <- crMessages req
+                            , CbText t <- msgContent m ]
+        sentUserTexts `shouldBe` ["[telegram:12345] hi"]
+        -- What the transcript keeps: clean text + the structured origin.
+        raw <- BS8.readFile (dir </> "conversation.jsonl")
+        case BS8.lines raw of
+          [] -> expectationFailure "conversation.jsonl is empty"
+          (firstLine : _) ->
+            case A.eitherDecodeStrict firstLine :: Either String Message of
+              Left e  -> expectationFailure ("bad conversation line: " <> e)
+              Right m -> do
+                msgContent m `shouldBe` [CbText "hi"]
+                msgOrigin m `shouldBe`
+                  Just (MessageOrigin "telegram" (Just "12345") (Just "tg:12345"))
+
   describe "stripToolCallXml" $ do
     it "removes a complete <invoke> block" $ do
       let input = "before<invoke name=\"FILE_READ\"></invoke>after"

@@ -553,6 +553,18 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
       content = A.Array (V.fromList contentBlocks)
       direction :: Text
       direction = if T.toCaseFold role == "user" then "request" else "response"
+      -- A conversation line carries its own origin (channel + sender) when it
+      -- arrived over an authenticated chat channel. Surface it on the
+      -- synthesized entry so a session whose entries.jsonl is missing or torn
+      -- still labels each message with who sent it, exactly as the
+      -- entries-backed path does from erMeta.
+      mOrigin = KeyMap.lookup (k "origin") o
+      originField :: Text -> Maybe Text
+      originField key = case mOrigin of
+        Just (A.Object om) -> case KeyMap.lookup (k key) om of
+          Just (A.String t) -> Just t
+          _                 -> Nothing
+        _ -> Nothing
       payloadJson = if direction == "request"
         then A.object ["messages" A..= [A.object ["role" A..= ("user" :: Text), "content" A..= content]]]
         else A.object ["content" A..= content]
@@ -565,8 +577,8 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
        , "payload"   .= payloadJson
        , "harness"   .= (Nothing :: Maybe Text)
        , "model"     .= model
-       , "channel"   .= (Nothing :: Maybe Text)
-       , "userId"    .= (Nothing :: Maybe Text)
+       , "channel"   .= originField "channel"
+       , "userId"    .= originField "userId"
       , "internal"  .= (Nothing :: Maybe Bool)
       , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
       ]

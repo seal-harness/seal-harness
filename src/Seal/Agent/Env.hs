@@ -98,6 +98,14 @@ data AgentEnv = AgentEnv
     -- 'EntryRecord's @erMeta@ @channel@ / @conversationId@ / @userId@
     -- fields, so every chat-channel message carries its channel name and
     -- sender id.
+    --
+    -- It also attaches the same provenance to the user message itself
+    -- ('Seal.Providers.Class.msgOrigin'), which is persisted in the
+    -- @conversation.jsonl@ line — the file the model actually reads.
+    -- @erMeta@ only ever describes the CURRENT turn's arrival; the
+    -- per-message origin is what lets the agent tell several senders apart in
+    -- a group chat, because 'runTurn' renders each user message's tag into
+    -- the provider request ('Seal.Transcript.Origin.annotateOrigins').
   , aeAutonomy :: AutonomyLevel
     -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
     -- human-confirmation gate for Untrusted opcodes (they run immediately after

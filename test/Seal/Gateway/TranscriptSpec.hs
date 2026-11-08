@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Tests for 'Seal.Gateway.Transcript.reconEntryToFrontend' — the filter
 -- that decides which reconstructed 'EKHarness' entries surface to the web
 -- frontend SPA. v1 whitelists @op.name == "SKILL_LOAD"@ so /skill load
@@ -53,8 +54,8 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Transcript.Entries
   (EntryRecord (..), EntryKind (..), encodeEntryRecordRaw)
 
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Providers.Class qualified as PC (Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..))
+import Seal.Providers.Class qualified as PC (pattern Message, Role (..))
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 21) (secondsToDiffTime 0)
@@ -194,6 +195,20 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
       let raw = A.object [ "role" .= String "user", "content" .= ([] :: [Value]) ]
           v = convLineToFrontend "m" [] "t" 0 raw
       getTopField "userId" v `shouldBe` Just Null
+
+    it "convLineToFrontend emits the message origin's channel and sender" $ do
+      -- Conv-only sessions (no entries.jsonl) must still label each user
+      -- message with its sender: the origin is on the line itself.
+      let raw = A.object
+            [ "role"    .= String "user"
+            , "content" .= [A.object [ "tag" .= String "CbText", "contents" .= String "hi" ]]
+            , "origin"  .= A.object
+                [ "channel"        .= String "telegram"
+                , "userId"         .= String "12345"
+                , "conversationId" .= String "tg:12345" ] ]
+          v = convLineToFrontend "m" [] "t" 0 raw
+      getTopField "channel" v `shouldBe` Just (String "telegram")
+      getTopField "userId" v `shouldBe` Just (String "12345")
 
   it "surfaces a SKILL_LOAD harness entry (whitelisted)" $ do
     let te = mkHarnessTe skillLoadPayload

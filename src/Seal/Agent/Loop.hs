@@ -59,6 +59,7 @@ import Seal.Session.Log
   , logRetryAttempt, logRetryExhausted )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
+import Seal.Transcript.Origin (annotateOrigins, originFromSource)
 import Seal.Types.App (App)
 
 -- | The output-token cap sent to the provider on every completion request.
@@ -126,7 +127,15 @@ runTurn env userText = do
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
   prior <- liftIO (itwReadConversation (aeTranscript env))
-  let userMsg = textMsg User userText
+  -- Attach the inbound message's provenance (channel + sender) to the user
+  -- message itself. 'conversation.jsonl' lines are canonical 'Message'
+  -- encodings, so the writer persists the origin with the line and every
+  -- later read gets it back — that per-message origin is what lets the model
+  -- tell senders apart in a group chat, long after this turn is over. The
+  -- text stays exactly as the user typed it (see 'Seal.Transcript.Origin':
+  -- the tag is rendered into the provider request, never into the file).
+  let userMsg = (textMsg User userText)
+                  { msgOrigin = originFromSource <$> aeMessageSource env }
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
@@ -261,10 +270,15 @@ runTurn env userText = do
                                  - estimateTokenCount (aeSystem env) [] tools)
                               msgs
                        else msgs
+      -- Render each user message's origin into the text the model reads. The
+      -- whole (possibly truncated) list is annotated, so earlier senders in a
+      -- group chat stay attributable too. This is the only place the tag is
+      -- applied: the transcript keeps the clean text plus the structured
+      -- origin, and @requests.jsonl@ (below) records exactly what was sent.
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
-                  , crMessages = sendMsgs
+                  , crMessages = annotateOrigins sendMsgs
                   , crTools = tools
                   , crToolChoice = ToolAuto
                   , crMaxTokens = defaultMaxTokens
