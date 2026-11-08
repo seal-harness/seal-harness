@@ -276,7 +276,11 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     )
   }
 
-  const tokenField = status.enrollment_via === 'none' ? null : (
+  // --no-enrollment-token mints a CliWindow grant: no secret to paste, so
+  // the token field is hidden and the register button is enabled without one.
+  const noTokenNeeded = status.enrollment_via === 'cli_window'
+
+  const tokenField = (status.enrollment_via === 'none' || noTokenNeeded) ? null : (
     <TokenField
       value={tokenInput}
       onChange={setTokenInput}
@@ -297,6 +301,14 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       <button className="agate-secondary" onClick={() => { void refresh() }}>
         Check again
       </button>
+    </div>
+  )
+
+  const windowHint = (
+    <div className="agate-note">
+      <p>
+        Enrollment is open — no token is needed. Click “Register a passkey” below.
+      </p>
     </div>
   )
 
@@ -322,10 +334,10 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
 
         <details className="agate-waive">
           <summary>Enroll this device</summary>
-          {tokenField ?? mintHint}
+          {tokenField ?? (noTokenNeeded ? windowHint : mintHint)}
           <button
             className="agate-secondary"
-            disabled={busy || !canUsePasskey() || effectiveToken === null}
+            disabled={busy || !canUsePasskey() || (effectiveToken === null && !noTokenNeeded)}
             onClick={() => { void addPasskey() }}
           >
             {busy ? 'Waiting for your passkey…' : 'Enroll a passkey on this device'}
@@ -371,14 +383,14 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       <CapabilityNote surface="setup" />
       <OriginNote status={status} />
 
-      {tokenField ?? mintHint}
+      {tokenField ?? (noTokenNeeded ? windowHint : mintHint)}
 
       {error && <p className="agate-error">{error}</p>}
 
       <div className="agate-actions">
         <button
           className="agate-primary"
-          disabled={busy || !canUsePasskey() || effectiveToken === null}
+          disabled={busy || !canUsePasskey() || (effectiveToken === null && !noTokenNeeded)}
           onClick={() => { void addPasskey() }}
         >
           {busy ? 'Waiting for your passkey…' : 'Register a passkey'}
@@ -399,12 +411,12 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
           {waiveError && <p className="agate-error">{waiveError}</p>}
           <button
             className="agate-secondary"
-            disabled={waiveBusy || effectiveToken === null}
+            disabled={waiveBusy || (effectiveToken === null && !noTokenNeeded)}
             onClick={() => { void waive() }}
           >
             {waiveBusy ? 'Waiving…' : 'Waive access control'}
           </button>
-          {effectiveToken === null && (
+          {effectiveToken === null && !noTokenNeeded && (
             <p className="agate-hint">
               An enrollment token is required to waive. Paste one above, or run
               <code> seal serve --no-enrollment-token</code> to skip the token entirely.
