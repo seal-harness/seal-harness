@@ -228,10 +228,11 @@ rebindBody mProvider mModel mChannel = A.object (catMaybes
 -- | The request body for @POST \/api\/sessions\/new@ on the @\/new@ path
 -- (no prior session): provider\/model overrides only. The gateway labels
 -- such a session @"web"@.
-mintBody :: Maybe Text -> Maybe Text -> Value
-mintBody mProvider mModel = A.object (catMaybes
+mintBody :: Maybe Text -> Maybe Text -> Maybe Text -> Value
+mintBody mProvider mModel mChannel = A.object (catMaybes
   [ ("provider" .=) <$> mProvider
   , ("model" .=) <$> mModel
+  , ("channel" .=) <$> mChannel
   ])
 
 -- | The request body of @POST \/api\/sessions\/:id\/setup-repo@:

@@ -941,7 +941,7 @@ handleSessionNew deps v = do
       mAgent = case lookupBodyStr "agent" of
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
-      channel = if lookupBodyBool "headless" then "bg" else "web"
+      channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
   meta <- newSession paths provider model channel mAgent
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))

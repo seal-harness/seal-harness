@@ -662,6 +662,14 @@ spec = describe "Seal.Gateway.API" $ do
     metaExplicit <- postSessionNewMeta (A.object [ "headless" .= False ])
     smChannel metaExplicit `shouldBe` "web"
 
+
+  it "POST /api/sessions/new honors an explicit channel (chat-channel origin)" $ do
+    metaTg <- postSessionNewMeta (A.object [ "channel" .= ("telegram" :: T.Text) ])
+    smChannel metaTg `shouldBe` "telegram"
+    -- headless still wins: a bg session must stay "bg".
+    metaBg <- postSessionNewMeta
+      (A.object [ "channel" .= ("telegram" :: T.Text), "headless" .= True ])
+    smChannel metaBg `shouldBe` "bg"
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "99999999-000000-000", "new"] (A.encode (A.object []))

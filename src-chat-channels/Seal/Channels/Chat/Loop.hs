@@ -1341,7 +1341,7 @@ handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker wat
         , noModel       = Just (nsrModel res)
         }) eRes
     Nothing -> do
-      eSid <- cccNewSession cfg mgr apiBase (mintBody (naProvider na) (naModel na))
+      eSid <- cccNewSession cfg mgr apiBase (mintBody (naProvider na) (naModel na) (Just (ccLabel chan)))
       pure $ fmap (\sidText -> NewOutcome
         { noSid         = sidText
         , noRebindError = Nothing
@@ -1423,7 +1423,7 @@ resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watch
     Nothing -> do
       let apiBase = gcApiBase (cccGateway cfg)
           mgr = cccHttpManager cfg
-      eSid <- httpNewSession mgr apiBase (A.object [])
+      eSid <- cccNewSession cfg mgr apiBase (A.object ["channel" .= ckChannel key])
       case eSid of
         Right sidText -> case mkSessionId sidText of
           Right sid -> do

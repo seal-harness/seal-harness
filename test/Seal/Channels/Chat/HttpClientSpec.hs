@@ -136,13 +136,19 @@ spec = do
       rebindBody Nothing Nothing Nothing `shouldBe` A.object []
 
   describe "mintBody" $ do
-    it "carries provider/model only — the gateway labels the session web" $
-      mintBody (Just "anthropic") (Just "claude")
+    it "carries provider/model/channel" $
+      mintBody (Just "anthropic") (Just "claude") (Just "telegram")
+        `shouldBe` A.object
+          [ "provider" .= ("anthropic" :: Text)
+          , "model" .= ("claude" :: Text)
+          , "channel" .= ("telegram" :: Text) ]
+    it "omits the channel when not provided" $
+      mintBody (Just "anthropic") (Just "claude") Nothing
         `shouldBe` A.object
           [ "provider" .= ("anthropic" :: Text)
           , "model" .= ("claude" :: Text) ]
     it "is the empty object without overrides" $
-      mintBody Nothing Nothing `shouldBe` A.object []
+      mintBody Nothing Nothing Nothing `shouldBe` A.object []
 
   describe "setupRepoBody" $ do
     it "is {url} with no branch — the body chat sent before -b existed" $

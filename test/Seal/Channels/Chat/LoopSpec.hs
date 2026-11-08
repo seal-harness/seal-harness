@@ -389,8 +389,26 @@ spec = do
       handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
         watchState thinkingTabs key (Just src) "hello"
       readIORef recorded `shouldReturn` Just src
+    it "mints a new session on the inbound channel" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "hello"
+      getMints seams `shouldReturn` [A.object ["channel" .= ("signal" :: Text)]]
 
   describe "loop streaming behavior (issue #198 follow-up)" $ do
+
     it "finalizes the pre-tool bubble when a tool call fires, so post-tool text starts a new message" $ do
       -- Symptom 1: pre-tool text, tool line, and post-tool text were
       -- landing in the same platform message. The loop must finalize
@@ -2147,7 +2165,8 @@ spec = do
       getMints seams `shouldReturn`
         [A.object
           [ "provider" .= ("anthropic" :: Text)
-          , "model" .= ("claude-sonnet-4" :: Text) ]]
+          , "model" .= ("claude-sonnet-4" :: Text)
+          , "channel" .= ("mock" :: Text) ]]
       getRebinds seams `shouldReturn` []
       -- No prior session: nothing to warn about and nothing to resume.
       getSends chan `shouldReturn` ["new session fresh-sid"]
