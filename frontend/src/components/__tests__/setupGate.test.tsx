@@ -55,6 +55,36 @@ describe('SetupGate', () => {
     await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
   })
 
+  it('does not reveal the app merely because the steps completed', async () => {
+    // The e2e caught the first version of this gate revealing the app the
+    // instant the server said required_complete — which made the completion
+    // screen unreachable. Completion must wait for Start chatting.
+    const incomplete = {
+      ...setupPayload,
+      steps: [
+        { id: 'vault', required: true, status: 'blocked', detail: 'Reopen it.', actions: ['recheck'] },
+        { id: 'provider', required: true, status: 'ready', detail: null, actions: [] },
+      ],
+    }
+    const complete = {
+      ...setupPayload,
+      required_complete: true,
+      steps: setupPayload.steps.map((s) => ({ ...s, status: 'ready' })),
+    }
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, incomplete))
+    render(<SetupGate><div>the app</div></SetupGate>)
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault'))
+
+    // Re-check re-probes; the server now says everything is ready.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, complete))
+    fireEvent.click(screen.getByRole('button', { name: /re-check/i }))
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Setup complete' })).toBeInTheDocument())
+    expect(screen.queryByText('the app')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /start chatting/i }))
+    await waitFor(() => expect(screen.getByText('the app')).toBeInTheDocument())
+  })
+
   it('keeps an /api/sessions error from painting over the wizard', async () => {
     // The gate must only ever ask /api/setup: a failing /api/sessions (e.g.
     // the app's own startup probe) is the app's problem, not the wizard's.

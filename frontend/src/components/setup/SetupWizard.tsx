@@ -23,9 +23,15 @@ import { VaultStep } from './VaultStep'
 export function SetupWizard({
   state,
   refresh,
+  onComplete,
 }: {
   state: ParsedSetupState
+  /** Re-probe `GET /api/setup` (after creating/reopening the vault, saving a
+   *  provider, or pressing Re-check). */
   refresh: () => void
+  /** Leave the wizard. Called by the completion screen only — the gate uses it
+   *  to reveal the app, so completing the steps alone does not do it. */
+  onComplete: () => void
 }) {
   const rail = resolveRail(state)
   const incomplete = firstIncompleteStepIndex(state)
@@ -57,12 +63,12 @@ export function SetupWizard({
   }, [index])
 
   if (incomplete === null) {
-    return <SetupComplete onComplete={refresh} />
+    return <SetupComplete onComplete={onComplete} />
   }
 
   const entry = rail[index] ?? rail[0]
   if (entry === undefined) {
-    return <SetupComplete onComplete={refresh} />
+    return <SetupComplete onComplete={onComplete} />
   }
 
   const dispatch = async (verb: string): Promise<void> => {

@@ -74,7 +74,7 @@ import Seal.Config.Security
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (SomeProvider)
 import Seal.Providers.Registry
-  ( KnownProvider, defaultModelFor, parseProvider, providerLabel )
+  ( KnownProvider, defaultModelFor, listSome, parseProvider, providerLabel )
 import Seal.Security.Vault
   ( UnlockMode (UnlockStartup), VaultConfig (..), VaultHandle (..), openVault )
 import Seal.Security.Vault.Age
@@ -354,16 +354,33 @@ handleProviderTest env rawName req =
           (Just "create the vault (or reopen it) before testing a provider"))
         Just _ -> do
           model <- testModel env known req
-          result <- sdResolveProvider (seDeps env) known model
-          pure $ case result of
-            Left err -> setupJson status200 (object
-              [ "ok" .= False
-              , "error" .= err
-              ])
-            Right _ -> setupJson status200 (object
-              [ "ok" .= True
-              , "detail" .= ("reachable" :: Text)
-              ])
+          resolved <- sdResolveProvider (seDeps env) known model
+          case resolved of
+            Left err -> pure (pingFailed err)
+            Right provider -> do
+              -- What this can prove, precisely: the credential resolves into
+              -- a working provider object, and (for providers whose
+              -- listModels actually calls the network — Ollama does,
+              -- Anthropic returns its static catalogue) that call succeeded.
+              -- It is not a completion round-trip: that would spend tokens and
+              -- take seconds on every click. The copy says "credentials
+              -- resolved" rather than "reachable" for that reason.
+              listed <- listSome provider
+              pure $ case listed of
+                Left err -> pingFailed err
+                Right models -> setupJson status200 (object
+                  [ "ok" .= True
+                  , "detail" .= ("credentials resolved" :: Text)
+                  , "models" .= length models
+                  ])
+
+-- | A failed ping is not an HTTP error: the wizard renders it inline next to
+-- the field (design §9.4).
+pingFailed :: Text -> Response
+pingFailed err = setupJson status200 (object
+  [ "ok" .= False
+  , "error" .= err
+  ])
 
 -- | The model the ping uses: the request's @model@ when given, else what a new
 -- session would use (global default, then the provider's configured default,

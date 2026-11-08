@@ -45,7 +45,7 @@ function jsonResponse(status: number, body: unknown) {
 
 describe('SetupWizard', () => {
   it('renders the rail from state', () => {
-    render(<SetupWizard state={parsed()} refresh={() => {}} />)
+    render(<SetupWizard state={parsed()} refresh={() => {}} onComplete={() => {}} />)
     const rail = screen.getByRole('navigation', { name: /setup steps/i })
     expect(rail).toHaveTextContent('Create your vault')
     expect(rail).toHaveTextContent('Choose an LLM provider')
@@ -53,12 +53,12 @@ describe('SetupWizard', () => {
 
   it('auto-advances when the current step becomes ready', () => {
     const first = parsed()
-    const { rerender } = render(<SetupWizard state={first} refresh={() => {}} />)
+    const { rerender } = render(<SetupWizard state={first} refresh={() => {}} onComplete={() => {}} />)
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Create your vault')
     const advanced = parsed({
       steps: [step({ status: 'ready' }), step({ id: 'provider', actions: ['configure'] })],
     })
-    rerender(<SetupWizard state={advanced} refresh={() => {}} />)
+    rerender(<SetupWizard state={advanced} refresh={() => {}} onComplete={() => {}} />)
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Choose an LLM provider')
   })
 
@@ -69,6 +69,7 @@ describe('SetupWizard', () => {
       <SetupWizard
         state={parsed({ steps: [step({ status: 'pending', actions: ['resume'] }), step({ id: 'provider' })] })}
         refresh={refresh}
+        onComplete={() => {}}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: /finish creating the vault/i }))
@@ -81,6 +82,7 @@ describe('SetupWizard', () => {
       <SetupWizard
         state={parsed({ steps: [step({ status: 'blocked', actions: ['reopen', 'recheck'] }), step({ id: 'provider' })] })}
         refresh={refresh}
+        onComplete={() => {}}
       />,
     )
     fetchMock.mockResolvedValue(jsonResponse(200, { opened: true, locked: false }))
@@ -109,6 +111,7 @@ describe('SetupWizard', () => {
           ],
         })}
         refresh={() => {}}
+        onComplete={() => {}}
       />,
     )
     expect(screen.getByText(/configured but not open/i)).toBeInTheDocument()
@@ -130,6 +133,7 @@ describe('SetupWizard', () => {
           ],
         })}
         refresh={() => {}}
+        onComplete={() => {}}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: /reopen the vault/i }))
@@ -139,23 +143,24 @@ describe('SetupWizard', () => {
   })
 
   it('the completion screen gates onComplete behind Start chatting', async () => {
-    const refresh = vi.fn()
+    const onComplete = vi.fn()
     render(
       <SetupWizard
         state={parsed({
           required_complete: true,
           steps: [step({ status: 'ready' }), step({ id: 'provider', status: 'ready' })],
         })}
-        refresh={refresh}
+        refresh={() => {}}
+        onComplete={onComplete}
       />,
     )
-    expect(refresh).not.toHaveBeenCalled()
+    expect(onComplete).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: /start chatting/i }))
-    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(onComplete).toHaveBeenCalledTimes(1)
   })
 
   it('there is no skip or close control', () => {
-    render(<SetupWizard state={parsed()} refresh={() => {}} />)
+    render(<SetupWizard state={parsed()} refresh={() => {}} onComplete={() => {}} />)
     for (const name of [/skip/i, /close/i, /later/i, /dismiss/i, /cancel/i]) {
       expect(screen.queryByRole('button', { name })).toBeNull()
     }
@@ -169,20 +174,21 @@ describe('SetupWizard', () => {
         step({ id: 'chat_channels', required: true, detail: 'Connect Telegram.', actions: [] }),
       ],
     })
-    render(<SetupWizard state={state} refresh={() => {}} />)
+    render(<SetupWizard state={state} refresh={() => {}} onComplete={() => {}} />)
     // The unknown step is current (nothing else is left) and says so.
     expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Chat channels')
     expect(screen.getByText(/does not know how to render/i)).toBeInTheDocument()
   })
 
   it('focus moves to the step heading on advance', () => {
-    const { rerender } = render(<SetupWizard state={parsed()} refresh={() => {}} />)
+    const { rerender } = render(<SetupWizard state={parsed()} refresh={() => {}} onComplete={() => {}} />)
     rerender(
       <SetupWizard
         state={parsed({
           steps: [step({ status: 'ready' }), step({ id: 'provider' })],
         })}
         refresh={() => {}}
+        onComplete={() => {}}
       />,
     )
     expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
@@ -198,6 +204,7 @@ describe('SetupWizard', () => {
           ],
         })}
         refresh={() => {}}
+        onComplete={() => {}}
       />,
     )
     const current = screen.getByRole('button', { name: /create your vault/i })

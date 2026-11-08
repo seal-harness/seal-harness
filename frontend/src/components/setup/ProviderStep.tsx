@@ -172,7 +172,7 @@ export function ProviderStep({
         <p role="status" aria-live="polite" className={pingOk && pingBody?.ok !== false ? 'text-emerald-300' : 'text-amber-300'}>
           {pingBody?.ok === false
             ? `Connection failed: ${pingBody.error ?? 'unknown error'}`
-            : 'Connection OK'}
+            : 'Credentials resolved.'}
         </p>
       ) : null}
 
