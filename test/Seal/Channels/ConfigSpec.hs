@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# HLINT ignore "Use record patterns" #-}
 module Seal.Channels.ConfigSpec (spec) where
 
 import Data.Set qualified as Set
@@ -155,7 +154,7 @@ spec = do
       case resolveChannelConfig cid sigCfg Nothing of
         Right (ResolvedSignal acct _ _) ->
           show acct `shouldContain` "15551234567"
-        Right (ResolvedTelegram _ _ _) ->
+        Right (ResolvedTelegram {}) ->
           expectationFailure "expected ResolvedSignal, got ResolvedTelegram"
         Left e -> expectationFailure ("unexpected Left: " <> T.unpack e)
 
@@ -166,7 +165,7 @@ spec = do
       case resolveChannelConfig cid tgCfg (Just "vault-tok") of
         Right (ResolvedTelegram token _ _) ->
           show token `shouldContain` "vault-tok"
-        Right (ResolvedSignal _ _ _) ->
+        Right (ResolvedSignal {}) ->
           expectationFailure "expected ResolvedTelegram, got ResolvedSignal"
         Left e -> expectationFailure ("unexpected Left: " <> T.unpack e)
 
@@ -174,7 +173,7 @@ spec = do
       case resolveChannelConfig cid tgCfg Nothing of
         Right (ResolvedTelegram token _ _) ->
           show token `shouldContain` "config-tok"
-        Right (ResolvedSignal _ _ _) ->
+        Right (ResolvedSignal {}) ->
           expectationFailure "expected ResolvedTelegram, got ResolvedSignal"
         Left e -> expectationFailure ("unexpected Left: " <> T.unpack e)
 

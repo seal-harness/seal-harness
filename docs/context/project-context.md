@@ -9,7 +9,8 @@
 - Frontend: `cd frontend && npm test -- --run` / `npm run build`
 
 ## Completed Work Units
-(none yet)
+| W1 | Seal.Channels.Config | src/Seal/Channels/Config.hs, test/Seal/Channels/ConfigSpec.hs | ChannelId, ChannelConfig, ResolvedChannel, channelConfigCodec, keyChannelIdBiMap, telegramVaultKeyFor, resolveChannelConfig |
+| W5 | Frontend ChannelsView | frontend/src/components/ChannelsView.tsx, types.ts, useApi.ts | ChannelDetail, ChannelInput, useChannels, createChannel, updateChannel, deleteChannel |
 
 ## Established Patterns
 - Providers CRUD: `Map Text ProviderConfig` via `Toml.tableMap` + `keyRepoBiMap`; `normalizeProvidersTable`; `upsertProvider`; `updateRuntimeConfig` (MVar-serialized); camelCase response JSON / snake_case input JSON; `ProvidersView.tsx` list+editor template; `useAllProviders` mount+refresh (not polling)
