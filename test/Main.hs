@@ -167,6 +167,7 @@ import qualified Seal.Telegram.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
+import qualified Seal.Channels.ConfigSpec
 import qualified Seal.Providers.OpenRouterSpec
 import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.ContextWindowSpec
@@ -362,6 +363,7 @@ specs = do
   Seal.Phase4Spec.spec
   Seal.Signal.ConfigSpec.spec
   Seal.Telegram.ConfigSpec.spec
+  Seal.Channels.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
