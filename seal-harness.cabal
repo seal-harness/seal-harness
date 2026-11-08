@@ -267,6 +267,7 @@ library
         Seal.Vault.Backend
 
         Seal.Vault.Provision
+        Seal.Setup.State
         Seal.Vault.IdentityPath
         Seal.Vault.Commands
         Seal.Agent.Env
@@ -647,6 +648,7 @@ test-suite tests
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.ProvisionSpec
+        Seal.Setup.StateSpec
         Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
