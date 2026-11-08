@@ -3,7 +3,7 @@ import logoImg from '../../assets/SealLogo.png'
 
 /** The top-level navigation sections. The existing sessions/tabs/chat UI
  *  lives under "Sessions"; "Agents" + "Skills" open the CRUD views. */
-export type TopSection = 'sessions' | 'providers' | 'agents' | 'skills' | 'repos' | 'secrets'
+export type TopSection = 'sessions' | 'providers' | 'agents' | 'skills' | 'repos' | 'secrets' | 'files'
 
 const SECTION_LABELS: Record<TopSection, string> = {
   sessions: 'Sessions',
@@ -12,6 +12,7 @@ const SECTION_LABELS: Record<TopSection, string> = {
   skills: 'Skills',
   repos: 'Repos',
   secrets: 'Secrets',
+  files: 'Files',
 }
 
 export function TopBar({

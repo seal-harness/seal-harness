@@ -478,6 +478,38 @@ export interface TranscriptEntry {
   streaming?: boolean
 }
 
+// ── File Explorer ───────────────────────────────────────────────────────
+
+/** A single entry in a directory listing. Mirrors the backend's
+ *  `FeEntry` JSON (camelCase at the fetch boundary). */
+export interface FileEntry {
+  name: string
+  isDir: boolean
+  isSymlink: boolean
+  size: number | null
+  mtime: string | null
+}
+
+/** The result of `GET /api/files?path=<dir>`. Mirrors the backend's
+ *  `FeListing` JSON. */
+export interface FileListing {
+  path: string
+  entries: FileEntry[]
+  truncated: boolean
+  warning: string | null
+}
+
+/** The result of `GET /api/files/content?path=<file>`. Mirrors the
+ *  backend's `FeContent` JSON. When `isBinary` is true, `content` is a
+ *  placeholder message and should NOT be rendered as file text. */
+export interface FileContent {
+  path: string
+  content: string
+  truncated: boolean
+  linesRead: number
+  isBinary: boolean
+}
+
 // ── Message derivation (UI-internal, from TranscriptEntry) ─────────────
 
 export interface CodeSpan {
