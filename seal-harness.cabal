@@ -405,6 +405,7 @@ test-suite tests
       , lens
       , openapi-hs
       , seal-gateway-types
+     , trasa
        , seal-chat-channels
     hs-source-dirs: test
     other-modules:
