@@ -507,6 +507,12 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** The authenticated sender user id on the originating channel (a Telegram
+   *  user id, or a Signal phone/uuid), or null when the channel carried no
+   *  sender identity (web/CLI, response entries, the conversation-only
+   *  fallback). Stamped into the request entry's erMeta as `userId` by
+   *  runTurn's requestMeta. */
+  userId: string | null
   /** Whether this is a harness-internal entry (e.g. the synthetic
    *  continuation prompt appended after a StopMaxTokens truncation).
    *  When true, the frontend hides the entry from the chat view so the

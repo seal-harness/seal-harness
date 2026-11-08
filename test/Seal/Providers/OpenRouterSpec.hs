@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | WU-C — real tests for the OpenRouter provider. Exercises the pure
 -- request/response mapping + the no-key branch + the static listModels +
 -- the bearer header builder, WITHOUT a network round-trip. A live
@@ -24,7 +25,7 @@ import qualified OpenAI.V1.Chat.Completions as Chat (ChatCompletionObject)
 import Seal.Core.Types (ModelId (ModelId), OpName (OpName), ToolCallId (ToolCallId))
 import Seal.Providers.Class
   ( CompletionRequest (..), CompletionResponse (..), ContentBlock (..)
-  , Message (..), Provider (..), Role (..), StopReason (..), ToolChoice (..)
+  , pattern Message, Provider (..), Role (..), StopReason (..), ToolChoice (..)
   , ToolResultPart (..), Usage (..), textMsg )
 import Seal.Providers.OpenRouter
   ( bearerHeaders, decodeResponse, encodeRequest, mapFinishReason, mkOpenRouter

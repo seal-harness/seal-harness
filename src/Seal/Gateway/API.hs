@@ -40,9 +40,10 @@ import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
   , status200, status201, status204, status400, status403, status404, status409, status500, status501 )
+import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
-  , queryString, requestMethod, responseLBS )
+  , queryString, requestMethod, responseLBS, remoteHost, requestHeaders )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
@@ -61,6 +62,8 @@ import Seal.Command.Spec (CommandName (..), CommandSpec (..), Registry (..))
 import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), mkChannelId, channelIdText, telegramVaultKeyFor, restrictChannelKind)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
+import Seal.Core.MessageSource (MessageSource (..), mkUserId)
+import qualified Data.Map.Strict as Map
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, deleteChannel)
@@ -87,9 +90,9 @@ import Seal.Handles.AskReply
 import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Agent.Runtime.RunRecord (cancelRunsForParent)
 import Seal.Gateway.Send
-  ( SendDeps (..), handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
-  , handleAskCancel, handleSend
-  , handleSetupRepo, sendOutcomeJson )
+  ( SendDeps (..), handleSend, mkWebMessageSource, parseSendBody
+  , handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
+  , handleAskCancel, handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
@@ -247,11 +250,22 @@ apiApp deps req respond =
       case adSend deps of
         Nothing -> respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
         Just sendDeps -> do
-          let msg = parseSendMessage body
+          let (msg, mSrc0) = parseSendBody body
           case mkSessionId sid of
             Left e   -> respond (errJson status400 ("invalid session id: " <> e))
             Right sId -> do
-              outcome <- handleSend sendDeps sId msg
+              let bodyVal = A.decode body :: Maybe A.Value
+                  passkeyFromBody = case bodyVal of
+                    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "passkeyId") o of
+                      Just (A.String t) -> Just t
+                      _                 -> Nothing
+                    _ -> Nothing
+                  passkey = passkeyFromBody `maybeAlt` (TE.decodeUtf8 <$> lookup "X-Passkey-Id" (requestHeaders req))
+                  ip = clientIpFromRequest req
+                  mSrc = case mSrc0 of
+                    Just src -> Just (augmentMessageSource src passkey ip)
+                    Nothing  -> mkWebMessageSource sId passkey ip
+              outcome <- handleSend sendDeps sId mSrc msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
     -- POST /api/sessions/:id/stop — abort the session's in-flight tool call
@@ -746,6 +760,48 @@ collectBody req = go []
         then pure (BL.fromChunks (reverse acc))
         else go (chunk : acc)
 
+-- | Enrich an inbound 'MessageSource' with the web gateway's
+-- passkey / client-ip information without rejecting the source.
+augmentMessageSource :: MessageSource -> Maybe Text -> Maybe Text -> MessageSource
+augmentMessageSource src mPasskey mIp =
+  src
+    { msUserId = case msUserId src of
+        Just _  -> msUserId src
+        Nothing -> case mPasskey of
+          Nothing -> Nothing
+          Just p  -> case mkUserId p of
+            Right u -> Just u
+            Left _  -> Nothing
+    , msOpen = case mIp of
+        Nothing -> msOpen src
+        Just ip -> Map.insert "clientIp" ip (msOpen src)
+    }
+
+-- | Derive the client IP address for an inbound API request, preferring a
+-- (single-valued) @X-Forwarded-For@ or @X-Real-IP@ header (the first
+-- comma-separated entry) and falling back to the WAI connection's
+-- 'remoteHost'. Returns 'Nothing' when no address can be derived.
+clientIpFromRequest :: Request -> Maybe Text
+clientIpFromRequest req =
+  case forwardedFor req of
+    Just ip -> Just (T.strip ip)
+    Nothing -> sockAddrToText (remoteHost req)
+  where
+    forwardedFor r = do
+      v <- lookup "X-Forwarded-For" (requestHeaders r)
+           `maybeAlt` lookup "X-Real-Ip" (requestHeaders r)
+      let first = T.takeWhile (/= ',') (TE.decodeUtf8 v)
+      if T.null (T.strip first) then Nothing else Just first
+    sockAddrToText (SockAddrInet _ ha) =
+      let (a,b,c,d) = hostAddressToTuple ha
+      in Just (T.intercalate "." (map (T.pack . show) [a,b,c,d]))
+    sockAddrToText (SockAddrInet6 {}) = Nothing
+    sockAddrToText _ = Nothing
+
+maybeAlt :: Maybe a -> Maybe a -> Maybe a
+maybeAlt (Just x) _ = Just x
+maybeAlt Nothing  y = y
+
 -- | Push a fresh @lists@ snapshot to every WS subscriber. Called after
 -- every state change that affects the sidebar partition (W6 broadcast
 -- trigger). No-op when 'adBroker' is 'Nothing' (tests without a broker).
@@ -756,17 +812,6 @@ triggerBroadcast deps =
   case adBroker deps of
     Nothing      -> pure ()
     Just broker  -> broadcastListsSnapshot broker (adTabsHandle deps) (srPaths (adSessionRuntime deps))
-
--- | Parse the @message@ field from a POST /send body. Returns "" on a
--- missing/invalid body so the agent loop receives an empty turn (the routing
--- grammar treats empty input as 'Plain ""').
-parseSendMessage :: BL.ByteString -> Text
-parseSendMessage body =
-  case A.decode body :: Maybe A.Value of
-    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "message") o of
-      Just (A.String t) -> t
-      _                 -> ""
-    _ -> ""
 
 -- | Parse the @url@ (required) and @branch@ (optional) fields from a POST
 -- /setup-repo body. 'Nothing' when the body is not a JSON object or @url@
@@ -981,7 +1026,7 @@ handleSessionNew deps v = do
       mAgent = case lookupBodyStr "agent" of
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
-      channel = if lookupBodyBool "headless" then "bg" else "web"
+      channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
   meta <- newSession paths provider model channel mAgent
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))

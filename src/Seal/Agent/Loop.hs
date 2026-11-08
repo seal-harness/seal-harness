@@ -7,6 +7,7 @@ module Seal.Agent.Loop
   , defaultMaxTokens
   , aggregateStreamEvents
   , stripToolCallXml, findAllInvokeCalls
+  , requestMeta
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -33,8 +34,9 @@ import System.Timeout (timeout)
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.ContextTruncation
   ( estimateTokenCount, truncateMessages, defaultTruncationConfig )
+import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
-  ( MessageSource (..), conversationIdText )
+  ( MessageSource (..), conversationIdText, userIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..), TrustLevel (..))
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
@@ -57,6 +59,7 @@ import Seal.Session.Log
   , logRetryAttempt, logRetryExhausted )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
+import Seal.Transcript.Origin (annotateOrigins, originFromSource)
 import Seal.Types.App (App)
 
 -- | The output-token cap sent to the provider on every completion request.
@@ -89,22 +92,30 @@ continuationPrompt =
   \limit. Continue exactly where you left off. Do not restart or repeat \
   \prior text. Finish the answer directly.]"
 
--- | Build the request @erMeta@: a @channel@ key (always present, sourced
--- from 'aeChannel' so every channel — including web/CLI with no
--- 'MessageSource' — is attributed) plus a @conversationId@ key when
--- 'aeMessageSource' is present (carrying the server-derived conversation
--- id for channels that have one). This is the single place channel
--- provenance is stamped into the transcript, so every turn is attributed
--- regardless of the source channel.
+-- | Build the request @erMeta@: a @channel@ key (always present), a
+-- @userId@ key when the inbound message carried an authenticated sender id,
+-- and a @conversationId@ key when 'aeMessageSource' is present. The channel
+-- name comes from the 'MessageSource' when present (the true chat-channel
+-- tag, e.g. @"telegram"@) and otherwise falls back to 'aeChannel' (web/CLI).
+-- This is the single place channel provenance is stamped into the
+-- transcript, so every turn is attributed regardless of the source channel.
 requestMeta :: Text -> Maybe MessageSource -> Map.Map Text Value
-requestMeta channel mSrc =
-  Map.fromList
-    ([ ("channel", String channel)
-     ] <> conversationIdField)
+requestMeta fallbackChannel mSrc =
+  Map.fromList $
+    [ ("channel", String effectiveChannel) ] <> conversationIdField <> userIdField <> openFields
   where
+    effectiveChannel = case mSrc of
+      Nothing -> fallbackChannel
+      Just ms -> channelKindToText (msChannelKind ms)
     conversationIdField = case mSrc of
       Nothing -> []
       Just ms -> [("conversationId", String (conversationIdText (msConversationId ms)))]
+    userIdField = case mSrc >>= msUserId of
+      Nothing -> []
+      Just u  -> [("userId", String (userIdText u))]
+    openFields = case mSrc of
+      Nothing -> []
+      Just ms -> [ (k, String v) | (k,v) <- Map.toList (msOpen ms) ]
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
@@ -119,14 +130,23 @@ runTurn env userText = do
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
   prior <- liftIO (itwReadConversation (aeTranscript env))
-  let userMsg = textMsg User userText
+  -- Attach the inbound message's provenance (channel + sender) to the user
+  -- message itself. 'conversation.jsonl' lines are canonical 'Message'
+  -- encodings, so the writer persists the origin with the line and every
+  -- later read gets it back — that per-message origin is what lets the model
+  -- tell senders apart in a group chat, long after this turn is over. The
+  -- text stays exactly as the user typed it (see 'Seal.Transcript.Origin':
+  -- the tag is rendered into the provider request, never into the file).
+  let userMsg = (textMsg User userText)
+                  { msgOrigin = originFromSource <$> aeMessageSource env }
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
   -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
-  -- The request's @erMeta@ carries the channel + conversation id when
-  -- 'aeMessageSource' is present (Signal), so the transcript records which
-  -- channel + conversation this turn served. @erConvLen@ is the full
+  -- The request's @erMeta@ carries the channel (from the message source when
+  -- present, else the arrival channel) plus the source's conversation id and
+  -- sender user id, so the transcript records who sent it on which channel.
+  -- @erConvLen@ is the full
   -- conversation length in effect at this request (prior + new user message),
   -- so reconstruction can slice the right prefix from @conversation.jsonl@.
   liftIO $ do
@@ -253,10 +273,15 @@ runTurn env userText = do
                                  - estimateTokenCount (aeSystem env) [] tools)
                               msgs
                        else msgs
+      -- Render each user message's origin into the text the model reads. The
+      -- whole (possibly truncated) list is annotated, so earlier senders in a
+      -- group chat stay attributable too. This is the only place the tag is
+      -- applied: the transcript keeps the clean text plus the structured
+      -- origin, and @requests.jsonl@ (below) records exactly what was sent.
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
-                  , crMessages = sendMsgs
+                  , crMessages = annotateOrigins sendMsgs
                   , crTools = tools
                   , crToolChoice = ToolAuto
                   , crMaxTokens = defaultMaxTokens

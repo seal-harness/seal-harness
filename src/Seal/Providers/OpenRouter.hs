@@ -1,5 +1,6 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | OpenRouter provider using the @openai@ package's *types* (v2.5.4) with our
 -- own HTTP round-trip (mirroring 'Seal.Providers.Anthropic' / 'Ollama'). We do
 -- NOT use 'OpenAI.V1.makeMethods' (the servant-client convenience wrapper) —
@@ -60,7 +61,8 @@ import Seal.Providers.Class
   ( CompletionRequest (crMaxTokens, crMessages, crModel, crSystem, crToolChoice, crTools)
   , CompletionResponse (CompletionResponse)
   , ContentBlock (CbText, CbToolResult, CbToolUse)
-  , Message (Message)
+  , Message
+  , pattern Message
   , Provider (complete, listModels)
   , Role (Assistant, User)
   , StopReason (StopEnd, StopMaxTokens, StopOther, StopToolUse)

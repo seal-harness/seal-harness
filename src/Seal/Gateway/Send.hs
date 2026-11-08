@@ -13,6 +13,11 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , mkSendMessageSource
+  , mkWebMessageSource
+  , parseSendBody
+  , plainTurn
+  , plainTurnWithCaps
   , handleSetupRepo
   , setupRepoInput
   , validateSetupRepoArgs
@@ -66,6 +71,8 @@ import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
    TurnOutcome (..), runSessionTurn, sessionSkillBackend, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
+import Seal.Core.ChannelKind (channelKindFromText)
+import Seal.Core.MessageSource (MessageSource, mkConversationId, mkMessageSource, mkUserId)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
@@ -531,6 +538,61 @@ sendOutcomeJson = \case
     (200, object [ "kind" .= ("answer" :: Text), "response" .= ("✓ " <> a) ])
   SendError c m  -> (c, object [ "error" .= m ])
 
+-- | Reconstruct the inbound 'MessageSource' from the optional provenance
+-- fields of a POST /send body. Every leaf is re-validated by the smart
+-- constructors; any invalid leaf makes the whole source 'Nothing' (the turn
+-- then falls back to the arrival channel and carries no user id). The
+-- conversation id is used only for attribution (requestMeta), never for
+-- routing or authorization, so a forged value cannot hijack anything.
+mkSendMessageSource :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe MessageSource
+mkSendMessageSource mChannel mUserId mConversationId = do
+  chText <- mChannel
+  cidText <- mConversationId
+  kind <- channelKindFromText chText
+  cid <- either (const Nothing) Just (mkConversationId cidText)
+  uid <- case mUserId of
+    Nothing     -> Just Nothing
+    Just uidTxt -> Just <$> either (const Nothing) Just (mkUserId uidTxt)
+  either (const Nothing) Just (mkMessageSource cid kind uid mempty)
+
+-- | Mint a 'web'-channel 'MessageSource' for a POST /send that did not carry
+-- explicit provenance. The conversation id is server-derived from the session
+-- id, the (optional) authenticated passkey id is recorded as the user id, and
+-- the client IP (when known) rides in the open metadata map under
+-- @"clientIp"@. Returns 'Nothing' when the session id cannot be turned
+-- into a valid conversation id (should not happen in practice).
+mkWebMessageSource :: SessionId -> Maybe Text -> Maybe Text -> Maybe MessageSource
+mkWebMessageSource sid mPasskey mIp = do
+  cid <- either (const Nothing) Just (mkConversationId ("web:" <> sessionIdText sid))
+  kind <- channelKindFromText "web"
+  uid <- case mPasskey of
+    Nothing -> Just Nothing
+    Just p  -> Just <$> either (const Nothing) Just (mkUserId p)
+  let open = case mIp of
+        Nothing -> Map.empty
+        Just ip -> Map.singleton "clientIp" ip
+  either (const Nothing) Just (mkMessageSource cid kind uid open)
+
+-- | Parse a POST /send body into its message text and (optional) inbound
+-- 'MessageSource'. A missing message reads as @""@ (the routing grammar
+-- treats empty input as 'Plain ""'), and a malformed body yields
+-- @("", Nothing)@.
+parseSendBody :: BL.ByteString -> (Text, Maybe MessageSource)
+parseSendBody body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) ->
+      ( messageText (KeyMap.lookup (Key.fromText "message") o)
+      , mkSendMessageSource
+          (asText (KeyMap.lookup (Key.fromText "channel") o))
+          (asText (KeyMap.lookup (Key.fromText "userId") o))
+          (asText (KeyMap.lookup (Key.fromText "conversationId") o)) )
+    _ -> ("", Nothing)
+  where
+    asText (Just (A.String t)) = Just t
+    asText _                   = Nothing
+    messageText (Just (A.String t)) = t
+    messageText _                   = ""
+
 -- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
 -- -> 404; an unknown provider / vault error -> 400; an internal failure ->
@@ -549,8 +611,8 @@ sendOutcomeJson = \case
 -- excluded from auto-tabbing. The auto-tab is gated on
 -- 'Seal.Core.TurnEngine.shouldAutoTab' exactly as the turn engine's own is, so
 -- a @\/bg@ session (@channel="bg"@) stays headless.
-handleSend :: SendDeps -> SessionId -> Text -> IO SendOutcome
-handleSend deps sid rawText = do
+handleSend :: SendDeps -> SessionId -> Maybe MessageSource -> Text -> IO SendOutcome
+handleSend deps sid mSrc rawText = do
   mMeta <- loadSessionMeta (sdPaths deps) sid
   case mMeta of
     Nothing -> pure (SendError 404 "session not found")
@@ -574,14 +636,14 @@ handleSend deps sid rawText = do
             pure (SendAnswer answer)
           -- No pending question (or it was resolved concurrently, in which
           -- case nothing was delivered): route the text as a normal turn.
-          _ -> startPlainTurn deps meta t
+          _ -> startPlainTurn deps meta mSrc t
       Right (SlashCommand cmdName) -> do
         -- W5: no srActive swap bracket. The per-request call/skill
         -- dispatcher closes over the request's explicit sid (see
         -- 'runSlash'). /new still swaps srActive via its ndRebind (the
         -- swap is how /new communicates the new session to
         -- 'newSessionIdIfChangedFrom').
-        r <- runSlash deps meta rawText
+        r <- runSlash deps meta mSrc rawText
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -596,7 +658,7 @@ handleSend deps sid rawText = do
             triggerBroadcast deps
             pure r
       Right (NewSession _args) -> do
-        r <- runSlash deps meta rawText
+        r <- runSlash deps meta mSrc rawText
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -620,12 +682,12 @@ handleSend deps sid rawText = do
 --
 -- Split out of 'handleSend' so the ask-answer branch (which starts NO turn)
 -- stays readable.
-startPlainTurn :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
-startPlainTurn deps meta t = do
+startPlainTurn :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO SendOutcome
+startPlainTurn deps meta mSrc t = do
   let sid' = smId meta
   void (forkIO (do
     er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
-      plainTurn deps meta t
+      plainTurn deps meta mSrc t
     case er of
       Left _   -> pure ()
       Right (Left _) -> pure ()
@@ -690,12 +752,12 @@ loadSessionMeta = readSessionMeta
 -- After the turn, the reply is fanned out to any chat channels (Telegram,
 -- Signal) subscribed to this session via the 'ReplyRegistry', so a web
 -- send on a channel-origin tab also delivers the reply to the channel.
-plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
-plainTurn deps meta t = do
+plainTurn :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO (Either Text ())
+plainTurn deps meta mSrc t = do
   let td = mkWebTurnDeps deps
   caps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
   let adapter = mkWebTurnAdapter deps td caps
-  outcome <- runSessionTurn td adapter meta Nothing t
+  outcome <- runSessionTurn td adapter meta mSrc t
   pure (case toError outcome of
           Just err -> Left err
           Nothing  -> Right ())
@@ -711,8 +773,8 @@ plainTurn deps meta t = do
 -- with, include the new id in the 'SendSlash' outcome so the frontend can
 -- navigate to it. (This avoids widening the 'CommandAction' contract or
 -- threading a per-call IORef through the registry.)
-runSlash :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
-runSlash deps meta fullLine = do
+runSlash :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO SendOutcome
+runSlash deps meta mSrc fullLine = do
   outVar <- newMVar ([] :: [Text])
   askCaps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
   let caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
@@ -760,13 +822,13 @@ runSlash deps meta fullLine = do
       -- the skill body is already there from 'recordSkillLoadResult'.
       case mFollowUp of
         Just t -> do
-          _ <- plainTurnWithCaps deps meta caps t
+          _ <- plainTurnWithCaps deps meta mSrc caps t
           pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
         Nothing -> pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
     ShowText t -> pure (SendSlash t Nothing)
     Rejected t -> pure (SendError 400 t)
     PlainMessage t -> do
-      er <- plainTurnWithCaps deps meta caps t
+      er <- plainTurnWithCaps deps meta mSrc caps t
       case er of
         Left err -> pure (SendError 400 err)
         Right () -> do
@@ -791,11 +853,11 @@ newSessionIdIfChangedFrom deps beforeSid = do
 -- | The plain-turn helper for a slash-dispatched PlainMessage (when the
 -- preprocess chain passes a leading-/ line through but the registry doesn't
 -- claim it). Mirrors 'plainTurn' but takes the caller's caps.
-plainTurnWithCaps :: SendDeps -> SessionMeta -> ChannelCaps -> Text -> IO (Either Text ())
-plainTurnWithCaps deps meta caps t = do
+plainTurnWithCaps :: SendDeps -> SessionMeta -> Maybe MessageSource -> ChannelCaps -> Text -> IO (Either Text ())
+plainTurnWithCaps deps meta mSrc caps t = do
   let td = mkWebTurnDeps deps
       adapter = mkWebTurnAdapter deps td caps
-  outcome <- runSessionTurn td adapter meta Nothing t
+  outcome <- runSessionTurn td adapter meta mSrc t
   pure (case toError outcome of
           Just err -> Left err
           Nothing  -> Right ())
@@ -913,6 +975,7 @@ streamingEntryJson text = object
   , "harness"   .= (Nothing :: Maybe Text)
   , "model"     .= (Nothing :: Maybe Text)
   , "channel"   .= (Nothing :: Maybe Text)
+  , "userId"    .= (Nothing :: Maybe Text)
   , "internal"  .= (Nothing :: Maybe Bool)
   , "raw"       .= ("" :: Text)
   ]

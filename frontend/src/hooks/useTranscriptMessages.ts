@@ -225,7 +225,9 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
             messages.push({
               id: e.id + '-user',
               entryId: e.id,
-              agentName: e.channel ? `You · ${e.channel}` : 'You',
+              agentName: e.channel
+                ? (e.userId ? `You · ${e.channel}:${e.userId}` : `You · ${e.channel}`)
+                : 'You',
               agentStatus: 'completed',
               timestamp: ts,
               blocks: [{ id: 'u-' + e.id, text: textParts }],

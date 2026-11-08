@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Tests for 'Seal.Gateway.Transcript.reconEntryToFrontend' — the filter
 -- that decides which reconstructed 'EKHarness' entries surface to the web
 -- frontend SPA. v1 whitelists @op.name == "SKILL_LOAD"@ so /skill load
@@ -38,6 +39,8 @@ import Seal.Gateway.Transcript
   , readTranscriptEntries, readTranscriptEntriesTimed, ReadLimit (..)
   , ttEntryCount
   , reconEntryToFrontend
+  , teLineToFrontend
+  , convLineToFrontend
   , renderServerTiming
   , trailingConvEntries
   , firstUserMessageSnippetFast
@@ -51,8 +54,8 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Transcript.Entries
   (EntryRecord (..), EntryKind (..), encodeEntryRecordRaw)
 
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Providers.Class qualified as PC (Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..))
+import Seal.Providers.Class qualified as PC (pattern Message, Role (..))
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 21) (secondsToDiffTime 0)
@@ -148,8 +151,65 @@ getPayloadField k (A.Object o) =
     _ -> Nothing
 getPayloadField _ _ = Nothing
 
+-- | Extract a top-level field from a frontend TranscriptEntry JSON value.
+getTopField :: String -> A.Value -> Maybe Value
+getTopField k (A.Object o) = KeyMap.lookup (Key.fromString k) o
+getTopField _ _ = Nothing
+
 spec :: Spec
 spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
+  describe "userId in frontend entries" $ do
+    it "reconEntryToFrontend emits teMeta.userId and teMeta.channel" $ do
+      let te = (mkHarnessTe skillLoadPayload)
+            { teMeta = Map.fromList
+                [ ("channel", String "telegram")
+                , ("userId", String "12345") ] }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v -> do
+          getTopField "userId" v `shouldBe` Just (String "12345")
+          getTopField "channel" v `shouldBe` Just (String "telegram")
+
+    it "reconEntryToFrontend emits null userId when the entry carries none" $ do
+      let te = (mkHarnessTe skillLoadPayload)
+            { teMeta = Map.fromList [("channel", String "telegram")] }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "userId" v `shouldBe` Just Null
+
+    it "teLineToFrontend reads meta.userId from a legacy line" $ do
+      let raw = A.object
+            [ "id"        .= String "e1"
+            , "timestamp" .= String "t"
+            , "direction" .= String "request"
+            , "payload"   .= String "{}"
+            , "meta"      .= object
+                [ "channel" .= String "telegram"
+                , "userId"  .= String "12345" ] ]
+      case teLineToFrontend raw of
+        A.Object o ->
+          KeyMap.lookup (Key.fromText "userId") o `shouldBe` Just (String "12345")
+        _ -> expectationFailure "expected an object"
+
+    it "convLineToFrontend emits null userId (conversation-only fallback)" $ do
+      let raw = A.object [ "role" .= String "user", "content" .= ([] :: [Value]) ]
+          v = convLineToFrontend "m" [] "t" 0 raw
+      getTopField "userId" v `shouldBe` Just Null
+
+    it "convLineToFrontend emits the message origin's channel and sender" $ do
+      -- Conv-only sessions (no entries.jsonl) must still label each user
+      -- message with its sender: the origin is on the line itself.
+      let raw = A.object
+            [ "role"    .= String "user"
+            , "content" .= [A.object [ "tag" .= String "CbText", "contents" .= String "hi" ]]
+            , "origin"  .= A.object
+                [ "channel"        .= String "telegram"
+                , "userId"         .= String "12345"
+                , "conversationId" .= String "tg:12345" ] ]
+          v = convLineToFrontend "m" [] "t" 0 raw
+      getTopField "channel" v `shouldBe` Just (String "telegram")
+      getTopField "userId" v `shouldBe` Just (String "12345")
+
   it "surfaces a SKILL_LOAD harness entry (whitelisted)" $ do
     let te = mkHarnessTe skillLoadPayload
     case reconEntryToFrontend 0 te of

@@ -2135,7 +2135,9 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
                 // came from. The channel is stamped into the request
                 // entry's erMeta by runTurn's requestMeta and shipped as
                 // a top-level `channel` field on the TranscriptEntry.
-                agentName: e.channel ? `You · ${e.channel}` : 'You',
+                agentName: e.channel
+                  ? (e.userId ? `You · ${e.channel}:${e.userId}` : `You · ${e.channel}`)
+                  : 'You',
                 agentStatus: 'completed',
                 timestamp: ts,
                 blocks: [{ id: 'u-' + e.id, text: textParts }],
