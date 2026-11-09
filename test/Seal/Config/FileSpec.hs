@@ -41,7 +41,6 @@ spec = describe "Seal.Config.File" $ do
         , rcRetrieval       = Nothing
         , rcSignal          = Nothing
         , rcTelegram        = Nothing
-        , rcGateway         = Nothing
         , rcDebugSessionTranscript = Nothing
         , rcDebugModelResponses = Nothing
         , rcMaxModelRetries = Nothing
@@ -100,7 +99,6 @@ spec = describe "Seal.Config.File" $ do
               , rcRetrieval       = Nothing
               , rcSignal          = Nothing
               , rcTelegram        = Nothing
-              , rcGateway         = Nothing
               , rcDebugSessionTranscript = Nothing
               , rcDebugModelResponses = Nothing
               , rcMaxModelRetries = Nothing
@@ -291,6 +289,21 @@ spec = describe "Seal.Config.File" $ do
         case result of
           Left _  -> pure ()
           Right _ -> expectationFailure "expected Left for malformed config"
+
+    -- Re-encoding through runtimeConfigCodec cannot carry a section the codec
+    -- no longer knows, so an un-migrated file must be refused, not rewritten:
+    -- the write would delete the operator's gateway bind address and the
+    -- migration could never recover it.
+    it "refuses while the file still carries a [gateway] table, and changes nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            initial = "default_provider = \"ollama\"\n\n[gateway]\nhost = \"0.0.0.0\"\nport = 8443\n"
+        TIO.writeFile path initial
+        result <- updateRuntimeConfig path (\c -> c { rcDefaultAgent = Just "worker" })
+        case result of
+          Left err -> err `shouldSatisfy` T.isInfixOf "seal serve"
+          Right _  -> expectationFailure "expected the legacy [gateway] write to be refused"
+        TIO.readFile path `shouldReturn` initial
 
   describe "provider defaults" $ do
     it "round-trips default_provider and default_model through TOML" $

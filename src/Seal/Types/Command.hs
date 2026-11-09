@@ -149,9 +149,10 @@ pAutonomy = flag Supervised Full
   <> help "Bypass the approval gate so untrusted opcodes run without prompting (ACK audit still recorded)"
   )
 
--- | @--static-dir DIR@ overrides the @[gateway] static_dir@ from TOML config,
--- serving UI assets from DIR instead of the embedded bundle (dev mode).
--- Absent = @Nothing@ (use TOML config or embedded default).
+-- | @--static-dir DIR@ overrides the @[gateway] static_dir@ in
+-- @~\/.seal\/security.toml@, serving UI assets from DIR instead of the embedded
+-- bundle (dev mode). Absent = @Nothing@ (use the security config or the
+-- embedded default).
 pStaticDir :: Parser (Maybe FilePath)
 pStaticDir = optional (strOption
   ( long "static-dir"

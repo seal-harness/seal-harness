@@ -8,7 +8,10 @@ BASE=http://127.0.0.1:$PORT
 
 rm -rf "$HOME_DIR"
 mkdir -p "$HOME_DIR/config"
-cat > "$HOME_DIR/config/config.toml" <<EOF
+# The gateway's bind address is a security setting, so it lives in
+# security.toml (see README). config.toml only carries runtime options.
+printf 'max_turns = 90\n' > "$HOME_DIR/config/config.toml"
+cat > "$HOME_DIR/security.toml" <<EOF
 [gateway]
 port = $PORT
 host = "127.0.0.1"
@@ -16,7 +19,7 @@ ws_port = 18091
 EOF
 # mode = "none" is the explicit operator waiver: it takes the passkey
 # middleware out of the picture so this walkthrough can run from curl.
-printf '[access_control]\nmode = "none"\n' > "$HOME_DIR/security.toml"
+printf '[access_control]\nmode = "none"\n' >> "$HOME_DIR/security.toml"
 chmod 600 "$HOME_DIR/security.toml"
 
 SEAL_HOME="$HOME_DIR" nix develop --command cabal run -v0 seal -- serve \
@@ -106,5 +109,5 @@ call GET /api/setup; show
 
 say "13. files written"
 ls -l "$HOME_DIR/security.toml" "$HOME_DIR/config/vault/" "$HOME_DIR/keys/" 2>&1
-say "security.toml contents (only the three vault fields + access_control)"
+say "security.toml contents (gateway bind, access_control, the three vault fields)"
 cat "$HOME_DIR/security.toml"

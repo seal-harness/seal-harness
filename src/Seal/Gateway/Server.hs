@@ -196,7 +196,7 @@ emptyEmbedResponse =
     ,("X-Content-Type-Options", "nosniff")]
     "<html><body><h1>No UI embedded in this build</h1>\
     \<p>Run <code>make build</code> with the frontend built, or set\
-    \[gateway] static_dir in config.toml.</p></body></html>"
+    \[gateway] static_dir in ~/.seal/security.toml.</p></body></html>"
 
 -- | Content-Type header from a file extension (case-insensitive).
 contentTypeHeader :: String -> ResponseHeaders

@@ -34,6 +34,7 @@ import Seal.Config.Security
   , WriteMode (PreserveCredentials) )
 import Seal.Security.EnrollmentGrant
   ( Grant (..), loadGrantFile, tokenDigest )
+import Seal.Gateway.Config (PartialGatewayConfig (..))
 import Seal.Types.Command (AccessControlAction (..), EnrollOptions (..))
 import Seal.Security.DaemonLock (acquireServeLock)
 
@@ -160,6 +161,39 @@ spec = describe "seal access-control" $ do
       runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitFailure 1
       doesFileExist (enrollmentGrantPath paths) `shouldReturn` False
 
+    -- After the [gateway] move, the bind lives in security.toml. The old
+    -- fixture above keeps working through the read-only upgrade fallback; this
+    -- one is the post-migration shape and must refuse for the same reason.
+    it "refuses on a non-loopback bind configured in security.toml" $ withHome $ \paths -> do
+      writeGateway paths (PartialGatewayConfig
+        { pgcPort = Just 8443, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0"
+        , pgcStaticDir = Nothing, pgcAllowedOrigins = []
+        , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
+        , pgcTlsHosts = [] })
+      runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitFailure 1
+      doesFileExist (enrollmentGrantPath paths) `shouldReturn` False
+
+    it "lets security.toml win over a stale table left in config.toml" $ withHome $ \paths -> do
+      TIO.writeFile (configFilePath paths) "[gateway]\nhost = \"0.0.0.0\"\n"
+      writeGateway paths (PartialGatewayConfig
+        { pgcPort = Nothing, pgcWsPort = Nothing, pgcHost = Just "localhost"
+        , pgcStaticDir = Nothing, pgcAllowedOrigins = []
+        , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
+        , pgcTlsHosts = [] })
+      runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitSuccess
+
+    -- The fallback exists so `status`/`enroll` stay correct during the upgrade
+    -- window. It must stay read-only: those verbs did not write here before,
+    -- and a pre-upgrade `seal serve` may be running (the security write lock is
+    -- process-local).
+    it "writes neither config file on status or enroll" $ withHome $ \paths -> do
+      let cfg = "default_provider = \"ollama\"\n"
+      TIO.writeFile (configFilePath paths) cfg
+      runAccessControlWith paths AcStatus `shouldReturn` ExitSuccess
+      runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitSuccess
+      doesFileExist (securityFilePath paths) `shouldReturn` False
+      TIO.readFile (configFilePath paths) `shouldReturn` cfg
+
   describe "disable" $ do
     it "refuses without --yes, as a usage error" $ withHome $ \paths -> do
       writeSection paths passkeySection
@@ -209,6 +243,12 @@ writeSection :: SealPaths -> AccessControlFileConfig -> IO ()
 writeSection paths section =
   saveSecurityConfig (securityFilePath paths)
     defaultSecurityConfig { scAccessControl = Just section } PreserveCredentials
+    `shouldReturn` Right ()
+
+writeGateway :: SealPaths -> PartialGatewayConfig -> IO ()
+writeGateway paths gateway =
+  saveSecurityConfig (securityFilePath paths)
+    defaultSecurityConfig { scGateway = Just gateway } PreserveCredentials
     `shouldReturn` Right ()
 
 sectionMode paths = do
