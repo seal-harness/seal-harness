@@ -503,6 +503,7 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = repo
         , adVault            = rt
+        , adCanonicalOrigin = naOrigin access
         , adPaths            = paths
         , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg
@@ -566,7 +567,6 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- Run the HTTP gateway (blocks). A non-loopback bind is allowed in every
   -- configuration; it is warned about, never refused (see 'runGateway').
   runGateway logger (Just (naHandle access)) gwCfg deps guard broker
-
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -732,6 +732,16 @@ forkResolvedChannel logger gwCfg mgr chanId resolved watchState = do
                       (\chan -> runChatChannel chanCfg chan watchState)))
 
 
+-- ---------------------------------------------------------------------------
+-- Access-control boot banner
+-- ---------------------------------------------------------------------------
+
+-- | Print the boot banner through the gateway's banner module, deciding the TTY
+-- case here because only the process knows what its stderr is.
+printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
+printAccessControlBanner paths access = do
+  stderrIsTTY <- hIsTerminalDevice stderr
+  printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access
 
 -- | Fork chat-channel listeners for every entry in 'rcChannels' (design
 -- §3.5). Each 'ChannelConfig' is resolved via the pure
@@ -766,16 +776,3 @@ forkChatChannels logger gwCfg mgr cfg mHandle watchState =
                       ("channel " <> ls (channelIdText chanId) <> ": " <> ls err)
         Right resolved ->
           void (forkIO (forkResolvedChannel logger gwCfg mgr chanId resolved watchState))
-
-
--- ---------------------------------------------------------------------------
--- Access-control boot banner
--- ---------------------------------------------------------------------------
-
--- | Print the boot banner through the gateway's banner module, deciding the TTY
--- case here because only the process knows what its stderr is.
-printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
-printAccessControlBanner paths access = do
-  stderrIsTTY <- hIsTerminalDevice stderr
-  printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access
-

@@ -246,6 +246,8 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.AccessControl
+         Seal.Gateway.OriginGuard
+         Seal.Gateway.Setup
          Seal.Gateway.Audit
         Seal.Gateway.API
          Seal.Gateway.Embedded
@@ -456,6 +458,8 @@ test-suite tests
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
         Seal.Gateway.AccessControlSpec
+        Seal.Gateway.OriginGuardSpec
+        Seal.Gateway.MutationGuardSpec
         Seal.Gateway.AuditSpec
        Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec

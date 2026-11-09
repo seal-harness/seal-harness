@@ -111,7 +111,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
@@ -172,7 +172,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
