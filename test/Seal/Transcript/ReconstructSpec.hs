@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Transcript.ReconstructSpec (spec) where
 
 import Data.Aeson (Value (..), decode, encode, object, (.=))
@@ -17,7 +18,7 @@ import qualified Data.Vector as V
 
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), Usage (..)
+  ( ContentBlock (..), pattern Message, Role (..), ToolResultPart (..), Usage (..)
   , ToolDefinition (..) )
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)

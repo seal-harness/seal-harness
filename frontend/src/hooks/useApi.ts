@@ -11,6 +11,10 @@ import type {
   ProviderInfo,
   ProviderDetail,
   ProviderInput,
+  ChannelDetail,
+  ChannelInput,
+  ChannelUpdateInput,
+  ChannelMutationResult,
   RepoInfo,
   RepoInput,
   SecretInput,
@@ -861,6 +865,95 @@ export function useAllProviders() {
   }, [refreshCount])
 
   return { providers, loaded, error, refresh }
+}
+
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** Fetch ALL channels from GET /api/channels. Returns null on any failure. */
+export async function fetchAllChannels(): Promise<ChannelDetail[] | null> {
+  return fetchJson<ChannelDetail[]>('/api/channels')
+}
+
+/** Read the backend's @{"error": "..."}@ body for a channel mutation,
+ *  falling back to the HTTP status. */
+async function channelMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new channel. For Telegram, the `token` is stored in the vault;
+ *  never persisted in config.toml. Returns the created channel detail on
+ *  success, or the backend's error on failure. */
+export async function createChannel(input: ChannelInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch('/api/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing channel's config. The id is taken from the path.
+ *  Returns the updated channel detail on success, or the backend's error
+ *  on failure. */
+export async function updateChannel(id: string, input: ChannelUpdateInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a channel by id. Returns true when the backend accepted the
+ *  delete (204). Idempotent — a missing id is not an error. */
+export async function deleteChannel(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Mount + refresh list of all channels. Mirrors useAllProviders — fetches
+ *  GET /api/channels on mount and when `refresh()` is called after a
+ *  mutation. NOT polled (channel config changes only via this UI). */
+export function useChannels() {
+  const [channels, setChannels] = useState<ChannelDetail[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchAllChannels().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setChannels(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { channels, loaded, error, refresh }
 }
 
 // ── Tab mutators ────────────────────────────────────────────────────────

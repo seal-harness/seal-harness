@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Transcript.ConvIndexSpec (spec) where
 
 import Data.ByteString qualified as BS
@@ -13,7 +14,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.QuickCheck
 
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..))
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
 import Seal.Transcript.ConvIndex

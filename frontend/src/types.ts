@@ -287,6 +287,55 @@ export interface ProviderInput {
   default_model?: string
 }
 
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** The auth status of a channel, as reported by GET /api/channels.
+ *  Mirrors the backend's authStatus field. */
+export type ChannelAuthStatus = 'configured' | 'missing-credential' | 'vault-locked'
+
+/** The detailed channel info returned by GET /api/channels, showing ALL
+ *  configured channels. camelCase response wire keys match the backend's
+ *  JSON 1:1 (no mapping function needed, like ProviderDetail). */
+export interface ChannelDetail {
+  id: string
+  kind: string
+  label: string | null
+  account: string | null
+  textChunkLimit: number | null
+  allowFrom: string[] | null
+  authStatus: ChannelAuthStatus
+}
+
+/** The body for POST /api/channels. Wire keys are snake_case, matching the
+ *  request body 1:1 (like ProviderInput). `token` is write-only — never
+ *  returned by the API. */
+export interface ChannelInput {
+  id: string
+  kind: string
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The body for PUT /api/channels/:id. All optional — only provided fields
+ *  are updated. `kind` and `id` are immutable. */
+export interface ChannelUpdateInput {
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The outcome of a channel create/update mutation. On success `channel`
+ *  carries the updated detail; on failure `error` carries the backend's
+ *  error message. The token is NEVER echoed back. */
+export type ChannelMutationResult =
+  | { ok: true; channel: ChannelDetail }
+  | { ok: false; error: string }
+
 // ── Agent CRUD (full def) ──────────────────────────────────────────────
 
 /** The opcode-allow-list wire shape: the string "all" or an array of
@@ -458,6 +507,12 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** The authenticated sender user id on the originating channel (a Telegram
+   *  user id, or a Signal phone/uuid), or null when the channel carried no
+   *  sender identity (web/CLI, response entries, the conversation-only
+   *  fallback). Stamped into the request entry's erMeta as `userId` by
+   *  runTurn's requestMeta. */
+  userId: string | null
   /** Whether this is a harness-internal entry (e.g. the synthetic
    *  continuation prompt appended after a StopMaxTokens truncation).
    *  When true, the frontend hides the entry from the chat view so the

@@ -45,6 +45,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: null,
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
     ...overrides,
@@ -400,6 +401,7 @@ describe('transcriptToMessages', () => {
         id: 'u-tg',
         direction: 'request',
         channel: 'telegram',
+        userId: '12345',
         payload: JSON.stringify({
           messages: [{ role: 'user', content: [{ type: 'text', text: 'hi from telegram' }] }],
         }),
@@ -407,9 +409,25 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const userRow = msgs.find((m) => m.agentName === 'You · telegram')
+    const userRow = msgs.find((m) => m.agentName === 'You · telegram:12345')
     expect(userRow).toBeTruthy()
     expect(userRow!.blocks[0]!.text).toBe('hi from telegram')
+  })
+
+  it('renders only the channel when the entry has no user id', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u-tg2',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'no id' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.find((m) => m.agentName === 'You · telegram')).toBeTruthy()
   })
 
   it('carries the verbatim raw json through to the row', () => {

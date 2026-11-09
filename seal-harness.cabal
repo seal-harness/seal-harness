@@ -127,6 +127,7 @@ library
         Seal.Transcript.Conv
         Seal.Transcript.ConvIndex
         Seal.Transcript.Entries
+        Seal.Transcript.Origin
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
         Seal.Handles.AskReply
@@ -195,6 +196,7 @@ library
           Seal.SourceControl.GithubKeys
          Seal.Signal.Config
          Seal.Telegram.Config
+         Seal.Channels.Config
          Seal.Security.Command
          Seal.Security.Crypto
          Seal.Security.Path
@@ -405,6 +407,7 @@ test-suite tests
       , lens
       , openapi-hs
       , seal-gateway-types
+     , trasa
        , seal-chat-channels
     hs-source-dirs: test
     other-modules:
@@ -450,6 +453,7 @@ test-suite tests
         Seal.Transcript.ConvSpec
         Seal.Transcript.ConvIndexSpec
         Seal.Transcript.EntriesSpec
+        Seal.Transcript.OriginSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
         Seal.Handles.AskReplySpec
@@ -489,6 +493,7 @@ test-suite tests
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Telegram.ConfigSpec
+        Seal.Channels.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec

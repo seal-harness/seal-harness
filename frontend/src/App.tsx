@@ -9,6 +9,7 @@ import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
+import { ChannelsView } from './components/ChannelsView'
 import { FilesView } from './components/FilesView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
@@ -65,6 +66,7 @@ function sectionFromPath(): TopSection {
   if (typeof window === 'undefined') return 'sessions'
   const path = window.location.pathname
   if (path === '/providers' || path.startsWith('/providers/')) return 'providers'
+  if (path === '/channels' || path.startsWith('/channels/')) return 'channels'
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
@@ -1032,6 +1034,8 @@ export default function App() {
       <TopBar section={section} onSectionChange={handleSectionChange} />
       {section === 'providers' ? (
         <ProvidersView />
+      ) : section === 'channels' ? (
+        <ChannelsView />
       ) : section === 'agents' ? (
         <AgentsView />
       ) : section === 'skills' ? (

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Append-only session transcript with a single-writer daemon.
 --
 -- Two coexisting on-disk formats:
@@ -75,7 +76,8 @@ import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionConversatio
 import Seal.Core.Types (OpName, ToolCallId, ModelId (..), SessionId)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), ToolChoice (..) )
+  ( ContentBlock (..), Message (msgContent), pattern Message, Role (..)
+  , ToolResultPart (..), ToolChoice (..) )
 import Seal.Session.Log (appendSessionLog)
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
 import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
@@ -733,9 +735,12 @@ redactMessages secretOps allMsgs newMsgs =
               | otherwise             = a
             goBlock _ a = a
 
+    -- Redaction rewrites the content blocks only: the message's origin and
+    -- role ride through untouched, so a redacted user message still records
+    -- who sent it.
     redactMessage :: Set ToolCallId -> Message -> Message
-    redactMessage secretIds (Message role blocks) =
-      Message role (map (redactBlock secretIds) blocks)
+    redactMessage secretIds m@(Message _ blocks) =
+      m { msgContent = map (redactBlock secretIds) blocks }
       where
         redactBlock ids (CbToolResult tcid parts isErr)
           | tcid `Set.member` ids = CbToolResult tcid (map redactPart parts) isErr

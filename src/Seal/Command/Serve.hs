@@ -11,6 +11,7 @@ import Control.Exception (catch)
 import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
+import Data.Map.Strict qualified as Map
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
@@ -34,6 +35,8 @@ import Seal.Channels.Chat.Telegram as ChatTelegram
 import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
 import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
+import Seal.Channels.Config
+import Seal.Core.ChannelKind (ChannelKind (..))
 
 import Seal.Agent.Runtime.Registry (AgentRuntime, hasRunningChildren)
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
@@ -88,13 +91,11 @@ import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHan
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
-import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -437,9 +438,9 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The channels connect to the gateway as clients (HTTP + WS)
-  -- via the 'seal-chat-channels' package.
-  forkNewSignalChatChannel logger gwCfg mgr cfg watchState
-  forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState
+  -- via the 'seal-chat-channels' package. Iterates 'rcChannels' (design
+  -- §3.5): each entry is resolved and forked; failures log a warning.
+  forkChatChannels logger gwCfg mgr cfg mHandle watchState
   -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
   -- mode=remote (design V6: prevents network access to the unauthenticated
   -- updateRuntimeConfig caller).
@@ -527,33 +528,46 @@ renumberTabs ts = TabList (zipWith renumber [0..] ts)
 -- ---------------------------------------------------------------------------
 -- Chat-channel fork functions (gateway-API-client implementation)
 -- ---------------------------------------------------------------------------
--- | Fork the new Signal chat channel if @[signal]@ is configured.
-forkNewSignalChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> WatchState -> IO ()
-forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
-  case Seal.Signal.Config.resolveSignalConfig (rcSignal cfg) Nothing of
-    Left _ -> pure ()
-    Right (account, chunkLimit, allow) -> do
-      -- The chat channels connect to the gateway as clients. When the
-      -- gateway binds to 0.0.0.0, use 127.0.0.1 for client connections.
-      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
-                         then "127.0.0.1" :: T.Text
-                         else Seal.Gateway.Config.gcHost gwCfg
-      let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = clientHost
-            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            -- The WS stream is served on the SAME port as the HTTP API.
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
-            }
-          chanCfg = defaultChatChannelConfig mgr chatGwCfg
-          accountText = Seal.Signal.Config.signalAccountText account
+-- | Fork a single resolved chat channel. This is the post-resolution body
+-- extracted from the former monolithic @forkNewSignalChatChannel@ /
+-- @forkNewTelegramChatChannel@ (design §3.5): resolution has already
+-- happened ('resolveChannelConfig' in the caller); this function builds the
+-- gateway-client transport and forks 'withSignalChatChannel' or
+-- 'withTelegramChatChannel'. The existing library functions are reused
+-- unchanged. The 'ChannelId' is used only for diagnostic logging.
+forkResolvedChannel
+  :: SealLogger
+  -> Seal.Gateway.Config.GatewayConfig
+  -> Manager
+  -> ChannelId
+  -> ResolvedChannel
+  -> WatchState
+  -> IO ()
+forkResolvedChannel logger gwCfg mgr chanId resolved watchState = do
+  -- The chat channels connect to the gateway as clients. When the
+  -- gateway binds to 0.0.0.0, use 127.0.0.1 for client connections.
+  let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
+                     then "127.0.0.1" :: T.Text
+                     else Seal.Gateway.Config.gcHost gwCfg
+      chatGwCfg = ChatTypes.GatewayConfig
+        { ChatTypes.gcHost = clientHost
+        , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
+        -- The WS stream is served on the SAME port as the HTTP API.
+        , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
+        , ChatTypes.gcApiBase = "http://" <> clientHost
+            <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
+        , ChatTypes.gcWsUrl = "ws://" <> clientHost
+            <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
+        }
+      chanCfg = defaultChatChannelConfig mgr chatGwCfg
+      cid = channelIdText chanId
+  case resolved of
+    ResolvedSignal account chunkLimit allow -> do
+      let accountText = Seal.Signal.Config.signalAccountText account
       eTransport <- ChatSignal.mkRealSignalChatTransport accountText
       case eTransport of
-        Left err -> logIO logger WarningS ("signal chat channel: " <> ls err)
+        Left err -> logIO logger WarningS
+                      ("channel " <> ls cid <> ": signal chat channel: " <> ls err)
         Right transport ->
           void (forkIO (withSignalChatChannel
                           allow
@@ -561,36 +575,8 @@ forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
                          1000000
                           transport
                           (\chan -> runChatChannel chanCfg chan watchState)))
-
--- | Fork the new Telegram chat channel if @[telegram]@ is configured.
-forkNewTelegramChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> WatchState -> IO ()
-forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
-  mVaultToken <- case mHandle of
-    Nothing -> pure Nothing
-    Just vh -> do
-      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
-      pure (case r of
-        Right bs -> Just (TE.decodeUtf8 bs)
-        Left _   -> Nothing)
-  case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) mVaultToken of
-    Left err -> logIO logger WarningS ("telegram chat channel: " <> ls err)
-    Right (token, chunkLimit, allow) -> do
-      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
-                         then "127.0.0.1" :: T.Text
-                         else Seal.Gateway.Config.gcHost gwCfg
-      let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = clientHost
-            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            -- The WS stream is served on the SAME port as the HTTP API.
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg))
-            }
-          chanCfg = defaultChatChannelConfig mgr chatGwCfg
-          tokenText = Seal.Telegram.Config.telegramTokenText token
+    ResolvedTelegram token chunkLimit allow -> do
+      let tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
       -- Register the bot's command menu (/help on Telegram shows it) from
       -- the gateway's slash-command registry. Forked: the chat listeners are
@@ -604,10 +590,45 @@ forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
         case eRes of
           Right () -> pure ()
           Left e   -> logIO logger WarningS
-                        ("telegram chat channel: command menu not registered: " <> ls e)))
+                        ("channel " <> ls cid
+                           <> ": telegram chat channel: command menu not registered: " <> ls e)))
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit
                      1000000
                       transport
                       (\chan -> runChatChannel chanCfg chan watchState)))
+
+-- | Fork chat-channel listeners for every entry in 'rcChannels' (design
+-- §3.5). Each 'ChannelConfig' is resolved via the pure
+-- 'resolveChannelConfig'; the caller pre-fetches the vault token for
+-- Telegram channels via 'vhGet' + 'telegramVaultKeyFor'. A channel that
+-- fails resolution logs a warning rather than crashing serve startup.
+-- Replaces the former single-fork @forkNewSignalChatChannel@ /
+-- @forkNewTelegramChatChannel@.
+forkChatChannels
+  :: SealLogger
+  -> Seal.Gateway.Config.GatewayConfig
+  -> Manager
+  -> RuntimeConfig
+  -> Maybe VaultHandle
+  -> WatchState
+  -> IO ()
+forkChatChannels logger gwCfg mgr cfg mHandle watchState =
+  void (Map.traverseWithKey forkOne (rcChannels cfg))
+  where
+    forkOne chanId chanCfg = do
+      -- Pre-fetch the vault token for Telegram channels (IO); Signal
+      -- channels pass Nothing (the account lives in config, not the vault).
+      mVaultToken <- case (ccKind chanCfg, mHandle) of
+        (Telegram, Just vh) -> do
+          r <- vhGet vh (telegramVaultKeyFor chanId)
+          pure (case r of
+            Right bs -> Just (TE.decodeUtf8 bs)
+            Left _   -> Nothing)
+        _ -> pure Nothing
+      case resolveChannelConfig chanId chanCfg mVaultToken of
+        Left err -> logIO logger WarningS
+                      ("channel " <> ls (channelIdText chanId) <> ": " <> ls err)
+        Right resolved ->
+          void (forkIO (forkResolvedChannel logger gwCfg mgr chanId resolved watchState))
