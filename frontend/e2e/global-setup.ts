@@ -14,7 +14,6 @@ import { join } from 'node:path'
  */
 
 const PORT = 18080
-const WS_PORT = 18081
 const BASE_URL = process.env.SEAL_E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`
 
 // Fixed path under /tmp so global-teardown can find the PID + SEAL_HOME
@@ -69,7 +68,6 @@ export default async function globalSetup(): Promise<void> {
     '[gateway]',
     `port = ${PORT}`,
     'host = "127.0.0.1"',
-    `ws_port = ${WS_PORT}`,
     `static_dir = "${STATIC_DIR}"`,
     `allowed_origins = ["http://127.0.0.1:${PORT}"]`,
     '',
