@@ -379,7 +379,7 @@ sampleSecurityConfig = SecurityConfig
                                (Just "https://seal.example.com")
                                (Just "seal.example.com"))
   , scGateway        = Just (PartialGatewayConfig
-      { pgcPort = Just 8080, pgcWsPort = Just 8080, pgcHost = Just "sample-host"
+      { pgcPort = Just 8080, pgcHost = Just "sample-host"
       , pgcStaticDir = Just "/srv/sample", pgcAllowedOrigins = ["https://sample"]
       , pgcTlsCert = Just "/c.pem", pgcTlsKey = Just "/k.pem", pgcTls = Just True
       , pgcTlsHosts = ["sample.lan"] })

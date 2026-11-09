@@ -15,7 +15,6 @@ cat > "$HOME_DIR/security.toml" <<EOF
 [gateway]
 port = $PORT
 host = "127.0.0.1"
-ws_port = 18091
 EOF
 # mode = "none" is the explicit operator waiver: it takes the passkey
 # middleware out of the picture so this walkthrough can run from curl.

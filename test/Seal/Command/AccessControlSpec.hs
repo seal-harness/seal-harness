@@ -166,7 +166,7 @@ spec = describe "seal access-control" $ do
     -- one is the post-migration shape and must refuse for the same reason.
     it "refuses on a non-loopback bind configured in security.toml" $ withHome $ \paths -> do
       writeGateway paths (PartialGatewayConfig
-        { pgcPort = Just 8443, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0"
+        { pgcPort = Just 8443, pgcHost = Just "0.0.0.0"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })
@@ -176,7 +176,7 @@ spec = describe "seal access-control" $ do
     it "lets security.toml win over a stale table left in config.toml" $ withHome $ \paths -> do
       TIO.writeFile (configFilePath paths) "[gateway]\nhost = \"0.0.0.0\"\n"
       writeGateway paths (PartialGatewayConfig
-        { pgcPort = Nothing, pgcWsPort = Nothing, pgcHost = Just "localhost"
+        { pgcPort = Nothing, pgcHost = Just "localhost"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })

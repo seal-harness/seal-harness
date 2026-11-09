@@ -340,7 +340,6 @@ spec = describe "Seal.Config.Security" $ do
   describe "gateway section" $ do
     let partial = PartialGatewayConfig
           { pgcPort = Just 8443
-          , pgcWsPort = Nothing
           , pgcHost = Just "0.0.0.0"
           , pgcStaticDir = Just "/srv/seal/frontend-dist"
           , pgcAllowedOrigins = ["https://seal.example.com"]

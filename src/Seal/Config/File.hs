@@ -157,7 +157,7 @@ data RuntimeConfig = RuntimeConfig
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
-    -- 'defaultMaxTurns' (90). Values < 1 are clamped to 1 at resolution
+    -- 'defaultMaxTurns' (200). Values < 1 are clamped to 1 at resolution
     -- time. Mirrors Hermes' default.
   , rcToolTimeout :: Maybe ToolTimeoutFileConfig
     -- ^ Optional @[tool_timeout]@ section (per-call timeout/abort/retry
@@ -422,9 +422,9 @@ defaultModelRetryBaseDelayMs = 1000
 
 -- | The compiled-in default for the maximum tool-use iterations per turn.
 -- Used when the @max_turns@ key is absent (or the whole config is absent).
--- Mirrors Hermes' default (90).
+-- Raised from 90: long tool-driven tasks routinely hit the old ceiling.
 defaultMaxTurns :: Int
-defaultMaxTurns = 90
+defaultMaxTurns = 200
 
 -- | Resolve the per-turn max-iterations bound from the loaded config. Absent
 -- or non-positive values fall back to 'defaultMaxTurns'; values below 1 are

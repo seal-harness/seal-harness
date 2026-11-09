@@ -84,10 +84,6 @@ port = 8080
 # automatically, so this only needs entries for a reverse proxy.
 allowed_origins = ["http://localhost:8080"]
 
-# ws_port is retired: the WebSocket stream shares `port`. The key is still
-# parsed so an older config file keeps working.
-# ws_port = 8080
-
 # Serve the web UI from a directory instead of the copy embedded in the binary.
 # `seal serve --static-dir DIR` overrides it for one run.
 # static_dir = "/srv/seal/frontend-dist"

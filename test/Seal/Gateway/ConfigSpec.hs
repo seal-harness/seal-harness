@@ -19,9 +19,6 @@ spec = describe "Seal.Gateway.Config" $ do
   describe "defaultGatewayConfig" $ do
     it "has port 8080, host localhost" $ do
       gcPort defaultGatewayConfig `shouldBe` 8080
-      -- The WS stream shares the HTTP port (single-port gateway), so the
-      -- deprecated ws_port defaults to the same value.
-      gcWsPort defaultGatewayConfig `shouldBe` 8080
       gcHost defaultGatewayConfig `shouldBe` "localhost"
       gcStaticDir defaultGatewayConfig `shouldBe` Nothing
       gcAllowedOrigins defaultGatewayConfig `shouldBe` ["http://localhost:8080"]
@@ -73,19 +70,17 @@ spec = describe "Seal.Gateway.Config" $ do
 
   describe "withGatewayDefaults" $ do
     it "fills in defaults for missing fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
-      gcWsPort full `shouldBe` 8080   -- default (same as the HTTP port)
       gcHost full `shouldBe` "0.0.0.0"
       gcStaticDir full `shouldBe` Nothing
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
 
     it "preserves all set fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
-      gcWsPort full `shouldBe` 9091
       gcHost full `shouldBe` "0.0.0.0"
       gcStaticDir full `shouldBe` Just "/srv/seal"
       gcAllowedOrigins full `shouldBe` ["http://example.com"]
@@ -95,7 +90,6 @@ spec = describe "Seal.Gateway.Config" $ do
   describe "gatewayTableCodec / loadLegacyGatewayTable" $ do
     let full = PartialGatewayConfig
           { pgcPort = Just 9090
-          , pgcWsPort = Just 9091
           , pgcHost = Just "0.0.0.0"
           , pgcStaticDir = Just "/srv/seal"
           , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
