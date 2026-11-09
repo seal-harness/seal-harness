@@ -27,6 +27,7 @@ import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
+import Data.Map.Strict qualified as Map
 import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 
@@ -38,7 +39,7 @@ import Text.Read (readMaybe)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status500, status501 )
+  , status200, status201, status204, status400, status403, status404, status409, status500, status501 )
 import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
@@ -58,12 +59,13 @@ import Seal.Agent.Def.Types
   , sanitizeAgentDefFields )
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Command.Spec (CommandName (..), CommandSpec (..), Registry (..))
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), mkChannelId, channelIdText, telegramVaultKeyFor, restrictChannelKind)
+import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Core.MessageSource (MessageSource (..), mkUserId)
-import qualified Data.Map.Strict as Map
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, deleteChannel)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
@@ -626,6 +628,32 @@ apiApp deps req respond =
         [ "contextWindow" .= modelContextWindow m
         , "maxOutputTokens" .= modelMaxOutputTokens m
         ]))
+    -- GET /api/channels -> the configured chat channels (multi-instance
+    -- Signal/Telegram). Returns a JSON array of channel detail objects
+    -- (camelCase: id, kind, label, account, textChunkLimit, allowFrom,
+    -- authStatus). Legacy [signal]/[telegram] sections are migrated into
+    -- the channel map on load (design §3.3).
+    (m', ["api", "channels"]) | m' == methodGet ->
+      respond =<< handleChannelsList deps
+    -- POST /api/channels -> create a new channel. Body (snake_case):
+    -- {id, kind, label?, account?, token?, text_chunk_limit?, allow_from?}.
+    -- Validates id (mkChannelId), kind (signal/telegram), duplicate (409).
+    -- Telegram tokens stored in vault. Returns 201 + detail.
+    (m', ["api", "channels"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleChannelCreate deps body
+    -- PUT /api/channels/:id -> update an existing channel's fields. Body
+    -- (snake_case, all optional): {label?, account?, token?, text_chunk_limit?,
+    -- allow_from?}. kind is immutable. 404 for unknown id. Rotates vault
+    -- key if token present (Telegram). Returns 200 + detail.
+    (m', ["api", "channels", cid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleChannelUpdate deps cid body
+    -- DELETE /api/channels/:id -> remove a channel. Idempotent (204 for
+    -- missing). Deletes the Telegram vault key. Nullifies the legacy
+    -- [signal]/[telegram] field when the id is a legacy default.
+    (m', ["api", "channels", cid]) | m' == methodDelete ->
+      respond =<< handleChannelDelete deps cid
     -- GET /api/ui/state -> the persisted last-chosen "new tab" options and
     -- the custom-model id history. The frontend loads this on mount so the
     -- form opens with the last-used selection; the custom-model combobox
@@ -2562,6 +2590,258 @@ handleProviderDelete deps name =
               _ <- updateRuntimeConfig cfgPath (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
               pure noContent
             else pure noContent
+
+-- ---------------------------------------------------------------------------
+-- Channel CRUD handlers (design §3.7)
+-- ---------------------------------------------------------------------------
+
+-- | Handle GET /api/channels — returns all configured chat channels
+-- (multi-instance Signal/Telegram) as a JSON array of camelCase detail
+-- objects. Legacy @[signal]@\/@[telegram]@ sections are migrated into the
+-- channel map on load ('migrateLegacyChannels'), so they appear here too.
+-- Telegram tokens are NEVER returned; @authStatus@ probes the vault.
+handleChannelsList :: ApiDeps -> IO Response
+handleChannelsList deps = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadRuntimeConfig cfgPath
+  let cfg = fromRight defaultRuntimeConfig eCfg
+  mh <- readIORef (vrHandleRef (adVault deps))
+  details <- mapM (channelDetailJson mh) (Map.toList (rcChannels cfg))
+  pure (jsonLBS status200 (A.encode details))
+
+-- | Build the camelCase detail JSON for one channel. Wire keys match the
+-- frontend's @ChannelDetail@ TS type 1:1 (no mapping function): @id@,
+-- @kind@, @label@, @account@, @textChunkLimit@, @allowFrom@, @authStatus@.
+-- The token is never included. @authStatus@ is @configured@,
+-- @missing-credential@, or @vault-locked@ (probes vault for Telegram).
+channelDetailJson :: Maybe VaultHandle -> (ChannelId, ChannelConfig) -> IO Value
+channelDetailJson mh (cid, cc) = do
+  authStatus <- channelAuthStatus mh cid cc
+  pure $ object
+    [ "id" .= channelIdText cid
+    , "kind" .= channelKindToText (ccKind cc)
+    , "label" .= ccLabel cc
+    , "account" .= ccAccount cc
+    , "textChunkLimit" .= ccTextChunkLimit cc
+    , "allowFrom" .= allowFromJson (ccAllowFrom cc)
+    , "authStatus" .= authStatus
+    ]
+
+-- | Encode an 'AllowList' as the @allowFrom@ wire field: 'AllowAll' → JSON
+-- null (the frontend treats null as "allow everyone"); 'AllowOnly' → a JSON
+-- array of strings.
+allowFromJson :: AllowList Text -> Value
+allowFromJson AllowAll       = Null
+allowFromJson (AllowOnly xs) = A.toJSON (Set.toList xs)
+
+-- | Determine the @authStatus@ for a channel by probing the vault (Telegram)
+-- or checking the account field (Signal).
+-- * Signal: @configured@ if 'ccAccount' is set (non-empty), else
+--   @missing-credential@. No vault involvement.
+-- * Telegram: the vault token takes precedence; if the vault is locked →
+--   @vault-locked@; if the vault key is absent, fall back to 'ccToken'
+--   (the config-level migration token) → @configured@ if present, else
+--   @missing-credential@.
+channelAuthStatus :: Maybe VaultHandle -> ChannelId -> ChannelConfig -> IO Text
+channelAuthStatus mh cid cc = case ccKind cc of
+  Signal -> pure (credStatus (ccAccount cc))
+  Telegram -> case mh of
+    -- No handle = vault unconfigured/locked (the test harness models a
+    -- locked vault as a 'Nothing' handle). Fail closed: can't probe →
+    -- @vault-locked@ (a token may exist but is unreachable).
+    Nothing -> pure "vault-locked"
+    Just vh -> do
+      r <- vhGet vh (telegramVaultKeyFor cid)
+      case r of
+        Right _             -> pure "configured"
+        Left VaultLocked    -> pure "vault-locked"
+        Left (VaultKeyNotFound _) -> pure (credStatus (ccToken cc))
+        Left _              -> pure (credStatus (ccToken cc))
+  _ -> pure "missing-credential"
+  where
+    credStatus :: Maybe Text -> Text
+    credStatus (Just t) | not (T.null t) = "configured"
+    credStatus _ = "missing-credential"
+
+-- | Handle POST /api/channels — create a new channel. Input wire keys are
+-- snake_case (matching @ChannelInput@ 1:1): @id@, @kind@, @label?@,
+-- @account?@, @token?@, @text_chunk_limit?@, @allow_from?@. Validates @id@
+-- via 'mkChannelId' (400 on failure), @kind@ via 'restrictChannelKind'
+-- (400 on non-signal/telegram), and duplicate id (409). Telegram tokens
+-- are stored in the vault (never in config). Returns 201 + the detail.
+handleChannelCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleChannelCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseMaybe (withObject "channel" (.: "id")) v of
+      Nothing -> pure (errJson status400 "id is required")
+      Just cidTxt
+        | T.null cidTxt -> pure (errJson status400 "id must not be empty")
+        | otherwise -> case mkChannelId cidTxt of
+            Left e  -> pure (errJson status400 ("invalid id: " <> e))
+            Right cid -> case parseMaybe (withObject "channel" (.: "kind")) v of
+              Nothing -> pure (errJson status400 "kind is required")
+              Just kindTxt -> case restrictChannelKind kindTxt of
+                Left e  -> pure (errJson status400 e)
+                Right kind -> do
+                  let cfgPath = srConfigPath (adSessionRuntime deps)
+                      mLabel = parseMaybe (withObject "channel" (.: "label")) v
+                      mAccount = parseMaybe (withObject "channel" (.: "account")) v
+                      mToken = parseMaybe (withObject "channel" (.: "token")) v
+                      mChunkLimit = parseMaybe (withObject "channel" (.: "text_chunk_limit")) v
+                      mAllowFrom = parseMaybe (withObject "channel" (.: "allow_from")) v
+                      allowFrom = case mAllowFrom of
+                        Just xs -> AllowOnly (Set.fromList xs)
+                        Nothing -> AllowAll
+                  -- duplicate check (after migration so legacy ids conflict)
+                  eCfg <- loadRuntimeConfig cfgPath
+                  let cfg0 = fromRight defaultRuntimeConfig eCfg
+                  if Map.member cid (rcChannels cfg0)
+                    then pure (errJson status409 ("channel already exists: " <> channelIdText cid))
+                    else do
+                      -- store token in vault (Telegram only)
+                      vaultResult <- case (kind, mToken) of
+                        (Telegram, Just tok) | not (T.null tok) -> do
+                          mh <- readIORef (vrHandleRef (adVault deps))
+                          case mh of
+                            Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                            Just vh -> do
+                              r <- vhPut vh (telegramVaultKeyFor cid) (TE.encodeUtf8 tok)
+                              pure $ case r of
+                                Left e' -> Left (T.pack (show e'))
+                                Right _ -> Right ()
+                        _ -> pure (Right ())
+                      case vaultResult of
+                        Left e -> pure (errJson status500 e)
+                        Right () -> do
+                          let newCc = ChannelConfig
+                                { ccKind = kind
+                                , ccLabel = mLabel
+                                , ccAccount = mAccount
+                                , ccToken = Nothing
+                                , ccTextChunkLimit = mChunkLimit
+                                , ccAllowFrom = allowFrom
+                                }
+                          eRes <- updateRuntimeConfig cfgPath
+                            (\c -> c { rcChannels = Map.insert cid newCc (rcChannels c) })
+                          case eRes of
+                            Left e -> pure (errJson status500 e)
+                            Right _ -> do
+                              eCfg2 <- loadRuntimeConfig cfgPath
+                              let cfg2 = fromRight defaultRuntimeConfig eCfg2
+                              mh <- readIORef (vrHandleRef (adVault deps))
+                              case Map.lookup cid (rcChannels cfg2) of
+                                Just cc -> do
+                                  detail <- channelDetailJson mh (cid, cc)
+                                  pure (jsonLBS status201 (A.encode detail))
+                                Nothing -> pure (errJson status500 "channel not found after create")
+
+-- | Handle PUT /api/channels/:id — update an existing channel's fields.
+-- Input wire keys are snake_case (all optional): @label?@, @account?@,
+-- @token?@, @text_chunk_limit?@, @allow_from?@. @kind@ is immutable (a
+-- @kind@ in the body is silently ignored). 404 for an unknown id. For
+-- Telegram, a present @token@ rotates the vault key. Returns 200 + detail.
+handleChannelUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleChannelUpdate deps cidTxt body =
+  case mkChannelId cidTxt of
+    Left e -> pure (errJson status400 ("invalid id: " <> e))
+    Right cid -> case A.decode body :: Maybe A.Value of
+      Nothing -> pure (errJson status400 "invalid JSON body")
+      Just v  -> do
+        let cfgPath = srConfigPath (adSessionRuntime deps)
+        eCfg <- loadRuntimeConfig cfgPath
+        let cfg0 = fromRight defaultRuntimeConfig eCfg
+        case Map.lookup cid (rcChannels cfg0) of
+          Nothing -> pure (errJson status404 ("channel not found: " <> channelIdText cid))
+          Just cc -> do
+            let mLabel = parseMaybe (withObject "channel" (.: "label")) v
+                mAccount = parseMaybe (withObject "channel" (.: "account")) v
+                mToken = parseMaybe (withObject "channel" (.: "token")) v
+                mChunkLimit = parseMaybe (withObject "channel" (.: "text_chunk_limit")) v
+                mAllowFrom = parseMaybe (withObject "channel" (.: "allow_from")) v
+            -- rotate vault key if token present (Telegram only)
+            vaultResult <- case (ccKind cc, mToken) of
+              (Telegram, Just tok) | not (T.null tok) -> do
+                mh <- readIORef (vrHandleRef (adVault deps))
+                case mh of
+                  Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                  Just vh -> do
+                    r <- vhPut vh (telegramVaultKeyFor cid) (TE.encodeUtf8 tok)
+                    pure $ case r of
+                      Left e' -> Left (T.pack (show e'))
+                      Right _ -> Right ()
+              _ -> pure (Right ())
+            case vaultResult of
+              Left e -> pure (errJson status500 e)
+              Right () -> do
+                let updatedCc = cc
+                      { ccLabel = mLabel <|> ccLabel cc
+                      , ccAccount = mAccount <|> ccAccount cc
+                      , ccTextChunkLimit = mChunkLimit <|> ccTextChunkLimit cc
+                      , ccAllowFrom = case mAllowFrom of
+                          Just xs -> AllowOnly (Set.fromList xs)
+                          Nothing -> ccAllowFrom cc
+                      }
+                eRes <- updateRuntimeConfig cfgPath
+                  (\c -> c { rcChannels = Map.insert cid updatedCc (rcChannels c) })
+                case eRes of
+                  Left e -> pure (errJson status500 e)
+                  Right _ -> do
+                    eCfg2 <- loadRuntimeConfig cfgPath
+                    let cfg2 = fromRight defaultRuntimeConfig eCfg2
+                    mh <- readIORef (vrHandleRef (adVault deps))
+                    case Map.lookup cid (rcChannels cfg2) of
+                      Just cc2 -> do
+                        detail <- channelDetailJson mh (cid, cc2)
+                        pure (jsonOk detail)
+                      Nothing -> pure (errJson status500 "channel not found after update")
+
+-- | Handle DELETE /api/channels/:id — remove a channel. Idempotent (204
+-- whether or not the id existed). Deletes the Telegram vault key. When the
+-- deleted id is a legacy default (@signal@ / @telegram@), nullifies the
+-- corresponding legacy field (@rcSignal@ / @rcTelegram@) in the same
+-- transaction so the legacy section no longer re-synthesizes on the next
+-- load (design §3.3 deletion-respawn prevention).
+handleChannelDelete :: ApiDeps -> Text -> IO Response
+handleChannelDelete deps cidTxt =
+  case mkChannelId cidTxt of
+    Left e -> pure (errJson status400 ("invalid id: " <> e))
+    Right cid -> do
+      let cfgPath = srConfigPath (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig cfgPath
+      let cfg0 = fromRight defaultRuntimeConfig eCfg
+          mExisting = Map.lookup cid (rcChannels cfg0)
+          isLegacySignal = channelIdText cid == "signal"
+          isLegacyTelegram = channelIdText cid == "telegram"
+      -- delete the Telegram vault key (idempotent — missing key is fine)
+      forM_ mExisting $ \c -> case ccKind c of
+        Telegram -> do
+          mh <- readIORef (vrHandleRef (adVault deps))
+          forM_ mh $ \vh -> void (vhDelete vh (telegramVaultKeyFor cid))
+        _ -> pure ()
+      -- Skip the write entirely when there is nothing to persist (the
+      -- channel is absent AND no legacy field needs nullifying). This keeps
+      -- DELETE idempotent without requiring the config dir to pre-exist.
+      let needsWrite = isJust mExisting
+            || (isLegacySignal && isJust (rcSignal cfg0))
+            || (isLegacyTelegram && isJust (rcTelegram cfg0))
+      if not needsWrite
+        then pure noContent
+        else do
+          -- remove the channel + nullify the matching legacy field
+          let updateCfg c0 =
+                let c1 = deleteChannel cid c0
+                    c2 = if isLegacySignal
+                           then c1 { rcSignal = Nothing }
+                           else c1
+                    c3 = if isLegacyTelegram
+                           then c2 { rcTelegram = Nothing }
+                           else c2
+                in c3
+          eRes <- updateRuntimeConfig cfgPath updateCfg
+          case eRes of
+            Left e  -> pure (errJson status500 e)
+            Right _ -> pure noContent
 
 -- | Handle GET /api/providers/default — returns the configured
 -- @default_provider@ from config.toml as @{"provider": "anthropic"}@ or

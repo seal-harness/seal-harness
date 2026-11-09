@@ -196,6 +196,7 @@ library
           Seal.SourceControl.GithubKeys
          Seal.Signal.Config
          Seal.Telegram.Config
+         Seal.Channels.Config
          Seal.Security.Command
          Seal.Security.Crypto
          Seal.Security.Path
@@ -405,6 +406,7 @@ test-suite tests
       , lens
       , openapi-hs
       , seal-gateway-types
+     , trasa
        , seal-chat-channels
     hs-source-dirs: test
     other-modules:
@@ -489,6 +491,7 @@ test-suite tests
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Telegram.ConfigSpec
+        Seal.Channels.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
