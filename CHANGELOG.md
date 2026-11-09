@@ -2,6 +2,15 @@
 
 ## 0.1.0.0 — unreleased
 
+* **`[gateway] ws_port` is gone, and `max_turns` now defaults to 200.** The
+  WebSocket stream has shared the gateway's HTTP port since the single-port
+  change, so `ws_port` was a knob whose only effect was to be ignored; it is no
+  longer decoded (a file that still sets it parses, the key is dropped on the
+  next rewrite). `max_turns` — the tool-use iterations allowed in one turn
+  before the loop stops — was 90 and is now 200; long tool-driven tasks
+  routinely hit the old ceiling. A config file that sets `max_turns`
+  explicitly is unaffected.
+
 * **The web gateway's settings moved to `security.toml`.** `[gateway]` — the
   bind host and port, the WebSocket Origin allowlist, `static_dir`, and the TLS
   pair — now lives in `~/.seal/security.toml` beside the vault and

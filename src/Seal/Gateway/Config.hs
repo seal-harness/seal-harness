@@ -44,7 +44,6 @@ import Toml qualified
 -- | The gateway config section.
 data GatewayConfig = GatewayConfig
   { gcPort           :: Int        -- ^ default 8080 (REST + static + the WS stream)
-  , gcWsPort         :: Int        -- ^ DEPRECATED: the WS stream shares @gcPort@; kept only so old config files still parse
   , gcHost           :: Text
     -- ^ default "localhost" — the one loopback name browsers treat as a
     -- passkey-capable secure context. Handed to Warp as the bind address.
@@ -70,7 +69,6 @@ data GatewayConfig = GatewayConfig
 defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
   { gcPort = 8080
-  , gcWsPort = 8080
   , gcHost = "localhost"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
@@ -154,7 +152,6 @@ gatewayHostResolutionError resolves raw = do
 gatewayConfigCodec :: Toml.TomlCodec PartialGatewayConfig
 gatewayConfigCodec = PartialGatewayConfig
   <$> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "port")) .= pgcPort
-  <*> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "ws_port")) .= pgcWsPort
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
@@ -196,7 +193,6 @@ loadLegacyGatewayTable path = do
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
 data PartialGatewayConfig = PartialGatewayConfig
   { pgcPort           :: Maybe Int
-  , pgcWsPort         :: Maybe Int
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
@@ -214,7 +210,6 @@ data PartialGatewayConfig = PartialGatewayConfig
 withGatewayDefaults :: PartialGatewayConfig -> GatewayConfig
 withGatewayDefaults p = GatewayConfig
   { gcPort           = fromMaybe (gcPort defaultGatewayConfig) (pgcPort p)
-  , gcWsPort         = fromMaybe (gcWsPort defaultGatewayConfig) (pgcWsPort p)
   , gcHost           = fromMaybe (gcHost defaultGatewayConfig) (pgcHost p)
   , gcStaticDir      = pgcStaticDir p  -- Nothing = no static serving (the default)
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)

@@ -109,7 +109,7 @@ legacyMarkers =
 -- by the loader and loses no setting when it is dropped.
 gatewayKeys :: [Text]
 gatewayKeys =
-  [ "port", "ws_port", "host", "static_dir", "allowed_origins"
+  [ "port", "host", "static_dir", "allowed_origins"
   , "tls_cert", "tls_key", "tls", "tls_hosts"
   ]
 

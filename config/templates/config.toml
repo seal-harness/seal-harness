@@ -29,7 +29,7 @@
 # default_agent = "<agent-id>"
 
 # Tool-use iterations allowed in one turn before the loop stops (minimum 1).
-max_turns = 90
+max_turns = 200
 
 # Retries for a failed model call, and the first backoff delay in ms.
 max_model_retries = 3

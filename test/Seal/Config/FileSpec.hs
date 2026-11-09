@@ -173,8 +173,8 @@ spec = describe "Seal.Config.File" $ do
         result `shouldBe` Right cfg
 
   describe "maxTurnsConfig" $ do
-    it "defaults to 90 when max_turns is absent" $
-      maxTurnsConfig defaultRuntimeConfig `shouldBe` 90
+    it "defaults to 200 when max_turns is absent" $
+      maxTurnsConfig defaultRuntimeConfig `shouldBe` 200
 
     it "returns the configured value when set" $
       maxTurnsConfig (defaultRuntimeConfig { rcMaxTurns = Just 30 }) `shouldBe` 30
