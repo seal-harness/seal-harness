@@ -4,12 +4,26 @@
 -- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
 -- the agent/operator-tunable 'RuntimeConfig'). No opcode can reach this module.
 --
--- It is re-read in one narrow case only: 'updateAccessControlSection', which
--- rewrites the @[access_control]@ table when the operator enrolls a passkey,
--- waives the requirement, or manages credentials from the authenticated web
--- UI. That writer's callback sees only 'AccessControlFileConfig', so it
--- physically cannot express a change to any other section — the type split
--- (design §4 Approach E) keeps its guarantee.
+-- It is re-read through exactly two narrow writers, both reachable from the
+-- gateway and from the CLI:
+--
+-- * 'updateAccessControlSection' rewrites the @[access_control]@ table when the
+--   operator enrolls a passkey, waives the requirement, or manages credentials
+--   from the authenticated web UI. Its callback sees only
+--   'AccessControlFileConfig'.
+-- * 'updateVaultKeySection' records the three vault-key fields
+--   (@vault_recipient@, @vault_identity@, @vault_key_type@) when a vault is
+--   created from the web setup wizard. Its callback sees the current
+--   'SecurityConfig' but may only return 'VaultKeyFields'.
+--
+-- Neither callback can express a change to the other's section, nor to
+-- @untrusted_execution@: the type split (design §4 Approach E) keeps its
+-- guarantee, and it is a compile error, not a convention. Both run under
+-- 'securityWriteLock' and verify the re-encoded document before committing.
+--
+-- The file is therefore reachable from the HTTP gateway — but only through
+-- those two writers, only on a loopback-origin-guarded route, and only behind
+-- the passkey middleware (default-deny). Nothing here is an opcode surface.
 --
 -- Moving @untrusted_execution@ and the vault settings here means a future
 -- @CONFIG_UPDATE@ opcode (which operates on 'RuntimeConfig') and the Gateway's
@@ -36,6 +50,8 @@ module Seal.Config.Security
   , raiseMode
   , restoreMode
   , updateAccessControlSection
+  , VaultKeyFields (..)
+  , updateVaultKeySection
   , clearAccessControlSection
   , writeSecretFile
   , securityWriteLock
@@ -545,7 +561,9 @@ updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
     Left err  -> pure (Left err)
     Right cfg -> saveSecurityConfig path (f cfg) PreserveCredentials
 
--- | The ONLY writer of @security.toml@ reachable from the gateway.
+-- | One of the TWO narrow writers of @security.toml@ reachable from the
+-- gateway (the other is 'updateVaultKeySection'; they deliberately cannot touch
+-- each other's fields).
 --
 -- It loads the file, applies @f@ to the @[access_control]@ section alone, and
 -- re-encodes. The callback's type is @AccessControlFileConfig ->
@@ -578,6 +596,66 @@ updateAccessControlSection path f = withMVar securityWriteLock $ \_ -> do
               fmap (>> Right updated)
                 (saveSecurityConfig path newCfg PreserveCredentials)
         _ -> pure (Left "refusing to write security.toml: the encoded document does not round-trip the new [access_control] section")
+  where
+    reDecode encoded = case Toml.parse encoded of
+      Left _     -> Nothing
+      Right toml -> case Toml.runTomlCodec securityConfigCodec toml of
+        Success c -> Just c
+        Failure _ -> Nothing
+
+-- | The vault-key triple, and nothing else. The gateway's setup wizard writes
+-- exactly these three fields when it creates a vault.
+data VaultKeyFields = VaultKeyFields
+  { vkfRecipient :: !Text
+    -- ^ age public key (@age1…@ \/ @age1yubikey1…@).
+  , vkfIdentity  :: !FilePath
+    -- ^ Absolute path to the identity file.
+  , vkfKeyType   :: !Text
+    -- ^ Display label: @"x25519"@ \/ @"yubikey"@ \/ @"user"@.
+  } deriving stock (Eq, Show)
+
+-- | The other narrow writer: the vault-key triple, and nothing else.
+--
+-- The callback sees the *current* config and returns either a rejection (which
+-- is how the setup wizard refuses to overwrite a key that appeared between its
+-- pre-check and this write — a compare-and-swap across processes, since the
+-- read and the write happen inside 'securityWriteLock') or the triple to
+-- record.
+--
+-- Like 'updateAccessControlSection' the write is verified before it is
+-- committed: the encoded document is decoded again and compared, so a codec
+-- change that silently drops a field surfaces as @Left@ instead of data loss.
+-- The @[access_control]@ and @[untrusted_execution]@ sections are asserted
+-- unchanged, so this writer cannot become a back door for them.
+updateVaultKeySection
+  :: FilePath
+  -> (SecurityConfig -> Either e VaultKeyFields)
+  -> IO (Either Text (Either e VaultKeyFields))
+updateVaultKeySection path f = withMVar securityWriteLock $ \_ -> do
+  loaded <- loadSecurityConfig path
+  case loaded of
+    Left err -> pure (Left err)
+    Right cfg -> case f cfg of
+      Left rejection -> pure (Right (Left rejection))
+      Right fields -> do
+        let newCfg = cfg
+              { scVaultRecipient = Just (vkfRecipient fields)
+              , scVaultIdentity  = Just (T.pack (vkfIdentity fields))
+              , scVaultKeyType   = Just (vkfKeyType fields)
+              }
+            encoded = Toml.encode securityConfigCodec newCfg
+        case reDecode encoded of
+          Just roundTripped
+            | scVaultRecipient roundTripped == scVaultRecipient newCfg
+            , scVaultIdentity  roundTripped == scVaultIdentity newCfg
+            , scVaultKeyType   roundTripped == scVaultKeyType newCfg
+            , scAccessControl  roundTripped == scAccessControl cfg
+            , scUntrustedExec  roundTripped == scUntrustedExec cfg
+            , scVaultPath      roundTripped == scVaultPath cfg
+            , scVaultUnlock    roundTripped == scVaultUnlock cfg ->
+                fmap (>> Right (Right fields))
+                  (saveSecurityConfig path newCfg PreserveCredentials)
+          _ -> pure (Left "refusing to write security.toml: the encoded document does not round-trip the new vault key fields")
   where
     reDecode encoded = case Toml.parse encoded of
       Left _     -> Nothing

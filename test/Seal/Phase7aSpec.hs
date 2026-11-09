@@ -28,6 +28,7 @@ import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Logging.Logger (SealLogger, testSealLogger)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddleware)
@@ -111,7 +112,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
@@ -172,7 +173,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)

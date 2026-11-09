@@ -66,7 +66,8 @@ import Seal.Core.MessageSource (MessageSource (..), mkUserId)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, deleteChannel)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
+import Seal.Config.Paths
+  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath )
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Session.AgentMetaCache
@@ -98,6 +99,9 @@ import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
 import Seal.Gateway.OriginGuard (GuardVerdict (..), guardHeadersFrom, sameOriginVerdict)
+import Seal.Gateway.Setup
+  ( SetupDeps (..), SetupEnv (..), handleProviderTest, handleSetupState
+  , handleVaultCreate, handleVaultReopen )
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
@@ -183,6 +187,10 @@ data ApiDeps = ApiDeps
     -- mutation guard compares each mutating request's @Origin@ against it; it is
     -- the same value WebAuthn verifies @clientDataJSON.origin@ against, so the
     -- HTTP and WebSocket surfaces share one trust anchor.
+  , adSetup            :: SetupDeps
+    -- ^ The setup endpoints' injected seams (vault provisioning + provider
+    -- resolution). Real wiring in 'Seal.Command.Serve'; 'stubSetupDeps' in the
+    -- test literals, which fail closed rather than touching the filesystem.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   }
 
@@ -206,6 +214,18 @@ guardApplies req =
   requestMethod req `elem` [methodPost, methodPut, methodDelete]
     || pathInfo req == ["api", "setup"]
 
+-- | The setup handlers' view of the running gateway. 'adPaths' (not
+-- 'VaultRuntime.vrPaths', which is a test stub) supplies the real paths.
+setupEnv :: ApiDeps -> SetupEnv
+setupEnv deps = SetupEnv
+  { sePaths        = adPaths deps
+  , seHandleRef    = vrHandleRef (adVault deps)
+  , seConfigPath   = srConfigPath (adSessionRuntime deps)
+  , seSecurityPath = securityFilePath (adPaths deps)
+  , seProviders    = adProviders deps
+  , seDeps         = adSetup deps
+  }
+
 -- | The route table.
 dispatchApi :: ApiDeps -> Application
 dispatchApi deps req respond =
@@ -224,6 +244,18 @@ dispatchApi deps req respond =
           , "wsStatus" .= streamHealthStatus wsHealth
           , "wsMessage" .= streamHealthMessage wsHealth
           ]))
+    -- The first-run setup wizard (issue #303). These four live ahead of every
+    -- capture arm; the literal "setup" segment cannot be confused with a
+    -- capture, and the passkey middleware has already authorised the request
+    -- (see Seal.Gateway.Setup's module header for the trust boundary).
+    (m', ["api", "setup"]) | m' == methodGet ->
+      respond =<< handleSetupState (setupEnv deps)
+    (m', ["api", "setup", "vault"]) | m' == methodPost ->
+      respond =<< handleVaultCreate (setupEnv deps) req
+    (m', ["api", "setup", "vault", "reopen"]) | m' == methodPost ->
+      respond =<< handleVaultReopen (setupEnv deps)
+    (m', ["api", "providers", name, "test"]) | m' == methodPost ->
+      respond =<< handleProviderTest (setupEnv deps) name req
     -- GET /api/commands -> the slash-command menu as
     -- [{"name": …, "synopsis": …}], one entry per registered CommandSpec
     -- (canonical names only — aliases are not advertised). The chat channels
@@ -2475,6 +2507,9 @@ providerAuthStatus mh cfg kp = case kp of
   OpenRouterProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
+  OpenAICompatibleProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenAICompatibleProvider)
 
 -- | Probe the vault for a single key and return the auth status string.
 probeVault :: VaultHandle -> Text -> IO Text
@@ -2929,6 +2964,9 @@ staticModelsFor AnthropicProvider =
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
 staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+-- | Empty on purpose: a generic endpoint owns its catalogue, and inventing
+-- model ids here would be a guess the UI would present as fact.
+staticModelsFor OpenAICompatibleProvider = []
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value

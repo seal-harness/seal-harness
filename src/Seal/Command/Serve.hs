@@ -66,7 +66,8 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.BootPlan
-  ( BindCoordinates (..), BootPlan (bpOrigin), bootPlan, bootRefusalMessage, preflight )
+  ( BindCoordinates (..), BootPlan (bpOrigin, bpMintGrant), bootPlan, bootRefusalMessage, preflight )
+import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
   , untrustedExecConfigFromSecurity )
@@ -81,6 +82,7 @@ import Seal.Gateway.Config
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
   , effectiveTlsPaths, withGatewayDefaults )
 import Seal.Gateway.Server (runGateway)
+import Seal.Gateway.Setup (SetupDeps (..))
 
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
@@ -90,7 +92,7 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (configuredProviders)
+import Seal.Providers.Registry (configuredProviders, resolveProvider)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
@@ -114,6 +116,7 @@ import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -125,17 +128,17 @@ import Seal.Web.UiState (newUiStateHandle)
 -- main thread, which 'handleServeInterrupt' turns into a shutdown log line
 -- naming the live sub-agents (whose forked threads die with this process)
 -- followed by exit 130.
-runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
-runServeMain autonomy mCliStaticDir logger = do
+runServeMain :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IO ()
+runServeMain autonomy mCliStaticDir noEnrollToken logger = do
   -- Filled in once the backends exist; 'Nothing' means an interrupt landed
   -- during startup, before there was a runtime to report on.
   runtimeRef <- newIORef Nothing
-  runServeMainInner autonomy mCliStaticDir logger runtimeRef
+  runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef
     `catch` handleServeInterrupt logger runtimeRef
 
 runServeMainInner
-  :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
-runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
+  :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
+runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
   -- Claim this SEAL_HOME for the life of the process before anything else
@@ -273,7 +276,16 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
       Just err -> do
         logIO logger ErrorS ("gateway: " <> ls err)
         ioError (userError (T.unpack err))
-      Nothing -> newAccessControlHandle paths plan
+      Nothing -> do
+        -- @--no-enrollment-token@: the operator asserts the network is
+        -- secured (firewall/VPN), so a 'CliWindow' grant (no secret) is
+        -- minted instead of a 'CliToken' grant. The browser can enroll a
+        -- passkey without pasting a token. Passkey auth stays enabled —
+        -- this is not @mode = "none"@.
+        let adjustedPlan = if noEnrollToken
+              then plan { bpMintGrant = CliWindow <$ bpMintGrant plan }
+              else plan
+        newAccessControlHandle paths adjustedPlan
   printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
@@ -490,10 +502,15 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adSkills          = bSkills backends
         , adProviders       = do
             -- The configured-provider list is computed on each request so
-            -- newly-added credentials are reflected without a restart. The
-            -- vault handle is read from the same ref the commands use.
+            -- newly-added credentials are reflected without a restart. Both
+            -- inputs are re-read: the vault handle from the same ref the
+            -- commands use, and config.toml from disk — a provider whose
+            -- *credential* arrives through the vault, but whose *endpoint*
+            -- (`[providers.openai] base_url`) arrives through the config, is
+            -- only "configured" once both are visible.
             mh <- readIORef (vrHandleRef rt)
-            configuredProviders mh cfg
+            cfg' <- loadCfg
+            configuredProviders mh cfg'
         , adUiState         = uiState
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
@@ -504,6 +521,19 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
         , adConfigRepo       = repo
         , adVault            = rt
         , adCanonicalOrigin = naOrigin access
+        -- The setup endpoints' real seams: the provisioning core and a
+        -- provider resolver that re-reads config.toml + the vault handle on
+        -- every call (so a provider saved during setup is what a
+        -- Test-connection ping actually reaches).
+        , adSetup = SetupDeps
+            { sdProvision = defaultProvisionDeps paths
+            , sdResolveProvider = \kp model -> do
+                mh' <- readIORef (vrHandleRef rt)
+                cfg' <- loadRuntimeConfig cfgPath
+                case cfg' of
+                  Left err -> pure (Left err)
+                  Right rc' -> resolveProvider mh' mgr rc' kp model callCounter
+            }
         , adPaths            = paths
         , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg

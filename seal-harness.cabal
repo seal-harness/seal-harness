@@ -267,6 +267,10 @@ library
         Seal.Types.Config
         Seal.Types.Env
         Seal.Vault.Backend
+
+        Seal.Vault.Provision
+        Seal.Setup.State
+        Seal.Vault.IdentityPath
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
@@ -648,6 +652,10 @@ test-suite tests
         Seal.Providers.OpenRouterSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
+        Seal.Vault.ProvisionSpec
+        Seal.Setup.StateSpec
+        Seal.Gateway.SetupApiSpec
+        Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
         Seal.Agent.ContextTruncationSpec

@@ -38,7 +38,8 @@ import Seal.Providers.Anthropic.OAuth
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
-import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl, mkOpenRouter)
+import Seal.Providers.OpenRouter
+  ( defaultOpenRouterBaseUrl, mkOpenAICompatible, mkOpenRouter )
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -52,7 +53,15 @@ anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 -- | Every provider Seal can build. M1 ships Anthropic only; later milestones
 -- extend this sum (the totality of the functions below forces each addition to
 -- be handled everywhere).
-data KnownProvider = AnthropicProvider | OllamaProvider | OpenRouterProvider
+data KnownProvider
+  = AnthropicProvider
+  | OllamaProvider
+  | OpenRouterProvider
+  | OpenAICompatibleProvider
+    -- ^ Any OpenAI-compatible @/v1/chat/completions@ endpoint the operator
+    -- names (a self-hosted vLLM, LM Studio, api.openai.com, …). Same client as
+    -- OpenRouter ('mkOpenAICompatible'); the difference is that it has **no**
+    -- built-in base URL — the endpoint is required input, not a default.
   deriving stock (Eq, Show, Enum, Bounded)
 
 knownProviders :: [KnownProvider]
@@ -63,6 +72,7 @@ providerLabel :: KnownProvider -> Text
 providerLabel AnthropicProvider = "anthropic"
 providerLabel OllamaProvider    = "ollama"
 providerLabel OpenRouterProvider = "openrouter"
+providerLabel OpenAICompatibleProvider = "openai"
 
 providerId :: KnownProvider -> ProviderId
 providerId = ProviderId . providerLabel
@@ -78,12 +88,17 @@ vaultKeyName :: KnownProvider -> Text
 vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
 vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
 vaultKeyName OpenRouterProvider = "OPENROUTER_API_KEY"
+vaultKeyName OpenAICompatibleProvider = "OPENAI_API_KEY"
 
 -- | The model used when the user has not chosen one.
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
 defaultModelFor OllamaProvider    = ModelId "llama3.2"
 defaultModelFor OpenRouterProvider = ModelId "deepseek/deepseek-v4.1-flash-1017"
+-- | A starting point only: a generic endpoint's real model ids are its own, so
+-- the operator overrides this in @[providers.openai] default_model@ or in the
+-- setup wizard.
+defaultModelFor OpenAICompatibleProvider = ModelId "gpt-4o-mini"
 
 -- | A provider's default model: the configured value if given, else the
 -- provider's hardcoded default (Anthropic's for an unrecognized label).
@@ -152,6 +167,29 @@ resolveProvider mvh mgr cfg OpenRouterProvider model _ =
   where
     baseUrl = providerBaseUrlFor cfg OpenRouterProvider
 
+resolveProvider mvh mgr cfg OpenAICompatibleProvider model _ =
+  -- No built-in endpoint: the operator names it. Fail closed rather than
+  -- silently reaching out to api.openai.com on their behalf, which would send
+  -- a key meant for a self-hosted server to a third party.
+  if T.null baseUrl
+    then pure (Left "the OpenAI-compatible provider needs a base URL — set \
+                    \[providers.openai] base_url (the setup wizard asks for it)")
+    else case mvh of
+      Nothing ->
+        pure (Left "the OpenAI-compatible provider needs an API key — run \
+                   \/vault setup then /provider add openai")
+      Just vh -> do
+        eKey <- vhGet vh (vaultKeyName OpenAICompatibleProvider)
+        case eKey of
+          Left e -> pure (Left (credErr OpenAICompatibleProvider e))
+          Right kb ->
+            -- The same client OpenRouter uses: that protocol is the whole
+            -- point of the generic option.
+            pure (Right (SomeProvider
+              (mkOpenAICompatible mgr (Just (mkApiKey kb)) baseUrl model)))
+  where
+    baseUrl = providerBaseUrlFor cfg OpenAICompatibleProvider
+
 -- | The effective base URL for a provider: the configured
 -- @[providers.&lt;label&gt;] base_url@ when set, else that provider's own
 -- built-in default. Each provider reads its OWN config section — Ollama's URL
@@ -164,6 +202,9 @@ providerBaseUrlFor cfg kp =
     builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl
     builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl
     builtInBaseUrl AnthropicProvider  = "https://api.anthropic.com"
+    -- Deliberately empty: a generic endpoint has no default (see
+    -- 'resolveProvider'), and callers treat "" as "not configured".
+    builtInBaseUrl OpenAICompatibleProvider = ""
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
@@ -219,6 +260,12 @@ configuredProviders mvh cfg = filterM isConfigured knownProviders
           ||^ hasVaultKey mvh anthropicOAuthKey
       OpenRouterProvider ->
         hasVaultKey mvh (vaultKeyName OpenRouterProvider)
+      OpenAICompatibleProvider -> do
+        -- BOTH halves are required: a base URL with no credential fails on the
+        -- first call, and a credential with no base URL has nowhere to go.
+        keyed <- hasVaultKey mvh (vaultKeyName OpenAICompatibleProvider)
+        pure (keyed && not (T.null
+          (fromMaybe "" (providerBaseUrl cfg (providerLabel OpenAICompatibleProvider)))))
 
 -- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
 -- (locked / key missing) → 'False'; a present key → 'True'.

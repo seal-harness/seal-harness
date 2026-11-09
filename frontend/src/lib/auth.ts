@@ -443,6 +443,16 @@ export function logout() {
   return authRequest('logout', {})
 }
 
+/** Waive access control: write `mode = "none"` to security.toml from the
+ *  browser. Requires the enrollment token (or a CliWindow grant from
+ *  `--no-enrollment-token`). The running gateway keeps its current mode
+ *  until the next restart. */
+export function waiveAccess(enrollToken: string | null): Promise<AuthResult<{ ok: boolean; detail: string }>> {
+  return authRequest<{ ok: boolean; detail: string }>('waive', {
+    enrollToken,
+  })
+}
+
 export function listCredentials() {
   return authRequest<CredentialInfo[]>('credentials', { method: 'GET' })
 }

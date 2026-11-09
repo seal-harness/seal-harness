@@ -22,6 +22,8 @@ const AUTH_STATUS_LABELS: Record<ProviderAuthStatus, string> = {
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama',
+  openrouter: 'OpenRouter',
+  openai: 'OpenAI-compatible',
 }
 
 const labelStyle: React.CSSProperties = {

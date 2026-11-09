@@ -3,6 +3,7 @@ import {
   clearEnrollToken,
   createPasskey,
   fetchAuthStatus,
+  waiveAccess,
   getPasskey,
   hasWebAuthn,
   isSecureContextOk,
@@ -49,6 +50,9 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [recovery, setRecovery] = useState(false)
+  const [waiveBusy, setWaiveBusy] = useState(false)
+  const [showWaiveConfirm, setShowWaiveConfirm] = useState(false)
+  const [waiveError, setWaiveError] = useState<string | null>(null)
   const steppedUp = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -171,6 +175,20 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     }
   }, [runCeremony, refresh])
 
+  const waive = useCallback(async () => {
+    setWaiveBusy(true)
+    setWaiveError(null)
+    setShowWaiveConfirm(false)
+    const res = await waiveAccess(effectiveToken)
+    setWaiveBusy(false)
+    if (!res.ok) {
+      setWaiveError(res.error ?? 'waive failed')
+      return
+    }
+    setStatus(null)
+    await refresh()
+  }, [effectiveToken, refresh])
+
   if (loadFailed) {
     return (
       <Panel title="Cannot reach the Seal gateway">
@@ -258,7 +276,11 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
     )
   }
 
-  const tokenField = status.enrollment_via === 'none' ? null : (
+  // --no-enrollment-token mints a CliWindow grant: no secret to paste, so
+  // the token field is hidden and the register button is enabled without one.
+  const noTokenNeeded = status.enrollment_via === 'cli_window'
+
+  const tokenField = (status.enrollment_via === 'none' || noTokenNeeded) ? null : (
     <TokenField
       value={tokenInput}
       onChange={setTokenInput}
@@ -279,6 +301,14 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       <button className="agate-secondary" onClick={() => { void refresh() }}>
         Check again
       </button>
+    </div>
+  )
+
+  const windowHint = (
+    <div className="agate-note">
+      <p>
+        Enrollment is open — no token is needed. Click “Register a passkey” below.
+      </p>
     </div>
   )
 
@@ -304,10 +334,10 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
 
         <details className="agate-waive">
           <summary>Enroll this device</summary>
-          {tokenField ?? mintHint}
+          {tokenField ?? (noTokenNeeded ? windowHint : mintHint)}
           <button
             className="agate-secondary"
-            disabled={busy || !canUsePasskey() || effectiveToken === null}
+            disabled={busy || !canUsePasskey() || (effectiveToken === null && !noTokenNeeded)}
             onClick={() => { void addPasskey() }}
           >
             {busy ? 'Waiting for your passkey…' : 'Enroll a passkey on this device'}
@@ -353,24 +383,56 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
       <CapabilityNote surface="setup" />
       <OriginNote status={status} />
 
-      {tokenField ?? mintHint}
+      {tokenField ?? (noTokenNeeded ? windowHint : mintHint)}
 
       {error && <p className="agate-error">{error}</p>}
 
       <div className="agate-actions">
         <button
           className="agate-primary"
-          disabled={busy || !canUsePasskey() || effectiveToken === null}
+          disabled={busy || !canUsePasskey() || (effectiveToken === null && !noTokenNeeded)}
           onClick={() => { void addPasskey() }}
         >
           {busy ? 'Waiting for your passkey…' : 'Register a passkey'}
         </button>
+        <button
+          className="agate-secondary"
+          disabled={waiveBusy}
+          onClick={() => { setShowWaiveConfirm(true) }}
+        >
+          Waive access control
+        </button>
       </div>
 
-      <p className="agate-hint">
-        Prefer to run without access control? Stop <code>seal serve</code> and run
-        <code> seal access-control disable --yes</code>. Only the terminal can turn it off.
-      </p>
+      {showWaiveConfirm && (
+        <div className="agate-overlay" role="dialog" aria-modal="true">
+          <div className="agate-panel">
+            <h1 className="agate-title">Waive access control?</h1>
+            <p className="agate-text">
+              Anyone who can reach this gateway will have full control of every
+              session. This is appropriate only when the gateway is behind a
+              firewall or VPN.
+            </p>
+            {waiveError && <p className="agate-error">{waiveError}</p>}
+            <div className="agate-actions">
+              <button
+                className="agate-primary"
+                disabled={waiveBusy || (effectiveToken === null && !noTokenNeeded)}
+                onClick={() => { void waive() }}
+              >
+                {waiveBusy ? 'Waiving…' : 'Yes, waive access control'}
+              </button>
+              <button
+                className="agate-secondary"
+                disabled={waiveBusy}
+                onClick={() => { setShowWaiveConfirm(false); setWaiveError(null) }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </Panel>
   )
 }

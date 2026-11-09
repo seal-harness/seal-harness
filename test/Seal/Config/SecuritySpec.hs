@@ -20,8 +20,10 @@ import Test.QuickCheck (Gen, elements, forAll, oneof)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , WriteMode (..), hasLegacyLayout, loadSecurityConfig, saveSecurityConfig
-  , tomlKeyPaths, untrustedExecConfigFromSecurity )
+  , VaultKeyFields (..), WriteMode (..), hasLegacyLayout, loadSecurityConfig
+  , saveSecurityConfig, tomlKeyPaths, untrustedExecConfigFromSecurity
+  , updateSecurityConfig, updateVaultKeySection )
+
 
 spec :: Spec
 spec = describe "Seal.Config.Security" $ do
@@ -290,6 +292,45 @@ spec = describe "Seal.Config.Security" $ do
       let cfg = defaultSecurityConfig
             { scUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
       untrustedExecConfigFromSecurity cfg `shouldBe` Nothing
+
+  -- Plan WU1 tests 26–28. The plan names 'updateSecurityConfigEither'; the
+  -- implementation keeps the base branch's "two narrow writers" guarantee by
+  -- adding 'updateVaultKeySection' (whose callback cannot name
+  -- access_control/untrusted_execution) instead of a general writer. The
+  -- assertions are otherwise the ones the plan specifies.
+  describe "updateVaultKeySection" $ do
+
+    it "updateSecurityConfigEither propagates the callback rejection" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "vault_recipient = \"age1already\"\n"
+        result <- updateVaultKeySection path
+          (\_ -> Left ("already recorded" :: Text) :: Either Text VaultKeyFields)
+        result `shouldBe` Right (Left "already recorded")
+        -- The rejection is a compare-and-swap miss, not a crash: the file is
+        -- byte-identical and no temp file is left behind.
+        TIO.readFile path `shouldReturn` "vault_recipient = \"age1already\"\n"
+        doesFileExist (path <> ".tmp") `shouldReturn` False
+
+    it "updateSecurityConfigEither reports an unparseable file as an outer Left" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "vault_path = [not valid toml"
+        result <- updateVaultKeySection path
+          (\_ -> error "the callback must not run on an unparseable file")
+        case result of
+          Left _  -> TIO.readFile path `shouldReturn` "vault_path = [not valid toml"
+          Right _ -> expectationFailure "expected an outer Left for an unparseable file"
+
+    it "updateSecurityConfig still works" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "vault_recipient = \"age1old\"\n"
+        updateSecurityConfig path (\sc -> sc { scVaultKeyType = Just "x25519" })
+          `shouldReturn` Right ()
+        loaded <- loadSecurityConfig path
+        fmap scVaultKeyType loaded `shouldBe` Right (Just "x25519")
+        fmap scVaultRecipient loaded `shouldBe` Right (Just "age1old")
 
   -- Design §9.6: "no value of RuntimeConfig affects selectExecBackend's
   -- remote-only arm." Since the untrusted_execution fields live in

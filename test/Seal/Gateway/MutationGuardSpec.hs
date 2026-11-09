@@ -39,7 +39,7 @@ import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
-import Seal.Gateway.Setup (collectBodyLimited, maxSetupBodyBytes)
+import Seal.Gateway.Setup (collectBodyLimited, maxSetupBodyBytes, stubSetupDeps)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -227,6 +227,7 @@ mkApp canonicalOrigin = do
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
     , adCanonicalOrigin = canonicalOrigin
+    , adSetup = stubSetupDeps
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing

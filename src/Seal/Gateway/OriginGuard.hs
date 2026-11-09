@@ -15,6 +15,18 @@
 --
 -- Pure on purpose: the whole verdict (including the loopback-alias cases that
 -- keep @vite dev@ and the e2e harness working) is testable without a socket.
+--
+-- == Residual threats (stated, not claimed away)
+--
+-- * Holders of the per-run service token and clients in an explicitly waived
+--   @mode = "none"@ install are authorised to mutate; the guard only stops a
+--   *browser page from another origin*.
+-- * A same-UID local process is admitted: it sends no @Origin@, and it could
+--   already write @~\/.seal\/security.toml@ directly. See
+--   "Seal.Gateway.Setup"'s module header for the same statement about setup.
+-- * @mode = "none"@ on a wildcard bind resolves no canonical origin, so the
+--   verdict is @Allowed@ for everything. That is the operator's written
+--   waiver, not an oversight.
 module Seal.Gateway.OriginGuard
   ( GuardHeaders (..)
   , GuardVerdict (..)

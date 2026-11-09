@@ -69,7 +69,9 @@ import Seal.Security.EnrollmentGrant
   , claimLiveAt, defaultTtlFor, effectiveDeadline, enrollGrant, enrollmentAuthority
   , findAuthority, grantLiveAt, grantRedeems, grantSourceText, loadClaimFile
   , loadGrantFile, saveGrantFile, tokenDigest )
-import Seal.Config.Security (CredentialFileConfig (..), writeSecretFile)
+import Seal.Config.Security
+  ( AccessControlFileConfig (..), CredentialFileConfig (..)
+  , updateAccessControlSection, writeSecretFile )
 import Seal.Gateway.Audit qualified as Audit
 import Seal.Gateway.Audit
   ( AuditFields (..), admitRefusal, appendAudit, emptyAuditFields, newAuditGate )
@@ -648,6 +650,10 @@ authApp h req respond =
 
     (m, ["api", "auth", "credentials", cid]) | m == methodPut -> do
       result <- withCredentialAdmin h req (renameCredential h cid)
+      respond (respondResult [] result)
+
+    (m, ["api", "auth", "waive"]) | m == methodPost -> do
+      result <- withEnrollment h req (waiveAccess h)
       respond (respondResult [] result)
 
     _ -> respond (authError status404 "not_found" "no such endpoint")
@@ -1463,6 +1469,38 @@ clearOutstandingGrants :: AccessControlHandle -> IO ()
 clearOutstandingGrants h = do
   cancelGrant (achPaths h)
   modifyMVar_ (achState h) $ \s -> pure s { acsSessionGrants = Map.empty }
+
+-- | @POST /api/auth/waive@: write @mode = "none"@ to @security.toml@, turning
+-- access control off from the browser. Gated on 'withEnrollment', so the
+-- enrollment token (or a 'CliWindow' grant from @--no-enrollment-token@) is
+-- required — a remote attacker cannot waive without the token. The grant is
+-- consumed after the write. The in-memory mode is updated to AccessOpen
+-- immediately, so the status endpoint reports open and the frontend
+-- advances without a restart.
+waiveAccess
+  :: AccessControlHandle
+  -> EnrollmentAuthority
+  -> Request
+  -> IO (Either AuthErr Value)
+waiveAccess h _authority _req = do
+  written <- updateAccessControlSection (securityFilePath (achPaths h)) $
+    \cfg -> cfg { acfcMode = Just "none" }
+  case written of
+    Left err -> pure (Left (AuthErr status500 "waive_failed"
+      ("could not write security.toml: " <> err)))
+    Right _ -> do
+      now <- getCurrentTime
+      _ <- appendAudit (achPaths h) now (emptyAuditFields Audit.ModeDisabled)
+      modifyMVar_ (achState h) $ \s ->
+        pure s { acsMode = AccessOpen
+               , acsSetupCode = Nothing
+               , acsSetupHash = Nothing
+               }
+      clearOutstandingGrants h
+      pure (Right (object
+        [ "ok" .= True
+        , "detail" .= ("access control waived" :: Text)
+        ]))
 
 -- ---------------------------------------------------------------------------
 -- Body / JSON helpers

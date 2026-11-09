@@ -2,6 +2,53 @@
 
 ## 0.1.0.0 — unreleased
 
+* **A fourth provider: any OpenAI-compatible endpoint.** `openai` (label
+  "OpenAI-compatible") reuses the OpenRouter client — both speak
+  `/v1/chat/completions` — and differs in exactly one way: it has **no**
+  built-in base URL. The endpoint is required input (`[providers.openai]
+  base_url`, or the setup wizard's "API endpoint" field), and resolution fails
+  with an actionable message rather than defaulting to `api.openai.com`, so a
+  key meant for a self-hosted server is never sent to a third party. Its vault
+  credential is `OPENAI_API_KEY`; `/api/providers` now lists four providers.
+
+  Because "Test connection" is only useful if it actually reaches the endpoint,
+  the OpenAI-compatible client's `listModels` now asks the endpoint's
+  `/models` (it used to answer with one static id). That call backs the
+  wizard's Test button and `/model list`, so a wrong URL or a rejected key
+  surfaces as a real error instead of a cheerful "ok". With no credential the
+  call is skipped and the configured default is returned, as before.
+
+* **A first run can now be completed in the browser.** `seal serve` serves a
+  guided wizard before the app: create the vault (local `age-keygen` key,
+  YubiKey, or your own age identity), then add an LLM provider. It reaches
+  parity with the CLI's `/vault setup` for the three backends, writes only the
+  three vault-key fields, and never returns key material to the browser. The
+  gate is blocking — there is no skip — and the two routes it uses
+  (`GET /api/setup`, `POST /api/setup/vault`, plus `POST /api/setup/vault/reopen`
+  and `POST /api/providers/:name/test`) sit behind the passkey middleware and
+  the mutation origin guard. The CLI remains the way to rotate a key.
+
+* **A `startup`-mode vault needs one `reopen` after a first-run setup.** A
+  vault created from the wizard is opened in `on_demand` mode for the rest of
+  the process. If `security.toml` asks for `startup`, the wizard's vault step
+  reports "locked" with a Reopen action (which unlocks it) until that is done —
+  `seal serve` does not unlock at boot. Nothing is lost: the vault is on disk
+  and `seal tui`'s `/vault unlock` does the same thing.
+
+* **`age` is now invoked with single-token option forms.** The vault encryptor
+  passes `--decrypt --identity=<path>` and `--encrypt --recipient=<value>`
+  rather than separating the value, so a stored value that begins with `-` can
+  never be read as a flag (AGENTS.md invariant 2).
+
+* **`mkAgeEncryptor` rejects a malformed recipient or identity path.** Both
+  credentials are validated at the single choke point every caller goes
+  through (CLI, gateway, a hand-edited `security.toml`), so a vault configured
+  with a broken value now fails loudly at open time with "invalid recipient" /
+  "invalid identity path" instead of failing later inside `age`. This is a
+  behaviour change for the CLI: a config that used to limp along now refuses to
+  open the vault.
+
+
 * **Mutating API requests must come from the gateway's own origin.** The REST
   API was reachable from any page in the operator's browser: the router
   answered `OPTIONS` for every path with `Access-Control-Allow-Origin: *`, so a
