@@ -1474,8 +1474,9 @@ clearOutstandingGrants h = do
 -- access control off from the browser. Gated on 'withEnrollment', so the
 -- enrollment token (or a 'CliWindow' grant from @--no-enrollment-token@) is
 -- required — a remote attacker cannot waive without the token. The grant is
--- consumed after the write. The running gateway keeps its current mode until
--- the next restart (the same behaviour as @seal access-control disable --yes@).
+-- consumed after the write. The in-memory mode is updated to AccessOpen
+-- immediately, so the status endpoint reports open and the frontend
+-- advances without a restart.
 waiveAccess
   :: AccessControlHandle
   -> EnrollmentAuthority
@@ -1490,10 +1491,15 @@ waiveAccess h _authority _req = do
     Right _ -> do
       now <- getCurrentTime
       _ <- appendAudit (achPaths h) now (emptyAuditFields Audit.ModeDisabled)
+      modifyMVar_ (achState h) $ \s ->
+        pure s { acsMode = AccessOpen
+               , acsSetupCode = Nothing
+               , acsSetupHash = Nothing
+               }
       clearOutstandingGrants h
       pure (Right (object
         [ "ok" .= True
-        , "detail" .= ("access control waived — restart seal serve for it to take effect" :: Text)
+        , "detail" .= ("access control waived" :: Text)
         ]))
 
 -- ---------------------------------------------------------------------------

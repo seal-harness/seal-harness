@@ -264,6 +264,9 @@ spec = describe "Seal.Gateway.AccessControl" $ do
         case loaded of
           Right cfg -> (scAccessControl cfg >>= acfcMode) `shouldBe` Just "none"
           Left _    -> expectationFailure "security.toml did not parse after waive"
+        -- The in-memory mode is updated immediately: the status endpoint
+        -- reports 'open' without a server restart.
+        accessControlMode (naHandle na) `shouldReturn` AccessOpen
 
     it "refuses waive without an enrollment token" $
       withHome Nothing $ \paths -> do
