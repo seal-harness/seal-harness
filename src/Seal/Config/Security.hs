@@ -30,6 +30,11 @@
 -- @updateRuntimeConfig@ caller physically cannot express a change to these
 -- fields — the type split makes it a compile error (design §4 Approach E).
 --
+-- @[gateway]@ joined them for the same reason: its bind host and port decide
+-- who can reach the agent, and its Origin allowlist and TLS paths decide how.
+-- The two narrow writers below assert it unchanged across their round-trip, so
+-- an enrollment or a vault-key write cannot move the listener either.
+--
 -- Every field is optional; a missing key decodes as 'Nothing' and a
 -- 'Nothing' value is omitted from the encoded output.
 module Seal.Config.Security
@@ -53,6 +58,7 @@ module Seal.Config.Security
   , VaultKeyFields (..)
   , updateVaultKeySection
   , clearAccessControlSection
+  , gatewayConfigFromSecurity
   , writeSecretFile
   , securityWriteLock
   , defaultSecurityConfig
@@ -87,6 +93,9 @@ import Validation (Validation (..))
 import Toml ((.=))
 import Toml qualified
 
+import Seal.Gateway.Config
+  ( GatewayConfig, PartialGatewayConfig, defaultGatewayConfig, gatewayTableCodec
+  , withGatewayDefaults )
 import Seal.Tools.Exec.Types
   ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
 import Seal.Tools.Exec.Untrusted
@@ -117,6 +126,13 @@ data SecurityConfig = SecurityConfig
     -- gateway serves only the setup screen until the operator enrolls a
     -- passkey or explicitly waives (design §4). This is the ONE section the
     -- gateway may write, via 'updateAccessControlSection'.
+  , scGateway :: Maybe PartialGatewayConfig
+    -- ^ Optional @[gateway]@ section: bind host/port, the WS Origin allowlist,
+    -- the static-dir override and the TLS settings. Boot-only and
+    -- agent-immutable like the rest of this file — a bind address is not a
+    -- setting to guess from, and no opcode or gateway config writer can
+    -- express a change to it (the type split makes that a compile error).
+    -- 'Seal.Gateway.Config.gatewayConfigFromSecurity' resolves it.
   } deriving stock (Eq, Show)
 
 -- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
@@ -406,6 +422,7 @@ defaultSecurityConfig = SecurityConfig
   , scVaultKeyType   = Nothing
   , scUntrustedExec  = Nothing
   , scAccessControl  = Nothing
+  , scGateway        = Nothing
   }
 
 -- ---------------------------------------------------------------------------
@@ -423,6 +440,7 @@ securityConfigCodec = SecurityConfig
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= scUntrustedExec
   <*> Toml.dioptional (Toml.table accessControlCodec "access_control")
         .= scAccessControl
+  <*> gatewayTableCodec .= scGateway
 
 -- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
 untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
@@ -590,7 +608,8 @@ updateAccessControlSection path f = withMVar securityWriteLock $ \_ -> do
           encoded = Toml.encode securityConfigCodec newCfg
       case reDecode encoded of
         Just roundTripped
-          | scAccessControl roundTripped == Just updated ->
+          | scAccessControl roundTripped == Just updated
+          , scGateway       roundTripped == scGateway cfg ->
               -- The section writer never discards credentials: enrollment
               -- moves them out, it does not drop them.
               fmap (>> Right updated)
@@ -651,6 +670,7 @@ updateVaultKeySection path f = withMVar securityWriteLock $ \_ -> do
             , scVaultKeyType   roundTripped == scVaultKeyType newCfg
             , scAccessControl  roundTripped == scAccessControl cfg
             , scUntrustedExec  roundTripped == scUntrustedExec cfg
+            , scGateway        roundTripped == scGateway cfg
             , scVaultPath      roundTripped == scVaultPath cfg
             , scVaultUnlock    roundTripped == scVaultUnlock cfg ->
                 fmap (>> Right (Right fields))
@@ -672,6 +692,14 @@ clearAccessControlSection path mode = withMVar securityWriteLock $ \_ -> do
   case loaded of
     Left err  -> pure (Left err)
     Right cfg -> saveSecurityConfig path (cfg { scAccessControl = Nothing }) mode
+
+-- | Resolve the @[gateway]@ section to the 'GatewayConfig' the boot path and
+-- the CLI consume. An absent section yields
+-- 'Seal.Gateway.Config.defaultGatewayConfig' (loopback, port 8080); present
+-- keys override it field by field.
+gatewayConfigFromSecurity :: SecurityConfig -> GatewayConfig
+gatewayConfigFromSecurity cfg =
+  maybe defaultGatewayConfig withGatewayDefaults (scGateway cfg)
 
 -- | The section a first write starts from when the file has none.
 --

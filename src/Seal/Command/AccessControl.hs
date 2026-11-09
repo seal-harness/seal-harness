@@ -26,7 +26,6 @@ import Control.Monad (forM_, unless, when)
 import Data.Time (diffUTCTime, getCurrentTime)
 import System.Directory (doesFileExist, removeFile)
 
-import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Credentials
   ( MigrationOutcome (..), migrateLegacyCredentials )
@@ -38,6 +37,7 @@ import Seal.Gateway.Audit
   ( AuditEvent (..), AuditFields (..), appendAudit, emptyAuditFields )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), WriteMode (..), clearAccessControlSection
+  , SecurityConfig (..), gatewayConfigFromSecurity, loadSecurityConfig
   , updateAccessControlSection, writeSecretFile )
 import Seal.Security.AccessControl
   ( CredentialAvailability (NoCredentials), credentialAvailability, isLoopbackHost )
@@ -46,7 +46,8 @@ import Seal.Security.EnrollmentGrant
   , enrollGrant, grantSourceText, parseTtl )
 import Seal.Config.BootPlan
   ( BindCoordinates (..), BootPlan (..), bootPlan, bootRefusalMessage, preflight )
-import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+import Seal.Gateway.Config
+  ( GatewayConfig (..), defaultGatewayConfig, loadLegacyGatewayTable, withGatewayDefaults )
 import Seal.Security.WebAuthn.Types (AccessMode (..), Credential (..))
 import Seal.Types.Command (AccessControlAction (..), EnrollOptions (..))
 
@@ -327,7 +328,15 @@ removeStoreFile paths = do
 
 gatewayConfig :: SealPaths -> IO GatewayConfig
 gatewayConfig paths = do
-  cfg <- loadRuntimeConfig (configFilePath paths)
-  pure $ case cfg of
-    Right rc -> maybe defaultGatewayConfig withGatewayDefaults (rcGateway rc)
-    Left _   -> defaultGatewayConfig
+  sec <- loadSecurityConfig (securityFilePath paths)
+  case sec of
+    Right cfg | isJust (scGateway cfg) -> pure (gatewayConfigFromSecurity cfg)
+    -- Upgrade window: this SEAL_HOME has not booted serve/tui since the
+    -- [gateway] section moved, so the table is still in config.toml. Read it
+    -- from there — read-only. `status` and `enroll` must not rewrite
+    -- security.toml: a pre-upgrade daemon may be running, and the write lock
+    -- is process-local. The next serve/tui boot moves the table and this path
+    -- goes quiet.
+    _ -> do
+      legacy <- loadLegacyGatewayTable (configFilePath paths)
+      pure (maybe defaultGatewayConfig withGatewayDefaults legacy)

@@ -4,11 +4,14 @@ module Seal.Gateway.ConfigSpec (spec) where
 import Control.Monad (unless)
 import Data.Text qualified as T
 import Data.Maybe (isJust)
+import Data.Text.IO qualified as TIO
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
+import Toml qualified
 
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
+import Validation (Validation (..))
+
 import Seal.Gateway.Config
 
 spec :: Spec
@@ -87,63 +90,51 @@ spec = describe "Seal.Gateway.Config" $ do
       gcStaticDir full `shouldBe` Just "/srv/seal"
       gcAllowedOrigins full `shouldBe` ["http://example.com"]
 
-  describe "TOML round-trip" $ do
-    it "round-trips a [gateway] section with all fields set" $
-      withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
-        let path = dir </> "config.toml"
-            partial = PartialGatewayConfig
-              { pgcPort = Just 9090
-              , pgcWsPort = Just 9091
-              , pgcHost = Just "0.0.0.0"
-              , pgcStaticDir = Just "/srv/seal"
-              , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
-              , pgcTlsCert = Just "/srv/seal/fullchain.pem"
-              , pgcTlsKey = Just "/srv/seal/privkey.pem"
-              , pgcTls = Just True
-              , pgcTlsHosts = ["seal.example.com"]
-              }
-            cfg = defaultRuntimeConfig { rcGateway = Just partial }
-        saveRuntimeConfig path cfg
-        result <- loadRuntimeConfig path
-        case result of
-          Left err -> expectationFailure ("load failed: " <> T.unpack err)
-          Right loaded -> rcGateway loaded `shouldBe` Just partial
+  -- The table lives in security.toml; the codec and the read-only legacy
+  -- reader are shared, so they are tested here rather than in FileSpec.
+  describe "gatewayTableCodec / loadLegacyGatewayTable" $ do
+    let full = PartialGatewayConfig
+          { pgcPort = Just 9090
+          , pgcWsPort = Just 9091
+          , pgcHost = Just "0.0.0.0"
+          , pgcStaticDir = Just "/srv/seal"
+          , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
+          , pgcTlsCert = Just "/srv/seal/fullchain.pem"
+          , pgcTlsKey = Just "/srv/seal/privkey.pem"
+          , pgcTls = Just True
+          , pgcTlsHosts = ["seal.example.com"]
+          }
 
-    it "round-trips a [gateway] section with only some fields set (rest default)" $
-      withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
-        let path = dir </> "config.toml"
-            -- A user who sets only host + port, omitting ws_port + static_dir.
-            partial = PartialGatewayConfig
-              { pgcPort = Just 9090
-              , pgcWsPort = Nothing
-              , pgcHost = Just "0.0.0.0"
-              , pgcStaticDir = Nothing
-              , pgcAllowedOrigins = []
-              , pgcTlsCert = Nothing
-              , pgcTlsKey = Nothing
-              , pgcTls = Nothing
-              , pgcTlsHosts = []
-              }
-            cfg = defaultRuntimeConfig { rcGateway = Just partial }
-        saveRuntimeConfig path cfg
-        result <- loadRuntimeConfig path
-        case result of
-          Left err -> expectationFailure ("load failed: " <> T.unpack err)
-          Right loaded -> do
-            rcGateway loaded `shouldBe` Just partial
-            -- The merge fills in ws_port + allowed_origins from defaults.
-            let full = maybe defaultGatewayConfig withGatewayDefaults (rcGateway loaded)
-            gcWsPort full `shouldBe` 8080   -- default: the WS shares the HTTP port
-            gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]
+    it "round-trips the table through the codec" $
+      case Toml.parse (Toml.encode gatewayTableCodec (Just full)) of
+        Left err -> expectationFailure (T.unpack (Toml.unTomlParseError err))
+        Right toml ->
+          Toml.runTomlCodec gatewayTableCodec toml `shouldBe` Success (Just full)
 
-    it "absent section decodes as Nothing" $
+    it "decodes the table out of a document that holds other sections" $
       withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-        saveRuntimeConfig path defaultRuntimeConfig
-        result <- loadRuntimeConfig path
-        case result of
-          Right loaded -> rcGateway loaded `shouldBe` Nothing
-          Left err -> expectationFailure ("load failed: " <> T.unpack err)
+        TIO.writeFile path $ T.unlines
+          [ "default_provider = \"anthropic\""
+          , ""
+          , "[gateway]"
+          , "host = \"0.0.0.0\""
+          , "port = 9090"
+          , ""
+          , "[retrieval]"
+          , "max_scan_bytes = 1024"
+          ]
+        table <- loadLegacyGatewayTable path
+        fmap pgcHost table `shouldBe` Just (Just "0.0.0.0")
+        fmap pgcPort table `shouldBe` Just (Just 9090)
+
+    it "is Nothing for an absent file, an unparseable file, or no table" $
+      withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
+        loadLegacyGatewayTable (dir </> "absent.toml") `shouldReturn` Nothing
+        TIO.writeFile (dir </> "bad.toml") "port = [not toml"
+        loadLegacyGatewayTable (dir </> "bad.toml") `shouldReturn` Nothing
+        TIO.writeFile (dir </> "clean.toml") "default_provider = \"anthropic\"\n"
+        loadLegacyGatewayTable (dir </> "clean.toml") `shouldReturn` Nothing
 
   -- TLS is what makes a passkey ceremony possible without a reverse proxy:
   -- WebAuthn needs a secure context, and a plain http LAN address is not one.

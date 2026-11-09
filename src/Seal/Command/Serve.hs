@@ -70,7 +70,7 @@ import Seal.Config.BootPlan
 import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
-  , untrustedExecConfigFromSecurity )
+  , gatewayConfigFromSecurity, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
@@ -78,9 +78,9 @@ import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config
-  ( GatewayConfig (..), defaultGatewayConfig, gatewayHostError
+  ( GatewayConfig (..), gatewayHostError
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
-  , effectiveTlsPaths, withGatewayDefaults )
+  , effectiveTlsPaths )
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Setup (SetupDeps (..))
 
@@ -181,7 +181,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
     Right c  -> pure c
   -- Access control is resolved ONCE here, before any channel is forked or any
   -- port is bound, so the refuse-to-start matrix (design §10) runs first.
-  let gwCfgForAccess = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
+  let gwCfgForAccess = gatewayConfigFromSecurity secCfg
   let gwCfgAccess = case mCliStaticDir of
         Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
         Nothing  -> gwCfgForAccess

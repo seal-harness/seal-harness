@@ -2,6 +2,24 @@
 
 ## 0.1.0.0 — unreleased
 
+* **The web gateway's settings moved to `security.toml`.** `[gateway]` — the
+  bind host and port, the WebSocket Origin allowlist, `static_dir`, and the TLS
+  pair — now lives in `~/.seal/security.toml` beside the vault and
+  `untrusted_execution`, because a bind address is not a setting an agent
+  should be able to change. It is no longer in `config.toml`, so a future
+  `CONFIG_UPDATE` opcode typed on the runtime config, and the gateway's own
+  `updateRuntimeConfig` writer, cannot express a change to it.
+
+  `seal serve` or `seal tui` migrates an existing `config.toml` on the next
+  boot: the table is moved into `security.toml` when that file has none of its
+  own (the usual upgrade case — `security.toml` exists but has never held a
+  gateway table), and `security.toml` wins if both carry one. Until that boot,
+  `seal provider`/`seal model`/`seal agent`/`seal channel` refuse to write
+  `config.toml` rather than silently drop the table, and `seal access-control`
+  keeps reading it read-only so its origin checks stay correct. Rolling the
+  build back does not move the table back: copy `[gateway]` from
+  `security.toml` into `config.toml` by hand.
+
 * **A fourth provider: any OpenAI-compatible endpoint.** `openai` (label
   "OpenAI-compatible") reuses the OpenRouter client — both speak
   `/v1/chat/completions` — and differs in exactly one way: it has **no**

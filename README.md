@@ -264,13 +264,15 @@ existing one is yours, and is left byte-for-byte alone (so an upgrade does not
 re-hand you a template — copy one out of `config/templates/` in the repository
 if you want to see it next to a file you already have).
 
-* `~/.seal/config/config.toml` — the runtime options: session defaults, the
-  gateway, tool timeouts, sub-agents, web tools, prompt sections, memory search,
-  chat channels. Also a git repository (`~/.seal/config`), so edits are diffable
-  and revertable.
+* `~/.seal/config/config.toml` — the runtime options: session defaults, tool
+  timeouts, sub-agents, web tools, prompt sections, memory search, chat
+  channels. Also a git repository (`~/.seal/config`), so edits are diffable and
+  revertable.
 * `~/.seal/security.toml` — boot-only, agent-immutable settings: the vault, where
-  untrusted code runs, and passkey access control. No opcode, tool or agent can
-  read or write it.
+  untrusted code runs, the web gateway's bind address / Origin allowlist / TLS
+  pair, and passkey access control. No opcode, tool or agent can read or write
+  it. The gateway settings live here because they decide who can reach the
+  agent, and a bind address is not a value to guess from.
 
 Both files spell out the default for every option. A key is written out only
 where writing it resolves to exactly what leaving it out resolves to;
@@ -360,7 +362,7 @@ cannot be bound refuses to start before anything listens.
 The gateway can terminate TLS itself, so no reverse proxy is required:
 
 ```toml
-# ~/.seal/config/config.toml
+# ~/.seal/security.toml
 [gateway]
 # "localhost" (the default) is loopback-only. Bind a specific address, or
 # 0.0.0.0 to listen on every IPv4 interface, when clients are elsewhere.
@@ -371,6 +373,13 @@ tls  = true                       # serves ~/.seal/keys/tls/{cert,key}.pem
 # tls_key  = "/etc/ssl/privkey.pem"
 # tls_hosts = ["seal.lan"]          # names for a generated certificate's SAN
 ```
+
+The bind address, the Origin allowlist and the TLS pair are security settings:
+they live in `~/.seal/security.toml`, not `config.toml`, so no opcode or agent
+config writer can move the listener. An install that still carries `[gateway]`
+in `config.toml` is migrated on the next `seal serve` or `seal tui` boot;
+`seal provider`/`seal channel`/`seal agent` refuse to write `config.toml` until
+that has happened.
 
 `tls = true` is the whole configuration: the PEM paths default to
 `~/.seal/keys/tls/cert.pem` and `~/.seal/keys/tls/key.pem`. Setting both paths

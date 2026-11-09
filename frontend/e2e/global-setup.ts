@@ -61,7 +61,11 @@ export default async function globalSetup(): Promise<void> {
   await rm(SEAL_HOME, { recursive: true, force: true })
   await mkdir(join(SEAL_HOME, 'config'), { recursive: true })
 
-  const configToml = [
+  // The gateway's bind address is a security setting: it lives in
+  // security.toml, not config.toml. Writing the old location would still work
+  // (the first `serve` migrates it), but it would make every e2e run depend on
+  // the migration and hide a regression in it.
+  const securityToml = [
     '[gateway]',
     `port = ${PORT}`,
     'host = "127.0.0.1"',
@@ -69,18 +73,15 @@ export default async function globalSetup(): Promise<void> {
     `static_dir = "${STATIC_DIR}"`,
     `allowed_origins = ["http://127.0.0.1:${PORT}"]`,
     '',
+    // Access control: the e2e suite drives the API directly and has no
+    // authenticator, so it runs in the explicitly-waived "none" mode. Without
+    // this the gateway would serve only the setup screen and every spec would
+    // 403.
+    '[access_control]',
+    'mode = "none"',
+    '',
   ].join('\n')
-  await writeFile(join(SEAL_HOME, 'config', 'config.toml'), configToml)
-
-  // Access control: the e2e suite drives the API directly and has no
-  // authenticator, so it runs in the explicitly-waived "none" mode. Without
-  // this the gateway would serve only the setup screen and every spec would
-  // 403.
-  await writeFile(
-    join(SEAL_HOME, 'security.toml'),
-    ['[access_control]', 'mode = "none"', ''].join('\n'),
-    { mode: 0o600 },
-  )
+  await writeFile(join(SEAL_HOME, 'security.toml'), securityToml, { mode: 0o600 })
 
   // Spawn `nix develop --command cabal run seal -- serve`. The `--` after
   // `seal` separates cabal's run-target args from the program's own args.

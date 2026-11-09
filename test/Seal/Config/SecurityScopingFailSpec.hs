@@ -46,3 +46,16 @@ spec = describe "Security scoping (design §9.1 compile-fail fixture)" $ do
           ]
         -- Same root cause: scUntrustedExec is not a field of RuntimeConfig.
     assertCompileFail "gateway_cannot_touch_security" "Not in scope" src
+
+  it "a RuntimeConfig handler that tries to set the gateway table fails to compile" $ do
+    let src = unlines
+          [ "{-# LANGUAGE OverloadedStrings #-}"
+          , "module Probe where"
+          , "import Seal.Config.File (RuntimeConfig (..))"
+          , "-- The [gateway] table moved to SecurityConfig: the bind address, the"
+          , "-- Origin allowlist and the TLS paths are not expressible through the"
+          , "-- mutable config, so a CONFIG_UPDATE handler cannot move the listener."
+          , "handler :: RuntimeConfig -> RuntimeConfig"
+          , "handler cfg = cfg { rcGateway = Nothing }"
+          ]
+    assertCompileFail "config_update_cannot_touch_gateway" "Not in scope" src

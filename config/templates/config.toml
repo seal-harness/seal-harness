@@ -55,41 +55,14 @@ debug_model_responses = false
 # Web gateway
 # ---------------------------------------------------------------------------
 
-[gateway]
-# Where `seal serve` listens. It prints this URL at boot, and it is the origin
-# passkey ceremonies are verified against, so all three must agree.
+# The gateway's own settings - the address and port `seal serve` listens on, the
+# origins allowed to open the WebSocket, and the TLS pair - live in
+# ~/.seal/security.toml, not here. They decide who can reach the agent, so they
+# are boot-only and no opcode, tool or agent can read or write them. See the
+# `gateway` section of that file.
 #
-# "localhost" is deliberate. A passkey ceremony needs a secure context, and
-# http://localhost is the one name every browser treats as one - it is also the
-# origin Seal derives for a loopback bind and the origin it allows for the
-# WebSocket. Spelled 127.0.0.1 the browser would be at a different origin than
-# the one being verified.
-#
-# To reach the gateway from another machine, bind a specific address (a tailnet
-# or LAN address), or 0.0.0.0 for every IPv4 interface ("::" for every
-# interface). Seal warns at boot whenever the bind is reachable from off-host.
-host = "localhost"
-port = 8080
-
-# Origins allowed to open the WebSocket. The bind address's own origin is added
-# automatically, so this only needs entries for a reverse proxy.
-allowed_origins = ["http://localhost:8080"]
-
-# ws_port is retired: the WebSocket stream shares `port`. The key is still
-# parsed so an older config file keeps working.
-# ws_port = 8080
-
-# Serve the web UI from a directory instead of the copy embedded in the binary.
-# static_dir = "/srv/seal/frontend-dist"
-
-# Serve HTTPS so a passkey ceremony works without a reverse proxy. The PEM paths
-# default to ~/.seal/keys/tls/{cert,key}.pem; if they are missing, Seal
-# generates a self-signed pair, which a browser must be told to trust before
-# WebAuthn will run on it.
-tls = false
-# tls_cert = "/etc/ssl/fullchain.pem"
-# tls_key  = "/etc/ssl/privkey.pem"
-# tls_hosts = ["seal.lan"]   # extra names for a generated certificate's SAN
+# For dev work, `seal serve --static-dir DIR` serves the UI from DIR instead of
+# the copy embedded in the binary; it overrides nothing else.
 
 # ---------------------------------------------------------------------------
 # Retrieval
