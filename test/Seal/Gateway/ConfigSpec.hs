@@ -23,7 +23,7 @@ spec = describe "Seal.Gateway.Config" $ do
 
   describe "withGatewayDefaults" $ do
     it "fills in defaults for missing fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcAllowRemoteFileExplorer = Nothing }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcFileExplorerEnabled = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 8080   -- default (same as the HTTP port)
@@ -32,7 +32,7 @@ spec = describe "Seal.Gateway.Config" $ do
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
 
     it "preserves all set fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcAllowRemoteFileExplorer = Nothing }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcFileExplorerEnabled = Nothing }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcWsPort full `shouldBe` 9091
@@ -50,7 +50,7 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcHost = Just "0.0.0.0"
               , pgcStaticDir = Just "/srv/seal"
               , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
-              , pgcAllowRemoteFileExplorer = Nothing
+              , pgcFileExplorerEnabled = Nothing
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg
@@ -69,7 +69,7 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcHost = Just "0.0.0.0"
               , pgcStaticDir = Nothing
               , pgcAllowedOrigins = []
-              , pgcAllowRemoteFileExplorer = Nothing
+              , pgcFileExplorerEnabled = Nothing
               }
             cfg = defaultRuntimeConfig { rcGateway = Just partial }
         saveRuntimeConfig path cfg

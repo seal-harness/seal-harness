@@ -354,15 +354,13 @@ runServeMainInner autonomy mCliStaticDir logger runtimeRef = do
   -- (port already in use) still advertised the dead port, so the frontend
   -- connected to a non-WebSocket port and its transcript froze.
   wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
-  -- File explorer: enabled when the gateway host is loopback OR the
-  -- operator has explicitly opted in via [gateway]
-  -- allow_remote_file_explorer. The handle is built from the security
+  -- File explorer: enabled by default (file_explorer_enabled = true).
+  -- The operator can disable it via [gateway] file_explorer_enabled = false.
+  -- The handle is built from the security
   -- config: local mode → mkLocalFileExplorer, remote mode with SSH →
   -- mkRemoteFileExplorer, remote mode without SSH → mkFailClosedFileExplorer
   -- (fail-closed — NOT a local fallback, per architect review).
-  let isLoopback = gcHost gwCfg `elem` ["127.0.0.1", "::1", "localhost"]
-      fileExplorerEnabled = isLoopback
-        || fromMaybe False (gcAllowRemoteFileExplorer gwCfg)
+  let fileExplorerEnabled = fromMaybe True (gcFileExplorerEnabled gwCfg)
   fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
     Nothing -> pure (mkLocalFileExplorer maxScanBytes)
     Just uec -> case uecRemote uec of

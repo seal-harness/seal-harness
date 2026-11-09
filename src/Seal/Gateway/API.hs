@@ -184,7 +184,7 @@ data ApiDeps = ApiDeps
     -- (the handler builds the real 'SessionExec' via 'mkSessionExec').
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   , adFileExplorer     :: FileExplorerHandle  -- ^ the file explorer capability handle (local or remote)
-  , adFileExplorerEnabled :: Bool  -- ^ 'False' when the gateway is non-loopback and the operator has not opted in via [gateway] allow_remote_file_explorer. Routes return 403.
+  , adFileExplorerEnabled :: Bool  -- ^ 'False' when the operator has disabled it via [gateway] file_explorer_enabled = false. Routes return 403.
   }
 
 -- | The REST API as a WAI Application.
@@ -2223,10 +2223,6 @@ handleAdopt deps body =
 -- ---------------------------------------------------------------------------
 -- File explorer routes (design §5.4)
 -- ---------------------------------------------------------------------------
-
--- | The set of loopback addresses. The file explorer is enabled when the
--- gateway host is one of these (or when the operator has explicitly opted
--- in via [gateway] allow_remote_file_explorer).
 
 -- | Parse the @path@ query parameter from a WAI request. Returns 'Nothing'
 -- when absent. Returns @Just ""@ for an explicitly empty value (the handler
