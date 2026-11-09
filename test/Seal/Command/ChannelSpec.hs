@@ -23,7 +23,7 @@ import Seal.Command.Spec
   ( Availability (..), CommandName (..), CommandSpec (..), runCommandAction )
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig,
-                             saveSecurityConfig)
+                             saveSecurityConfig, WriteMode (PreserveCredentials))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
 import Seal.Telegram.Config
@@ -403,6 +403,7 @@ spec = describe "Seal.Command.Channel" $ do
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
         -- Seed security.toml with a vault recipient (now lives there, not config.toml).
         saveSecurityConfig secPath (defaultSecurityConfig { scVaultRecipient = Just "age1xxx" })
+          PreserveCredentials `shouldReturn` Right ()
         cli <- mkMockCli
           (Right "0.13.0")
           (LinkSucceeded "sgnl://enc")
@@ -502,6 +503,7 @@ spec = describe "Seal.Command.Channel" $ do
             secPath = tmp <> "/security.toml"
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
         saveSecurityConfig secPath (defaultSecurityConfig { scVaultRecipient = Just "age1yyy" })
+          PreserveCredentials `shouldReturn` Right ()
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "SealBot")

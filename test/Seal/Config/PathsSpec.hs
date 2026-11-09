@@ -12,7 +12,9 @@ import Test.Hspec
 import Seal.Config.Paths
   ( SealPaths (..)
   , resolveSealHome, getSealPaths, ensureSealDirs
-  , configFilePath, vaultFilePath
+  , configFilePath, vaultFilePath, securityFilePath, credentialsFilePath
+  , enrollmentGrantPath
+  , serveLockPath
   , reposFilePath, repoCloneStateDir
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionConversationIndexPath, sessionEntriesPath, sessionRequestsPath
@@ -99,6 +101,25 @@ spec = describe "Seal.Config.Paths" $ do
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           vaultFilePath paths `shouldBe` tmp </> "config" </> "vault" </> "vault.age"
+
+    it "securityFilePath returns credentials.toml's sibling security.toml" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          securityFilePath paths `shouldBe` tmp </> "security.toml"
+          credentialsFilePath paths `shouldBe` tmp </> "credentials.toml"
+
+    it "enrollmentGrantPath lives under state/ (ephemeral, not config)" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          enrollmentGrantPath paths `shouldBe` tmp </> "state" </> "enrollment-grant.json"
+
+    it "serveLockPath lives under state/ (per-SEAL_HOME, ephemeral)" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          serveLockPath paths `shouldBe` tmp </> "state" </> "serve.lock"
 
     it "reposFilePath returns config/repos.toml" $
       withSystemTempDirectory "seal-home" $ \tmp ->

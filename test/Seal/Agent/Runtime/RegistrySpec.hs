@@ -3,6 +3,8 @@ module Seal.Agent.Runtime.RegistrySpec (spec) where
 
 import Control.Concurrent (myThreadId, threadDelay)
 import Control.Exception (throwIO)
+import Control.Monad (forM)
+import Data.Text qualified as T
 import Data.IORef
 import Test.Hspec
 
@@ -60,18 +62,27 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
       -- Poll for the async crash transition instead of one fixed sleep:
       -- under full-suite load a bare 50ms wait can observe Running and
       -- flake. Bounded at ~2s (200 × 10ms) so the suite stays fast.
-      let pollUntilCrashed :: Int -> IO Bool
-          pollUntilCrashed n
-            | n <= (0 :: Int) = pure False
-            | otherwise = do
-                mStatus <- agentStatus rt sampleSubagentId
-                case mStatus of
-                  Just s | isCrashed s -> pure True
-                  _ -> threadDelay 10000 >> pollUntilCrashed (n - 1)
-      crashed <- pollUntilCrashed 200
+      crashed <- pollUntilCrashed rt sampleSubagentId 200
       crashed `shouldBe` True
       _ <- stopAgent rt sampleSubagentId
       pure ()
+
+  describe "startAgent crash handshake" $ do
+    -- The worker must not be able to run before its registry entry exists: an
+    -- agent that throws on its first line would report its crash (a Map.adjust
+    -- keyed by subagent id) to a map that does not hold it yet, and the insert
+    -- would then leave the instance Running forever. Repeated so that a lost
+    -- update shows up even when the scheduler usually orders it the safe way.
+    it "never loses a crash that happens immediately" $ do
+      results <- forM [1 .. 50 :: Int] $ \n -> do
+        rt <- newAgentRuntime
+        let sid = SubagentId ("sa-a1-crash-" <> T.pack (show n))
+        _ <- startAgent rt sampleDefId sid sampleParentSession sampleSession 0
+               (throwIO (userError "boom"))
+        crashed <- pollUntilCrashed rt sid 100
+        _ <- stopAgent rt sid
+        pure crashed
+      results `shouldSatisfy` and
 
   describe "stopAgent" $ do
     it "removes the instance (a fresh start can proceed)" $ do
@@ -172,6 +183,16 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
 isRight :: Either a b -> Bool
 isRight (Right _) = True
 isRight (Left _)  = False
+
+-- | Poll a subagent's status until it is 'Crashed', for at most @n * 10ms@.
+pollUntilCrashed :: AgentRuntime -> SubagentId -> Int -> IO Bool
+pollUntilCrashed rt sid n
+  | n <= (0 :: Int) = pure False
+  | otherwise = do
+      mStatus <- agentStatus rt sid
+      case mStatus of
+        Just s | isCrashed s -> pure True
+        _ -> threadDelay 10000 >> pollUntilCrashed rt sid (n - 1)
 
 isCrashed :: AgentStatus -> Bool
 isCrashed (Crashed _) = True
