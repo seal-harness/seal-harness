@@ -337,6 +337,7 @@ sampleRuntimeConfig = RuntimeConfig
                                (AllowOnly (Set.singleton "+15551230001")))
   , rcTelegram        = Just (TelegramConfig (Just "sample-token") (Just 3900)
                                (AllowOnly (Set.singleton "12345")))
+  , rcChannels        = Map.empty
   , rcGateway         = Just PartialGatewayConfig
       { pgcPort = Just 8080, pgcWsPort = Just 8080, pgcHost = Just "sample-host"
       , pgcStaticDir = Just "/srv/sample", pgcAllowedOrigins = ["https://sample"]

@@ -48,6 +48,9 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , migrateLegacyChannels
+  , upsertChannel
+  , deleteChannel
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -70,6 +73,9 @@ import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), channelConfigCodec, keyChannelIdBiMap, fromSignalConfig, fromTelegramConfig)
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
 import Seal.Tools.Timeout
   ( ToolTimeoutConfig (..), defaultToolTimeoutConfig )
@@ -166,6 +172,10 @@ data RuntimeConfig = RuntimeConfig
     -- ^ Optional @[embedding]@ section (semantic search backend for
     -- memory). Absent means the null backend is used (substring search
     -- only). Set @backend = "engram"@ to enable engram subprocess search.
+  , rcChannels :: Map ChannelId ChannelConfig
+    -- ^ Per-channel config sections (@[channels.\<id\>]@). Multi-instance
+    -- chat channel management (design §3.1). Legacy @[signal]@\/@[telegram]@
+    -- sections are migrated into this map at load time ('migrateLegacyChannels').
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -306,6 +316,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcMaxTurns         = Nothing
   , rcToolTimeout      = Nothing
   , rcEmbedding        = Nothing
+  , rcChannels         = Map.empty
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -475,6 +486,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
   <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
   <*> Toml.dioptional (Toml.table embeddingConfigCodec "embedding")       .= rcEmbedding
+  <*> Toml.tableMap keyChannelIdBiMap (Toml.table channelConfigCodec) "channels" .= rcChannels
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -599,6 +611,55 @@ normalizeProvidersTable t =
         Toml.Leaf ("providers" :|| []) (mempty { Toml.tomlTables = Toml.single (p :|| ps) v })
 
 -- ---------------------------------------------------------------------------
+-- @channels@ table normalization
+-- ---------------------------------------------------------------------------
+
+-- | Parallel to 'normalizeProvidersTable' for the @[channels.\<id\>]@
+-- table. tomland's 'Toml.tableMap' silently returns an empty map when a
+-- config declares only @[channels.\<id\>]@ sub-tables and no bare
+-- @[channels]@ header (the idiomatic hand-written style). This walks the
+-- parsed AST once before decoding and makes that node explicit so both
+-- styles decode correctly. Round-tripped files (written by
+-- 'saveRuntimeConfig') already have an explicit node and pass through
+-- unchanged.
+normalizeChannelsTable :: Toml.TOML -> Toml.TOML
+normalizeChannelsTable t =
+  t { Toml.tomlTables = HashMap.adjust explicitNode "channels" (Toml.tomlTables t) }
+  where
+    explicitNode :: Toml.PrefixTree Toml.TOML -> Toml.PrefixTree Toml.TOML
+    explicitNode tree = case tree of
+      Toml.Branch pref Nothing children ->
+        Toml.Leaf pref (mempty { Toml.tomlTables = children })
+      Toml.Branch _ (Just _) _ -> tree
+      Toml.Leaf (_ :|| [])  _  -> tree
+      Toml.Leaf (_ :|| (p : ps)) v ->
+        Toml.Leaf ("channels" :|| []) (mempty { Toml.tomlTables = Toml.single (p :|| ps) v })
+
+-- ---------------------------------------------------------------------------
+-- Legacy channel migration (design §3.3)
+-- ---------------------------------------------------------------------------
+
+-- | Migrate legacy @[signal]@\/@[telegram]@ sections into 'rcChannels' on
+-- load. Per-id synthesis (not whole-map-empty): a legacy section is
+-- synthesized only when its default id (@\"signal\"@\/@\"telegram\"@) is
+-- /not/ already present in 'rcChannels', so an explicit
+-- @[channels.signal]@ wins over a legacy @[signal]@. A legacy section is
+-- migrated even when 'rcChannels' is non-empty (coexistence during the
+-- upgrade transition). 'fromTelegramConfig' preserves 'tcToken' in
+-- 'ccToken' so token-in-config setups survive migration. This is read-only
+-- migration — the legacy sections are NOT removed from the file.
+migrateLegacyChannels :: RuntimeConfig -> RuntimeConfig
+migrateLegacyChannels cfg =
+  let chans0 = rcChannels cfg
+      chans1 = case (Map.notMember (ChannelId "signal") chans0, rcSignal cfg) of
+        (True, Just sig) -> Map.insert (ChannelId "signal") (fromSignalConfig sig) chans0
+        _                -> chans0
+      chans2 = case (Map.notMember (ChannelId "telegram") chans1, rcTelegram cfg) of
+        (True, Just tg) -> Map.insert (ChannelId "telegram") (fromTelegramConfig tg) chans1
+        _               -> chans1
+  in cfg { rcChannels = chans2 }
+
+-- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
 
@@ -615,8 +676,8 @@ loadRuntimeConfig path = do
       contents <- TIO.readFile path
       pure $ case Toml.parse contents of
         Left err   -> Left (Toml.unTomlParseError err)
-        Right toml -> case Toml.runTomlCodec runtimeConfigCodec (normalizeProvidersTable toml) of
-          Success cfg  -> Right cfg
+        Right toml -> case Toml.runTomlCodec runtimeConfigCodec (normalizeChannelsTable (normalizeProvidersTable toml)) of
+          Success cfg  -> Right (migrateLegacyChannels cfg)
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
 -- | Save @cfg@ to @path@ atomically: write @path.tmp@, rename over @path@.
@@ -742,3 +803,29 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | A 'ChannelConfig' with all optional fields absent and 'ccKind' defaulting
+-- to 'Signal'. Used by 'upsertChannel' as the seed when the id is absent.
+emptyChannelConfig :: ChannelConfig
+emptyChannelConfig = ChannelConfig
+  { ccKind           = Signal
+  , ccLabel          = Nothing
+  , ccAccount        = Nothing
+  , ccToken          = Nothing
+  , ccTextChunkLimit = Nothing
+  , ccAllowFrom      = AllowAll
+  }
+
+-- | Insert or update one channel by applying @f@ to its current config (or
+-- to 'emptyChannelConfig' if absent). Mirrors 'upsertProvider'.
+upsertChannel :: ChannelId -> (ChannelConfig -> ChannelConfig) -> RuntimeConfig -> RuntimeConfig
+upsertChannel cid f cfg =
+  cfg { rcChannels = Map.insertWith (\_ old -> f old) cid (f emptyChannelConfig) (rcChannels cfg) }
+
+-- | Remove a channel from 'rcChannels'. Idempotent — a no-op when the id is
+-- absent. (Nullifying the corresponding legacy @[signal]@\/@[telegram]@
+-- field to prevent re-synthesis on the next load is the caller's
+-- responsibility — see design §3.3 deletion-respawn prevention.)
+deleteChannel :: ChannelId -> RuntimeConfig -> RuntimeConfig
+deleteChannel cid cfg =
+  cfg { rcChannels = Map.delete cid (rcChannels cfg) }

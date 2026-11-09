@@ -33,6 +33,7 @@ import Seal.Channels.Chat.Types
   , defaultGatewayConfig
   , sessionInsert
   , sessionLookup
+  , convKeyFromSource
   )
 import Seal.Channels.Chat.WsClient (WsClient (..), WsEventCallback)
 import Seal.Gateway.Types.ChannelKind (ChannelKind (..))
@@ -252,7 +253,7 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
       nextQueued (smRepoSetupQueue seams) (Right ())
   , cccGetRepos = \_mgr _apiBase ->
       nextQueued (smReposQueue seams) (Right [])
-  , cccSendMessage = \_mgr _apiBase sid prompt -> do
+  , cccSendMessage = \_mgr _apiBase sid _mSrc prompt -> do
       modifyIORef' (smSends seams) ((sid, prompt) :)
       nextQueued (smSendQueue seams) (Right okSendResult)
   , cccStartWs = \_host _port cb -> do
@@ -364,7 +365,50 @@ bgReplyJson = entryJsonFor
 
 spec :: Spec
 spec = do
+  describe "handleInboundWithSource" $ do
+    it "forwards the inbound MessageSource to the HTTP send" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      recorded <- newIORef (Nothing :: Maybe MessageSource)
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+          sid = mkSid "sid-1"
+          cfg = (stubCfg mgr seams)
+            { cccSendMessage = \_mgr _apiBase _sid mSrc _prompt -> do
+                writeIORef recorded mSrc
+                pure (Right okSendResult) }
+      sessionInsert sessions key sid
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "hello"
+      readIORef recorded `shouldReturn` Just src
+    it "mints a new session on the inbound channel" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "hello"
+      getMints seams `shouldReturn` [A.object ["channel" .= ("signal" :: Text)]]
+
   describe "loop streaming behavior (issue #198 follow-up)" $ do
+
     it "finalizes the pre-tool bubble when a tool call fires, so post-tool text starts a new message" $ do
       -- Symptom 1: pre-tool text, tool line, and post-tool text were
       -- landing in the same platform message. The loop must finalize
@@ -2121,7 +2165,8 @@ spec = do
       getMints seams `shouldReturn`
         [A.object
           [ "provider" .= ("anthropic" :: Text)
-          , "model" .= ("claude-sonnet-4" :: Text) ]]
+          , "model" .= ("claude-sonnet-4" :: Text)
+          , "channel" .= ("mock" :: Text) ]]
       getRebinds seams `shouldReturn` []
       -- No prior session: nothing to warn about and nothing to resume.
       getSends chan `shouldReturn` ["new session fresh-sid"]

@@ -10,6 +10,7 @@ export type TopSection =
   | 'agents'
   | 'skills'
   | 'repos'
+  | 'channels'
   | 'secrets'
   | 'access'
 
@@ -19,6 +20,7 @@ const SECTION_LABELS: Record<TopSection, string> = {
   agents: 'Agents',
   skills: 'Skills',
   repos: 'Repos',
+  channels: 'Channels',
   secrets: 'Secrets',
   access: 'Access',
 }

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Handles.TranscriptSpec (spec) where
 
 import Control.Exception (try, evaluate, throwIO, fromException, SomeException)
@@ -14,7 +15,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
+  ( ContentBlock (..), Message (..), pattern Message, Role (..), ToolResultPart (..)
   , ToolChoice (..), ToolDefinition (..) )
 import Seal.Core.Types (OpName (..), ToolCallId (..), ModelId (..))
 import Seal.Transcript.Entries

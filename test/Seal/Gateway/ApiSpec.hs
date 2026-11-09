@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Gateway.ApiSpec (spec) where
 
 import Control.Exception (try, SomeException)
@@ -15,7 +16,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, isJust)
+import Data.Maybe (fromJust, isJust, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -40,6 +41,9 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( Availability (..), CommandGroup (..), CommandName (..), CommandSpec (..)
   , commandAction, mkRegistry )
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), telegramVaultKeyFor)
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
@@ -58,7 +62,7 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
+  ( ContentBlock (..), Message, pattern Message, Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -662,6 +666,14 @@ spec = describe "Seal.Gateway.API" $ do
     metaExplicit <- postSessionNewMeta (A.object [ "headless" .= False ])
     smChannel metaExplicit `shouldBe` "web"
 
+
+  it "POST /api/sessions/new honors an explicit channel (chat-channel origin)" $ do
+    metaTg <- postSessionNewMeta (A.object [ "channel" .= ("telegram" :: T.Text) ])
+    smChannel metaTg `shouldBe` "telegram"
+    -- headless still wins: a bg session must stay "bg".
+    metaBg <- postSessionNewMeta
+      (A.object [ "channel" .= ("telegram" :: T.Text), "headless" .= True ])
+    smChannel metaBg `shouldBe` "bg"
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
     req <- testPost ["api", "sessions", "99999999-000000-000", "new"] (A.encode (A.object []))
@@ -4439,6 +4451,447 @@ spec = describe "Seal.Gateway.API" $ do
     status `shouldBe` 400
 
 
+  -- ── Channel CRUD (GET/POST/PUT/DELETE /api/channels) ─────────────────
+
+  it "GET /api/channels returns 200 with empty array when no channels" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Just xs -> xs `shouldBe` []
+        Nothing -> expectationFailure ("expected JSON array: " ++ show body)
+
+  it "GET /api/channels returns camelCase JSON (textChunkLimit, allowFrom, authStatus)" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [ (ChannelId "work-signal", ChannelConfig
+                { ccKind = Signal
+                , ccLabel = Just "Work"
+                , ccAccount = Just "+15555550123"
+                , ccToken = Nothing
+                , ccTextChunkLimit = Just 1998
+                , ccAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                })
+            ]
+        })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      arr `shouldSatisfy` (not . null)
+      forM_ arr $ \case
+        A.Object o -> do
+          lookupK "id" o `shouldBe` Just (A.String "work-signal")
+          lookupK "kind" o `shouldBe` Just (A.String "signal")
+          lookupK "label" o `shouldBe` Just (A.String "Work")
+          lookupK "account" o `shouldBe` Just (A.String "+15555550123")
+          lookupK "textChunkLimit" o `shouldBe` Just (A.Number 1998)
+          lookupK "allowFrom" o `shouldSatisfy` isJust
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected object"
+
+  it "POST /api/channels creates a Signal channel" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("work-signal" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+15555550123" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "id" o `shouldBe` Just (A.String "work-signal")
+          lookupK "kind" o `shouldBe` Just (A.String "signal")
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected JSON object"
+      (gStatus, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      gStatus `shouldBe` 200
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` (not . null)
+        Nothing -> expectationFailure "expected array"
+
+  it "POST /api/channels creates a Telegram channel + stores token in vault" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("dev-bot" :: T.Text)
+          , "kind" .= ("telegram" :: T.Text)
+          , "token" .= ("123:abc" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "id" o `shouldBe` Just (A.String "dev-bot")
+          lookupK "kind" o `shouldBe` Just (A.String "telegram")
+          lookupK "token" o `shouldBe` Nothing
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected JSON object"
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> vhGet vh (telegramVaultKeyFor (ChannelId "dev-bot")) `shouldReturn` Right "123:abc"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "POST /api/channels rejects duplicate id (409)" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "dup", ChannelConfig Signal Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("dup" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+1" :: T.Text)
+          ]))
+      status <- runAppStatus app req
+      status `shouldBe` 409
+
+  it "POST /api/channels rejects invalid id (400)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-err" "/tmp/seal-chan-err" vault
+    let app = apiApp deps
+    req <- testPost ["api", "channels"]
+      (A.encode (A.object
+        [ "id" .= ("bad id" :: T.Text)
+        , "kind" .= ("signal" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/channels rejects invalid kind (400)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-err2" "/tmp/seal-chan-err2" vault
+    let app = apiApp deps
+    req <- testPost ["api", "channels"]
+      (A.encode (A.object
+        [ "id" .= ("ok-id" :: T.Text)
+        , "kind" .= ("slack" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "PUT /api/channels/:id updates label + chunk limit" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig1", ChannelConfig Signal Nothing (Just "+1") Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "channels", "sig1"]
+        (A.encode (A.object
+          [ "label" .= ("Sig One" :: T.Text)
+          , "text_chunk_limit" .= (1998 :: Int)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "label" o `shouldBe` Just (A.String "Sig One")
+          lookupK "textChunkLimit" o `shouldBe` Just (A.Number 1998)
+        _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/channels/:id rotates telegram token in vault" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg1", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "channels", "tg1"]
+        (A.encode (A.object [ "token" .= ("new-token" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> vhGet vh (telegramVaultKeyFor (ChannelId "tg1")) `shouldReturn` Right "new-token"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "PUT /api/channels/:id returns 404 for unknown id" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-404" "/tmp/seal-chan-404" vault
+    let app = apiApp deps
+    req <- testPut ["api", "channels", "nope"]
+      (A.encode (A.object [ "label" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "DELETE /api/channels/:id removes channel" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig1", ChannelConfig Signal Nothing (Just "+1") Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "sig1"])
+      dStatus `shouldBe` 204
+      (gStatus, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      gStatus `shouldBe` 200
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldBe` []
+        Nothing -> expectationFailure "expected array"
+
+  it "DELETE /api/channels/:id deletes vault key for telegram" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+          key = telegramVaultKeyFor (ChannelId "tg1")
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg1", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime [(key, "tok")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "tg1"])
+      dStatus `shouldBe` 204
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> do
+          r <- vhGet vh key
+          case r of
+            Left _  -> pure ()
+            Right _ -> expectationFailure "expected vault key to be deleted"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "DELETE /api/channels/:id nullifies legacy field for 'telegram' id" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig { rcTelegram = Just defaultTelegramConfig })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "telegram"])
+      dStatus `shouldBe` 204
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> rcTelegram cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "DELETE /api/channels/:id is idempotent (204 for missing id)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-idem" "/tmp/seal-chan-idem" vault
+    let app = apiApp deps
+    status <- runAppStatus app (testRequest methodDelete ["api", "channels", "ghost"])
+    status `shouldBe` 204
+
+  it "GET /api/channels authStatus: 'missing-credential' for signal without account" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig-bare", ChannelConfig Signal Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      forM_ arr $ \case
+        A.Object o -> lookupK "authStatus" o `shouldBe` Just (A.String "missing-credential")
+        _ -> pure ()
+
+  it "GET /api/channels authStatus: 'vault-locked' for telegram when vault locked" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg-locked", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeLockedVaultRuntime
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      forM_ arr $ \case
+        A.Object o -> lookupK "authStatus" o `shouldBe` Just (A.String "vault-locked")
+        _ -> pure ()
+
+
+
+  -- ── Channel CRUD integration (W6) ────────────────────────────────
+
+  it "channel CRUD integration: full lifecycle create → list → update → delete" $
+    withSystemTempDirectory "seal-chan-int" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "lifecycle-sig")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("lifecycle-sig" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+15555550123" :: T.Text)
+          ]))
+      (cStatus, _) <- runAppBody app req
+      cStatus `shouldBe` 201
+      -- list → present
+      (_, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` any hasId
+        Nothing -> expectationFailure "expected array after create"
+      -- update
+      uReq <- testPut ["api", "channels", "lifecycle-sig"]
+        (A.encode (A.object [ "label" .= ("Updated" :: T.Text) ]))
+      (uStatus, _) <- runAppBody app uReq
+      uStatus `shouldBe` 200
+      -- delete
+      (dStatus, _) <- runAppBody app (testRequest methodDelete ["api", "channels", "lifecycle-sig"])
+      dStatus `shouldBe` 204
+      -- list → absent
+      (_, gBody2) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody2 :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` not . any hasId
+        Nothing -> expectationFailure "expected array after delete"
+
+  it "channel CRUD integration: multiple channels of same type coexist" $
+    withSystemTempDirectory "seal-chan-multi" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create sig1
+      r1 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig1" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+1111" :: T.Text) ]))
+      (s1, _) <- runAppBody app r1
+      s1 `shouldBe` 201
+      -- create sig2 (same kind, different id)
+      r2 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig2" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+2222" :: T.Text) ]))
+      (s2, _) <- runAppBody app r2
+      s2 `shouldBe` 201
+      -- GET → both present
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode body :: Maybe [A.Value] of
+        Just xs -> length xs `shouldBe` 2
+        Nothing -> expectationFailure "expected array with 2 channels"
+
+  it "channel CRUD integration: legacy [telegram] with vault token migrates" $
+    withSystemTempDirectory "seal-chan-leg" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with no tcToken, token in vault
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig })
+      vault <- makeFakeVaultRuntime
+        [("TELEGRAM_BOT_TOKEN", "999:legacy-token")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      -- the migrated "telegram" channel appears
+      let found = any hasTelegramId arr
+      found `shouldBe` True
+      -- authStatus is "configured" (vault has the token)
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
+
+  it "channel CRUD integration: legacy [telegram] with tcToken in config migrates" $
+    withSystemTempDirectory "seal-chan-leg2" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with tcToken (config-level token)
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig
+            { tcToken = Just "888:config-token" } })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      arr `shouldSatisfy` any hasTelegramId
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
+
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT
   -- /api/ui/state persists the last-chosen options; a follow-up GET
@@ -4999,7 +5452,11 @@ spec = describe "Seal.Gateway.API" $ do
         Just sidTxt -> do
           -- 2. Send a message.
           sendReq <- testPost ["api", "sessions", sidTxt, "send"]
-            (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+            (A.encode (A.object
+              [ "message" .= ("hello" :: T.Text)
+              , "channel" .= ("telegram" :: T.Text)
+              , "userId" .= ("12345" :: T.Text)
+              , "conversationId" .= ("tg:12345" :: T.Text) ]))
           (sendStatus, _sendBody) <- runAppBody app sendReq
           sendStatus `shouldBe` 200
           -- 3. Poll the transcript; the turn runs async so the reply
@@ -5018,6 +5475,23 @@ spec = describe "Seal.Gateway.API" $ do
                     pure hasReply
           replyFound <- waitForPoll 5000000 pollTranscript id
           replyFound `shouldBe` True
+          -- The request entry's metadata carries the channel + sender id
+          -- forwarded from the /send body. This proves the API handler threads
+          -- the parsed MessageSource into handleSend (passing Nothing there
+          -- would leave channel "web" and no userId).
+          case mkSessionId sidTxt of
+            Left _ -> expectationFailure "bad session id"
+            Right sid' -> do
+              raw <- BC.readFile (sessionDir paths sid' </> "entries.jsonl")
+              let entries = mapMaybe (A.decode . BL.fromStrict) (BC.lines raw)
+                  metas = [ m | Just (A.Object o) <- entries
+                              , Just (A.Object m) <- [KeyMap.lookup (Key.fromText "meta") o] ]
+              case metas of
+                (m : _) -> do
+                  KeyMap.lookup (Key.fromText "channel") m `shouldBe` Just (A.String "telegram")
+                  KeyMap.lookup (Key.fromText "userId") m `shouldBe` Just (A.String "12345")
+                  KeyMap.lookup (Key.fromText "conversationId") m `shouldBe` Just (A.String "tg:12345")
+                [] -> expectationFailure "no request entry with meta"
 
   -- ── Regression: subscribed chat channels must receive the final reply
   -- EXACTLY ONCE after a web-originated turn ──────────────────────────────
