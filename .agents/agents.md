@@ -192,8 +192,9 @@ function typed by trust level (`UntrustedIO` for Untrusted,
    constructed command strings, never an arbitrary or agent-supplied
    command. Direct mechanisms only (native libs, direct handles, SQLite,
    STM). Permitted exception: fixed-argv invocation of a specific trusted
-   binary (`age` for vault crypto, `ssh` for transport, `tmux` for harness
-   control).
+   binary (`age` for vault crypto, `age-keygen` for local vault keys,
+   `age-plugin-yubikey` for hardware-token keys, `ssh` for transport, `tmux`
+   for harness control).
 2. **Type-guaranteed argument sanitization.** Every value from user/LLM
    input that reaches a subprocess argv must be a validated
    smart-constructed newtype — never raw `Text`/`String`. Smart constructors

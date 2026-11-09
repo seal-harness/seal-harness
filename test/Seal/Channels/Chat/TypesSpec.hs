@@ -94,7 +94,11 @@ spec = do
 
   describe "defaultGatewayConfig" $ do
     it "has localhost host" $
-      gcHost defaultGatewayConfig `shouldBe` "127.0.0.1"
+      gcHost defaultGatewayConfig `shouldBe` "localhost"
+
+    it "points the API and WS URLs at localhost" $ do
+      gcApiBase defaultGatewayConfig `shouldBe` "http://localhost:8080/api"
+      gcWsUrl defaultGatewayConfig `shouldBe` "ws://localhost:8081"
 
     it "has port 8080 for HTTP" $
       gcHttpPort defaultGatewayConfig `shouldBe` 8080

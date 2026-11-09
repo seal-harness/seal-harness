@@ -28,6 +28,7 @@ import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Logging.Logger (SealLogger, testSealLogger)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddleware)
@@ -111,7 +112,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
@@ -119,14 +120,14 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp testLogger deps Nothing
+        app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
   it "a WS client connects, receives hello + a broadcastLists event" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600 }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
         port = 18095
     -- The WS stream is mounted in the HTTP app (single-port gateway).
     _ <- forkIO (run port (streamMiddleware guard broker fallbackApp))
@@ -172,7 +173,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adRepoRegistry = fakeRepoRegistryHandle
         , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault = fakeLockedVaultRuntime
+    , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
@@ -180,6 +181,6 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
-        app = gatewayApp testLogger deps Nothing
+        app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })
     status `shouldBe` 200

@@ -9,6 +9,7 @@ import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
+import { AccessView } from './components/AccessView'
 import { ChannelsView } from './components/ChannelsView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
@@ -70,6 +71,7 @@ function sectionFromPath(): TopSection {
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
+  if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
 
@@ -1042,6 +1044,8 @@ export default function App() {
         <ReposView />
       ) : section === 'secrets' ? (
         <SecretsView />
+      ) : section === 'access' ? (
+        <AccessView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar

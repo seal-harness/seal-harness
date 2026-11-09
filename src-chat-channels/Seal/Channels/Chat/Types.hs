@@ -117,21 +117,21 @@ sessionInsert (SessionMap tv) key sid =
 
 -- | The gateway connection config: where the HTTP API and WS server live.
 data GatewayConfig = GatewayConfig
-  { gcHost     :: Text    -- ^ e.g. @"127.0.0.1"@
+  { gcHost     :: Text    -- ^ e.g. @"localhost"@
   , gcHttpPort :: Int     -- ^ e.g. 8080
   , gcWsPort   :: Int     -- ^ e.g. 8081
-  , gcApiBase  :: Text    -- ^ e.g. @"http://127.0.0.1:8080/api"@
-  , gcWsUrl    :: Text    -- ^ e.g. @"ws://127.0.0.1:8081"@
+  , gcApiBase  :: Text    -- ^ e.g. @"http://localhost:8080/api"@
+  , gcWsUrl    :: Text    -- ^ e.g. @"ws://localhost:8081"@
   } deriving stock (Eq, Show)
 
 -- | Default config for localhost with typical ports.
 defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
-  { gcHost = "127.0.0.1"
+  { gcHost = "localhost"
   , gcHttpPort = 8080
   , gcWsPort = 8081
-  , gcApiBase = "http://127.0.0.1:8080/api"
-  , gcWsUrl = "ws://127.0.0.1:8081"
+  , gcApiBase = "http://localhost:8080/api"
+  , gcWsUrl = "ws://localhost:8081"
   }
 
 -- | Mutable streaming state for one conversation's streaming bubble. Lives

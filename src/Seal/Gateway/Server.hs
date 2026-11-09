@@ -10,13 +10,17 @@ module Seal.Gateway.Server
   , requestTimingMiddleware
   , requestTimingMiddlewareWith
   , runGateway
+  , isExposedBind
+  , warpSettingsFor
   ) where
 
 import Data.ByteString.Char8 qualified as BC
+import Control.Monad (when)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Char (toLower)
 import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as Map
+import Data.String (fromString)
 import Data.Text qualified as T
 import Data.Time (diffUTCTime, getCurrentTime)
 import Katip (Severity (..), ls)
@@ -26,12 +30,16 @@ import Network.HTTP.Types.Header (ResponseHeaders)
 import Network.Wai
   ( Application, pathInfo, requestMethod, responseFile
   , responseLBS, responseStatus, Response )
-import Network.Wai.Handler.Warp (defaultSettings, runSettings, setPort, setTimeout, Settings)
+import Network.Wai.Handler.Warp
+  ( defaultSettings, runSettings, setHost, setPort, setTimeout, Settings )
+import Network.Wai.Handler.WarpTLS (runTLS, tlsSettings)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeExtension)
 
+import Seal.Gateway.AccessControl
+  ( AccessControlHandle, accessControlMiddleware )
 import Seal.Gateway.API (apiApp, ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..))
+import Seal.Gateway.Config (GatewayConfig (..), tlsEnabled)
 import Seal.Gateway.Embedded (embeddedAssets)
 import Seal.Gateway.Stream (StreamGuard, streamMiddleware)
 import Seal.Gateway.StreamBroker (StreamBroker)
@@ -48,14 +56,22 @@ import Seal.Security.Path
 -- otherwise falls back to the compile-time-embedded asset map (release
 -- default). Each request is wrapped with 'requestTimingMiddleware' so the
 -- method, path, status, and duration are logged via Katip for observability.
-gatewayApp :: SealLogger -> ApiDeps -> Maybe FilePath -> Application
-gatewayApp logger deps mStaticDir =
+--
+-- The optional 'AccessControlHandle' gates the @\/api\/*@ branch only: the
+-- static bundle must always load, because the setup screen is part of it
+-- (design §7 "Where the middleware sits").
+gatewayApp :: SealLogger -> Maybe AccessControlHandle -> ApiDeps -> Maybe FilePath -> Application
+gatewayApp logger mAccess deps mStaticDir =
   requestTimingMiddleware logger $ \req respond ->
     case pathInfo req of
-      ("api" : _) -> apiApp deps req respond
+      ("api" : _) -> gatedApi req respond
       _ -> case mStaticDir of
         Just staticDir -> serveStatic staticDir req respond
         Nothing        -> serveEmbedded req respond
+  where
+    gatedApi = case mAccess of
+      Nothing     -> apiApp deps
+      Just access -> accessControlMiddleware access (apiApp deps)
 
 -- | The assembled application WITH the WebSocket stream endpoint mounted
 -- on the same port.
@@ -66,13 +82,14 @@ gatewayApp logger deps mStaticDir =
 -- collide with.
 gatewayAppWithStream
   :: SealLogger
+  -> Maybe AccessControlHandle
   -> ApiDeps
   -> Maybe FilePath
   -> StreamGuard
   -> StreamBroker
   -> Application
-gatewayAppWithStream logger deps mStaticDir guard broker =
-  streamMiddleware guard broker (gatewayApp logger deps mStaticDir)
+gatewayAppWithStream logger mAccess deps mStaticDir guard broker =
+  streamMiddleware guard broker (gatewayApp logger mAccess deps mStaticDir)
 
 -- | WAI middleware that logs each request's HTTP method, path, response
 -- status, and total duration (in milliseconds) via the Katip 'SealLogger'.
@@ -242,9 +259,26 @@ contentTypeFor ext = case ext of
   _              -> "application/octet-stream"
 
 -- | Run the gateway. Logs a startup banner with the bind address via the
--- Katip 'SealLogger'. When the host is non-loopback:
---   - If @failClosedOnNonLoopback@ is True (mode=remote), REFUSES to start.
---   - Otherwise, warns (the full slash-command surface is reachable).
+-- Katip 'SealLogger'.
+--
+-- A non-loopback host is allowed in **every** configuration, including
+-- @untrusted_execution.mode = "remote"@, and warned about. There is
+-- deliberately no refusal path.
+--
+-- It used to refuse in remote mode, as a compensating control for an
+-- unauthenticated config write that could flip @remote@ to @local@
+-- (design 2026-07-22, V6). That control was retired when the write path's
+-- type was narrowed to 'Seal.Config.File.RuntimeConfig', which cannot name
+-- the @untrusted_execution@ section at all — the attack became
+-- unrepresentable rather than merely refused.
+--
+-- Keeping the refusal would now be actively harmful. Remote mode is the
+-- configuration where the agent cannot reach the harness binary or its
+-- environment, so refusing to bind it on a network address pushes operators
+-- toward @mode = "local"@, which is strictly weaker. Exposing the port is the
+-- operator's decision — behind a VPN, a loopback TLS proxy, or passkey access
+-- control it is the normal one — so 'isExposedBind' warns and the gateway
+-- serves.
 --
 -- The WebSocket stream endpoint is served by the SAME listener (mounted
 -- via 'gatewayAppWithStream'), so there is exactly one port and one bind.
@@ -252,35 +286,53 @@ contentTypeFor ext = case ext of
 -- than leaving a half-running gateway whose live transcript was dead.
 runGateway
   :: SealLogger
+  -> Maybe AccessControlHandle
   -> GatewayConfig
-  -> Bool
   -> ApiDeps
   -> StreamGuard
   -> StreamBroker
   -> IO ()
-runGateway logger cfg failClosedOnNonLoopback deps guard broker = do
+runGateway logger mAccess cfg deps guard broker = do
   let host = gcHost cfg
       port = gcPort cfg
+      mStaticDir = fmap T.unpack (gcStaticDir cfg)
+      scheme = if tlsEnabled cfg then "https" else "http" :: T.Text
+      streamScheme = if tlsEnabled cfg then "wss" else "ws" :: T.Text
   logIO logger InfoS "Seal Harness gateway"
-  logIO logger InfoS ("  URL:      http://" <> ls host <> ":" <> ls (show port))
-  logIO logger InfoS ("  Stream:   ws://" <> ls host <> ":" <> ls (show port) <> "/ (same port)")
-  if host /= "127.0.0.1" && host /= "::1" && host /= "localhost"
-    then
-      if failClosedOnNonLoopback
-        then do
-          logIO logger ErrorS ("refusing to start gateway on non-loopback address " <> ls host
-                               <> " in remote-only mode — bind 127.0.0.1 or disable remote-only")
-          pure ()
-        else do
-          logIO logger WarningS ("binding to " <> ls host
-                                 <> " — the full slash-command surface is reachable by anything that can reach this address")
-          let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-              app = gatewayAppWithStream logger deps mStaticDir guard broker
-          runSettings (setPort port settings) app
-    else do
-      let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-          app = gatewayAppWithStream logger deps mStaticDir guard broker
-      runSettings (setPort port settings) app
+  logIO logger InfoS ("  URL:      " <> ls scheme <> "://" <> ls host <> ":" <> ls (show port))
+  logIO logger InfoS ("  Stream:   " <> ls streamScheme <> "://" <> ls host <> ":"
+                       <> ls (show port) <> "/ (same port)")
+  when (isExposedBind host) $
+    logIO logger WarningS ("binding to " <> ls host
+      <> " — the full slash-command surface is reachable by anything that can reach this address")
+  let app = gatewayAppWithStream logger mAccess deps mStaticDir guard broker
+      warpSettings = warpSettingsFor cfg
+  -- TLS in-process when both PEM paths are configured, so passkeys work with
+  -- no reverse proxy in front. 'tlsConfigError' has already refused the
+  -- half-configured case at boot.
+  case (gcTlsCert cfg, gcTlsKey cfg) of
+    (Just cert, Just key) ->
+      runTLS (tlsSettings (T.unpack cert) (T.unpack key)) warpSettings app
+    _ -> runSettings warpSettings app
+
+-- | The Warp settings for a gateway config: the port to listen on and the
+-- host to bind.
+--
+-- The host has to be passed to Warp explicitly. Warp's default host preference
+-- is the IPv4 wildcard, so a gateway configured for @localhost@ would otherwise
+-- listen on every interface — the printed URL, the WebAuthn origin and the
+-- exposed-bind warning would all describe a loopback listener that does not
+-- exist.
+warpSettingsFor :: GatewayConfig -> Settings
+warpSettingsFor cfg =
+  setHost (fromString (T.unpack (gcHost cfg))) (setPort (gcPort cfg) settings)
+
+-- | Does this bind expose the gateway beyond the local machine?
+--
+-- Only ever chooses a log line. There is intentionally no "refuse" outcome:
+-- see the note on 'runGateway'.
+isExposedBind :: T.Text -> Bool
+isExposedBind host = host `notElem` ["127.0.0.1", "::1", "localhost"]
 
 -- | Warp settings for the gateway.
 --

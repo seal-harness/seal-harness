@@ -2,6 +2,7 @@
 -- | Top-level TUI entry: path resolution -> config -> vault -> registry -> loop.
 module Seal.Tui (runTui) where
 
+import Control.Monad (forM_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
@@ -22,6 +23,7 @@ import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -84,6 +86,12 @@ runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
+  -- First-run scaffolding: see 'Seal.Config.Templates'. Never overwrites, and a
+  -- failure is a warning — the TUI boots either way.
+  (createdTemplates, templateWarnings) <- ensureConfigTemplates paths
+  forM_ createdTemplates $ \fp ->
+    putStrLn ("Wrote a documented config template at " <> fp)
+  forM_ templateWarnings $ \w -> putStrLn ("Warning: " <> T.unpack w)
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

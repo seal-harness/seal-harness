@@ -1,4 +1,10 @@
 cabal-version: 3.0
+extra-source-files:
+    -- Inputs for the `file-embed` splices in Seal.Config.Templates, and what
+    -- makes a source distribution buildable.
+    config/templates/config.toml
+    config/templates/security.toml
+
 name: seal-harness
 version: 0.1.0.0
 synopsis: A harness for secure AI agent execution around the SealOp ISA
@@ -170,15 +176,19 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
+        Seal.Command.AccessControl
         Seal.Command.Call
         Seal.Command.New
         Seal.Command.Registry
         Seal.Command.Spec
         Seal.Command.Channel
+        Seal.Config.BootPlan
+        Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
         Seal.Config.Paths
         Seal.Config.Security
+        Seal.Config.Templates
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
@@ -199,9 +209,17 @@ library
          Seal.Channels.Config
          Seal.Security.Command
          Seal.Security.Crypto
+         Seal.Security.DaemonLock
+         Seal.Security.EnrollmentGrant
          Seal.Security.Path
+        Seal.Security.AccessControl
          Seal.Security.Policy
          Seal.Security.Secrets
+        Seal.Security.WebAuthn
+        Seal.Security.TlsCert
+        Seal.Security.WebAuthn.Cbor
+        Seal.Security.WebAuthn.Der
+        Seal.Security.WebAuthn.Types
          Seal.Security.Vault
          Seal.Security.Vault.Age
          Seal.Text.LineFile
@@ -227,7 +245,11 @@ library
         Seal.Media.Image
         Seal.Media.Tts
          Seal.Gateway.Config
-          Seal.Gateway.API
+          Seal.Gateway.AccessControl
+         Seal.Gateway.OriginGuard
+         Seal.Gateway.Setup
+         Seal.Gateway.Audit
+        Seal.Gateway.API
          Seal.Gateway.Embedded
          Seal.Gateway.Route
          Seal.Gateway.Send
@@ -245,6 +267,10 @@ library
         Seal.Types.Config
         Seal.Types.Env
         Seal.Vault.Backend
+
+        Seal.Vault.Provision
+        Seal.Setup.State
+        Seal.Vault.IdentityPath
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
@@ -309,6 +335,8 @@ library
       , containers
       , conduit
       , crypton
+      , crypton-x509
+      , crypton-x509-store
       , directory
       , exceptions
       , filepath
@@ -316,7 +344,7 @@ library
       , haskeline
       , katip
       , lens
-      , memory
+      , ram
       , mtl
       , optparse-applicative
       , stm
@@ -327,6 +355,7 @@ library
       , http-client-tls
       , http-types
       , network
+      , network-info
       , tomland
       , process
       , temporary
@@ -339,6 +368,9 @@ library
         , uuid-types
       , wai
       , warp
+      , warp-tls
+      , tls
+      , time-hourglass
       , websockets
       , wai-websockets
       , case-insensitive
@@ -379,17 +411,25 @@ test-suite tests
       , containers
       , directory
       , filepath
+      , crypton
+      , crypton-x509
+      , crypton-x509-store
+      , ram
+      , file-embed
+      , template-haskell
        , hspec
       , hspec-core
        , http-client
        , http-client-tls
        , katip
       , network
+      , network-info
        , optparse-applicative
        , stm
        , temporary
        , text
        , time
+       , time-hourglass
        , process
        , unix
        , random
@@ -398,6 +438,7 @@ test-suite tests
       , case-insensitive
       , wai
       , warp
+      , tls
       , http-types
       , vector
       , tomland
@@ -420,7 +461,11 @@ test-suite tests
         Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
-        Seal.Gateway.ApiRouteSpec
+        Seal.Gateway.AccessControlSpec
+        Seal.Gateway.OriginGuardSpec
+        Seal.Gateway.MutationGuardSpec
+        Seal.Gateway.AuditSpec
+       Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
@@ -518,21 +563,33 @@ test-suite tests
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec
+        Seal.Command.AccessControlSpec
         Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
         Seal.Command.NewSpec
+        Seal.Config.BootPlanSpec
+        Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
-        Seal.Config.SecuritySpec
+        Seal.Config.SecurityAccessControlSpec
+       Seal.Config.SecuritySpec
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
+        Seal.Config.TemplatesSpec
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
+        Seal.Security.EnrollmentGrantSpec
+        Seal.Security.DaemonLockSpec
         Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
+       Seal.Security.WebAuthnSpec
+       Seal.Security.WebAuthn.CborSpec
+       Seal.Security.WebAuthn.DerSpec
+       Seal.Security.TlsCertSpec
+       Seal.Security.WebAuthnSpecFixture
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
@@ -595,6 +652,10 @@ test-suite tests
         Seal.Providers.OpenRouterSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
+        Seal.Vault.ProvisionSpec
+        Seal.Setup.StateSpec
+        Seal.Gateway.SetupApiSpec
+        Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
         Seal.Agent.ContextTruncationSpec

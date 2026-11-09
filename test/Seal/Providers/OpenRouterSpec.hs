@@ -28,8 +28,8 @@ import Seal.Providers.Class
   , pattern Message, Provider (..), Role (..), StopReason (..), ToolChoice (..)
   , ToolResultPart (..), Usage (..), textMsg )
 import Seal.Providers.OpenRouter
-  ( bearerHeaders, decodeResponse, encodeRequest, mapFinishReason, mkOpenRouter
-  , defaultOpenRouterBaseUrl )
+  ( bearerHeaders, decodeModelIds, decodeResponse, encodeRequest
+  , mapFinishReason, mkOpenRouter, defaultOpenRouterBaseUrl )
 
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
 minimalReq :: CompletionRequest
@@ -214,6 +214,17 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
       let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- listModels prov
       r `shouldBe` Right [ModelId "deepseek/deepseek-v4.1-flash-1017"]
+
+  describe "decodeModelIds" $ do
+    it "reads the OpenAI-compatible model list" $
+      decodeModelIds "{\"data\":[{\"id\":\"gpt-4o-mini\"},{\"id\":\"local-llama\"}]}"
+        `shouldBe` Right [ModelId "gpt-4o-mini", ModelId "local-llama"]
+
+    it "rejects a payload that is not a model list" $
+      decodeModelIds "<html>not json</html>" `shouldSatisfy` isLeft
+
+    it "rejects entries without an id" $
+      decodeModelIds "{\"data\":[{\"object\":\"model\"}]}" `shouldSatisfy` isLeft
 
   describe "bearerHeaders" $ do
     it "puts the raw key bytes only in Authorization: Bearer + json content-type" $ do

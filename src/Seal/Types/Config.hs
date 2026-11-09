@@ -29,7 +29,7 @@ makeLenses ''ServerConfig
 
 defaultServerConfig :: ServerConfig
 defaultServerConfig = ServerConfig
-  { _serverConfig_host = "127.0.0.1"
+  { _serverConfig_host = "localhost"
   , _serverConfig_port = 8080
   }
 
