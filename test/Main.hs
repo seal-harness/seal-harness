@@ -14,6 +14,11 @@ import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
 import qualified Seal.Gateway.ApiRouteSpec
+import qualified Seal.Gateway.AccessControlSpec
+import qualified Seal.Gateway.OriginGuardSpec
+import qualified Seal.Gateway.MutationGuardSpec
+import qualified Seal.Gateway.AuditSpec
+import qualified Seal.Command.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
@@ -62,13 +67,20 @@ import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
+import qualified Seal.Config.TemplatesSpec
 import qualified Seal.Security.CryptoSpec
+import qualified Seal.Security.WebAuthnSpec
+import qualified Seal.Security.TlsCertSpec
+import qualified Seal.Security.WebAuthn.CborSpec
+import qualified Seal.Security.WebAuthn.DerSpec
 import qualified Seal.Security.PathSpec
 import qualified Seal.Security.SecretsSpec
 import qualified Seal.Security.Vault.AgeSpec
 import qualified Seal.Security.VaultSpec
 import qualified Seal.Security.PolicySpec
 import qualified Seal.Security.CommandSpec
+import qualified Seal.Security.EnrollmentGrantSpec
+import qualified Seal.Security.DaemonLockSpec
 import qualified Seal.Security.AdoptionSpec
 import qualified Seal.Command.HelpSpec
 import qualified Seal.Command.ModelSpec
@@ -86,12 +98,19 @@ import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
 import qualified Seal.Command.NewSpec
+import qualified Seal.Config.BootPlanSpec
+import qualified Seal.Config.CredentialsSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.SecuritySpec
+import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.CapabilityScopingWorkdirFsFailSpec
 import qualified Seal.Vault.BackendSpec
+import qualified Seal.Vault.ProvisionSpec
+import qualified Seal.Setup.StateSpec
+import qualified Seal.Gateway.SetupApiSpec
+import qualified Seal.Vault.IdentityPathScopingFailSpec
 import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
@@ -216,6 +235,11 @@ specs = do
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
+  Seal.Gateway.AccessControlSpec.spec
+  Seal.Gateway.OriginGuardSpec.spec
+  Seal.Gateway.MutationGuardSpec.spec
+  Seal.Gateway.AuditSpec.spec
+  Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiFilesSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
@@ -264,13 +288,20 @@ specs = do
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
+  Seal.Config.TemplatesSpec.spec
   Seal.Security.CryptoSpec.spec
+  Seal.Security.WebAuthnSpec.spec
+  Seal.Security.TlsCertSpec.spec
+  Seal.Security.WebAuthn.CborSpec.spec
+  Seal.Security.WebAuthn.DerSpec.spec
   Seal.Security.PathSpec.spec
   Seal.Security.SecretsSpec.spec
   Seal.Security.Vault.AgeSpec.spec
   Seal.Security.VaultSpec.spec
   Seal.Security.PolicySpec.spec
   Seal.Security.CommandSpec.spec
+  Seal.Security.EnrollmentGrantSpec.spec
+  Seal.Security.DaemonLockSpec.spec
   Seal.Security.AdoptionSpec.spec
   Seal.Command.HelpSpec.spec
   Seal.Command.ModelSpec.spec
@@ -288,12 +319,19 @@ specs = do
   Seal.Command.SpecSpec.spec
   Seal.Command.TabSpec.spec
   Seal.Command.NewSpec.spec
+  Seal.Config.BootPlanSpec.spec
+  Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.SecuritySpec.spec
+  Seal.Config.SecurityAccessControlSpec.spec
   Seal.Config.SecurityScopingFailSpec.spec
   Seal.CapabilityScopingWorkdirFsFailSpec.spec
   Seal.Vault.BackendSpec.spec
+  Seal.Vault.ProvisionSpec.spec
+  Seal.Setup.StateSpec.spec
+  Seal.Gateway.SetupApiSpec.spec
+  Seal.Vault.IdentityPathScopingFailSpec.spec
   Seal.Vault.CommandsSpec.spec
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec

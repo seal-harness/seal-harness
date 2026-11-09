@@ -76,10 +76,22 @@ openRouterCfg mUrl = defaultRuntimeConfig
         mUrl
   }
 
+-- | A runtime config whose @[providers.openai] base_url@ is set (or absent).
+openAICfg :: Maybe T.Text -> RuntimeConfig
+openAICfg mUrl = defaultRuntimeConfig
+  { rcProviders =
+      maybe Map.empty
+        (\u -> Map.fromList
+          [("openai", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+        mUrl
+  }
+
 spec :: Spec
 spec = describe "Seal.Providers.Registry vocabulary" $ do
   it "lists the known providers" $
-    knownProviders `shouldBe` [AnthropicProvider, OllamaProvider, OpenRouterProvider]
+    knownProviders
+      `shouldBe` [ AnthropicProvider, OllamaProvider, OpenRouterProvider
+                 , OpenAICompatibleProvider ]
 
   it "labels Anthropic" $
     providerLabel AnthropicProvider `shouldBe` "anthropic"
@@ -89,6 +101,11 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
 
   it "labels OpenRouter" $
     providerLabel OpenRouterProvider `shouldBe` "openrouter"
+
+  it "labels the generic OpenAI-compatible provider" $ do
+    providerLabel OpenAICompatibleProvider `shouldBe` "openai"
+    vaultKeyName OpenAICompatibleProvider `shouldBe` "OPENAI_API_KEY"
+    parseProvider "openai" `shouldBe` Just OpenAICompatibleProvider
 
   it "maps Anthropic to its ProviderId" $
     providerId AnthropicProvider `shouldBe` ProviderId "anthropic"
@@ -251,6 +268,42 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       case r of
         Left e  -> e `shouldSatisfy` ("API key" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for no vault handle"
+
+  describe "resolveProvider (openai-compatible)" $ do
+    it "refuses to resolve without a base URL (never guesses api.openai.com)" $ do
+      vh  <- makeFakeVault [("OPENAI_API_KEY", "sk-local")]
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr defaultRuntimeConfig
+               OpenAICompatibleProvider (ModelId "m") counter
+      case r of
+        Left e  -> e `shouldSatisfy` ("base URL" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected a Left when no endpoint is configured"
+
+    it "resolves against the configured endpoint with a stored key" $ do
+      vh  <- makeFakeVault [("OPENAI_API_KEY", "sk-local")]
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr (openAICfg (Just "http://localhost:8000/v1"))
+               OpenAICompatibleProvider (ModelId "m") counter
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right, got Left: " <> show e)
+
+    it "reports a missing key with an actionable hint" $ do
+      vh  <- makeFakeVault []
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr (openAICfg (Just "http://localhost:8000/v1"))
+               OpenAICompatibleProvider (ModelId "m") counter
+      case r of
+        Left e  -> e `shouldSatisfy` ("provider add" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected a Left for a missing credential"
+
+  describe "configuredProviders (openai-compatible)" $ do
+    it "needs BOTH the endpoint and the key" $ do
+      vh  <- makeFakeVault [("OPENAI_API_KEY", "sk-local")]
+      keyed <- configuredProviders (Just vh) (openAICfg (Just "http://localhost:8000/v1"))
+      keyed `shouldSatisfy` elem OpenAICompatibleProvider
+      endpointOnly <- configuredProviders (Just vh) defaultRuntimeConfig
+      endpointOnly `shouldSatisfy` notElem OpenAICompatibleProvider
 
   describe "providerBaseUrlFor" $ do
     it "uses each provider's OWN default base URL" $ do

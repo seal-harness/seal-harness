@@ -146,6 +146,10 @@ openApiMeta = \case
   RouteFilesList -> api (match "files" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteFilesContent -> api (match "files" ./ match "content" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteFilesDownload -> api (match "files" ./ match "download" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteSetupState -> api (match "setup" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteSetupVault -> api (match "setup" ./ match "vault" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteSetupVaultReopen -> api (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteProviderTest -> api (match "providers" ./ capture oaText ./ match "test" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
 
 -- | Prefix a path with @match "api"@ so the rendered OpenAPI paths include the
 -- @\/api@ prefix the client sees (the gateway strips it before dispatching to

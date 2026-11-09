@@ -87,9 +87,10 @@ import Seal.Config.Paths (SealPaths (..), securityFilePath, sshAgentsDir)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , saveSecurityConfig )
+  , WriteMode (PreserveCredentials), saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -466,7 +467,7 @@ buildTestEnv tmp mode mRepo opts = do
       secCfg = if mode == UemRemote
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
-  saveSecurityConfig (securityFilePath paths) secCfg
+  _ <- saveSecurityConfig (securityFilePath paths) secCfg PreserveCredentials
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
@@ -536,7 +537,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adRepoRegistry = repoRegH
         , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
-        , adVault = rt
+        , adVault = rt, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)

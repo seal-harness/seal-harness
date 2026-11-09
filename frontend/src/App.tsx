@@ -9,6 +9,7 @@ import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
+import { AccessView } from './components/AccessView'
 import { ChannelsView } from './components/ChannelsView'
 import { FilesView } from './components/FilesView'
 import { PerfOverlay } from './components/PerfOverlay'
@@ -72,6 +73,7 @@ function sectionFromPath(): TopSection {
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
   if (path === '/files' || path.startsWith('/files/')) return 'files'
+  if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
 
@@ -1046,6 +1048,8 @@ export default function App() {
         <SecretsView />
       ) : section === 'files' ? (
         <FilesView />
+      ) : section === 'access' ? (
+        <AccessView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar

@@ -1,9 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import logoImg from '../../assets/SealLogo.png'
+import { SignOutButton } from './SignOutButton'
 
 /** The top-level navigation sections. The existing sessions/tabs/chat UI
  *  lives under "Sessions"; "Agents" + "Skills" open the CRUD views. */
-export type TopSection = 'sessions' | 'providers' | 'agents' | 'skills' | 'repos' | 'channels' | 'secrets' | 'files'
+export type TopSection =
+  | 'sessions'
+  | 'providers'
+  | 'agents'
+  | 'skills'
+  | 'repos'
+  | 'channels'
+  | 'secrets'
+  | 'files'
+  | 'access'
 
 const SECTION_LABELS: Record<TopSection, string> = {
   sessions: 'Sessions',
@@ -14,6 +24,7 @@ const SECTION_LABELS: Record<TopSection, string> = {
   channels: 'Channels',
   secrets: 'Secrets',
   files: 'Files',
+  access: 'Access',
 }
 
 export function TopBar({
@@ -57,6 +68,7 @@ export function TopBar({
       <div className="flex-1" />
 
       <div className="flex items-center gap-2">
+        <SignOutButton />
         <div
           className="text-xs px-2.5 py-1.5 rounded-md flex items-center"
           style={{ background: 'var(--bg-elevated)', color: 'var(--text-faint)', border: '1px solid var(--border)' }}

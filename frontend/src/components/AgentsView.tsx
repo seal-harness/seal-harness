@@ -14,7 +14,7 @@ import {
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI',
+  openai: 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }

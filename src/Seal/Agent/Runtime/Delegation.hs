@@ -20,7 +20,7 @@
 --
 --   * batch mode ('tasks' array) with a concurrency cap
 --     (@delegation.max_concurrent_children@);
---   * depth cap (@delegation.max_spawn_depth@, default 1, clamped to [1,3])
+--   * depth cap (@delegation.max_spawn_depth@, default 3, clamped to [1,3])
 --     + @orchestrator_enabled@ kill switch (the role field is accepted but the
 --     wiring layer enforces the effective role when it builds the child's
 --     ISA registry);
@@ -120,7 +120,7 @@ data DelegationConfig = DelegationConfig
   , dcChildTimeoutSeconds :: Maybe Double
     -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
   , dcMaxSpawnDepth :: Maybe Int
-    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+    -- ^ Max delegation tree depth. Default 3, clamped to [1,3].
   , dcOrchestratorEnabled :: Maybe Bool
     -- ^ Kill switch for the orchestrator role. Default True.
   , dcProvider :: Maybe Text

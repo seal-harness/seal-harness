@@ -27,6 +27,7 @@ import Seal.Config.Paths (SealPaths (..))
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -156,6 +157,8 @@ mkDeps fe enabled = do
     , adConfigRepo = undefined
     , adVault = undefined
     , adPaths = paths
+    , adCanonicalOrigin = Nothing
+    , adSetup = stubSetupDeps
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing

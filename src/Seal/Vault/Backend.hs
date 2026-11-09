@@ -6,12 +6,15 @@
 module Seal.Vault.Backend
   ( VaultKeyBackend (..)
   , ResolvedKey (..)
+  , KeySetupFailure (..)
   , detectAgePlugins
   , filterPluginNames    -- exported for testing
   , parsePluginRecipient -- exported for testing
   , setupLocalAgeKey
   , setupYubiKey
+  , setupYubiKeyCore     -- non-interactive core shared with the web wizard
   , setupUserSupplied
+  , setupUserSuppliedFrom
   , parseUnlockMode
   , resolveEncryptor
   , readProcessNoInput   -- exported for test reuse
@@ -20,7 +23,7 @@ module Seal.Vault.Backend
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
 import Data.Either (fromRight)
-import Data.List (isPrefixOf, nub, sort)
+import Data.List (isPrefixOf, nub, sort, stripPrefix)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -44,6 +47,7 @@ import Seal.Security.Vault.Age
   , VaultError (..)
   , mkAgeEncryptor
   )
+import Seal.Vault.IdentityPath (VaultIdentityPath, vaultIdentityPathText)
 
 -- | Run a process with no stdin, capturing stdout and stderr as strict
 -- 'ByteString's. Used by the age-keygen / age-plugin-yubikey setup seams
@@ -79,6 +83,22 @@ data ResolvedKey = ResolvedKey
   , rkIdentity :: Text   -- absolute path to identity file
   , rkKeyType :: Text   -- "x25519" | "yubikey" | "user"
   } deriving stock (Eq, Show)
+
+-- | Why a non-interactive key setup failed.
+--
+-- Kept as a sum type rather than a message so the web wizard can map each
+-- class to the right response: a missing binary is "install it", a plugin that
+-- wanted stdin is "run this command in a terminal", anything else is a 500-ish
+-- failure. The 'Text' payloads are for the log; only 'KeySetupNeedsTty'\'s
+-- command is ever shown to a user.
+data KeySetupFailure
+  = KeySetupMissing Text
+    -- ^ The tool is not on PATH (the payload is the binary name).
+  | KeySetupNeedsTty Text
+    -- ^ The plugin needs a terminal; the payload is the runnable command.
+  | KeySetupFailed Text
+    -- ^ Anything else; the payload is the tool's own output.
+  deriving stock (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- Plugin detection
@@ -223,6 +243,19 @@ setupUserSupplied caps = do
     , rkKeyType   = "user"
     })
 
+-- | The non-interactive form of 'setupUserSupplied': already-validated
+-- credentials in, a 'ResolvedKey' out. The web wizard parses its body through
+-- 'mkAgeRecipient' and 'mkVaultIdentityPath' first, so by the time this runs
+-- neither value can carry an option-injection prefix or a control character.
+setupUserSuppliedFrom
+  :: AgeRecipient -> VaultIdentityPath -> Either Text ResolvedKey
+setupUserSuppliedFrom (AgeRecipient recipient) identity =
+  Right ResolvedKey
+    { rkRecipient = recipient
+    , rkIdentity  = T.pack (vaultIdentityPathText identity)
+    , rkKeyType   = "user"
+    }
+
 -- ---------------------------------------------------------------------------
 -- Unlock mode + encryptor resolution
 -- ---------------------------------------------------------------------------
@@ -253,6 +286,71 @@ parseAgePublicKey txt =
   case filter (T.isPrefixOf "Public key: ") (T.lines txt) of
     []       -> Nothing
     (line:_) -> Just (T.drop (T.length "Public key: ") line)
+
+-- | The non-interactive core of 'setupYubiKey': no 'ChannelCaps', no prompt,
+-- no waiting. The web wizard cannot answer a terminal prompt, so a plugin that
+-- wants one is reported as 'KeySetupNeedsTty' together with the exact command
+-- the operator should run.
+--
+-- The identity file it writes is @0600@ under the keys directory (mode 0700).
+setupYubiKeyCore
+  :: SealPaths -> Text -> Bool -> Bool -> IO (Either KeySetupFailure ResolvedKey)
+setupYubiKeyCore paths name touchRequired pinRequired = do
+  mPlugin <- findExecutable "age-plugin-yubikey"
+  case mPlugin of
+    Nothing -> pure (Left (KeySetupMissing "age-plugin-yubikey"))
+    Just _ -> do
+      keysRoot <- ensureKeysRoot (spKeys paths)
+      rel      <- freshKeyName (spKeys paths) (T.unpack name) ".yubikey.txt"
+      pathRes  <- mkSafeKeyPath keysRoot rel
+      case pathRes of
+        Left err -> pure (Left (KeySetupFailed (T.pack (show err))))
+        Right safePath -> do
+          let identPath   = getSafeKeyPath safePath
+              touchPolicy = if touchRequired then "always" else "never"
+              pinPolicy   = if pinRequired then "once" else "never"
+          (exitCode, stdoutBs, stderrBs) <-
+            readProcessNoInput "age-plugin-yubikey"
+              [ "--generate"
+              , "--touch-policy", touchPolicy
+              , "--pin-policy", pinPolicy
+              ]
+          let stdoutText = TE.decodeUtf8Lenient stdoutBs
+          if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
+            then case parsePluginRecipient stdoutText of
+              Nothing -> pure (Left (KeySetupFailed
+                ("age-plugin-yubikey: could not parse a recipient line from its output; "
+                 <> TE.decodeUtf8Lenient stderrBs)))
+              Just pub -> do
+                BS.writeFile identPath (TE.encodeUtf8 stdoutText)
+                setFileMode identPath 0o600
+                pure (Right ResolvedKey
+                  { rkRecipient = pub
+                  , rkIdentity  = T.pack identPath
+                  , rkKeyType   = "yubikey"
+                  })
+            else pure (Left (KeySetupNeedsTty
+              (yubiCommandFor paths identPath touchPolicy pinPolicy)))
+
+-- | The command the operator runs by hand when the plugin needs a TTY. The
+-- path is rendered in tilde form when it is under the seal home, because that
+-- is the form that stays readable in an error body and is still runnable from
+-- the operator's own shell. Single-quoted: a @SEAL_HOME@ with a space must not
+-- turn the hint into two words.
+yubiCommandFor :: SealPaths -> FilePath -> String -> String -> Text
+yubiCommandFor paths identPath touchPolicy pinPolicy =
+  T.unwords
+    [ "age-plugin-yubikey --generate"
+    , "--touch-policy", T.pack touchPolicy
+    , "--pin-policy", T.pack pinPolicy
+    , ">", "'" <> T.pack (tildeForm (spHome paths) identPath) <> "'"
+    ]
+
+-- | @~\/rest@ for a path under @home@, otherwise the path unchanged.
+tildeForm :: FilePath -> FilePath -> FilePath
+tildeForm home path = case stripPrefix (home <> "/") path of
+  Just rest -> "~/" <> rest
+  Nothing   -> path
 
 -- | Parse the recipient (public key) from age-plugin-yubikey @--generate@
 -- output. The recipient appears on a comment line such as
