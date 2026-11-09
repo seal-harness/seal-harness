@@ -20,10 +20,10 @@ const SECTION_LABELS: Record<TopSection, string> = {
   providers: 'Providers',
   agents: 'Agents',
   skills: 'Skills',
+  files: 'Files',
   repos: 'Repos',
   channels: 'Channels',
   secrets: 'Secrets',
-  files: 'Files',
   access: 'Access',
 }
 
