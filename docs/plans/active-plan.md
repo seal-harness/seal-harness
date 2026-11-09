@@ -2,7 +2,7 @@
 <!-- approved: 2026-11-09 -->
 <!-- gate-iterations: 3 -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: completed -->
 
 Move the whole `[gateway]` table out of `~/.seal/config/config.toml` and into
 `~/.seal/security.toml`, so the bind address, origin allowlist and TLS paths
@@ -17,5 +17,5 @@ Execution: orchestrated (2 work units).
 
 | WU | Title | Status |
 |---|---|---|
-| WU1 | the section moves (atomic) | in progress |
-| WU2 | enforcement and prose | pending |
+| WU1 | the section moves (atomic) | complete |
+| WU2 | enforcement and prose | complete |
