@@ -372,7 +372,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccSetupRepo = httpSetupRepo
   , cccGetRepos = httpGetRepos
   , cccSendMessage = httpSend
-  , cccStartWs = startWsClient
+  , cccStartWs = startWsClient (gcWsSecure gw) (gcTlsCert gw) Nothing
   , cccAnswerQuestion = httpAnswerQuestion
   , cccGetLists = httpGetLists
   }

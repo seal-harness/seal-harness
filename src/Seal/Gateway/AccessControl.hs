@@ -714,7 +714,8 @@ enrollRefusal denied = case denied of
       "confirm it's you with an existing passkey to add another"
   GrantInvalid ->
     AuthErr status403 "grant_invalid"
-      "that enrollment token is not valid for this gateway; run `seal access-control enroll`"
+      ("that enrollment token is not valid for this gateway; use the token the "
+        <> "current `seal serve` printed, or run `seal access-control enroll --force`")
 
 -- | Gate an enrollment endpoint on 'resolveEnrollment', handing the accepted
 -- authority to the handler.

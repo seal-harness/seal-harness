@@ -60,6 +60,7 @@ module Seal.Config.Security
   , clearAccessControlSection
   , gatewayConfigFromSecurity
   , writeSecretFile
+  , openUniqueTemp
   , securityWriteLock
   , defaultSecurityConfig
   , securityConfigCodec
@@ -71,7 +72,9 @@ module Seal.Config.Security
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (bracketOnError)
+import Control.Exception (IOException, bracketOnError, try)
+import Control.Monad (void)
+import Data.ByteString qualified as BS
 import Data.HashMap.Strict qualified as HashMap
 import Data.Functor ((<&>))
 import Data.List.NonEmpty qualified as NonEmpty
@@ -80,10 +83,12 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist, renameFile)
+import System.Directory (doesFileExist, removeFile, renameFile)
+import System.FilePath (takeDirectory, takeFileName)
+import System.IO (Handle, hClose, openBinaryTempFile)
 import System.IO.Unsafe (unsafePerformIO)
-import System.IO (hClose)
 import System.Posix.Files (setFileMode)
 import System.Posix.IO
   ( OpenFileFlags (creat, nofollow, trunc), OpenMode (WriteOnly), closeFd
@@ -518,10 +523,38 @@ saveSecurityConfig path cfg mode = do
     Just err -> pure (Left err)
     Nothing  -> do
       let encoded = Toml.encode securityConfigCodec cfg
-          tmp     = path <> ".tmp"
-      writeSecretFile tmp encoded
-      renameFile tmp path
-      pure (Right ())
+      outcome <- try (writeAtomicText path encoded) :: IO (Either IOException ())
+      pure $ case outcome of
+        Left err -> Left ("could not write " <> T.pack path <> ": "
+                            <> T.pack (show err))
+        Right () -> Right ()
+
+-- | Open a unique temp file in @path@'s directory, at mode 0600.
+--
+-- 'openBinaryTempFile' is @mkstemp@-style: it creates with @O_CREAT|O_EXCL@ and
+-- mode 0600, so a pre-created symlink or a colliding name makes the open fail
+-- rather than being followed. That is why no separate @O_NOFOLLOW@ is needed.
+-- Two writers targeting the same destination therefore never share a temp path.
+openUniqueTemp :: FilePath -> IO (FilePath, Handle)
+openUniqueTemp path =
+  openBinaryTempFile (takeDirectory path) (takeFileName path <> ".tmp")
+
+-- | Write UTF-8 bytes through a unique temp file and rename into place.
+--
+-- Binary mode is deliberate: 'openBinaryTempFile' returns a binary handle, and
+-- encoding explicitly keeps non-ASCII paths/hosts from being written as latin1.
+writeAtomicText :: FilePath -> Text -> IO ()
+writeAtomicText path contents =
+  bracketOnError (openUniqueTemp path) cleanup $ \(tmp, h) -> do
+    BS.hPutStr h (TE.encodeUtf8 contents)
+    hClose h
+    setFileMode tmp 0o600
+    renameFile tmp path
+  where
+    cleanup (tmp, h) = do
+      ignoreIO (hClose h)
+      ignoreIO (removeFile tmp)
+    ignoreIO action = void (try action :: IO (Either IOException ()))
 
 legacyCredentialRefusal :: FilePath -> WriteMode -> IO (Maybe Text)
 legacyCredentialRefusal _    DropCredentials   = pure Nothing

@@ -28,6 +28,6 @@ spec = describe "Seal.AppMain" $ do
       reorderGlobalArgs ["--log-level", "debug", "serve", "--yolo"]
         `shouldBe` ["--log-level", "debug", "serve", "--yolo"]
 
-    it "hoists multiple global options" $
+    it "does not hoist a removed --server-host flag" $
       reorderGlobalArgs ["serve", "--yolo", "--log-level", "debug", "--server-host", "0.0.0.0", "--no-enrollment-token"]
-        `shouldBe` ["--log-level", "debug", "--server-host", "0.0.0.0", "serve", "--yolo", "--no-enrollment-token"]
+        `shouldBe` ["--log-level", "debug", "serve", "--yolo", "--server-host", "0.0.0.0", "--no-enrollment-token"]

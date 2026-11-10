@@ -14,15 +14,26 @@ module Seal.Channels.Chat.WsClient
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, finally, try)
 import Data.Aeson qualified as A
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.X509.CertificateStore
+  (CertificateStore, listCertificates, makeCertificateStore, readCertificateStore)
+import Network.Connection
+  ( ConnectionParams (..), TLSSettings (..), connectTo, connectionClose
+  , connectionGet, connectionPut, initConnectionContext )
+import Network.TLS (ClientParams (..), Shared (..), defaultParamsClient)
 import Network.WebSockets
-  (ClientApp, Connection, receiveData, runClient, sendTextData, sendClose)
+  ( ClientApp, Connection, defaultConnectionOptions, receiveData
+  , runClientWith, runClientWithStream, sendClose, sendTextData )
+import Network.WebSockets.Stream (makeStream)
 import System.Timeout (timeout)
+import System.X509 (getSystemCertificateStore)
 
 import Seal.Gateway.Types.Core (SessionId, sessionIdText)
 import Seal.Gateway.Types.Stream
@@ -43,22 +54,50 @@ data WsClient = WsClient
 
 -- | Connect to the gateway's WS server. Forks the connection in a
 -- background thread and returns a 'WsClient' handle immediately. Returns
--- 'Left' if the connection fails within 5 seconds.
+-- 'Left' if the connection fails within 5 seconds. A secure connection uses
+-- @wss@ and trusts the gateway's own PEM certificate: its generated
+-- certificate is self-signed, so the system trust store does not contain it.
 startWsClient
-  :: Text    -- ^ Host (e.g. @"127.0.0.1"@)
+  :: Bool    -- ^ Use TLS (@wss@)
+  -> Maybe Text -- ^ Gateway PEM certificate to trust (when TLS is on)
+  -> Maybe Text -- ^ Gateway service token for the handshake
+  -> Text    -- ^ Host (e.g. @"127.0.0.1"@)
   -> Int     -- ^ Port (e.g. 8081)
   -> WsEventCallback
   -> IO (Either Text WsClient)
-startWsClient host port callback = do
+startWsClient secure mCert mToken host port callback = do
   connRef <- newIORef Nothing
   readyVar <- newEmptyMVar
-  let app :: ClientApp ()
+  let headers =
+        maybe [] (\tok -> [("Authorization", "Bearer " <> TE.encodeUtf8 tok)]) mToken
+      app :: ClientApp ()
       app conn = do
         writeIORef connRef (Just conn)
         putMVar readyVar ()
         readerLoop conn callback
+      connect :: IO ()
+      connect
+        | secure = void (runSecureTls app)
+        | otherwise = runClientWith (T.unpack host) port "/"
+                        defaultConnectionOptions headers app
+      runSecureTls wsApp = do
+        settings <- secureTlsSettings mCert host
+        ctx <- initConnectionContext
+        conn <- connectTo ctx ConnectionParams
+          { connectionHostname = T.unpack host
+          , connectionPort = fromIntegral port
+          , connectionUseSecure = Just settings
+          , connectionUseSocks = Nothing
+          }
+        stream <- makeStream
+          (connectionGet conn 32768 >>= \bs ->
+             pure (if BS.null bs then Nothing else Just bs))
+          (maybe (pure ()) (connectionPut conn . BL.toStrict))
+        runClientWithStream stream (T.unpack host) "/"
+          defaultConnectionOptions headers wsApp
+          `finally` connectionClose conn
   -- Fork the client connection so we can return immediately.
-  _ <- forkIO $ void (try (runClient (T.unpack host) port "/" app) :: IO (Either SomeException ()))
+  _ <- forkIO $ void (try connect :: IO (Either SomeException ()))
   -- Wait up to 5s for the connection to be established.
   mReady <- timeout 5000000 (takeMVar readyVar)
   case mReady of
@@ -70,6 +109,27 @@ startWsClient host port callback = do
             , wcClose = closeConnRef connRef
             }
       pure (Right client)
+
+-- | TLS settings that trust exactly the gateway's PEM certificate. The
+-- generated certificate is self-signed, and the system store does not carry
+-- it, so the channel pins it as its own trust anchor instead of silently
+-- failing the handshake.
+secureTlsSettings :: Maybe Text -> Text -> IO TLSSettings
+secureTlsSettings Nothing _ =
+  ioError (userError "gateway TLS certificate path is not configured")
+secureTlsSettings (Just certPath) host = do
+  mPinned <- readCertificateStore (T.unpack certPath)
+  case mPinned of
+    Nothing -> ioError (userError ("cannot read gateway TLS certificate: " <> T.unpack certPath))
+    Just pinned -> do
+      eSystem <- try getSystemCertificateStore
+        :: IO (Either SomeException CertificateStore)
+      let systemCerts = either (const []) listCertificates eSystem
+          store = makeCertificateStore (systemCerts <> listCertificates pinned)
+          base = defaultParamsClient (T.unpack host) BS.empty
+          params = base
+            { clientShared = (clientShared base) { sharedCAStore = store } }
+      pure (TLSSettings params)
 
 -- | The read loop: decode incoming frames, call the callback for each.
 -- Exits when the connection closes or an error occurs.

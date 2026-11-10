@@ -2,6 +2,25 @@
 
 ## 0.1.0.0 — unreleased
 
+* **Configure the gateway coordinates before the first passkey.** New
+  `seal access-control configure [--host HOST] [--port PORT] [--tls|--no-tls]
+  [--tls-cert PATH --tls-key PATH] [--tls-host NAME]... [--origin URL]
+  [--rp-id DOMAIN]` persists the final bind host/port, TLS settings and the
+  external origin/`rp_id` in `~/.seal/security.toml`. A passkey is bound to the
+  `rp_id` it was created for, so this must run before the first enrollment if
+  clients will use a name other than `localhost`. It refuses to write a config
+  that would orphan an enrolled credential or fail to boot, and it preserves
+  `[access_control] mode` (the web setup wizard still runs). `--origin` also
+  replaces the previous managed origin in the WebSocket allowlist.
+  `seal access-control reset --yes` deletes all enrolled passkeys; the recovery
+  order is reset -> configure -> serve -> enroll.
+
+* **The dead `--server-host` / `--server-port` surface is gone.** They were
+  parsed into a `[server]` config object that no code read; the listener has
+  always come from `~/.seal/security.toml`. `--print-config` no longer emits a
+  `server` object, a `[server]` table in `config.toml` is ignored, and the flags
+  are rejected in either position. Use `seal access-control configure` instead.
+
 * **`[gateway] ws_port` is gone, and `max_turns` now defaults to 200.** The
   WebSocket stream has shared the gateway's HTTP port since the single-port
   change, so `ws_port` was a knob whose only effect was to be ignored; it is no

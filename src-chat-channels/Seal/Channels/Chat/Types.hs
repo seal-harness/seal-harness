@@ -18,6 +18,7 @@ module Seal.Channels.Chat.Types
     -- * Gateway config
   , GatewayConfig (..)
   , defaultGatewayConfig
+  , mkGatewayConfig
     -- * Streaming
   , StreamingState (..)
   , newStreamingState
@@ -30,6 +31,7 @@ import Data.IORef (IORef, newIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime)
 import Seal.Gateway.Types.Core (SessionId)
 import Seal.Gateway.Types.ChannelKind (channelKindToText)
@@ -122,6 +124,10 @@ data GatewayConfig = GatewayConfig
   , gcWsPort   :: Int     -- ^ e.g. 8081
   , gcApiBase  :: Text    -- ^ e.g. @"http://localhost:8080/api"@
   , gcWsUrl    :: Text    -- ^ e.g. @"ws://localhost:8081"@
+  , gcWsSecure :: Bool    -- ^ Connect to the WS server over TLS (@wss@)
+  , gcTlsCert  :: Maybe Text
+    -- ^ PEM certificate to trust for the gateway connection. Used only when
+    -- 'gcWsSecure' is set; the gateway's generated certificate is self-signed.
   } deriving stock (Eq, Show)
 
 -- | Default config for localhost with typical ports.
@@ -132,7 +138,27 @@ defaultGatewayConfig = GatewayConfig
   , gcWsPort = 8081
   , gcApiBase = "http://localhost:8080/api"
   , gcWsUrl = "ws://localhost:8081"
+  , gcWsSecure = False
+  , gcTlsCert = Nothing
   }
+
+-- | Build the client config for a gateway listening on @port@ at @host@.
+-- @secure@ selects @https@ and @wss@; the gateway serves both HTTP and WS on
+-- the same port. @cert@ is the PEM certificate to trust for that connection.
+mkGatewayConfig :: Text -> Int -> Bool -> Maybe Text -> GatewayConfig
+mkGatewayConfig host port secure cert = GatewayConfig
+  { gcHost = host
+  , gcHttpPort = port
+  , gcWsPort = port
+  , gcApiBase = scheme <> "://" <> host <> ":" <> portText <> "/api"
+  , gcWsUrl = wsScheme <> "://" <> host <> ":" <> portText
+  , gcWsSecure = secure
+  , gcTlsCert = cert
+  }
+  where
+    scheme = if secure then "https" else "http"
+    wsScheme = if secure then "wss" else "ws"
+    portText = T.pack (show port)
 
 -- | Mutable streaming state for one conversation's streaming bubble. Lives
 -- in 'IORef's so the WS event handler can call create/edit without passing

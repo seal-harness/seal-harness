@@ -14,6 +14,7 @@ import Seal.Channels.Chat.Types
   , sessionInsert
   , GatewayConfig (..)
   , defaultGatewayConfig
+  , mkGatewayConfig
   )
 
 import Seal.Gateway.Types.ChannelKind (ChannelKind (..))
@@ -105,3 +106,25 @@ spec = do
 
     it "has port 8081 for WS" $
       gcWsPort defaultGatewayConfig `shouldBe` 8081
+
+    it "does not use TLS by default" $ do
+      gcWsSecure defaultGatewayConfig `shouldBe` False
+      gcTlsCert defaultGatewayConfig `shouldBe` Nothing
+
+  describe "mkGatewayConfig" $ do
+    it "uses plain http/ws for a non-TLS gateway" $ do
+      let gw = mkGatewayConfig "localhost" 8080 False Nothing
+      gcHost gw `shouldBe` "localhost"
+      gcHttpPort gw `shouldBe` 8080
+      gcWsPort gw `shouldBe` 8080
+      gcApiBase gw `shouldBe` "http://localhost:8080/api"
+      gcWsUrl gw `shouldBe` "ws://localhost:8080"
+      gcWsSecure gw `shouldBe` False
+      gcTlsCert gw `shouldBe` Nothing
+
+    it "uses https/wss and carries the trust anchor for a TLS gateway" $ do
+      let gw = mkGatewayConfig "localhost" 8443 True (Just "/keys/tls/cert.pem")
+      gcApiBase gw `shouldBe` "https://localhost:8443/api"
+      gcWsUrl gw `shouldBe` "wss://localhost:8443"
+      gcWsSecure gw `shouldBe` True
+      gcTlsCert gw `shouldBe` Just "/keys/tls/cert.pem"

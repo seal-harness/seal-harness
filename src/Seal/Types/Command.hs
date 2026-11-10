@@ -2,9 +2,12 @@ module Seal.Types.Command
   ( Command(..)
   , AccessControlAction(..)
   , EnrollOptions(..)
+  , ConfigureOptions(..)
   , pCommand
   ) where
 
+import Data.Text (Text)
+import Data.Text qualified as T
 import Options.Applicative
 
 import Seal.Security.Policy (AutonomyLevel (..))
@@ -30,10 +33,12 @@ data Command
 -- @enroll@ mints the one-time authority that adds a credential, @disable@ is
 -- the only way to turn access control off (there is no HTTP path that can),
 -- @reset@ is the lost-every-device escape hatch, and @migrate-credentials@
--- finishes the pre-split → @credentials.toml@ move.
+-- finishes the pre-split → @credentials.toml@ move. @configure@ persists the
+-- gateway coordinates before the first passkey is enrolled.
 data AccessControlAction
   = AcStatus
   | AcEnroll !EnrollOptions
+  | AcConfigure !ConfigureOptions
   | AcDisable !Bool
     -- ^ @--yes@: disabling hands the gateway to anyone who can reach it, so it
     -- is never implicit. Kept as a field rather than a parse-time requirement so
@@ -43,6 +48,23 @@ data AccessControlAction
     -- ^ @--force@: re-run the table removal even though @credentials.toml@
     -- exists. Never overwrites the store itself.
   deriving (Eq, Show)
+
+-- | The @configure@ flag set. Every field is optional (except that at least
+-- one must be present, which the command enforces): the operator changes the
+-- coordinates they name and nothing else. @coPort@ is raw text so a bad value
+-- is a usage error (exit 2) the command reports, not an optparse failure.
+data ConfigureOptions = ConfigureOptions
+  { coHost     :: !(Maybe Text)
+  , coPort     :: !(Maybe Text)
+  , coTls      :: !Bool
+  , coNoTls    :: !Bool
+  , coTlsCert  :: !(Maybe FilePath)
+  , coTlsKey   :: !(Maybe FilePath)
+  , coTlsHosts :: ![Text]
+  , coOrigin   :: !(Maybe Text)
+  , coRpId     :: !(Maybe Text)
+  } deriving (Eq, Show)
+
 
 -- | The @enroll@ flag matrix. Validation lives in the command, not the parser,
 -- so every illegal combination is reachable and testable as a usage error.
@@ -78,6 +100,9 @@ pAccessControl = CommandAccessControl <$> hsubparser
   <> command "enroll"
        (info (AcEnroll <$> pEnroll)
              (progDesc "Mint a one-time enrollment grant (token on stdout, hints on stderr)"))
+  <> command "configure"
+       (info (AcConfigure <$> pConfigure)
+             (progDesc "Set the gateway bind host/port, TLS and passkey origin before first enrollment"))
   <> command "disable"
        (info (AcDisable <$> pDisableConfirm)
              (progDesc "Turn access control off, keeping credentials (requires --yes)"))
@@ -110,6 +135,40 @@ pEnroll = EnrollOptions
         ( long "cancel"
        <> help "Drop the outstanding grant, its claims and its token file"
         )
+
+-- | The @configure@ flags. All optional; the command requires at least one and
+-- validates combinations (exit 2) before touching the filesystem.
+pConfigure :: Parser ConfigureOptions
+pConfigure = ConfigureOptions
+  <$> optionalText "host" "HOST" "Bind host (a name, an address, or 0.0.0.0 for every interface)"
+  <*> optionalText "port" "PORT"
+        "Bind port (1-65535); must match the port clients use"
+  <*> switch
+        ( long "tls"
+       <> help "Serve HTTPS (with --tls-cert/--tls-key, or a generated self-signed pair)"
+        )
+  <*> switch
+        ( long "no-tls"
+       <> help "Serve HTTP; clears tls_cert, tls_key and tls_hosts"
+        )
+  <*> optionalFilePath "tls-cert" "PATH" "PEM certificate chain (implies TLS)"
+  <*> optionalFilePath "tls-key" "PATH" "PEM private key (implies TLS)"
+  <*> many (T.pack <$> strOption
+        ( long "tls-host"
+       <> metavar "NAME"
+       <> help "Replace the generated certificate's SAN names (repeatable; requires TLS)"
+        ))
+  <*> optionalText "origin" "URL"
+        "External origin clients use (https://name[:port]); also allowlisted for the WebSocket"
+  <*> optionalText "rp-id" "DOMAIN"
+        "WebAuthn relying-party id (defaults to the origin host)"
+  where
+    optionalText longName meta desc =
+      (T.pack <$>) <$> optional (strOption
+        ( long longName <> metavar meta <> help desc ))
+    optionalFilePath longName meta desc =
+      optional (strOption
+        ( long longName <> metavar meta <> help desc ))
 
 -- | @--force@ re-runs the table removal. It never overwrites @credentials.toml@.
 pMigrateForce :: Parser Bool

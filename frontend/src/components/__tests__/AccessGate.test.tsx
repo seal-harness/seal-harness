@@ -177,6 +177,23 @@ describe('AccessGate', () => {
     expect(verifyHeaders['X-Seal-Enroll-Token']).toBe('abc123')
   })
 
+  it('lets a typed token replace one captured from the link', async () => {
+    window.history.replaceState(null, '', '/#enroll=abc123')
+    renderGate()
+    await screen.findByText('Set up access control')
+    // The link captured abc123, but the operator pastes a fresh token. The
+    // typed value must win; otherwise a stale link token silently overrides it
+    // and the server answers grant_invalid.
+    fireEvent.change(screen.getByLabelText('Enrollment token'), {
+      target: { value: 'deadbeef' },
+    })
+    const button = screen.getByRole('button', { name: /Register a passkey/ })
+    await waitFor(() => expect(button).toBeEnabled())
+    fireEvent.click(button)
+    expect(await screen.findByText('THE APP')).toBeInTheDocument()
+    expect(verifyHeaders['X-Seal-Enroll-Token']).toBe('deadbeef')
+  })
+
   it('hides the token field and offers "Check again" when no grant is armed', async () => {
     status = { ...status, enrollment_via: 'none' }
     renderGate()
