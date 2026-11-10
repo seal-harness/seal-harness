@@ -91,7 +91,11 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   }, [refresh])
 
   const typedToken = normaliseToken(tokenInput)
-  const effectiveToken = enrollToken ?? (typedToken || null)
+  // Typed input wins over a token captured from the URL/sessionStorage: the
+  // operator may be replacing a stale link token with the one just printed.
+  // (A captured token silently overriding the pasted value made a fresh token
+  // look invalid.)
+  const effectiveToken = (typedToken || null) ?? enrollToken
 
   const runCeremony = useCallback(
     async (fn: () => Promise<{ ok: boolean; code?: string; error?: string }>) => {
@@ -283,7 +287,15 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const tokenField = (status.enrollment_via === 'none' || noTokenNeeded) ? null : (
     <TokenField
       value={tokenInput}
-      onChange={setTokenInput}
+      onChange={(value) => {
+        setTokenInput(value)
+        // Typing means "use this token", so drop the captured/stored one; it
+        // would otherwise win on the next render or after a reload.
+        if (enrollToken !== null) {
+          setEnrollToken(null)
+          clearEnrollToken()
+        }
+      }}
       captured={enrollToken !== null}
       minted={status.enrollment_via === 'cli_token' || status.enrollment_via === 'cli_window'}
     />
