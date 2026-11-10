@@ -7,8 +7,9 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, removeFile)
 import System.FilePath ((</>))
+import System.IO (hClose)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (getFileStatus, fileMode)
 import Toml qualified
@@ -21,7 +22,7 @@ import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
   , VaultKeyFields (..), WriteMode (..), hasLegacyLayout, loadSecurityConfig
-  , gatewayConfigFromSecurity, saveSecurityConfig, tomlKeyPaths
+  , gatewayConfigFromSecurity, openUniqueTemp, saveSecurityConfig, tomlKeyPaths
   , untrustedExecConfigFromSecurity, updateAccessControlSection
   , updateSecurityConfig, updateVaultKeySection )
 import Seal.Gateway.Config
@@ -303,6 +304,20 @@ spec = describe "Seal.Config.Security" $ do
   -- adding 'updateVaultKeySection' (whose callback cannot name
   -- access_control/untrusted_execution) instead of a general writer. The
   -- assertions are otherwise the ones the plan specifies.
+  describe "openUniqueTemp" $ do
+    it "returns distinct 0600 temp files in the destination directory" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        (p1, h1) <- openUniqueTemp path
+        (p2, h2) <- openUniqueTemp path
+        p1 `shouldNotBe` p2
+        st <- getFileStatus p1
+        (fileMode st .&. 0o777) `shouldBe` 0o600
+        hClose h1
+        hClose h2
+        removeFile p1
+        removeFile p2
+
   describe "updateVaultKeySection" $ do
 
     it "updateSecurityConfigEither propagates the callback rejection" $

@@ -34,7 +34,9 @@ module Seal.Config.Templates
   , ensureConfigTemplates
   ) where
 
-import Control.Exception (IOException, displayException, try)
+import Control.Exception (IOException, bracketOnError, displayException, try)
+import Control.Monad (void)
+import Data.ByteString qualified as BS
 import Data.Either (lefts, rights)
 import Data.Maybe (catMaybes)
 import Data.FileEmbed (embedFile)
@@ -43,13 +45,16 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
 import Language.Haskell.TH.Syntax (qAddDependentFile)
-import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath (takeDirectory)
+import System.IO (hClose)
+import System.IO.Error (isAlreadyExistsError)
+import System.Posix.Files (createLink, setFileMode)
 
 import Seal.Config.Migrate (configHasLegacySecurityFields)
 import Seal.Config.Paths
   ( SealPaths, configFilePath, securityFilePath )
-import Seal.Config.Security (writeSecretFile)
+import Seal.Config.Security (openUniqueTemp)
 
 -- | The bytes of @config\/templates\/config.toml@, embedded at compile time.
 configTomlTemplate :: Text
@@ -131,12 +136,29 @@ seedFile path contents sensitivity = do
           -- write inside one handler, so a missing directory is a reported
           -- failure rather than an exception.
           createDirectoryIfMissing True (takeDirectory path)
-          let tmp = path <> ".tmp"
-          case sensitivity of
-            SecretFile -> writeSecretFile tmp contents
-            PlainFile  -> TIO.writeFile tmp contents
-          renameFile tmp path
-          pure (Just path)
+          -- Never rename over the destination: a file created between the
+          -- existence check above and this install must survive. Write a
+          -- unique temp, then hard-link it into place; EEXIST is a benign lost
+          -- race, not a write failure.
+          bracketOnError (openUniqueTemp path) cleanup $ \(tmp, h) -> do
+            BS.hPutStr h (TE.encodeUtf8 contents)
+            hClose h
+            case sensitivity of
+              SecretFile -> setFileMode tmp 0o600
+              PlainFile  -> pure ()
+            installed <- try (createLink tmp path) :: IO (Either IOException ())
+            ignoreIO (removeFile tmp)
+            case installed of
+              Right () -> pure (Just path)
+              Left err
+                | isAlreadyExistsError err -> pure Nothing
+                | otherwise               -> ioError err
+
+    cleanup (tmp, h) = do
+      ignoreIO (hClose h)
+      ignoreIO (removeFile tmp)
+
+    ignoreIO action = void (try action :: IO (Either IOException ()))
 
 describeWriteError :: FilePath -> IOException -> Text
 describeWriteError path err =
