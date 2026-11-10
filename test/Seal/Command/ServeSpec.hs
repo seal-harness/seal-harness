@@ -40,3 +40,13 @@ spec = describe "Seal.Command.Serve" $ do
     case execParserPure defaultPrefs cmdInfo ["serve", "--help"] of
       Failure f -> T.unpack (T.pack (fst (renderFailure f "seal"))) `shouldContain` "serve"
       other     -> expectationFailure ("expected Failure for --help, got: " <> show other)
+
+  it "rejects the removed --server-host flag after the subcommand" $
+    case execParserPure defaultPrefs cmdInfo ["serve", "--server-host", "0.0.0.0"] of
+      Failure _ -> pure ()
+      other     -> expectationFailure ("expected --server-host to be removed, got: " <> show other)
+
+  it "rejects the removed --server-host flag before the subcommand" $
+    case execParserPure defaultPrefs cmdInfo ["--server-host", "0.0.0.0", "serve"] of
+      Failure _ -> pure ()
+      other     -> expectationFailure ("expected --server-host to be removed, got: " <> show other)

@@ -105,9 +105,10 @@ reorderGlobalArgs args =
     subcommands = ["serve", "tui", "access-control", "gen-openapi"]
     isSubcommand s = s `elem` subcommands
 
-    -- Global option names (defined in pConfig / pServerConfig, outside any
-    -- hsubparser). Each takes exactly one argument.
-    globalOpts = ["--log-level", "--server-host", "--server-port"]
+    -- Global option names (defined in pConfig, outside any hsubparser). Each
+    -- takes exactly one argument. The gateway's bind host/port live in
+    -- security.toml, so there are no server flags to hoist.
+    globalOpts = ["--log-level"]
     isGlobalOpt s = s `elem` globalOpts
 
     -- Extract global option pairs (flag + value) from the post-subcommand
