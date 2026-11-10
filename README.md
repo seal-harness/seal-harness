@@ -225,6 +225,28 @@ Provider credentials are read from the vault (set them with
 
 There are two gates, in this order, and both are blocking.
 
+0. **Coordinates** (optional, before the first `seal serve`). If clients will
+   reach the gateway under a name other than `localhost`, set the final bind
+   host/port, TLS settings and external origin **before** enrolling:
+
+   ```bash
+   # Reverse proxy terminating TLS, gateway on loopback:
+   seal access-control configure --origin https://seal.example.com \
+                                  --rp-id seal.example.com
+
+   # Direct TLS on a named host:
+   seal access-control configure --host seal.example.com --port 443 --tls \
+                                  --origin https://seal.example.com \
+                                  --rp-id seal.example.com
+   ```
+
+   A passkey is bound to the WebAuthn relying-party id (`rp_id`), which is
+   derived from the origin's host. Changing the hostname after enrollment
+   orphans the passkey; recovery is `seal access-control reset --yes` (which
+   deletes every enrolled passkey), then `configure`, then `serve`, then
+   enroll again. `seal access-control status` prints the current origin and
+   `rp_id`.
+
 1. **Access control** (passkey). `seal serve` mints an enrollment token on
    first boot and prints it; the web UI walks you through enrolling a passkey.
    If you explicitly waive it (`[access_control] mode = "none"`), that waiver
@@ -446,6 +468,27 @@ so set `tls_hosts` to the name the device will use. For the same effort,
 `tailscale cert <name>` produces a certificate that every device already
 trusts, with no installation step — that is the better default when you have a
 tailnet.
+
+**Harness on another machine.** If the browser is not on the harness host, the
+lowest-friction options avoid trusting a certificate at all:
+
+* **SSH tunnel** (one operator): bind the gateway to loopback
+  (`[gateway] host = "localhost"`, `tls = false`,
+  `[access_control] origin = "http://localhost:<port>"`), then
+  `ssh -N -L 9090:localhost:<port> you@harness` and open
+  `http://localhost:9090`. `localhost` is a secure context, so passkeys work
+  with `rp_id = localhost`; the passkey is bound to that tunnel, which is fine
+  for a single operator.
+* **Tailscale**: `tailscale serve --bg https / http://localhost:8080`, bind Seal
+  to loopback, and set `origin`/`rp_id` to the `*.ts.net` URL. Clients already
+  trust the certificate, so every device works with no installation step.
+* **mkcert / an internal CA**: install the root once per device, then point
+  `tls_cert`/`tls_key` at the issued pair. Rotating the leaf certificate does
+  not require re-trusting.
+
+The generated certificate remains useful for a single trusted device. If you
+use it on several, install the same PEM on each and fully quit the browser after
+changing the trust store.
 
 **Troubleshooting: "The passkey prompt was cancelled or timed out."** When no
 Touch ID / Windows Hello prompt appears at all and the ceremony fails

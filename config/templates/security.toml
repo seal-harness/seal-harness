@@ -75,6 +75,14 @@ vault_unlock = "on_demand"
 # To reach the gateway from another machine, bind a specific address (a tailnet
 # or LAN address), or 0.0.0.0 for every IPv4 interface ("::" for every
 # interface). Seal warns at boot whenever the bind is reachable from off-host.
+#
+# Set these before the first passkey is enrolled, so the credential is bound to
+# the origin clients actually use:
+#   seal access-control configure --host NAME --port PORT --tls \
+#                                  --origin https://NAME[:PORT] --rp-id NAME
+# Changing the host after enrollment orphans the passkey; recover with
+# `seal access-control reset --yes` (deletes all passkeys), then configure,
+# serve, and enroll again.
 
 [gateway]
 host = "localhost"
@@ -91,7 +99,9 @@ allowed_origins = ["http://localhost:8080"]
 # Serve HTTPS so a passkey ceremony works without a reverse proxy. The PEM paths
 # default to ~/.seal/keys/tls/{cert,key}.pem; if they are missing, Seal
 # generates a self-signed pair, which a browser must be told to trust before
-# WebAuthn will run on it.
+# WebAuthn will run on it. For a browser on another machine, prefer an SSH
+# tunnel to the loopback address (`ssh -L 9090:localhost:8080 you@host`, then
+# http://localhost:9090) or `tailscale serve`, which need no certificate trust.
 tls = false
 # tls_cert = "/etc/ssl/fullchain.pem"
 # tls_key  = "/etc/ssl/privkey.pem"
