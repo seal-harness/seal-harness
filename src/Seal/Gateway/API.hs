@@ -2811,8 +2811,12 @@ handleProviderDelete deps name =
           let cfg = fromRight defaultRuntimeConfig eCfg
           if rcDefaultProvider cfg == Just lbl
             then do
-              _ <- updateRuntimeConfig cfgPath (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
-              pure noContent
+              eSaved <- updateRuntimeConfig cfgPath
+                          (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
+              case eSaved of
+                Left e   -> pure (errJson status500
+                            ("the credentials were removed, but the default provider could not be cleared: " <> e))
+                Right () -> pure noContent
             else pure noContent
 
 -- ---------------------------------------------------------------------------

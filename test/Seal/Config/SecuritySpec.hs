@@ -7,8 +7,9 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, removeFile)
 import System.FilePath ((</>))
+import System.IO (hClose)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (getFileStatus, fileMode)
 import Toml qualified
@@ -18,11 +19,14 @@ import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Gen, elements, forAll, oneof)
 
 import Seal.Config.Security
-  ( SecurityConfig (..), UntrustedExecFileConfig (..)
+  ( AccessControlFileConfig (..), SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
   , VaultKeyFields (..), WriteMode (..), hasLegacyLayout, loadSecurityConfig
-  , saveSecurityConfig, tomlKeyPaths, untrustedExecConfigFromSecurity
+  , gatewayConfigFromSecurity, openUniqueTemp, saveSecurityConfig, tomlKeyPaths
+  , untrustedExecConfigFromSecurity, updateAccessControlSection
   , updateSecurityConfig, updateVaultKeySection )
+import Seal.Gateway.Config
+  ( GatewayConfig (..), PartialGatewayConfig (..), defaultGatewayConfig )
 
 
 spec :: Spec
@@ -38,6 +42,7 @@ spec = describe "Seal.Config.Security" $ do
         , scVaultKeyType   = Nothing
         , scUntrustedExec  = Nothing
         , scAccessControl  = Nothing
+        , scGateway        = Nothing
         }
 
   describe "loadSecurityConfig" $ do
@@ -86,6 +91,7 @@ spec = describe "Seal.Config.Security" $ do
               , scVaultKeyType   = Just "x25519"
               , scUntrustedExec  = Nothing
               , scAccessControl  = Nothing
+              , scGateway        = Nothing
               }
         saveSecurityConfig path cfg PreserveCredentials `shouldReturn` Right ()
         result <- loadSecurityConfig path
@@ -298,6 +304,20 @@ spec = describe "Seal.Config.Security" $ do
   -- adding 'updateVaultKeySection' (whose callback cannot name
   -- access_control/untrusted_execution) instead of a general writer. The
   -- assertions are otherwise the ones the plan specifies.
+  describe "openUniqueTemp" $ do
+    it "returns distinct 0600 temp files in the destination directory" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        (p1, h1) <- openUniqueTemp path
+        (p2, h2) <- openUniqueTemp path
+        p1 `shouldNotBe` p2
+        st <- getFileStatus p1
+        (fileMode st .&. 0o777) `shouldBe` 0o600
+        hClose h1
+        hClose h2
+        removeFile p1
+        removeFile p2
+
   describe "updateVaultKeySection" $ do
 
     it "updateSecurityConfigEither propagates the callback rejection" $
@@ -332,6 +352,67 @@ spec = describe "Seal.Config.Security" $ do
         fmap scVaultKeyType loaded `shouldBe` Right (Just "x25519")
         fmap scVaultRecipient loaded `shouldBe` Right (Just "age1old")
 
+  describe "gateway section" $ do
+    let partial = PartialGatewayConfig
+          { pgcPort = Just 8443
+          , pgcHost = Just "0.0.0.0"
+          , pgcStaticDir = Just "/srv/seal/frontend-dist"
+          , pgcAllowedOrigins = ["https://seal.example.com"]
+          , pgcFileExplorerEnabled = Just True
+          , pgcTlsCert = Just "/etc/ssl/fullchain.pem"
+          , pgcTlsKey = Just "/etc/ssl/privkey.pem"
+          , pgcTls = Just True
+          , pgcTlsHosts = ["seal.lan"]
+          }
+
+    it "round-trips the [gateway] table through security.toml" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        let cfg = defaultSecurityConfig { scGateway = Just partial }
+        saveSecurityConfig path cfg PreserveCredentials `shouldReturn` Right ()
+        loadSecurityConfig path `shouldReturn` Right cfg
+        raw <- TIO.readFile path
+        raw `shouldSatisfy` T.isInfixOf "[gateway]"
+        raw `shouldSatisfy` T.isInfixOf "host = \"0.0.0.0\""
+
+    it "decodes an absent [gateway] table as Nothing" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "vault_key_type = \"x25519\"\n"
+        loaded <- loadSecurityConfig path
+        fmap scGateway loaded `shouldBe` Right Nothing
+
+    it "resolves the compiled-in default when the table is absent" $
+      gatewayConfigFromSecurity defaultSecurityConfig `shouldBe` defaultGatewayConfig
+
+    it "resolves a configured bind, leaving unset keys at their defaults" $
+      let resolved = gatewayConfigFromSecurity
+            (defaultSecurityConfig { scGateway = Just partial { pgcAllowedOrigins = [] } })
+      in do
+        gcHost resolved `shouldBe` "0.0.0.0"
+        gcPort resolved `shouldBe` 8443
+        gcAllowedOrigins resolved `shouldBe` ["http://localhost:8080"]
+
+    it "keeps [gateway] intact when the gateway rewrites [access_control]" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        let withGateway = defaultSecurityConfig { scGateway = Just partial }
+        saveSecurityConfig path withGateway PreserveCredentials `shouldReturn` Right ()
+        _ <- updateAccessControlSection path
+               (\_ -> AccessControlFileConfig (Just "passkey") Nothing Nothing)
+        loaded <- loadSecurityConfig path
+        fmap scGateway loaded `shouldBe` Right (Just partial)
+
+    it "keeps [gateway] intact when the setup wizard writes the vault key" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        let withGateway = defaultSecurityConfig { scGateway = Just partial }
+        saveSecurityConfig path withGateway PreserveCredentials `shouldReturn` Right ()
+        _ <- updateVaultKeySection path
+               (const (Right (VaultKeyFields "age1new" "/keys/new.identity" "x25519")))
+        loaded <- loadSecurityConfig path
+        fmap scGateway loaded `shouldBe` Right (Just partial)
+
   -- Design §9.6: "no value of RuntimeConfig affects selectExecBackend's
   -- remote-only arm." Since the untrusted_execution fields live in
   -- SecurityConfig (not RuntimeConfig), the resolution is a pure function of
@@ -359,6 +440,7 @@ genSecurityConfig = do
     , scVaultKeyType   = Nothing
     , scUntrustedExec  = uefc
     , scAccessControl  = Nothing
+    , scGateway        = Nothing
     }
 
 -- | One legacy credential, in the shape the pre-split file used.

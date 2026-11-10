@@ -10,6 +10,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus, intersectFileModes)
 import System.Process (readProcessWithExitCode)
+import System.Info (os)
 import Test.Hspec
 
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
@@ -301,6 +302,18 @@ spec = describe "Seal.Security.TlsCert" $ do
       let msg = expiryWarning (fromGregorian 2027 1 2)
       msg `shouldSatisfy` T.isInfixOf "2027"
       msg `shouldSatisfy` T.isInfixOf "cert.pem"
+
+  describe "generatedCertificateTrustHint" $ do
+    it "names the cert, WebAuthn, and the no-trust alternatives" $ do
+      let hint = generatedCertificateTrustHint "/tmp/seal-cert.pem"
+      hint `shouldSatisfy` T.isInfixOf "/tmp/seal-cert.pem"
+      hint `shouldSatisfy` T.isInfixOf "WebAuthn"
+      hint `shouldSatisfy` T.isInfixOf "ssh -L"
+      hint `shouldSatisfy` T.isInfixOf "tailscale"
+      case os of
+        "darwin" -> hint `shouldSatisfy` T.isInfixOf "security add-trusted-cert"
+        "linux"  -> hint `shouldSatisfy` T.isInfixOf "update-ca-certificates"
+        _        -> pure ()
 
 addDays :: Integer -> Day -> Day
 addDays n (ModifiedJulianDay d) = ModifiedJulianDay (d + n)

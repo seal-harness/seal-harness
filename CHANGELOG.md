@@ -2,6 +2,52 @@
 
 ## 0.1.0.0 — unreleased
 
+* **Configure the gateway coordinates before the first passkey.** New
+  `seal access-control configure [--host HOST] [--port PORT] [--tls|--no-tls]
+  [--tls-cert PATH --tls-key PATH] [--tls-host NAME]... [--origin URL]
+  [--rp-id DOMAIN]` persists the final bind host/port, TLS settings and the
+  external origin/`rp_id` in `~/.seal/security.toml`. A passkey is bound to the
+  `rp_id` it was created for, so this must run before the first enrollment if
+  clients will use a name other than `localhost`. It refuses to write a config
+  that would orphan an enrolled credential or fail to boot, and it preserves
+  `[access_control] mode` (the web setup wizard still runs). `--origin` also
+  replaces the previous managed origin in the WebSocket allowlist.
+  `seal access-control reset --yes` deletes all enrolled passkeys; the recovery
+  order is reset -> configure -> serve -> enroll.
+
+* **The dead `--server-host` / `--server-port` surface is gone.** They were
+  parsed into a `[server]` config object that no code read; the listener has
+  always come from `~/.seal/security.toml`. `--print-config` no longer emits a
+  `server` object, a `[server]` table in `config.toml` is ignored, and the flags
+  are rejected in either position. Use `seal access-control configure` instead.
+
+* **`[gateway] ws_port` is gone, and `max_turns` now defaults to 200.** The
+  WebSocket stream has shared the gateway's HTTP port since the single-port
+  change, so `ws_port` was a knob whose only effect was to be ignored; it is no
+  longer decoded (a file that still sets it parses, the key is dropped on the
+  next rewrite). `max_turns` — the tool-use iterations allowed in one turn
+  before the loop stops — was 90 and is now 200; long tool-driven tasks
+  routinely hit the old ceiling. A config file that sets `max_turns`
+  explicitly is unaffected.
+
+* **The web gateway's settings moved to `security.toml`.** `[gateway]` — the
+  bind host and port, the WebSocket Origin allowlist, `static_dir`, and the TLS
+  pair — now lives in `~/.seal/security.toml` beside the vault and
+  `untrusted_execution`, because a bind address is not a setting an agent
+  should be able to change. It is no longer in `config.toml`, so a future
+  `CONFIG_UPDATE` opcode typed on the runtime config, and the gateway's own
+  `updateRuntimeConfig` writer, cannot express a change to it.
+
+  `seal serve` or `seal tui` migrates an existing `config.toml` on the next
+  boot: the table is moved into `security.toml` when that file has none of its
+  own (the usual upgrade case — `security.toml` exists but has never held a
+  gateway table), and `security.toml` wins if both carry one. Until that boot,
+  `seal provider`/`seal model`/`seal agent`/`seal channel` refuse to write
+  `config.toml` rather than silently drop the table, and `seal access-control`
+  keeps reading it read-only so its origin checks stay correct. Rolling the
+  build back does not move the table back: copy `[gateway]` from
+  `security.toml` into `config.toml` by hand.
+
 * **A fourth provider: any OpenAI-compatible endpoint.** `openai` (label
   "OpenAI-compatible") reuses the OpenRouter client — both speak
   `/v1/chat/completions` — and differs in exactly one way: it has **no**

@@ -76,7 +76,7 @@ import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
 import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), channelConfigCodec, keyChannelIdBiMap, fromSignalConfig, fromTelegramConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.ChannelKind (ChannelKind (..))
-import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
+import Seal.Gateway.Config (loadLegacyGatewayTable)
 import Seal.Tools.Timeout
   ( ToolTimeoutConfig (..), defaultToolTimeoutConfig )
 
@@ -104,10 +104,6 @@ data RuntimeConfig = RuntimeConfig
   , rcTelegram :: Maybe TelegramConfig
     -- ^ Optional @[telegram]@ section (Telegram channel config). Absent
     -- means the Telegram channel is not configured.
-  , rcGateway :: Maybe PartialGatewayConfig
-    -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
-    -- gateway is not configured. Each field inside is optional too; the
-    -- call site merges with 'Seal.Gateway.Config.withGatewayDefaults'.
   , rcDebugSessionTranscript :: Maybe Bool
     -- ^ Optional @debug_session_transcript@ flag. When @true@, every
     -- 'CompletionRequest' sent to the LLM is also appended (redundantly,
@@ -161,7 +157,7 @@ data RuntimeConfig = RuntimeConfig
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
-    -- 'defaultMaxTurns' (90). Values < 1 are clamped to 1 at resolution
+    -- 'defaultMaxTurns' (200). Values < 1 are clamped to 1 at resolution
     -- time. Mirrors Hermes' default.
   , rcToolTimeout :: Maybe ToolTimeoutFileConfig
     -- ^ Optional @[tool_timeout]@ section (per-call timeout/abort/retry
@@ -302,7 +298,6 @@ defaultRuntimeConfig = RuntimeConfig
   , rcRetrieval       = Nothing
   , rcSignal          = Nothing
   , rcTelegram        = Nothing
-  , rcGateway         = Nothing
   , rcDebugSessionTranscript = Nothing
   , rcDebugModelResponses = Nothing
   , rcMaxModelRetries = Nothing
@@ -427,9 +422,9 @@ defaultModelRetryBaseDelayMs = 1000
 
 -- | The compiled-in default for the maximum tool-use iterations per turn.
 -- Used when the @max_turns@ key is absent (or the whole config is absent).
--- Mirrors Hermes' default (90).
+-- Raised from 90: long tool-driven tasks routinely hit the old ceiling.
 defaultMaxTurns :: Int
-defaultMaxTurns = 90
+defaultMaxTurns = 200
 
 -- | Resolve the per-turn max-iterations bound from the loaded config. Absent
 -- or non-positive values fall back to 'defaultMaxTurns'; values below 1 are
@@ -472,7 +467,6 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= rcRetrieval
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= rcSignal
   <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= rcTelegram
-  <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= rcGateway
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
   <*> Toml.dioptional (Toml.bool "debug_model_responses") .= rcDebugModelResponses
   <*> Toml.dioptional (Toml.int "max_model_retries") .= rcMaxModelRetries
@@ -709,10 +703,28 @@ configWriteLock = unsafePerformIO (newMVar ())
 -- lost-update races (design V7).
 updateRuntimeConfig :: FilePath -> (RuntimeConfig -> RuntimeConfig) -> IO (Either Text ())
 updateRuntimeConfig path f = withMVar configWriteLock $ \_ -> do
-  result <- loadRuntimeConfig path
-  case result of
-    Left err  -> pure (Left err)
-    Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
+  stillLegacy <- loadLegacyGatewayTable path
+  case stillLegacy of
+    Just _    -> pure (Left gatewayTableRefusal)
+    Nothing   -> do
+      result <- loadRuntimeConfig path
+      case result of
+        Left err  -> pure (Left err)
+        Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
+
+-- | Why a @config.toml@ write stops while the file still carries @[gateway]@.
+--
+-- The gateway table lives in @security.toml@. A re-encode through
+-- 'runtimeConfigCodec' cannot carry a section the codec no longer knows, so
+-- writing here would delete the operator's bind address, and the migration
+-- could never recover it. Refusing is the only outcome that cannot lose the
+-- setting: the next @seal serve@ or @seal tui@ boot moves the table into
+-- @security.toml@ and the refusal clears.
+gatewayTableRefusal :: Text
+gatewayTableRefusal =
+  "config.toml still carries a [gateway] table, which this build cannot write "
+    <> "back. Start `seal serve` or `seal tui` once to move it into "
+    <> "~/.seal/security.toml, then retry."
 
 -- | The configured default model for provider @lbl@, if any.
 providerDefaultModel :: RuntimeConfig -> Text -> Maybe Text

@@ -59,14 +59,13 @@ import Seal.Config.Paths
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..)
   , UntrustedExecFileConfig (..), UntrustedExecRemoteFileConfig (..)
-  , decodeSecurityConfig, scUntrustedExec, scVaultKeyType, scVaultUnlock
-  , securityConfigCodec, tomlKeyPaths )
+  , decodeSecurityConfig, gatewayConfigFromSecurity, scUntrustedExec
+  , scVaultKeyType, scVaultUnlock, securityConfigCodec, tomlKeyPaths )
 import Seal.Config.Templates
   ( configTomlTemplate, ensureConfigTemplates, securityTomlTemplate )
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Gateway.Config
-  ( PartialGatewayConfig (..), defaultGatewayConfig, tlsEnabled
-  , withGatewayDefaults )
+  ( PartialGatewayConfig (..), defaultGatewayConfig, tlsEnabled )
 import Seal.Signal.Config (SignalConfig (..))
 import Seal.Telegram.Config (TelegramConfig (..))
 import Seal.Vault.Backend (parseUnlockMode)
@@ -164,10 +163,13 @@ spec = describe "Seal.Config.Templates" $ do
         $ \key -> (key `T.isInfixOf` remoteBlock) `shouldBe` True
 
   describe "written values resolve like absent keys" $ do
-    it "keeps the loopback gateway default" $ withDecodedTemplate $ \tpl -> do
-      let resolved = withGatewayDefaults <$> rcGateway tpl
-      resolved `shouldBe` Just defaultGatewayConfig
-      fmap tlsEnabled resolved `shouldBe` Just False
+    it "keeps the loopback gateway default" $
+      case decodeSecurityConfig securityTomlTemplate of
+        Left err -> expectationFailure ("security.toml does not decode: " <> T.unpack err)
+        Right sec -> do
+          let resolved = gatewayConfigFromSecurity sec
+          resolved `shouldBe` defaultGatewayConfig
+          tlsEnabled resolved `shouldBe` False
 
     it "agrees with every exported resolver" $ withDecodedTemplate $ \tpl -> do
       let absent = defaultRuntimeConfig
@@ -338,11 +340,6 @@ sampleRuntimeConfig = RuntimeConfig
   , rcTelegram        = Just (TelegramConfig (Just "sample-token") (Just 3900)
                                (AllowOnly (Set.singleton "12345")))
   , rcChannels        = Map.empty
-  , rcGateway         = Just PartialGatewayConfig
-      { pgcPort = Just 8080, pgcWsPort = Just 8080, pgcHost = Just "sample-host"
-      , pgcStaticDir = Just "/srv/sample", pgcAllowedOrigins = ["https://sample"]
-      , pgcTlsCert = Just "/c.pem", pgcTlsKey = Just "/k.pem", pgcTls = Just True
-      , pgcTlsHosts = ["sample.lan"], pgcFileExplorerEnabled = Just True }
   , rcDebugSessionTranscript = Just True
   , rcDebugModelResponses    = Just True
   , rcMaxModelRetries        = Just 3
@@ -381,6 +378,12 @@ sampleSecurityConfig = SecurityConfig
   , scAccessControl  = Just (AccessControlFileConfig (Just "passkey")
                                (Just "https://seal.example.com")
                                (Just "seal.example.com"))
+  , scGateway        = Just (PartialGatewayConfig
+      { pgcPort = Just 8080, pgcHost = Just "sample-host"
+      , pgcStaticDir = Just "/srv/sample", pgcAllowedOrigins = ["https://sample"]
+      , pgcFileExplorerEnabled = Just True
+      , pgcTlsCert = Just "/c.pem", pgcTlsKey = Just "/k.pem", pgcTls = Just True
+      , pgcTlsHosts = ["sample.lan"] })
   }
 
 -- ---------------------------------------------------------------------------

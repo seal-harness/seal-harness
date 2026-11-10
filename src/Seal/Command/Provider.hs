@@ -173,8 +173,10 @@ addCmd pr lbl = commandAction $ \caps ->
           case res of
             Left e   -> ccSend caps (vaultErrText e)
             Right () -> do
-              _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
-              ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
+              saved <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
+              case saved of
+                Left e   -> ccSend caps ("Stored the API key, but could not update config.toml: " <> e)
+                Right () -> ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
 
 -- | Ollama onboarding: prompt for the base URL (blank keeps the default),
 -- persist it to config, then prompt for an optional API key (blank => local,
@@ -192,8 +194,10 @@ addOllama pr caps vh kp = do
   case keyRes of
     Left e   -> ccSend caps (vaultErrText e)
     Right () -> do
-      _ <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
-      ccSend caps "Configured ollama."
+      saved <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
+      case saved of
+        Left e   -> ccSend caps ("Could not update config.toml: " <> e)
+        Right () -> ccSend caps "Configured ollama."
   where
     seedAll mUrl fc =
       let fc' = seedProviderDefaults kp fc
@@ -279,8 +283,10 @@ loginCmd pr lbl = commandAction $ \caps ->
             case res of
               Left e   -> ccSend caps (vaultErrText e)
               Right () -> do
-                _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
-                ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
+                saved <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
+                case saved of
+                  Left e   -> ccSend caps ("Logged in, but could not update config.toml: " <> e)
+                  Right () -> ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
 
 -- | Best-effort browser open; failure is silently ignored (headless-friendly).
 openBrowser :: Text -> IO ()
@@ -316,8 +322,10 @@ removeCmd pr lbl = commandAction $ \caps ->
         (Left e, _) -> ccSend caps (vaultErrText e)
         (_, Left e) -> ccSend caps (vaultErrText e)
         _           -> do
-          _ <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
-          ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
+          saved <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
+          case saved of
+            Left e   -> ccSend caps ("Removed the credentials, but could not update config.toml: " <> e)
+            Right () -> ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
   where
     -- | Delete a key; a missing key is not an error.
     deleteIfPresent vh k = do

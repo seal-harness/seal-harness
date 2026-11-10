@@ -3,11 +3,19 @@
 -- origins. The server binds loopback by default; a non-loopback host emits
 -- a runtime warning (the full slash-command surface is reachable by
 -- anything that can reach the address).
+--
+-- The section is defined here and configured in @~\/.seal\/security.toml@
+-- (@[gateway]@ in 'Seal.Config.Security.SecurityConfig'), not in
+-- @config.toml@: the bind address, the Origin allowlist and the TLS settings
+-- decide who can reach the gateway, so no opcode or gateway config writer may
+-- express a change to them.
 module Seal.Gateway.Config
   ( GatewayConfig (..)
   , PartialGatewayConfig (..)
   , defaultGatewayConfig
   , gatewayConfigCodec
+  , gatewayTableCodec
+  , loadLegacyGatewayTable
   , withGatewayDefaults
   , tlsEnabled
   , effectiveTlsPaths
@@ -23,16 +31,19 @@ import Data.Char (isSpace)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Network.Socket
   ( AddrInfo (..), AddrInfoFlag (AI_PASSIVE), SocketType (Stream), defaultHints
   , getAddrInfo )
+import System.Directory (doesFileExist)
+import Validation (Validation (..))
+
 import Toml ((.=))
 import Toml qualified
 
 -- | The gateway config section.
 data GatewayConfig = GatewayConfig
   { gcPort           :: Int        -- ^ default 8080 (REST + static + the WS stream)
-  , gcWsPort         :: Int        -- ^ DEPRECATED: the WS stream shares @gcPort@; kept only so old config files still parse
   , gcHost           :: Text
     -- ^ default "localhost" — the one loopback name browsers treat as a
     -- passkey-capable secure context. Handed to Warp as the bind address.
@@ -59,7 +70,6 @@ data GatewayConfig = GatewayConfig
 defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
   { gcPort = 8080
-  , gcWsPort = 8080
   , gcHost = "localhost"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
@@ -144,7 +154,6 @@ gatewayHostResolutionError resolves raw = do
 gatewayConfigCodec :: Toml.TomlCodec PartialGatewayConfig
 gatewayConfigCodec = PartialGatewayConfig
   <$> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "port")) .= pgcPort
-  <*> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "ws_port")) .= pgcWsPort
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
@@ -154,11 +163,39 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
   <*> hostsCodec .= pgcTlsHosts
 
+-- | Codec for the @[gateway]@ table itself — the one definition of where the
+-- section lives. Three consumers share it: @security.toml@'s document codec
+-- ('Seal.Config.Security.securityConfigCodec'), the pre-migration
+-- read-through in @seal access-control@ ('loadLegacyGatewayTable'), and the
+-- write guard that refuses to re-encode a @config.toml@ still carrying the
+-- table ('Seal.Config.File.updateRuntimeConfig').
+gatewayTableCodec :: Toml.TomlCodec (Maybe PartialGatewayConfig)
+gatewayTableCodec = Toml.dioptional (Toml.table gatewayConfigCodec "gateway")
+
+-- | Decode the @[gateway]@ table out of a TOML file, ignoring every other key.
+-- 'Nothing' means the file is absent, does not parse, or has no table.
+--
+-- Only for the upgrade window: while an install still has its gateway settings
+-- in @config.toml@, @seal access-control@ reads them from there instead of
+-- silently resolving the loopback defaults. The first @seal serve@/@seal tui@
+-- moves the table into @security.toml@ and this path goes quiet.
+loadLegacyGatewayTable :: FilePath -> IO (Maybe PartialGatewayConfig)
+loadLegacyGatewayTable path = do
+  exists <- doesFileExist path
+  if not exists then pure Nothing else do
+    outcome <- try (TIO.readFile path) :: IO (Either IOException Text)
+    pure $ case outcome of
+      Left _     -> Nothing
+      Right text -> case Toml.parse text of
+        Left _     -> Nothing
+        Right toml -> case Toml.runTomlCodec gatewayTableCodec toml of
+          Success table -> table
+          Failure _     -> Nothing
+
 -- | A partial gateway config where every field is optional. 'withGatewayDefaults'
 -- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
 data PartialGatewayConfig = PartialGatewayConfig
   { pgcPort           :: Maybe Int
-  , pgcWsPort         :: Maybe Int
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
@@ -177,7 +214,6 @@ data PartialGatewayConfig = PartialGatewayConfig
 withGatewayDefaults :: PartialGatewayConfig -> GatewayConfig
 withGatewayDefaults p = GatewayConfig
   { gcPort           = fromMaybe (gcPort defaultGatewayConfig) (pgcPort p)
-  , gcWsPort         = fromMaybe (gcWsPort defaultGatewayConfig) (pgcWsPort p)
   , gcHost           = fromMaybe (gcHost defaultGatewayConfig) (pgcHost p)
   , gcStaticDir      = pgcStaticDir p  -- Nothing = no static serving (the default)
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)
