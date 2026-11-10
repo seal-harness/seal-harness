@@ -101,6 +101,10 @@ library seal-chat-channels
       , http-client
       , http-types
       , websockets
+      , crypton-connection
+      , crypton-x509-store
+      , crypton-x509-system
+      , tls
       , network
       , async
       , process
@@ -335,8 +339,10 @@ library
       , containers
       , conduit
       , crypton
+      , crypton-connection
       , crypton-x509
       , crypton-x509-store
+      , crypton-x509-system
       , directory
       , exceptions
       , filepath
