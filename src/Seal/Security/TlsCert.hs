@@ -35,6 +35,7 @@ module Seal.Security.TlsCert
   , certificateExpiryWarning
   , expiryWarning
   , certificateLifetimeDays
+  , generatedCertificateTrustHint
     -- * The names in the certificate
   , SanInputs (..)
   , SanName (..)
@@ -74,6 +75,7 @@ import System.Directory
   ( copyFile, createDirectoryIfMissing, doesFileExist, removeFile, renameFile )
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory)
+import System.Info (os)
 import System.Posix.Files (setFileMode)
 import System.Process (readProcessWithExitCode)
 
@@ -296,6 +298,46 @@ renderOpensslConfig primaryHost hosts = T.unlines $
     renderAlt i host = case classifySanName host of
       SanIp ip  -> "IP." <> tshow i <> " = " <> ip
       SanDns nm -> "DNS." <> tshow i <> " = " <> nm
+
+-- | Operator guidance for the generated self-signed certificate.
+--
+-- The certificate is self-signed (with @CA:TRUE@, so installing it as a
+-- trusted root works). It has to be trusted by every browser that will run a
+-- WebAuthn ceremony; clicking through the interstitial does not count. This
+-- text is shared by @seal access-control configure@ and the @seal serve@
+-- startup warning so the two cannot drift. The exact trust command is
+-- OS-specific; the SSH-tunnel and Tailscale alternatives are the zero-trust
+-- paths for a harness on another machine.
+generatedCertificateTrustHint :: FilePath -> Text
+generatedCertificateTrustHint certPath = T.intercalate "\n" (header <> trust <> footer)
+  where
+    p = T.pack certPath
+    header =
+      [ "the generated certificate at " <> p <> " is self-signed."
+      , "  Browsers disable WebAuthn until it is trusted; clicking through the warning is not enough."
+      ]
+    trust = case os of
+      "darwin" ->
+        [ "  Trust it in the System keychain, then fully quit the browser (Command-Q):"
+        , "    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain " <> p
+        ]
+      "mingw32" ->
+        [ "  Trust it in the Windows Root store (admin PowerShell):"
+        , "    certutil -addstore -f Root " <> p
+        ]
+      "linux" ->
+        [ "  Trust it on this machine (Debian/Ubuntu):"
+        , "    sudo cp " <> p <> " /usr/local/share/ca-certificates/seal.crt && sudo update-ca-certificates"
+        , "  Fedora/RHEL: sudo trust anchor " <> p
+        ]
+      _ ->
+        [ "  Install it in the OS trust store on every device that will use the gateway." ]
+    footer =
+      [ "  Other devices: install the same PEM and mark it trusted."
+      , "  To avoid per-device trust entirely: bind loopback and use an SSH tunnel"
+      , "  (`ssh -L 9090:localhost:8080 you@host`, then open http://localhost:9090),"
+      , "  or use `tailscale serve` / a certificate from `tailscale cert <name>`."
+      ]
 
 -- | The reason an existing pair cannot serve a legal certificate, if it cannot.
 --

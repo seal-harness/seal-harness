@@ -99,7 +99,8 @@ import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Security.AccessControl (originHostOf)
 import Seal.Security.TlsCert
   ( TlsCertOutcome (..), certificateExpiryWarning, ensureCertificateAt
-  , ensureGeneratedCertificate, localAddressNames, sanHostsFor, sanInputsFor )
+  , ensureGeneratedCertificate, generatedCertificateTrustHint
+  , localAddressNames, sanHostsFor, sanInputsFor )
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
@@ -221,12 +222,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       let (certPath, keyPath) =
             effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
           managed = isNothing (gcTlsCert gwCfgAccess) && isNothing (gcTlsKey gwCfgAccess)
-          warnSelfSigned =
-            logIO logger WarningS
-              ("a generated certificate is self-signed: browsers refuse WebAuthn "
-                <> "on a certificate they do not trust, so install it on the device "
-                <> "(and mark it trusted) \8212 or replace tls_cert/tls_key with a "
-                <> "publicly-trusted pair, e.g. from `tailscale cert`.")
+          warnSelfSigned = logIO logger WarningS (ls (generatedCertificateTrustHint certPath))
       systemId <- getSystemID
       addresses <- localAddressNames
       let hosts = sanHostsFor
