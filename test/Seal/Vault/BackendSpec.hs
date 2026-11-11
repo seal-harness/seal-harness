@@ -5,7 +5,7 @@ import Data.Bits ((.&.))
 import Data.Either (isLeft)
 import Data.List (sort)
 import Data.Text qualified as T
-import System.Directory (doesFileExist, findExecutable)
+import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus)
@@ -26,6 +26,8 @@ import Seal.Vault.Backend
   , setupLocalAgeKey
   , setupUserSupplied
   , setupYubiKey
+  , setupYubiKeyCore
+  , yubiCommandFor
   )
 
 spec :: Spec
@@ -115,6 +117,46 @@ spec = describe "Seal.Vault.Backend" $ do
         Left (VaultBackendError _) -> pure ()  -- age binary absent; acceptable
         Left other ->
           expectationFailure $ "unexpected error variant: " ++ show other
+
+  describe "yubiCommandFor" $ do
+    it "renders a path under the user's home in unquoted tilde form" $
+      yubiCommandFor "/home/alice" "/home/alice/.seal/keys/default.yubikey.txt" "always" "once"
+        `shouldBe` "age-plugin-yubikey --generate --touch-policy always --pin-policy once > ~/.seal/keys/default.yubikey.txt"
+
+    it "quotes an absolute path outside the user's home" $
+      yubiCommandFor "/home/alice" "/opt/seal/keys/default.yubikey.txt" "never" "never"
+        `shouldBe` "age-plugin-yubikey --generate --touch-policy never --pin-policy never > '/opt/seal/keys/default.yubikey.txt'"
+
+    it "keeps tilde expansion while quoting a path that contains spaces" $
+      yubiCommandFor "/home/alice" "/home/alice/custom seal/keys/default.yubikey.txt" "always" "never"
+        `shouldBe` "age-plugin-yubikey --generate --touch-policy always --pin-policy never > \"$HOME/custom seal/keys/default.yubikey.txt\""
+
+  describe "setupYubiKeyCore" $ do
+    it "adopts a key file left by the TTY fallback command" $
+      withSystemTempDirectory "seal-yubi-adopt" $ \tmpDir -> do
+        let paths = SealPaths
+              { spHome   = tmpDir
+              , spConfig = tmpDir </> "config"
+              , spState  = tmpDir </> "state"
+              , spKeys   = tmpDir </> "keys"
+              , spCache  = tmpDir </> "cache"
+              }
+            identPath = spKeys paths </> "default.yubikey.txt"
+        createDirectoryIfMissing True (spKeys paths)
+        writeFile identPath (unlines
+          [ "#       Serial: 27249638, Slot: 3"
+          , "#    Recipient: age1yubikey1qexampleexampleexampleexampleexampleex0"
+          , "AGE-PLUGIN-YUBIKEY-1EXAMPLEEXAMPLEEXAMPLE"
+          ])
+        result <- setupYubiKeyCore paths "default" True True
+        case result of
+          Left err -> expectationFailure $ "adoption failed: " ++ show err
+          Right rk -> do
+            rkRecipient rk `shouldBe` "age1yubikey1qexampleexampleexampleexampleexampleex0"
+            rkIdentity rk `shouldBe` T.pack identPath
+            rkKeyType rk `shouldBe` "yubikey"
+            st <- getFileStatus identPath
+            (fileMode st .&. 0o777) `shouldBe` 0o600
 
   describe "setupUserSupplied" $ do
     it "prompts for recipient then identity path; returns ResolvedKey with rkKeyType=user" $ do
