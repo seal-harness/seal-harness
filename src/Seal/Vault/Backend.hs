@@ -13,6 +13,7 @@ module Seal.Vault.Backend
   , setupLocalAgeKey
   , setupYubiKey
   , setupYubiKeyCore     -- non-interactive core shared with the web wizard
+  , yubiCommandFor       -- exported for testing
   , setupUserSupplied
   , setupUserSuppliedFrom
   , parseUnlockMode
@@ -23,11 +24,13 @@ module Seal.Vault.Backend
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
 import Data.Either (fromRight)
+import Data.Char (isDigit)
 import Data.List (isPrefixOf, nub, sort, stripPrefix)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (doesPathExist, findExecutable, listDirectory)
+import System.Directory
+  ( doesPathExist, findExecutable, getHomeDirectory, listDirectory )
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath (splitSearchPath, (</>))
@@ -38,7 +41,9 @@ import System.Process
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Config.Security (SecurityConfig (..))
 import Seal.Config.Paths (SealPaths (..))
-import Seal.Security.Path (ensureKeysRoot, getSafeKeyPath, mkSafeKeyPath)
+import Seal.Security.Path
+  ( KeysRoot, PathError (PathInsecureMode), ensureKeysRoot, getSafeKeyPath
+  , mkSafeKeyPath )
 import Seal.Security.Vault (UnlockMode (..))
 import Seal.Security.Vault.Age
   ( AgeIdentity (..)
@@ -292,65 +297,152 @@ parseAgePublicKey txt =
 -- wants one is reported as 'KeySetupNeedsTty' together with the exact command
 -- the operator should run.
 --
+-- A key file left behind by that terminal command is adopted on the next
+-- attempt: the wizard's Re-check re-sends this backend, the file under the keys
+-- directory parses, and setup finishes without touching the token again. An
+-- adoptable file is checked before 'findExecutable', so the completion path
+-- does not depend on the plugin staying on the gateway's PATH.
+--
 -- The identity file it writes is @0600@ under the keys directory (mode 0700).
 setupYubiKeyCore
   :: SealPaths -> Text -> Bool -> Bool -> IO (Either KeySetupFailure ResolvedKey)
 setupYubiKeyCore paths name touchRequired pinRequired = do
-  mPlugin <- findExecutable "age-plugin-yubikey"
-  case mPlugin of
-    Nothing -> pure (Left (KeySetupMissing "age-plugin-yubikey"))
-    Just _ -> do
-      keysRoot <- ensureKeysRoot (spKeys paths)
-      rel      <- freshKeyName (spKeys paths) (T.unpack name) ".yubikey.txt"
-      pathRes  <- mkSafeKeyPath keysRoot rel
+  keysRoot <- ensureKeysRoot (spKeys paths)
+  adopted <- adoptExistingYubiKey keysRoot (spKeys paths) (T.unpack name)
+  case adopted of
+    Just key -> pure (Right key)
+    Nothing -> do
+      mPlugin <- findExecutable "age-plugin-yubikey"
+      case mPlugin of
+        Nothing -> pure (Left (KeySetupMissing "age-plugin-yubikey"))
+        Just _ -> do
+          rel      <- freshKeyName (spKeys paths) (T.unpack name) ".yubikey.txt"
+          pathRes  <- mkSafeKeyPath keysRoot rel
+          case pathRes of
+            Left err -> pure (Left (KeySetupFailed (T.pack (show err))))
+            Right safePath -> do
+              let identPath   = getSafeKeyPath safePath
+                  touchPolicy = if touchRequired then "always" else "never"
+                  pinPolicy   = if pinRequired then "once" else "never"
+              (exitCode, stdoutBs, stderrBs) <-
+                readProcessNoInput "age-plugin-yubikey"
+                  [ "--generate"
+                  , "--touch-policy", touchPolicy
+                  , "--pin-policy", pinPolicy
+                  ]
+              let stdoutText = TE.decodeUtf8Lenient stdoutBs
+              if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
+                then case parsePluginRecipient stdoutText of
+                  Nothing -> pure (Left (KeySetupFailed
+                    ("age-plugin-yubikey: could not parse a recipient line from its output; "
+                     <> TE.decodeUtf8Lenient stderrBs)))
+                  Just pub -> do
+                    BS.writeFile identPath (TE.encodeUtf8 stdoutText)
+                    setFileMode identPath 0o600
+                    pure (Right ResolvedKey
+                      { rkRecipient = pub
+                      , rkIdentity  = T.pack identPath
+                      , rkKeyType   = "yubikey"
+                      })
+                else do
+                  home <- getHomeDirectory
+                  pure (Left (KeySetupNeedsTty
+                    (yubiCommandFor home identPath touchPolicy pinPolicy)))
+
+-- | Adopt the identity file the TTY fallback command wrote. Only files named
+-- like 'freshKeyName''s output for this backend (@\<name\>.yubikey.txt@,
+-- @\<name\>-1.yubikey.txt@, …) and containing a parseable @Recipient:@ line
+-- qualify, so unrelated key material is never picked up. Names are sorted, so
+-- the choice is deterministic when several attempts left several files.
+adoptExistingYubiKey :: KeysRoot -> FilePath -> FilePath -> IO (Maybe ResolvedKey)
+adoptExistingYubiKey keysRoot keysDir name = do
+  listed <- try @IOException (listDirectory keysDir)
+  let candidates = sort (filter (isYubiCandidate name) (fromRight [] listed))
+  firstAdoptable candidates
+  where
+    firstAdoptable [] = pure Nothing
+    firstAdoptable (candidate : rest) = do
+      accepted <- acceptCandidate candidate
+      case accepted of
+        Nothing -> firstAdoptable rest
+        Just safePath -> do
+          let identPath = getSafeKeyPath safePath
+          parsed <- readRecipient identPath
+          case parsed of
+            Nothing -> firstAdoptable rest
+            Just pub -> pure (Just ResolvedKey
+              { rkRecipient = pub
+              , rkIdentity  = T.pack identPath
+              , rkKeyType   = "yubikey"
+              })
+    -- The shell command writes the file under the operator's umask, usually
+    -- 0644. A confined-but-loose file is tightened to 0600 and re-validated;
+    -- anything that escapes the keys root is never touched.
+    acceptCandidate candidate = do
+      pathRes <- mkSafeKeyPath keysRoot candidate
       case pathRes of
-        Left err -> pure (Left (KeySetupFailed (T.pack (show err))))
-        Right safePath -> do
-          let identPath   = getSafeKeyPath safePath
-              touchPolicy = if touchRequired then "always" else "never"
-              pinPolicy   = if pinRequired then "once" else "never"
-          (exitCode, stdoutBs, stderrBs) <-
-            readProcessNoInput "age-plugin-yubikey"
-              [ "--generate"
-              , "--touch-policy", touchPolicy
-              , "--pin-policy", pinPolicy
-              ]
-          let stdoutText = TE.decodeUtf8Lenient stdoutBs
-          if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
-            then case parsePluginRecipient stdoutText of
-              Nothing -> pure (Left (KeySetupFailed
-                ("age-plugin-yubikey: could not parse a recipient line from its output; "
-                 <> TE.decodeUtf8Lenient stderrBs)))
-              Just pub -> do
-                BS.writeFile identPath (TE.encodeUtf8 stdoutText)
-                setFileMode identPath 0o600
-                pure (Right ResolvedKey
-                  { rkRecipient = pub
-                  , rkIdentity  = T.pack identPath
-                  , rkKeyType   = "yubikey"
-                  })
-            else pure (Left (KeySetupNeedsTty
-              (yubiCommandFor paths identPath touchPolicy pinPolicy)))
+        Right safePath -> pure (Just safePath)
+        Left (PathInsecureMode p) -> do
+          tightened <- try @IOException (setFileMode p 0o600)
+          case tightened of
+            Left _ -> pure Nothing
+            Right () -> either (const Nothing) Just <$> mkSafeKeyPath keysRoot candidate
+        Left _ -> pure Nothing
+    readRecipient path = do
+      raw <- try @IOException (BS.readFile path)
+      pure $ either (const Nothing)
+        (parsePluginRecipient . TE.decodeUtf8Lenient) raw
+
+isYubiCandidate :: FilePath -> FilePath -> Bool
+isYubiCandidate name candidate =
+  case T.stripSuffix ".yubikey.txt" (T.pack candidate) of
+    Nothing -> False
+    Just stemText ->
+      let stem = T.unpack stemText
+      in stem == name || case stripPrefix (name <> "-") stem of
+          Just suffix -> not (null suffix) && all isDigit suffix
+          Nothing -> False
 
 -- | The command the operator runs by hand when the plugin needs a TTY. The
--- path is rendered in tilde form when it is under the seal home, because that
--- is the form that stays readable in an error body and is still runnable from
--- the operator's own shell. Single-quoted: a @SEAL_HOME@ with a space must not
--- turn the hint into two words.
-yubiCommandFor :: SealPaths -> FilePath -> String -> String -> Text
-yubiCommandFor paths identPath touchPolicy pinPolicy =
+-- path is rendered in tilde form when it is under the user's home, because
+-- that is the form that stays readable in an error body and is still runnable
+-- from the operator's own shell.
+--
+-- A tilde only expands when the shell sees it unquoted, so the default
+-- @~/.seal/keys/…@ form is emitted bare. A path that needs quoting (a
+-- @SEAL_HOME@ with a space) uses the double-quoted @\"\$HOME/…\"@ form, which
+-- keeps expansion while still being one word; a path outside @\$HOME@ is
+-- single-quoted absolute.
+yubiCommandFor :: FilePath -> FilePath -> String -> String -> Text
+yubiCommandFor home identPath touchPolicy pinPolicy =
   T.unwords
     [ "age-plugin-yubikey --generate"
     , "--touch-policy", T.pack touchPolicy
     , "--pin-policy", T.pack pinPolicy
-    , ">", "'" <> T.pack (tildeForm (spHome paths) identPath) <> "'"
+    , ">", renderShellTarget home identPath
     ]
 
--- | @~\/rest@ for a path under @home@, otherwise the path unchanged.
-tildeForm :: FilePath -> FilePath -> FilePath
-tildeForm home path = case stripPrefix (home <> "/") path of
-  Just rest -> "~/" <> rest
-  Nothing   -> path
+renderShellTarget :: FilePath -> FilePath -> Text
+renderShellTarget home path = case stripPrefix (home <> "/") path of
+  Just rest
+    | isShellSafeWord rest -> "~/" <> T.pack rest
+    | otherwise -> "\"$HOME/" <> T.pack (escapeDouble rest) <> "\""
+  Nothing -> "'" <> T.pack (escapeSingle path) <> "'"
+
+isShellSafeWord :: FilePath -> Bool
+isShellSafeWord = all (`elem` safeChars)
+  where
+    safeChars = ['a' .. 'z'] ++ ['A' .. 'Z'] ++ ['0' .. '9'] ++ "/._-+"
+
+escapeDouble :: String -> String
+escapeDouble = concatMap escapeChar
+  where
+    escapeChar c
+      | c `elem` ['\\', '"', '$', '`'] = ['\\', c]
+      | otherwise = [c]
+
+escapeSingle :: String -> String
+escapeSingle = concatMap (\c -> if c == '\'' then "'\\''" else [c])
 
 -- | Parse the recipient (public key) from age-plugin-yubikey @--generate@
 -- output. The recipient appears on a comment line such as

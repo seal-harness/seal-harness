@@ -41,11 +41,14 @@ describe('VaultStep', () => {
   })
 
   it('shows the YubiKey waiting state and policy in the hint', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(422, {
-      error: 'this vault backend needs an interactive terminal',
-      hint: "age-plugin-yubikey --generate --touch-policy always --pin-policy once > '~/.seal/keys/default.yubikey.txt'",
-    }))
-    render(<VaultStep step={step()} onDone={() => {}} />)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(422, {
+        error: 'this vault backend needs an interactive terminal',
+        hint: "age-plugin-yubikey --generate --touch-policy always --pin-policy once > ~/.seal/keys/default.yubikey.txt",
+      }))
+      .mockResolvedValueOnce(jsonResponse(201, { recipient: 'age1yubikey1x', key_type: 'yubikey' }))
+    const onDone = vi.fn()
+    render(<VaultStep step={step()} onDone={onDone} />)
     fireEvent.click(screen.getByRole('button', { name: /yubikey/i }))
     // Policies are on by default, and the operator can turn them off.
     expect(screen.getByLabelText(/require a touch/i)).toBeChecked()
@@ -54,7 +57,12 @@ describe('VaultStep', () => {
     await waitFor(() => expect(screen.getByText(/--touch-policy always/)).toBeInTheDocument())
     expect(screen.getByText(/--pin-policy once/)).toBeInTheDocument()
     expect(screen.getByText(/run that command in a terminal/i)).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith('/api/setup/vault', expect.objectContaining({
+    // Re-check re-sends the request so the server can adopt the key file the
+    // terminal command wrote; success advances the wizard.
+    fireEvent.click(screen.getByRole('button', { name: /re-check/i }))
+    await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/setup/vault', expect.objectContaining({
       body: JSON.stringify({ backend: 'yubikey', touch: true, pin: true }),
     }))
   })
@@ -109,6 +117,18 @@ describe('VaultStep', () => {
     fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
     await waitFor(() => expect(screen.getByText(/unexpected response \(415\)/i)).toBeInTheDocument())
     expect(screen.getByText(/looks like a bug/i)).toBeInTheDocument()
+  })
+
+  it('explains how to obtain a user-supplied key', () => {
+    render(<VaultStep step={step()} onDone={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: /my own key/i }))
+    expect(screen.getByText(/already have an/i)).toBeInTheDocument()
+    expect(screen.getByText(/choose/i)).toBeInTheDocument()
+    expect(screen.getByText(/age-keygen -o/i)).toBeInTheDocument()
+    expect(screen.getByLabelText(/identity file path/i)).toHaveAttribute(
+      'placeholder',
+      '/Users/you/.config/age/keys.txt',
+    )
   })
 
   it('never pre-fills a key field', () => {
