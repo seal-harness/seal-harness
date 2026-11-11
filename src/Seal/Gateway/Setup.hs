@@ -195,6 +195,7 @@ setupStateJson state = object
       , "requires_name" .= pcRequiresName card
       , "isDefault" .= pcIsDefault card
       , "default_model" .= pcDefaultModel card
+      , "models" .= pcModels card
       ]
 
 statusText :: StepStatus -> Text

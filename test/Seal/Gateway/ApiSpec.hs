@@ -45,7 +45,7 @@ import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), telegramVaultKe
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerModels, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
@@ -4350,6 +4350,41 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> lookupK "defaultModel" o `shouldBe` Just (A.String "claude-sonnet-4")
         _ -> expectationFailure "expected JSON object"
 
+  it "POST + PUT /api/providers store the frequent-model list in config.toml" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("anthropic" :: T.Text)
+          , "api_key" .= ("sk-test-123" :: T.Text)
+          , "models" .= (["claude-opus-4-8", " claude-sonnet-4 ", ""] :: [T.Text])
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "models" o `shouldBe`
+            Just (A.Array (V.fromList [A.String "claude-opus-4-8", A.String "claude-sonnet-4"]))
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> providerModels cfg "anthropic" `shouldBe` ["claude-opus-4-8", "claude-sonnet-4"]
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- PUT replaces the list (and [] clears it).
+      req2 <- testPut ["api", "providers", "anthropic"]
+        (A.encode (A.object [ "models" .= (["gpt-4o"] :: [T.Text]) ]))
+      (status2, body2) <- runAppBody app req2
+      status2 `shouldBe` 200
+      case A.decode body2 :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "models" o `shouldBe` Just (A.Array (V.fromList [A.String "gpt-4o"]))
+        _ -> expectationFailure "expected JSON object"
+
   it "PUT /api/providers/:name with api_key rotates the vault key" $
     withSystemTempDirectory "seal-prov" $ \tmp -> do
       let cfgRoot = tmp </> "config"
@@ -4440,7 +4475,8 @@ spec = describe "Seal.Gateway.API" $ do
       saveRuntimeConfig (cfgRoot </> "config.toml")
         defaultRuntimeConfig { rcProviders = Map.fromList
           [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
-                                         , pcBaseUrl = Just "http://localhost:8000/v1" })] }
+                                         , pcBaseUrl = Just "http://localhost:8000/v1"
+                                         , pcModels = Nothing })] }
       vault <- makeFakeVaultRuntime []
       deps <- mkProviderTestDeps tmp cfgRoot vault
       let app = apiApp deps
@@ -4478,7 +4514,8 @@ spec = describe "Seal.Gateway.API" $ do
         { rcDefaultProvider = Just "local-vllm"
         , rcProviders = Map.fromList
             [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
-                                           , pcBaseUrl = Just "http://localhost:8000/v1" }) ]
+                                           , pcBaseUrl = Just "http://localhost:8000/v1"
+                                           , pcModels = Nothing }) ]
         }
       vault <- makeFakeVaultRuntime [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
       deps <- mkProviderTestDeps tmp cfgRoot vault

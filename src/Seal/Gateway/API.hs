@@ -65,7 +65,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Core.MessageSource (MessageSource (..), mkUserId)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
 import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath )
 import Seal.Config.Security
@@ -658,11 +658,12 @@ dispatchApi deps req respond =
                 [ "name" .= name
                 , "type" .= ("openai" :: Text)
                 , "configured" .= True
+                , "models" .= providerModels cfg name
                 ]
             | name <- customs
             ]
       respond (jsonLBS status200 (A.encode
-        (map (providerInfoJson cfgSet) knownProviders <> customInfos)))
+        (map (providerInfoJson cfg cfgSet) knownProviders <> customInfos)))
     -- GET /api/providers/all -> ALL known providers with full status
     -- details (authStatus, isDefault, defaultModel, baseUrl) for the
     -- ProvidersView CRUD page. Literal "all" must precede :p/models.
@@ -2459,20 +2460,20 @@ skillInfoJson s = A.object
 jsonCreated :: Value -> Response
 jsonCreated v = responseLBS status201 [jsonHeader] (A.encode v)
 
--- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
--- emits @name@ + @configured@ (membership in the configured-provider set);
--- @isDefault@ / @defaultModel@ are UI conveniences not threaded into
--- 'ApiDeps' for T11.
-providerInfoJson :: Set.Set Text -> KnownProvider -> Value
-providerInfoJson cfgSet p =
+-- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape:
+-- @name@ + @configured@ (membership in the configured-provider set) plus the
+-- operator's frequently-used @models@ for the new-tab model combobox.
+providerInfoJson :: RuntimeConfig -> Set.Set Text -> KnownProvider -> Value
+providerInfoJson cfg cfgSet p =
   object
     [ "name" .= providerLabel p
     , "configured" .= Set.member (providerLabel p) cfgSet
+    , "models" .= providerModels cfg (providerLabel p)
     ]
 
 -- | Handle GET /api/providers/all — returns ALL known providers with full
 -- status details for the ProvidersView CRUD page. Each provider object
--- includes name, isDefault, defaultModel, baseUrl, and authStatus.
+-- includes name, isDefault, defaultModel, models, baseUrl, and authStatus.
 handleProvidersAll :: ApiDeps -> IO Response
 handleProvidersAll deps = do
   let cfgPath = srConfigPath (adSessionRuntime deps)
@@ -2506,11 +2507,13 @@ providerDetailJsonFor cfg mh name typeId = do
   let isDef = rcDefaultProvider cfg == Just name
       dModel = providerDefaultModel cfg name
       bUrl = providerBaseUrl cfg name
+      models = providerModels cfg name
   pure $ object
     [ "name" .= name
     , "type" .= typeId
     , "isDefault" .= isDef
     , "defaultModel" .= dModel
+    , "models" .= models
     , "baseUrl" .= bUrl
     , "authStatus" .= authStatus
     ]
@@ -2579,6 +2582,7 @@ handleProviderCreate deps body =
             mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
             mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
             mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
+            mModels = parseMaybe (withObject "provider" (.: "models")) v :: Maybe [Text]
             cfgPath = srConfigPath (adSessionRuntime deps)
         eCfg0 <- loadRuntimeConfig cfgPath
         let cfg0 = fromRight defaultRuntimeConfig eCfg0
@@ -2601,7 +2605,10 @@ handleProviderCreate deps body =
                           cfg5 = case mDefaultModel of
                             Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg4
                             _ -> cfg4
-                      in cfg5
+                          cfg6 = case mModels of
+                            Just ms -> upsertProvider lbl (\p -> p { pcModels = Just (normalizeModels ms) }) cfg5
+                            _ -> cfg5
+                      in cfg6
                 eRes <- updateRuntimeConfig cfgPath seedCfg
                 case eRes of
                   Left e -> pure (errJson status500 e)
@@ -2611,6 +2618,10 @@ handleProviderCreate deps body =
                     mh <- readIORef (vrHandleRef (adVault deps))
                     detail <- providerDetailJsonFor cfg mh lbl typeId
                     pure (jsonLBS status201 (A.encode detail))
+
+-- | Trim and drop blank entries from the operator's frequent-model list.
+normalizeModels :: [Text] -> [Text]
+normalizeModels = filter (not . T.null) . map T.strip
 
 -- | Resolve a POST target. Built-ins keep their own name/key; a custom
 -- instance requires @type: "openai"@, a valid name, and a name not already in
@@ -2680,6 +2691,7 @@ handleProviderUpdate deps name body = do
         let mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
             mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
             mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
+            mModels = parseMaybe (withObject "provider" (.: "models")) v :: Maybe [Text]
         vaultResult <- storeProviderKey deps vKey mApiKey
         case vaultResult of
           Left e -> pure (errJson status500 e)
@@ -2692,7 +2704,10 @@ handleProviderUpdate deps name body = do
                       cfg2 = case mDefaultModel of
                         Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg1
                         _ -> cfg1
-                  in cfg2
+                      cfg3 = case mModels of
+                        Just ms -> upsertProvider lbl (\p -> p { pcModels = Just (normalizeModels ms) }) cfg2
+                        _ -> cfg2
+                  in cfg3
             eRes <- updateRuntimeConfig cfgPath updateCfg
             case eRes of
               Left e -> pure (errJson status500 e)

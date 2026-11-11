@@ -27,6 +27,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     model: 'claude-sonnet-4',
     setModel: vi.fn(),
     models: [{ name: 'claude-sonnet-4', contextWindow: 200000 }],
+    modelOptions: ['claude-sonnet-4'],
     modelsLoading: false,
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),

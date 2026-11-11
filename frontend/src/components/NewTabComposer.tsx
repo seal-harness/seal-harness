@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  CUSTOM_MODEL_VALUE,
   type HarnessFlavour,
   type NewTabKind,
   type NewTabSpec,
@@ -197,34 +196,15 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
           </Row>
 
           <Row label="Model" htmlFor="provider-model">
-            <select
+            <CustomModelCombobox
               id="provider-model"
-              value={spec.useCustomModel ? CUSTOM_MODEL_VALUE : spec.model}
-              onChange={(e) => spec.handleModelSelectChange(e.target.value)}
-              disabled={spec.modelsLoading}
-              className="composer-select"
-              style={inputStyle}
-            >
-              {spec.modelsLoading && <option value="">Loading…</option>}
-              {!spec.modelsLoading && spec.models.length === 0 && (
-                <option value="" disabled>(no models — choose Custom… and enter one)</option>
-              )}
-              {spec.models.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
-              <option value={CUSTOM_MODEL_VALUE}>Custom…</option>
-            </select>
+              value={spec.model}
+              onChange={spec.setModel}
+              options={spec.modelOptions}
+              placeholder="model id (pick a suggestion or type your own)"
+              testId="provider-model-list"
+            />
           </Row>
-
-          {spec.useCustomModel && (
-            <Row label="Custom Model" htmlFor="provider-model-custom">
-              <CustomModelCombobox
-                id="provider-model-custom"
-                value={spec.model}
-                onChange={spec.setModel}
-                options={spec.customModels}
-                placeholder="model id (e.g. claude-3-opus-20240229)"
-              />
-            </Row>
-          )}
 
           <Row label="Set up repo" htmlFor="provider-repo">
             <CustomModelCombobox

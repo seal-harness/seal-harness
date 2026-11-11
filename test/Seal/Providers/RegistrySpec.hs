@@ -69,7 +69,7 @@ ollamaCfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("ollama", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("ollama", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
   }
 
@@ -79,7 +79,7 @@ openRouterCfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("openrouter", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("openrouter", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
   }
 
@@ -89,7 +89,7 @@ openAICfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("openai", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("openai", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
   }
 
@@ -98,7 +98,7 @@ customCfg :: T.Text -> Maybe T.Text -> RuntimeConfig
 customCfg name mUrl = defaultRuntimeConfig
   { rcProviders =
       Map.fromList
-        [(name, ProviderConfig { pcDefaultModel = Just "my-model", pcBaseUrl = mUrl })]
+        [(name, ProviderConfig { pcDefaultModel = Just "my-model", pcBaseUrl = mUrl, pcModels = Nothing })]
   }
 
 spec :: Spec
@@ -380,7 +380,8 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       let cfg = defaultRuntimeConfig
             { rcProviders = Map.fromList
                 [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
-                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+                                            , pcBaseUrl = Just "https://ollama.com"
+                                            , pcModels = Nothing }) ]
             }
       ps <- configuredProviders (Just vh) cfg
       ps `shouldNotSatisfy` elem OllamaProvider
@@ -390,7 +391,8 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       let cfg = defaultRuntimeConfig
             { rcProviders = Map.fromList
                 [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
-                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+                                            , pcBaseUrl = Just "https://ollama.com"
+                                            , pcModels = Nothing }) ]
             }
       ps <- configuredProviders (Just vh) cfg
       ps `shouldSatisfy` elem OllamaProvider

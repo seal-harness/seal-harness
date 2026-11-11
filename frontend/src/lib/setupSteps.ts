@@ -28,6 +28,8 @@ export interface ProviderCard {
   configured: boolean
   isDefault: boolean
   default_model: string | null
+  /** Operator-configured frequently-used models for this provider. */
+  models?: string[]
   /** True when the provider has no built-in endpoint (the generic
    *  OpenAI-compatible option), so the wizard must collect a base URL. */
   requires_base_url: boolean

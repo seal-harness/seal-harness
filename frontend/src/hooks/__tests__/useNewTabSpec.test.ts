@@ -37,6 +37,29 @@ describe('useNewTabSpec', () => {
     expect(result.current.validationError).toBeNull()
   })
 
+  it('modelOptions prefers the configured models over the static list', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/providers') {
+        return new Response(JSON.stringify([{
+          name: 'anthropic',
+          isDefault: true,
+          defaultModel: 'claude-opus-4-8',
+          models: ['claude-opus-4-8', 'claude-sonnet-4'],
+        }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/providers/anthropic/models') {
+        return new Response(JSON.stringify([{ name: 'static-model', contextWindow: 1 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/ui/state') {
+        return new Response(JSON.stringify({ last_options: null, custom_models: [], repo_history: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.modelOptions).toEqual(['claude-opus-4-8', 'claude-sonnet-4']))
+    expect(result.current.model).toBe('claude-opus-4-8')
+  })
+
   it('buildBody produces the flat CreateTabBody for kind=provider', async () => {
     const { result } = renderHook(() => useNewTabSpec())
     await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))

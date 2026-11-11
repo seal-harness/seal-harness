@@ -38,7 +38,7 @@ import Data.Text qualified as T
 import System.FilePath (takeDirectory, takeFileName)
 
 import Seal.Config.File
-  ( RuntimeConfig (..), defaultRuntimeConfig, providerDefaultModel )
+  ( RuntimeConfig (..), defaultRuntimeConfig, providerDefaultModel, providerModels )
 import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
 import Seal.Core.Types (ModelId (..))
@@ -74,6 +74,9 @@ data ProviderCard = ProviderCard
   , pcConfigured   :: Bool
   , pcIsDefault    :: Bool
   , pcDefaultModel :: Maybe Text
+  , pcModels      :: [Text]
+    -- ^ The operator's frequently-used models for this provider. Offered as
+    -- suggestions by the new-tab model combobox.
   , pcRequiresBaseUrl :: Bool
     -- ^ True for providers with no built-in endpoint (the generic
     -- OpenAI-compatible option): the wizard must collect the URL, and the
@@ -291,6 +294,7 @@ providerCards inputs configured =
       , pcConfigured = Set.member (providerLabel known) configured
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
+      , pcModels = providerModels (siRuntime inputs) (providerLabel known)
       , pcRequiresBaseUrl = case known of
           OpenAICompatibleProvider -> True
           _ -> False

@@ -38,6 +38,7 @@ function makeProvider(overrides: Partial<ProviderDetail> = {}): ProviderDetail {
     name: 'anthropic',
     isDefault: false,
     defaultModel: null,
+    models: [],
     baseUrl: null,
     authStatus: 'none',
     ...overrides,
@@ -234,6 +235,25 @@ describe('ProvidersView', () => {
     await waitFor(() => {
       expect(setDefaultProvider).toHaveBeenCalledWith('anthropic')
     })
+  })
+
+  it('seeds the frequent-model list when editing and sends it as an array', async () => {
+    providersState = [makeProvider({
+      name: 'anthropic',
+      authStatus: 'api-key',
+      models: ['claude-opus-4-8', 'claude-sonnet-4'],
+    })]
+    updateProvider.mockResolvedValue({ ok: true, provider: providersState[0]! })
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-anthropic'))
+    const modelsInput = screen.getByTestId('provider-models-input') as HTMLTextAreaElement
+    expect(modelsInput.value).toBe('claude-opus-4-8\nclaude-sonnet-4')
+    fireEvent.change(modelsInput, { target: { value: 'gpt-4o, claude-opus-4-8\n\n' } })
+    fireEvent.click(screen.getByTestId('provider-save'))
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledTimes(1))
+    expect(updateProvider).toHaveBeenCalledWith('anthropic', expect.objectContaining({
+      models: ['gpt-4o', 'claude-opus-4-8'],
+    }))
   })
 
   it('displays form error when create fails', async () => {

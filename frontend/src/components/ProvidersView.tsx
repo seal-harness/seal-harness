@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ProviderInput, ProviderAuthStatus } from '../types'
 import {
+  ProviderFormFields,
+  emptyProviderFormValues,
+  modelsFromText,
+  providerFormValuesFrom,
+  type ProviderFormValues,
+} from './ProviderFormFields'
+import {
   createProvider,
   deleteProvider,
   fetchDefaultProvider,
@@ -61,11 +68,6 @@ function Row({
   )
 }
 
-/** The empty-form defaults for "New provider". */
-function emptyInput(): ProviderInput {
-  return { name: '', api_key: '', base_url: '', default_model: '' }
-}
-
 /** Provider ids that already mean a built-in type (and are therefore not
  *  available as a *new* custom instance name). `openai` is allowed: it is the
  *  built-in OpenAI-compatible instance, and reconfiguring it keeps the same
@@ -120,7 +122,8 @@ export function ProvidersView() {
 
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
-  const [form, setForm] = useState<ProviderInput>(emptyInput())
+  const [formName, setFormName] = useState('')
+  const [form, setForm] = useState<ProviderFormValues>(emptyProviderFormValues())
   const [uniqueName, setUniqueName] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
@@ -135,7 +138,8 @@ export function ProvidersView() {
   // When the user picks a provider to edit (or starts creating), seed the form.
   useEffect(() => {
     if (creating) {
-      setForm(emptyInput())
+      setFormName('')
+      setForm(emptyProviderFormValues())
       setUniqueName('')
       setFormError(null)
       return
@@ -143,12 +147,8 @@ export function ProvidersView() {
     if (editing) {
       const p = providersRef.current.find((pr) => pr.name === editing)
       if (p) {
-        setForm({
-          name: p.name,
-          api_key: '',
-          base_url: p.baseUrl ?? '',
-          default_model: p.defaultModel ?? '',
-        })
+        setFormName(p.name)
+        setForm(providerFormValuesFrom(p))
         setFormError(null)
       }
     }
@@ -181,26 +181,27 @@ export function ProvidersView() {
     [providers],
   )
 
-  const isOpenAIType = creating && form.name === 'openai'
+  const isOpenAIType = creating && formName === 'openai'
     || (!creating && (selected?.type ?? selected?.name) === 'openai')
-  const uniqueNameError = creating && form.name === 'openai'
+  const uniqueNameError = creating && formName === 'openai'
     ? providerNameError(uniqueName, existingCustomNames)
     : null
   const openAIBaseUrlOk =
-    !isOpenAIType || /^https?:\/\/\S+$/.test((form.base_url ?? '').trim())
+    !isOpenAIType || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
 
   const handleSubmit = async () => {
     setSubmitting(true)
     setFormError(null)
-    const trimmedName = (form.name ?? '').trim()
+    const trimmedName = formName.trim()
     if (creating) {
-      const customOpenAI = form.name === 'openai'
+      const customOpenAI = formName === 'openai'
       const payload: ProviderInput = {
         name: customOpenAI ? uniqueName.trim() : trimmedName,
         ...(customOpenAI ? { type: 'openai' } : {}),
-        api_key: form.api_key && form.api_key.trim().length > 0 ? form.api_key.trim() : undefined,
-        base_url: form.base_url && form.base_url.trim().length > 0 ? form.base_url.trim() : undefined,
-        default_model: form.default_model && form.default_model.trim().length > 0 ? form.default_model.trim() : undefined,
+        api_key: form.apiKey && form.apiKey.trim().length > 0 ? form.apiKey.trim() : undefined,
+        base_url: form.baseUrl && form.baseUrl.trim().length > 0 ? form.baseUrl.trim() : undefined,
+        default_model: form.defaultModel && form.defaultModel.trim().length > 0 ? form.defaultModel.trim() : undefined,
+        models: modelsFromText(form.modelsText),
       }
       const res = await createProvider(payload)
       setSubmitting(false)
@@ -214,9 +215,10 @@ export function ProvidersView() {
       }
     } else if (editing) {
       const payload: ProviderInput = {
-        api_key: form.api_key && form.api_key.trim().length > 0 ? form.api_key.trim() : undefined,
-        base_url: form.base_url && form.base_url.trim().length > 0 ? form.base_url.trim() : undefined,
-        default_model: form.default_model && form.default_model.trim().length > 0 ? form.default_model.trim() : undefined,
+        api_key: form.apiKey && form.apiKey.trim().length > 0 ? form.apiKey.trim() : undefined,
+        base_url: form.baseUrl && form.baseUrl.trim().length > 0 ? form.baseUrl.trim() : undefined,
+        default_model: form.defaultModel && form.defaultModel.trim().length > 0 ? form.defaultModel.trim() : undefined,
+        models: modelsFromText(form.modelsText),
       }
       const res = await updateProvider(editing, payload)
       setSubmitting(false)
@@ -260,7 +262,7 @@ export function ProvidersView() {
 
   const isVaultLocked = selected?.authStatus === 'vault-locked'
   const isKeyless = selected?.authStatus === 'keyless'
-  const isOllama = selected?.name === 'ollama' || (creating && form.name === 'ollama')
+  const isOllama = selected?.name === 'ollama' || (creating && formName === 'ollama')
 
   // ── Render ──────────────────────────────────────────────────────────
   return (
@@ -409,8 +411,8 @@ export function ProvidersView() {
               <Row label="Provider" htmlFor="provider-name" hint="Select a provider to configure.">
                 <select
                   id="provider-name"
-                  value={form.name ?? ''}
-                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
                   className="composer-select"
                   style={inputStyle}
                 >
@@ -430,7 +432,7 @@ export function ProvidersView() {
               </Row>
             )}
 
-            {creating && form.name === 'openai' && (
+            {creating && formName === 'openai' && (
               <Row
                 label="Unique Name"
                 htmlFor="provider-instance-name"
@@ -458,72 +460,17 @@ export function ProvidersView() {
               </Row>
             )}
 
-            <Row
-              label="API key"
-              htmlFor="provider-api-key"
-              hint={creating
-                ? 'Stored in the vault — never persisted in cleartext. Leave blank for keyless providers (e.g. local Ollama).'
-                : isKeyless
-                  ? 'This provider is keyless (local). No API key required.'
-                  : isVaultLocked
-                    ? 'Vault is locked — unlock it to manage API keys.'
-                    : 'Paste a new key to rotate (the stored key is never shown).'}
-            >
-              <input
-                id="provider-api-key"
-                type="password"
-                value={form.api_key ?? ''}
-                onChange={(e) => setForm((f) => ({ ...f, api_key: e.target.value }))}
-                style={inputStyle}
-                placeholder={isKeyless ? '(keyless — not required)' : 'Enter API key'}
-                autoComplete="off"
-                disabled={isVaultLocked}
-                data-testid="provider-api-key-input"
-              />
-            </Row>
-
-            <Row
-              label="Base URL"
-              htmlFor="provider-base-url"
-              hint={isOllama
-                ? 'Ollama server URL. Leave blank for default (http://localhost:11434).'
-                : isOpenAIType
-                  ? 'Required for OpenAI-compatible providers, e.g. https://api.openai.com/v1 or http://localhost:8000/v1.'
-                  : 'Custom API endpoint URL (optional).'}
-            >
-              <input
-                id="provider-base-url"
-                type="text"
-                value={form.base_url ?? ''}
-                onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))}
-                style={inputStyle}
-                placeholder={isOllama ? 'http://localhost:11434' : isOpenAIType ? 'https://api.openai.com/v1' : '(optional)'}
-                autoComplete="off"
-                aria-invalid={isOpenAIType && !openAIBaseUrlOk}
-                data-testid="provider-base-url-input"
-              />
-              {isOpenAIType && !openAIBaseUrlOk && (
-                <div style={{ fontSize: 11, color: 'var(--needs-input)', marginTop: 4 }}>
-                  Enter an http:// or https:// URL.
-                </div>
-              )}
-            </Row>
-
-            <Row
-              label="Default model"
-              htmlFor="provider-default-model"
-              hint="Provider-specific model id. Leave blank to use the provider default."
-            >
-              <input
-                id="provider-default-model"
-                type="text"
-                value={form.default_model ?? ''}
-                onChange={(e) => setForm((f) => ({ ...f, default_model: e.target.value }))}
-                style={inputStyle}
-                placeholder="e.g. claude-sonnet-4-20250514"
-                autoComplete="off"
-              />
-            </Row>
+            <ProviderFormFields
+              idPrefix="provider"
+              values={form}
+              onChange={(patch) => setForm((f) => ({ ...f, ...patch }))}
+              creating={creating}
+              isKeyless={isKeyless}
+              isVaultLocked={isVaultLocked}
+              isOllama={isOllama}
+              isOpenAIType={isOpenAIType}
+              baseUrlError={isOpenAIType && !openAIBaseUrlOk ? 'Enter an http:// or https:// URL.' : null}
+            />
 
             {formError && (
               <div
@@ -545,8 +492,8 @@ export function ProvidersView() {
                   onClick={handleSubmit}
                   disabled={
                     submitting
-                    || (creating && !(form.name ?? '').trim())
-                    || (creating && form.name === 'openai' && uniqueNameError !== null)
+                    || (creating && !formName.trim())
+                    || (creating && formName === 'openai' && uniqueNameError !== null)
                     || (isOpenAIType && !openAIBaseUrlOk)
                   }
                   aria-label={creating ? 'Create provider' : 'Save provider'}

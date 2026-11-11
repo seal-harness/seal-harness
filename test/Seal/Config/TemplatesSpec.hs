@@ -333,7 +333,7 @@ sampleRuntimeConfig = RuntimeConfig
   , rcDefaultModel    = Just "claude-opus-4-8"
   , rcDefaultAgent    = Just "sample-agent"
   , rcProviders       = Map.fromList
-      [("sample", ProviderConfig (Just "sample-model") (Just "https://example.com"))]
+      [("sample", ProviderConfig (Just "sample-model") (Just "https://example.com") (Just ["sample-model", "sample-model-2"]))]
   , rcRetrieval       = Just (RetrievalConfig (Just 1024))
   , rcSignal          = Just (SignalConfig (Just "+15551230000") (Just 1998)
                                (AllowOnly (Set.singleton "+15551230001")))

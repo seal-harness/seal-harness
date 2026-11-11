@@ -178,7 +178,7 @@ spec = describe "Seal.Setup.State" $ do
             , siIdentityReadable = Just True
             , siRuntime = defaultRuntimeConfig
                 { rcDefaultProvider = Just "anthropic"
-                , rcProviders = Map.fromList [("anthropic", ProviderConfig Nothing Nothing)]
+                , rcProviders = Map.fromList [("anthropic", ProviderConfig Nothing Nothing Nothing)]
                 }
             -- Reaching this would decrypt, i.e. ask for a touch.
             , siConfiguredProviders =
