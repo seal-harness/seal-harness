@@ -424,6 +424,24 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
         Left (FeExec _) -> True
         _ -> False
 
+    it "maps ExecHostKeyUnknown to FeExec with ssh-keyscan instructions" $ do
+      calls <- newIORef []
+      runner <- scriptedRunner calls [Left ExecHostKeyUnknown]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576
+      r <- feResolveHome fe
+      r `shouldSatisfy` \case
+        Left (FeExec msg) -> "ssh-keyscan" `T.isInfixOf` msg
+        _ -> False
+
+    it "maps ExecHostKeyUnknown on feListDirectory with ssh-keyscan instructions" $ do
+      calls <- newIORef []
+      runner <- scriptedRunner calls [Left ExecHostKeyUnknown]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576
+      r <- feListDirectory fe "/test"
+      r `shouldSatisfy` \case
+        Left (FeExec msg) -> "ssh-keyscan" `T.isInfixOf` msg
+        _ -> False
+
     it "sets flWarning for sensitive path" $ do
       calls <- newIORef []
       runner <- scriptedRunner calls [Right ""]

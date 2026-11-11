@@ -2318,11 +2318,11 @@ handleFilesList deps req = do
           Nothing -> do
             eHome <- feResolveHome (adFileExplorer deps)
             case eHome of
-              Left _ -> pure (Right "")
+              Left err -> pure (Left err)
               Right home -> pure (Right (T.pack home))
           Just p -> pure (Right p)
         case mPath of
-          Left e -> pure (errJson status400 e)
+          Left err -> pure (fileExplorerErrResponse err)
           Right pathTxt
             | T.null pathTxt -> pure (errJson status400 "path is required")
             | otherwise -> case validateFilePath pathTxt of

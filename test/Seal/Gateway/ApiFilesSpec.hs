@@ -13,7 +13,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..), fromGregorian)
-import Network.HTTP.Types (status200, status400, status403, status404)
+import Network.HTTP.Types (status200, status400, status403, status404, status500)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, queryString
   , requestMethod, requestHeaders, responseHeaders, responseStatus )
@@ -34,6 +34,7 @@ import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer
   ( FileExplorerHandle (..)
+  , FileExplorerErr (..)
   , mkLocalFileExplorer
   , mkFailClosedFileExplorer
   )
@@ -64,6 +65,25 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       deps <- mkDeps (mkLocalFileExplorer 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [("path", Just "/nonexistent/path/that/does/not/exist")])
       responseStatus resp `shouldBe` status404
+
+    it "returns 200 when path is absent (defaults to feResolveHome)" $ do
+      withSystemTempDirectory "seal-files-test" $ \tmp -> do
+        createDirectoryIfMissing True (tmp </> "subdir")
+        let fe = (mkLocalFileExplorer 131072) { feResolveHome = pure (Right tmp) }
+        deps <- mkDeps fe True
+        resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [])
+        responseStatus resp `shouldBe` status200
+
+    it "returns 500 (not 400) when feResolveHome fails with FeExec" $ do
+      let fe = (mkLocalFileExplorer 131072) { feResolveHome = pure (Left (FeExec "SSH unreachable")) }
+      deps <- mkDeps fe True
+      resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [])
+      responseStatus resp `shouldBe` status500
+
+    it "returns 403 (not 400) when feResolveHome fails with FeDisabled" $ do
+      deps <- mkDeps mkFailClosedFileExplorer True
+      resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [])
+      responseStatus resp `shouldBe` status403
 
   describe "GET /api/files/content" $ do
     it "returns 200 with file content as JSON" $ do

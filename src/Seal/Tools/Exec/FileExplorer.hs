@@ -50,7 +50,7 @@ import Text.Read (readMaybe)
 import Seal.Security.Path (blockedNames, lexicalCollapse)
 import Seal.Tools.Args (mkShellCommand)
 import Seal.Tools.Exec.Remote (RemoteRunner, runRemoteShell, runRemoteBytes, sshExecArgv)
-import Seal.Tools.Exec.Types (SshConfig)
+import Seal.Tools.Exec.Types (ExecError (..), SshConfig (..), getSshHost)
 import Seal.Tools.Exec.UntrustedIO (shellQuote)
 
 -- ---------------------------------------------------------------------------
@@ -168,6 +168,20 @@ checkBlocked path =
   if any (`elem` blockedNames) (splitDirectories path)
     then Just sensitiveWarning
     else Nothing
+
+-- | Map an 'ExecError' from the remote SSH runner to a 'FileExplorerErr'.
+-- The file explorer has no TOFU host-key adoption flow (unlike the CLI
+-- channel), so 'ExecHostKeyUnknown' gets a descriptive message with the
+-- manual fix instructions — same approach as the web channel's
+-- session-exec path in "Seal.Session.Workdir".
+mapRemoteExecError :: SshConfig -> ExecError -> FileExplorerErr
+mapRemoteExecError sshCfg = \case
+  ExecHostKeyUnknown -> FeExec
+    ("remote host key not in known_hosts (TOFU adoption not available from the file explorer). "
+     <> "Add the key manually with: ssh-keyscan -H "
+     <> getSshHost (scHost sshCfg)
+     <> " >> " <> T.pack (scKnownHosts sshCfg))
+  e -> FeExec (T.pack (show e))
 
 -- ---------------------------------------------------------------------------
 -- Fail-closed stub
@@ -412,7 +426,7 @@ remoteListDirectory sshCfg runner _ origPath = do
     Right cmd -> do
       res <- runRemoteShell runner sshCfg cmd
       case res of
-        Left e -> pure (Left (FeExec (T.pack (show e))))
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
         Right out -> do
           let (cleanOut, runnerTruncated) = stripTruncationMarker out
           if notFoundMarker `T.isPrefixOf` cleanOut
@@ -447,7 +461,7 @@ remoteReadFile sshCfg runner ceilingBytes origPath = do
     Right cmd -> do
       res <- runRemoteShell runner sshCfg cmd
       case res of
-        Left e -> pure (Left (FeExec (T.pack (show e))))
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
         Right out -> do
           let (cleanOut, runnerTruncated) = stripTruncationMarker out
           if notFoundMarker `T.isPrefixOf` cleanOut
@@ -484,7 +498,7 @@ remoteReadFileBytes sshCfg runner ceilingBytes origPath = do
     Right _ -> do
       res <- runRemoteBytes runner (sshExecArgv sshCfg cmdText)
       case res of
-        Left e -> pure (Left (FeExec (T.pack (show e))))
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
         Right (bs, transportTruncated) -> do
           let truncated = transportTruncated || BS.length bs >= ceilingBytes
           if notFoundBs `BS.isPrefixOf` bs
@@ -506,7 +520,7 @@ remoteResolveHome sshCfg runner ref = do
       Right cmd -> do
         res <- runRemoteShell runner sshCfg cmd
         case res of
-          Left e -> pure (Left (FeExec (T.pack (show e))))
+          Left e -> pure (Left (mapRemoteExecError sshCfg e))
           Right out -> do
             let home = T.unpack (T.strip out)
             if T.null (T.strip out)
