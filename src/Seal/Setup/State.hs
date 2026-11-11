@@ -43,8 +43,8 @@ import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Registry
-  ( KnownProvider (..), defaultModelFor, knownProviders, parseProvider
-  , providerLabel )
+  ( KnownProvider (..), knownProviders, providerLabel
+  , configuredCustomProviderNames, resolveDefaultModelForName )
 import Seal.Security.Vault (VaultHandle (vhStatus), VaultStatus (..))
 
 -- | The three states a wizard row can be in. There is deliberately no
@@ -79,6 +79,9 @@ data ProviderCard = ProviderCard
     -- OpenAI-compatible option): the wizard must collect the URL, and the
     -- backend refuses to use the provider without one. Server-driven so the
     -- wizard never has to know which provider is which.
+  , pcRequiresName :: Bool
+    -- ^ True for the generic OpenAI-compatible option: each instance needs its
+    -- own unique name, which becomes the config key and the vault-key stem.
   } deriving stock (Eq, Show)
 
 data SetupState = SetupState
@@ -242,8 +245,10 @@ configuredProviderIds :: SetupInputs -> IO (Set Text)
 configuredProviderIds inputs
   | isYubiKeyVault inputs =
       pure (Set.fromList (Map.keys (rcProviders (siRuntime inputs))))
-  | otherwise =
-      Set.fromList . map providerLabel <$> siConfiguredProviders inputs
+  | otherwise = do
+      builtins <- map providerLabel <$> siConfiguredProviders inputs
+      customs <- configuredCustomProviderNames (siHandle inputs) (siRuntime inputs)
+      pure (Set.fromList (builtins <> customs))
 
 classifyProvider :: SetupInputs -> Set Text -> SetupStep
 classifyProvider inputs configured =
@@ -267,20 +272,16 @@ classifyProvider inputs configured =
             ["configure"]
 
 -- | The model a session would actually use: the global default, else the
--- provider's configured default, else the provider's hardcoded default.
+-- provider's configured default, else the provider's hardcoded default. A
+-- custom OpenAI-compatible instance falls back to that implementation's
+-- default.
 modelFor :: SetupInputs -> Text -> Text
 modelFor inputs label =
-  fromMaybe (defaultModelText label) $
-    rcDefaultModel (siRuntime inputs)
-      <> providerDefaultModel (siRuntime inputs) label
-
-defaultModelText :: Text -> Text
-defaultModelText label = case parseProvider label of
-  Just known -> modelText (defaultModelFor known)
-  Nothing -> "unknown model"
-
-modelText :: ModelId -> Text
-modelText (ModelId m) = m
+  case rcDefaultModel (siRuntime inputs) of
+    Just m -> m
+    Nothing ->
+      let ModelId m = resolveDefaultModelForName (siRuntime inputs) label
+      in m
 
 providerCards :: SetupInputs -> Set Text -> [ProviderCard]
 providerCards inputs configured =
@@ -291,6 +292,9 @@ providerCards inputs configured =
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
       , pcRequiresBaseUrl = case known of
+          OpenAICompatibleProvider -> True
+          _ -> False
+      , pcRequiresName = case known of
           OpenAICompatibleProvider -> True
           _ -> False
       }

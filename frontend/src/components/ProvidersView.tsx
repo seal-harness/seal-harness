@@ -4,6 +4,7 @@ import {
   createProvider,
   deleteProvider,
   fetchDefaultProvider,
+  notifyProvidersChanged,
   setDefaultProvider,
   updateProvider,
   useAllProviders,
@@ -65,6 +66,28 @@ function emptyInput(): ProviderInput {
   return { name: '', api_key: '', base_url: '', default_model: '' }
 }
 
+/** Provider ids that already mean a built-in type (and are therefore not
+ *  available as a *new* custom instance name). `openai` is allowed: it is the
+ *  built-in OpenAI-compatible instance, and reconfiguring it keeps the same
+ *  name. */
+const RESERVED_PROVIDER_NAMES = new Set(['all', 'default', 'anthropic', 'ollama', 'openrouter'])
+
+const PROVIDER_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/
+
+/** Validate the unique name of an OpenAI-compatible instance. Returns the
+ *  user-facing reason, or null when it is acceptable. */
+function providerNameError(name: string, existingCustomNames: Set<string>): string | null {
+  const t = name.trim()
+  if (!t) return 'Enter a unique name for this provider.'
+  if (t.length > 32) return 'Use at most 32 characters.'
+  if (!PROVIDER_NAME_RE.test(t) || t.includes('--')) {
+    return 'Use 1–32 characters: a–z, 0–9 and “-” (no leading/trailing “-”, no “--”).'
+  }
+  if (RESERVED_PROVIDER_NAMES.has(t)) return `“${t}” is a reserved provider name.`
+  if (existingCustomNames.has(t)) return `A provider named “${t}” already exists.`
+  return null
+}
+
 /** Auth status badge color. */
 function authBadgeColor(status: ProviderAuthStatus): string {
   switch (status) {
@@ -98,6 +121,7 @@ export function ProvidersView() {
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<ProviderInput>(emptyInput())
+  const [uniqueName, setUniqueName] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
@@ -112,6 +136,7 @@ export function ProvidersView() {
   useEffect(() => {
     if (creating) {
       setForm(emptyInput())
+      setUniqueName('')
       setFormError(null)
       return
     }
@@ -148,13 +173,31 @@ export function ProvidersView() {
     [providers],
   )
 
+  // Names already used by custom OpenAI-compatible instances. The built-in
+  // `openai` row is intentionally excluded: it is the same instance the user
+  // may reconfigure by entering "openai".
+  const existingCustomNames = useMemo(
+    () => new Set(providers.filter((p) => PROVIDER_LABELS[p.name] === undefined).map((p) => p.name)),
+    [providers],
+  )
+
+  const isOpenAIType = creating && form.name === 'openai'
+    || (!creating && (selected?.type ?? selected?.name) === 'openai')
+  const uniqueNameError = creating && form.name === 'openai'
+    ? providerNameError(uniqueName, existingCustomNames)
+    : null
+  const openAIBaseUrlOk =
+    !isOpenAIType || /^https?:\/\/\S+$/.test((form.base_url ?? '').trim())
+
   const handleSubmit = async () => {
     setSubmitting(true)
     setFormError(null)
     const trimmedName = (form.name ?? '').trim()
     if (creating) {
+      const customOpenAI = form.name === 'openai'
       const payload: ProviderInput = {
-        name: trimmedName,
+        name: customOpenAI ? uniqueName.trim() : trimmedName,
+        ...(customOpenAI ? { type: 'openai' } : {}),
         api_key: form.api_key && form.api_key.trim().length > 0 ? form.api_key.trim() : undefined,
         base_url: form.base_url && form.base_url.trim().length > 0 ? form.base_url.trim() : undefined,
         default_model: form.default_model && form.default_model.trim().length > 0 ? form.default_model.trim() : undefined,
@@ -163,6 +206,7 @@ export function ProvidersView() {
       setSubmitting(false)
       if (res.ok) {
         refresh()
+        notifyProvidersChanged()
         setCreating(false)
         setEditing(res.provider.name)
       } else {
@@ -178,6 +222,7 @@ export function ProvidersView() {
       setSubmitting(false)
       if (res.ok) {
         refresh()
+        notifyProvidersChanged()
         setEditing(res.provider.name)
       } else {
         setFormError(res.error)
@@ -191,6 +236,7 @@ export function ProvidersView() {
       if (editing === name) setEditing(null)
       if (confirmingDelete === name) setConfirmingDelete(null)
       refresh()
+      notifyProvidersChanged()
       await refreshDefault()
     }
   }
@@ -369,18 +415,46 @@ export function ProvidersView() {
                   style={inputStyle}
                 >
                   <option value="">(select)</option>
-                  {unconfigured.map((p) => (
+                  {unconfigured.filter((p) => PROVIDER_LABELS[p.name] !== undefined).map((p) => (
                     <option key={p.name} value={p.name}>
                       {PROVIDER_LABELS[p.name] ?? p.name}
                     </option>
                   ))}
                   {/* Allow already-configured providers too (upsert) */}
-                  {configured.map((p) => (
+                  {configured.filter((p) => PROVIDER_LABELS[p.name] !== undefined).map((p) => (
                     <option key={p.name} value={p.name}>
                       {PROVIDER_LABELS[p.name] ?? p.name} (reconfigure)
                     </option>
                   ))}
                 </select>
+              </Row>
+            )}
+
+            {creating && form.name === 'openai' && (
+              <Row
+                label="Unique Name"
+                htmlFor="provider-instance-name"
+                hint="1–32 characters: a–z, 0–9 and “-”. This is the provider's id and is shown in the list."
+              >
+                <input
+                  id="provider-instance-name"
+                  type="text"
+                  value={uniqueName}
+                  onChange={(e) => setUniqueName(e.target.value)}
+                  style={inputStyle}
+                  placeholder="e.g. local-vllm"
+                  autoComplete="off"
+                  aria-invalid={uniqueNameError !== null}
+                  data-testid="provider-instance-name-input"
+                />
+                {uniqueNameError !== null && (
+                  <div
+                    data-testid="provider-instance-name-error"
+                    style={{ fontSize: 11, color: 'var(--needs-input)', marginTop: 4 }}
+                  >
+                    {uniqueNameError}
+                  </div>
+                )}
               </Row>
             )}
 
@@ -413,7 +487,9 @@ export function ProvidersView() {
               htmlFor="provider-base-url"
               hint={isOllama
                 ? 'Ollama server URL. Leave blank for default (http://localhost:11434).'
-                : 'Custom API endpoint URL (optional).'}
+                : isOpenAIType
+                  ? 'Required for OpenAI-compatible providers, e.g. https://api.openai.com/v1 or http://localhost:8000/v1.'
+                  : 'Custom API endpoint URL (optional).'}
             >
               <input
                 id="provider-base-url"
@@ -421,9 +497,16 @@ export function ProvidersView() {
                 value={form.base_url ?? ''}
                 onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))}
                 style={inputStyle}
-                placeholder={isOllama ? 'http://localhost:11434' : '(optional)'}
+                placeholder={isOllama ? 'http://localhost:11434' : isOpenAIType ? 'https://api.openai.com/v1' : '(optional)'}
                 autoComplete="off"
+                aria-invalid={isOpenAIType && !openAIBaseUrlOk}
+                data-testid="provider-base-url-input"
               />
+              {isOpenAIType && !openAIBaseUrlOk && (
+                <div style={{ fontSize: 11, color: 'var(--needs-input)', marginTop: 4 }}>
+                  Enter an http:// or https:// URL.
+                </div>
+              )}
             </Row>
 
             <Row
@@ -460,7 +543,12 @@ export function ProvidersView() {
                   type="button"
                   className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
                   onClick={handleSubmit}
-                  disabled={submitting || (creating && !(form.name ?? '').trim())}
+                  disabled={
+                    submitting
+                    || (creating && !(form.name ?? '').trim())
+                    || (creating && form.name === 'openai' && uniqueNameError !== null)
+                    || (isOpenAIType && !openAIBaseUrlOk)
+                  }
                   aria-label={creating ? 'Create provider' : 'Save provider'}
                   data-testid="provider-save"
                 >

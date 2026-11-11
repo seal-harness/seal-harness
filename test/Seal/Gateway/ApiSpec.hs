@@ -45,7 +45,7 @@ import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), telegramVaultKe
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
@@ -4388,6 +4388,109 @@ spec = describe "Seal.Gateway.API" $ do
     let app = apiApp deps
     status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
     status `shouldBe` 400
+
+  it "POST /api/providers creates a named OpenAI-compatible instance" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "name" o `shouldBe` Just (A.String "local-vllm")
+          lookupK "type" o `shouldBe` Just (A.String "openai")
+          lookupK "authStatus" o `shouldBe` Just (A.String "api-key")
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> do
+          rcDefaultProvider cfg `shouldBe` Just "local-vllm"
+          Map.member "local-vllm" (rcProviders cfg) `shouldBe` True
+        Left e -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- It is listed as a configured provider by name (the shape the
+      -- session composers consume).
+      (_, listedBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      let listedNames = case A.decode listedBody :: Maybe [A.Value] of
+            Just xs -> [ n | A.Object o <- xs, Just (A.String n) <- [lookupK "name" o] ]
+            Nothing -> []
+      listedNames `shouldContain` ["local-vllm"]
+      -- ...and by the CRUD list's detail endpoint.
+      (_, allBody) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      let names = case A.decode allBody :: Maybe [A.Value] of
+            Just xs -> [ n | A.Object o <- xs, Just (A.String n) <- [lookupK "name" o] ]
+            Nothing -> []
+      names `shouldContain` ["local-vllm"]
+
+  it "POST /api/providers rejects a duplicate custom name" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig (cfgRoot </> "config.toml")
+        defaultRuntimeConfig { rcProviders = Map.fromList
+          [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
+                                         , pcBaseUrl = Just "http://localhost:8000/v1" })] }
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:9000/v1" :: T.Text)
+          ]))
+      status <- runAppStatus app req
+      status `shouldBe` 409
+
+  it "POST /api/providers rejects an invalid custom name" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    req <- testPost ["api", "providers"]
+      (A.encode (A.object
+        [ "name" .= ("Bad Name" :: T.Text)
+        , "type" .= ("openai" :: T.Text)
+        , "api_key" .= ("k" :: T.Text)
+        , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "DELETE /api/providers/:name removes a custom instance's section" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath defaultRuntimeConfig
+        { rcDefaultProvider = Just "local-vllm"
+        , rcProviders = Map.fromList
+            [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
+                                           , pcBaseUrl = Just "http://localhost:8000/v1" }) ]
+        }
+      vault <- makeFakeVaultRuntime [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      status <- runAppStatus app (testRequest methodDelete ["api", "providers", "local-vllm"])
+      status `shouldBe` 204
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> do
+          Map.member "local-vllm" (rcProviders cfg) `shouldBe` False
+          rcDefaultProvider cfg `shouldBe` Nothing
+        Left e -> expectationFailure ("config load failed: " <> T.unpack e)
 
   -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
 

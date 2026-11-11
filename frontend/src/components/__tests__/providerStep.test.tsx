@@ -11,6 +11,7 @@ function card(overrides: Partial<ProviderCard> = {}): ProviderCard {
     isDefault: false,
     default_model: null,
     requires_base_url: false,
+    requires_name: false,
     ...overrides,
   }
 }
@@ -121,12 +122,12 @@ describe('ProviderStep', () => {
     }))
   })
 
-  it('requires a base URL for the generic OpenAI-compatible provider', async () => {
+  it('requires a base URL and a unique name for the generic OpenAI-compatible provider', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'openai' }))
     render(
       <ProviderStep
         step={step()}
-        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true })]}
+        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
         onDone={() => {}}
       />,
     )
@@ -138,12 +139,16 @@ describe('ProviderStep', () => {
     fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'localhost:8000' } })
     expect(save).toBeDisabled()
     fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'http://localhost:8000/v1' } })
+    // The instance also needs a unique name before Save is enabled.
+    expect(save).toBeDisabled()
+    fireEvent.change(screen.getByLabelText(/unique name/i), { target: { value: 'local-vllm' } })
     expect(save).toBeEnabled()
     fireEvent.click(save)
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
     expect(fetchMock).toHaveBeenCalledWith('/api/providers', expect.objectContaining({
       body: JSON.stringify({
-        name: 'openai',
+        name: 'local-vllm',
+        type: 'openai',
         api_key: 'sk-local',
         base_url: 'http://localhost:8000/v1',
       }),

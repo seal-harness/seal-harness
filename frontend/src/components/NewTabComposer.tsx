@@ -42,9 +42,11 @@ interface NewTabComposerProps {
 // ── Component ─────────────────────────────────────────────────────────
 
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
+  // Only configured providers are selectable. Unconfigured types stay hidden:
+  // they belong in the Providers screen, not in a "start a new tab" picker.
   // `configured` absent => configured (back-compat with older test mocks).
-  const noProviders =
-    spec.providersLoaded && !spec.configuredProviders.some((p) => p.configured !== false)
+  const selectableProviders = spec.configuredProviders.filter((p) => p.configured !== false)
+  const noProviders = spec.providersLoaded && selectableProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -185,17 +187,12 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
                   (no providers configured — set an API key or start Ollama)
                 </option>
               )}
-              {spec.configuredProviders.map((p) => {
-                // `configured` absent => configured (back-compat).
-                const isCfg = p.configured !== false
-                return (
-                  <option key={p.name} value={p.name} disabled={!isCfg}>
-                    {PROVIDER_LABELS[p.name] ?? p.name}
-                    {p.isDefault ? ' (default)' : ''}
-                    {isCfg ? '' : ' (not configured)'}
-                  </option>
-                )
-              })}
+              {selectableProviders.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {PROVIDER_LABELS[p.name] ?? p.name}
+                  {p.isDefault ? ' (default)' : ''}
+                </option>
+              ))}
             </select>
           </Row>
 

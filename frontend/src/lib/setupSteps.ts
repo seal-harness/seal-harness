@@ -31,6 +31,9 @@ export interface ProviderCard {
   /** True when the provider has no built-in endpoint (the generic
    *  OpenAI-compatible option), so the wizard must collect a base URL. */
   requires_base_url: boolean
+  /** True when the provider needs an operator-chosen unique name (the generic
+   *  OpenAI-compatible option). */
+  requires_name: boolean
 }
 
 export interface SetupState {
@@ -186,7 +189,7 @@ function parseStep(raw: unknown): { step: SetupStep; unknownStatus?: string } | 
 
 function parseProvider(raw: unknown): ProviderCard | null {
   if (!isRecord(raw)) return null
-  const { id, label, configured, isDefault, default_model, requires_base_url } = raw
+  const { id, label, configured, isDefault, default_model, requires_base_url, requires_name } = raw
   if (typeof id !== 'string' || typeof label !== 'string') return null
   if (typeof configured !== 'boolean' || typeof isDefault !== 'boolean') return null
   return {
@@ -196,6 +199,7 @@ function parseProvider(raw: unknown): ProviderCard | null {
     isDefault,
     default_model: typeof default_model === 'string' ? default_model : null,
     requires_base_url: requires_base_url === true,
+    requires_name: requires_name === true,
   }
 }
 

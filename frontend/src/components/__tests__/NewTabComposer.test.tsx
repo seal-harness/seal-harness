@@ -88,7 +88,7 @@ describe('NewTabComposer — provider kind', () => {
     expect(screen.queryByLabelText('Agent')).toBeNull()
   })
 
-  it('shows all supported providers, marking unconfigured ones as disabled', () => {
+  it('shows only configured providers in the provider dropdown', () => {
     render(
       <NewTabComposer
         spec={makeSpec({
@@ -104,19 +104,11 @@ describe('NewTabComposer — provider kind', () => {
       />,
     )
     const sel = screen.getByLabelText('Provider') as HTMLSelectElement
-    const byValue = Object.fromEntries(Array.from(sel.options).map((o) => [o.value, o]))
-    const anthropic = byValue['anthropic']!
-    const ollama = byValue['ollama']!
-    const openrouter = byValue['openrouter']!
-    expect(anthropic).toBeDefined()
-    expect(ollama).toBeDefined()
-    expect(openrouter).toBeDefined()
-    // The unconfigured one is present but disabled + labelled.
-    expect(openrouter.disabled).toBe(true)
-    expect(openrouter.textContent).toMatch(/not configured/)
-    // Configured ones are selectable.
-    expect(anthropic.disabled).toBe(false)
-    expect(ollama.disabled).toBe(false)
+    const values = Array.from(sel.options).map((o) => o.value)
+    expect(values).toContain('anthropic')
+    expect(values).toContain('ollama')
+    // The unconfigured type is not rendered at all.
+    expect(values).not.toContain('openrouter')
   })
 
   it('submit calls createTab then onSubmit', async () => {

@@ -272,6 +272,10 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** The provider implementation ("anthropic", "ollama", "openrouter",
+   *  "openai"). For a custom OpenAI-compatible instance `name` is the
+   *  operator-chosen unique name and `type` is "openai". */
+  type?: string
   isDefault: boolean
   defaultModel: string | null
   baseUrl: string | null
@@ -279,9 +283,11 @@ export interface ProviderDetail {
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
- *  api_key is write-only — never returned by the API. */
+ *  api_key is write-only — never returned by the API. `type` is required when
+ *  creating a custom OpenAI-compatible instance (name is its unique id). */
 export interface ProviderInput {
   name?: string
+  type?: string
   api_key?: string
   base_url?: string
   default_model?: string

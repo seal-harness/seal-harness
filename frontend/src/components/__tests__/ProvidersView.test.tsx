@@ -21,6 +21,7 @@ vi.mock('../../hooks/useApi', () => ({
   updateProvider: (name: string, input: unknown) => updateProvider(name, input),
   deleteProvider: (name: string) => deleteProvider(name),
   fetchDefaultProvider: () => fetchDefaultProvider(),
+  notifyProvidersChanged: () => {},
   setDefaultProvider: (provider: string | null) => setDefaultProvider(provider),
   useAllProviders: () => ({
     providers: providersState,
@@ -253,3 +254,51 @@ describe('ProvidersView', () => {
     expect(screen.getByText('vault not configured')).toBeDefined()
   })
 })
+  it('requires a unique name when creating an OpenAI-compatible provider', async () => {
+    providersState = [makeProvider({ name: 'openai', authStatus: 'none' })]
+    const created: ProviderDetail = makeProvider({
+      name: 'local-vllm',
+      type: 'openai',
+      authStatus: 'api-key',
+      baseUrl: 'http://localhost:8000/v1',
+    })
+    createProvider.mockResolvedValue({ ok: true, provider: created })
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')
+    fireEvent.change(select!, { target: { value: 'openai' } })
+
+    // The openai type alone is not an identity: Save stays disabled until the
+    // operator supplies a unique name.
+    const save = screen.getByTestId('provider-save')
+    expect(save).toBeDisabled()
+    const nameInput = screen.getByTestId('provider-instance-name-input')
+    fireEvent.change(nameInput, { target: { value: 'local-vllm' } })
+    fireEvent.change(screen.getByTestId('provider-api-key-input'), { target: { value: 'sk-local' } })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'http://localhost:8000/v1' },
+    })
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    await waitFor(() => expect(createProvider).toHaveBeenCalledTimes(1))
+    expect(createProvider).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'local-vllm',
+      type: 'openai',
+      api_key: 'sk-local',
+      base_url: 'http://localhost:8000/v1',
+    }))
+  })
+
+  it('rejects a duplicate custom provider name', () => {
+    providersState = [
+      makeProvider({ name: 'openai', authStatus: 'none' }),
+      makeProvider({ name: 'local-vllm', type: 'openai', authStatus: 'api-key' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')
+    fireEvent.change(select!, { target: { value: 'openai' } })
+    fireEvent.change(screen.getByTestId('provider-instance-name-input'), { target: { value: 'local-vllm' } })
+    expect(screen.getByTestId('provider-instance-name-error')).toBeDefined()
+    expect(screen.getByTestId('provider-save')).toBeDisabled()
+  })

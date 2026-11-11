@@ -49,6 +49,9 @@ export function ProviderStep({
   // OpenAI-compatible option). Never pre-filled: the endpoint belongs to the
   // operator, and echoing a guess back would be worse than an empty field.
   const [baseUrl, setBaseUrl] = useState('')
+  // The unique instance name for an OpenAI-compatible provider. This becomes
+  // the provider id in config/vault and the label shown in the Providers list.
+  const [instanceName, setInstanceName] = useState('')
   const [dirty, setDirty] = useState(false)
   const [save, setSave] = useState<SaveState>({ status: 'idle' })
   const [ping, setPing] = useState<SetupResult | null>(null)
@@ -66,8 +69,14 @@ export function ProviderStep({
   const effectiveId = providers.some((p) => p.id === selected) ? selected : fallback.id
   const card = providers.find((p) => p.id === effectiveId)
   const needsBaseUrl = card?.requires_base_url === true
+  const needsName = card?.requires_name === true
   const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(baseUrl.trim())
-  const canSaveKey = dirty && baseUrlOk
+  const nameOk = !needsName || (
+    /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(instanceName.trim())
+    && !instanceName.includes('--')
+    && !['all', 'default', 'anthropic', 'ollama', 'openrouter'].includes(instanceName.trim())
+  )
+  const canSaveKey = dirty && baseUrlOk && nameOk
   const saveDisabled = save.status === 'saving' || !canSaveKey
 
   const saveKey = async (): Promise<void> => {
@@ -76,7 +85,8 @@ export function ProviderStep({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: effectiveId,
+        name: needsName ? instanceName.trim() : effectiveId,
+        ...(needsName ? { type: 'openai' } : {}),
         api_key: apiKey,
         ...(needsBaseUrl ? { base_url: baseUrl.trim() } : {}),
       }),
@@ -86,6 +96,7 @@ export function ProviderStep({
       // component state would be the only place it outlives the request.
       setApiKey('')
       setBaseUrl('')
+      setInstanceName('')
       setDirty(false)
       setSave({ status: 'saved' })
       onDone()
@@ -171,6 +182,24 @@ export function ProviderStep({
             onChange={(e) => { setApiKey(e.target.value); setDirty(true) }}
             style={s.inputStyle}
           />
+        </label>
+      ) : null}
+      {card !== undefined && needsName ? (
+        <label style={{ ...s.labelStyle, marginTop: 14 }}>
+          Unique name
+          <input
+            type="text"
+            placeholder="e.g. local-vllm"
+            value={instanceName}
+            onChange={(e) => { setInstanceName(e.target.value); setDirty(true) }}
+            style={s.inputStyle}
+            aria-invalid={!nameOk}
+          />
+          <span style={{ ...s.faintStyle, display: 'block', marginTop: 4 }}>
+            {nameOk
+              ? '1–32 characters: a–z, 0–9 and “-”. This id identifies the provider in the Providers list.'
+              : 'Use 1–32 characters: a–z, 0–9 and “-” (no leading/trailing “-”, no “--”).'}
+          </span>
         </label>
       ) : null}
       {card !== undefined && needsBaseUrl ? (

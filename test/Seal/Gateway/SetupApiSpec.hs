@@ -57,7 +57,6 @@ import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Class (SomeProvider (..))
-import Seal.Providers.Registry (KnownProvider (..))
 import Seal.Security.AccessControl (credentialFromFile)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault
@@ -337,7 +336,7 @@ data Harness = Harness
   { hApp   :: Application
   , hPaths :: SealPaths
   , hRef   :: IORef (Maybe VaultHandle)
-  , hCalls :: IORef [(KnownProvider, ModelId)]
+  , hCalls :: IORef [(Text, ModelId)]
   }
 
 withHarness :: HarnessConfig -> (Harness -> IO a) -> IO a
@@ -359,7 +358,7 @@ harnessApp config paths = do
 
 harnessAppWith
   :: HarnessConfig -> SealPaths
-  -> IORef (Maybe VaultHandle) -> IORef [(KnownProvider, ModelId)]
+  -> IORef (Maybe VaultHandle) -> IORef [(Text, ModelId)]
   -> IO Application
 harnessAppWith config paths ref calls = do
   tabsH <- newTabsHandle

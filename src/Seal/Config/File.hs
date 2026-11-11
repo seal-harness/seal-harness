@@ -48,6 +48,7 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , deleteProvider
   , migrateLegacyChannels
   , upsertChannel
   , deleteChannel
@@ -815,6 +816,12 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | Remove one provider section by name (used when deleting a custom
+-- OpenAI-compatible instance; built-ins keep their section).
+deleteProvider :: Text -> RuntimeConfig -> RuntimeConfig
+deleteProvider lbl cfg =
+  cfg { rcProviders = Map.delete lbl (rcProviders cfg) }
 
 -- | A 'ChannelConfig' with all optional fields absent and 'ccKind' defaulting
 -- to 'Signal'. Used by 'upsertChannel' as the seed when the id is absent.

@@ -81,6 +81,25 @@ describe('NewSessionComposer', () => {
     expect(screen.queryByText('Existing Harness')).toBeNull()
   })
 
+  it('shows only configured providers in the provider dropdown', () => {
+    render(
+      <NewSessionComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', configured: true }),
+            makeProvider({ name: 'openrouter', configured: false }),
+          ],
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const values = Array.from(sel.options).map((o) => o.value)
+    expect(values).toContain('anthropic')
+    expect(values).not.toContain('openrouter')
+  })
+
   it('fires onSubmit with the createBareSession response on submit', async () => {
     const onSubmit = vi.fn()
     render(<NewSessionComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)

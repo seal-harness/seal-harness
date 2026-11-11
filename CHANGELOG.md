@@ -64,6 +64,14 @@
   surfaces as a real error instead of a cheerful "ok". With no credential the
   call is skipped and the configured default is returned, as before.
 
+* **OpenAI-compatible providers can be named.** Creating one from the
+  Providers view or the setup wizard now requires a unique id (1-32 characters
+  of `a-z`, `0-9` and `-`). The id becomes the `[providers.<name>]` config key,
+  the value sessions and agent defs store, and the stem of a per-instance vault
+  key (`PROVIDER_APIKEY_<NAME>`), so several endpoints can coexist instead of
+  sharing one `openai` slot. The chosen name is what the Providers list shows.
+  The built-in `openai` instance keeps its legacy `OPENAI_API_KEY` name.
+
 * **A first run can now be completed in the browser.** `seal serve` serves a
   guided wizard before the app: create the vault (local `age-keygen` key,
   YubiKey, or your own age identity), then add an LLM provider. It reaches
