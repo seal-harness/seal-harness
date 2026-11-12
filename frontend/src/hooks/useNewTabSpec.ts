@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
 
@@ -33,6 +33,10 @@ export interface NewTabSpec {
   model: string
   setModel: (v: string) => void
   models: { name: string; contextWindow: number }[]
+  /** Suggestions for the model combobox: the provider's configured frequent
+   *  models, falling back to the statically-known model list when none are
+   *  configured. Free-form entry is always allowed. */
+  modelOptions: string[]
   modelsLoading: boolean
   useCustomModel: boolean
   handleModelSelectChange: (v: string) => void
@@ -224,23 +228,33 @@ export function useNewTabSpec(): NewTabSpec {
         setModel(restored)
         return
       }
-      // A restored custom model (useCustomModel=true) isn't in the provider's
-      // static list — keep the custom flag + the restored id.
+      // A restored model may be custom — the combobox accepts free entry, so
+      // just keep the id and mark it custom when it is not a suggestion.
+      const configured = info?.models ?? []
+      const suggestions = configured.length > 0 ? configured : names
       if (restored) {
-        setUseCustomModel(true)
+        setUseCustomModel(!suggestions.includes(restored))
         setModel(restored)
         return
       }
-      setUseCustomModel(false)
       const dflt = info?.defaultModel
-      if (dflt && names.includes(dflt)) {
+      if (dflt) {
+        setUseCustomModel(!suggestions.includes(dflt))
         setModel(dflt)
       } else {
-        setModel(names.length > 0 ? names[0]! : '')
+        setUseCustomModel(false)
+        setModel(suggestions.length > 0 ? suggestions[0]! : '')
       }
     })
     return () => { cancelled = true }
   }, [kind, provider, configuredProviders])
+
+  const selectedProviderInfo = configuredProviders.find((p) => p.name === provider)
+  const modelOptions = useMemo(() => {
+    const configured = selectedProviderInfo?.models ?? []
+    if (configured.length > 0) return configured
+    return models.map((m) => m.name)
+  }, [selectedProviderInfo, models])
 
   const handleModelSelectChange = useCallback((value: string) => {
     if (value === CUSTOM_MODEL_VALUE) {
@@ -295,11 +309,13 @@ export function useNewTabSpec(): NewTabSpec {
   // session, just without cross-restart recall). Fires after a successful
   // submit so the next "new tab" opens with the same values.
   const persistOnSubmit = useCallback(() => {
+    const trimmedModel = model.trim()
+    const isCustomModel = trimmedModel !== '' && !modelOptions.includes(trimmedModel)
     const opts: LastOptions = {
       kind,
       provider,
-      model: model.trim(),
-      useCustomModel,
+      model: trimmedModel,
+      useCustomModel: isCustomModel,
       flavour,
       customBinary: customBinary.trim(),
       attachSession,
@@ -308,10 +324,10 @@ export function useNewTabSpec(): NewTabSpec {
       repo: repo.trim(),
     }
     void putUiState(opts)
-    if (useCustomModel && model.trim()) {
-      void addCustomModel(model.trim())
+    if (isCustomModel) {
+      void addCustomModel(trimmedModel)
       setCustomModels((prev) => {
-        const next = [model.trim(), ...prev.filter((m) => m !== model.trim())]
+        const next = [trimmedModel, ...prev.filter((m) => m !== trimmedModel)]
         return next.slice(0, 32)
       })
     }
@@ -322,13 +338,13 @@ export function useNewTabSpec(): NewTabSpec {
         return next.slice(0, 32)
       })
     }
-  }, [kind, provider, model, useCustomModel, flavour, customBinary, attachSession, attachWindow, attachManual, repo])
+  }, [kind, provider, model, modelOptions, flavour, customBinary, attachSession, attachWindow, attachManual, repo])
 
   return {
     kind, setKind,
     configuredProviders, providersLoaded,
     provider, setProvider,
-    model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
+    model, setModel, models, modelOptions, modelsLoading, useCustomModel, handleModelSelectChange,
     customModels,
     repo, setRepo,
     repoBranch, setRepoBranch,

@@ -121,6 +121,9 @@ spec = describe "Seal.Setup.State" $ do
       -- Only the generic endpoint needs a URL from the operator.
       map pcRequiresBaseUrl (ssProviders state)
         `shouldBe` [False, False, False, True]
+      -- ...and only it needs an operator-chosen unique name.
+      map pcRequiresName (ssProviders state)
+        `shouldBe` [False, False, False, True]
 
   describe "provider step" $ do
 
@@ -175,7 +178,7 @@ spec = describe "Seal.Setup.State" $ do
             , siIdentityReadable = Just True
             , siRuntime = defaultRuntimeConfig
                 { rcDefaultProvider = Just "anthropic"
-                , rcProviders = Map.fromList [("anthropic", ProviderConfig Nothing Nothing)]
+                , rcProviders = Map.fromList [("anthropic", ProviderConfig Nothing Nothing Nothing)]
                 }
             -- Reaching this would decrypt, i.e. ask for a touch.
             , siConfiguredProviders =

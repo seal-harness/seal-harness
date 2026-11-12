@@ -36,6 +36,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     model: 'claude-sonnet-4',
     setModel: vi.fn(),
     models: [{ name: 'claude-sonnet-4', contextWindow: 200000 }],
+    modelOptions: ['claude-sonnet-4'],
     modelsLoading: false,
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),
@@ -88,7 +89,7 @@ describe('NewTabComposer — provider kind', () => {
     expect(screen.queryByLabelText('Agent')).toBeNull()
   })
 
-  it('shows all supported providers, marking unconfigured ones as disabled', () => {
+  it('shows only configured providers in the provider dropdown', () => {
     render(
       <NewTabComposer
         spec={makeSpec({
@@ -104,19 +105,11 @@ describe('NewTabComposer — provider kind', () => {
       />,
     )
     const sel = screen.getByLabelText('Provider') as HTMLSelectElement
-    const byValue = Object.fromEntries(Array.from(sel.options).map((o) => [o.value, o]))
-    const anthropic = byValue['anthropic']!
-    const ollama = byValue['ollama']!
-    const openrouter = byValue['openrouter']!
-    expect(anthropic).toBeDefined()
-    expect(ollama).toBeDefined()
-    expect(openrouter).toBeDefined()
-    // The unconfigured one is present but disabled + labelled.
-    expect(openrouter.disabled).toBe(true)
-    expect(openrouter.textContent).toMatch(/not configured/)
-    // Configured ones are selectable.
-    expect(anthropic.disabled).toBe(false)
-    expect(ollama.disabled).toBe(false)
+    const values = Array.from(sel.options).map((o) => o.value)
+    expect(values).toContain('anthropic')
+    expect(values).toContain('ollama')
+    // The unconfigured type is not rendered at all.
+    expect(values).not.toContain('openrouter')
   })
 
   it('submit calls createTab then onSubmit', async () => {
@@ -142,22 +135,28 @@ describe('NewTabComposer — provider kind', () => {
     expect(onSubmit).toHaveBeenCalled()
   })
 
-  it('custom model input renders a combobox populated with customModels', () => {
+  it('model field is a combobox populated with the provider configured models and accepts free text', () => {
+    const setModel = vi.fn()
     render(
       <NewTabComposer
-        spec={makeSpec({ useCustomModel: true, model: '', customModels: ['claude-3-opus', 'gpt-4o'] })}
+        spec={makeSpec({
+          model: '',
+          setModel,
+          modelOptions: ['claude-sonnet-4', 'claude-opus-4-8'],
+        })}
         onSubmit={() => {}}
         onCancel={() => {}}
       />,
     )
-    const input = screen.getByLabelText('Custom Model') as HTMLInputElement
+    const input = screen.getByLabelText('Model') as HTMLInputElement
     expect(input).toBeTruthy()
-    // The custom combobox popup renders on focus with the customModel options.
     fireEvent.focus(input)
-    const list = screen.getByTestId('provider-model-custom-list')
-    expect(list).toBeTruthy()
+    const list = screen.getByTestId('provider-model-list')
     const opts = Array.from(list.querySelectorAll('[role="option"]')).map((o) => o.textContent)
-    expect(opts).toEqual(['claude-3-opus', 'gpt-4o'])
+    expect(opts).toEqual(['claude-sonnet-4', 'claude-opus-4-8'])
+    // A model not in the list is typed straight into the same combobox.
+    fireEvent.change(input, { target: { value: 'my-custom-model' } })
+    expect(setModel).toHaveBeenCalledWith('my-custom-model')
   })
 })
 

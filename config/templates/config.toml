@@ -50,6 +50,7 @@ debug_model_responses = false
 # [providers.<label>]
 # default_model = "<model-id>"
 # base_url      = "https://api.example.com"   # a proxy, or a local endpoint
+# models        = ["<model-id>", "<another-model-id>"]  # frequent-model shortcuts
 
 # ---------------------------------------------------------------------------
 # Web gateway

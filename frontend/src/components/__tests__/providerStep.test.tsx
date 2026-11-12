@@ -11,6 +11,7 @@ function card(overrides: Partial<ProviderCard> = {}): ProviderCard {
     isDefault: false,
     default_model: null,
     requires_base_url: false,
+    requires_name: false,
     ...overrides,
   }
 }
@@ -121,12 +122,12 @@ describe('ProviderStep', () => {
     }))
   })
 
-  it('requires a base URL for the generic OpenAI-compatible provider', async () => {
+  it('requires a base URL and a unique name for the generic OpenAI-compatible provider', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'openai' }))
     render(
       <ProviderStep
         step={step()}
-        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true })]}
+        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
         onDone={() => {}}
       />,
     )
@@ -135,19 +136,49 @@ describe('ProviderStep', () => {
     fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-local' } })
     expect(save).toBeDisabled()
     // ...and a non-URL is rejected before it reaches the server.
-    fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'localhost:8000' } })
+    fireEvent.change(screen.getByLabelText(/base url/i), { target: { value: 'localhost:8000' } })
     expect(save).toBeDisabled()
-    fireEvent.change(screen.getByLabelText(/api endpoint/i), { target: { value: 'http://localhost:8000/v1' } })
+    fireEvent.change(screen.getByLabelText(/base url/i), { target: { value: 'http://localhost:8000/v1' } })
+    // The instance also needs a unique name before Save is enabled.
+    expect(save).toBeDisabled()
+    fireEvent.change(screen.getByLabelText(/unique name/i), { target: { value: 'local-vllm' } })
     expect(save).toBeEnabled()
     fireEvent.click(save)
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
     expect(fetchMock).toHaveBeenCalledWith('/api/providers', expect.objectContaining({
       body: JSON.stringify({
-        name: 'openai',
+        name: 'local-vllm',
+        type: 'openai',
         api_key: 'sk-local',
         base_url: 'http://localhost:8000/v1',
+        models: [],
       }),
     }))
+  })
+
+  it('sends the frequent-model list from the setup form', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(201, { name: 'anthropic' }))
+    render(<ProviderStep step={step()} providers={[card()]} onDone={() => {}} />)
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant' } })
+    fireEvent.change(screen.getByLabelText(/frequent models/i), {
+      target: { value: 'claude-opus-4-8\nclaude-sonnet-4' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
+    expect(body.models).toEqual(['claude-opus-4-8', 'claude-sonnet-4'])
+  })
+
+  it('seeds an existing frequent-model list from the provider card', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ models: ['claude-opus-4-8', 'claude-sonnet-4'] })]}
+        onDone={() => {}}
+      />,
+    )
+    const models = screen.getByLabelText(/frequent models/i) as HTMLTextAreaElement
+    expect(models.value).toBe('claude-opus-4-8\nclaude-sonnet-4')
   })
 
   it('sends no base_url for providers that have a built-in endpoint', async () => {

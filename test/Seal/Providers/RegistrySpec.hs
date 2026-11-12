@@ -2,6 +2,7 @@
 module Seal.Providers.RegistrySpec (spec) where
 
 import Data.IORef (IORef, newIORef)
+import Data.Either (isLeft)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -19,6 +20,8 @@ import Seal.Providers.Registry
   ( KnownProvider (..)
   , completeSome
   , configuredProviders
+  , configuredCustomProviderNames
+  , customProviderNames
   , defaultModelFor
   , knownProviders
   , listSome
@@ -27,8 +30,12 @@ import Seal.Providers.Registry
   , providerId
   , providerLabel
   , resolveDefaultModel
+  , resolveDefaultModelForName
   , resolveProvider
+  , resolveProviderByName
+  , validateProviderName
   , vaultKeyName
+  , vaultKeyNameForName
   )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.OpenRouter (defaultOpenRouterBaseUrl)
@@ -62,7 +69,7 @@ ollamaCfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("ollama", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("ollama", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
   }
 
@@ -72,7 +79,7 @@ openRouterCfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("openrouter", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("openrouter", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
   }
 
@@ -82,8 +89,16 @@ openAICfg mUrl = defaultRuntimeConfig
   { rcProviders =
       maybe Map.empty
         (\u -> Map.fromList
-          [("openai", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u })])
+          [("openai", ProviderConfig { pcDefaultModel = Nothing, pcBaseUrl = Just u, pcModels = Nothing })])
         mUrl
+  }
+
+-- | A runtime config with one custom OpenAI-compatible instance.
+customCfg :: T.Text -> Maybe T.Text -> RuntimeConfig
+customCfg name mUrl = defaultRuntimeConfig
+  { rcProviders =
+      Map.fromList
+        [(name, ProviderConfig { pcDefaultModel = Just "my-model", pcBaseUrl = mUrl, pcModels = Nothing })]
   }
 
 spec :: Spec
@@ -365,7 +380,8 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       let cfg = defaultRuntimeConfig
             { rcProviders = Map.fromList
                 [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
-                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+                                            , pcBaseUrl = Just "https://ollama.com"
+                                            , pcModels = Nothing }) ]
             }
       ps <- configuredProviders (Just vh) cfg
       ps `shouldNotSatisfy` elem OllamaProvider
@@ -375,7 +391,8 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       let cfg = defaultRuntimeConfig
             { rcProviders = Map.fromList
                 [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
-                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+                                            , pcBaseUrl = Just "https://ollama.com"
+                                            , pcModels = Nothing }) ]
             }
       ps <- configuredProviders (Just vh) cfg
       ps `shouldSatisfy` elem OllamaProvider
@@ -386,3 +403,59 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       -- local ollama is keyless so it survives even a locked vault (it never
       -- touches the vault); anthropic is excluded.
       ps `shouldBe` [OllamaProvider]
+
+  describe "custom provider instances" $ do
+    it "validates names against the allow-list grammar" $ do
+      validateProviderName "local-vllm" `shouldBe` Right ()
+      validateProviderName "openai" `shouldBe` Right ()
+      validateProviderName "a" `shouldBe` Right ()
+      validateProviderName "" `shouldSatisfy` isLeft
+      validateProviderName "Local" `shouldSatisfy` isLeft
+      validateProviderName "-x" `shouldSatisfy` isLeft
+      validateProviderName "x-" `shouldSatisfy` isLeft
+      validateProviderName "a--b" `shouldSatisfy` isLeft
+      validateProviderName "all" `shouldSatisfy` isLeft
+      validateProviderName "anthropic" `shouldSatisfy` isLeft
+
+    it "derives a distinct vault key for a custom name" $ do
+      vaultKeyNameForName "local-vllm" `shouldBe` "PROVIDER_APIKEY_LOCAL_VLLM"
+      vaultKeyNameForName "openai" `shouldBe` "OPENAI_API_KEY"
+
+    it "lists only non-built-in config sections as custom instances" $ do
+      let cfg = customCfg "local-vllm" (Just "http://localhost:8000/v1")
+      customProviderNames cfg `shouldBe` ["local-vllm"]
+
+    it "resolves a custom instance against its own endpoint and vault key" $ do
+      vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
+      mgr <- newManager defaultManagerSettings
+      r <- resolveProviderByName (Just vh) mgr
+             (customCfg "local-vllm" (Just "http://localhost:8000/v1"))
+             "local-vllm" (ModelId "m") counter
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right, got Left: " <> show e)
+
+    it "refuses a custom instance with no endpoint" $ do
+      vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
+      mgr <- newManager defaultManagerSettings
+      r <- resolveProviderByName (Just vh) mgr
+             (customCfg "local-vllm" Nothing)
+             "local-vllm" (ModelId "m") counter
+      case r of
+        Left e  -> e `shouldSatisfy` ("base URL" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected a Left when no endpoint is configured"
+
+    it "counts a custom instance as configured only with URL and key" $ do
+      vh <- makeFakeVault [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
+      withKey <- configuredCustomProviderNames (Just vh)
+        (customCfg "local-vllm" (Just "http://localhost:8000/v1"))
+      withKey `shouldBe` ["local-vllm"]
+      noUrl <- configuredCustomProviderNames (Just vh)
+        (customCfg "local-vllm" Nothing)
+      noUrl `shouldBe` []
+
+    it "uses the OpenAI-compatible default model for a custom name" $ do
+      resolveDefaultModelForName (customCfg "local-vllm" Nothing) "local-vllm"
+        `shouldBe` ModelId "my-model"
+      resolveDefaultModelForName defaultRuntimeConfig "local-vllm"
+        `shouldBe` defaultModelFor OpenAICompatibleProvider

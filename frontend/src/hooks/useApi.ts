@@ -701,18 +701,41 @@ export function useSessionAgents(sessionId: string | null) {
   return { agents }
 }
 
+/** Fired after a provider create/update/delete so the long-lived
+ *  `useConfiguredProviders` consumers (the new-session/new-tab composers)
+ *  re-read the list without a page reload. */
+export const PROVIDERS_CHANGED_EVENT = 'seal:providers-changed'
+
+export function notifyProvidersChanged(): void {
+  window.dispatchEvent(new Event(PROVIDERS_CHANGED_EVENT))
+}
+
 export function useConfiguredProviders() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [loaded, setLoaded] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
   useEffect(() => {
+    let cancelled = false
     fetchJson<ProviderInfo[]>('/api/providers').then((data) => {
+      if (cancelled) return
       if (Array.isArray(data)) setProviders(data)
       setLoaded(true)
     })
-  }, [])
+    return () => { cancelled = true }
+  }, [refreshCount])
 
-  return { providers, loaded }
+  // The composer hook lives at the App level and stays mounted while the user
+  // visits the Providers tab. Re-fetch when a provider mutation lands so the
+  // newly-added provider is selectable on the next session.
+  useEffect(() => {
+    const handler = () => refresh()
+    window.addEventListener(PROVIDERS_CHANGED_EVENT, handler)
+    return () => window.removeEventListener(PROVIDERS_CHANGED_EVENT, handler)
+  }, [refresh])
+
+  return { providers, loaded, refresh }
 }
 
 /** Live fetch of available models for a provider. The backend proxies to the

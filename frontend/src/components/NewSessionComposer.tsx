@@ -32,7 +32,10 @@ interface NewSessionComposerProps {
  *  provider/model selection + persisted last-options are consistent with
  *  the "New tab" flow. */
 export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionComposerProps) {
-  const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
+  // Only configured providers are selectable; unconfigured types are managed
+  // from the Providers screen.
+  const selectableProviders = spec.configuredProviders.filter((p) => p.configured !== false)
+  const noProviders = spec.providersLoaded && selectableProviders.length === 0
   const [submitting, setSubmitting] = useState(false)
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
 
@@ -95,7 +98,7 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
                 (no providers configured — set an API key or start Ollama)
               </option>
             )}
-            {spec.configuredProviders.map((p) => (
+            {selectableProviders.map((p) => (
               <option key={p.name} value={p.name}>
                 {PROVIDER_LABELS[p.name] ?? p.name}{p.isDefault ? ' (default)' : ''}
               </option>

@@ -105,7 +105,7 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (configuredProviders, resolveProvider)
+import Seal.Providers.Registry (configuredProviders, resolveProviderByName)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
@@ -549,12 +549,12 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         -- Test-connection ping actually reaches).
         , adSetup = SetupDeps
             { sdProvision = defaultProvisionDeps paths
-            , sdResolveProvider = \kp model -> do
+            , sdResolveProvider = \name model -> do
                 mh' <- readIORef (vrHandleRef rt)
                 cfg' <- loadRuntimeConfig cfgPath
                 case cfg' of
                   Left err -> pure (Left err)
-                  Right rc' -> resolveProvider mh' mgr rc' kp model callCounter
+                  Right rc' -> resolveProviderByName mh' mgr rc' name model callCounter
             }
         , adPaths            = paths
         , adWsHealth         = readIORef wsHealthRef

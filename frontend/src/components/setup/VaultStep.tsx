@@ -5,6 +5,8 @@ import * as s from './styles'
 
 type Choice = 'local' | 'yubikey' | 'user'
 
+const mono = { fontFamily: 'var(--font-mono)' }
+
 /**
  * The vault step's cards.
  *
@@ -43,6 +45,17 @@ export function VaultStep({
     setBusy(false)
     setResult(res)
     if (res.ok) onDone()
+  }
+
+  // Re-check re-runs the YubiKey request: after the operator has run the
+  // terminal command, the server adopts the identity file it wrote and finishes
+  // provisioning. For the other backends a re-probe is the right action.
+  const recheck = (): void => {
+    if (choice === 'yubikey') {
+      void submit({ backend: 'yubikey', touch, pin })
+    } else {
+      onDone()
+    }
   }
 
   return (
@@ -127,15 +140,30 @@ export function VaultStep({
             void submit({ backend: 'user', recipient, identity_path: identityPath })
           }}
         >
+          <p style={{ ...s.mutedStyle, marginBottom: 12 }}>
+            Use this only if you already have an <code style={mono}>age</code>{' '}
+            identity. If you do not, choose <strong>Local key</strong> instead —
+            Seal will generate one for you.
+          </p>
+          <p style={{ ...s.mutedStyle, marginBottom: 12 }}>
+            To make one in a terminal, run{' '}
+            <code style={mono}>mkdir -p ~/.config/age &amp;&amp; age-keygen -o ~/.config/age/keys.txt</code>.
+            The <strong>recipient</strong> is the public <code style={mono}>age1…</code>{' '}
+            key it prints. The <strong>identity file path</strong> is the absolute
+            path to the file it wrote, for example{' '}
+            <code style={mono}>/Users/you/.config/age/keys.txt</code>.
+          </p>
           <Field
             label="Recipient (age1…)"
+            placeholder="age1…"
             value={recipient}
             onChange={setRecipient}
             error={fieldError(result, 'recipient')}
           />
           <div style={{ marginTop: 10 }}>
             <Field
-              label="Identity file path"
+              label="Identity file path (absolute)"
+              placeholder="/Users/you/.config/age/keys.txt"
               value={identityPath}
               onChange={setIdentityPath}
               error={fieldError(result, 'identity_path')}
@@ -152,7 +180,7 @@ export function VaultStep({
         </form>
       ) : null}
 
-      {result !== null && !result.ok ? <VaultFailure result={result} /> : null}
+      {result !== null && !result.ok ? <VaultFailure result={result} onRecheck={recheck} /> : null}
     </div>
   )
 }
@@ -164,7 +192,7 @@ function fieldError(result: SetupResult | null, field: string): string | null {
   return result.error ?? 'invalid value'
 }
 
-function VaultFailure({ result }: { result: SetupResult }) {
+function VaultFailure({ result, onRecheck }: { result: SetupResult; onRecheck: () => void }) {
   if (result.status === 400) {
     return (
       <p role="alert" style={{ ...s.errorStyle, marginTop: 14 }}>
@@ -189,6 +217,14 @@ function VaultFailure({ result }: { result: SetupResult }) {
         <p style={{ ...s.faintStyle, marginTop: 8 }}>
           Run that command in a terminal, then press Re-check.
         </p>
+        <button
+          type="button"
+          onClick={onRecheck}
+          className={s.primaryButtonClass}
+          style={{ marginTop: 10 }}
+        >
+          Re-check
+        </button>
       </div>
     )
   }
@@ -205,11 +241,13 @@ function Field({
   value,
   onChange,
   error,
+  placeholder,
 }: {
   label: string
   value: string
   onChange: (next: string) => void
   error: string | null
+  placeholder?: string
 }) {
   return (
     <label style={s.labelStyle}>
@@ -217,6 +255,7 @@ function Field({
       <input
         type="text"
         value={value}
+        placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
         style={s.inputStyle}
       />

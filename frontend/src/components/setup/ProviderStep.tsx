@@ -1,8 +1,14 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { setDefaultProvider, testProvider, type SetupResult } from '../../hooks/useSetup'
 import { providerLabel } from '../../lib/providerLabels'
 import type { ProviderCard, SetupStep } from '../../lib/setupSteps'
 import * as s from './styles'
+import {
+  ProviderFormFields,
+  emptyProviderFormValues,
+  modelsFromText,
+  type ProviderFormValues,
+} from '../ProviderFormFields'
 
 type SaveState =
   | { status: 'idle' }
@@ -44,15 +50,36 @@ export function ProviderStep({
   const [selected, setSelected] = useState<string>(
     defaultCard?.id ?? providers.find((p) => p.configured)?.id ?? firstProvider?.id ?? '',
   )
-  const [apiKey, setApiKey] = useState('')
-  // Only used by providers with no built-in endpoint (the generic
-  // OpenAI-compatible option). Never pre-filled: the endpoint belongs to the
-  // operator, and echoing a guess back would be worse than an empty field.
-  const [baseUrl, setBaseUrl] = useState('')
+  // API key, endpoint, default model, and frequent-model list. Shared with
+  // the Providers tab's form so both write the same config.
+  const [form, setForm] = useState<ProviderFormValues>(emptyProviderFormValues())
+  // The unique instance name for an OpenAI-compatible provider. This becomes
+  // the provider id in config/vault and the label shown in the Providers list.
+  const [instanceName, setInstanceName] = useState('')
   const [dirty, setDirty] = useState(false)
   const [save, setSave] = useState<SaveState>({ status: 'idle' })
   const [ping, setPing] = useState<SetupResult | null>(null)
   const [pinging, setPinging] = useState(false)
+
+  const fallback = defaultCard ?? providers.find((p) => p.configured) ?? firstProvider
+  const effectiveId = providers.some((p) => p.id === selected) ? selected : (fallback?.id ?? '')
+  const card = providers.find((p) => p.id === effectiveId)
+
+  // Seed the shared fields from the selected card. In particular, an existing
+  // frequent-model list must be shown (and round-tripped) instead of being
+  // silently cleared by an empty textarea on save.
+  useEffect(() => {
+    if (card === undefined) return
+    setForm({
+      apiKey: '',
+      baseUrl: '',
+      defaultModel: card.default_model ?? '',
+      modelsText: (card.models ?? []).join('\n'),
+    })
+    setDirty(false)
+    setSave({ status: 'idle' })
+    setPing(null)
+  }, [card?.id])
 
   if (firstProvider === undefined) {
     return (
@@ -62,12 +89,15 @@ export function ProviderStep({
     )
   }
 
-  const fallback = defaultCard ?? providers.find((p) => p.configured) ?? firstProvider
-  const effectiveId = providers.some((p) => p.id === selected) ? selected : fallback.id
-  const card = providers.find((p) => p.id === effectiveId)
   const needsBaseUrl = card?.requires_base_url === true
-  const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(baseUrl.trim())
-  const canSaveKey = dirty && baseUrlOk
+  const needsName = card?.requires_name === true
+  const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
+  const nameOk = !needsName || (
+    /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(instanceName.trim())
+    && !instanceName.includes('--')
+    && !['all', 'default', 'anthropic', 'ollama', 'openrouter'].includes(instanceName.trim())
+  )
+  const canSaveKey = dirty && baseUrlOk && nameOk
   const saveDisabled = save.status === 'saving' || !canSaveKey
 
   const saveKey = async (): Promise<void> => {
@@ -76,16 +106,19 @@ export function ProviderStep({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: effectiveId,
-        api_key: apiKey,
-        ...(needsBaseUrl ? { base_url: baseUrl.trim() } : {}),
+        name: needsName ? instanceName.trim() : effectiveId,
+        ...(needsName ? { type: 'openai' } : {}),
+        api_key: form.apiKey,
+        ...(needsBaseUrl ? { base_url: form.baseUrl.trim() } : {}),
+        ...(form.defaultModel.trim() ? { default_model: form.defaultModel.trim() } : {}),
+        models: modelsFromText(form.modelsText),
       }),
     })
     if (res.ok) {
       // The field is cleared: the key is now in the vault, and keeping it in
       // component state would be the only place it outlives the request.
-      setApiKey('')
-      setBaseUrl('')
+      setForm(emptyProviderFormValues())
+      setInstanceName('')
       setDirty(false)
       setSave({ status: 'saved' })
       onDone()
@@ -162,35 +195,35 @@ export function ProviderStep({
         ))}
       </ul>
 
-      {card !== undefined && !card.configured ? (
+      {card !== undefined && needsName ? (
         <label style={{ ...s.labelStyle, marginTop: 14 }}>
-          API key for {providerLabel(card.id)}
+          Unique name
           <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => { setApiKey(e.target.value); setDirty(true) }}
+            type="text"
+            placeholder="e.g. local-vllm"
+            value={instanceName}
+            onChange={(e) => { setInstanceName(e.target.value); setDirty(true) }}
             style={s.inputStyle}
-          />
-        </label>
-      ) : null}
-      {card !== undefined && needsBaseUrl ? (
-        <label style={{ ...s.labelStyle, marginTop: 14 }}>
-          API endpoint (base URL)
-          <input
-            type="url"
-            placeholder="https://api.openai.com/v1"
-            value={baseUrl}
-            onChange={(e) => { setBaseUrl(e.target.value); setDirty(true) }}
-            style={s.inputStyle}
-            aria-invalid={!baseUrlOk}
+            aria-invalid={!nameOk}
           />
           <span style={{ ...s.faintStyle, display: 'block', marginTop: 4 }}>
-            {baseUrlOk
-              ? 'The OpenAI-compatible endpoint, e.g. https://api.openai.com/v1 or http://localhost:8000/v1. Local servers usually accept any non-empty token as the key.'
-              : 'Enter an http:// or https:// URL.'}
+            {nameOk
+              ? '1–32 characters: a–z, 0–9 and “-”. This id identifies the provider in the Providers list.'
+              : 'Use 1–32 characters: a–z, 0–9 and “-” (no leading/trailing “-”, no “--”).'}
           </span>
         </label>
       ) : null}
+      {card !== undefined && !card.configured && (
+        <ProviderFormFields
+          idPrefix="setup-provider"
+          values={form}
+          onChange={(patch) => { setForm((f) => ({ ...f, ...patch })); setDirty(true) }}
+          layout="stacked"
+          creating
+          showBaseUrl={needsBaseUrl}
+          baseUrlError={needsBaseUrl && !baseUrlOk ? 'Enter an http:// or https:// URL.' : null}
+        />
+      )}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
         {card !== undefined && card.configured ? (

@@ -45,6 +45,7 @@ import {
   stopSession,
   fetchSessionAgents,
   useConfiguredProviders,
+  notifyProvidersChanged,
   setSessionDescription,
   setSessionArchived,
   setSessionPrompt,
@@ -578,6 +579,16 @@ describe('useConfiguredProviders', () => {
     const { result } = renderHook(() => useConfiguredProviders())
     await waitFor(() => expect(result.current.providers).toHaveLength(1))
     expect(result.current.loaded).toBe(true)
+  })
+
+  it('re-fetches when a provider mutation is announced', async () => {
+    setNextResponse([{ name: 'anthropic' }])
+    const { result } = renderHook(() => useConfiguredProviders())
+    await waitFor(() => expect(result.current.providers).toHaveLength(1))
+    setNextResponse([{ name: 'anthropic' }, { name: 'local-vllm' }])
+    act(() => notifyProvidersChanged())
+    await waitFor(() => expect(result.current.providers).toHaveLength(2))
+    expect(result.current.providers.map((p) => p.name)).toContain('local-vllm')
   })
 })
 
