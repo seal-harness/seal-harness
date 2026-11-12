@@ -15,6 +15,7 @@ import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isNothing)
+import Data.Time (getCurrentTime)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.X509.CertificateStore
@@ -131,6 +132,8 @@ import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent)
+import Control.Concurrent.STM (newTVarIO)
 
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
@@ -318,6 +321,18 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- log exactly which children are being taken down with the process
   -- ('Seal.Command.Shutdown').
   writeIORef runtimeRef (Just (bRuntime backends))
+  -- Start the cron scheduler (background thread).
+  cronStopSignal <- newTVarIO False
+  let cronScheduler = CronScheduler
+        { csStore = bCronStore backends
+        , csFireDelegate = \_job -> pure (Left "cron fire delegate not yet wired")
+        , csClock = getCurrentTime
+        , csTickInterval = defaultTickInterval
+        , csStopSignal = cronStopSignal
+        , csMaxConcurrent = defaultMaxConcurrent
+        , csNotifyHuman = \_msg -> pure ()
+        }
+  void (forkIO (startCronScheduler cronScheduler))
   wakeMutex <- newSessionWakeMutex
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
