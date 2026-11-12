@@ -17,6 +17,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Network.HTTP.Client.TLS (newTlsManager)
+import Network.HTTP.Client
+  ( HttpException (..), HttpExceptionContent (..)
+  , parseRequest )
+import Control.Exception (toException)
 import Network.HTTP.Types.Header (hAuthorization, hContentType, RequestHeaders)
 import Test.Hspec
 
@@ -30,7 +34,7 @@ import Seal.Providers.Class
 import Seal.Providers.OpenRouter
   ( bearerHeaders, decodeModelIds, decodeResponse, encodeRequest
   , mapFinishReason, mkOpenRouter, defaultOpenRouterBaseUrl
-  , sendChatCompletion )
+  , sendChatCompletion, httpTransportErrorText, chatCompletionTimeoutMicro )
 
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
 minimalReq :: CompletionRequest
@@ -250,6 +254,37 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
           e `shouldSatisfy` T.isInfixOf "127.0.0.1:1"
           e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
         Right _ -> expectationFailure "expected Left (connection failure), got Right"
+
+  describe "chatCompletionTimeoutMicro" $ do
+    it "is at least 300 seconds (5 minutes) — cloud models need headroom" $ do
+      chatCompletionTimeoutMicro `shouldSatisfy` (>= 300_000_000)
+
+  describe "httpTransportErrorText" $ do
+    -- Construct a real Request via parseRequest so HttpExceptionRequest
+    -- typechecks; the actual URL contents don't matter for the error message
+    -- (the base URL is passed separately to httpTransportErrorText).
+    let mkReq = parseRequest "POST https://example.com/v1/chat/completions"
+
+    it "distinguishes a response timeout from a generic transport error" $ do
+      req <- mkReq
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (HttpExceptionRequest req ResponseTimeout)
+      msg `shouldSatisfy` T.isInfixOf "timed out"
+      msg `shouldSatisfy` T.isInfixOf "ollama.com"
+      msg `shouldSatisfy` (not . T.isInfixOf "connection or transport error")
+
+    it "uses the generic message for a non-timeout transport error" $ do
+      req <- mkReq
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (HttpExceptionRequest req (ConnectionFailure
+                    (toException (userError "connection refused"))))
+      msg `shouldSatisfy` T.isInfixOf "connection or transport error"
+      msg `shouldSatisfy` T.isInfixOf "ollama.com"
+
+    it "uses the generic message for InvalidUrlException" $ do
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (InvalidUrlException "bad%url" "invalid URL")
+      msg `shouldSatisfy` T.isInfixOf "connection or transport error"
 
   describe "listModels" $ do
     it "returns Right with the default model" $ do

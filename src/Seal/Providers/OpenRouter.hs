@@ -41,6 +41,8 @@ module Seal.Providers.OpenRouter
   , bearerHeaders
   , sendChatCompletion
   , httpErrorText
+  , httpTransportErrorText
+  , chatCompletionTimeoutMicro
   , decodeModelIds
   ) where
 
@@ -56,9 +58,10 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
 import Data.Vector qualified as V
 import Network.HTTP.Client
-  ( HttpException, Manager, RequestBody (RequestBodyLBS), Response
+  ( HttpException (..), Manager, RequestBody (RequestBodyLBS), Response
   , httpLbs, parseRequest, requestBody, requestHeaders, responseBody
-  , responseStatus )
+  , responseStatus, responseTimeout, responseTimeoutMicro
+  , HttpExceptionContent (..) )
 import Network.HTTP.Types (statusCode)
 import Network.HTTP.Types.Header (RequestHeaders)
 
@@ -277,6 +280,33 @@ bearerHeaders bytes =
 
 -- HTTP round-trip ------------------------------------------------------------
 
+-- | Response timeout for chat-completion requests, in microseconds. The
+-- @newTlsManager@ default is too short for non-streaming requests to remote
+-- cloud models with a large context (49k+ input tokens): the model can take
+-- 74+ seconds to generate the full response before returning it in one shot.
+-- A 5-minute timeout gives generous headroom, matching the Ollama provider's
+-- 'ollamaResponseTimeoutMicro'. This is a per-request override (the manager's
+-- default is not changed, so other HTTP clients in the process keep their own
+-- timeouts).
+chatCompletionTimeoutMicro :: Int
+chatCompletionTimeoutMicro = 300_000_000  -- 5 minutes
+
+-- | Render an 'HttpException' (transport-level failure) as a user-facing
+-- error message naming @baseUrl@. A 'ResponseTimeout' gets a distinct
+-- message so the user knows the endpoint is reachable but the model was too
+-- slow — not that the endpoint is down. Other transport errors use the
+-- generic wording.
+httpTransportErrorText :: Text -> HttpException -> Text
+httpTransportErrorText baseUrl = \case
+  HttpExceptionRequest _ ResponseTimeout ->
+    "request to " <> baseUrl <> " timed out after "
+      <> T.pack (show (chatCompletionTimeoutMicro `div` 1_000_000))
+      <> "s — the model likely took too long to respond (large context or \
+        \a slow cloud model). Try reducing the conversation context, \
+        \switching to a faster model, or send \"continue\" to retry."
+  _ -> "HTTP request to " <> baseUrl
+        <> " failed (connection or transport error)"
+
 -- | POST @<baseUrl>/chat/completions@ with the given headers + request body,
 -- then decode the response. Non-2xx -> 'httpErrorText'; a transport error
 -- (connection / TLS) -> a 'Left' string naming @baseUrl@ so the operator can
@@ -292,11 +322,12 @@ sendChatCompletion mgr baseUrl hdrs req = do
   let httpReq = initReq
         { requestBody = RequestBodyLBS (encode req)
         , requestHeaders = hdrs
+        , responseTimeout = responseTimeoutMicro chatCompletionTimeoutMicro
         }
   result <- try (httpLbs httpReq mgr) :: IO (Either HttpException (Response BL.ByteString))
   case result of
-    Left _e ->
-      pure (Left ("HTTP request to " <> baseUrl <> " failed (connection or transport error)"))
+    Left e ->
+      pure (Left (httpTransportErrorText baseUrl e))
     Right resp ->
       let code = statusCode (responseStatus resp)
       in if code >= 200 && code <= 299
