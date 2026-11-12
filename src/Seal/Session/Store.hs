@@ -9,6 +9,7 @@ module Seal.Session.Store
   , newSession
   , newSessionMeta
   , saveSessionMeta
+  , saveChildSessionMeta
   , listSessions
   , listArchivedSessions
   , listChildSessions
@@ -21,6 +22,7 @@ module Seal.Session.Store
   , updateSessionSystemOverride
   , updateSessionDescription
   , updateSessionRepoUrl
+  , updateSessionRepo
   , updateSessionSealFrontMatter
   , autoBindRepoAgent
   , autoBindRepoAgentWith
@@ -42,18 +44,19 @@ import Data.Time
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , listDirectory, removeFile, renameFile )
-import System.FilePath ((</>), takeBaseName)
+import System.FilePath ((</>), takeBaseName, takeDirectory)
 import System.IO
   ( hClose, openBinaryTempFile )
 import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
-import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
+import Seal.Config.File (RuntimeConfig (..))
 import Seal.Config.Paths
-  ( SealPaths, sessionArchivedMarkerPath, sessionDir, sessionMetaPath, sessionsRoot )
+  ( SealPaths, agentSessionDir, sessionArchivedMarkerPath
+  , sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
-import Seal.Providers.Registry (resolveDefaultModel)
+import Seal.Providers.Registry (resolveDefaultModelForName)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
@@ -88,11 +91,12 @@ newSessionMeta _paths provider model channel mAgent = do
     Left e  -> ioError (userError ("session id generation failed: " <> T.unpack e))
   pure SessionMeta
     { smId = sid, smProvider = provider, smModel = model
-    , smChannel = channel, smAgent = mAgent
+    , smChannel = channel, smParent = Nothing, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smRepoBranch = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -108,9 +112,26 @@ newSession paths provider model channel mAgent = do
 -- /model command) don't collide on a shared @.tmp@ path ("resource busy"
 -- / "does not exist" rename race). The rename is atomic on POSIX.
 saveSessionMeta :: SealPaths -> SessionMeta -> IO ()
-saveSessionMeta paths meta = do
-  let dir  = sessionDir paths (smId meta)
-      path = sessionMetaPath paths (smId meta)
+saveSessionMeta paths meta = writeMetaFileAtomic (sessionMetaPath paths (smId meta)) meta
+
+-- | Persist a child (sub-agent) session's @session.json@ under
+-- @sessions\/\<parent\>\/agents\/\<child\>@ atomically. The same
+-- durability guarantees as 'saveSessionMeta' (dir 0700, unique temp
+-- file, chmod 0600, rename). The child meta is nested one level below
+-- the top-level dirs that 'listSessions' scans, so it never appears in
+-- the SESSION_MANAGE list.
+saveChildSessionMeta :: SealPaths -> SessionId -> SessionId -> SessionMeta -> IO ()
+saveChildSessionMeta paths parentSid childSid =
+  writeMetaFileAtomic (agentSessionDir paths parentSid childSid </> "session.json")
+
+-- | The shared temp-write-chmod-rename body of 'saveSessionMeta' and
+-- 'saveChildSessionMeta': create the containing dir (0700), write a
+-- unique temp file, chmod 0600, rename over the destination. The temp
+-- file is unique per call (via 'openBinaryTempFile') so concurrent
+-- saves don't collide; the rename is atomic on POSIX.
+writeMetaFileAtomic :: FilePath -> SessionMeta -> IO ()
+writeMetaFileAtomic path meta = do
+  let dir = takeDirectory path
   createDirectoryIfMissing True dir
   setFileMode dir 0o700
   (tmp, h) <- openBinaryTempFile dir (takeBaseName path <> ".tmp")
@@ -224,7 +245,7 @@ defaultSessionSelection cfg =
   , fromMaybe fallbackModel (rcDefaultModel cfg) )
   where
     provLabel = fromMaybe "anthropic" (rcDefaultProvider cfg)
-    ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
+    ModelId fallbackModel = resolveDefaultModelForName cfg provLabel
 
 -- | Resolve the default agent for a new session. Returns 'Nothing' if
 -- @default_agent@ is unset, the id fails validation, or the def is not on
@@ -392,9 +413,11 @@ updateSessionDescription paths sid mDesc = do
 -- through the same 'callDispatcher'). 'Nothing' or an empty/whitespace
 -- URL clears the field. Returns 'False' when the session's
 -- @session.json@ cannot be found or parsed; 'True' on a successful write.
--- Only touches 'smRepoUrl' — all other fields are preserved.
-updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
-updateSessionRepoUrl paths sid mUrl = do
+-- Only touches 'smRepoUrl' and 'smRepoBranch' — all other fields are
+-- preserved. Written together (one read + one atomic save) so the pair can
+-- never disagree: the branch is a property of *that* clone.
+updateSessionRepo :: SealPaths -> SessionId -> Maybe Text -> Maybe Text -> IO Bool
+updateSessionRepo paths sid mUrl mBranch = do
   let mp = sessionMetaPath paths sid
   exists <- doesFileExist mp
   if not exists
@@ -404,15 +427,22 @@ updateSessionRepoUrl paths sid mUrl = do
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
-          let next = meta { smRepoUrl = normalized }
+          let next = meta { smRepoUrl = normalized mUrl
+                          , smRepoBranch = normalized mBranch }
           saveSessionMeta paths next
           pure True
   where
-    normalized = case mUrl of
+    normalized x = case x of
       Just t
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing
       Nothing                      -> Nothing
+
+-- | Record only the repo URL (see 'updateSessionRepo'). Kept for callers
+-- that have no branch to record; equivalent to passing 'Nothing' as the
+-- branch.
+updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepoUrl paths sid mUrl = updateSessionRepo paths sid mUrl Nothing
 
 -- | Set (or clear) whether the harness injects its own front matter into
 -- the session's system prompt. 'True' injects the static guidance blocks,

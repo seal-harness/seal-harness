@@ -1,0 +1,132 @@
+# Seal Harness security configuration - ~/.seal/security.toml
+#
+# Boot-only and agent-immutable: no opcode, tool or agent can read or write this
+# file, and it deliberately does not live inside ~/.seal/config (which is a git
+# repository an agent may commit to). Only human-driven admin commands change
+# it: `/vault setup` (interactive) and the `seal access-control ...` commands.
+#
+# It holds the settings that decide who can reach the agent: the vault, where
+# untrusted code runs, the web gateway's bind address / Origin allowlist /
+# TLS pair, and passkey access control.
+#
+# Seal writes this file once, on first run, and never overwrites it: edit it
+# freely. Every key is optional. A commented key is commented out on purpose -
+# either its default is "unset", or writing it would pin a path that is only
+# true on this machine, or the value is a security decision only you should
+# make. The comment states what Seal uses when the key is absent.
+#
+# Seal re-encodes this file when it changes it (`seal access-control ...`,
+# `/vault setup`), and a re-encode does not preserve comments. Keep a copy of
+# anything you care about.
+
+# ---------------------------------------------------------------------------
+# Vault
+# ---------------------------------------------------------------------------
+# `/vault setup` fills these in. The vault file defaults to
+# <seal home>/config/vault/vault.age and the age identity stays under keys/,
+# which is outside the git-versioned config tree.
+
+# vault_path      = "/absolute/path/to/vault.age"
+# vault_recipient = "age1..."        # age public key
+# vault_identity  = "/absolute/path/to/identity.txt"
+
+# Display label for the key type: x25519 | yubikey | user.
+vault_key_type = "x25519"
+
+# When the vault is unlocked: startup | on_demand | per_access.
+# on_demand asks on first use, which is why it is the default.
+vault_unlock = "on_demand"
+
+# ---------------------------------------------------------------------------
+# Where untrusted code runs
+# ---------------------------------------------------------------------------
+# Left commented out rather than written as the default: the setting interacts
+# with how the binary was built. A build made with `-f remote-only-untrusted`
+# has no local executor, and an absent table is what tells it so; writing
+# mode = "local" there would change its behaviour.
+#
+# [untrusted_execution]
+# mode = "local"                     # local | remote
+#
+# Remote execution fail-closes at call time when this block is incomplete: a
+# half-configured remote refuses to run rather than falling back to local.
+# [untrusted_execution.remote]
+# host        = "builder.example.com"
+# user        = "seal"
+# port        = 22
+# identity    = "/home/you/.ssh/id_ed25519"
+# known_hosts = "/home/you/.ssh/known_hosts"   # mandatory: host keys are pinned
+# workspace   = "/srv/seal/workspace"
+
+# ---------------------------------------------------------------------------
+# Web gateway
+# ---------------------------------------------------------------------------
+# Where `seal serve` listens, which origins may open the WebSocket, and how TLS
+# is served. Here rather than in config.toml because these settings decide who
+# can reach the agent: a bind address is not a value to guess from, and no
+# opcode, tool or agent can read or write this file.
+#
+# "localhost" is deliberate. A passkey ceremony needs a secure context, and
+# http://localhost is the one name every browser treats as one - it is also the
+# origin Seal derives for a loopback bind and the origin it allows for the
+# WebSocket. Spelled 127.0.0.1 the browser would be at a different origin than
+# the one being verified.
+#
+# To reach the gateway from another machine, bind a specific address (a tailnet
+# or LAN address), or 0.0.0.0 for every IPv4 interface ("::" for every
+# interface). Seal warns at boot whenever the bind is reachable from off-host.
+#
+# Set these before the first passkey is enrolled, so the credential is bound to
+# the origin clients actually use:
+#   seal access-control configure --host NAME --port PORT --tls \
+#                                  --origin https://NAME[:PORT] --rp-id NAME
+# Changing the host after enrollment orphans the passkey; recover with
+# `seal access-control reset --yes` (deletes all passkeys), then configure,
+# serve, and enroll again.
+
+[gateway]
+host = "localhost"
+port = 8080
+
+# Origins allowed to open the WebSocket. The bind address's own origin is added
+# automatically, so this only needs entries for a reverse proxy.
+allowed_origins = ["http://localhost:8080"]
+
+# Serve the web UI from a directory instead of the copy embedded in the binary.
+# `seal serve --static-dir DIR` overrides it for one run.
+# static_dir = "/srv/seal/frontend-dist"
+
+# Serve HTTPS so a passkey ceremony works without a reverse proxy. The PEM paths
+# default to ~/.seal/keys/tls/{cert,key}.pem; if they are missing, Seal
+# generates a self-signed pair, which a browser must be told to trust before
+# WebAuthn will run on it. For a browser on another machine, prefer an SSH
+# tunnel to the loopback address (`ssh -L 9090:localhost:8080 you@host`, then
+# http://localhost:9090) or `tailscale serve`, which need no certificate trust.
+tls = false
+# tls_cert = "/etc/ssl/fullchain.pem"
+# tls_key  = "/etc/ssl/privkey.pem"
+# tls_hosts = ["seal.lan"]   # extra names for a generated certificate's SAN
+
+# ---------------------------------------------------------------------------
+# Passkey access control for the web gateway
+# ---------------------------------------------------------------------------
+# Three states, and the difference between the first two matters:
+#
+#   * no table at all  -> unconfigured. The API is closed and the first browser
+#     visit shows a setup screen. This is the default, and the reason the table
+#     below is commented out: absence never means "open".
+#   * mode = "none"    -> open. An explicit waiver, written only by
+#     `seal access-control disable --yes`.
+#   * mode = "passkey" -> every request needs a passkey-backed session.
+#
+# Enrolled passkeys are not stored here. They live in ~/.seal/credentials.toml,
+# which the gateway owns at mode 0600.
+#
+# [access_control]
+# mode = "passkey"
+#
+# Only needed when a TLS reverse proxy fronts the gateway; otherwise the origin
+# is derived from [gateway] host/port at boot. rp_id defaults to the origin's
+# host and must be a domain name - a passkey can never be bound to an IP.
+# origin = "https://seal.example.com"
+# rp_id  = "seal.example.com"

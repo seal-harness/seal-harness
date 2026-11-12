@@ -30,12 +30,14 @@ mkMeta s =
     , smProvider = "ollama"
     , smModel = "llama3.2"
     , smChannel = "cli"
+    , smParent = Nothing
     , smAgent = Nothing
     , smSystemOverride = Nothing
     , smAgentName = Nothing
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smRepoBranch = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime
     }

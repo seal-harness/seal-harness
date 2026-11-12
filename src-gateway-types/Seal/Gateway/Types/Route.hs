@@ -79,6 +79,8 @@ data Req
 data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   -- Health
   RouteHealth        :: SealRoute '[] '[] Bodyless Text
+  -- Commands
+  RouteCommands      :: SealRoute '[] '[] Bodyless Resp
   -- Tabs
   RouteTabsList       :: SealRoute '[] '[] Bodyless Resp
   RouteTabsNew       :: SealRoute '[] '[] (Body Req) Resp
@@ -87,6 +89,7 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteTabsAcknowledge :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
   RouteTabsRelease   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
   RouteTabsDestroy   :: SealRoute '[TabIndexOrErr] '[] Bodyless Resp
+  RouteTabsRename    :: SealRoute '[TabIndexOrErr] '[] (Body Req) Resp
   -- Lists
   RouteLists         :: SealRoute '[] '[] Bodyless Resp
   -- Sessions
@@ -141,6 +144,11 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteProviderDelete :: SealRoute '[Text] '[] Bodyless Resp
   RouteProviderDefaultGet :: SealRoute '[] '[] Bodyless Resp
   RouteProviderDefaultPut :: SealRoute '[] '[] (Body Req) Resp
+  -- Channels
+  RouteChannelsList   :: SealRoute '[] '[] Bodyless Resp
+  RouteChannelCreate  :: SealRoute '[] '[] (Body Req) Resp
+  RouteChannelUpdate  :: SealRoute '[Text] '[] (Body Req) Resp
+  RouteChannelDelete  :: SealRoute '[Text] '[] Bodyless Resp
   -- UI
   RouteUiStateGet    :: SealRoute '[] '[] Bodyless Resp
   RouteUiStatePut    :: SealRoute '[] '[] (Body Req) Resp
@@ -148,6 +156,12 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
   -- Adopt
   RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+  -- Setup (first-run wizard). The gate is blocking: these four are the only
+  -- routes the SPA may call before it hands control back to <App/>.
+  RouteSetupState    :: SealRoute '[] '[] Bodyless Resp
+  RouteSetupVault    :: SealRoute '[] '[] (Body Req) Resp
+  RouteSetupVaultReopen :: SealRoute '[] '[] (Body Req) Resp
+  RouteProviderTest  :: SealRoute '[Text] '[] (Body Req) Resp
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
@@ -161,6 +175,7 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
 routeMeta :: SealRoute caps qrys req resp -> MetaCodec caps qrys req resp
 routeMeta = \case
   RouteHealth -> Meta (match "health" ./ end) qend bodyless (resp (one jsonBodyCodec)) M.get
+  RouteCommands -> Meta (match "commands" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsList -> Meta (match "tabs" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteTabsNew -> Meta (match "tabs" ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteTabsClose -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "close" ./ end) qend bodyless (resp (one respCodec)) M.post
@@ -168,6 +183,7 @@ routeMeta = \case
   RouteTabsAcknowledge -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "acknowledge" ./ end) qend bodyless (resp (one respCodec)) M.post
   RouteTabsRelease -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "release" ./ end) qend bodyless (resp (one respCodec)) M.post
   RouteTabsDestroy -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "destroy" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsRename -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "rename" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteLists -> Meta (match "lists" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSessionsList -> Meta (match "sessions" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSessionsArchived -> Meta (match "sessions" ./ match "archived" ./ end) qend bodyless (resp (one respCodec)) M.get
@@ -215,11 +231,19 @@ routeMeta = \case
   RouteProviderDelete -> Meta (match "providers" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteProviderDefaultGet -> Meta (match "providers" ./ match "default" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProviderDefaultPut -> Meta (match "providers" ./ match "default" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteChannelsList -> Meta (match "channels" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteChannelCreate -> Meta (match "channels" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteChannelUpdate -> Meta (match "channels" ./ capture textCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteChannelDelete -> Meta (match "channels" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSetupState -> Meta (match "setup" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteProviderTest -> Meta (match "providers" ./ capture textCapture ./ match "test" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -227,6 +251,7 @@ routeMeta = \case
 allRoutes :: [Constructed SealRoute]
 allRoutes =
   [ Constructed RouteHealth
+  , Constructed RouteCommands
   , Constructed RouteTabsList
   , Constructed RouteTabsNew
   , Constructed RouteTabsClose
@@ -234,6 +259,7 @@ allRoutes =
   , Constructed RouteTabsAcknowledge
   , Constructed RouteTabsRelease
   , Constructed RouteTabsDestroy
+  , Constructed RouteTabsRename
   , Constructed RouteLists
   , Constructed RouteSessionsList
   , Constructed RouteSessionsArchived
@@ -281,11 +307,19 @@ allRoutes =
   , Constructed RouteProviderDelete
   , Constructed RouteProviderDefaultGet
   , Constructed RouteProviderDefaultPut
+  , Constructed RouteChannelsList
+  , Constructed RouteChannelCreate
+  , Constructed RouteChannelUpdate
+  , Constructed RouteChannelDelete
   , Constructed RouteUiStateGet
   , Constructed RouteUiStatePut
   , Constructed RouteUiCustomModels
   , Constructed RouteUiRepos
   , Constructed RouteAdopt
+  , Constructed RouteSetupState
+  , Constructed RouteSetupVault
+  , Constructed RouteSetupVaultReopen
+  , Constructed RouteProviderTest
   ]
 
 -- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.

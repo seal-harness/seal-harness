@@ -15,7 +15,7 @@ module Seal.Command.Provider
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
 import Data.IORef (IORef, readIORef)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -37,9 +37,10 @@ import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), SomeProvider, ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
-  ( KnownProvider, completeSome, configuredProviders, defaultModelFor
-  , knownProviders, parseProvider, providerLabel, resolveDefaultModel
-  , resolveProvider, vaultErrText, vaultKeyName )
+  ( KnownProvider, completeSome, configuredProviders, customProviderNames
+  , defaultModelFor, knownProviders, parseProvider, providerLabel
+  , resolveDefaultModel, resolveProvider, resolveProviderByName, vaultErrText
+  , vaultKeyName )
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -173,8 +174,10 @@ addCmd pr lbl = commandAction $ \caps ->
           case res of
             Left e   -> ccSend caps (vaultErrText e)
             Right () -> do
-              _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
-              ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
+              saved <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
+              case saved of
+                Left e   -> ccSend caps ("Stored the API key, but could not update config.toml: " <> e)
+                Right () -> ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
 
 -- | Ollama onboarding: prompt for the base URL (blank keeps the default),
 -- persist it to config, then prompt for an optional API key (blank => local,
@@ -192,8 +195,10 @@ addOllama pr caps vh kp = do
   case keyRes of
     Left e   -> ccSend caps (vaultErrText e)
     Right () -> do
-      _ <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
-      ccSend caps "Configured ollama."
+      saved <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
+      case saved of
+        Left e   -> ccSend caps ("Could not update config.toml: " <> e)
+        Right () -> ccSend caps "Configured ollama."
   where
     seedAll mUrl fc =
       let fc' = seedProviderDefaults kp fc
@@ -279,8 +284,10 @@ loginCmd pr lbl = commandAction $ \caps ->
             case res of
               Left e   -> ccSend caps (vaultErrText e)
               Right () -> do
-                _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
-                ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
+                saved <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
+                case saved of
+                  Left e   -> ccSend caps ("Logged in, but could not update config.toml: " <> e)
+                  Right () -> ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
 
 -- | Best-effort browser open; failure is silently ignored (headless-friendly).
 openBrowser :: Text -> IO ()
@@ -316,8 +323,10 @@ removeCmd pr lbl = commandAction $ \caps ->
         (Left e, _) -> ccSend caps (vaultErrText e)
         (_, Left e) -> ccSend caps (vaultErrText e)
         _           -> do
-          _ <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
-          ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
+          saved <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
+          case saved of
+            Left e   -> ccSend caps ("Removed the credentials, but could not update config.toml: " <> e)
+            Right () -> ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
   where
     -- | Delete a key; a missing key is not an error.
     deleteIfPresent vh k = do
@@ -340,25 +349,26 @@ modelText (ModelId t) = t
 -- provider reads its OWN @[providers.&lt;label&gt;]@ section).
 resolveSessionProvider
   :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
-resolveSessionProvider pr meta =
-  case parseProvider (smProvider meta) of
-    Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
-    Just kp -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let cfg   = fromRight defaultRuntimeConfig eCfg
-          model = ModelId (smModel meta)
+resolveSessionProvider pr meta = do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg   = fromRight defaultRuntimeConfig eCfg
+      name  = smProvider meta
+      model = ModelId (smModel meta)
+  if isNothing (parseProvider name) && name `notElem` customProviderNames cfg
+    then pure (Left ("unknown provider in session: " <> name))
+    else do
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveProviderByName mh (prManager pr) cfg name model (prCallCounter pr))
 
 -- | Resolve a provider+model from explicit labels (for AGENT_START, which
 -- builds a fresh AgentEnv from a def rather than the active session).
 resolveDefProvider
   :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
-resolveDefProvider pr providerLabel' model =
-  case parseProvider providerLabel' of
-    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel'))
-    Just kp -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let cfg = fromRight defaultRuntimeConfig eCfg
+resolveDefProvider pr name model = do
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
+  if isNothing (parseProvider name) && name `notElem` customProviderNames cfg
+    then pure (Left ("unknown provider in agent def: " <> name))
+    else do
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) cfg kp model (prCallCounter pr))
+      fmap (fmap (, model)) (resolveProviderByName mh (prManager pr) cfg name model (prCallCounter pr))

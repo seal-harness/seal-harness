@@ -133,6 +133,11 @@ spec = do
         [ "type" .= ("repos-changed" :: Text)
         ]) `shouldBe` Just SeReposChanged
 
+    it "decodes the application-level heartbeat" $
+      decodeServerEvent (encodeFrame
+        [ "type" .= ("heartbeat" :: Text)
+        ]) `shouldBe` Just SeHeartbeat
+
     it "decodes an error event" $
       decodeServerEvent (encodeFrame
         [ "type" .= ("error" :: Text)

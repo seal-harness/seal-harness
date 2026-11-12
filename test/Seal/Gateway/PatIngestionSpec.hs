@@ -49,6 +49,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
+import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
@@ -56,6 +57,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun)
@@ -231,7 +233,7 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing True Nothing
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Build 'ApiDeps' with a REAL 'mkRepoRegistryHandle' (writing to a real
@@ -267,9 +269,10 @@ mkVaultDeps vr tmp = do
         , adRepoRegistry     = repoRegH
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-        , adVault            = vr
+        , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths            = paths
-        , adWsPort           = 8081
+        
+        , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg         = testAbortReg
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing

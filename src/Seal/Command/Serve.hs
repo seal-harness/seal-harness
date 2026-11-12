@@ -7,16 +7,30 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (SomeException, catch, try)
 import Control.Monad (filterM, void, forever)
-import Data.Foldable (for_)
+import Data.Foldable (for_, forM_)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.ByteString qualified as BS
+import Data.Map.Strict qualified as Map
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Time (getCurrentTime)
 import Data.Text qualified as T
-import Network.HTTP.Client (Manager)
-import Network.HTTP.Client.TLS (newTlsManager)
+import Data.Text.IO qualified as TIO
+import Data.X509.CertificateStore
+  (CertificateStore, listCertificates, makeCertificateStore, readCertificateStore)
+import Network.Connection (TLSSettings (..))
+import Network.HTTP.Client
+  ( Manager, ManagerSettings (..), Request (..), defaultManagerSettings
+  , newManager )
+import Network.HTTP.Client.TLS
+  ( mkManagerSettings, newTlsManager, tlsManagerSettings )
+import Network.TLS (ClientParams (..), Shared (..), defaultParamsClient)
 import System.Directory (doesFileExist)
+import System.IO (hIsTerminalDevice, stderr)
+import System.Posix.Unistd (getSystemID, nodeName)
+import System.X509 (getSystemCertificateStore)
 
 import Katip (Severity (..), ls)
 
@@ -24,16 +38,24 @@ import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
 import qualified Data.Text.Encoding as TE
 import Seal.Channels.Chat.Loop
-  (runChatChannel, defaultChatChannelConfig, WatchState, newPersistingWatchState, seedWatchState)
+  ( ChatChannelConfig (cccStartWs), runChatChannel, defaultChatChannelConfig
+  , WatchState, newPersistingWatchState, seedWatchState )
 import Seal.Channels.Chat.Types qualified as ChatTypes
-  (GatewayConfig (..))
+  (GatewayConfig (..), mkGatewayConfig)
+import Seal.Channels.Chat.WsClient qualified as ChatWs (startWsClient)
 import Seal.Channels.Chat.Signal as ChatSignal
   (withSignalChatChannel, mkRealSignalChatTransport)
 import Seal.Channels.Chat.Telegram as ChatTelegram
-  (withTelegramChatChannel, mkRealTelegramChatTransport)
+  (withTelegramChatChannel, mkRealTelegramChatTransport, tgSetCommandsViaApi)
+import Seal.Channels.Chat.TelegramCommands (registerWithRetry)
+import Seal.Channels.Chat.HttpClient qualified as ChatHttp
 import Seal.Channels.Chat.WatchPersist (saveWatchMap, loadWatchMap)
+import Seal.Channels.Config
+import Seal.Core.ChannelKind (ChannelKind (..))
 
+import Seal.Agent.Runtime.Registry (AgentRuntime, hasRunningChildren)
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
+import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Channels.Cursor
   ( newPersistingCursorStore, seedCursorStore )
 import Seal.Channels.Cursor.Persist (loadCursorMap)
@@ -47,19 +69,34 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
+import Seal.Command.Shutdown (handleServeInterrupt)
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Templates (ensureConfigTemplates)
+import Seal.Config.BootPlan
+  ( BindCoordinates (..), BootPlan (bpOrigin, bpMintGrant), bootPlan, bootRefusalMessage, preflight )
+import Seal.Security.EnrollmentGrant (GrantSource (..))
+import Seal.Config.Security
+  ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
+  , gatewayConfigFromSecurity, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath, watchMapPath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
+import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
+import Seal.Gateway.AccessControl
+  ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+import Seal.Gateway.Config
+  ( GatewayConfig (..), gatewayHostError
+  , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
+  , effectiveTlsPaths )
 import Seal.Gateway.Server (runGateway)
-import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+import Seal.Gateway.Setup (SetupDeps (..))
+
+import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -67,10 +104,15 @@ import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (configuredProviders)
+import Seal.Providers.Registry (configuredProviders, resolveProviderByName)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Security.AccessControl (originHostOf)
+import Seal.Security.TlsCert
+  ( TlsCertOutcome (..), certificateExpiryWarning, ensureCertificateAt
+  , ensureGeneratedCertificate, generatedCertificateTrustHint
+  , localAddressNames, sanHostsFor, sanInputsFor )
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
@@ -81,14 +123,13 @@ import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHan
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
-import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent)
@@ -97,10 +138,28 @@ import Control.Concurrent.STM (newTVarIO)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: AutonomyLevel -> Maybe FilePath -> SealLogger -> IO ()
-runServeMain autonomy mCliStaticDir logger = do
+--
+-- Ctrl-C is handled here: SIGINT reaches the RTS as a 'UserInterrupt' on the
+-- main thread, which 'handleServeInterrupt' turns into a shutdown log line
+-- naming the live sub-agents (whose forked threads die with this process)
+-- followed by exit 130.
+runServeMain :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IO ()
+runServeMain autonomy mCliStaticDir noEnrollToken logger = do
+  -- Filled in once the backends exist; 'Nothing' means an interrupt landed
+  -- during startup, before there was a runtime to report on.
+  runtimeRef <- newIORef Nothing
+  runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef
+    `catch` handleServeInterrupt logger runtimeRef
+
+runServeMainInner
+  :: AutonomyLevel -> Maybe FilePath -> Bool -> SealLogger -> IORef (Maybe AgentRuntime) -> IO ()
+runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   paths <- getSealPaths
   ensureSealDirs paths
+  -- Claim this SEAL_HOME for the life of the process before anything else
+  -- starts listening. The lock is advisory and kernel-held, so a previous
+  -- daemon that crashed does not block this one (design §12).
+  _serveLock <- claimSealHome paths
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
   -- a crashed/killed seal process so their stale entries don't accumulate
   -- (#88). Live agents are reused (the key is still loaded).
@@ -113,6 +172,13 @@ runServeMain autonomy mCliStaticDir logger = do
   -- newest N entries, drop the rest. Best-effort — failures are ignored.
   gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN
   migrateSecurityConfig paths
+  -- First-run scaffolding, after the migration so the security template cannot
+  -- pre-empt it (see 'Seal.Config.Templates.seedSecurity'). Never overwrites and
+  -- never fatal: a missing template must not keep the harness from booting.
+  (createdTemplates, templateWarnings) <- ensureConfigTemplates paths
+  forM_ templateWarnings (logIO logger WarningS . ls)
+  forM_ createdTemplates $ \fp ->
+    logIO logger InfoS ("wrote a documented config template at " <> ls (T.pack fp))
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
@@ -121,9 +187,116 @@ runServeMain autonomy mCliStaticDir logger = do
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      logIO logger WarningS ("could not load security config: " <> ls err)
-      pure defaultSecurityConfig
+      -- Fail closed. Degrading an unparseable security.toml to the defaults
+      -- would silently reopen the access-control enrollment window on every
+      -- boot, so the gateway refuses to start and prints the diagnostics.
+      logIO logger ErrorS ("could not load security config: " <> ls err)
+      ioError (userError ("security.toml could not be parsed; refusing to start. "
+                          <> T.unpack err))
     Right c  -> pure c
+  -- Access control is resolved ONCE here, before any channel is forked or any
+  -- port is bound, so the refuse-to-start matrix (design §10) runs first.
+  let gwCfgForAccess = gatewayConfigFromSecurity secCfg
+  let gwCfgAccess = case mCliStaticDir of
+        Just dir -> gwCfgForAccess { gcStaticDir = Just (T.pack dir) }
+        Nothing  -> gwCfgForAccess
+  -- TLS is validated before anything binds. A half-configured certificate/key
+  -- pair is a boot refusal rather than a handshake failure on the first
+  -- connection, where the message would be about a cipher, not a typo.
+  case tlsConfigError gwCfgAccess of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  -- `host` is handed to Warp, so an unusable value is a boot refusal rather
+  -- than a string in a log line: a malformed or unresolvable host used to be
+  -- harmless (it only fed the printed URL) and now aborts inside Warp, after
+  -- the banner. Both halves run here, beside the TLS check, before anything
+  -- binds.
+  case gatewayHostError (gcHost gwCfgAccess) of
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  gatewayHostResolutionError hostResolves (gcHost gwCfgAccess) >>= \case
+    Just err -> do
+      logIO logger ErrorS ("gateway: " <> ls err)
+      ioError (userError (T.unpack err))
+    Nothing -> pure ()
+  -- TLS paths default under keys/tls, so `tls = true` is the whole
+  -- configuration. A missing pair is generated with openssl rather than left
+  -- to the operator; see 'Seal.Security.TlsCert' for why that is not a
+  -- substitute for a trusted certificate.
+  --
+  -- A pair Seal generated at the default paths is Seal's to maintain: it is
+  -- replaced when it cannot serve a browser a legal certificate. A pair the
+  -- operator pointed at with tls_cert/tls_key is never validated or replaced.
+  gwCfgTls <- if tlsEnabled gwCfgAccess
+    then do
+      let (certPath, keyPath) =
+            effectiveTlsPaths (tlsCertPath paths) (tlsKeyPath paths) gwCfgAccess
+          managed = isNothing (gcTlsCert gwCfgAccess) && isNothing (gcTlsKey gwCfgAccess)
+          warnSelfSigned = logIO logger WarningS (ls (generatedCertificateTrustHint certPath))
+      systemId <- getSystemID
+      addresses <- localAddressNames
+      let hosts = sanHostsFor
+                    (sanInputsFor gwCfgAccess
+                       (T.pack (nodeName systemId))
+                       (scAccessControl secCfg >>= acfcOrigin >>= originHostOf)
+                       addresses)
+      ensured <- (if managed then ensureGeneratedCertificate else ensureCertificateAt)
+                   certPath keyPath hosts
+      case ensured of
+        Left err -> do
+          logIO logger ErrorS ("gateway: " <> ls err)
+          ioError (userError (T.unpack err))
+        Right TlsCertUnchanged ->
+          logIO logger DebugS ("TLS certificate unchanged at " <> ls (T.pack certPath))
+        Right TlsCertCreated -> do
+          logIO logger InfoS ("generated a self-signed TLS certificate for "
+            <> ls (T.intercalate ", " hosts) <> " at " <> ls (T.pack certPath)
+            <> " (private key " <> ls (T.pack keyPath) <> ", mode 0600)")
+          warnSelfSigned
+        Right (TlsCertReplaced why) -> do
+          logIO logger WarningS
+            ("replaced the generated TLS certificate at " <> ls (T.pack certPath)
+              <> ": " <> ls why <> ".")
+          logIO logger WarningS
+            ("the previous pair is kept at " <> ls (T.pack (certPath <> ".bak"))
+              <> " and " <> ls (T.pack (keyPath <> ".bak"))
+              <> "; trust the new certificate on every device that uses this gateway.")
+          warnSelfSigned
+      expiry <- certificateExpiryWarning certPath
+      forM_ expiry (logIO logger WarningS . ls)
+      pure gwCfgAccess { gcTlsCert = Just (T.pack certPath)
+                        , gcTlsKey  = Just (T.pack keyPath) }
+    else pure gwCfgAccess
+  -- The §10 matrix runs here, before any channel is forked or port bound.
+  bootInputs <- preflight paths
+  let planResult = bootInputs >>= bootPlan (BindCoordinates (gcHost gwCfgAccess)
+                                                             (gcPort gwCfgAccess))
+  access <- case planResult of
+    Left refusal -> do
+      let reason = bootRefusalMessage refusal
+      logIO logger ErrorS ("access control: " <> ls reason)
+      ioError (userError (T.unpack reason))
+    -- Serving HTTPS makes the https origin authoritative; a verified origin
+    -- that still says http:// would fail every ceremony's origin check.
+    Right plan -> case tlsOriginError (tlsEnabled gwCfgAccess) (bpOrigin plan) of
+      Just err -> do
+        logIO logger ErrorS ("gateway: " <> ls err)
+        ioError (userError (T.unpack err))
+      Nothing -> do
+        -- @--no-enrollment-token@: the operator asserts the network is
+        -- secured (firewall/VPN), so a 'CliWindow' grant (no secret) is
+        -- minted instead of a 'CliToken' grant. The browser can enroll a
+        -- passkey without pasting a token. Passkey auth stays enabled —
+        -- this is not @mode = "none"@.
+        let adjustedPlan = if noEnrollToken
+              then plan { bpMintGrant = CliWindow <$ bpMintGrant plan }
+              else plan
+        newAccessControlHandle paths adjustedPlan
+  printAccessControlBanner paths access
   mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
@@ -144,6 +317,10 @@ runServeMain autonomy mCliStaticDir logger = do
   let repo = openConfigRepo cfgRoot
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
   backends <- newBackends paths repo embedding
+  -- Publish the sub-agent runtime so an interrupt during the gateway run can
+  -- log exactly which children are being taken down with the process
+  -- ('Seal.Command.Shutdown').
+  writeIORef runtimeRef (Just (bRuntime backends))
   -- Start the cron scheduler (background thread).
   cronStopSignal <- newTVarIO False
   let cronScheduler = CronScheduler
@@ -301,6 +478,7 @@ runServeMain autonomy mCliStaticDir logger = do
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
         , sdAbortReg    = cdAbortReg chanDeps
+        , sdRepeatReg   = cdRepeatReg chanDeps
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
@@ -329,11 +507,15 @@ runServeMain autonomy mCliStaticDir logger = do
           -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg0 = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
-      gwCfg  = case mCliStaticDir of
-        Just dir -> gwCfg0 { gcStaticDir = Just (T.pack dir) }
-        Nothing  -> gwCfg0
-      deps = ApiDeps
+  let gwCfg = gwCfgTls
+  -- The WS stream server's liveness, published through /api/health. The
+  -- ref is created BEFORE the ApiDeps that reads it and is filled in by
+  -- the WS server thread once it has attempted its bind. Reporting the
+  -- CONFIGURED port unconditionally was the bug: a WS that failed to bind
+  -- (port already in use) still advertised the dead port, so the frontend
+  -- connected to a non-WebSocket port and its transcript froze.
+  wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
+  let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
         , adHarnessRegistry = reg
@@ -342,10 +524,15 @@ runServeMain autonomy mCliStaticDir logger = do
         , adSkills          = bSkills backends
         , adProviders       = do
             -- The configured-provider list is computed on each request so
-            -- newly-added credentials are reflected without a restart. The
-            -- vault handle is read from the same ref the commands use.
+            -- newly-added credentials are reflected without a restart. Both
+            -- inputs are re-read: the vault handle from the same ref the
+            -- commands use, and config.toml from disk — a provider whose
+            -- *credential* arrives through the vault, but whose *endpoint*
+            -- (`[providers.openai] base_url`) arrives through the config, is
+            -- only "configured" once both are visible.
             mh <- readIORef (vrHandleRef rt)
-            configuredProviders mh cfg
+            cfg' <- loadCfg
+            configuredProviders mh cfg'
         , adUiState         = uiState
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
@@ -355,13 +542,29 @@ runServeMain autonomy mCliStaticDir logger = do
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = repo
         , adVault            = rt
+        , adCanonicalOrigin = naOrigin access
+        -- The setup endpoints' real seams: the provisioning core and a
+        -- provider resolver that re-reads config.toml + the vault handle on
+        -- every call (so a provider saved during setup is what a
+        -- Test-connection ping actually reaches).
+        , adSetup = SetupDeps
+            { sdProvision = defaultProvisionDeps paths
+            , sdResolveProvider = \name model -> do
+                mh' <- readIORef (vrHandleRef rt)
+                cfg' <- loadRuntimeConfig cfgPath
+                case cfg' of
+                  Left err -> pure (Left err)
+                  Right rc' -> resolveProviderByName mh' mgr rc' name model callCounter
+            }
         , adPaths            = paths
-        , adWsPort           = gcWsPort gwCfg
+        , adWsHealth         = readIORef wsHealthRef
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
         }
-  -- Start the WS stream server on the WS port.
+  -- The WS stream server is MOUNTED in the HTTP application (same port),
+  -- so there is no second listener and no second port to collide with.
+  --
   -- The Origin allowlist is the configured list PLUS origins derived from
   -- the HTTP server's host + port. A wildcard host (0.0.0.0) means "bind all
   -- interfaces" — the browser may reach the server via any of them, so we
@@ -370,33 +573,52 @@ runServeMain autonomy mCliStaticDir logger = do
   -- any Origin) — overriding even the default loopback origin. For a specific
   -- host, derive the origin + prepend it to the configured list.
   let isWildcard = gcHost gwCfg == "0.0.0.0" || gcHost gwCfg == "::"
-      httpOrigins = [ "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
+      -- The scheme has to match what clients actually reach: with TLS on they
+      -- send an https Origin, and an http-only allowlist would reject the
+      -- WebSocket handshake.
+      scheme = if tlsEnabled gwCfg then "https" else "http"
+      httpOrigins = [ scheme <> "://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
                     | not isWildcard ]
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
-      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
-  logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
-  _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
-  -- Periodically clear stale "thinking" sessions (safety net for sessions
-  -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
-  -- every 5 minutes; clears sessions thinking longer than 30 minutes.
+      guard = StreamGuard
+        { sgAllowedOrigins = origins
+        , sgGlobalCap = 1024
+        , sgTabsHandle = tabsH
+        , sgPaths = paths
+        , sgHeartbeatSeconds = 30
+        , sgAccessControl = Just (naHandle access)
+        }
+  -- The WS server shares the HTTP listener, so it is up as soon as the
+  -- HTTP server is. Record that in the health state the /api/health
+  -- endpoint publishes.
+  writeIORef wsHealthRef (StreamHealth "up" (gcPort gwCfg))
+  logIO logger InfoS ("WS stream server mounted on the same port ("
+    <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))) <> ")")
+  -- Periodically clear stale "thinking" sessions (a safety net for a turn
+  -- that died without its bracket cleanup broadcasting idle). Runs every 5
+  -- minutes and clears only sessions that have been SILENT for 30 minutes
+  -- — every entry/tool-call broadcast refreshes the session's stamp — and
+  -- are not busy (no turn in flight, no running background children). A
+  -- long turn that is still producing output is never cleared: reporting
+  -- it idle mid-turn mis-sorts the sidebar, drops the chat channels'
+  -- /watch state, and closes a /bg connection.
   _ <- forkIO $ forever $ do
     threadDelay (5 * 60 * 1_000_000)
-    void (reconcileStaleThinking broker (30 * 60))
+    void (reconcileStaleThinking broker
+            (\sid -> (||) <$> sessionTurnInFlight (sdLocks sendDeps) sid
+                          <*> hasRunningChildren (bRuntime backends) sid)
+            (30 * 60))
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The channels connect to the gateway as clients (HTTP + WS)
-  -- via the 'seal-chat-channels' package.
-  forkNewSignalChatChannel logger gwCfg mgr cfg watchState
-  forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState
-  -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
-  -- mode=remote (design V6: prevents network access to the unauthenticated
-  -- updateRuntimeConfig caller).
-  let isRemote = case scUntrustedExec secCfg of
-        Just uefc -> uefcMode uefc == "remote"
-        Nothing   -> False
-  runGateway logger gwCfg isRemote deps
+  -- via the 'seal-chat-channels' package. Iterates 'rcChannels' (design
+  -- §3.5): each entry is resolved and forked; failures log a warning.
+  forkChatChannels logger gwCfg mgr (naServiceToken access) cfg mHandle watchState
+  -- Run the HTTP gateway (blocks). A non-loopback bind is allowed in every
+  -- configuration; it is warned about, never refused (see 'runGateway').
+  runGateway logger (Just (naHandle access)) gwCfg deps guard broker
 
 -- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
 -- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
@@ -430,6 +652,19 @@ mkRepoTestSeam rt repoRegH agentRegH paths = do
         Nothing -> pure (Left VaultLocked)
         Just vh -> vhPut vh k v
   }
+
+-- | Take the per-@SEAL_HOME@ daemon lock for the life of this process.
+--
+-- Refuses rather than queueing: two daemons on one @SEAL_HOME@ would fight for
+-- the same port and the same transcript directories, and the second one is
+-- always a mistake. The returned lock is never released explicitly — process
+-- exit is the release.
+claimSealHome :: SealPaths -> IO ServeLock
+claimSealHome paths = do
+  locked <- acquireServeLock (serveLockPath paths)
+  case locked of
+    Left err -> ioError (userError (T.unpack err))
+    Right lock -> pure lock
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
@@ -477,32 +712,102 @@ renumberTabs ts = TabList (zipWith renumber [0..] ts)
 -- ---------------------------------------------------------------------------
 -- Chat-channel fork functions (gateway-API-client implementation)
 -- ---------------------------------------------------------------------------
--- | Fork the new Signal chat channel if @[signal]@ is configured.
-forkNewSignalChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> WatchState -> IO ()
-forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
-  case Seal.Signal.Config.resolveSignalConfig (rcSignal cfg) Nothing of
-    Left _ -> pure ()
-    Right (account, chunkLimit, allow) -> do
-      -- The chat channels connect to the gateway as clients. When the
-      -- gateway binds to 0.0.0.0, use 127.0.0.1 for client connections.
-      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
-                         then "127.0.0.1" :: T.Text
-                         else Seal.Gateway.Config.gcHost gwCfg
-      let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = clientHost
-            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
-            }
-          chanCfg = defaultChatChannelConfig mgr chatGwCfg
-          accountText = Seal.Signal.Config.signalAccountText account
+-- | The address a co-located chat channel uses to reach the gateway. A
+-- wildcard bind is not dialable, so it maps to loopback.
+clientHostFor :: Seal.Gateway.Config.GatewayConfig -> T.Text
+clientHostFor gwCfg
+  | Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0" = "127.0.0.1"
+  | otherwise = Seal.Gateway.Config.gcHost gwCfg
+
+-- | The manager every chat channel uses to call the gateway API.
+--
+-- It carries the process-local service token, so the channel passes the
+-- access-control gate without a browser passkey session, and under TLS it
+-- trusts the gateway's own PEM certificate: the generated pair is
+-- self-signed, so the system store cannot verify it. The token is injected by
+-- the manager rather than threaded through every 'HttpClient' call.
+gatewayManager
+  :: SealLogger
+  -> Seal.Gateway.Config.GatewayConfig
+  -> T.Text   -- ^ Client host
+  -> T.Text   -- ^ Gateway service token
+  -> IO Manager
+gatewayManager logger gwCfg clientHost serviceToken = do
+  base <- if tlsEnabled gwCfg then tlsSettings else pure defaultManagerSettings
+  newManager (base { managerModifyRequest = pure . authorize })
+  where
+    authorize req = req
+      { requestHeaders =
+          ("Authorization", "Bearer " <> TE.encodeUtf8 serviceToken)
+            : filter ((/= "Authorization") . fst) (requestHeaders req)
+      }
+    tlsSettings = case Seal.Gateway.Config.gcTlsCert gwCfg of
+      Nothing -> pure tlsManagerSettings
+      Just certPath -> do
+        mPinned <- readCertificateStore (T.unpack certPath)
+        case mPinned of
+          Nothing -> do
+            logIO logger WarningS
+              ("gateway: cannot read TLS certificate at " <> ls certPath
+                 <> "; chat channels may fail to verify the TLS handshake")
+            pure tlsManagerSettings
+          Just pinned -> do
+            eSystem <- try getSystemCertificateStore
+              :: IO (Either SomeException CertificateStore)
+            let systemCerts = either (const []) listCertificates eSystem
+                store = makeCertificateStore (systemCerts <> listCertificates pinned)
+                baseParams = defaultParamsClient (T.unpack clientHost) BS.empty
+                params = baseParams
+                  { clientShared = (clientShared baseParams) { sharedCAStore = store } }
+            pure (mkManagerSettings (TLSSettings params) Nothing)
+
+-- | Fork a single resolved chat channel. This is the post-resolution body
+-- extracted from the former monolithic @forkNewSignalChatChannel@ /
+-- @forkNewTelegramChatChannel@ (design §3.5): resolution has already
+-- happened ('resolveChannelConfig' in the caller); this function builds the
+-- gateway-client transport and forks 'withSignalChatChannel' or
+-- 'withTelegramChatChannel'. The existing library functions are reused
+-- unchanged. The 'ChannelId' is used only for diagnostic logging.
+forkResolvedChannel
+  :: SealLogger
+  -> Seal.Gateway.Config.GatewayConfig
+  -> Manager
+    -- ^ Gateway API manager (pinned to the gateway certificate under TLS).
+  -> Manager
+    -- ^ Shared manager for Telegram's own API.
+  -> T.Text
+    -- ^ Gateway service token (sent on the WS handshake).
+  -> ChannelId
+  -> ResolvedChannel
+  -> WatchState
+  -> IO ()
+forkResolvedChannel logger gwCfg gwMgr mgr serviceToken chanId resolved watchState = do
+  let clientHost = clientHostFor gwCfg
+      -- The WS stream is served on the SAME port as the HTTP API. When the
+      -- gateway serves TLS, the channel client must speak https/wss too and
+      -- trust the gateway's own certificate: plain http against the TLS
+      -- listener fails with 'InsecureConnectionDenied', and the generated
+      -- certificate is self-signed, so the system store cannot verify it.
+      chatGwCfg = ChatTypes.mkGatewayConfig clientHost
+        (Seal.Gateway.Config.gcPort gwCfg)
+        (tlsEnabled gwCfg)
+        (Seal.Gateway.Config.gcTlsCert gwCfg)
+      -- The WS handshake also passes the access-control gate, so the
+      -- channel's connection carries the same service token as its HTTP
+      -- calls (which the manager injects).
+      chanCfg = (defaultChatChannelConfig gwMgr chatGwCfg)
+        { cccStartWs = ChatWs.startWsClient
+            (ChatTypes.gcWsSecure chatGwCfg)
+            (ChatTypes.gcTlsCert chatGwCfg)
+            (Just serviceToken) }
+      cid = channelIdText chanId
+  case resolved of
+    ResolvedSignal account chunkLimit allow -> do
+      let accountText = Seal.Signal.Config.signalAccountText account
       eTransport <- ChatSignal.mkRealSignalChatTransport accountText
       case eTransport of
-        Left err -> logIO logger WarningS ("signal chat channel: " <> ls err)
+        Left err -> logIO logger WarningS
+                      ("channel " <> ls cid <> ": signal chat channel: " <> ls err)
         Right transport ->
           void (forkIO (withSignalChatChannel
                           allow
@@ -510,39 +815,77 @@ forkNewSignalChatChannel logger gwCfg mgr cfg watchState =
                          1000000
                           transport
                           (\chan -> runChatChannel chanCfg chan watchState)))
-
--- | Fork the new Telegram chat channel if @[telegram]@ is configured.
-forkNewTelegramChatChannel
-  :: SealLogger -> Seal.Gateway.Config.GatewayConfig -> Manager -> RuntimeConfig -> Maybe VaultHandle -> WatchState -> IO ()
-forkNewTelegramChatChannel logger gwCfg mgr cfg mHandle watchState = do
-  mVaultToken <- case mHandle of
-    Nothing -> pure Nothing
-    Just vh -> do
-      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
-      pure (case r of
-        Right bs -> Just (TE.decodeUtf8 bs)
-        Left _   -> Nothing)
-  case Seal.Telegram.Config.resolveTelegramConfig (rcTelegram cfg) mVaultToken of
-    Left err -> logIO logger WarningS ("telegram chat channel: " <> ls err)
-    Right (token, chunkLimit, allow) -> do
-      let clientHost = if Seal.Gateway.Config.gcHost gwCfg == "0.0.0.0"
-                         then "127.0.0.1" :: T.Text
-                         else Seal.Gateway.Config.gcHost gwCfg
-      let chatGwCfg = ChatTypes.GatewayConfig
-            { ChatTypes.gcHost = clientHost
-            , ChatTypes.gcHttpPort = Seal.Gateway.Config.gcPort gwCfg
-            , ChatTypes.gcWsPort = Seal.Gateway.Config.gcWsPort gwCfg
-            , ChatTypes.gcApiBase = "http://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcPort gwCfg)) <> "/api"
-            , ChatTypes.gcWsUrl = "ws://" <> clientHost
-                <> ":" <> T.pack (show (Seal.Gateway.Config.gcWsPort gwCfg))
-            }
-          chanCfg = defaultChatChannelConfig mgr chatGwCfg
-          tokenText = Seal.Telegram.Config.telegramTokenText token
+    ResolvedTelegram token chunkLimit allow -> do
+      let tokenText = Seal.Telegram.Config.telegramTokenText token
       transport <- ChatTelegram.mkRealTelegramChatTransport tokenText mgr
+      -- Register the bot's command menu (/help on Telegram shows it) from
+      -- the gateway's slash-command registry. Forked: the chat listeners are
+      -- started before 'runGateway' binds the HTTP port, so an immediate
+      -- fetch always races the bind — 'registerWithRetry' retries for ~10s.
+      -- Failure is non-fatal (the bot still works; the menu is stale).
+      void (forkIO (do
+        eRes <- registerWithRetry 10 1000000
+                  (ChatHttp.httpGetCommands gwMgr (ChatTypes.gcApiBase chatGwCfg))
+                  (tgSetCommandsViaApi mgr tokenText)
+        case eRes of
+          Right () -> pure ()
+          Left e   -> logIO logger WarningS
+                        ("channel " <> ls cid
+                           <> ": telegram chat channel: command menu not registered: " <> ls e)))
       void (forkIO (withTelegramChatChannel
                       allow
                       chunkLimit
                      1000000
                       transport
                       (\chan -> runChatChannel chanCfg chan watchState)))
+
+
+-- ---------------------------------------------------------------------------
+-- Access-control boot banner
+-- ---------------------------------------------------------------------------
+
+-- | Print the boot banner through the gateway's banner module, deciding the TTY
+-- case here because only the process knows what its stderr is.
+printAccessControlBanner :: SealPaths -> NewAccess -> IO ()
+printAccessControlBanner paths access = do
+  stderrIsTTY <- hIsTerminalDevice stderr
+  printAccessControlBannerTo stderrIsTTY (TIO.hPutStrLn stderr) paths access
+
+-- | Fork chat-channel listeners for every entry in 'rcChannels' (design
+-- §3.5). Each 'ChannelConfig' is resolved via the pure
+-- 'resolveChannelConfig'; the caller pre-fetches the vault token for
+-- Telegram channels via 'vhGet' + 'telegramVaultKeyFor'. A channel that
+-- fails resolution logs a warning rather than crashing serve startup.
+-- Replaces the former single-fork @forkNewSignalChatChannel@ /
+-- @forkNewTelegramChatChannel@.
+forkChatChannels
+  :: SealLogger
+  -> Seal.Gateway.Config.GatewayConfig
+  -> Manager
+  -> T.Text
+    -- ^ Gateway service token.
+  -> RuntimeConfig
+  -> Maybe VaultHandle
+  -> WatchState
+  -> IO ()
+forkChatChannels logger gwCfg mgr serviceToken cfg mHandle watchState = do
+  let clientHost = clientHostFor gwCfg
+  gwMgr <- gatewayManager logger gwCfg clientHost serviceToken
+  void (Map.traverseWithKey (forkOne gwMgr) (rcChannels cfg))
+  where
+    forkOne gwMgr chanId chanCfg = do
+      -- Pre-fetch the vault token for Telegram channels (IO); Signal
+      -- channels pass Nothing (the account lives in config, not the vault).
+      mVaultToken <- case (ccKind chanCfg, mHandle) of
+        (Telegram, Just vh) -> do
+          r <- vhGet vh (telegramVaultKeyFor chanId)
+          pure (case r of
+            Right bs -> Just (TE.decodeUtf8 bs)
+            Left _   -> Nothing)
+        _ -> pure Nothing
+      case resolveChannelConfig chanId chanCfg mVaultToken of
+        Left err -> logIO logger WarningS
+                      ("channel " <> ls (channelIdText chanId) <> ": " <> ls err)
+        Right resolved ->
+          void (forkIO (forkResolvedChannel logger gwCfg gwMgr mgr serviceToken
+                          chanId resolved watchState))

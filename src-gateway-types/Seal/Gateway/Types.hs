@@ -16,6 +16,7 @@ module Seal.Gateway.Types
   , module Seal.Gateway.Types.Stream
   , module Seal.Gateway.Types.ListsSnapshot
   , module Seal.Gateway.Types.AesonUtils
+  , module Seal.Gateway.Types.NewArgs
   ) where
 
 import Seal.Gateway.Types.Core
@@ -30,3 +31,4 @@ import Seal.Gateway.Types.Route
 import Seal.Gateway.Types.Stream
 import Seal.Gateway.Types.ListsSnapshot
 import Seal.Gateway.Types.AesonUtils
+import Seal.Gateway.Types.NewArgs

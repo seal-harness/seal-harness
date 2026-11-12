@@ -24,6 +24,20 @@ export interface EntryEvent {
   entry: TranscriptEntry
 }
 
+/** Application-level keep-alive, sent by the server every 30s.
+ *
+ *  WebSocket PING frames are invisible to browser JavaScript: the browser
+ *  answers them below the JS API and `onmessage` never fires. A client that
+ *  watched only for data frames therefore could not tell a healthy idle
+ *  connection from a dead one, and tore down a perfectly good connection
+ *  every 90s (heartbeat watchdog) — which the transcript view showed as a
+ *  periodic redraw: the connection banner appearing, then the whole chat
+ *  re-rendering. This frame is what keeps the watchdog fed. It carries no
+ *  state: consumers must NOT re-render on it. */
+export interface HeartbeatEvent {
+  type: 'heartbeat'
+}
+
 /** Emitted when a streaming entry's payload grows. The entry already exists in
  *  the transcript (same id); consumers should replace it in place. */
 export interface EntryUpdateEvent {
@@ -142,7 +156,10 @@ export interface ReposChangedEvent {
  *  client can preserve the last known value. */
 export interface EntriesChunkPayload {
   entries: TranscriptEntry[]
-  hasMore: boolean
+  /** Omitted by the backend's error frame (the catch handler sends only
+   *  `entries: []` and `requestBefore`). The client treats `undefined` as
+   *  "no window information" rather than "no older entries". */
+  hasMore?: boolean
   totalCount?: number
   requestBefore: string | null
 }
@@ -153,13 +170,25 @@ export interface EntriesChunkEvent {
   type: 'entries-chunk'
   sessionId: string
   entries: TranscriptEntry[]
-  hasMore: boolean
-  totalCount: number
+  hasMore?: boolean
+  totalCount?: number
   requestBefore: string | null
 }
 
+/** Result of a jump-to-top/bottom action.
+ *  - `requested`: a WS request was sent; the scroll applies when the chunk
+ *    arrives.
+ *  - `applied`: a pinned chunk with different entries was dispatched; the
+ *    next render/effect applies the scroll.
+ *  - `unchanged`: the pinned chunk is the same array reference as the
+ *    current entries, so no re-render will happen — the caller must scroll
+ *    directly.
+ *  - `unavailable`: no focused session. */
+export type LoadResult = 'requested' | 'applied' | 'unchanged' | 'unavailable'
+
 export type ServerEvent =
   | HelloEvent
+  | HeartbeatEvent
   | EntryEvent
   | EntryUpdateEvent
   | ActivityEnvelope
@@ -182,6 +211,13 @@ export type ClientOp =
   | { op: 'request-entries'; sessionId: string; before: string | null; limit: number }
 
 // ── Stream client + hook contracts ──────────────────────────────────────
+
+/** The number of consecutive failed connection attempts after which the UI
+ *  escalates from the non-modal connection banner to the "live updates
+ *  unavailable" modal. At the current backoff (250ms -> 5s) this is roughly
+ *  30-40s of trying: long enough to ride out a brief gateway restart, short
+ *  enough that a user waiting on a reply is not left staring at a spinner. */
+export const WS_RECONNECT_ALERT_THRESHOLD = 10
 
 export type StreamStatus =
   | 'connecting'
@@ -223,6 +259,13 @@ export interface StreamClient {
   onReposChanged(cb: () => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
+  /** The number of consecutive failed connection attempts since the last
+   *  successful message. Used to decide when a disconnect has become
+   *  terminal and should escalate from a banner to a modal. */
+  reconnectAttempts(): number
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. A no-op after an explicit 'close()'. */
+  reconnectNow(): void
   /** Request a chunk of transcript entries from the server. */
   requestEntries(sessionId: string, before: string | null, limit: number): void
   /** Subscribe to entries-chunk events. */
@@ -254,6 +297,13 @@ export interface UseTranscriptStream {
   entries: TranscriptEntry[]
   status: StreamStatus
   lastError: string | null
+  /** Consecutive failed connection attempts since the last successful
+   *  message. At or above 'WS_RECONNECT_ALERT_THRESHOLD' the UI escalates
+   *  from the connection banner to the "live updates unavailable" modal. */
+  reconnectAttempts: number
+  /** Force an immediate reconnection attempt, bypassing the pending
+   *  backoff. Wired to the modal's "Reconnect now" action. */
+  reconnectNow: () => void
   /** Pending human-confirmation questions (Untrusted opcode gate or ASK_HUMAN). */
   pendingQuestions: import('../hooks/useApi').PendingQuestion[]
   /** True until the first HTTP seed fetch completes. The WS stream hook is
@@ -262,9 +312,8 @@ export interface UseTranscriptStream {
    *  click), so `loading` is derived from the seed-fetch state. */
   loading: boolean
   /** Force a re-seed. Bumps the internal `refreshCount` which re-runs the
-   *  HTTP seed fetch. Used as `useSendMessage`'s `onComplete` callback —
-   *  the WS stream usually delivers new entries live, but the re-seed
-   *  acts as a consistency check. */
+   *  HTTP seed fetch. The WS stream delivers new entries live, so a
+   *  re-seed is a consistency check rather than the live path. */
   refresh: () => void
   /** Older entries exist on disk; initialized false. */
   hasMore: boolean
@@ -274,11 +323,12 @@ export interface UseTranscriptStream {
   loadingMore: boolean
   /** Trigger to load the next chunk of older entries. */
   loadOlder: () => void
-  loadFromBeginning: () => void
+  /** Jump to the oldest entries. See 'LoadResult' for the return value. */
+  loadFromBeginning: () => LoadResult
   /** Jump to the newest entries (scroll-to-bottom button). Re-requests the
    *  latest N entries from the backend, replacing whatever is currently
    *  loaded. */
-  loadLatest: () => void
+  loadLatest: () => LoadResult
   /** True when the loaded entries include the latest (tail) entries —
    *  i.e. the user is viewing the newest end of the transcript. False
    *  after `loadFromBeginning` (oldest entries loaded, latest not in

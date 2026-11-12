@@ -30,6 +30,8 @@ function fakeClient(): StreamClient & {
   const requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[] = []
   const entriesChunkCbs = new Set<(sessionId: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void>()
   let lastError: string | null = null
+  let reconnectAttempts = 0
+  let reconnectNowCalls = 0
   return {
     status: 'live' as StreamClient['status'],
     focus: () => {},
@@ -43,6 +45,8 @@ function fakeClient(): StreamClient & {
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
+    reconnectAttempts: () => reconnectAttempts,
+    reconnectNow: () => { reconnectNowCalls += 1 },
     requestEntries: (sessionId: string, before: string | null, limit: number) => { requestEntriesCalls.push({ sessionId, before, limit }) },
     onEntriesChunk: (cb) => { entriesChunkCbs.add(cb); return () => { entriesChunkCbs.delete(cb) } },
     // test drivers:
@@ -53,6 +57,8 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid, ask) => { for (const cb of askResolvedCbs) cb(sid, ask) },
     setStatus: (s) => { for (const cb of statusCbs) cb(s); },
     setError: (e) => { lastError = e },
+    setReconnectAttempts: (n) => { reconnectAttempts = n; for (const cb of statusCbs) cb('reconnecting') },
+    getReconnectNowCalls: () => reconnectNowCalls,
     pushEntriesChunk: (sid, chunk) => { for (const cb of entriesChunkCbs) cb(sid, chunk) },
     requestEntriesCalls,
   } as StreamClient & {
@@ -63,13 +69,15 @@ function fakeClient(): StreamClient & {
     pushAskResolved: (sid: string, ask: { id: string; resolution: string }) => void
     setStatus: (s: StreamClient['status']) => void
     setError: (e: string | null) => void
+    setReconnectAttempts: (n: number) => void
+    getReconnectNowCalls: () => number
     pushEntriesChunk: (sid: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void
     requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[]
   }
 }
 
 function makeEntry(id: string, ts: string, payload = 'hi'): TranscriptEntry {
-  return { id, timestamp: ts, direction: 'response', payload, harness: null, model: 'm', channel: null, internal: null, raw: '{}' }
+  return { id, timestamp: ts, direction: 'response', payload, harness: null, model: 'm', channel: null, userId: null, internal: null, raw: '{}' }
 }
 
 // ── useListsStream ───────────────────────────────────────────────────────
@@ -152,6 +160,100 @@ describe('reconcileEntries', () => {
     expect(result).toHaveLength(2)
     expect(result[1]!.streaming).toBe(true)
     expect(result[1]!.payload).toBe('growing text')
+  })
+})
+
+describe('useTranscriptStream turn-completion re-seed', () => {
+  // The re-seed after a send used to fire when POST /send RETURNED — but
+  // the backend forks the turn and returns immediately, so the re-seed
+  // always saw a pre-turn transcript (measured: re-seed at t+4ms saw 0
+  // entries; the first entry landed at t+1033ms). The re-seed now fires
+  // when the turn actually COMPLETES, signalled by the WS
+  // 'harness-status: idle' activity for the focused session.
+  const stubFetch = (body: string = '[]') =>
+    vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+  const seedFetches = (m: ReturnType<typeof vi.fn>) =>
+    m.mock.calls.filter((c) => String(c[0]).includes('/transcript')).length
+
+  it(`re-seeds when the focused session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    // The turn ends -> the harness goes idle -> re-seed.
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(2)
+    expect(result.current.entries).toEqual([])
+    vi.unstubAllGlobals()
+  })
+
+  it(`does NOT re-seed when a DIFFERENT session's turn completes`, async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+
+    await act(async () => {
+      c.pushActivity('s2', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('does NOT re-seed on the initial load (no turn has completed)', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    const fetchMock = stubFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(seedFetches(fetchMock)).toBe(1)
+    vi.unstubAllGlobals()
+  })
+
+  it('re-seeds merge new entries rather than replacing what is shown', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    let call = 0
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      call += 1
+      const body = call === 1
+        ? JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z')])
+        : JSON.stringify([makeEntry('e1', '2026-01-01T00:00:00Z'), makeEntry('e2', '2026-01-01T00:00:01Z')])
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.entries).toHaveLength(1)
+
+    await act(async () => {
+      c.pushActivity('s1', { kind: 'harness-status', status: 'idle' })
+      await new Promise((r) => setTimeout(r, 10))
+    })
+    expect(result.current.entries).toHaveLength(2)
+    expect(result.current.entries[1]!.id).toBe('e2')
+    vi.unstubAllGlobals()
   })
 })
 
@@ -669,5 +771,231 @@ describe('useSessionActivityStream', () => {
     expect(result.current.sessions['s1']!.toolCall).toEqual({ tool: 'SHELL_EXEC', input: '{"command":"make lint"}' })
     await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
     expect(result.current.sessions['s1']!.toolCall).toBeNull()
+  })
+})
+
+// ── Window-derived pagination (scroll-to-top regression) ─────────────────
+//
+// The reported bug: after a couple of backward pages the server said
+// hasMore:false, the client stored it, and "Scroll to top" fell back to
+// scrolling the loaded slice. The window extent is now derived from
+// per-chunk facts, and the backend reports correct facts for every page.
+
+describe('useTranscriptStream window-derived pagination', () => {
+  const stubSeed = (entries: TranscriptEntry[], hasMore: boolean, totalCount: number) =>
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/pending-questions')) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(entries), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Has-More': hasMore ? 'true' : 'false',
+          'X-Total-Count': String(totalCount),
+        },
+      })
+    }))
+
+  it('keeps hasMore true across partial backward pages and clears it at the final page', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-950', 't950')], true, 1000)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls[0]!.before).toBe('e-950')
+
+    // The fixed backend returns a full page and says there is more.
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-900', 't900')],
+        hasMore: true,
+        totalCount: 1000,
+        requestBefore: 'e-950',
+      })
+    })
+    expect(result.current.hasMore).toBe(true)
+
+    // The final page: entries 0.. arrived, nothing before them.
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: false,
+        totalCount: 1000,
+        requestBefore: 'e-900',
+      })
+    })
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(true) // the seed was the tail
+
+    // No further requests once the start is reached.
+    const before = c.requestEntriesCalls.length
+    await act(async () => { result.current.loadOlder() })
+    expect(c.requestEntriesCalls.length).toBe(before)
+    vi.unstubAllGlobals()
+  })
+
+  it('restores the derived flags on a cache hit after switching away and back', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.isViewingLatest).toBe(true)
+
+    await act(async () => { c.pushEntry(makeEntry('e-6', 't6')) })
+    expect(result.current.entries).toHaveLength(2)
+
+    rerender({ sid: 's2' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    rerender({ sid: 's1' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    expect(result.current.entries.map((e) => e.id)).toEqual(['e-5', 'e-6'])
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.isViewingLatest).toBe(true)
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('leaves the window untouched on an error frame and clears loadingMore', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    expect(result.current.hasMore).toBe(true)
+
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [],
+        hasMore: undefined as unknown as boolean,
+        requestBefore: 'e-5',
+      })
+    })
+    expect(result.current.hasMore).toBe(true)
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('reports whether loadLatest/loadFromBeginning changed state', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 100)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    // The pinned tail is the current entries → no re-render will happen.
+    expect(result.current.loadLatest()).toBe('unchanged')
+
+    // Jump to the beginning (WS request), then back to the pinned tail.
+    expect(result.current.loadFromBeginning()).toBe('requested')
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.isViewingLatest).toBe(false)
+    await act(async () => {
+      expect(result.current.loadLatest()).toBe('applied')
+    })
+    expect(result.current.isViewingLatest).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('restores a beginning-only window on a cache hit', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 100)
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useTranscriptStream(sid, c),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadFromBeginning() })
+    await act(async () => {
+      c.pushEntriesChunk('s1', {
+        entries: [makeEntry('e-0', 't0')],
+        hasMore: true,
+        totalCount: 100,
+        requestBefore: '__beginning__',
+      })
+    })
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+
+    rerender({ sid: 's2' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    rerender({ sid: 's1' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    expect(result.current.hasMore).toBe(false)
+    expect(result.current.isViewingLatest).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('clears loadingMore when the stream disconnects', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+    await act(async () => { c.setStatus('reconnecting') })
+    expect(result.current.loadingMore).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('reports requested when no pinned tail exists and unavailable without a session', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    // Drop the cache (and its pins) while the view keeps its entries.
+    _resetDataCacheForTests()
+    expect(result.current.loadLatest()).toBe('requested')
+
+    const noSession = renderHook(() => useTranscriptStream(null, c))
+    expect(noSession.result.current.loadFromBeginning()).toBe('unavailable')
+    expect(noSession.result.current.loadLatest()).toBe('unavailable')
+    vi.unstubAllGlobals()
+  })
+
+  it('clears loadingMore when a chunk for another session arrives', async () => {
+    _resetDataCacheForTests()
+    const c = fakeClient()
+    stubSeed([makeEntry('e-5', 't5')], true, 10)
+    const { result } = renderHook(() => useTranscriptStream('s1', c))
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.loadOlder() })
+    expect(result.current.loadingMore).toBe(true)
+
+    await act(async () => {
+      c.pushEntriesChunk('s2', {
+        entries: [makeEntry('x-1', 't1')],
+        hasMore: false,
+        totalCount: 1,
+        requestBefore: 'e-5',
+      })
+    })
+    expect(result.current.loadingMore).toBe(false)
+    // s1's window is untouched.
+    expect(result.current.hasMore).toBe(true)
+    vi.unstubAllGlobals()
   })
 })

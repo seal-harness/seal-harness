@@ -6,16 +6,21 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (catch, IOException)
 import System.Timeout (timeout)
 import Data.Aeson (object, (.=))
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Text qualified as T
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
-import Network.WebSockets (ClientApp, runClient, receiveData, ConnectionException)
+import Network.HTTP.Types (status404)
+import Network.Wai (Application, responseLBS)
+import Network.Wai.Handler.Warp (run)
+import Network.WebSockets (ClientApp, Connection, runClient, receiveData, ConnectionException)
 import Test.Hspec
 
 import Seal.Config.Paths (SealPaths(..))
 import Seal.Gateway.Stream
+import Seal.Gateway.Transcript (ReadLimit (..))
 import Seal.Gateway.StreamBroker
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FreePort (withFreePort)
@@ -41,10 +46,14 @@ withTimeout act =
 -- the client against it. Tolerates a bind failure (e.g. a transient
 -- port-take race) by skipping with 'pendingWith' instead of crashing the
 -- suite.
+--
+-- The server is the gateway app WITH the WS stream mounted (the
+-- single-port arrangement), so these tests exercise the same path
+-- production uses: an HTTP listener that also serves the WS upgrade.
 withStreamServer :: StreamGuard -> StreamBroker -> (Int -> ClientApp ()) -> IO ()
 withStreamServer guard broker clientApp =
   withFreePort $ \port -> do
-    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
+    _ <- forkIO (run port (streamAppWithFallback guard broker))
     threadDelay 200000  -- wait for the server to bind
     withTimeout (runClient "127.0.0.1" port "/" (clientApp port))
       `catch` \(e :: IOException) ->
@@ -52,17 +61,39 @@ withStreamServer guard broker clientApp =
       `catch` \(_ :: ConnectionException) ->
         pendingWith "client connection closed unexpectedly"
 
+-- | The WS middleware mounted on an HTTP application — the production
+-- arrangement (one port serving both).
+streamAppWithFallback :: StreamGuard -> StreamBroker -> Application
+streamAppWithFallback guard broker =
+  streamMiddleware guard broker (\_req respond -> respond (responseLBS status404 [] "not found"))
+
 -- | Extract a field from a JSON object (for assertions).
 jsonField :: T.Text -> A.Value -> Maybe A.Value
 jsonField key (A.Object o) = KeyMap.lookup (Key.fromText key) o
 jsonField _ _ = Nothing
+
+-- | Read frames until one of them is an application-level heartbeat (the
+-- @hello@ and initial @lists@ frames precede it), or give up after
+-- @maxFrames@. Returns the heartbeat frame when one arrives.
+firstHeartbeat :: Connection -> Int -> IO (Maybe A.Value)
+firstHeartbeat conn = go
+  where
+    go :: Int -> IO (Maybe A.Value)
+    go 0 = pure Nothing
+    go n = do
+      raw <- receiveData conn :: IO BL.ByteString
+      case A.decode raw :: Maybe A.Value of
+        Just v
+          | jsonField "type" v == Just (A.String "heartbeat") -> pure (Just v)
+          | otherwise -> go (n - 1)
+        Nothing -> go (n - 1)
 
 spec :: Spec
 spec = describe "Seal.Gateway.Stream" $ do
   it "a client connects and receives hello with protocolVersion + serverStartedAt" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
     withStreamServer guard broker $ \_port conn -> do
       hello <- receiveData conn :: IO BL.ByteString
       case A.decode hello :: Maybe A.Value of
@@ -79,7 +110,7 @@ spec = describe "Seal.Gateway.Stream" $ do
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
     withStreamServer guard broker $ \_port conn -> do
       _hello <- receiveData conn :: IO BL.ByteString
       _lists <- receiveData conn :: IO BL.ByteString
@@ -89,6 +120,23 @@ spec = describe "Seal.Gateway.Stream" $ do
       case A.decode msg :: Maybe A.Value of
         Just _ -> pure ()
         Nothing -> error "expected an event JSON"
+
+  it "sends an application-level heartbeat frame so an idle connection is visibly alive" $ do
+    -- Protocol-level PING frames (withPingThread) are answered by the
+    -- browser's WebSocket implementation and NEVER surface to
+    -- `WebSocket.onmessage`. A JS client therefore cannot observe them, and
+    -- would treat a healthy idle connection as dead — the frontend's 90s
+    -- watchdog force-reconnects, which the transcript view shows as a
+    -- periodic redraw (connection banner + re-render). The data-level
+    -- heartbeat below is the frame the browser CAN observe.
+    broker <- newStreamBroker 10
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 1, sgAccessControl = Nothing }
+    withStreamServer guard broker $ \_port conn -> do
+      frame <- firstHeartbeat conn 6
+      case frame of
+        Just v -> jsonField "type" v `shouldBe` Just (A.String "heartbeat")
+        Nothing -> expectationFailure "expected a {\"type\":\"heartbeat\"} frame"
 
   it "FocusOp parses the since field" $ do
     let msg = A.encode (object ["op" .= ("focus" :: T.Text), "sessionId" .= ("sess-1" :: T.Text), "since" .= ("entry-5" :: T.Text)])
@@ -342,3 +390,79 @@ spec = describe "Seal.Gateway.Stream" $ do
           hasMore = totalCount > limit
       chunk `shouldBe` ([] :: [A.Value])
       hasMore `shouldBe` False
+
+  -- ── request-entries chunk planning (production decision path) ─────────
+  --
+  -- The scroll-to-top bug lived here: a `before` cursor read only the last
+  -- `limit * 3` entries, so once the cursor walked past that window
+  -- `entriesBeforeId` missed it and `hasMore` was computed inside the
+  -- truncated window. These tests exercise the same pure value the handler
+  -- uses, and then the handler core with an injected reader/sink so the
+  -- production path (read mode + shaping) is pinned without a socket.
+  describe "request-entries chunk planning" $ do
+    let mkEntries :: [Int] -> [A.Value]
+        mkEntries = map (\i -> A.object [Key.fromText "id" .= T.pack ("e" <> show i)])
+        full = mkEntries [0..999]
+
+    it "reads the whole transcript for a before cursor" $ do
+      readLimitFor (Just "e5") 50 `shouldBe` ReadAll
+      readLimitFor (Just "__beginning__") 50 `shouldBe` ReadFirstN 50
+      readLimitFor Nothing 50 `shouldBe` ReadLastN 50
+
+    it "returns a full page with hasMore=True for a cursor in the middle" $ do
+      let (chunk, hasMore) = shapeChunk (Just "e100") 50 1000 full
+      chunk `shouldBe` mkEntries [50..99]
+      hasMore `shouldBe` True
+
+    it "returns the first page with hasMore=False" $ do
+      let (chunk, hasMore) = shapeChunk (Just "e10") 50 1000 full
+      chunk `shouldBe` mkEntries [0..9]
+      hasMore `shouldBe` False
+
+    it "a partial backward page still reports hasMore=True" $ do
+      -- 100 entries before the cursor, limit 50: 50 remain unread.
+      let (chunk, hasMore) = shapeChunk (Just "e100") 50 1000 full
+      chunk `shouldBe` mkEntries [50..99]
+      hasMore `shouldBe` True
+
+    it "keeps the bounded windows for beginning/initial requests" $ do
+      let (beg, begMore) = shapeChunk (Just "__beginning__") 50 1000 (mkEntries [0..49])
+      beg `shouldBe` mkEntries [0..49]
+      begMore `shouldBe` True
+      let (tailChunk, tailMore) = shapeChunk Nothing 50 1000 (mkEntries [950..999])
+      tailChunk `shouldBe` mkEntries [950..999]
+      tailMore `shouldBe` True
+
+    it "a missing cursor yields an empty chunk with hasMore=False" $ do
+      shapeChunk (Just "nope") 50 1000 full `shouldBe` ([], False)
+
+    it "the handler core reads ReadAll and sends the planned frame" $ do
+      seenLimit <- newIORef (Nothing :: Maybe ReadLimit)
+      captured <- newIORef (Nothing :: Maybe (Int, Bool, Int, Maybe T.Text))
+      handleRequestEntriesCore
+        (\rlim -> do
+            writeIORef seenLimit (Just rlim)
+            pure (full, 1000))
+        (\chunk hasMore totalCount cursor ->
+            writeIORef captured (Just (length chunk, hasMore, totalCount, cursor)))
+        (Just "e100") 50
+      readIORef seenLimit `shouldReturn` Just ReadAll
+      readIORef captured `shouldReturn` Just (50, True, 1000, Just "e100")
+
+    it "the handler core reports the whole transcript for a short beginning read" $ do
+      captured <- newIORef (Nothing :: Maybe (Int, Bool))
+      handleRequestEntriesCore
+        (\_rlim -> pure (mkEntries [0..39], 40))
+        (\chunk hasMore _ _ -> writeIORef captured (Just (length chunk, hasMore)))
+        (Just "__beginning__") 50
+      readIORef captured `shouldReturn` Just (40, False)
+
+    it "the handler core keeps the bounded read for the initial chunk" $ do
+      seenLimit <- newIORef (Nothing :: Maybe ReadLimit)
+      handleRequestEntriesCore
+        (\rlim -> do
+            writeIORef seenLimit (Just rlim)
+            pure (mkEntries [950..999], 1000))
+        (\_ _ _ _ -> pure ())
+        Nothing 50
+      readIORef seenLimit `shouldReturn` Just (ReadLastN 50)

@@ -20,6 +20,8 @@ import Seal.Channels.Chat.Loop
   , defaultChatChannelConfig
   , newWatchState
   , newThinkingTabs
+  , newBgSessions
+  , newPendingAsks
   , handleServerEvent
   )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
@@ -197,7 +199,7 @@ spec = do
               , wcClose = pure ()
               }
         ss <- newStreamingState
-        conns <- newTVarIO (Map.singleton key (stubWs, ss))
+        conns <- newTVarIO (Map.singleton key (mkSid "stream", stubWs, ss))
         -- Fire 40 entry-updates back-to-back. Frame 1 carries 79 chars
         -- (creates the bubble); each subsequent frame adds 5 chars, so
         -- the TOTAL crosses 80 at frame 2 — but the NEW text per frame is
@@ -207,15 +209,16 @@ spec = do
                       { cccStreamCfg = defaultStreamProgressConfig }
             frameLen i = 79 + 5 * (i - 1)  -- frame i (1-based) total length
             frame i = streamingJsonFor (T.replicate (frameLen i) "x")
-        pendingAsks <- newTVarIO Map.empty
+        pendingAsks <- newPendingAsks
         tabTracker <- newTVarIO Map.empty
         watchState <- newWatchState
         thinkingTabs <- newThinkingTabs
+        bg <- newBgSessions
         -- Signal has ccSupportsStreaming = False, so entry-updates
         -- accumulate text WITHOUT sending intermediate edits. The text
         -- is delivered as a single message when the turn finalizes
         -- (idle or entry event).
-        mapM_ (handleServerEvent cfg ch key conns pendingAsks tabTracker watchState thinkingTabs (mkSid "stream")
+        mapM_ (handleServerEvent cfg ch key conns pendingAsks bg tabTracker watchState thinkingTabs (mkSid "stream")
                  . SeEntryUpdate (mkSid "stream") . frame)
               [1 .. 40]
         edits <- getEdits
@@ -223,7 +226,7 @@ spec = do
         length edits `shouldBe` 0
         -- Fire idle to finalize the turn — the accumulated text should
         -- be sent as a single new message.
-        handleServerEvent cfg ch key conns pendingAsks tabTracker watchState thinkingTabs (mkSid "stream")
+        handleServerEvent cfg ch key conns pendingAsks bg tabTracker watchState thinkingTabs (mkSid "stream")
           (SeActivity (mkSid "stream") (A.object ["kind" .= ("harness-status" :: T.Text), "status" .= ("idle" :: T.Text)]))
         sends <- getCaptured
         -- The final send carries the last frame's full text (274 chars).

@@ -691,7 +691,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           callback = putMVar resultMVar
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
@@ -713,7 +713,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           callback = putMVar resultMVar
           resolver _task = pure (Right ( undefined
                                         , recordingWorker ran))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsCompleted
@@ -726,7 +726,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       let cfg = defaultDelegationConfig
           callback = putMVar resultMVar
           resolver _task = pure (Left "agent def not found: nope")
-          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False Nothing)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
@@ -740,7 +740,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           crashingWorker :: Del.AgentWorkerBuilder
           crashingWorker _ _ _ _ = ioError (userError "boom")
           resolver _task = pure (Right (undefined, crashingWorker))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsError
@@ -758,7 +758,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             threadDelay 31000000  -- 31s, just over the 30s timeout
             pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, slowWorker))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       _ <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       result <- takeMVar resultMVar
       crStatus result `shouldBe` CsTimeout
@@ -772,7 +772,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           dummyWorker :: Del.AgentWorkerBuilder
           dummyWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           resolver _task = pure (Right (undefined, dummyWorker))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       eResult <- runDelegateAsync cfg pauseFlag Nothing 0 input resolver callback (\_ _ _ _ -> pure ()) (pure (mkSystemSessionId "child"))
       case eResult of
         Left err -> T.isInfixOf "paused" err `shouldBe` True
@@ -785,7 +785,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       concurrencyState <- newMVar (0 :: Int, 0 :: Int)
       let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
           callback = const (pure ())
-          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False Nothing
           tasks = [mkTask i | i <- [1..5 :: Int]]
           input = DiBatch tasks
           resolver _task = pure (Right (undefined, concurrencyTrackingWorker concurrencyState))
@@ -832,7 +832,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           resolver _task = pure (Right ( undefined
                                         , recordingWorker' "foreground done"
                                         , mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
       case eResult of
         Left err -> expectationFailure ("expected Right but got Left: " <> T.unpack err)
@@ -848,7 +848,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           crashingWorker :: Del.AgentWorkerBuilder
           crashingWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
           resolver _task = pure (Right (undefined, crashingWorker, mkSystemSessionId "child"))
-          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "a1" "do the thing" Nothing Nothing False Nothing)
       eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
       case eResult of
         Right [result] -> crStatus result `shouldBe` CsError
@@ -857,7 +857,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
     it "batch foreground mode returns results for all children" $ do
       pauseFlag <- newSpawnPauseFlag
       let cfg = defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
-          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False
+          mkTask i = Del.ChildTask "a1" ("task " <> T.pack (show i)) Nothing Nothing False Nothing
           tasks = [mkTask i | i <- [1..3 :: Int]]
           input = DiBatch tasks
           resolver _task = pure (Right ( undefined
@@ -872,7 +872,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       pauseFlag <- newSpawnPauseFlag
       let cfg = defaultDelegationConfig
           resolver _task = pure (Left "agent def not found: nope")
-          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False)
+          input = DiSingle (Del.ChildTask "nope" "do the thing" Nothing Nothing False Nothing)
       eResult <- runDelegate cfg pauseFlag Nothing 0 input resolver
       case eResult of
         Right [result] -> do

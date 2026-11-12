@@ -50,6 +50,20 @@ data PathError
 blockedNames :: [FilePath]
 blockedNames = [".env", ".ssh", ".gnupg", ".netrc", ".seal"]
 
+-- | Reject a path that *resolves* into a blocked location.
+--
+-- 'blockedNames' is checked against the path the caller asked for. That alone
+-- is not enough: a symlink whose own name is innocent can point inside
+-- @~\/.seal@, and the @AllowAbs@ variants canonicalise without re-checking, so
+-- an absolute path naming the link would come back as a valid 'SafePath' while
+-- the subsequent read or write follows it into the blocklist. Call this on
+-- every canonical path before returning it.
+blockedSegment :: FilePath -> Maybe PathError
+blockedSegment resolved
+  | any (`elem` blockedNames) (splitDirectories resolved) =
+      Just (PathIsBlocked (T.pack ("path resolves to a blocked location: " <> resolved)))
+  | otherwise = Nothing
+
 -- | Lexically collapse @.@ and @..@ segments without touching the filesystem.
 -- A @..@ removes the preceding ordinary segment; if there is none (or the
 -- predecessor is itself an un-collapsible @..@) the @..@ is retained, so an
@@ -223,11 +237,13 @@ mkSafePathAllowAbs (WorkspaceRoot root) requested = do
       canonResult <- try (canonicalizePath requested) :: IO (Either IOException FilePath)
       case canonResult of
         Left _ -> pure $ Left $ PathDoesNotExist requested
-        Right canon -> do
-          exists <- doesPathExist canon
-          if not exists
-            then pure $ Left $ PathDoesNotExist canon
-            else pure $ Right $ SafePath canon
+        Right canon -> case blockedSegment canon of
+          Just err -> pure (Left err)
+          Nothing -> do
+            exists <- doesPathExist canon
+            if not exists
+              then pure $ Left $ PathDoesNotExist canon
+              else pure $ Right $ SafePath canon
     resolveAndCheck rootDirs joined lexical = do
       canonResult <- try (canonicalizePath joined) :: IO (Either IOException FilePath)
       case canonResult of
@@ -283,7 +299,20 @@ mkSafePathForWriteAllowAbs (WorkspaceRoot root) requested = do
               parentExists <- doesPathExist canonParent
               if not parentExists
                 then pure $ Left $ PathDoesNotExist canonParent
-                else pure $ Right $ SafePath lexicalPath
+                else case blockedSegment canonParent of
+                  Just err -> pure (Left err)
+                  Nothing -> do
+                    -- Canonicalising the parent does not resolve a symlink that
+                    -- is the final component, so resolve the whole path before
+                    -- handing it back: a link into a blocked directory must not
+                    -- be writable through.
+                    canonFullResult <- try (canonicalizePath lexicalPath)
+                                         :: IO (Either IOException FilePath)
+                    case canonFullResult of
+                      Right canonFull -> case blockedSegment canonFull of
+                        Just err -> pure (Left err)
+                        Nothing  -> pure (Right (SafePath canonFull))
+                      Left _ -> pure $ Right $ SafePath lexicalPath
     resolveParentAndCheck rootDirs lexicalPath canonParent = do
       if not (rootDirs `isPrefixOf` splitDirectories canonParent)
         then pure $ Left $ PathEscapesWorkspace canonParent

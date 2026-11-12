@@ -17,6 +17,7 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..))
 import Seal.ISA.Opcode (BackendExec, localBackend)
 import Seal.ISA.Registry (Registry)
+import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tools.Exec.Abort (AbortFlag)
@@ -57,6 +58,15 @@ data AgentEnv = AgentEnv
     -- Looked up from a 'Seal.Tools.Exec.Abort.SessionAbortRegistry' by
     -- 'SessionId' (the web gateway has no 'AgentEnv' at the @/stop@ call
     -- site — the registry is the vehicle, design Blocker Resolution #2).
+  , aeRepeatTrack :: RepeatTrack
+    -- ^ The session's no-progress repeat window (session-read hardening
+    -- WU4). Sliding window of the last 'Seal.ISA.RepeatDetect.repeatWindowCapacity'
+    -- canonical keys for in-scope opcodes ('Seal.ISA.RepeatDetect.repeatScope'),
+    -- consulted by the loop's dispatch path: 2nd–3rd identical call warns
+    -- (a note is prepended to the result parts), ≥4th is blocked (the op is
+    -- never dispatched). Looked up per turn from the process-lifetime
+    -- 'Seal.ISA.RepeatDetect.SessionRepeatRegistry' (same journey as
+    -- 'aeAbortFlag'), so the window survives across turns.
   , aeToolTimeout :: ToolTimeoutConfig
     -- ^ The per-call timeout/retry config (default 120s, max 600s, 3
     -- retries, 2s base delay, 2.0 backoff, 50KB output cap). Loaded from
@@ -76,18 +86,26 @@ data AgentEnv = AgentEnv
     -- session is always created on the channel its messages arrive on).
     -- 'runTurn' stamps this into every request entry's @erMeta@ @channel@
     -- field so the frontend can attribute every user message to the
-    -- channel it came from. This is the single source of truth for channel
-    -- provenance — 'MessageSource' carries the finer-grained conversation
-    -- id + user id, but the channel label itself always comes from here.
+    -- channel it came from. When the turn carries a 'MessageSource' (a
+    -- chat channel), @requestMeta@ prefers its @msChannelKind@ and uses
+    -- this value only as the fallback (web/CLI, and turns with no source).
   , aeMessageSource :: Maybe MessageSource
     -- ^ The authenticated-transport identity of the inbound message this
     -- turn is answering. 'Nothing' for the CLI TUI and the web (which
     -- bypass 'MessageSource'); @'Just' ms@ for channels that carry one
-    -- (Signal, Telegram). 'runTurn' folds the 'msConversationId' into the
-    -- request 'EntryRecord's @erMeta@ @conversationId@ field. The
-    -- @channel@ field comes from 'aeChannel' (above), NOT from here, so
-    -- every channel — including those with no 'MessageSource' — is
-    -- attributed.
+    -- (Signal, Telegram). 'runTurn' stamps @msChannelKind@,
+    -- @msConversationId@, and (when present) @msUserId@ into the request
+    -- 'EntryRecord's @erMeta@ @channel@ / @conversationId@ / @userId@
+    -- fields, so every chat-channel message carries its channel name and
+    -- sender id.
+    --
+    -- It also attaches the same provenance to the user message itself
+    -- ('Seal.Providers.Class.msgOrigin'), which is persisted in the
+    -- @conversation.jsonl@ line — the file the model actually reads.
+    -- @erMeta@ only ever describes the CURRENT turn's arrival; the
+    -- per-message origin is what lets the agent tell several senders apart in
+    -- a group chat, because 'runTurn' renders each user message's tag into
+    -- the provider request ('Seal.Transcript.Origin.annotateOrigins').
   , aeAutonomy :: AutonomyLevel
     -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
     -- human-confirmation gate for Untrusted opcodes (they run immediately after
@@ -218,6 +236,11 @@ data TurnEnv = TurnEnv
   , teOnToolCall    :: OpName -> Value -> IO ()
   , teOnTextDelta   :: Maybe (Text -> IO ())
   , teAbortFlag     :: AbortFlag
+  , teRepeatTrack   :: RepeatTrack
+    -- ^ The session's no-progress repeat window (WU4). Looked up from the
+    -- process-lifetime registry by 'SessionId' each turn (mirrors
+    -- 'teAbortFlag'), so identical session reads across turns count
+    -- against the same window.
   , teToolTimeout   :: ToolTimeoutConfig
   }
 
@@ -257,5 +280,6 @@ mkSessionAgentEnv te = AgentEnv
   , aeOnDemandSchemas = teOnDemand te
   , aeLogPath    = teLogPath te
   , aeAbortFlag  = teAbortFlag te
+  , aeRepeatTrack = teRepeatTrack te
   , aeToolTimeout = teToolTimeout te
   }

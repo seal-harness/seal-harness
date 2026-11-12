@@ -78,9 +78,11 @@ openApiMeta :: SealRoute caps qrys req resp
                      caps qrys req resp
 openApiMeta = \case
   RouteHealth -> api (match "health" ./ end) qend bodyless (resp (one openApiJsonBody)) M.get
+  RouteCommands -> api (match "commands" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteTabsList -> api (match "tabs" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteTabsNew -> api (match "tabs" ./ match "new" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteTabsClose -> api (match "tabs" ./ capture oaTabIndex ./ match "close" ./ end) qend bodyless (resp (one ffBody)) M.post
+  RouteTabsRename -> api (match "tabs" ./ capture oaTabIndex ./ match "rename" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteTabsDismiss -> api (match "tabs" ./ capture oaTabIndex ./ match "dismiss" ./ end) qend bodyless (resp (one ffBody)) M.post
   RouteTabsAcknowledge -> api (match "tabs" ./ capture oaTabIndex ./ match "acknowledge" ./ end) qend bodyless (resp (one ffBody)) M.post
   RouteTabsRelease -> api (match "tabs" ./ capture oaTabIndex ./ match "release" ./ end) qend bodyless (resp (one ffBody)) M.post
@@ -132,11 +134,19 @@ openApiMeta = \case
   RouteProviderDelete -> api (match "providers" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteProviderDefaultGet -> api (match "providers" ./ match "default" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProviderDefaultPut -> api (match "providers" ./ match "default" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteChannelsList -> api (match "channels" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteChannelCreate -> api (match "channels" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteChannelUpdate -> api (match "channels" ./ capture oaText ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteChannelDelete -> api (match "channels" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteUiStateGet -> api (match "ui" ./ match "state" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteUiStatePut -> api (match "ui" ./ match "state" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
   RouteUiCustomModels -> api (match "ui" ./ match "custom-models" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteUiRepos -> api (match "ui" ./ match "repos" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteAdopt -> api (match "adopt" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteSetupState -> api (match "setup" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteSetupVault -> api (match "setup" ./ match "vault" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteSetupVaultReopen -> api (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteProviderTest -> api (match "providers" ./ capture oaText ./ match "test" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
 
 -- | Prefix a path with @match "api"@ so the rendered OpenAPI paths include the
 -- @\/api@ prefix the client sees (the gateway strips it before dispatching to

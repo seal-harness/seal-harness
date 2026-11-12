@@ -27,6 +27,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     model: 'claude-sonnet-4',
     setModel: vi.fn(),
     models: [{ name: 'claude-sonnet-4', contextWindow: 200000 }],
+    modelOptions: ['claude-sonnet-4'],
     modelsLoading: false,
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),
@@ -34,6 +35,8 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     repo: '',
     setRepo: vi.fn(),
     repoOptions: [], refreshRepos: () => {},
+    repoBranch: '',
+    setRepoBranch: vi.fn(),
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
@@ -77,6 +80,25 @@ describe('NewSessionComposer', () => {
     expect(screen.queryByText('AI Provider')).toBeNull()
     expect(screen.queryByText('New Harness')).toBeNull()
     expect(screen.queryByText('Existing Harness')).toBeNull()
+  })
+
+  it('shows only configured providers in the provider dropdown', () => {
+    render(
+      <NewSessionComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', configured: true }),
+            makeProvider({ name: 'openrouter', configured: false }),
+          ],
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const values = Array.from(sel.options).map((o) => o.value)
+    expect(values).toContain('anthropic')
+    expect(values).not.toContain('openrouter')
   })
 
   it('fires onSubmit with the createBareSession response on submit', async () => {

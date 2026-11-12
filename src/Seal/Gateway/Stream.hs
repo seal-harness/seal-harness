@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The WebSocket stream endpoint. Runs on a separate port from the REST +
--- static WARP server (the @wai-app-websockets@ bridge isn't available; a
--- separate port is the clean 7a path). Every connection is gated by the
+-- | The WebSocket stream endpoint. Mounted INSIDE the REST + static WARP
+-- server, so the stream shares the gateway's port. Every connection is
+-- gated by the
 -- Origin allowlist + the broker's global cap. The wire protocol: on
 -- connect, a one-shot @hello@ (carrying @protocolVersion@ +
 -- @serverStartedAt@ so the client can detect server restarts); then a
@@ -13,9 +13,16 @@
 -- @entry@ events, then sends a @replay-end@ event so the client transitions
 -- from @replaying@ back to @live@. This closes the gap: entries broadcast
 -- while the WS was disconnected are no longer permanently lost.
+--
+-- Every connection also carries two keep-alives at the same interval: a
+-- protocol-level PING (invisible to browser JavaScript) and an
+-- application-level @heartbeat@ data frame (see 'heartbeatLoop').
 module Seal.Gateway.Stream
-  ( runStreamServer
+  ( streamMiddleware
   , StreamGuard (..)
+  , StreamHealth (..)
+  , streamHealthStatus
+  , streamHealthMessage
   , FocusOp (..)
   , handleRequestEntries
   , RequestEntriesOp (..)
@@ -24,11 +31,16 @@ module Seal.Gateway.Stream
   , extractId
   , entriesBeforeId
   , clampLimit
+  , readLimitFor
+  , shapeChunk
+  , handleRequestEntriesCore
   , sendErrorFrame
   ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (concurrently_)
 import Control.Exception (SomeException, catch)
-import Control.Monad (forever, forM_)
+import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
@@ -39,9 +51,13 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
+import Network.HTTP.Types (status401)
+import Network.Wai
+  ( Application, responseLBS )
+import Network.Wai.Handler.WebSockets (isWebSocketsReq, websocketsOr)
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
-  , withPingThread, sendClose, Connection )
+  , withPingThread, sendClose, Connection, defaultConnectionOptions )
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
@@ -52,11 +68,46 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
 import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso, ReadLimit (..))
+import Seal.Gateway.AccessControl
+  ( AccessControlHandle, AuthDecision (..), accessControlAuthorize )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
 
 import Seal.Gateway.Types.Stream (FocusOp (..), RequestEntriesOp (..), ClientMessage (..))
+
+-- | The liveness of the WebSocket stream server, as reported by
+-- @\/api\/health@. The health endpoint used to report the CONFIGURED
+-- @ws_port@ unconditionally, so a server whose WS had failed to bind
+-- (port already in use) still advertised the dead port and the frontend
+-- connected to a non-WebSocket port and froze. The status is now derived
+-- from what actually happened at bind time.
+data StreamHealth = StreamHealth
+  { shStatus :: Text
+    -- ^ @\"starting\"@ (bind not yet attempted), @\"up\"@ (bound and
+    -- accepting), @\"failed\"@ (the bind failed).
+  , shPort  :: Int
+    -- ^ The port the server was asked to bind.
+  } deriving stock (Eq, Show)
+
+-- | The status string of a 'StreamHealth', as surfaced in @\/api\/health@.
+streamHealthStatus :: StreamHealth -> Text
+streamHealthStatus = shStatus
+
+-- | A human-readable, actionable description of a 'StreamHealth'. For a
+-- failed bind this names the port so the operator can see WHICH port
+-- collided — the whole point of reporting the failure.
+streamHealthMessage :: StreamHealth -> Text
+streamHealthMessage h =
+  case shStatus h of
+    "up"      -> "WebSocket stream server listening on port " <> tshow (shPort h)
+    "failed"  -> "WebSocket stream server FAILED to bind port " <> tshow (shPort h)
+                  <> " (port already in use?) — live transcript updates are unavailable"
+    "down"    -> "WebSocket stream server is not running"
+    _         -> "WebSocket stream server is starting on port " <> tshow (shPort h)
+  where
+    tshow :: Int -> Text
+    tshow = T.pack . show
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 -- Also carries the TabsHandle + SealPaths so the stream can send an
@@ -67,13 +118,54 @@ data StreamGuard = StreamGuard
   , sgGlobalCap :: Int
   , sgTabsHandle :: TabsHandle
   , sgPaths :: SealPaths
+  -- | Interval in SECONDS for the connection keep-alives: the protocol-level
+  -- PING ('withPingThread') and the application-level @{"type":"heartbeat"}@
+  -- data frame. The protocol ping keeps intermediaries and dead-peer
+  -- detection honest; the data frame is the only one a browser's JavaScript
+  -- can observe (see 'heartbeatLoop'). Production uses 30s — comfortably
+  -- inside the frontend's 90s watchdog. Tests override it to keep the suite
+  -- fast, or raise it to keep heartbeat frames out of unrelated assertions.
+  , sgHeartbeatSeconds :: Int
+  -- | The access-control handle, when the gateway has one. A handshake is
+  -- rejected before the upgrade when 'accessControlAuthorize' says no, so a
+  -- browser without a session never gets a live transcript stream (design §7
+  -- "WebSocket"). 'Nothing' (tests, access control unwired) skips the check.
+  , sgAccessControl :: Maybe AccessControlHandle
   }
 
--- | Run the WebSocket stream server on the given port. Blocks (run in a
--- forked thread from @seal serve@).
-runStreamServer :: Text -> Int -> StreamGuard -> StreamBroker -> IO ()
-runStreamServer host port guard broker =
-  WS.runServer (T.unpack host) port (streamApp guard broker)
+-- | The WebSocket stream endpoint, as a WAI middleware.
+--
+-- The WS server is mounted INSIDE the HTTP server, so the stream shares
+-- the gateway's port. This removes the second listener entirely: the old
+-- two-port split existed only because @wai-app-websockets@ (now
+-- @wai-websockets@) was missing from the nix snapshot when the split was
+-- chosen in 2026-07. With the bridge available, one port means one bind,
+-- one thing to go wrong -- and no chance of the WS silently dying while
+-- HTTP kept serving.
+--
+-- Non-WebSocket requests fall through to the supplied backup application,
+-- so this can wrap the whole gateway app.
+streamMiddleware
+  :: StreamGuard
+  -> StreamBroker
+  -> Application
+  -> Application
+streamMiddleware guard broker backup = \req respond ->
+  if isWebSocketsReq req
+    then case sgAccessControl guard of
+      Nothing -> wsApp req respond
+      Just access -> do
+        decision <- accessControlAuthorize access req
+        if decision == AuthAllow
+          then wsApp req respond
+          else do
+            globalLogIO InfoS "[ws] rejected handshake: access control"
+            respond (responseLBS status401
+                      [("Content-Type", "application/json"), ("Cache-Control", "no-store")]
+                      "{\"error\":\"a passkey session is required\",\"code\":\"unauthenticated\"}")
+    else backup req respond
+  where
+    wsApp = websocketsOr defaultConnectionOptions (streamApp guard broker) backup
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.
@@ -149,7 +241,14 @@ streamApp guard broker pending = do
       -- Without this, the snapshot is broadcast to zero subscribers, the
       -- frontend never flips wsLive, and REST /api/lists polling stays on.
       broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
-      withPingThread conn 30 (pure ()) $ do
+      -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
+      -- so intermediaries and dead-peer detection stay honest, and the
+      -- application-level heartbeat frame ('heartbeatLoop') because that is
+      -- the only one a browser's JavaScript can observe. The heartbeat is
+      -- cancelled as soon as the reader loop ends (peer closed), so it never
+      -- outlives the connection.
+      let hbSeconds = sgHeartbeatSeconds guard
+      withPingThread conn hbSeconds (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
               case A.decode msg :: Maybe ClientMessage of
@@ -167,7 +266,30 @@ streamApp guard broker pending = do
                 Just (CmRequestEntries reqOp) ->
                   handleRequestEntries conn (sgPaths guard) reqOp
                 Nothing -> sendErrorFrame conn "unknown op"
-        readerLoop `catch` \(_e :: SomeException) -> pure ()
+        concurrently_
+          (heartbeatLoop conn hbSeconds)
+          (readerLoop `catch` \(_e :: SomeException) -> pure ())
+
+-- | Push a content-free @{"type":"heartbeat"}@ frame every
+-- @intervalSeconds@ for as long as the connection lives.
+--
+-- WebSocket PING frames ('withPingThread') are answered below the browser's
+-- JavaScript API: `WebSocket.onmessage` never fires for them. A client that
+-- watches data frames — as ours does — therefore cannot distinguish a
+-- healthy idle connection from a dead one, and tears it down once its
+-- watchdog expires. On the web that showed up as a periodic redraw of the
+-- transcript view: the "reconnecting" banner appearing, the chat
+-- re-rendering, and the sidebar refreshing, roughly every 90 seconds of
+-- idleness. This frame is the keep-alive the browser can actually observe.
+-- It carries no state, so clients must not re-render on it.
+--
+-- A failed send (peer went away) is swallowed: the reader loop notices the
+-- closed connection promptly and cancels this thread.
+heartbeatLoop :: Connection -> Int -> IO ()
+heartbeatLoop conn intervalSeconds = forever $ do
+  threadDelay (max 1 intervalSeconds * 1_000_000)
+  sendTextData conn (A.encode (object [ "type" .= ("heartbeat" :: Text) ]))
+    `catch` \(_e :: SomeException) -> pure ()
 
 -- | Replay transcript entries after the given entry id, then send a
 -- @replay-end@ event so the client transitions from @replaying@ to @live@.
@@ -259,6 +381,55 @@ extractId v = case v of
     _                 -> ""
   _ -> ""
 
+-- | How much of the transcript to read for a request-entries op.
+--
+-- A @before@ cursor must read the WHOLE transcript: the cursor can be
+-- arbitrarily far from the tail, and truncating the read makes
+-- 'entriesBeforeId' miss the cursor (empty chunk) or makes 'hasMore' lie
+-- (a partial page reports "no entries before me"). That lie is what
+-- stranded the frontend's scroll-to-top button. The initial and
+-- @__beginning__@ requests keep their bounded reads.
+readLimitFor :: Maybe Text -> Int -> ReadLimit
+readLimitFor mBefore limit = case mBefore of
+  Nothing              -> ReadLastN limit
+  Just "__beginning__" -> ReadFirstN limit
+  Just _               -> ReadAll
+
+-- | Shape the read window into the chunk to send.
+--
+-- For a @before@ cursor the window must be the full transcript (see
+-- 'readLimitFor'); 'hasMore' then means "entries exist before this chunk"
+-- and is independent of any count. For the initial and @__beginning__@
+-- requests the bounded window is already the chunk, and 'totalCount' (a
+-- conservative upper bound) decides whether anything remains.
+shapeChunk :: Maybe Text -> Int -> Int -> [A.Value] -> ([A.Value], Bool)
+shapeChunk mBefore limit totalCount window = case mBefore of
+  Nothing -> (window, totalCount > limit)
+  Just before
+    | before == "__beginning__" -> (take limit window, totalCount > limit)
+    | otherwise -> case entriesBeforeId before window of
+        Just beforeEntries ->
+          ( drop (max 0 (length beforeEntries - limit)) beforeEntries
+          , length beforeEntries > limit
+          )
+        Nothing -> ([], False)
+
+-- | Testable core of 'handleRequestEntries'. The caller supplies the reader
+-- (which must honour the 'ReadLimit') and the frame sink, so the production
+-- decision path — read mode plus chunk shaping — is exercised by tests
+-- without a live WebSocket connection.
+handleRequestEntriesCore
+  :: (ReadLimit -> IO ([A.Value], Int))
+  -> ([A.Value] -> Bool -> Int -> Maybe Text -> IO ())
+  -> Maybe Text
+  -> Int
+  -> IO ()
+handleRequestEntriesCore readEntries sendChunk mBefore limit = do
+  putStrLn $ "[ws] request-entries: limit=" <> show limit <> " mBefore=" <> show mBefore
+  (window, totalCount) <- readEntries (readLimitFor mBefore limit)
+  let (chunk, hasMore) = shapeChunk mBefore limit totalCount window
+  sendChunk chunk hasMore totalCount mBefore
+
 -- | Handle a @request-entries@ op: read the transcript from disk, slice it
 -- to the requested chunk, and send an @entries-chunk@ event. Includes a
 -- catch handler so a corrupt/missing transcript sends an error frame
@@ -268,60 +439,34 @@ handleRequestEntries :: Connection -> SealPaths -> RequestEntriesOp -> IO ()
 handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
   case mkSessionId sidTxt of
     Left _ -> sendErrorFrame conn "invalid session id"
-    Right sid -> do
-      let go = do
-            mMeta <- loadSessionMeta paths sid
-            let model = maybe "" smModel mMeta
-                fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-                limit = clampLimit mLimit
-            putStrLn $ "[ws] handleRequestEntries: limit=" <> show limit <> " mBefore=" <> show mBefore
-            -- Use the paginated read to avoid loading all entries into
-            -- memory. For the initial chunk (mBefore == Nothing), read
-            -- only the last `limit` entries. For before/id pagination,
-            -- read a wider window. For __beginning__, we need the FIRST
-            -- entries — use ReadFirstN to read only the first `limit`
-            -- entries instead of loading the entire transcript.
-            (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
-              (case mBefore of
-                Nothing              -> ReadLastN limit
-                Just "__beginning__" -> ReadFirstN limit
-                Just _               -> ReadLastN (limit * 3))
-            -- totalCount comes from the timings (full entry count before
-            -- limiting), NOT from length allEntries (which is the limited count).
-            let totalCount = ttEntryCount tt
-                (chunk, hasMore) = case mBefore of
-                  Nothing ->
-                    -- allEntries already contains only the last `limit`
-                    -- entries; the chunk is all of them, hasMore = totalCount > limit
-                    (allEntries, totalCount > limit)
-                  Just before ->
-                   if before == "__beginning__"
-                     -- allEntries already contains only the first `limit`
-                     -- entries (ReadFirstN); no take needed.
-                     then (allEntries, totalCount > limit)
-                     else
-                    case entriesBeforeId before allEntries of
-                      Just beforeEntries ->
-                        let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries
-                            hasMoreBefore = length beforeEntries > limit
-                        in (taken, hasMoreBefore)
-                      Nothing -> ([], False)
-            sendTextData conn (A.encode (A.object
-              [ "type" A..= ("entries-chunk" :: Text)
-              , "sessionId" A..= sidTxt
-              , "entries" A..= chunk
-              , "hasMore" A..= hasMore
-              , "totalCount" A..= totalCount
-              , "requestBefore" A..= mBefore
-              ]))
-      go `catch` \(e :: SomeException) -> do
-        globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
-        sendTextData conn (A.encode (A.object
-          [ "type" A..= ("entries-chunk" :: Text)
-          , "sessionId" A..= sidTxt
-          , "entries" A..= ([] :: [A.Value])
-          , "requestBefore" A..= mBefore
-          ]))
+    Right sid ->
+      handleRequestEntriesCore (readEntries sid) sendChunk
+        mBefore (clampLimit mLimit)
+        `catch` \(e :: SomeException) -> do
+          globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
+          sendTextData conn (A.encode (A.object
+            [ "type" A..= ("entries-chunk" :: Text)
+            , "sessionId" A..= sidTxt
+            , "entries" A..= ([] :: [A.Value])
+            , "requestBefore" A..= mBefore
+            ]))
+  where
+    readEntries sid rlim = do
+      mMeta <- loadSessionMeta paths sid
+      let model = maybe "" smModel mMeta
+          fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
+      (entries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid rlim
+      pure (entries, ttEntryCount tt)
+
+    sendChunk chunk hasMore totalCount before =
+      sendTextData conn (A.encode (A.object
+        [ "type" A..= ("entries-chunk" :: Text)
+        , "sessionId" A..= sidTxt
+        , "entries" A..= chunk
+        , "hasMore" A..= hasMore
+        , "totalCount" A..= totalCount
+        , "requestBefore" A..= before
+        ]))
 
 -- | Return entries before the entry with id @before@ (exclusive).
 -- Returns 'Nothing' when the id is not found (distinct from

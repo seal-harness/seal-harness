@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.ISA.DispatchSpec (spec) where
 
 import Data.Default (def)
@@ -20,7 +21,8 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types
-import Seal.Handles.Transcript (IndexedTranscriptHandle (..), fakeIndexedTranscript)
+import Seal.Handles.Transcript
+  ( IndexedTranscriptHandle (..), emptyTranscriptDiagnostics, fakeIndexedTranscript )
 import Seal.ISA.Dispatch
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Shell (shellExecSchema)
@@ -31,7 +33,7 @@ import Seal.Channel.Caps
 import Seal.Handles.AskReply
   ( AskReply (..), ApprovalScope (..), askHuman
   , deliverAnswer, newAskReplyStore, pendingForSession, pqiId )
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), pattern Message, Role (..), ToolResultPart (..))
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -63,6 +65,8 @@ probe ref tl =
       , itwSetSecretOps    = \_ -> pure ()
       , itwCloseTranscript = pure ()
       , itwIsAlive         = pure True
+      , itwDiagnostics     = pure emptyTranscriptDiagnostics
+      , itwRecordedLength  = pure 0
       }
   , mkProbeOpcode ref tl
   )
@@ -79,6 +83,8 @@ probeHandle ref =
     , itwSetSecretOps    = \_ -> pure ()
     , itwCloseTranscript = pure ()
     , itwIsAlive         = pure True
+    , itwDiagnostics     = pure emptyTranscriptDiagnostics
+    , itwRecordedLength  = pure 0
     }
 
 mkProbeOpcode :: IORef [String] -> TrustLevel -> Opcode

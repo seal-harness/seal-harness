@@ -9,6 +9,8 @@ import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
+import { AccessView } from './components/AccessView'
+import { ChannelsView } from './components/ChannelsView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
@@ -64,10 +66,12 @@ function sectionFromPath(): TopSection {
   if (typeof window === 'undefined') return 'sessions'
   const path = window.location.pathname
   if (path === '/providers' || path.startsWith('/providers/')) return 'providers'
+  if (path === '/channels' || path.startsWith('/channels/')) return 'channels'
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
+  if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
 
@@ -163,6 +167,12 @@ interface SlashBubble {
   text: string
   at: number       // send seq (ordering among multiple slash bubbles)
   insertAt: number // transcript-messages length when the response arrived
+  /** Header title of the bubble: "Command output" for a slash command, or
+   *  "Answer" for an ASK_HUMAN answer the gateway consumed (kind:"answer"). */
+  title: string
+  /** The muted italic tag after the title. Both kinds are ephemeral: they
+   *  never enter the transcript and vanish on reload. */
+  label: string
 }
 
 // ── App ──────────────────────────────────────────────────────────────────
@@ -355,11 +365,11 @@ export default function App() {
   // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
   // fetch on every tab click). The `loading` flag and `refresh` action
   // are exposed by the stream hook.
- const { entries: streamEntries, pendingQuestions, loading, refresh, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest } = useTranscriptStream(currentSessionId)
+ const { entries: streamEntries, pendingQuestions, loading, hasMore, loadingMore, loadOlder, loadFromBeginning, loadLatest, isViewingLatest, status: streamStatus, lastError: streamError, reconnectAttempts: streamReconnectAttempts, reconnectNow: streamReconnectNow } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
-  const { send, sending, resetSending } = useSendMessage(currentSessionId, refresh)
+  const { send, sending, resetSending } = useSendMessage(currentSessionId)
 
   // ── Pending optimistic message + slash bubbles ────────────────────────
   const [pendingMessage, setPendingMessage] = useState<string | null>(null)
@@ -558,9 +568,16 @@ export default function App() {
   // A `kind:"slash"` send response adds no transcript entry: render a
   // transient bubble and clear the optimistic spinner. When the slash
   // command mints a fresh session (e.g. /new), `session_id` is set and the
-  // SPA navigates to it so the new session becomes the focused one. Any
-  // other kind falls through to the transcript-driven clear path. Returns
-  // true when the caller must NOT keep a pending spinner.
+  // SPA navigates to it so the new session becomes the focused one.
+  //
+  // `kind:"answer"` needs the same treatment for the same reason: the
+  // backend consumed the message as the reply to a pending ASK_HUMAN
+  // question and started no turn, so the transcript-driven clear below
+  // would never fire and the message would sit in a permanent "thinking"
+  // state. The response carries a ready-made `✓ <answer>` confirmation.
+  //
+  // Any other kind falls through to the transcript-driven clear path.
+  // Returns true when the caller must NOT keep a pending spinner.
   // Ref that mirrors the current transcript-messages count so
   // `handleSendResult` can capture the insert position for a slash bubble
   // without adding `transcriptMessages` to its dependency array (which
@@ -569,8 +586,16 @@ export default function App() {
   const transcriptMsgCountRef = useRef(0)
 
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
-    if (res && res.kind === 'slash') {
-      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
+    if (res && (res.kind === 'slash' || res.kind === 'answer')) {
+      const isAnswer = res.kind === 'answer'
+      setSlashBubbles((b) => [...b, {
+        id: `slash-${seq}`,
+        text: res.response,
+        at: seq,
+        insertAt: transcriptMsgCountRef.current,
+        title: isAnswer ? 'Answer' : 'Command output',
+        label: isAnswer ? 'sent as the answer — not saved' : 'command output — not saved',
+      }])
       setPendingMessage(null)
       setPendingMessageModel(null)
       // /new swaps the backend's active session; navigate the SPA to it so
@@ -688,11 +713,12 @@ export default function App() {
       const idx = Math.min(sb.insertAt + offset, merged.length)
       merged.splice(idx, 0, {
         id: sb.id,
-        agentName: 'Command output',
+        agentName: sb.title,
         agentStatus: 'idle' as const,
         timestamp: now,
         blocks: [{ id: sb.id + '-text', text: sb.text }],
         slashBubble: true,
+        slashBubbleLabel: sb.label,
       })
       offset++
     }
@@ -1008,6 +1034,8 @@ export default function App() {
       <TopBar section={section} onSectionChange={handleSectionChange} />
       {section === 'providers' ? (
         <ProvidersView />
+      ) : section === 'channels' ? (
+        <ChannelsView />
       ) : section === 'agents' ? (
         <AgentsView />
       ) : section === 'skills' ? (
@@ -1016,6 +1044,8 @@ export default function App() {
         <ReposView />
       ) : section === 'secrets' ? (
         <SecretsView />
+      ) : section === 'access' ? (
+        <AccessView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar
@@ -1060,6 +1090,10 @@ export default function App() {
             <ChatArea
               selectedAgent={displayAgent ?? DEFAULT_AGENT}
               selectedSession={selectedSession}
+              streamStatus={streamStatus}
+              streamError={streamError}
+              streamReconnectAttempts={streamReconnectAttempts}
+              onStreamReconnect={streamReconnectNow}
               onSetDescription={handleSetDescription}
               messages={messages}
               loading={loading}

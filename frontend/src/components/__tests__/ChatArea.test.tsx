@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
+import { WS_RECONNECT_ALERT_THRESHOLD } from '../../types/stream'
+import type { StreamStatus } from '../../types/stream'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -43,6 +45,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: null,
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
     ...overrides,
@@ -277,7 +280,7 @@ describe('transcriptToMessages', () => {
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
-  it('renders a new System Prompt row when the value changes between turns', () => {
+  it('renders the System Prompt row only once, at the top of the session', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -294,8 +297,8 @@ describe('transcriptToMessages', () => {
         raw: '{}',
       }),
       // Second request: system CHANGED to 'sys-B'; tools unchanged (omitted
-      // by the backend's delta encoding, but we include them here for the
-      // test since the dedup is purely content-based).
+      // by the backend's delta encoding, but we include them here so the
+      // test covers the changed-value case).
       makeEntry({
         id: 'c3',
         direction: 'request',
@@ -304,15 +307,17 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    // Two distinct system prompts → two rows; identical tools → one row.
-    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(2)
+    // The session preamble is rendered ONCE, by the first LLM request —
+    // a mid-session change does NOT add a second System Prompt row
+    // half-way down the conversation (that row used to pop up at the
+    // bottom of a long session the moment the user hit enter).
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
-    // The first System Prompt row appears before the second.
+    // The System Prompt row carries the FIRST request's system prompt.
     const sysRows = msgs.filter((m) => m.agentName === 'System Prompt')
+    expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
+    // The System Prompt row appears before the first user message.
     const firstIdx = msgs.indexOf(sysRows[0]!)
-    const secondIdx = msgs.indexOf(sysRows[1]!)
-    expect(firstIdx).toBeLessThan(secondIdx)
-    // The first System Prompt row appears before the first user message.
     const userIdx = msgs.findIndex((m) => m.agentName === 'You')
     expect(firstIdx).toBeLessThan(userIdx)
   })
@@ -396,6 +401,7 @@ describe('transcriptToMessages', () => {
         id: 'u-tg',
         direction: 'request',
         channel: 'telegram',
+        userId: '12345',
         payload: JSON.stringify({
           messages: [{ role: 'user', content: [{ type: 'text', text: 'hi from telegram' }] }],
         }),
@@ -403,9 +409,25 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const userRow = msgs.find((m) => m.agentName === 'You · telegram')
+    const userRow = msgs.find((m) => m.agentName === 'You · telegram:12345')
     expect(userRow).toBeTruthy()
     expect(userRow!.blocks[0]!.text).toBe('hi from telegram')
+  })
+
+  it('renders only the channel when the entry has no user id', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u-tg2',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'no id' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.find((m) => m.agentName === 'You · telegram')).toBeTruthy()
   })
 
   it('carries the verbatim raw json through to the row', () => {
@@ -719,6 +741,50 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
     expect(msgs[0]!.agentName).toBe('Repo · web')
   })
+
+  it('names the branch in a branch-aware clone summary (branch from input)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-branch',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+          result: { status: 'cloned', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock!.toolCall!.result).toBe('Cloned into bar (branch dev)')
+  })
+
+  it('renders a branch switch as a non-error summary naming the branch', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-switch',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+          result: { status: 'switched', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock!.toolCall!.result).toBe('Switched to dev — bar')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    expect(msgs[0]!.agentStatus).toBe('completed')
+  })
 })
 
 // ── ChatArea rendering ──────────────────────────────────────────────────────
@@ -776,6 +842,58 @@ describe('ChatArea', () => {
     expect(screen.getByText('shell')).toBeTruthy()
     // System row collapses by default but is present in the DOM.
     expect(document.querySelector('.addressable-block')).toBeTruthy()
+  })
+
+  it('surfaces the repo branch inline in the tool-call header (toolCallSummary)', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'Repo · web',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'setuprepo-branch-header',
+            name: 'SETUP_REPO',
+            input: { url: 'https://github.com/foo/bar.git', branch: 'dev' },
+            result: 'Cloned into bar (branch dev)',
+            resultIsError: false,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    // The header names the primary arg AND the branch qualifier, so the
+    // branch is visible without expanding the raw input JSON.
+    expect(screen.getByText('https://github.com/foo/bar.git (branch: dev)')).toBeTruthy()
+  })
+
+  it('leaves the header unchanged for a tool call without a branch', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'Repo · web',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'setuprepo-nobranch-header',
+            name: 'SETUP_REPO',
+            input: { url: 'https://github.com/foo/bar.git' },
+            result: 'Cloned into bar',
+            resultIsError: false,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    expect(screen.getByText('https://github.com/foo/bar.git')).toBeTruthy()
   })
 
   it('shows an "exit 0" pill for a tool call with exit code 0', () => {
@@ -2398,8 +2516,8 @@ describe('Scroll-to-bottom behavior', () => {
   it('switching to a loading session scrolls to bottom once messages arrive', () => {
     // Regression test for the cache-miss case: when switching to a session
     // whose messages haven't loaded yet (loading=true), the scroll must be
-    // deferred until the real messages arrive. The pendingScrollToBottom
-    // ref persists across the loading → messages-ready transition.
+    // deferred until the real messages arrive. The scroll intent persists
+    // across the loading → messages-ready transition.
     const msgsA = makeMessages('a', 3)
     const msgsB = makeMessages('b', 5)
 
@@ -2587,5 +2705,733 @@ describe('Scroll-to-top behavior', () => {
       />,
     )
     expect(loadLatest).not.toHaveBeenCalled()
+  })
+})
+
+// ── WebSocket connection state banner ─────────────────────────────────────
+//
+// The transcript's only data path is the WebSocket. When the socket dies,
+// the transcript silently stops updating — the user has no idea whether
+// the agent is thinking or the connection is broken. These tests pin the
+// banner that makes the state visible.
+
+describe('ChatArea connection state banner', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        {...props}
+      />,
+    )
+
+  it('shows no banner while the stream is live', () => {
+    renderWith({ streamStatus: 'live' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('shows a reconnecting banner when the stream is reconnecting', () => {
+    renderWith({ streamStatus: 'reconnecting' satisfies StreamStatus })
+    const banner = screen.getByTestId('ws-connection-banner')
+    expect(banner.textContent).toMatch(/reconnect/i)
+  })
+
+  it('shows a banner when the stream is still connecting', () => {
+    renderWith({ streamStatus: 'connecting' satisfies StreamStatus })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('shows the last error text in the banner when present', () => {
+    renderWith({
+      streamStatus: 'reconnecting' satisfies StreamStatus,
+      streamError: 'connection closed (code 1006)',
+    })
+    expect(screen.getByTestId('ws-connection-banner').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('does not show a banner when the stream is closed by the user', () => {
+    // 'closed' is the terminal state after an explicit client.close();
+    // warning about it would be noise.
+    renderWith({ streamStatus: 'closed' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('does not show a banner for the replaying state (a normal, transient state)', () => {
+    renderWith({ streamStatus: 'replaying' satisfies StreamStatus })
+    expect(screen.queryByTestId('ws-connection-banner')).toBeNull()
+  })
+
+  it('keeps the transcript readable while the banner is shown', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages, streamStatus: 'reconnecting' })
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
+  })
+})
+
+// ── WebSocket connection modal (terminal disconnect) ──────────────────────
+//
+// A brief disconnect is self-healing and deserves only a banner. A
+// PERSISTENT one (the gateway is down, or the port is wrong) leaves the
+// transcript frozen with no way for the user to know why. Once the
+// reconnect ladder has been exhausted, the UI escalates to a modal.
+
+describe('ChatArea connection modal', () => {
+  const renderWith = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+        {...props}
+      />,
+    )
+
+  it('shows no modal before the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD - 1 })
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('shows the modal once the attempt threshold is reached', () => {
+    renderWith({ streamReconnectAttempts: WS_RECONNECT_ALERT_THRESHOLD })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+  })
+
+  it('states that live updates are unavailable and the transcript may be stale', () => {
+    renderWith({})
+    const modal = screen.getByTestId('ws-connection-modal')
+    expect(modal.textContent).toMatch(/unavailable/i)
+    expect(modal.textContent).toMatch(/out of date|stale/i)
+  })
+
+  it('shows the last error when present', () => {
+    renderWith({ streamError: 'connection closed (code 1006)' })
+    expect(screen.getByTestId('ws-connection-modal').textContent).toContain('connection closed (code 1006)')
+  })
+
+  it('the "Reconnect now" action calls the reconnect callback', () => {
+    const onStreamReconnect = vi.fn()
+    renderWith({ onStreamReconnect })
+    fireEvent.click(screen.getByTestId('ws-connection-reconnect'))
+    expect(onStreamReconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('"Dismiss" closes the modal but the banner remains', () => {
+    renderWith({})
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('ws-connection-dismiss'))
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+    // The non-modal banner is still shown — the connection is still down.
+    expect(screen.getByTestId('ws-connection-banner')).toBeTruthy()
+  })
+
+  it('closes automatically when the stream comes back', () => {
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'reconnecting'}
+        streamReconnectAttempts={WS_RECONNECT_ALERT_THRESHOLD}
+      />,
+    )
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={[]}
+        streamStatus={'live'}
+        streamReconnectAttempts={0}
+      />,
+    )
+    expect(screen.queryByTestId('ws-connection-modal')).toBeNull()
+  })
+
+  it('does not block the transcript from being read', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ text: 'a message that must stay visible' }],
+      },
+    ]
+    renderWith({ messages })
+    expect(screen.getByTestId('ws-connection-modal')).toBeTruthy()
+    expect(screen.getByText('a message that must stay visible')).toBeTruthy()
+  })
+})
+
+// ── Scroll button no-op regression ───────────────────────────────────────
+//
+// When the user switches tabs and switches back, the data cache may have
+// pinned entries for the original session. If loadLatest()/loadFromBeginning()
+// finds the pinned entries are the same array reference as the current
+// entries, dispatching would produce no observable change (React bails out
+// on the same array). The hook reports `'unchanged'`, and the button scrolls
+// directly instead of waiting for an effect that will never run.
+
+describe('scroll button no-op after tab switch', () => {
+  function makeMessages(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    cleanup()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('"Scroll to bottom" works after switching tabs and back (loadLatest no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadLatest = vi.fn(() => 'unchanged' as const) // pinned cache hit, same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          loadLatest={loadLatest}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            loadLatest={loadLatest}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to bottom" — loadLatest is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to bottom'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The window is already at the end (`isViewingLatest` defaults to
+      // true), so no fetch is needed and the button scrolls directly.
+      expect(scrollToSpy).toHaveBeenCalled()
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+
+  it('"Scroll to top" works after switching tabs and back (loadFromBeginning no-op)', () => {
+    const msgsA = makeMessages('a', 3)
+    const msgsB = makeMessages('b', 5)
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const) // pinned cache hit, same ref
+
+    const scrollToSpy = vi.fn()
+    const origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+
+    try {
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgsA}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+
+      // Switch to session B
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={msgsB}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Switch back to session A — SAME messages reference (pinned cache no-op)
+      act(() => {
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's1' })}
+            messages={msgsA}
+            hasMore={true}
+            loadFromBeginning={loadFromBeginning}
+          />,
+        )
+      })
+
+      // Clear scroll calls from session-switch effects
+      scrollToSpy.mockClear()
+
+      // Click "Scroll to top" — loadFromBeginning is a no-op (same ref)
+      act(() => {
+        fireEvent.click(screen.getByLabelText('Scroll to top'))
+      })
+
+      // Flush requestAnimationFrame (the fallback scroll)
+      act(() => {
+        vi.advanceTimersByTime(16)
+      })
+
+      // The hook reported that no re-render will happen, so the button
+      // applied the scroll directly.
+      expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+      const topZeroCalls = scrollToSpy.mock.calls.filter(
+        (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+      )
+      expect(topZeroCalls.length).toBeGreaterThan(0)
+    } finally {
+      Element.prototype.scrollTo = origScrollTo
+    }
+  })
+})
+
+// ── Scroll-to-top failure mode and regression (window-derived state) ─────
+//
+// The reported bug: the client believed `hasMore:false` while the loaded
+// slice started mid-transcript, so "Scroll to top" only scrolled the slice.
+// `hasMore` is now derived from the loaded window's extent; these tests pin
+// the button contract and the failure mode explicitly.
+
+describe('ChatArea scroll-to-top with a window-derived hasMore', () => {
+  function msgs(prefix: string, count: number): Message[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}-m${i}`,
+      entryId: `${prefix}-e${i}`,
+      agentName: i % 2 === 0 ? 'You' : 'Assistant',
+      agentStatus: 'completed' as const,
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{ id: `${prefix}-b${i}`, text: `Message ${i}` }],
+      rawJson: '{}',
+    }))
+  }
+
+  const renderArea = (props: Record<string, unknown> = {}) =>
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        {...props}
+      />,
+    )
+
+  let scrollToSpy: ReturnType<typeof vi.fn>
+  let origScrollTo: typeof Element.prototype.scrollTo
+
+  beforeEach(() => {
+    scrollToSpy = vi.fn()
+    origScrollTo = Element.prototype.scrollTo
+    Element.prototype.scrollTo = scrollToSpy as unknown as typeof Element.prototype.scrollTo
+  })
+
+  afterEach(() => {
+    Element.prototype.scrollTo = origScrollTo
+    window.location.hash = ''
+  })
+
+  const topZeroCalls = () =>
+    scrollToSpy.mock.calls.filter(
+      (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 0,
+    )
+
+  it('requests the beginning when the window is not at the start', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fetch when the window is already at the start', () => {
+    // Failure-mode pin: this is the state the truncated backend produced
+    // (`hasMore:false` mid-transcript). The client cannot fetch in that
+    // state, which is why the backend fix must ship with this change.
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: false, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).not.toHaveBeenCalled()
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('requests the beginning again after switching away and back', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgs('a', 3)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(2)
+  })
+
+  it('works on a virtualized transcript (> 500 messages)', () => {
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    renderArea({ messages: msgs('v', 501), hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('still scrolls to the top while a deep-link fragment is present', () => {
+    window.location.hash = '#some-block'
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    renderArea({ hasMore: true, loadFromBeginning })
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('applies the top scroll when the beginning chunk arrives', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(loadFromBeginning).toHaveBeenCalledTimes(1)
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's1' })}
+          messages={msgs('oldest', 3)}
+          hasMore={false}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('does not auto-scroll on a session switch while a fragment is pinned', () => {
+    window.location.hash = '#some-block'
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={true}
+          loadFromBeginning={loadFromBeginning}
+        />,
+      )
+    })
+    // Deep-link mode: the anchor wins over the session-switch follow.
+    expect(scrollToSpy).not.toHaveBeenCalled()
+    // An explicit click still scrolls.
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+  })
+
+  it('replaces a pending top intent with the bottom follow on a session switch', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    const { container, rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={makeSession({ id: 's1' })}
+        messages={msgs('a', 3)}
+        hasMore={true}
+        loadFromBeginning={loadFromBeginning}
+      />,
+    )
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    const scroller = container.querySelector('.chat-scroll') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 600, configurable: true })
+    scrollToSpy.mockClear()
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={false}
+        />,
+      )
+    })
+    // The session-change render carries the previous session's messages
+    // and intentionally does not scroll; the content arrives next.
+    act(() => {
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={makeSession({ id: 's2' })}
+          messages={msgs('b', 5)}
+          hasMore={false}
+        />,
+      )
+    })
+    const bottomCalls = scrollToSpy.mock.calls.filter(
+      (args) => args[0] !== undefined && (args[0] as { top?: number }).top === 1000,
+    )
+    expect(bottomCalls.length).toBeGreaterThan(0)
+    expect(topZeroCalls().length).toBe(0)
+  })
+
+  it('reaches index 0 on a virtualized transcript after the button scroll', async () => {
+    const loadFromBeginning = vi.fn(() => 'unchanged' as const)
+    const { container } = renderArea({
+      messages: msgs('v', 501),
+      hasMore: true,
+      loadFromBeginning,
+    })
+    const scroller = container.querySelector('.chat-scroll') as HTMLDivElement
+    scrollToSpy.mockClear()
+    act(() => { fireEvent.click(screen.getByLabelText('Scroll to top')) })
+    expect(topZeroCalls().length).toBeGreaterThan(0)
+    // The mocked scrollTo does not move scrollTop; simulate the resulting
+    // event so the virtual range recomputes.
+    await act(async () => {
+      scroller.scrollTop = 0
+      scroller.dispatchEvent(new Event('scroll'))
+      await new Promise((r) => setTimeout(r, 40))
+    })
+    expect(screen.getByText('Message 0')).toBeTruthy()
+  })
+
+  it('a disabled button cannot issue a second request while a chunk loads', () => {
+    const loadFromBeginning = vi.fn(() => 'requested' as const)
+    renderArea({ hasMore: true, loadingMore: true, loadFromBeginning })
+    const btn = screen.getByLabelText('Scroll to top') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    act(() => { fireEvent.click(btn) })
+    expect(loadFromBeginning).not.toHaveBeenCalled()
+  })
+
+  it('disables the buttons while a chunk is loading', () => {
+    renderArea({ hasMore: true, loadingMore: true, loadFromBeginning: vi.fn() })
+    expect((screen.getByLabelText('Scroll to top') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByLabelText('Scroll to bottom') as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+// ── Transcript markdown view mode ─────────────────────────────────────────
+
+describe('ChatArea — transcript markdown view toggle', () => {
+  const TABLE_MD = '| File | Status |\n| --- | --- |\n| a.txt | ok |'
+
+  function makeMarkdownMessages(): Message[] {
+    return [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: TABLE_MD }],
+      },
+    ]
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  it('defaults to rendered markdown — the table is real HTML', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    expect(container.querySelector('table')).toBeTruthy()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeNull()
+  })
+
+  it('honours a stored "raw" preference — the literal source, pipe table and all', () => {
+    localStorage.setItem('seal.transcriptViewMode', 'raw')
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    const raw = container.querySelector('[data-testid="msg-raw-text"]')
+    expect(raw).toBeTruthy()
+    expect(raw!.textContent).toBe(TABLE_MD)
+    expect(container.querySelector('table')).toBeNull()
+  })
+
+  it('switching to Rendered renders the markdown as HTML (real <table>)', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    // Leave the rendered default first, so the assertion exercises a real
+    // transition rather than a no-op click on the active mode.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(container.querySelector('table')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    const table = container.querySelector('table')
+    expect(table).toBeTruthy()
+    expect(container.querySelectorAll('tbody td')[0]!.textContent).toBe('a.txt')
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeNull()
+  })
+
+  it('switching back to Raw restores the source text', () => {
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    expect(container.querySelector('table')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(container.querySelector('table')).toBeNull()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')!.textContent).toBe(TABLE_MD)
+  })
+
+  it('marks the active mode with aria-pressed', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
+    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(screen.getByRole('button', { name: 'Raw' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Rendered' }).getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('persists the choice so it survives a reload', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />)
+    // Persist the non-default mode, so the reload assertion proves the stored
+    // preference wins over the default.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
+    expect(localStorage.getItem('seal.transcriptViewMode')).toBe('raw')
+
+    // Remount: the stored preference is picked up on first render.
+    cleanup()
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={makeMarkdownMessages()} />,
+    )
+    expect(container.querySelector('table')).toBeNull()
+    expect(container.querySelector('[data-testid="msg-raw-text"]')).toBeTruthy()
+  })
+
+  it('does not render the toggle when there is no transcript', () => {
+    render(<ChatArea selectedAgent={makeAgent()} messages={[]} />)
+    expect(screen.queryByRole('button', { name: 'Rendered' })).toBeNull()
+  })
+
+  it('does not alter tool-call result rendering', () => {
+    const messages: Message[] = [{
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'claude-sonnet-4-20250514',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'shell',
+          input: { command: 'ls' },
+          result: '| not | a | table |',
+          resultIsError: false,
+        },
+      }],
+    }]
+    const { container } = render(
+      <ChatArea selectedAgent={makeAgent()} messages={messages} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    // The tool-call block is payload data, not prose: no markdown body is
+    // created for it, so nothing in its input/result is reinterpreted.
+    expect(container.querySelectorAll('.md-body')).toHaveLength(0)
+    expect(container.querySelector('table')).toBeNull()
+    expect(screen.getByText('shell')).toBeTruthy()
   })
 })
