@@ -1,19 +1,28 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
--- | OpenRouter provider using the @openai@ package's *types* (v2.5.4) with our
--- own HTTP round-trip (mirroring 'Seal.Providers.Anthropic' / 'Ollama'). We do
--- NOT use 'OpenAI.V1.makeMethods' (the servant-client convenience wrapper) —
--- that would unwrap the 'ApiKey' to 'Text' and surface 'servant-client'
--- runtime exceptions. Instead the request is built as a
+-- | OpenAI-compatible provider using the @openai@ package's *types* (v2.5.4)
+-- with our own HTTP round-trip (mirroring 'Seal.Providers.Anthropic' /
+-- 'Ollama'). We do NOT use 'OpenAI.V1.makeMethods' (the servant-client
+-- convenience wrapper) — that would unwrap the 'ApiKey' to 'Text' and surface
+-- 'servant-client' runtime exceptions. Instead the request is built as a
 -- 'OpenAI.V1.Chat.Completions.CreateChatCompletion', @encode@d to JSON, and
 -- POSTed with 'Network.HTTP.Client'; the response is @eitherDecode@d as a
 -- 'OpenAI.V1.Chat.Completions.ChatCompletionObject'. The API key bytes live
 -- only on the @Authorization: Bearer@ header built inside the CPS 'withApiKey'
 -- accessor — never returned, never logged.
 --
--- Base URL: @https://openrouter.ai/api/v1/chat/completions@
--- Vault key: @OPENROUTER_API_KEY@
+-- This module originally began life as a fixed OpenRouter provider, but the
+-- 'OpenRouter' type now serves /any/ OpenAI-compatible
+-- @\/v1\/chat\/completions@ endpoint — a self-hosted vLLM, LM Studio,
+-- api.openai.com, Ollama Cloud, etc. The only difference between instances is
+-- the base URL the caller supplies, which is why 'Seal.Providers.Registry'
+-- routes both 'OpenRouterProvider' and 'OpenAICompatibleProvider' through
+-- here. Error messages include the base URL so a failure at an Ollama Cloud
+-- endpoint is not misattributed to OpenRouter.
+--
+-- OpenRouter-specific defaults: @https://openrouter.ai/api/v1@,
+-- @OPENROUTER_API_KEY@.
 --
 -- Security: capability-based — no opcode touches the agent-immutable home
 -- state dir; this module imports only the openai types, the HTTP client
@@ -212,13 +221,15 @@ mapFinishReason r
 -- | Decode an OpenAI 'Chat.ChatCompletionObject' into our
 -- 'CompletionResponse'. An empty @choices@ array is a graceful 'Left' (some
 -- upstream error conditions return no choices). The first choice is taken;
--- its @message@ is an 'Chat.Assistant' carrying optional text + tool calls.
--- Tool-call ids are taken verbatim from OpenRouter (it returns ids); the
--- JSON-encoded @arguments@ text is parsed back to a 'Value'.
-decodeResponse :: Chat.ChatCompletionObject -> Either Text CompletionResponse
-decodeResponse obj =
+-- its @message@ is an 'Chat.Assistant' carrying optional text + tool calls. The
+-- @endpoint@ label is included in error messages so a non-OpenRouter
+-- OpenAI-compatible instance (e.g. an Ollama Cloud endpoint) is not
+-- misattributed. Tool-call ids are taken verbatim from the upstream (it
+-- returns ids); the JSON-encoded @arguments@ text is parsed back to a 'Value'.
+decodeResponse :: Text -> Chat.ChatCompletionObject -> Either Text CompletionResponse
+decodeResponse endpoint obj =
   case V.toList (Chat.choices obj) of
-    []     -> Left "OpenRouter returned no choices"
+    []     -> Left ("the endpoint " <> endpoint <> " returned no choices")
     (c:_)  ->
       let stop  = mapFinishReason (Chat.finish_reason c)
           blkss = assistantBlocks (Chat.message c)
@@ -252,10 +263,10 @@ assistantBlocks msg = case msg of
 
 -- Headers --------------------------------------------------------------------
 
--- | The headers for an OpenRouter chat-completion POST. The API key bytes
--- (@bytes@) live only here, inside the 'withApiKey' continuation. OpenRouter
--- recommends @HTTP-Referer@ / @X-Title@ for app attribution; neither carries a
--- secret.
+-- | The headers for an OpenAI-compatible chat-completion POST. The API key
+-- bytes (@bytes@) live only here, inside the 'withApiKey' continuation.
+-- OpenRouter recommends @HTTP-Referer@ / @X-Title@ for app attribution;
+-- neither carries a secret.
 bearerHeaders :: ByteString -> RequestHeaders
 bearerHeaders bytes =
   [ ("content-type", "application/json")
@@ -268,9 +279,11 @@ bearerHeaders bytes =
 
 -- | POST @<baseUrl>/chat/completions@ with the given headers + request body,
 -- then decode the response. Non-2xx -> 'httpErrorText'; a transport error
--- (connection / TLS) -> a 'Left' string. The body carries no secret. The
--- @baseUrl@ is the configured one ('orBaseUrl'), so a custom/proxy endpoint
--- is honored.
+-- (connection / TLS) -> a 'Left' string naming @baseUrl@ so the operator can
+-- see which endpoint is unreachable (this function serves all
+-- OpenAI-compatible providers, not just OpenRouter). The body carries no
+-- secret. The @baseUrl@ is the configured one ('orBaseUrl'), so a
+-- custom/proxy endpoint is honored.
 sendChatCompletion
   :: Manager -> Text -> RequestHeaders -> Chat.CreateChatCompletion
   -> IO (Either Text CompletionResponse)
@@ -283,20 +296,20 @@ sendChatCompletion mgr baseUrl hdrs req = do
   result <- try (httpLbs httpReq mgr) :: IO (Either HttpException (Response BL.ByteString))
   case result of
     Left _e ->
-      pure (Left "OpenRouter HTTP request failed (connection or transport error)")
+      pure (Left ("HTTP request to " <> baseUrl <> " failed (connection or transport error)"))
     Right resp ->
       let code = statusCode (responseStatus resp)
       in if code >= 200 && code <= 299
            then case eitherDecode (responseBody resp) of
                   Left e    -> pure (Left (T.pack e))
-                  Right obj -> pure (decodeResponse obj)
+                  Right obj -> pure (decodeResponse baseUrl obj)
            else pure (Left (httpErrorText code
                              (TE.decodeUtf8With TEE.lenientDecode
                                (BL.toStrict (responseBody resp)))))
 
--- | Render a non-2xx OpenRouter response into a user-facing message. 429
--- (rate limit) and 401 (auth) get friendlier, actionable hints; other codes
--- keep the full response body (the body carries no secret).
+-- | Render a non-2xx response into a user-facing message. 429 (rate limit)
+-- and 401 (auth) get friendlier, actionable hints; other codes keep the full
+-- response body (the body carries no secret).
 httpErrorText :: Int -> Text -> Text
 httpErrorText 429 _ =
   "the provider is rate limiting this credential (HTTP 429) — wait a moment \
@@ -325,7 +338,8 @@ instance Provider OpenRouter where
 
   complete prov cr = case orApiKey prov of
     Nothing ->
-      pure (Left "OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter")
+      pure (Left ("the endpoint " <> orBaseUrl prov
+        <> " needs an API key \x2014 run /vault setup then /provider add"))
     Just key ->
       withApiKey key $ \bytes ->
         sendChatCompletion (orManager prov) (orBaseUrl prov) (bearerHeaders bytes) (encodeRequest cr)

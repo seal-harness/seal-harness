@@ -17,7 +17,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Network.HTTP.Client.TLS (newTlsManager)
-import Network.HTTP.Types.Header (hAuthorization, hContentType)
+import Network.HTTP.Types.Header (hAuthorization, hContentType, RequestHeaders)
 import Test.Hspec
 
 import qualified OpenAI.V1.Chat.Completions as Chat (ChatCompletionObject)
@@ -29,7 +29,8 @@ import Seal.Providers.Class
   , ToolResultPart (..), Usage (..), textMsg )
 import Seal.Providers.OpenRouter
   ( bearerHeaders, decodeModelIds, decodeResponse, encodeRequest
-  , mapFinishReason, mkOpenRouter, defaultOpenRouterBaseUrl )
+  , mapFinishReason, mkOpenRouter, defaultOpenRouterBaseUrl
+  , sendChatCompletion )
 
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
 minimalReq :: CompletionRequest
@@ -103,11 +104,13 @@ chatObj mContent finishReason mToolCalls = object
 
 -- | Decode a JSON 'Value' as a 'Chat.ChatCompletionObject' and run
 -- 'decodeResponse'. Fails the test (Left) if the JSON doesn't parse.
-decodeFromJson :: Value -> Either Text CompletionResponse
-decodeFromJson v =
+-- The endpoint label is the OpenRouter default (the tests that check for
+-- generic error messages pass their own — see "decodeResponse (empty choices)").
+decodeFromJson :: Text -> Value -> Either Text CompletionResponse
+decodeFromJson endpoint v =
   case eitherDecode (encode v) :: Either String Chat.ChatCompletionObject of
     Left e  -> Left ("decode: " <> T.pack e)
-    Right o -> decodeResponse o
+    Right o -> decodeResponse endpoint o
 
 -- ── Spec ────────────────────────────────────────────────────────────────────
 
@@ -160,7 +163,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
 
   describe "decodeResponse" $ do
     it "decodes a plain assistant text choice with stop + usage" $ do
-      case decodeFromJson (chatObj (Just "hi") "stop" Nothing) of
+      case decodeFromJson defaultOpenRouterBaseUrl (chatObj (Just "hi") "stop" Nothing) of
         Left e  -> expectationFailure ("Left: " <> T.unpack e)
         Right (CompletionResponse blocks stop (Usage i o)) -> do
           blocks `shouldBe` [CbText "hi"]
@@ -176,7 +179,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
                 , "arguments" .= ("{\"q\":\"rust\"}" :: Text)
                 ]
             ]
-      case decodeFromJson (chatObj Nothing "tool_calls" (Just [toolCallVal])) of
+      case decodeFromJson defaultOpenRouterBaseUrl (chatObj Nothing "tool_calls" (Just [toolCallVal])) of
         Left e -> expectationFailure ("Left: " <> T.unpack e)
         Right (CompletionResponse blocks stop _) -> do
           stop `shouldBe` StopToolUse
@@ -199,7 +202,25 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
                 , "total_tokens" .= (0 :: Int)
                 ]
             ]
-      decodeFromJson emptyObj `shouldSatisfy` isLeft
+      decodeFromJson defaultOpenRouterBaseUrl emptyObj `shouldSatisfy` isLeft
+
+  describe "decodeResponse (empty choices — error message is generic)" $ do
+    it "does not say 'OpenRouter' in the error" $ do
+      let emptyObj = object
+            [ "id" .= ("chatcmpl-2" :: Text)
+            , "object" .= ("chat.completion" :: Text)
+            , "created" .= (0 :: Int)
+            , "model" .= ("deepseek/deepseek-v4.1-flash-1017" :: Text)
+            , "choices" .= ([] :: [Value])
+            , "usage" .= object
+                [ "prompt_tokens" .= (0 :: Int)
+                , "completion_tokens" .= (0 :: Int)
+                , "total_tokens" .= (0 :: Int)
+                ]
+            ]
+      case decodeFromJson "https://ollama.com/v1" emptyObj of
+        Left e -> e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left, got Right"
 
   describe "complete (no key)" $ do
     it "returns Left when the API key is absent" $ do
@@ -207,6 +228,28 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
       let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- complete prov minimalReq
       r `shouldSatisfy` isLeft
+
+    it "error message does not say 'OpenRouter' for a non-OpenRouter endpoint" $ do
+      mgr <- newTlsManager
+      let customUrl = "https://ollama.com/v1"
+          prov = mkOpenRouter mgr Nothing customUrl (ModelId "deepseek-v4.1-flash:cloud")
+      r <- complete prov minimalReq
+      case r of
+        Left e -> e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left, got Right"
+
+  describe "sendChatCompletion (transport error — error message names the endpoint)" $ do
+    it "includes the base URL, not 'OpenRouter', on a connection failure" $ do
+      mgr <- newTlsManager
+      -- An unreachable endpoint: the port is chosen to refuse connections.
+      let badUrl = "http://127.0.0.1:1/v1"
+          hdrs = bearerHeaders ("sk-test" :: ByteString) :: RequestHeaders
+      r <- sendChatCompletion mgr badUrl hdrs (encodeRequest minimalReq)
+      case r of
+        Left e -> do
+          e `shouldSatisfy` T.isInfixOf "127.0.0.1:1"
+          e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left (connection failure), got Right"
 
   describe "listModels" $ do
     it "returns Right with the default model" $ do
