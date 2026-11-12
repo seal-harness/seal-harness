@@ -28,10 +28,9 @@ module Seal.Core.TurnEngine
   , loadSessionMeta
   ) where
 
-import Control.Exception (bracket)
-import Control.Monad (unless, when)
+import Control.Exception (bracket, catch)
+import Control.Monad (unless, void, when)
 import Data.Aeson (Value)
-import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -42,7 +41,6 @@ import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath ((</>))
 import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -59,7 +57,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
-  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs
+  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs, defaultMaxModelRetries, defaultModelRetryBaseDelayMs
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
@@ -85,8 +83,10 @@ import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
   ( IndexedTranscriptHandle, withIndexedTranscript, itwSetSecretOps, itwReadEntries
-  , itwRecordAndAck, itwRecordAsync, itwReadConversation, IndexedTranscriptWrite (..)
+  , itwRecordAndAck, itwReadConversation, IndexedTranscriptWrite (..)
+  , TranscriptError (..), completionHarnessTag, pendingCompletionCount
   , readAndClearCompletions )
+import Seal.Session.Log (appendSessionLog)
 import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
@@ -95,7 +95,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, AgentHandoffDeps (..), agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -106,7 +106,7 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput, setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
@@ -130,10 +130,10 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
-  , updateSessionRepoUrl )
+  , updateSessionRepo )
 import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -147,7 +147,8 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, isAborted, lookupOrCreateAbortFlag)
+import Seal.ISA.RepeatDetect (SessionRepeatRegistry, lookupOrCreateRepeatTrack)
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
@@ -157,10 +158,10 @@ import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
+import Seal.Tools.Args (branchNameText)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
@@ -267,6 +268,7 @@ buildSessionRegistry
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
+  -> AgentHandoffDeps
   -> HarnessRegistry
   -> TmuxRunner
   -> Maybe Manager
@@ -274,7 +276,7 @@ buildSessionRegistry
   -> Bool
   -> ISA.Registry
 buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring harnessReg tmuxRunner httpManager caps onDemand =
+                     startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
@@ -303,13 +305,13 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-     , agentManageOp startWiring
+     , agentManageOp startWiring handoffDeps
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
+      , setupRepoOp cloneDeps autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
      , browserManageOp securityPolicy
@@ -320,9 +322,9 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
           HfGeneric newHarnessId
       , harnessStopOp harnessReg tmuxRunner
       , sessionListOp paths
-      , sessionSearchOp paths (bSessionSearch backends)
-      , sessionGetOp paths
-      , sessionManageOp paths (bSessionSearch backends)
+      , sessionSearchOp paths (bSessionSearch backends) [sid]
+      , sessionGetOp paths [sid]
+      , sessionManageOp paths (bSessionSearch backends) [sid]
       ]
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.hideOpcodes legacyHidden
@@ -390,6 +392,13 @@ data TurnDeps = TurnDeps
   , tdReplies      :: ReplyRegistry
   , tdLocks        :: SessionLocks
   , tdAbortReg     :: SessionAbortRegistry
+  , tdRepeatReg    :: SessionRepeatRegistry
+    -- ^ Process-lifetime no-progress repeat registry (session-read
+    -- hardening WU4). Created ONCE per process at the same origination
+    -- sites as 'tdAbortReg' (channels/web via 'newChannelDeps'; CLI/TUI at
+    -- entry) and threaded identically — a per-request registry would
+    -- silently reset the cross-turn window. The engine looks up the
+    -- session's 'RepeatTrack' per turn (mirroring 'lookupOrCreateAbortFlag').
   , tdTabsHandle   :: TabsHandle
   , tdLogger       :: SealLogger
   , tdIsRemote     :: Bool
@@ -445,6 +454,21 @@ data TurnDeps = TurnDeps
     -- turn so the sidecar completions are read and processed. 'Nothing' in
     -- tests / channels that don't support idle wake-up. The action must be
     -- safe to call from a forked thread (the child's worker thread).
+  , tdOnTurnEnd :: Maybe (SessionId -> IO ())
+    -- ^ End-of-turn hook: called when a turn ends, so the surface can
+    -- deliver sub-agent completions that arrived while the turn was in
+    -- flight (their idle wake-up was skipped: "turn in flight"). Called
+    -- from the turn bracket's release action — after the idle broadcast,
+    -- with the session lock (acquired in the bracket's body) already
+    -- released — so it runs on the exception path too: a turn that threw
+    -- still delivers its completions. NOT called on the provider-
+    -- resolution early return (that path returns before the bracket is
+    -- entered and never drains the completion sidecar — firing there
+    -- would start a wake chain that cannot end), and not when the turn
+    -- was aborted by the user (an explicit "not now": the completions
+    -- stay pending until the next user message). 'Nothing' on surfaces
+    -- with no wake-up (the CLI); the gateway wires it behind the same
+    -- 'sdEnableIdleWake' switch as 'tdOnIdleCompletion'.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -574,7 +598,28 @@ runSessionTurn td adapter meta mSrc t = do
             then broadcastReplyDelivered (tdBroker td) sid
             else do
               fanoutLastReply (tdReplies td) (tdBroker td) paths sid
-              broadcastReplyDelivered (tdBroker td) sid)
+              broadcastReplyDelivered (tdBroker td) sid
+          -- [engine] End-of-turn hook (the completion-delivery stranding
+          -- fix, plan §3 D2): a completion that arrived while this turn
+          -- was in flight has no other delivery scheduled — the idle
+          -- wake-up was skipped ("turn in flight") and nothing re-checks
+          -- when the turn ends. The surface (the gateway's wake-up wiring)
+          -- uses this to wake the session now that the turn — and the
+          -- session lock, which lives in the bracket's body — is done. The
+          -- call site is the release action on purpose: it runs on the
+          -- exception path too, so a turn that threw still delivers its
+          -- completions, and it runs after the idle broadcast so a
+          -- wake-up's "thinking" reads as a new turn (idle -> thinking,
+          -- not thinking -> idle). It does NOT fire on the provider-
+          -- resolution early return above (that path never enters the
+          -- bracket and never drains the sidecar — firing there would
+          -- start a wake chain that cannot end), and it does not fire
+          -- when the user aborted the turn: an explicit "not now" — the
+          -- completions stay pending until the next user message.
+          for_ (tdOnTurnEnd td) $ \onTurnEnd -> do
+            abortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
+            aborted <- isAborted abortFlag
+            unless aborted (onTurnEnd sid))
         (\_ -> withSessionLock (tdLocks td) sid $
           withIndexedTranscript sessionDirPath $ \tHandle ->
             runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
@@ -685,15 +730,21 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               autoloadId injectCatalog injectAgents catalogAgentDefs
               parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
+  turnRepeatTrack <- lookupOrCreateRepeatTrack (tdRepeatReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
+      channelLabel = taChannelLabel adapter meta'
+      handoffDeps = AgentHandoffDeps
+        { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+        , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+        }
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
       -- broadcast idle → thinking around the blocking ccPrompt call. This
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
       isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
-                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
@@ -726,17 +777,34 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
                    Nothing   -> pure ()
               , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag
+              , teRepeatTrack   = turnRepeatTrack
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               })
             { aeMessageSource = mSrc }
   -- Inject subagent completion messages from the sidecar file. These are
   -- user-role harness messages appended by forked child threads when
-  -- subagents complete. We write them through the daemon (via
-  -- itwRecordAsync) so itsWritten is updated correctly, then runTurn reads
-  -- the updated conversation from itwReadConversation.
+  -- subagents complete.
+  --
+  -- The write is DURABLE, and it must be: the conversation the model is
+  -- given is read straight off disk (Seal.Agent.Loop reads the file), so
+  -- an enqueued-but-not-yet-flushed injection is invisible to the model.
+  -- The parent is then told a finished sub-agent is still running, while
+  -- its verdict sits in the transcript (see
+  -- docs/plans/2026-10-22-subagent-completion-delivery-diagnosis.md).
+  -- Recording it durably also keeps the writer's conversation the same
+  -- length as the caller's, so the writer's positional diff stays aligned
+  -- and the parent's own messages are not dropped from the transcript.
   completions <- readAndClearCompletions paths sid
   unless (null completions) $ do
     prior <- itwReadConversation tHandle
+    globalLogIO K2.DebugS
+      (K2.ls ("[completion-diag] injecting " <> T.pack (show (length completions))
+        <> " sub-agent completion(s) into sid=" <> sessionIdText sid
+        <> " conversationLen=" <> T.pack (show (length prior))))
+    appendSessionLog (Just (sessionLogPath paths sid)) "INFO"
+      ("[completion-diag] injecting " <> T.pack (show (length completions))
+        <> " sub-agent completion(s); conversation length before injection = "
+        <> T.pack (show (length prior)))
     now <- getCurrentTime
     hid <- newHarnessId
     let fullMsgs = prior <> completions
@@ -749,13 +817,30 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           , erUsage = Nothing
           , erStop = Nothing
           , erDurationMs = Nothing
-          , erHarness = Just "subagent-completion"
+          , erHarness = Just completionHarnessTag
           , erCorrelation = Nothing
           , erMeta = Map.empty
           }
-    itwRecordAsync tHandle (IndexedTranscriptWrite fullMsgs entry)
+    recordHandoff tHandle (IndexedTranscriptWrite fullMsgs entry)
   eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
+  -- [completion-diag] A completion still sitting in the sidecar when the
+  -- turn ends may have no delivery scheduled: the idle wake-up was skipped
+  -- because a turn was in flight, and nothing may pick the message up until
+  -- a human sends the next message. The session then looks dead even though
+  -- the sub-agent has finished. Checked on every exit path (including a
+  -- failed turn) so a stranded completion is always visible.
+  pending <- pendingCompletionCount paths sid
+  when (pending > 0) $ do
+    globalLogIO K2.WarningS
+      (K2.ls ("[completion-diag] " <> T.pack (show pending)
+        <> " sub-agent completion(s) still pending when the turn ended for sid="
+        <> sessionIdText sid
+        <> " — check that a wake-up picks them up"))
+    appendSessionLog (Just (sessionLogPath paths sid)) "WARN"
+      ("[completion-diag] " <> T.pack (show pending)
+        <> " sub-agent completion(s) still pending when the turn ended; "
+        <> "check that a wake-up picks them up")
   case eResult of
     Left errMsg -> pure (Just errMsg)
     Right _     -> do
@@ -763,6 +848,28 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- sequence; the per-entry live broadcast already fired via aeOnEntry).
       broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       pure Nothing
+
+-- | Record a completed sub-agent's message as a durable handoff.
+--
+-- Durable matters: the conversation the model is given is read straight
+-- off disk by 'Seal.Agent.Loop', so a handoff that is merely enqueued can
+-- be missing from the model's context even though it lands in the
+-- transcript. 'itwRecordAndAck' blocks until the write is fsync'd, which
+-- is what closes that race.
+--
+-- If the writer daemon is dead or stuck, 'itwRecordAndAck' raises
+-- 'TranscriptError'. That must not take the turn down with it: the
+-- completion is lost, but the session survives and the failure is
+-- visible.
+recordHandoff :: IndexedTranscriptHandle -> IndexedTranscriptWrite -> IO ()
+recordHandoff tHandle write =
+  itwRecordAndAck tHandle write `catch` \(e :: TranscriptError) -> do
+    globalLogIO K2.ErrorS
+      (K2.ls ("[completion-diag] FAILED to record a sub-agent completion handoff: "
+        <> T.pack (show e)))
+    appendSessionLog Nothing "ERROR"
+      ("[completion-diag] failed to record a sub-agent completion handoff: "
+        <> T.pack (show e))
 
 -- | Record a synthetic 'EKRequest' preamble entry (convLen=0, full envelope,
 -- no messages) before the first user message so the frontend's System Prompt
@@ -815,13 +922,12 @@ mkCloneDepsTurn td = do
 -- the session directory or @session.json@ is missing or undecodable. The
 -- engine uses this to re-read meta after 'autoBindRepoAgent' may have
 -- rebound 'smAgent'.
+--
+-- Thin re-export of 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the engine's many call sites stay
+-- unchanged while the gateway / delegation worker share the same code.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid System.FilePath.</> "session.json"
-  exists <- System.Directory.doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp
+loadSessionMeta = readSessionMeta
 
 -- | Should 'runSessionTurn' auto-tab the session after a turn? 'True' for
 -- normal turns (every channel-originated session is visible in the sidebar).
@@ -919,14 +1025,14 @@ modelRetriesFromConfig :: Either a RuntimeConfig -> Int
 modelRetriesFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcMaxModelRetries cfg -> n
-    _ -> 3
+    _ -> defaultMaxModelRetries
 
 -- | Extract model_retry_base_delay_ms from config (default 1000).
 retryBaseDelayFromConfig :: Either a RuntimeConfig -> Int
 retryBaseDelayFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcRetryBaseDelayMs cfg -> n
-    _ -> 1000
+    _ -> defaultModelRetryBaseDelayMs
 
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or
@@ -1003,8 +1109,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
+        handoffDeps = AgentHandoffDeps
+          { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+          , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+          }
         isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
-                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
@@ -1018,13 +1128,16 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
-              -- Persist the cloned repo URL to session.json so the sidebar
-              -- can display it. The URL comes from the opcode's input
-              -- value.
-              let mRepoUrl =
-                    AT.parseMaybe
-                      (AT.withObject "SETUP_REPO input" (AT..: "url")) val
-              _ <- updateSessionRepoUrl paths sid mRepoUrl
+              -- Persist the cloned repo URL *and* the branch (or tag) to
+              -- session.json, so the sidebar can display the repo and a
+              -- later clone — a handoff's pre-turn checkout, say — can
+              -- repeat exactly this checkout. Parsed with the opcode's own
+              -- input parser: what is recorded is exactly what was cloned.
+              case parseSetupRepoInput val of
+                Left _ -> pure ()   -- unreachable: the opcode just ran
+                Right (repoUrl, mBranch) ->
+                  void (updateSessionRepo paths sid
+                          (Just repoUrl) (branchNameText <$> mBranch))
               invalidateWorkdirScan (tdExecCache td) sid
               freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
@@ -1102,7 +1215,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswWorker =
         case tdMkWorker td of
           Just stub | 1 >= tdMkWorkerStubDepth td -> stub
-          _ -> buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel 0
+          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0 False
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
@@ -1150,16 +1263,21 @@ hexSuffix4 n = T.justifyRight 4 '0' (T.pack (go n))
 -- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
 -- message.
 buildWorker
-  :: TurnDeps -> Backends -> SessionId -> Env -> Either a RuntimeConfig -> Int -> Text
+  :: TurnDeps -> Backends -> SessionId -> [SessionId] -> Env -> Either a RuntimeConfig -> Int -> Text
   -> Int
      -- ^ This worker's OWN delegation depth (0 = a top-level session's
      -- worker; its children run at depth 1). Threaded so an orchestrator
      -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
+  -> Bool
+     -- ^ When 'True', the worker creates a top-level session (handoff)
+     -- instead of a child session nested under the parent's @agents\/@
+     -- directory. See 'dwdTopLevel' in "Seal.Agent.Runtime.Delegation.Worker".
   -> AgentWorkerBuilder
-buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel ownDepth =
+buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth topLevel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
+    , dwdParentLineage = parentLineage
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
@@ -1182,7 +1300,8 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdResolveProvider = resolveChild
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
-    , dwdChildRegistry = buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling appEnv channel
+    , dwdChildRegistry = \childLineage ->
+        buildChildRegistryAdapter childLineage td sessionBackends eCfg operatorCeiling appEnv channel
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1192,7 +1311,14 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdOnEntry = pure ()
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
+    , dwdRepeatTrack = lookupOrCreateRepeatTrack (tdRepeatReg td)
+      -- ^ Same shape as 'dwdAbortFlag': the CHILD's own track, keyed by the
+      -- child's session id at consumption time (session-read hardening WU4).
+      -- The child's repeat window is independent of the parent's — a child
+      -- re-reading its own session transcript is guarded by the child's
+      -- own counts.
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+    , dwdTopLevel = topLevel
     }
   where
     -- The parent session's front-matter toggle, read from its session.json
@@ -1212,10 +1338,11 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
       resolveDefProvider (tdProvider td) fallBackProvider (ModelId fallBackModel)
     fallbackMeta tnow = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+      , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
@@ -1224,10 +1351,15 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
 -- role-conditioned nested @AGENT_START@ wired with a child-side
 -- 'AgentStartWiring' (child depth+1, child-rooted session mint, the SAME
 -- workdir⊕user union def backend, and a re-anchored worker-builder).
+-- The @lineage@ is the child's FULL chain (self first) as passed by
+-- 'Seal.Agent.Runtime.Delegation.Worker.mkDelegateWorker'
+-- (@childSid : parentLineage@) — it is baked into the child's session
+-- ops (the read guards) and into the nested wiring, never looked up at
+-- op-run time.
 buildChildRegistryAdapter
-  :: TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
+  :: [SessionId] -> TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
+buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
@@ -1261,14 +1393,14 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
         , fileWriteOp childWsRoot operatorCeiling
         , filePatchOp childWsRoot
         , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps childWsRoot (tdAutonomy td)
+        , setupRepoOp childCloneDeps (tdAutonomy td)
         , binExecOp childWsRoot securityPolicy Nothing
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)
-       , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td))
-       , sessionGetOp (tdPaths td)
+        , sessionSearchOp (tdPaths td) (bSessionSearch (tdBaseBackends td)) lineage
+        , sessionGetOp (tdPaths td) lineage
         , nestedAgentStartOp
         ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
@@ -1322,8 +1454,9 @@ buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv 
       nestedWorker = case tdMkWorker td of
         Just stub
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
-        _ -> buildWorker td sessionBackends childSid adapterAppEnv
+        _ -> buildWorker td sessionBackends childSid lineage adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
+                          False
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at
   -- authorize: leaf/kill-switch rejections carry the dedicated messages

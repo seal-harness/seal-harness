@@ -152,6 +152,16 @@ dispatch with existentials only at the CLI wiring boundary.
 - **Transcript as source of truth.** All derived stores (memory, skills,
   agent defs) are materialized views rebuilt from transcript replay. The
   transcript is `conversation.jsonl` + `entries.jsonl`.
+- **Provenance rides on the message.** A user message that arrived over an
+  authenticated chat channel carries its `MessageOrigin` (channel + sender
+  id) as a field on the `Message`, so it is persisted in the
+  `conversation.jsonl` line itself — `entries.jsonl`'s `erMeta` only ever
+  describes one turn's arrival. The stored text stays exactly as typed; the
+  loop renders a `[channel:userId]` tag into the provider request
+  (`Seal.Transcript.Origin.annotateOrigins`), which is how the model tells
+  senders apart in a group chat. `requests.jsonl` records that rendering;
+  the reconstructed transcript payloads show the clean text plus the
+  structured `origin`.
 - **Two-plane split.** In `mode=remote`, untrusted execution (shell, files,
   web, browser) runs on a separate machine over SSH with mandatory host-key
   pinning; the control plane runs only Trusted/Audited opcodes. A Cabal flag
@@ -182,8 +192,9 @@ function typed by trust level (`UntrustedIO` for Untrusted,
    constructed command strings, never an arbitrary or agent-supplied
    command. Direct mechanisms only (native libs, direct handles, SQLite,
    STM). Permitted exception: fixed-argv invocation of a specific trusted
-   binary (`age` for vault crypto, `ssh` for transport, `tmux` for harness
-   control).
+   binary (`age` for vault crypto, `age-keygen` for local vault keys,
+   `age-plugin-yubikey` for hardware-token keys, `ssh` for transport, `tmux`
+   for harness control).
 2. **Type-guaranteed argument sanitization.** Every value from user/LLM
    input that reaches a subprocess argv must be a validated
    smart-constructed newtype — never raw `Text`/`String`. Smart constructors

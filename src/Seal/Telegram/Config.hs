@@ -6,6 +6,9 @@
 -- Seal.Config.File imports it and wires the @[telegram]@ table. Resolution
 -- takes the section directly (not the whole 'RuntimeConfig') to keep the
 -- modules acyclic. Mirrors "Seal.Signal.Config".
+--
+-- 'allowListCodec' is imported from 'Seal.Core.AllowList' (consolidated
+-- across Signal, Telegram, and Channels config modules).
 module Seal.Telegram.Config
   ( TelegramToken (..)
   , mkTelegramToken
@@ -27,7 +30,7 @@ import Data.Text qualified as T
 import Toml ((.=))
 import Toml qualified
 
-import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.AllowList (AllowList (..), allowListCodec)
 import Seal.Core.MessageSource (UserId, mkUserId)
 
 -- | The vault key under which the Telegram bot token is stored. The token
@@ -103,24 +106,13 @@ defaultTelegramConfig = TelegramConfig
 
 -- | Bidirectional tomland codec for the @[telegram]@ section. 'tcAllowFrom'
 -- is a TOML array of strings (@allow_from = ["12345", "67890"]@); an absent
--- array decodes as 'AllowAll'.
+-- array decodes as 'AllowAll' via the shared 'allowListCodec' from
+-- 'Seal.Core.AllowList'.
 telegramConfigCodec :: Toml.TomlCodec TelegramConfig
 telegramConfigCodec = TelegramConfig
   <$> Toml.dioptional (Toml.text "token")            .= tcToken
   <*> Toml.dioptional (Toml.int "text_chunk_limit")  .= tcTextChunkLimit
   <*> allowListCodec                                  .= tcAllowFrom
-
--- | Codec for the @allow_from@ array: 'AllowAll' when absent, 'AllowOnly'
--- of the listed strings when present.
-allowListCodec :: Toml.TomlCodec (AllowList Text)
-allowListCodec = Toml.dimap toList fromList (Toml.dioptional (Toml.arrayOf Toml._Text "allow_from"))
-  where
-    toList :: AllowList Text -> Maybe [Text]
-    toList AllowAll       = Nothing
-    toList (AllowOnly xs) = Just (Set.toList xs)
-    fromList :: Maybe [Text] -> AllowList Text
-    fromList Nothing   = AllowAll
-    fromList (Just xs) = AllowOnly (Set.fromList xs)
 
 -- ---------------------------------------------------------------------------
 -- Resolution — config section + vault token -> validated (token, limit, allow)

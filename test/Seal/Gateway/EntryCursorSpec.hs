@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Regression tests for the incremental entry broadcast (issue #198).
 --
 -- 'Seal.Core.TurnEngine.broadcastNewEntries' historically re-read the
@@ -40,7 +41,7 @@ import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.TurnEngine (broadcastNewEntries)
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Gateway.StreamBroker
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..))
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 
 mkSid :: T.Text -> SessionId

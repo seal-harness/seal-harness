@@ -37,6 +37,29 @@ describe('useNewTabSpec', () => {
     expect(result.current.validationError).toBeNull()
   })
 
+  it('modelOptions prefers the configured models over the static list', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/providers') {
+        return new Response(JSON.stringify([{
+          name: 'anthropic',
+          isDefault: true,
+          defaultModel: 'claude-opus-4-8',
+          models: ['claude-opus-4-8', 'claude-sonnet-4'],
+        }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/providers/anthropic/models') {
+        return new Response(JSON.stringify([{ name: 'static-model', contextWindow: 1 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/ui/state') {
+        return new Response(JSON.stringify({ last_options: null, custom_models: [], repo_history: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.modelOptions).toEqual(['claude-opus-4-8', 'claude-sonnet-4']))
+    expect(result.current.model).toBe('claude-opus-4-8')
+  })
+
   it('buildBody produces the flat CreateTabBody for kind=provider', async () => {
     const { result } = renderHook(() => useNewTabSpec())
     await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
@@ -148,5 +171,25 @@ describe('useNewTabSpec', () => {
     })
     // The repo history is updated optimistically.
     expect(result.current.repoOptions).toContain('https://github.com/foo/bar')
+  })
+
+  it('keeps repoBranch in memory and NEVER persists it', async () => {
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
+    act(() => result.current.setRepo('https://github.com/foo/bar'))
+    act(() => result.current.setRepoBranch('dev-branch'))
+    expect(result.current.repoBranch).toBe('dev-branch')
+    act(() => result.current.persistOnSubmit())
+    await waitFor(() => {
+      const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+      const put = calls.find(([u, init]) => u === '/api/ui/state' && init?.method === 'PUT')
+      expect(put).toBeTruthy()
+      if (put) {
+        const body = put[1]!.body as string
+        // A branch is repo-specific: the last-used one is not recalled.
+        expect(body).not.toContain('dev-branch')
+        expect(body).not.toContain('branch')
+      }
+    })
   })
 })

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The dispatcher. Runs the pure authorization gate, then — for Untrusted
 -- opcodes — durably records the invocation (itwRecordAndAck) BEFORE executing,
 -- so no untrusted action runs until its audit entry is on disk. Trusted
@@ -37,7 +38,7 @@ import Seal.Core.Types (OpName (..), TrustLevel (..))
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
+import Seal.Providers.Class (ContentBlock (..), pattern Message, Role (..), ToolResultPart (..))
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
 import Seal.Tools.Exec.Abort (AbortFlag)

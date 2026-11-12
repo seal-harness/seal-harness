@@ -92,18 +92,24 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
   const rawJson: () => string = () => e.raw || (typeof e.payload === "string" ? e.payload : JSON.stringify(e.payload, null, 2))
   const messages: Message[] = []
 
+  // Skip harness-internal entries (e.g. the synthetic continuation
+  // prompt appended after a StopMaxTokens truncation). These are
+  // system-injected messages that should not appear as user bubbles.
+  if (e.internal === true) return []
+
   if (e.direction === 'request') {
     const parsed = tryParsePayload(e.payload)
     if (parsed) {
       const opName = (parsed.op as { name?: string } | undefined)?.name
-      if (opName === 'SKILL_LOAD' && parsed.result) {
+      const isSkillLoad = opName === 'SKILL_LOAD' || (opName === 'SKILL_MANAGE' && (parsed.input as { action?: string } | undefined)?.action === 'load')
+      if (isSkillLoad && parsed.result) {
         const input = parsed.input as { id?: string } | undefined
         const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
         const body = result?.body ?? ''
         const channel = e.channel
         const tc: ToolCallInfo = {
           id: 'skillload-' + e.id,
-          name: 'SKILL_LOAD',
+          name: opName === 'SKILL_MANAGE' ? 'SKILL_MANAGE' : 'SKILL_LOAD',
           input: input ?? {},
           result: body,
           resultIsError: false,
@@ -120,12 +126,21 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         return messages
       }
       if (opName === 'SETUP_REPO' && parsed.result) {
-        const input = parsed.input as { url?: string } | undefined
+        const input = parsed.input as { url?: string; branch?: string } | undefined
         const result = parsed.result as { status?: string; target?: string } | undefined
         const status = result?.status ?? ''
         const target = result?.target ?? ''
-        const summary = status === 'cloned' ? `Cloned into ${target}`
-                      : status === 'noop' ? `Repo already exists — ${target}`
+        // The requested branch lives in the recorded opcode INPUT (the
+        // result carries only {status, target}) — so a branch-aware clone
+        // or switch is visible in the summary, not just in the raw JSON.
+        // `input` is untrusted JSON straight from the transcript: the
+        // backend treats a non-string branch as absent, so guard the type
+        // here too (a `.trim()` on a number would throw during render).
+        const branch = typeof input?.branch === 'string' ? input.branch.trim() : ''
+        const branchNote = branch ? ` (branch ${branch})` : ''
+        const summary = status === 'cloned' ? `Cloned into ${target}${branchNote}`
+                      : status === 'noop' ? `Repo already exists — ${target}${branchNote}`
+                      : status === 'switched' ? `Switched to ${branch || 'branch'} — ${target}`
                       : status === 'conflict' ? `Conflict at ${target}`
                       : status === 'failed' ? 'Clone failed'
                       : status
@@ -210,7 +225,9 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
             messages.push({
               id: e.id + '-user',
               entryId: e.id,
-              agentName: e.channel ? `You · ${e.channel}` : 'You',
+              agentName: e.channel
+                ? (e.userId ? `You · ${e.channel}:${e.userId}` : `You · ${e.channel}`)
+                : 'You',
               agentStatus: 'completed',
               timestamp: ts,
               blocks: [{ id: 'u-' + e.id, text: textParts }],
@@ -265,7 +282,14 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         blocks.push({ id: 'r-' + e.id + '-tk-' + i, thinkingText: tk }))
       if (textParts) blocks.push({ id: 'r-' + e.id + '-text', text: textParts })
       for (const tc of toolCalls) blocks.push({ id: 'tc-' + tc.id, toolCall: tc })
-      if (blocks.length === 0) blocks.push({ id: 'r-' + e.id + '-empty', text: '(empty response)' })
+      if (blocks.length === 0) {
+        const stopReason = parsed.stop as string | undefined
+        const isEmptyMaxTokens = stopReason === 'max_tokens'
+        blocks.push({
+          id: 'r-' + e.id + '-empty',
+          text: isEmptyMaxTokens ? '(truncated — continuing…)' : '(empty response)',
+        })
+      }
 
       messages.push({
         id: e.id,

@@ -9,6 +9,10 @@ import type {
   ProviderInfo,
   ProviderDetail,
   ProviderInput,
+  ChannelDetail,
+  ChannelInput,
+  ChannelUpdateInput,
+  ChannelMutationResult,
   RepoInfo,
   RepoInput,
   SecretInput,
@@ -310,11 +314,11 @@ export function useTranscript(sessionId: string | null) {
   const [refreshCount, setRefreshCount] = useState(0)
   // Track whether we've already loaded entries for the current session.
   // Only show "Loading transcript..." on the FIRST load for a session —
-  // NOT on refresh-after-send (which fires `refresh` via `useSendMessage`'s
-  // `onComplete`). At refresh time the WS stream has already delivered the
-  // new entries live, so the HTTP re-seed is a consistency check; setting
-  // `loading=true` would flash "Loading transcript..." and clear the
-  // visible entries for the round-trip duration.
+  // NOT on a re-seed. A re-seed happens when a turn completes (the WS
+  // 'harness-status: idle' activity), by which point the WS has already
+  // delivered the new entries live; the re-seed is a consistency check.
+  // Setting `loading=true` would flash "Loading transcript..." and clear
+  // the visible entries for the round-trip duration.
   const loadedSessionRef = useRef<string | null>(null)
 
   const refresh = useCallback(() => {
@@ -357,7 +361,9 @@ export function useTranscript(sessionId: string | null) {
  *  whose response is TRANSIENT (never enters the transcript); `"assistant"`
  *  means a normal turn whose reply lands in the transcript. Modelled as an
  *  OPEN enum — the frontend must tolerate future/unknown kinds. */
-export type SendKind = 'slash' | 'assistant' | (string & {})
+/** `answer` = the message was consumed as the reply to a pending ASK_HUMAN
+ *  question; no turn ran, so no transcript entry follows. */
+export type SendKind = 'slash' | 'assistant' | 'answer' | (string & {})
 
 /** Parsed 200 body of POST /api/sessions/:id/send. `session_id` is set only
  *  by slash commands that mint+focus a new session (e.g. /new) so the SPA
@@ -368,7 +374,7 @@ export interface SendResult {
   session_id?: string | null
 }
 
-export function useSendMessage(sessionId: string | null, onComplete: () => void) {
+export function useSendMessage(sessionId: string | null) {
   const [sending, setSending] = useState(false)
 
   // The optimistic `sending` flag is per-session: reset it when the focused
@@ -404,9 +410,8 @@ export function useSendMessage(sessionId: string | null, onComplete: () => void)
       return null
     } finally {
       setSending(false)
-      onComplete()
     }
-  }, [sessionId, sending, onComplete])
+  }, [sessionId, sending])
 
   /** Reset the optimistic `sending` flag without waiting for the POST
    *  /send round-trip to complete. Called when the user clicks the stop
@@ -694,18 +699,41 @@ export function useSessionAgents(sessionId: string | null) {
   return { agents }
 }
 
+/** Fired after a provider create/update/delete so the long-lived
+ *  `useConfiguredProviders` consumers (the new-session/new-tab composers)
+ *  re-read the list without a page reload. */
+export const PROVIDERS_CHANGED_EVENT = 'seal:providers-changed'
+
+export function notifyProvidersChanged(): void {
+  window.dispatchEvent(new Event(PROVIDERS_CHANGED_EVENT))
+}
+
 export function useConfiguredProviders() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [loaded, setLoaded] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
   useEffect(() => {
+    let cancelled = false
     fetchJson<ProviderInfo[]>('/api/providers').then((data) => {
+      if (cancelled) return
       if (Array.isArray(data)) setProviders(data)
       setLoaded(true)
     })
-  }, [])
+    return () => { cancelled = true }
+  }, [refreshCount])
 
-  return { providers, loaded }
+  // The composer hook lives at the App level and stays mounted while the user
+  // visits the Providers tab. Re-fetch when a provider mutation lands so the
+  // newly-added provider is selectable on the next session.
+  useEffect(() => {
+    const handler = () => refresh()
+    window.addEventListener(PROVIDERS_CHANGED_EVENT, handler)
+    return () => window.removeEventListener(PROVIDERS_CHANGED_EVENT, handler)
+  }, [refresh])
+
+  return { providers, loaded, refresh }
 }
 
 /** Live fetch of available models for a provider. The backend proxies to the
@@ -858,6 +886,95 @@ export function useAllProviders() {
   }, [refreshCount])
 
   return { providers, loaded, error, refresh }
+}
+
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** Fetch ALL channels from GET /api/channels. Returns null on any failure. */
+export async function fetchAllChannels(): Promise<ChannelDetail[] | null> {
+  return fetchJson<ChannelDetail[]>('/api/channels')
+}
+
+/** Read the backend's @{"error": "..."}@ body for a channel mutation,
+ *  falling back to the HTTP status. */
+async function channelMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new channel. For Telegram, the `token` is stored in the vault;
+ *  never persisted in config.toml. Returns the created channel detail on
+ *  success, or the backend's error on failure. */
+export async function createChannel(input: ChannelInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch('/api/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing channel's config. The id is taken from the path.
+ *  Returns the updated channel detail on success, or the backend's error
+ *  on failure. */
+export async function updateChannel(id: string, input: ChannelUpdateInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a channel by id. Returns true when the backend accepted the
+ *  delete (204). Idempotent — a missing id is not an error. */
+export async function deleteChannel(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Mount + refresh list of all channels. Mirrors useAllProviders — fetches
+ *  GET /api/channels on mount and when `refresh()` is called after a
+ *  mutation. NOT polled (channel config changes only via this UI). */
+export function useChannels() {
+  const [channels, setChannels] = useState<ChannelDetail[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchAllChannels().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setChannels(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { channels, loaded, error, refresh }
 }
 
 // ── Tab mutators ────────────────────────────────────────────────────────
@@ -1118,18 +1235,25 @@ export interface SetupRepoResult {
 
 /** Clone a repo into a session's workdir before the first turn (the "set
  *  up repo" combo box calls this right after creating a bare session).
+ *  `branch` is an optional branch or tag to check out instead of the
+ *  remote's default branch; blank/absent is omitted from the body, so the
+ *  request stays byte-identical to the pre-branch one.
  *  The backend dispatches the SETUP_REPO opcode, so the clone (and any
  *  failure) is recorded in the session transcript — visible in the chat,
  *  not silent. Returns the structured result, or null on a network/parse
  *  failure. */
-export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
+export async function setupRepo(sessionId: string, url: string, branch?: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  // Omit the branch entirely (never `null`) when it is absent or blank —
+  // the gateway then clones the remote's default branch.
+  const trimmedBranch = branch?.trim()
+  const body = trimmedBranch ? { url, branch: trimmedBranch } : { url }
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     })
     if (!res.ok) {

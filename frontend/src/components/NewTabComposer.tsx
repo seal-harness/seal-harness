@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  CUSTOM_MODEL_VALUE,
   type HarnessFlavour,
   type NewTabKind,
   type NewTabSpec,
@@ -42,9 +41,11 @@ interface NewTabComposerProps {
 // ── Component ─────────────────────────────────────────────────────────
 
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
+  // Only configured providers are selectable. Unconfigured types stay hidden:
+  // they belong in the Providers screen, not in a "start a new tab" picker.
   // `configured` absent => configured (back-compat with older test mocks).
-  const noProviders =
-    spec.providersLoaded && !spec.configuredProviders.some((p) => p.configured !== false)
+  const selectableProviders = spec.configuredProviders.filter((p) => p.configured !== false)
+  const noProviders = spec.providersLoaded && selectableProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -84,7 +85,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       // persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl && res.session_id) {
-        const result = await setupRepo(res.session_id, repoUrl)
+        const result = await setupRepo(res.session_id, repoUrl, spec.repoBranch.trim() || undefined)
         if (!result || !result.ok) {
           const reason = result?.error ?? 'network error'
           setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
@@ -185,49 +186,25 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
                   (no providers configured — set an API key or start Ollama)
                 </option>
               )}
-              {spec.configuredProviders.map((p) => {
-                // `configured` absent => configured (back-compat).
-                const isCfg = p.configured !== false
-                return (
-                  <option key={p.name} value={p.name} disabled={!isCfg}>
-                    {PROVIDER_LABELS[p.name] ?? p.name}
-                    {p.isDefault ? ' (default)' : ''}
-                    {isCfg ? '' : ' (not configured)'}
-                  </option>
-                )
-              })}
+              {selectableProviders.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {PROVIDER_LABELS[p.name] ?? p.name}
+                  {p.isDefault ? ' (default)' : ''}
+                </option>
+              ))}
             </select>
           </Row>
 
           <Row label="Model" htmlFor="provider-model">
-            <select
+            <CustomModelCombobox
               id="provider-model"
-              value={spec.useCustomModel ? CUSTOM_MODEL_VALUE : spec.model}
-              onChange={(e) => spec.handleModelSelectChange(e.target.value)}
-              disabled={spec.modelsLoading}
-              className="composer-select"
-              style={inputStyle}
-            >
-              {spec.modelsLoading && <option value="">Loading…</option>}
-              {!spec.modelsLoading && spec.models.length === 0 && (
-                <option value="" disabled>(no models — choose Custom… and enter one)</option>
-              )}
-              {spec.models.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
-              <option value={CUSTOM_MODEL_VALUE}>Custom…</option>
-            </select>
+              value={spec.model}
+              onChange={spec.setModel}
+              options={spec.modelOptions}
+              placeholder="model id (pick a suggestion or type your own)"
+              testId="provider-model-list"
+            />
           </Row>
-
-          {spec.useCustomModel && (
-            <Row label="Custom Model" htmlFor="provider-model-custom">
-              <CustomModelCombobox
-                id="provider-model-custom"
-                value={spec.model}
-                onChange={spec.setModel}
-                options={spec.customModels}
-                placeholder="model id (e.g. claude-3-opus-20240229)"
-              />
-            </Row>
-          )}
 
           <Row label="Set up repo" htmlFor="provider-repo">
             <CustomModelCombobox
@@ -239,6 +216,21 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               testId="provider-repo-list"
             />
           </Row>
+
+          {/* Only meaningful alongside a repo: a branch with nothing to
+              clone would silently do nothing. */}
+          {spec.repo.trim() !== '' && (
+            <Row label="Repo Branch" htmlFor="provider-repo-branch">
+              <input
+                id="provider-repo-branch"
+                type="text"
+                value={spec.repoBranch}
+                onChange={(e) => spec.setRepoBranch(e.target.value)}
+                style={inputStyle}
+                placeholder="branch or tag (optional — default branch)"
+              />
+            </Row>
+          )}
 
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">

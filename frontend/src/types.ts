@@ -255,6 +255,9 @@ export interface ProviderInfo {
   isDefault?: boolean
   /** The configured default model for this provider, if any. */
   defaultModel?: string
+  /** Operator-configured frequently-used models for this provider. Offered
+   *  as suggestions by the new-tab model combobox. Absent means none. */
+  models?: string[]
   /** Whether this provider has a usable credential (or is keyless, like
    *  local Ollama). The backend's /api/providers sets this for every entry;
    *  absent is treated as configured (back-compat with older test mocks). */
@@ -272,20 +275,80 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** The provider implementation ("anthropic", "ollama", "openrouter",
+   *  "openai"). For a custom OpenAI-compatible instance `name` is the
+   *  operator-chosen unique name and `type` is "openai". */
+  type?: string
   isDefault: boolean
   defaultModel: string | null
+  /** Operator-configured frequently-used models for this provider. */
+  models: string[]
   baseUrl: string | null
   authStatus: ProviderAuthStatus
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
- *  api_key is write-only — never returned by the API. */
+ *  api_key is write-only — never returned by the API. `type` is required when
+ *  creating a custom OpenAI-compatible instance (name is its unique id). */
 export interface ProviderInput {
   name?: string
+  type?: string
   api_key?: string
   base_url?: string
   default_model?: string
+  /** Frequently-used models for this provider. Sent as an array; a blank
+   *  entry is ignored by the backend. Pass [] to clear the list. */
+  models?: string[]
 }
+
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** The auth status of a channel, as reported by GET /api/channels.
+ *  Mirrors the backend's authStatus field. */
+export type ChannelAuthStatus = 'configured' | 'missing-credential' | 'vault-locked'
+
+/** The detailed channel info returned by GET /api/channels, showing ALL
+ *  configured channels. camelCase response wire keys match the backend's
+ *  JSON 1:1 (no mapping function needed, like ProviderDetail). */
+export interface ChannelDetail {
+  id: string
+  kind: string
+  label: string | null
+  account: string | null
+  textChunkLimit: number | null
+  allowFrom: string[] | null
+  authStatus: ChannelAuthStatus
+}
+
+/** The body for POST /api/channels. Wire keys are snake_case, matching the
+ *  request body 1:1 (like ProviderInput). `token` is write-only — never
+ *  returned by the API. */
+export interface ChannelInput {
+  id: string
+  kind: string
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The body for PUT /api/channels/:id. All optional — only provided fields
+ *  are updated. `kind` and `id` are immutable. */
+export interface ChannelUpdateInput {
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The outcome of a channel create/update mutation. On success `channel`
+ *  carries the updated detail; on failure `error` carries the backend's
+ *  error message. The token is NEVER echoed back. */
+export type ChannelMutationResult =
+  | { ok: true; channel: ChannelDetail }
+  | { ok: false; error: string }
 
 // ── Agent CRUD (full def) ──────────────────────────────────────────────
 
@@ -458,6 +521,12 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** The authenticated sender user id on the originating channel (a Telegram
+   *  user id, or a Signal phone/uuid), or null when the channel carried no
+   *  sender identity (web/CLI, response entries, the conversation-only
+   *  fallback). Stamped into the request entry's erMeta as `userId` by
+   *  runTurn's requestMeta. */
+  userId: string | null
   /** Whether this is a harness-internal entry (e.g. the synthetic
    *  continuation prompt appended after a StopMaxTokens truncation).
    *  When true, the frontend hides the entry from the chat view so the
@@ -548,11 +617,17 @@ export interface Message {
    *  the user actually clicks the "View raw JSON" button — not on every
    *  render. A plain string is also accepted (for test fixtures). */
   rawJson?: string | (() => string)
-  /** Marks a TRANSIENT slash-command output bubble (kind:"slash" send
-   *  response). These rows are NOT persisted — they never enter the
+  /** Marks a TRANSIENT output bubble: the response to a `kind:"slash"` send
+   *  (command output) or a `kind:"answer"` send (an `ASK_HUMAN` answer the
+   *  gateway consumed, so no turn runs and no transcript entry follows).
+   *  These rows are NOT persisted — they never enter the
   *  transcript and vanish on reload. Rendered in a muted "command output"
-  *  style with a "command output — not saved" label. Spliced into the
-  *  message list at the position the command occupied in the conversation
-  *  flow, so no reordering happens when new entries arrive later. */
+   *  style with a "command output — not saved" label. Spliced into the
+   *  message list at the position the command occupied in the conversation
+   *  flow, so no reordering happens when new entries arrive later. */
   slashBubble?: boolean
+  /** Overrides the bubble's muted tag when it is set. A slash-command bubble
+   *  keeps the default "command output — not saved"; an `ASK_HUMAN` answer
+   *  confirmation says "sent as the answer — not saved". */
+  slashBubbleLabel?: string
 }

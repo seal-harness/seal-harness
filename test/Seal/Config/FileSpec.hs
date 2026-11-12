@@ -12,17 +12,23 @@ import Test.Hspec
 
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
+  , providerModels
   , SkillsConfig (..)
   , AgentConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
-  , updateRuntimeConfig, upsertProvider
+  , updateRuntimeConfig, upsertProvider, migrateLegacyChannels, upsertChannel, deleteChannel
   , defaultAutoloadSkill, resolvedAutoloadSkill, resolvedAvailableSkills
   , resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
   , resolvedCredentialToolGuidance
   , maxTurnsConfig )
-
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..))
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Signal.Config (SignalConfig (..), defaultSignalConfig)
+import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
+import Data.Set qualified as Set
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
 
@@ -36,7 +42,6 @@ spec = describe "Seal.Config.File" $ do
         , rcRetrieval       = Nothing
         , rcSignal          = Nothing
         , rcTelegram        = Nothing
-        , rcGateway         = Nothing
         , rcDebugSessionTranscript = Nothing
         , rcDebugModelResponses = Nothing
         , rcMaxModelRetries = Nothing
@@ -50,6 +55,7 @@ spec = describe "Seal.Config.File" $ do
         , rcMaxTurns         = Nothing
         , rcToolTimeout      = Nothing
         , rcEmbedding        = Nothing
+        , rcChannels         = Map.empty
         }
 
   describe "loadRuntimeConfig" $ do
@@ -94,7 +100,6 @@ spec = describe "Seal.Config.File" $ do
               , rcRetrieval       = Nothing
               , rcSignal          = Nothing
               , rcTelegram        = Nothing
-              , rcGateway         = Nothing
               , rcDebugSessionTranscript = Nothing
               , rcDebugModelResponses = Nothing
               , rcMaxModelRetries = Nothing
@@ -108,6 +113,15 @@ spec = describe "Seal.Config.File" $ do
               , rcMaxTurns        = Nothing
               , rcToolTimeout     = Nothing
              , rcEmbedding       = Nothing
+              , rcChannels       = Map.fromList
+                  [ (ChannelId "test-signal", ChannelConfig
+                      { ccKind = Signal
+                      , ccLabel = Just "Test Signal"
+                      , ccAccount = Just "+15555550100"
+                      , ccToken = Nothing
+                      , ccTextChunkLimit = Just 1998
+                      , ccAllowFrom = AllowAll
+                      } ) ]
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
@@ -160,8 +174,8 @@ spec = describe "Seal.Config.File" $ do
         result `shouldBe` Right cfg
 
   describe "maxTurnsConfig" $ do
-    it "defaults to 90 when max_turns is absent" $
-      maxTurnsConfig defaultRuntimeConfig `shouldBe` 90
+    it "defaults to 200 when max_turns is absent" $
+      maxTurnsConfig defaultRuntimeConfig `shouldBe` 200
 
     it "returns the configured value when set" $
       maxTurnsConfig (defaultRuntimeConfig { rcMaxTurns = Just 30 }) `shouldBe` 30
@@ -277,6 +291,21 @@ spec = describe "Seal.Config.File" $ do
           Left _  -> pure ()
           Right _ -> expectationFailure "expected Left for malformed config"
 
+    -- Re-encoding through runtimeConfigCodec cannot carry a section the codec
+    -- no longer knows, so an un-migrated file must be refused, not rewritten:
+    -- the write would delete the operator's gateway bind address and the
+    -- migration could never recover it.
+    it "refuses while the file still carries a [gateway] table, and changes nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            initial = "default_provider = \"ollama\"\n\n[gateway]\nhost = \"0.0.0.0\"\nport = 8443\n"
+        TIO.writeFile path initial
+        result <- updateRuntimeConfig path (\c -> c { rcDefaultAgent = Just "worker" })
+        case result of
+          Left err -> err `shouldSatisfy` T.isInfixOf "seal serve"
+          Right _  -> expectationFailure "expected the legacy [gateway] write to be refused"
+        TIO.readFile path `shouldReturn` initial
+
   describe "provider defaults" $ do
     it "round-trips default_provider and default_model through TOML" $
       withSystemTempDirectory "seal-cfg" $ \dir -> do
@@ -302,13 +331,16 @@ spec = describe "Seal.Config.File" $ do
           [ "[providers.ollama]"
           , "base_url = \"http://localhost:11434\""
           , "default_model = \"glm-5.2:cloud\""
+          , "models = [\"glm-5.2:cloud\", \"llama3.2\"]"
           , "[providers.anthropic]"
           , "default_model = \"claude-opus-4-8\""
           ]
         Right cfg <- loadRuntimeConfig path
         providerBaseUrl      cfg "ollama"    `shouldBe` Just "http://localhost:11434"
         providerDefaultModel cfg "ollama"    `shouldBe` Just "glm-5.2:cloud"
+        providerModels       cfg "ollama"    `shouldBe` ["glm-5.2:cloud", "llama3.2"]
         providerDefaultModel cfg "anthropic" `shouldBe` Just "claude-opus-4-8"
+        providerModels       cfg "anthropic" `shouldBe` []
         providerBaseUrl      cfg "anthropic" `shouldBe` Nothing
 
     it "has an empty provider map when [providers] is absent" $
@@ -323,7 +355,7 @@ spec = describe "Seal.Config.File" $ do
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434"))) defaultRuntimeConfig
+            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434") Nothing)) defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg
@@ -430,3 +462,219 @@ spec = describe "Seal.Config.File" $ do
 
     it "onDemandSchemas returns True when the key is set" $
       onDemandSchemas (defaultRuntimeConfig { rcOnDemandSchemas = Just True }) `shouldBe` True
+
+  describe "rcChannels" $ do
+    it "defaultRuntimeConfig has empty rcChannels" $
+      rcChannels defaultRuntimeConfig `shouldBe` Map.empty
+
+  describe "migrateLegacyChannels" $ do
+    let sigCfg = defaultSignalConfig { scAccount = Just "+15555550123"
+                                     , scTextChunkLimit = Just 1998
+                                     , scAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                                     }
+        tgCfg = defaultTelegramConfig { tcToken = Just "123:ABCdef"
+                                      , tcTextChunkLimit = Just 3900
+                                      , tcAllowFrom = AllowOnly (Set.fromList ["111"])
+                                      }
+
+    it "migrates legacy [signal] to channel id 'signal'" $ do
+      let cfg = defaultRuntimeConfig { rcSignal = Just sigCfg }
+          migrated = migrateLegacyChannels cfg
+      Map.lookup (ChannelId "signal") (rcChannels migrated)
+        `shouldBe` Just (ChannelConfig { ccKind = Signal
+                                       , ccLabel = Nothing
+                                       , ccAccount = Just "+15555550123"
+                                       , ccToken = Nothing
+                                       , ccTextChunkLimit = Just 1998
+                                       , ccAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                                       })
+
+    it "migrates legacy [telegram] to channel id 'telegram'" $ do
+      let cfg = defaultRuntimeConfig { rcTelegram = Just tgCfg }
+          migrated = migrateLegacyChannels cfg
+      Map.lookup (ChannelId "telegram") (rcChannels migrated)
+        `shouldBe` Just (ChannelConfig { ccKind = Telegram
+                                       , ccLabel = Nothing
+                                       , ccAccount = Nothing
+                                       , ccToken = Just "123:ABCdef"
+                                       , ccTextChunkLimit = Just 3900
+                                       , ccAllowFrom = AllowOnly (Set.fromList ["111"])
+                                       })
+
+    it "migrates both signal + telegram legacy sections" $ do
+      let cfg = defaultRuntimeConfig { rcSignal = Just sigCfg, rcTelegram = Just tgCfg }
+          migrated = migrateLegacyChannels cfg
+      Map.member (ChannelId "signal") (rcChannels migrated) `shouldBe` True
+      Map.member (ChannelId "telegram") (rcChannels migrated) `shouldBe` True
+
+    it "preserves tcToken in ccToken on telegram migration" $ do
+      let cfg = defaultRuntimeConfig { rcTelegram = Just tgCfg }
+          migrated = migrateLegacyChannels cfg
+      (ccToken =<< Map.lookup (ChannelId "telegram") (rcChannels migrated))
+        `shouldBe` Just "123:ABCdef"
+
+    it "does NOT overwrite when the channel id already exists" $ do
+      let existing = ChannelConfig { ccKind = Signal
+                                   , ccLabel = Just "Existing"
+                                   , ccAccount = Just "+19999990000"
+                                   , ccToken = Nothing
+                                   , ccTextChunkLimit = Just 1000
+                                   , ccAllowFrom = AllowAll
+                                   }
+          cfg = defaultRuntimeConfig { rcSignal = Just sigCfg
+                                     , rcChannels = Map.fromList [(ChannelId "signal", existing)]
+                                     }
+          migrated = migrateLegacyChannels cfg
+      Map.lookup (ChannelId "signal") (rcChannels migrated) `shouldBe` Just existing
+
+    it "migrates a legacy section even when rcChannels is non-empty (coexistence)" $ do
+      let prodTg = ChannelConfig { ccKind = Telegram
+                                 , ccLabel = Just "Prod Telegram"
+                                 , ccAccount = Nothing
+                                 , ccToken = Nothing
+                                 , ccTextChunkLimit = Nothing
+                                 , ccAllowFrom = AllowAll
+                                 }
+          cfg = defaultRuntimeConfig { rcSignal = Just sigCfg
+                                     , rcChannels = Map.fromList [(ChannelId "prod-telegram", prodTg)]
+                                     }
+          migrated = migrateLegacyChannels cfg
+      Map.member (ChannelId "prod-telegram") (rcChannels migrated) `shouldBe` True
+      Map.member (ChannelId "signal") (rcChannels migrated) `shouldBe` True
+
+    it "does not migrate when the legacy section is absent" $ do
+      let migrated = migrateLegacyChannels defaultRuntimeConfig
+      rcChannels migrated `shouldBe` Map.empty
+
+  describe "channel config TOML round-trip" $ do
+    it "parses [channels.work-signal] with kind=signal" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[channels.work-signal]"
+          , "kind = \"signal\""
+          , "label = \"Work Signal\""
+          , "account = \"+15555550123\""
+          , "text_chunk_limit = 1998"
+          , "allow_from = [\"+15555550123\"]"
+          ]
+        Right cfg <- loadRuntimeConfig path
+        Map.lookup (ChannelId "work-signal") (rcChannels cfg)
+          `shouldBe` Just (ChannelConfig { ccKind = Signal
+                                         , ccLabel = Just "Work Signal"
+                                         , ccAccount = Just "+15555550123"
+                                         , ccToken = Nothing
+                                         , ccTextChunkLimit = Just 1998
+                                         , ccAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                                         })
+
+    it "parses [channels.dev-telegram] with kind=telegram and token" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[channels.dev-telegram]"
+          , "kind = \"telegram\""
+          , "label = \"Dev Bot\""
+          , "token = \"123:ABCdef\""
+          , "text_chunk_limit = 3900"
+          , "allow_from = [\"123456789\"]"
+          ]
+        Right cfg <- loadRuntimeConfig path
+        Map.lookup (ChannelId "dev-telegram") (rcChannels cfg)
+          `shouldBe` Just (ChannelConfig { ccKind = Telegram
+                                         , ccLabel = Just "Dev Bot"
+                                         , ccAccount = Nothing
+                                         , ccToken = Just "123:ABCdef"
+                                         , ccTextChunkLimit = Just 3900
+                                         , ccAllowFrom = AllowOnly (Set.fromList ["123456789"])
+                                         })
+
+    it "round-trips save -> load for a populated channels map" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg = defaultRuntimeConfig
+              { rcChannels = Map.fromList
+                  [ (ChannelId "work-signal", ChannelConfig
+                      { ccKind = Signal
+                      , ccLabel = Just "Work Signal"
+                      , ccAccount = Just "+15555550123"
+                      , ccToken = Nothing
+                      , ccTextChunkLimit = Just 1998
+                      , ccAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                      } )
+                  ]
+              }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
+        result `shouldBe` Right cfg
+
+    it "normalizes hand-written [channels.<id>] without a bare [channels] header" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[channels.a-signal]"
+          , "kind = \"signal\""
+          , "account = \"+15555550100\""
+          , "[channels.b-telegram]"
+          , "kind = \"telegram\""
+          ]
+        Right cfg <- loadRuntimeConfig path
+        Map.member (ChannelId "a-signal") (rcChannels cfg) `shouldBe` True
+        Map.member (ChannelId "b-telegram") (rcChannels cfg) `shouldBe` True
+
+    it "migrates a legacy [telegram] section into rcChannels on load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[telegram]"
+          , "token = \"999:legacy\""
+          ]
+        Right cfg <- loadRuntimeConfig path
+        Map.lookup (ChannelId "telegram") (rcChannels cfg)
+          `shouldBe` Just (ChannelConfig { ccKind = Telegram
+                                         , ccLabel = Nothing
+                                         , ccAccount = Nothing
+                                         , ccToken = Just "999:legacy"
+                                         , ccTextChunkLimit = Nothing
+                                         , ccAllowFrom = AllowAll
+                                         })
+
+  describe "upsertChannel" $ do
+    it "inserts a new channel" $ do
+      let cfg = upsertChannel (ChannelId "new-signal")
+                  (\c -> c { ccKind = Signal, ccAccount = Just "+15555550100" })
+                  defaultRuntimeConfig
+      Map.member (ChannelId "new-signal") (rcChannels cfg) `shouldBe` True
+
+    it "updates an existing channel without clobbering other fields" $ do
+      let existing = ChannelConfig { ccKind = Telegram
+                                   , ccLabel = Just "Old"
+                                   , ccAccount = Nothing
+                                   , ccToken = Just "tok"
+                                   , ccTextChunkLimit = Just 3900
+                                   , ccAllowFrom = AllowAll
+                                   }
+          cfg0 = defaultRuntimeConfig
+                   { rcChannels = Map.fromList [(ChannelId "tg", existing)] }
+          cfg1 = upsertChannel (ChannelId "tg")
+                   (\c -> c { ccLabel = Just "New" }) cfg0
+      (ccLabel =<< Map.lookup (ChannelId "tg") (rcChannels cfg1)) `shouldBe` Just "New"
+      (ccToken =<< Map.lookup (ChannelId "tg") (rcChannels cfg1)) `shouldBe` Just "tok"
+
+  describe "deleteChannel" $ do
+    it "removes a channel" $ do
+      let chan = ChannelConfig { ccKind = Signal
+                               , ccLabel = Nothing
+                               , ccAccount = Just "+1"
+                               , ccToken = Nothing
+                               , ccTextChunkLimit = Nothing
+                               , ccAllowFrom = AllowAll
+                               }
+          cfg0 = defaultRuntimeConfig
+                   { rcChannels = Map.fromList [(ChannelId "sig", chan)] }
+          cfg1 = deleteChannel (ChannelId "sig") cfg0
+      Map.member (ChannelId "sig") (rcChannels cfg1) `shouldBe` False
+
+    it "is a no-op when the channel is absent" $ do
+      deleteChannel (ChannelId "missing") defaultRuntimeConfig
+        `shouldBe` defaultRuntimeConfig

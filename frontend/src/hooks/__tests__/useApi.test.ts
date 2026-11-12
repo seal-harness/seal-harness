@@ -45,6 +45,7 @@ import {
   stopSession,
   fetchSessionAgents,
   useConfiguredProviders,
+  notifyProvidersChanged,
   setSessionDescription,
   setSessionArchived,
   setSessionPrompt,
@@ -58,6 +59,7 @@ import {
   adoptWindow,
   fetchProviderModels,
   fetchModelContext,
+  setupRepo,
 } from '../useApi'
 import type { TabInfoWire } from '../useApi'
 import { POLL_INTERVAL, WS_GRACE_MS } from '../useApi'
@@ -317,27 +319,45 @@ describe('useTranscript', () => {
 describe('useSendMessage', () => {
   it('POSTs /api/sessions/:id/send with {message, model?} and returns the parsed body', async () => {
     setNextResponse({ kind: 'slash', response: '/help text' })
-    const onComplete = vi.fn()
-    const { result } = renderHook(() => useSendMessage('s1', onComplete))
+    const { result } = renderHook(() => useSendMessage('s1'))
     let res: { kind: string; response: string } | null = null
     await act(async () => { res = await result.current.send('/help') })
     expect(res).toEqual({ kind: 'slash', response: '/help text' })
     expect(fetchCalls.some((c) => c.url === '/api/sessions/s1/send')).toBe(true)
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/send')!
     expect(JSON.parse(call.init!.body as string)).toEqual({ message: '/help' })
-    expect(onComplete).toHaveBeenCalled()
+  })
+
+  it('does NOT re-seed the transcript when POST /send returns', async () => {
+    // The backend forks the turn and returns from POST /send IMMEDIATELY
+    // (measured: 3ms), while the turn's first entry lands ~1s later. A
+    // re-seed fired here always raced the turn and saw a pre-turn
+    // transcript, so it was a wasted request that could never catch
+    // anything. The re-seed now runs when the turn COMPLETES (the WS
+    // 'harness-status: idle' activity), which is after the entries are on
+    // disk.
+    setNextResponse({ kind: 'assistant', response: '' })
+    const fetchMock = vi.fn(async (_url: string) => new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { result } = renderHook(() => useSendMessage('s1'))
+    await act(async () => { await result.current.send('hi') })
+    // Only the POST /send went over HTTP — no transcript re-seed.
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => u.includes('/transcript'))).toBe(false)
+    expect(urls.some((u) => u.includes('/send'))).toBe(true)
+    vi.unstubAllGlobals()
   })
 
   it('includes model in the body when provided', async () => {
     setNextResponse({ kind: 'assistant', response: '' })
-    const { result } = renderHook(() => useSendMessage('s1', () => {}))
+    const { result } = renderHook(() => useSendMessage('s1'))
     await act(async () => { await result.current.send('hi', 'claude-sonnet-4') })
     const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/send')!
     expect(JSON.parse(call.init!.body as string)).toEqual({ message: 'hi', model: 'claude-sonnet-4' })
   })
 
   it('returns null when sessionId is null', async () => {
-    const { result } = renderHook(() => useSendMessage(null, () => {}))
+    const { result } = renderHook(() => useSendMessage(null))
     let res: unknown = 'uninit'
     await act(async () => { res = await result.current.send('hi') })
     expect(res).toBeNull()
@@ -358,7 +378,7 @@ describe('useSendMessage', () => {
       })
     }))
     const { result, rerender } = renderHook(
-      ({ sid }: { sid: string | null }) => useSendMessage(sid, () => {}),
+      ({ sid }: { sid: string | null }) => useSendMessage(sid),
       { initialProps: { sid: 's1' as string | null } },
     )
     // Kick off a send on s1 — the POST stays in flight (never resolves).
@@ -383,7 +403,7 @@ describe('useSendMessage', () => {
         }))
       })
     }))
-    const { result } = renderHook(() => useSendMessage('s1', () => {}))
+    const { result } = renderHook(() => useSendMessage('s1'))
     // Kick off a send — POST stays in flight.
     await act(async () => { void result.current.send('hi') })
     await act(async () => { await Promise.resolve() })
@@ -559,6 +579,16 @@ describe('useConfiguredProviders', () => {
     const { result } = renderHook(() => useConfiguredProviders())
     await waitFor(() => expect(result.current.providers).toHaveLength(1))
     expect(result.current.loaded).toBe(true)
+  })
+
+  it('re-fetches when a provider mutation is announced', async () => {
+    setNextResponse([{ name: 'anthropic' }])
+    const { result } = renderHook(() => useConfiguredProviders())
+    await waitFor(() => expect(result.current.providers).toHaveLength(1))
+    setNextResponse([{ name: 'anthropic' }, { name: 'local-vllm' }])
+    act(() => notifyProvidersChanged())
+    await waitFor(() => expect(result.current.providers).toHaveLength(2))
+    expect(result.current.providers.map((p) => p.name)).toContain('local-vllm')
   })
 })
 
@@ -1050,5 +1080,38 @@ describe('useSecrets', () => {
     const initialCalls = fetchCalls.length
     act(() => result.current.refresh())
     await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+})
+
+describe('setupRepo', () => {
+  function lastSetupCall() {
+    const call = [...fetchCalls].reverse().find((c) => c.url.includes('/setup-repo'))
+    expect(call).toBeTruthy()
+    return call!
+  }
+
+  it('POSTs {url} when no branch is given', async () => {
+    setNextResponse({ ok: true, message: 'cloned' })
+    const res = await setupRepo('sess1', 'https://github.com/o/r.git')
+    expect(res).toEqual({ ok: true, message: 'cloned' })
+    const call = lastSetupCall()
+    expect(call.url).toBe('/api/sessions/sess1/setup-repo')
+    expect(call.init?.method).toBe('POST')
+    expect(JSON.parse(String(call.init?.body))).toEqual({ url: 'https://github.com/o/r.git' })
+  })
+
+  it('POSTs {url, branch} with a trimmed branch when one is given', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess2', 'https://github.com/o/r.git', '  dev  ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git', branch: 'dev' })
+  })
+
+  it('omits a blank branch (never sends null)', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess3', 'https://github.com/o/r.git', '   ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git' })
+    expect('branch' in body).toBe(false)
   })
 })

@@ -993,3 +993,11 @@ message.
 ---
 
 > End of consolidated design. Submitted to the design-review-gate.
+
+> **Superseded (2026-11-07).** The CORS invariants in §4.4/§8 no longer hold as
+> written: permissive `Access-Control-Allow-Origin` headers were removed from
+> the REST API, `OPTIONS` no longer grants anything, and every state-changing
+> request (plus `GET /api/setup`) must carry an `Origin` matching the gateway's
+> own origin. See
+> `docs/superpowers/specs/2026-11-07-web-first-run-setup-wizard-design.md` §3
+> and §7.1.

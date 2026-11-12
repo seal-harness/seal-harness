@@ -7,6 +7,7 @@ module Seal.Agent.Loop
   , defaultMaxTokens
   , aggregateStreamEvents
   , stripToolCallXml, findAllInvokeCalls
+  , requestMeta
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -22,6 +23,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BLC
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -32,8 +34,9 @@ import System.Timeout (timeout)
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.ContextTruncation
   ( estimateTokenCount, truncateMessages, defaultTruncationConfig )
+import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
-  ( MessageSource (..), conversationIdText )
+  ( MessageSource (..), conversationIdText, userIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..), TrustLevel (..))
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
@@ -43,6 +46,8 @@ import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
+import Seal.ISA.RepeatDetect
+  (RepeatVerdict (..), recordCall, repeatScope, repeatWarnNote, repeatBlockedMessage)
 import Seal.Providers.Class
 import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Security.Policy (AutonomyLevel (..))
@@ -54,6 +59,7 @@ import Seal.Session.Log
   , logRetryAttempt, logRetryExhausted )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
+import Seal.Transcript.Origin (annotateOrigins, originFromSource)
 import Seal.Types.App (App)
 
 -- | The output-token cap sent to the provider on every completion request.
@@ -86,22 +92,30 @@ continuationPrompt =
   \limit. Continue exactly where you left off. Do not restart or repeat \
   \prior text. Finish the answer directly.]"
 
--- | Build the request @erMeta@: a @channel@ key (always present, sourced
--- from 'aeChannel' so every channel — including web/CLI with no
--- 'MessageSource' — is attributed) plus a @conversationId@ key when
--- 'aeMessageSource' is present (carrying the server-derived conversation
--- id for channels that have one). This is the single place channel
--- provenance is stamped into the transcript, so every turn is attributed
--- regardless of the source channel.
+-- | Build the request @erMeta@: a @channel@ key (always present), a
+-- @userId@ key when the inbound message carried an authenticated sender id,
+-- and a @conversationId@ key when 'aeMessageSource' is present. The channel
+-- name comes from the 'MessageSource' when present (the true chat-channel
+-- tag, e.g. @"telegram"@) and otherwise falls back to 'aeChannel' (web/CLI).
+-- This is the single place channel provenance is stamped into the
+-- transcript, so every turn is attributed regardless of the source channel.
 requestMeta :: Text -> Maybe MessageSource -> Map.Map Text Value
-requestMeta channel mSrc =
-  Map.fromList
-    ([ ("channel", String channel)
-     ] <> conversationIdField)
+requestMeta fallbackChannel mSrc =
+  Map.fromList $
+    [ ("channel", String effectiveChannel) ] <> conversationIdField <> userIdField <> openFields
   where
+    effectiveChannel = case mSrc of
+      Nothing -> fallbackChannel
+      Just ms -> channelKindToText (msChannelKind ms)
     conversationIdField = case mSrc of
       Nothing -> []
       Just ms -> [("conversationId", String (conversationIdText (msConversationId ms)))]
+    userIdField = case mSrc >>= msUserId of
+      Nothing -> []
+      Just u  -> [("userId", String (userIdText u))]
+    openFields = case mSrc of
+      Nothing -> []
+      Just ms -> [ (k, String v) | (k,v) <- Map.toList (msOpen ms) ]
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
@@ -116,14 +130,23 @@ runTurn env userText = do
   -- to re-appending the whole list every iteration, corrupting
   -- @conversation.jsonl@ with duplicate user + assistant lines.
   prior <- liftIO (itwReadConversation (aeTranscript env))
-  let userMsg = textMsg User userText
+  -- Attach the inbound message's provenance (channel + sender) to the user
+  -- message itself. 'conversation.jsonl' lines are canonical 'Message'
+  -- encodings, so the writer persists the origin with the line and every
+  -- later read gets it back — that per-message origin is what lets the model
+  -- tell senders apart in a group chat, long after this turn is over. The
+  -- text stays exactly as the user typed it (see 'Seal.Transcript.Origin':
+  -- the tag is rendered into the provider request, never into the file).
+  let userMsg = (textMsg User userText)
+                  { msgOrigin = originFromSource <$> aeMessageSource env }
       turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
   -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
-  -- The request's @erMeta@ carries the channel + conversation id when
-  -- 'aeMessageSource' is present (Signal), so the transcript records which
-  -- channel + conversation this turn served. @erConvLen@ is the full
+  -- The request's @erMeta@ carries the channel (from the message source when
+  -- present, else the arrival channel) plus the source's conversation id and
+  -- sender user id, so the transcript records who sent it on which channel.
+  -- @erConvLen@ is the full
   -- conversation length in effect at this request (prior + new user message),
   -- so reconstruction can slice the right prefix from @conversation.jsonl@.
   liftIO $ do
@@ -250,10 +273,15 @@ runTurn env userText = do
                                  - estimateTokenCount (aeSystem env) [] tools)
                               msgs
                        else msgs
+      -- Render each user message's origin into the text the model reads. The
+      -- whole (possibly truncated) list is annotated, so earlier senders in a
+      -- group chat stay attributable too. This is the only place the tag is
+      -- applied: the transcript keeps the clean text plus the structured
+      -- origin, and @requests.jsonl@ (below) records exactly what was sent.
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
-                  , crMessages = sendMsgs
+                  , crMessages = annotateOrigins sendMsgs
                   , crTools = tools
                   , crToolChoice = ToolAuto
                   , crMaxTokens = defaultMaxTokens
@@ -565,13 +593,31 @@ runTurn env userText = do
       -- on chat channels, so the user sees which tools are running.
       liftIO $ aeOnToolCall env name input
       mConfirmed <- checkConfirmation name mOp input
-      res <- case mConfirmed of
-        Left denyMsg -> pure (Left (Denied denyMsg))
-        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
-      let result = case res of
+      -- No-progress repeat detection (session-read hardening WU4).
+      -- In-scope session reads ('repeatScope') are keyed by (opcode,
+      -- encoded input) into the session's sliding window
+      -- ('aeRepeatTrack'). 2nd–3rd identical call within the window
+      -- warns (dispatch proceeds, a note is prepended to the result
+      -- parts); ≥4th is blocked outright — the op is never dispatched.
+      -- A denied call never reached execution, so it is not recorded.
+      -- Ops outside the scope are untouched.
+      mRepeat <- case mConfirmed of
+        Left _ -> pure Nothing
+        Right ()
+          | Set.member name repeatScope ->
+              Just <$> liftIO (recordCall (aeRepeatTrack env) name input)
+          | otherwise -> pure Nothing
+      result <- case mRepeat of
+        Just RvBlock ->
+          pure (CbToolResult tcid [TrpText (repeatBlockedMessage name)] True)
+        _ -> do
+          res <- case mConfirmed of
+            Left denyMsg -> pure (Left (Denied denyMsg))
+            Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
+          pure $ case res of
             Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
-            Right r -> CbToolResult tcid (orParts r) (orIsError r)
-          (isErr, partCount) = case result of
+            Right r -> CbToolResult tcid (prependRepeatNote mRepeat (orParts r)) (orIsError r)
+      let (isErr, partCount) = case result of
             CbToolResult _ parts err -> (err, length parts)
             _ -> (False, 0)
       liftIO (logToolDispatch (aeLogPath env) name isErr partCount)
@@ -650,6 +696,13 @@ runTurn env userText = do
         -- name, input, and approval scope as evidence of the human's
         -- decision. This is separate from the dispatcher's own entry (which
         -- records the invocation, not the approval).
+        -- | Prepend the no-progress warning note to a dispatched result's
+        -- parts when the repeat detector flagged this call. The note is
+        -- model-visible only (a tool-result part); nothing content-bearing
+        -- is added to the recorded metadata.
+        prependRepeatNote :: Maybe RepeatVerdict -> [ToolResultPart] -> [ToolResultPart]
+        prependRepeatNote (Just RvWarn) parts = TrpText repeatWarnNote : parts
+        prependRepeatNote _ parts = parts
         recordApprovalEvidence :: OpName -> Value -> ApprovalScope -> App ()
         recordApprovalEvidence opName' input' scope = liftIO $ do
           now <- getCurrentTime

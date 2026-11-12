@@ -4,6 +4,9 @@
 module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
+  , rebindNewResponse
+  , parseSetupRepoBody
+  , handleSetupRepoResponse
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), withObject)
@@ -24,6 +27,7 @@ import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
+import Data.Map.Strict qualified as Map
 import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 
@@ -35,10 +39,11 @@ import Text.Read (readMaybe)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status500, status501 )
+  , status200, status201, status204, status400, status403, status404, status409, status500, status501 )
+import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
-  , queryString, requestMethod, responseLBS )
+  , queryString, requestMethod, responseLBS, remoteHost, requestHeaders )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
@@ -53,11 +58,16 @@ import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId
   , sanitizeAgentDefFields )
 import Seal.Core.AllowList (AllowList (..))
+import Seal.Command.Spec (CommandName (..), CommandSpec (..), Registry (..))
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), mkChannelId, channelIdText, telegramVaultKeyFor, restrictChannelKind)
+import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
+import Seal.Core.MessageSource (MessageSource (..), mkUserId)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
+import Seal.Config.Paths
+  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath )
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Session.AgentMetaCache
@@ -80,14 +90,18 @@ import Seal.Handles.AskReply
 import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Agent.Runtime.RunRecord (cancelRunsForParent)
 import Seal.Gateway.Send
-  ( SendDeps (..), handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
-  , handleAskCancel, handleSend
-  , handleSetupRepo, sendOutcomeJson )
+  ( SendDeps (..), handleSend, mkWebMessageSource, parseSendBody
+  , handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
+  , handleAskCancel, handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
+import Seal.Gateway.OriginGuard (GuardVerdict (..), guardHeadersFrom, sameOriginVerdict)
+import Seal.Gateway.Setup
+  ( SetupDeps (..), SetupEnv (..), handleProviderTest, handleSetupState
+  , handleVaultCreate, handleVaultReopen )
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
@@ -98,7 +112,9 @@ import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
   ( KnownProvider (..), anthropicOAuthKey, defaultModelFor, knownProviders
-  , parseProvider, providerLabel, vaultKeyName )
+  , parseProvider, providerLabel, vaultKeyName
+  , customProviderNames, configuredCustomProviderNames, validateProviderName
+  , vaultKeyNameForName )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
@@ -120,7 +136,7 @@ import Seal.Session.Store
   , updateSessionDescription
   , updateSessionSealFrontMatter )
 import Seal.Command.Tab (TabCloseNotifier)
-import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
+import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
@@ -166,12 +182,55 @@ data ApiDeps = ApiDeps
     -- a fixture repo's @.agents/agents.md@, so repo-agent discovery is
     -- exercised without a live SSH connection. 'Nothing' in production
     -- (the handler builds the real 'SessionExec' via 'mkSessionExec').
+  , adCanonicalOrigin  :: Maybe Text
+    -- ^ The origin the boot plan resolved for this gateway
+    -- (@http://localhost:8080@ for a loopback bind), or 'Nothing' when access
+    -- control is off on a wildcard bind and no origin could be resolved. The
+    -- mutation guard compares each mutating request's @Origin@ against it; it is
+    -- the same value WebAuthn verifies @clientDataJSON.origin@ against, so the
+    -- HTTP and WebSocket surfaces share one trust anchor.
+  , adSetup            :: SetupDeps
+    -- ^ The setup endpoints' injected seams (vault provisioning + provider
+    -- resolution). Real wiring in 'Seal.Command.Serve'; 'stubSetupDeps' in the
+    -- test literals, which fail closed rather than touching the filesystem.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   }
 
 -- | The REST API as a WAI Application.
 apiApp :: ApiDeps -> Application
-apiApp deps req respond =
+apiApp deps req respond
+  -- The mutation guard runs before the route table: a cross-origin request that
+  -- would change state is refused here, so no handler (present or future) can
+  -- forget the check.
+  | guardApplies req
+  , Rejected why <- sameOriginVerdict (adCanonicalOrigin deps) (guardHeadersFrom req) =
+      respond (errJson status403 ("cross-origin request rejected: " <> why))
+  | otherwise = dispatchApi deps req respond
+
+-- | Which requests the mutation guard covers: every method that can change
+-- state, plus the setup status probe (whose body describes system state).
+-- Reads and @OPTIONS@ preflights are not guarded — the CORS removal is what
+-- protects them from a hostile page reading the response.
+guardApplies :: Request -> Bool
+guardApplies req =
+  requestMethod req `elem` [methodPost, methodPut, methodDelete]
+    || pathInfo req == ["api", "setup"]
+
+-- | The setup handlers' view of the running gateway. 'adPaths' (not
+-- 'VaultRuntime.vrPaths', which is a test stub) supplies the real paths.
+setupEnv :: ApiDeps -> SetupEnv
+setupEnv deps = SetupEnv
+  { sePaths        = adPaths deps
+  , seHandleRef    = vrHandleRef (adVault deps)
+  , seConfigPath   = srConfigPath (adSessionRuntime deps)
+  , seSecurityPath = securityFilePath (adPaths deps)
+  , seProviders    = adProviders deps
+  , seDeps         = adSetup deps
+  }
+
+-- | The route table.
+dispatchApi :: ApiDeps -> Application
+dispatchApi deps req respond =
   case (requestMethod req, pathInfo req) of
     (m', ["api", "health"]) | m' == methodGet ->
       do
@@ -187,6 +246,26 @@ apiApp deps req respond =
           , "wsStatus" .= streamHealthStatus wsHealth
           , "wsMessage" .= streamHealthMessage wsHealth
           ]))
+    -- The first-run setup wizard (issue #303). These four live ahead of every
+    -- capture arm; the literal "setup" segment cannot be confused with a
+    -- capture, and the passkey middleware has already authorised the request
+    -- (see Seal.Gateway.Setup's module header for the trust boundary).
+    (m', ["api", "setup"]) | m' == methodGet ->
+      respond =<< handleSetupState (setupEnv deps)
+    (m', ["api", "setup", "vault"]) | m' == methodPost ->
+      respond =<< handleVaultCreate (setupEnv deps) req
+    (m', ["api", "setup", "vault", "reopen"]) | m' == methodPost ->
+      respond =<< handleVaultReopen (setupEnv deps)
+    (m', ["api", "providers", name, "test"]) | m' == methodPost ->
+      respond =<< handleProviderTest (setupEnv deps) name req
+    -- GET /api/commands -> the slash-command menu as
+    -- [{"name": …, "synopsis": …}], one entry per registered CommandSpec
+    -- (canonical names only — aliases are not advertised). The chat channels
+    -- render this as /help on Signal/Telegram. [] when the send plumbing is
+    -- unwired: the registry lives on SendDeps, so a gateway without it has no
+    -- menu to report.
+    (m', ["api", "commands"]) | m' == methodGet ->
+      respond =<< handleCommands deps
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
@@ -232,11 +311,22 @@ apiApp deps req respond =
       case adSend deps of
         Nothing -> respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
         Just sendDeps -> do
-          let msg = parseSendMessage body
+          let (msg, mSrc0) = parseSendBody body
           case mkSessionId sid of
             Left e   -> respond (errJson status400 ("invalid session id: " <> e))
             Right sId -> do
-              outcome <- handleSend sendDeps sId msg
+              let bodyVal = A.decode body :: Maybe A.Value
+                  passkeyFromBody = case bodyVal of
+                    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "passkeyId") o of
+                      Just (A.String t) -> Just t
+                      _                 -> Nothing
+                    _ -> Nothing
+                  passkey = passkeyFromBody `maybeAlt` (TE.decodeUtf8 <$> lookup "X-Passkey-Id" (requestHeaders req))
+                  ip = clientIpFromRequest req
+                  mSrc = case mSrc0 of
+                    Just src -> Just (augmentMessageSource src passkey ip)
+                    Nothing  -> mkWebMessageSource sId passkey ip
+              outcome <- handleSend sendDeps sId mSrc msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
     -- POST /api/sessions/:id/stop — abort the session's in-flight tool call
@@ -271,16 +361,18 @@ apiApp deps req respond =
              ]))
     -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
     -- workdir before the first turn (the web "set up repo" combo box calls
-    -- this). Shares the clone logic with the SETUP_REPO opcode via
-    -- 'cloneRepoIO'. Returns 200 {ok:true, target, status} on
-    -- cloned/noop, 409 on a conflict, 400 on an invalid url, 503 on a
-    -- clone failure. When 'adSend' is Nothing (tests without the full
-    -- runtime), returns a stub 200.
+    -- this). Body: {"url":"<git url>"} or {"url":"<git url>",
+    -- "branch":"<branch or tag>"} — the branch is optional and lands in
+    -- the SETUP_REPO dispatch payload, so the opcode clones that ref (or
+    -- switches an existing clone to it). Returns 200 {ok:true, message}
+    -- with the opcode's text result, 400 on an invalid url/branch. When
+    -- 'adSend' is Nothing (tests without the full runtime), returns a stub
+    -- 200.
     (m', ["api", "sessions", sid, "setup-repo"]) | m' == methodPost -> do
       body <- collectBody req
-      case parseRepoUrl body of
+      case parseSetupRepoBody body of
         Nothing -> respond (errJson status400 "missing or invalid 'url' field")
-        Just url -> case adSend deps of
+        Just (url, mBranch) -> case adSend deps of
           Nothing -> respond (jsonOk (object ["ok" .= True, "target" .= ("" :: Text), "status" .= ("stubbed" :: Text)]))
           Just sendDeps -> case mkSessionId sid of
             Left e -> respond (errJson status400 ("invalid session id: " <> e))
@@ -289,7 +381,7 @@ apiApp deps req respond =
               -- the frontend's session-scoped Agent dropdown re-fetches (the
               -- clone may have introduced repo-local .agents/ defs). The
               -- existing BeAgentDefsChanged event is reused (§3.6).
-              eRes <- handleSetupRepo sendDeps sId url
+              eRes <- handleSetupRepo sendDeps sId url mBranch
               when (isRight eRes) $
                 broadcastAgentDefsChanged (adBroker deps)
               respond (handleSetupRepoResponse eRes)
@@ -555,8 +647,23 @@ apiApp deps req respond =
     -- 'ApiDeps' for T11, so only @name@ + @configured@ are emitted.
     (m', ["api", "providers"]) | m' == methodGet -> do
       configured <- adProviders deps
-      let cfgSet = Set.fromList (map providerLabel configured)
-      respond (jsonLBS status200 (A.encode (map (providerInfoJson cfgSet) knownProviders)))
+      let cfgPath = srConfigPath (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig cfgPath
+      let cfg = fromRight defaultRuntimeConfig eCfg
+      mh <- readIORef (vrHandleRef (adVault deps))
+      customs <- configuredCustomProviderNames mh cfg
+      let cfgSet = Set.fromList (map providerLabel configured <> customs)
+          customInfos =
+            [ object
+                [ "name" .= name
+                , "type" .= ("openai" :: Text)
+                , "configured" .= True
+                , "models" .= providerModels cfg name
+                ]
+            | name <- customs
+            ]
+      respond (jsonLBS status200 (A.encode
+        (map (providerInfoJson cfg cfgSet) knownProviders <> customInfos)))
     -- GET /api/providers/all -> ALL known providers with full status
     -- details (authStatus, isDefault, defaultModel, baseUrl) for the
     -- ProvidersView CRUD page. Literal "all" must precede :p/models.
@@ -598,6 +705,32 @@ apiApp deps req respond =
         [ "contextWindow" .= modelContextWindow m
         , "maxOutputTokens" .= modelMaxOutputTokens m
         ]))
+    -- GET /api/channels -> the configured chat channels (multi-instance
+    -- Signal/Telegram). Returns a JSON array of channel detail objects
+    -- (camelCase: id, kind, label, account, textChunkLimit, allowFrom,
+    -- authStatus). Legacy [signal]/[telegram] sections are migrated into
+    -- the channel map on load (design §3.3).
+    (m', ["api", "channels"]) | m' == methodGet ->
+      respond =<< handleChannelsList deps
+    -- POST /api/channels -> create a new channel. Body (snake_case):
+    -- {id, kind, label?, account?, token?, text_chunk_limit?, allow_from?}.
+    -- Validates id (mkChannelId), kind (signal/telegram), duplicate (409).
+    -- Telegram tokens stored in vault. Returns 201 + detail.
+    (m', ["api", "channels"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleChannelCreate deps body
+    -- PUT /api/channels/:id -> update an existing channel's fields. Body
+    -- (snake_case, all optional): {label?, account?, token?, text_chunk_limit?,
+    -- allow_from?}. kind is immutable. 404 for unknown id. Rotates vault
+    -- key if token present (Telegram). Returns 200 + detail.
+    (m', ["api", "channels", cid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleChannelUpdate deps cid body
+    -- DELETE /api/channels/:id -> remove a channel. Idempotent (204 for
+    -- missing). Deletes the Telegram vault key. Nullifies the legacy
+    -- [signal]/[telegram] field when the id is a legacy default.
+    (m', ["api", "channels", cid]) | m' == methodDelete ->
+      respond =<< handleChannelDelete deps cid
     -- GET /api/ui/state -> the persisted last-chosen "new tab" options and
     -- the custom-model id history. The frontend loads this on mount so the
     -- form opens with the last-used selection; the custom-model combobox
@@ -643,14 +776,21 @@ apiApp deps req respond =
         Just v  -> respond =<< handleSessionNew deps v
         Nothing -> respond =<< handleSessionNew deps (A.object [])
     -- POST /api/sessions/:id/new — rebind the tab (if any) bound to :id to a
-    -- fresh session, and return the new sid + tab_index + rebound flag. The
+    -- fresh session, and return the new sid + tab_index + rebound flag +
+    -- rebind_error. Body is optional (provider/model/channel overrides). The
     -- old session is kept on disk. 404 when :id doesn't resolve to an
     -- on-disk session (matches handleSessionPrompt/handleSessionAgent —
     -- prevents orphan-session spam).
-    (m', ["api", "sessions", sid, "new"]) | m' == methodPost ->
-      respond =<< handleSessionRebindNew deps sid
+    (m', ["api", "sessions", sid, "new"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleSessionRebindNew deps sid v
+        Nothing -> respond =<< handleSessionRebindNew deps sid (A.object [])
     (m', ["api", "tabs", idx, "close"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
+    (m', ["api", "tabs", idx, "rename"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleTabRename deps idx body
     (m', ["api", "tabs", idx, "dismiss"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
     (m', ["api", "tabs", idx, "acknowledge"]) | m' == methodPost ->
@@ -667,8 +807,10 @@ apiApp deps req respond =
       respond (jsonLBS status200 encodeOpenApi)
     (m', ["api", "openapi"]) | m' == methodGet ->
       respond (responseLBS status200 [("Content-Type", "text/html")] swaggerUiHtml)
-    (m', _) | m' == methodOptions ->
-      respond (responseLBS status200 corsHeaders "")
+    -- A preflight for a mutation no longer gets a CORS grant (see below), so a
+    -- cross-origin ``simple'' request never reaches the handler either.
+    (_m', _) | requestMethod req == methodOptions ->
+      respond (responseLBS status204 [] "")
     _ -> respond (responseLBS status404 [("Content-Type", "application/json")] "{\"error\":\"not found\"}")
 
 -- | A static Swagger UI page that fetches @\/api\/openapi.json@ and renders
@@ -696,6 +838,48 @@ collectBody req = go []
         then pure (BL.fromChunks (reverse acc))
         else go (chunk : acc)
 
+-- | Enrich an inbound 'MessageSource' with the web gateway's
+-- passkey / client-ip information without rejecting the source.
+augmentMessageSource :: MessageSource -> Maybe Text -> Maybe Text -> MessageSource
+augmentMessageSource src mPasskey mIp =
+  src
+    { msUserId = case msUserId src of
+        Just _  -> msUserId src
+        Nothing -> case mPasskey of
+          Nothing -> Nothing
+          Just p  -> case mkUserId p of
+            Right u -> Just u
+            Left _  -> Nothing
+    , msOpen = case mIp of
+        Nothing -> msOpen src
+        Just ip -> Map.insert "clientIp" ip (msOpen src)
+    }
+
+-- | Derive the client IP address for an inbound API request, preferring a
+-- (single-valued) @X-Forwarded-For@ or @X-Real-IP@ header (the first
+-- comma-separated entry) and falling back to the WAI connection's
+-- 'remoteHost'. Returns 'Nothing' when no address can be derived.
+clientIpFromRequest :: Request -> Maybe Text
+clientIpFromRequest req =
+  case forwardedFor req of
+    Just ip -> Just (T.strip ip)
+    Nothing -> sockAddrToText (remoteHost req)
+  where
+    forwardedFor r = do
+      v <- lookup "X-Forwarded-For" (requestHeaders r)
+           `maybeAlt` lookup "X-Real-Ip" (requestHeaders r)
+      let first = T.takeWhile (/= ',') (TE.decodeUtf8 v)
+      if T.null (T.strip first) then Nothing else Just first
+    sockAddrToText (SockAddrInet _ ha) =
+      let (a,b,c,d) = hostAddressToTuple ha
+      in Just (T.intercalate "." (map (T.pack . show) [a,b,c,d]))
+    sockAddrToText (SockAddrInet6 {}) = Nothing
+    sockAddrToText _ = Nothing
+
+maybeAlt :: Maybe a -> Maybe a -> Maybe a
+maybeAlt (Just x) _ = Just x
+maybeAlt Nothing  y = y
+
 -- | Push a fresh @lists@ snapshot to every WS subscriber. Called after
 -- every state change that affects the sidebar partition (W6 broadcast
 -- trigger). No-op when 'adBroker' is 'Nothing' (tests without a broker).
@@ -707,26 +891,26 @@ triggerBroadcast deps =
     Nothing      -> pure ()
     Just broker  -> broadcastListsSnapshot broker (adTabsHandle deps) (srPaths (adSessionRuntime deps))
 
--- | Parse the @message@ field from a POST /send body. Returns "" on a
--- missing/invalid body so the agent loop receives an empty turn (the routing
--- grammar treats empty input as 'Plain ""').
-parseSendMessage :: BL.ByteString -> Text
-parseSendMessage body =
-  case A.decode body :: Maybe A.Value of
-    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "message") o of
-      Just (A.String t) -> t
-      _                 -> ""
-    _ -> ""
-
--- | Parse the @url@ field from a POST /setup-repo body. Returns 'Nothing'
--- on a missing/invalid body or a non-string @url@.
-parseRepoUrl :: BL.ByteString -> Maybe Text
-parseRepoUrl body =
+-- | Parse the @url@ (required) and @branch@ (optional) fields from a POST
+-- /setup-repo body. 'Nothing' when the body is not a JSON object or @url@
+-- is missing, blank, or a non-string. The branch is 'Nothing' when the
+-- field is absent, @null@, a non-string, or blank/whitespace — only a
+-- non-blank string is a branch. Both values are returned as parsed (the
+-- SETUP_REPO input parser in 'Seal.Gateway.Send' trims and validates).
+parseSetupRepoBody :: BL.ByteString -> Maybe (Text, Maybe Text)
+parseSetupRepoBody body =
   case A.decode body :: Maybe A.Value of
     Just (A.Object o) -> case KeyMap.lookup (Key.fromText "url") o of
-      Just (A.String t) | not (T.null (T.strip t)) -> Just t
+      Just (A.String t) | not (T.null (T.strip t)) ->
+        Just (t, branchOf o)
       _ -> Nothing
     _ -> Nothing
+  where
+    -- An absent, null, non-string, or blank @branch@ means "the remote's
+    -- default branch"; a non-string is never read as a branch.
+    branchOf o = case KeyMap.lookup (Key.fromText "branch") o of
+      Just (A.String b) | not (T.null (T.strip b)) -> Just b
+      _ -> Nothing
 
 -- | Agent-metadata cache env for API-driven scans. Remote mode only —
 -- in local mode the workdir is local and the legacy crawl costs nothing.
@@ -746,10 +930,11 @@ metaCacheEnvForApi deps = case adSend deps of
       _ -> Nothing
   _ -> Nothing
 
--- | Handle @POST /api/sessions/:id/setup-repo@: build the response from the
--- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
--- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
--- url, 500 on a capability/workdir failure.
+-- | Build the @POST /api/sessions/:id/setup-repo@ response from the
+-- 'Either' returned by 'Seal.Gateway.Send.handleSetupRepo': 400 carrying
+-- the error text (invalid url/branch, unknown session, dispatch failure,
+-- clone failure) or 200 @{ok:true, message}@ carrying the opcode's text
+-- result. Exported so the mapping is unit-testable.
 handleSetupRepoResponse :: Either Text Text -> Response
 handleSetupRepoResponse eRes =
   case eRes of
@@ -834,7 +1019,64 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       triggerBroadcast deps
       pure (tabInsertResponse res Nothing "harness")
+    Just "resume" -> case parseResumeSessionId v of
+      Nothing -> pure (errJson status400 "missing or invalid 'session_id' field")
+      Just sid -> do
+        -- Inserting a tab does not validate that the session exists, so a
+        -- well-formed id for a deleted session would create a dead tab.
+        -- Mirror handleSessionRebindNew's existence guard.
+        let paths = srPaths (adSessionRuntime deps)
+        exists <- doesFileExist (sessionMetaPath paths sid)
+        if not exists
+          then pure (errJson status404 "session not found")
+          else do
+            res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+            case res of
+              Left e -> pure (errJson status400 e)
+              Right _ -> do
+                triggerBroadcast deps
+                pure (tabInsertResponse res (Just sid) "session:provider")
+
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | Parse the @session_id@ field of a @POST /api/tabs/new {kind:"resume"}@ body.
+parseResumeSessionId :: A.Value -> Maybe SessionId
+parseResumeSessionId v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "session_id") o of
+    Just (A.String t) -> either (const Nothing) Just (mkSessionId t)
+    _                 -> Nothing
+  _ -> Nothing
+
+-- | Handle @POST /api/tabs/:index/rename@. Body: @{"label": "<text>"}@.
+-- Replies @200 {ok, tab_index, label}@, @404@ when the index is out of range,
+-- @400@ on a missing/blank label.
+handleTabRename :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleTabRename deps idxTxt body =
+  case parseIndex idxTxt of
+    Nothing   -> pure (errJson status400 "invalid tab index")
+    Just idx  -> case parseLabelBody body of
+      Nothing  -> pure (errJson status400 "missing or invalid 'label' field")
+      Just lbl -> do
+        r <- renameTabH (adTabsHandle deps) idx lbl
+        case r of
+          Left _   -> pure (errJson status404 "tab index out of range")
+          Right () -> do
+            triggerBroadcast deps
+            pure (jsonOk (object
+              [ "ok" .= True
+              , "tab_index" .= tabIndexToInt idx
+              , "label" .= lbl
+              ]))
+
+-- | Parse the @label@ field of a @POST /api/tabs/:index/rename@ body.
+-- A missing, blank, or non-string label is rejected.
+parseLabelBody :: BL.ByteString -> Maybe Text
+parseLabelBody body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "label") o of
+      Just (A.String t) | not (T.null (T.strip t)) -> Just (T.strip t)
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Handle POST /api/sessions/new — create a bare session (no tab attached)
 -- and return its id. The "Recent Sessions +" button calls this. Body is
@@ -843,6 +1085,12 @@ handleTabNew deps v =
 -- anthropic as the default, not a hardcoded fallback. When the body omits
 -- a field, the config default applies; when no default agent is
 -- configured, the session starts unbound. Does NOT touch TabsHandle.
+--
+-- The optional boolean @headless@ field selects the session's channel label:
+-- @true@ labels it @"bg"@ (a background session, invisible to Active Tabs
+-- because 'Seal.Core.TurnEngine.shouldAutoTab' is @False@ for that label),
+-- anything else @"web"@. Everything else — no tab, one broadcast — is
+-- identical for both.
 handleSessionNew :: ApiDeps -> A.Value -> IO Response
 handleSessionNew deps v = do
   let paths = srPaths (adSessionRuntime deps)
@@ -856,7 +1104,8 @@ handleSessionNew deps v = do
       mAgent = case lookupBodyStr "agent" of
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
-  meta <- newSession paths provider model "web" mAgent
+      channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
+  meta <- newSession paths provider model channel mAgent
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
@@ -865,6 +1114,11 @@ handleSessionNew deps v = do
     lookupBodyStr k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
       Just (A.String t) | not (T.null t) -> Just t
       _                                 -> Nothing
+    -- Absent, null, or non-boolean @headless@ means "not headless" (the
+    -- web UI omits the field entirely).
+    lookupBodyBool k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
+      Just (A.Bool b) -> b
+      _               -> False
     eitherToMaybe (Right x) = Just x
     eitherToMaybe (Left _)  = Nothing
 
@@ -873,8 +1127,22 @@ handleSessionNew deps v = do
 -- flag. The old session is kept on disk (still in /session list). 404 when
 -- :id doesn't resolve to an on-disk session (prevents orphan-session spam;
 -- matches handleSessionPrompt/handleSessionAgent).
-handleSessionRebindNew :: ApiDeps -> Text -> IO Response
-handleSessionRebindNew deps sidTxt =
+--
+-- The optional body carries @{provider?, model?, channel?}@:
+--
+--   * an absent @provider@\/@model@ inherits the old session's value, so a
+--     mid-session @\/model use@ survives @\/new@;
+--   * an absent @channel@ means @"web"@;
+--   * @agent@ is ALWAYS resolved from the config defaults
+--     ('resolveDefaultAgent') — the old session's agent is deliberately not
+--     inherited (D8, golden parity).
+--
+-- A failed rebind answers @200@ with @rebound: false@ and the raw
+-- @rebind_error@ instead of a @400@: the session is minted before the
+-- rebind, so a 4xx would discard the id the caller needs to print both the
+-- warning and the confirmation line.
+handleSessionRebindNew :: ApiDeps -> Text -> A.Value -> IO Response
+handleSessionRebindNew deps sidTxt body =
   case mkSessionId sidTxt of
     Left e  -> pure (errJson status400 ("invalid session id: " <> e))
     Right oldSid -> do
@@ -888,28 +1156,71 @@ handleSessionRebindNew deps sidTxt =
           case mOldMeta of
             Nothing -> pure (errJson status404 "session not found")
             Just oldMeta -> do
-              meta <- newSession paths (smProvider oldMeta) (smModel oldMeta) "web" (smAgent oldMeta)
+              eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+              let cfg = fromRight defaultRuntimeConfig eCfg
+              (mDefAgent, _, _) <- resolveDefaultAgent (adAgentDefs deps) cfg
+              let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
+                  model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
+                  channel  = fromMaybe "web" (bodyStr "channel" body)
+              meta <- newSession paths provider model channel mDefAgent
               let newSid = smId meta
+                  newSidTxt = sessionIdText newSid
               snap <- snapshotTabs (adTabsHandle deps)
               case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
                 []       -> do
                   triggerBroadcast deps
-                  pure (jsonOk (object
-                    [ "session_id" .= sessionIdText newSid
-                    , "tab_index" .= (Nothing :: Maybe Int)
-                    , "rebound" .= False
-                    ]))
+                  pure (jsonOk (rebindNewResponse
+                    newSidTxt Nothing False Nothing provider model))
                 (tab : _) -> do
+                  let idx = tabIndexToInt (tIndex tab)
                   r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
-                  case r of
-                    Left e -> pure (errJson status400 ("tab rebind failed: " <> e))
-                    Right _ -> do
-                      triggerBroadcast deps
-                      pure (jsonOk (object
-                        [ "session_id" .= sessionIdText newSid
-                        , "tab_index" .= tabIndexToInt (tIndex tab)
-                        , "rebound" .= True
-                        ]))
+                  triggerBroadcast deps
+                  pure (jsonOk $ case r of
+                    Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
+                    Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
+
+-- | The response body of @POST \/api\/sessions\/:id\/new@. Pure, so the
+-- rebind-failure branch (reachable only via an out-of-range race or a
+-- same-millisecond sid collision) is pinned by a unit test rather than an
+-- unreliable integration test.
+--
+-- @tab_index@ is 'Nothing' when no tab was bound to the old session; when a
+-- tab was bound it is the index of the tab we attempted to rebind (on
+-- failure that tab stays bound to the old session). @rebind_error@ carries
+-- the raw 'rebindTabH' error text; a 'Nothing' here serialises to JSON null.
+rebindNewResponse :: Text -> Maybe Int -> Bool -> Maybe Text -> Text -> Text -> A.Value
+rebindNewResponse newSid mTabIndex rebound mRebindError provider model = object
+  [ "session_id"   .= newSid
+  , "tab_index"    .= mTabIndex
+  , "rebound"      .= rebound
+  , "rebind_error" .= mRebindError
+  , "provider"     .= provider
+  , "model"        .= model
+  ]
+
+-- | Look up a non-empty string field of a JSON body. A missing body, a
+-- non-object body, an empty string and a non-string value all read as
+-- 'Nothing' (so the caller's default applies).
+bodyStr :: Text -> A.Value -> Maybe Text
+bodyStr k (A.Object o) = case KeyMap.lookup (Key.fromText k) o of
+  Just (A.String t) | not (T.null t) -> Just t
+  _                                 -> Nothing
+bodyStr _ _ = Nothing
+
+-- | Handle @GET \/api\/commands@ — the slash-command menu, one entry per
+-- registered 'CommandSpec' in registry order. Canonical names only (aliases
+-- are never advertised). Returns @[]@ when the send plumbing is unwired: the
+-- registry lives on 'SendDeps', so a gateway without it has no menu.
+handleCommands :: ApiDeps -> IO Response
+handleCommands deps = case adSend deps of
+  Nothing -> pure (jsonLBS status200 (A.encode ([] :: [A.Value])))
+  Just sd -> pure (jsonLBS status200 (A.encode (map commandJson (registrySpecs (sdRegistry sd)))))
+  where
+    commandJson spec = case csName spec of
+      CommandName n -> object
+        [ "name" .= n
+        , "synopsis" .= csSynopsis spec
+        ]
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
@@ -2046,7 +2357,7 @@ handleTranscript deps sidTxt req =
           timingHeader = (mkHN "Server-Timing", renderServerTiming tt)
           hasMoreHdr = (mkHN "X-Has-More", if hasMore then "true" else "false")
           totalCountHdr = (mkHN "X-Total-Count", BC.pack (show totalCount))
-      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader, hasMoreHdr, totalCountHdr]) body)
+      pure (responseLBS status200 [jsonHeader, timingHeader, hasMoreHdr, totalCountHdr] body)
   where
     msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
 
@@ -2147,22 +2458,22 @@ skillInfoJson s = A.object
 
 -- | A 201 Created with a JSON body + CORS headers.
 jsonCreated :: Value -> Response
-jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
+jsonCreated v = responseLBS status201 [jsonHeader] (A.encode v)
 
--- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
--- emits @name@ + @configured@ (membership in the configured-provider set);
--- @isDefault@ / @defaultModel@ are UI conveniences not threaded into
--- 'ApiDeps' for T11.
-providerInfoJson :: Set.Set Text -> KnownProvider -> Value
-providerInfoJson cfgSet p =
+-- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape:
+-- @name@ + @configured@ (membership in the configured-provider set) plus the
+-- operator's frequently-used @models@ for the new-tab model combobox.
+providerInfoJson :: RuntimeConfig -> Set.Set Text -> KnownProvider -> Value
+providerInfoJson cfg cfgSet p =
   object
     [ "name" .= providerLabel p
     , "configured" .= Set.member (providerLabel p) cfgSet
+    , "models" .= providerModels cfg (providerLabel p)
     ]
 
 -- | Handle GET /api/providers/all — returns ALL known providers with full
 -- status details for the ProvidersView CRUD page. Each provider object
--- includes name, isDefault, defaultModel, baseUrl, and authStatus.
+-- includes name, isDefault, defaultModel, models, baseUrl, and authStatus.
 handleProvidersAll :: ApiDeps -> IO Response
 handleProvidersAll deps = do
   let cfgPath = srConfigPath (adSessionRuntime deps)
@@ -2170,25 +2481,50 @@ handleProvidersAll deps = do
   let cfg = fromRight defaultRuntimeConfig eCfg
   mh <- readIORef (vrHandleRef (adVault deps))
   details <- mapM (providerDetailJson cfg mh) knownProviders
-  pure (jsonLBS status200 (A.encode details))
+  custom <- mapM (customProviderDetailJson cfg mh) (customProviderNames cfg)
+  pure (jsonLBS status200 (A.encode (details <> custom)))
 
--- | Build the detailed JSON object for a single provider, including its
--- auth status (derived from the vault + config), default-model, base-URL,
+-- | Build the detailed JSON object for a single built-in provider, including
+-- its auth status (derived from the vault + config), default-model, base-URL,
 -- and whether it is the configured default provider.
 providerDetailJson :: RuntimeConfig -> Maybe VaultHandle -> KnownProvider -> IO Value
-providerDetailJson cfg mh kp = do
-  authStatus <- providerAuthStatus mh cfg kp
-  let lbl = providerLabel kp
-      isDef = rcDefaultProvider cfg == Just lbl
-      dModel = providerDefaultModel cfg lbl
-      bUrl = providerBaseUrl cfg lbl
+providerDetailJson cfg mh kp =
+  providerDetailJsonFor cfg mh lbl lbl
+  where
+    lbl = providerLabel kp
+
+-- | Build the detailed JSON object for a custom OpenAI-compatible instance.
+customProviderDetailJson :: RuntimeConfig -> Maybe VaultHandle -> Text -> IO Value
+customProviderDetailJson cfg mh name =
+  providerDetailJsonFor cfg mh name "openai"
+
+-- | The shared detail object. @typeId@ is the implementation ("anthropic",
+-- "ollama", "openrouter", "openai"); @name@ is the instance name.
+providerDetailJsonFor
+  :: RuntimeConfig -> Maybe VaultHandle -> Text -> Text -> IO Value
+providerDetailJsonFor cfg mh name typeId = do
+  authStatus <- providerAuthStatusByName mh cfg name
+  let isDef = rcDefaultProvider cfg == Just name
+      dModel = providerDefaultModel cfg name
+      bUrl = providerBaseUrl cfg name
+      models = providerModels cfg name
   pure $ object
-    [ "name" .= lbl
+    [ "name" .= name
+    , "type" .= typeId
     , "isDefault" .= isDef
     , "defaultModel" .= dModel
+    , "models" .= models
     , "baseUrl" .= bUrl
     , "authStatus" .= authStatus
     ]
+
+-- | Auth status for an instance name.
+providerAuthStatusByName :: Maybe VaultHandle -> RuntimeConfig -> Text -> IO Text
+providerAuthStatusByName mh cfg name = case parseProvider name of
+  Just kp -> providerAuthStatus mh cfg kp
+  Nothing -> case mh of
+    Nothing -> pure "none"
+    Just vh -> probeVault vh (vaultKeyNameForName name)
 
 -- | Determine the auth status for a provider by probing the vault. For
 -- Ollama, a keyless local base URL returns "keyless" without touching the
@@ -2213,6 +2549,9 @@ providerAuthStatus mh cfg kp = case kp of
   OpenRouterProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
+  OpenAICompatibleProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenAICompatibleProvider)
 
 -- | Probe the vault for a single key and return the auth status string.
 probeVault :: VaultHandle -> Text -> IO Text
@@ -2226,10 +2565,11 @@ probeVault vh key = do
 
 -- | Handle POST /api/providers — add or update a provider. Stores the API
 -- key in the vault (when present) and seeds config defaults
--- (default_provider if unset, per-provider default_model if unset). If
--- the provider is already configured, the key is rotated and config updated
--- (upsert semantics — no 409). Returns 201 + the provider detail on
--- success, 400 on unknown provider name, 500 on vault error.
+-- (default_provider if unset, per-provider default_model if unset). Built-in
+-- providers keep their upsert semantics; a custom OpenAI-compatible instance
+-- (sent with @type: "openai"@) must have a unique name. Returns 201 + the
+-- provider detail on success, 400 on an unknown/invalid name, 409 on a
+-- duplicate custom name, 500 on vault error.
 handleProviderCreate :: ApiDeps -> BL.ByteString -> IO Response
 handleProviderCreate deps body =
   case A.decode body :: Maybe A.Value of
@@ -2237,51 +2577,101 @@ handleProviderCreate deps body =
     Just v  -> case parseMaybe (withObject "provider" (.: "name")) v of
       Nothing -> pure (errJson status400 "name is required")
       Just name | T.null name -> pure (errJson status400 "name must not be empty")
-                | otherwise -> case parseProvider name of
-        Nothing -> pure (errJson status400 ("unknown provider: " <> name))
-        Just kp -> do
-          let mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
-              mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
-              mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
-              cfgPath = srConfigPath (adSessionRuntime deps)
-          -- Store API key in vault (when present and non-empty)
-          vaultResult <- case mApiKey of
-            Just key | not (T.null key) -> do
-              mh <- readIORef (vrHandleRef (adVault deps))
-              case mh of
-                Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-                Just vh -> do
-                  r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
-                  pure $ case r of
-                    Left e  -> Left (T.pack (show e))
-                    Right _ -> Right ()
-            _ -> pure (Right ())
-          case vaultResult of
-            Left e -> pure (errJson status500 e)
-            Right () -> do
-              let lbl = providerLabel kp
-                  seedCfg :: RuntimeConfig -> RuntimeConfig
-                  seedCfg cfg0 =
-                    let cfg1 = cfg0 { rcDefaultProvider = rcDefaultProvider cfg0 <|> Just lbl }
-                        cfg2 = upsertProvider lbl (\p -> if isJust (pcDefaultModel p)
-                                                            then p
-                                                            else p { pcDefaultModel = Just (let ModelId t = defaultModelFor kp in t) }) cfg1
-                        cfg3 = case mBaseUrl of
-                          Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg2
-                          _ -> cfg2
-                        cfg4 = case mDefaultModel of
-                          Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg3
-                          _ -> cfg3
-                    in cfg4
-              eRes <- updateRuntimeConfig cfgPath seedCfg
-              case eRes of
-                Left e -> pure (errJson status500 e)
-                Right _ -> do
-                  eCfg <- loadRuntimeConfig cfgPath
-                  let cfg = fromRight defaultRuntimeConfig eCfg
-                  mh <- readIORef (vrHandleRef (adVault deps))
-                  detail <- providerDetailJson cfg mh kp
-                  pure (jsonLBS status201 (A.encode detail))
+                | otherwise -> do
+        let mType = parseMaybe (withObject "provider" (.: "type")) v
+            mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
+            mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
+            mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
+            mModels = parseMaybe (withObject "provider" (.: "models")) v :: Maybe [Text]
+            cfgPath = srConfigPath (adSessionRuntime deps)
+        eCfg0 <- loadRuntimeConfig cfgPath
+        let cfg0 = fromRight defaultRuntimeConfig eCfg0
+        case resolveCreateTarget cfg0 name mType mBaseUrl of
+          Left (status, msg) -> pure (errJson status msg)
+          Right (lbl, typeId, vKey, defModel) -> do
+            vaultResult <- storeProviderKey deps vKey mApiKey
+            case vaultResult of
+              Left e -> pure (errJson status500 e)
+              Right () -> do
+                let seedCfg :: RuntimeConfig -> RuntimeConfig
+                    seedCfg cfg1 =
+                      let cfg2 = cfg1 { rcDefaultProvider = rcDefaultProvider cfg1 <|> Just lbl }
+                          cfg3 = upsertProvider lbl (\p -> if isJust (pcDefaultModel p)
+                                                              then p
+                                                              else p { pcDefaultModel = Just (let ModelId t = defModel in t) }) cfg2
+                          cfg4 = case mBaseUrl of
+                            Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg3
+                            _ -> cfg3
+                          cfg5 = case mDefaultModel of
+                            Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg4
+                            _ -> cfg4
+                          cfg6 = case mModels of
+                            Just ms -> upsertProvider lbl (\p -> p { pcModels = Just (normalizeModels ms) }) cfg5
+                            _ -> cfg5
+                      in cfg6
+                eRes <- updateRuntimeConfig cfgPath seedCfg
+                case eRes of
+                  Left e -> pure (errJson status500 e)
+                  Right _ -> do
+                    eCfg <- loadRuntimeConfig cfgPath
+                    let cfg = fromRight defaultRuntimeConfig eCfg
+                    mh <- readIORef (vrHandleRef (adVault deps))
+                    detail <- providerDetailJsonFor cfg mh lbl typeId
+                    pure (jsonLBS status201 (A.encode detail))
+
+-- | Trim and drop blank entries from the operator's frequent-model list.
+normalizeModels :: [Text] -> [Text]
+normalizeModels = filter (not . T.null) . map T.strip
+
+-- | Resolve a POST target. Built-ins keep their own name/key; a custom
+-- instance requires @type: "openai"@, a valid name, and a name not already in
+-- the config.
+resolveCreateTarget
+  :: RuntimeConfig -> Text -> Maybe Text -> Maybe Text
+  -> Either (Status, Text) (Text, Text, Text, ModelId)
+resolveCreateTarget cfg name mType mBaseUrl = case parseProvider name of
+  Just kp
+    | maybe False (/= providerLabel kp) mType ->
+        Left (status400, "provider type does not match name: " <> name)
+    | otherwise ->
+        Right (providerLabel kp, providerLabel kp, vaultKeyName kp, defaultModelFor kp)
+  Nothing
+    | mType /= Just "openai" ->
+        Left (status400, "unknown provider: " <> name)
+    | otherwise -> case validateProviderName name of
+        Left e -> Left (status400, e)
+        Right ()
+          | Map.member name (rcProviders cfg) ->
+              Left (status409, "provider already exists: " <> name)
+          | maybe True (T.null . T.strip) mBaseUrl ->
+              Left (status400, "base_url is required for an OpenAI-compatible provider")
+          | otherwise ->
+              Right ( name, "openai", vaultKeyNameForName name
+                    , defaultModelFor OpenAICompatibleProvider )
+
+-- | Resolve an existing provider name (built-in or custom) to its config key,
+-- implementation type, and vault key. 'Nothing' for an unknown name.
+resolveExistingTarget :: RuntimeConfig -> Text -> Maybe (Text, Text, Text)
+resolveExistingTarget cfg name = case parseProvider name of
+  Just kp -> Just (providerLabel kp, providerLabel kp, vaultKeyName kp)
+  Nothing
+    | name `elem` customProviderNames cfg ->
+        Just (name, "openai", vaultKeyNameForName name)
+    | otherwise -> Nothing
+
+-- | Store a non-empty API key in the vault. An absent/empty key is a no-op.
+storeProviderKey :: ApiDeps -> Text -> Maybe Text -> IO (Either Text ())
+storeProviderKey deps vKey mApiKey = case mApiKey of
+  Just key | not (T.null key) -> do
+    mh <- readIORef (vrHandleRef (adVault deps))
+    case mh of
+      Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+      Just vh -> do
+        r <- vhPut vh vKey (TE.encodeUtf8 key)
+        pure $ case r of
+          Left e  -> Left (T.pack (show e))
+          Right _ -> Right ()
+  _ -> pure (Right ())
 
 -- | Handle PUT /api/providers/:name — update a provider's config. If
 -- @api_key@ is present and non-empty, rotates the vault key. If
@@ -2289,40 +2679,35 @@ handleProviderCreate deps body =
 -- change @default_provider@. Returns 200 + the provider detail, 400 on
 -- unknown provider.
 handleProviderUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
-handleProviderUpdate deps name body =
-  case parseProvider name of
+handleProviderUpdate deps name body = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg0 <- loadRuntimeConfig cfgPath
+  let cfg0 = fromRight defaultRuntimeConfig eCfg0
+  case resolveExistingTarget cfg0 name of
     Nothing -> pure (errJson status400 ("unknown provider: " <> name))
-    Just kp -> case A.decode body :: Maybe A.Value of
+    Just (lbl, typeId, vKey) -> case A.decode body :: Maybe A.Value of
       Nothing -> pure (errJson status400 "invalid JSON body")
       Just v  -> do
         let mApiKey = parseMaybe (withObject "provider" (.: "api_key")) v
             mBaseUrl = parseMaybe (withObject "provider" (.: "base_url")) v
             mDefaultModel = parseMaybe (withObject "provider" (.: "default_model")) v
-            cfgPath = srConfigPath (adSessionRuntime deps)
-            lbl = providerLabel kp
-        vaultResult <- case mApiKey of
-          Just key | not (T.null key) -> do
-            mh <- readIORef (vrHandleRef (adVault deps))
-            case mh of
-              Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-              Just vh -> do
-                r <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 key)
-                pure $ case r of
-                  Left e  -> Left (T.pack (show e))
-                  Right _ -> Right ()
-          _ -> pure (Right ())
+            mModels = parseMaybe (withObject "provider" (.: "models")) v :: Maybe [Text]
+        vaultResult <- storeProviderKey deps vKey mApiKey
         case vaultResult of
           Left e -> pure (errJson status500 e)
           Right () -> do
             let updateCfg :: RuntimeConfig -> RuntimeConfig
-                updateCfg cfg0 =
+                updateCfg cfg =
                   let cfg1 = case mBaseUrl of
-                        Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg0
-                        _ -> cfg0
+                        Just u | not (T.null u) -> upsertProvider lbl (\p -> p { pcBaseUrl = Just u }) cfg
+                        _ -> cfg
                       cfg2 = case mDefaultModel of
                         Just dm | not (T.null dm) -> upsertProvider lbl (\p -> p { pcDefaultModel = Just dm }) cfg1
                         _ -> cfg1
-                  in cfg2
+                      cfg3 = case mModels of
+                        Just ms -> upsertProvider lbl (\p -> p { pcModels = Just (normalizeModels ms) }) cfg2
+                        _ -> cfg2
+                  in cfg3
             eRes <- updateRuntimeConfig cfgPath updateCfg
             case eRes of
               Left e -> pure (errJson status500 e)
@@ -2330,34 +2715,295 @@ handleProviderUpdate deps name body =
                 eCfg <- loadRuntimeConfig cfgPath
                 let cfg = fromRight defaultRuntimeConfig eCfg
                 mh <- readIORef (vrHandleRef (adVault deps))
-                detail <- providerDetailJson cfg mh kp
+                detail <- providerDetailJsonFor cfg mh lbl typeId
                 pure (jsonOk detail)
 
 -- | Handle DELETE /api/providers/:name — remove all vault credentials for
 -- the provider (both the API key and the OAuth token) and clear
--- @default_provider@ / @default_model@ if set to this provider. Returns 204
+-- @default_provider@ / @default_model@ if set to this provider. A custom
+-- OpenAI-compatible instance also has its config section removed. Returns 204
 -- (idempotent — missing keys are not an error). 500 when the vault is not
 -- configured or locked.
 handleProviderDelete :: ApiDeps -> Text -> IO Response
-handleProviderDelete deps name =
-  case parseProvider name of
+handleProviderDelete deps name = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg0 <- loadRuntimeConfig cfgPath
+  let cfg0 = fromRight defaultRuntimeConfig eCfg0
+  case resolveExistingTarget cfg0 name of
     Nothing -> pure (errJson status400 ("unknown provider: " <> name))
-    Just kp -> do
-      let cfgPath = srConfigPath (adSessionRuntime deps)
-          lbl = providerLabel kp
+    Just (lbl, _typeId, vKey) -> do
       mh <- readIORef (vrHandleRef (adVault deps))
       case mh of
         Nothing -> pure (errJson status500 "vault not configured \x2014 run /vault setup")
         Just vh -> do
-          _ <- vhDelete vh (vaultKeyName kp)
+          _ <- vhDelete vh vKey
           _ <- vhDelete vh anthropicOAuthKey
-          eCfg <- loadRuntimeConfig cfgPath
-          let cfg = fromRight defaultRuntimeConfig eCfg
-          if rcDefaultProvider cfg == Just lbl
+          let isCustom = isNothing (parseProvider name)
+              removeSection c = if isCustom then deleteProvider lbl c else c
+          if isCustom || rcDefaultProvider cfg0 == Just lbl
             then do
-              _ <- updateRuntimeConfig cfgPath (\c -> c { rcDefaultProvider = Nothing, rcDefaultModel = Nothing })
-              pure noContent
+              eSaved <- updateRuntimeConfig cfgPath $ \c ->
+                let c1 = removeSection c
+                in if rcDefaultProvider c1 == Just lbl
+                     then c1 { rcDefaultProvider = Nothing, rcDefaultModel = Nothing }
+                     else c1
+              case eSaved of
+                Left e   -> pure (errJson status500
+                            ("the credentials were removed, but the provider config could not be updated: " <> e))
+                Right () -> pure noContent
             else pure noContent
+
+-- ---------------------------------------------------------------------------
+-- Channel CRUD handlers (design §3.7)
+-- ---------------------------------------------------------------------------
+
+-- | Handle GET /api/channels — returns all configured chat channels
+-- (multi-instance Signal/Telegram) as a JSON array of camelCase detail
+-- objects. Legacy @[signal]@\/@[telegram]@ sections are migrated into the
+-- channel map on load ('migrateLegacyChannels'), so they appear here too.
+-- Telegram tokens are NEVER returned; @authStatus@ probes the vault.
+handleChannelsList :: ApiDeps -> IO Response
+handleChannelsList deps = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadRuntimeConfig cfgPath
+  let cfg = fromRight defaultRuntimeConfig eCfg
+  mh <- readIORef (vrHandleRef (adVault deps))
+  details <- mapM (channelDetailJson mh) (Map.toList (rcChannels cfg))
+  pure (jsonLBS status200 (A.encode details))
+
+-- | Build the camelCase detail JSON for one channel. Wire keys match the
+-- frontend's @ChannelDetail@ TS type 1:1 (no mapping function): @id@,
+-- @kind@, @label@, @account@, @textChunkLimit@, @allowFrom@, @authStatus@.
+-- The token is never included. @authStatus@ is @configured@,
+-- @missing-credential@, or @vault-locked@ (probes vault for Telegram).
+channelDetailJson :: Maybe VaultHandle -> (ChannelId, ChannelConfig) -> IO Value
+channelDetailJson mh (cid, cc) = do
+  authStatus <- channelAuthStatus mh cid cc
+  pure $ object
+    [ "id" .= channelIdText cid
+    , "kind" .= channelKindToText (ccKind cc)
+    , "label" .= ccLabel cc
+    , "account" .= ccAccount cc
+    , "textChunkLimit" .= ccTextChunkLimit cc
+    , "allowFrom" .= allowFromJson (ccAllowFrom cc)
+    , "authStatus" .= authStatus
+    ]
+
+-- | Encode an 'AllowList' as the @allowFrom@ wire field: 'AllowAll' → JSON
+-- null (the frontend treats null as "allow everyone"); 'AllowOnly' → a JSON
+-- array of strings.
+allowFromJson :: AllowList Text -> Value
+allowFromJson AllowAll       = Null
+allowFromJson (AllowOnly xs) = A.toJSON (Set.toList xs)
+
+-- | Determine the @authStatus@ for a channel by probing the vault (Telegram)
+-- or checking the account field (Signal).
+-- * Signal: @configured@ if 'ccAccount' is set (non-empty), else
+--   @missing-credential@. No vault involvement.
+-- * Telegram: the vault token takes precedence; if the vault is locked →
+--   @vault-locked@; if the vault key is absent, fall back to 'ccToken'
+--   (the config-level migration token) → @configured@ if present, else
+--   @missing-credential@.
+channelAuthStatus :: Maybe VaultHandle -> ChannelId -> ChannelConfig -> IO Text
+channelAuthStatus mh cid cc = case ccKind cc of
+  Signal -> pure (credStatus (ccAccount cc))
+  Telegram -> case mh of
+    -- No handle = vault unconfigured/locked (the test harness models a
+    -- locked vault as a 'Nothing' handle). Fail closed: can't probe →
+    -- @vault-locked@ (a token may exist but is unreachable).
+    Nothing -> pure "vault-locked"
+    Just vh -> do
+      r <- vhGet vh (telegramVaultKeyFor cid)
+      case r of
+        Right _             -> pure "configured"
+        Left VaultLocked    -> pure "vault-locked"
+        Left (VaultKeyNotFound _) -> pure (credStatus (ccToken cc))
+        Left _              -> pure (credStatus (ccToken cc))
+  _ -> pure "missing-credential"
+  where
+    credStatus :: Maybe Text -> Text
+    credStatus (Just t) | not (T.null t) = "configured"
+    credStatus _ = "missing-credential"
+
+-- | Handle POST /api/channels — create a new channel. Input wire keys are
+-- snake_case (matching @ChannelInput@ 1:1): @id@, @kind@, @label?@,
+-- @account?@, @token?@, @text_chunk_limit?@, @allow_from?@. Validates @id@
+-- via 'mkChannelId' (400 on failure), @kind@ via 'restrictChannelKind'
+-- (400 on non-signal/telegram), and duplicate id (409). Telegram tokens
+-- are stored in the vault (never in config). Returns 201 + the detail.
+handleChannelCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleChannelCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseMaybe (withObject "channel" (.: "id")) v of
+      Nothing -> pure (errJson status400 "id is required")
+      Just cidTxt
+        | T.null cidTxt -> pure (errJson status400 "id must not be empty")
+        | otherwise -> case mkChannelId cidTxt of
+            Left e  -> pure (errJson status400 ("invalid id: " <> e))
+            Right cid -> case parseMaybe (withObject "channel" (.: "kind")) v of
+              Nothing -> pure (errJson status400 "kind is required")
+              Just kindTxt -> case restrictChannelKind kindTxt of
+                Left e  -> pure (errJson status400 e)
+                Right kind -> do
+                  let cfgPath = srConfigPath (adSessionRuntime deps)
+                      mLabel = parseMaybe (withObject "channel" (.: "label")) v
+                      mAccount = parseMaybe (withObject "channel" (.: "account")) v
+                      mToken = parseMaybe (withObject "channel" (.: "token")) v
+                      mChunkLimit = parseMaybe (withObject "channel" (.: "text_chunk_limit")) v
+                      mAllowFrom = parseMaybe (withObject "channel" (.: "allow_from")) v
+                      allowFrom = case mAllowFrom of
+                        Just xs -> AllowOnly (Set.fromList xs)
+                        Nothing -> AllowAll
+                  -- duplicate check (after migration so legacy ids conflict)
+                  eCfg <- loadRuntimeConfig cfgPath
+                  let cfg0 = fromRight defaultRuntimeConfig eCfg
+                  if Map.member cid (rcChannels cfg0)
+                    then pure (errJson status409 ("channel already exists: " <> channelIdText cid))
+                    else do
+                      -- store token in vault (Telegram only)
+                      vaultResult <- case (kind, mToken) of
+                        (Telegram, Just tok) | not (T.null tok) -> do
+                          mh <- readIORef (vrHandleRef (adVault deps))
+                          case mh of
+                            Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                            Just vh -> do
+                              r <- vhPut vh (telegramVaultKeyFor cid) (TE.encodeUtf8 tok)
+                              pure $ case r of
+                                Left e' -> Left (T.pack (show e'))
+                                Right _ -> Right ()
+                        _ -> pure (Right ())
+                      case vaultResult of
+                        Left e -> pure (errJson status500 e)
+                        Right () -> do
+                          let newCc = ChannelConfig
+                                { ccKind = kind
+                                , ccLabel = mLabel
+                                , ccAccount = mAccount
+                                , ccToken = Nothing
+                                , ccTextChunkLimit = mChunkLimit
+                                , ccAllowFrom = allowFrom
+                                }
+                          eRes <- updateRuntimeConfig cfgPath
+                            (\c -> c { rcChannels = Map.insert cid newCc (rcChannels c) })
+                          case eRes of
+                            Left e -> pure (errJson status500 e)
+                            Right _ -> do
+                              eCfg2 <- loadRuntimeConfig cfgPath
+                              let cfg2 = fromRight defaultRuntimeConfig eCfg2
+                              mh <- readIORef (vrHandleRef (adVault deps))
+                              case Map.lookup cid (rcChannels cfg2) of
+                                Just cc -> do
+                                  detail <- channelDetailJson mh (cid, cc)
+                                  pure (jsonLBS status201 (A.encode detail))
+                                Nothing -> pure (errJson status500 "channel not found after create")
+
+-- | Handle PUT /api/channels/:id — update an existing channel's fields.
+-- Input wire keys are snake_case (all optional): @label?@, @account?@,
+-- @token?@, @text_chunk_limit?@, @allow_from?@. @kind@ is immutable (a
+-- @kind@ in the body is silently ignored). 404 for an unknown id. For
+-- Telegram, a present @token@ rotates the vault key. Returns 200 + detail.
+handleChannelUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleChannelUpdate deps cidTxt body =
+  case mkChannelId cidTxt of
+    Left e -> pure (errJson status400 ("invalid id: " <> e))
+    Right cid -> case A.decode body :: Maybe A.Value of
+      Nothing -> pure (errJson status400 "invalid JSON body")
+      Just v  -> do
+        let cfgPath = srConfigPath (adSessionRuntime deps)
+        eCfg <- loadRuntimeConfig cfgPath
+        let cfg0 = fromRight defaultRuntimeConfig eCfg
+        case Map.lookup cid (rcChannels cfg0) of
+          Nothing -> pure (errJson status404 ("channel not found: " <> channelIdText cid))
+          Just cc -> do
+            let mLabel = parseMaybe (withObject "channel" (.: "label")) v
+                mAccount = parseMaybe (withObject "channel" (.: "account")) v
+                mToken = parseMaybe (withObject "channel" (.: "token")) v
+                mChunkLimit = parseMaybe (withObject "channel" (.: "text_chunk_limit")) v
+                mAllowFrom = parseMaybe (withObject "channel" (.: "allow_from")) v
+            -- rotate vault key if token present (Telegram only)
+            vaultResult <- case (ccKind cc, mToken) of
+              (Telegram, Just tok) | not (T.null tok) -> do
+                mh <- readIORef (vrHandleRef (adVault deps))
+                case mh of
+                  Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+                  Just vh -> do
+                    r <- vhPut vh (telegramVaultKeyFor cid) (TE.encodeUtf8 tok)
+                    pure $ case r of
+                      Left e' -> Left (T.pack (show e'))
+                      Right _ -> Right ()
+              _ -> pure (Right ())
+            case vaultResult of
+              Left e -> pure (errJson status500 e)
+              Right () -> do
+                let updatedCc = cc
+                      { ccLabel = mLabel <|> ccLabel cc
+                      , ccAccount = mAccount <|> ccAccount cc
+                      , ccTextChunkLimit = mChunkLimit <|> ccTextChunkLimit cc
+                      , ccAllowFrom = case mAllowFrom of
+                          Just xs -> AllowOnly (Set.fromList xs)
+                          Nothing -> ccAllowFrom cc
+                      }
+                eRes <- updateRuntimeConfig cfgPath
+                  (\c -> c { rcChannels = Map.insert cid updatedCc (rcChannels c) })
+                case eRes of
+                  Left e -> pure (errJson status500 e)
+                  Right _ -> do
+                    eCfg2 <- loadRuntimeConfig cfgPath
+                    let cfg2 = fromRight defaultRuntimeConfig eCfg2
+                    mh <- readIORef (vrHandleRef (adVault deps))
+                    case Map.lookup cid (rcChannels cfg2) of
+                      Just cc2 -> do
+                        detail <- channelDetailJson mh (cid, cc2)
+                        pure (jsonOk detail)
+                      Nothing -> pure (errJson status500 "channel not found after update")
+
+-- | Handle DELETE /api/channels/:id — remove a channel. Idempotent (204
+-- whether or not the id existed). Deletes the Telegram vault key. When the
+-- deleted id is a legacy default (@signal@ / @telegram@), nullifies the
+-- corresponding legacy field (@rcSignal@ / @rcTelegram@) in the same
+-- transaction so the legacy section no longer re-synthesizes on the next
+-- load (design §3.3 deletion-respawn prevention).
+handleChannelDelete :: ApiDeps -> Text -> IO Response
+handleChannelDelete deps cidTxt =
+  case mkChannelId cidTxt of
+    Left e -> pure (errJson status400 ("invalid id: " <> e))
+    Right cid -> do
+      let cfgPath = srConfigPath (adSessionRuntime deps)
+      eCfg <- loadRuntimeConfig cfgPath
+      let cfg0 = fromRight defaultRuntimeConfig eCfg
+          mExisting = Map.lookup cid (rcChannels cfg0)
+          isLegacySignal = channelIdText cid == "signal"
+          isLegacyTelegram = channelIdText cid == "telegram"
+      -- delete the Telegram vault key (idempotent — missing key is fine)
+      forM_ mExisting $ \c -> case ccKind c of
+        Telegram -> do
+          mh <- readIORef (vrHandleRef (adVault deps))
+          forM_ mh $ \vh -> void (vhDelete vh (telegramVaultKeyFor cid))
+        _ -> pure ()
+      -- Skip the write entirely when there is nothing to persist (the
+      -- channel is absent AND no legacy field needs nullifying). This keeps
+      -- DELETE idempotent without requiring the config dir to pre-exist.
+      let needsWrite = isJust mExisting
+            || (isLegacySignal && isJust (rcSignal cfg0))
+            || (isLegacyTelegram && isJust (rcTelegram cfg0))
+      if not needsWrite
+        then pure noContent
+        else do
+          -- remove the channel + nullify the matching legacy field
+          let updateCfg c0 =
+                let c1 = deleteChannel cid c0
+                    c2 = if isLegacySignal
+                           then c1 { rcSignal = Nothing }
+                           else c1
+                    c3 = if isLegacyTelegram
+                           then c2 { rcTelegram = Nothing }
+                           else c2
+                in c3
+          eRes <- updateRuntimeConfig cfgPath updateCfg
+          case eRes of
+            Left e  -> pure (errJson status500 e)
+            Right _ -> pure noContent
 
 -- | Handle GET /api/providers/default — returns the configured
 -- @default_provider@ from config.toml as @{"provider": "anthropic"}@ or
@@ -2382,11 +3028,14 @@ handleProviderDefaultPut deps body =
       Nothing -> pure (errJson status400 "provider field is required")
       Just mProv -> do
         let cfgPath = srConfigPath (adSessionRuntime deps)
+        eCfg0 <- loadRuntimeConfig cfgPath
+        let cfg0 = fromRight defaultRuntimeConfig eCfg0
+            customs = customProviderNames cfg0
             -- Validate non-null/non-empty provider names; null/empty clears.
             mValid = case mProv of
               Nothing -> Just Nothing
               Just p | T.null p  -> Just Nothing
-                     | isNothing (parseProvider p) -> Nothing
+                     | isNothing (parseProvider p) && p `notElem` customs -> Nothing
                      | otherwise -> Just (Just p)
         case mValid of
           Nothing -> pure (errJson status400 ("unknown provider: " <> T.pack (show mProv)))
@@ -2415,6 +3064,9 @@ staticModelsFor AnthropicProvider =
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
 staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+-- | Empty on purpose: a generic endpoint owns its catalogue, and inventing
+-- model ids here would be a guess the UI would present as fact.
+staticModelsFor OpenAICompatibleProvider = []
 
 -- | One model entry: @{name, contextWindow}@.
 modelEntryJson :: KnownProvider -> Text -> Value
@@ -2429,15 +3081,15 @@ jsonOk v = jsonLBS status200 (A.encode v)
 
 -- | A response with a raw JSON bytestring + CORS headers.
 jsonLBS :: Status -> BL.ByteString -> Response
-jsonLBS st = responseLBS st (corsHeaders <> [jsonHeader])
+jsonLBS st = responseLBS st [jsonHeader]
 
 -- | A 204 No Content (no body).
 noContent :: Response
-noContent = responseLBS status204 corsHeaders ""
+noContent = responseLBS status204 [] ""
 
 -- | A JSON error response with a status code.
 errJson :: Status -> Text -> Response
-errJson st msg = responseLBS st (corsHeaders <> [jsonHeader])
+errJson st msg = responseLBS st [jsonHeader]
   (A.encode (object ["error" .= msg]))
 
 ----------------------------------------------------------------------------
@@ -2659,13 +3311,6 @@ randomByteString n = BS.pack <$> replicateM n (randomRIO (0, 255))
 
 ----------------------------------------------------------------------------
 -- CORS headers
-corsHeaders :: [Header]
-corsHeaders =
-  [ (mkHN "Access-Control-Allow-Origin", "*")
-  , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-  , (mkHN "Access-Control-Allow-Headers", "Content-Type")
-  ]
-
 jsonHeader :: Header
 jsonHeader = (mkHN "Content-Type", "application/json")
 

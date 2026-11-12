@@ -2,6 +2,7 @@
 -- | Top-level TUI entry: path resolution -> config -> vault -> registry -> loop.
 module Seal.Tui (runTui) where
 
+import Control.Monad (forM_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
@@ -22,6 +23,7 @@ import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -46,6 +48,7 @@ import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (..))
 import Seal.Handles.Tab (TabKind (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -83,6 +86,12 @@ runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
+  -- First-run scaffolding: see 'Seal.Config.Templates'. Never overwrites, and a
+  -- failure is a warning — the TUI boots either way.
+  (createdTemplates, templateWarnings) <- ensureConfigTemplates paths
+  forM_ createdTemplates $ \fp ->
+    putStrLn ("Wrote a documented config template at " <> fp)
+  forM_ templateWarnings $ \w -> putStrLn ("Warning: " <> T.unpack w)
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
@@ -152,6 +161,7 @@ runTui autonomy logger = do
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   arProbeAndSweep agentRegH
   abortReg <- newSessionAbortRegistry
+  repeatReg <- newSessionRepeatRegistry
   -- The /new command: mints a fresh session and inserts a new tab into
   -- the TabsHandle. The ndInsertTab closure reads the old sid from
   -- srActive BEFORE swapping, inserts a new tab bound to the new session,
@@ -198,4 +208,4 @@ runTui autonomy logger = do
         )
   harnessReg <- newHarnessRegistry
   tmuxRunner <- mkRealTmuxRunner
-  runCliTui paths rt repoReg agentRegH pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg
+  runCliTui paths rt repoReg agentRegH pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg repeatReg

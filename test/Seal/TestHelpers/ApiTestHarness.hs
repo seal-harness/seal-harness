@@ -87,9 +87,10 @@ import Seal.Config.Paths (SealPaths (..), securityFilePath, sshAgentsDir)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , saveSecurityConfig )
+  , WriteMode (PreserveCredentials), saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -116,6 +117,7 @@ import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder, ChildWorkerOutcome (..)
   , ChildExitReason (..) )
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
@@ -407,6 +409,7 @@ buildTestEnv tmp mode mRepo opts = do
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
+  testRepeatReg <- newSessionRepeatRegistry
 
   let paths = SealPaths
         { spHome = tmp, spState = stateRoot, spConfig = configRoot
@@ -428,7 +431,7 @@ buildTestEnv tmp mode mRepo opts = do
 
   -- Session runtime.
   let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing True Nothing
+        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
         (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
   activeRef <- newIORef meta0
   let sr = SessionRuntime
@@ -463,7 +466,7 @@ buildTestEnv tmp mode mRepo opts = do
       secCfg = if mode == UemRemote
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
-  saveSecurityConfig (securityFilePath paths) secCfg
+  _ <- saveSecurityConfig (securityFilePath paths) secCfg PreserveCredentials
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
@@ -501,6 +504,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdReplies = testReplies
         , sdLocks = testLocks
         , sdAbortReg = testAbortReg
+        , sdRepeatReg = testRepeatReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
         , sdIsRemote = mode == UemRemote
@@ -532,7 +536,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adRepoRegistry = repoRegH
         , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
-        , adVault = rt
+        , adVault = rt, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)

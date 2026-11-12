@@ -1,0 +1,186 @@
+# Seal Harness runtime configuration - ~/.seal/config/config.toml
+#
+# Seal writes this file once, on first run, and never overwrites it: edit it
+# freely. Every key is optional. The values below are the defaults, written out
+# so you can see them; a key that is commented out is commented out on purpose -
+# either its default is "unset", or the value would have to name something only
+# you know (a provider, an account, a path), or it is derived from another key.
+# The comment states what Seal uses when the key is absent.
+#
+# Seal re-encodes this file when it changes it (a /provider or /model change
+# from the TUI, a settings change in the web UI), and a re-encode does not
+# preserve comments. Keep a copy of anything you care about.
+#
+# Security-critical boot settings - the vault, and where untrusted code runs -
+# are not in this file. They live in ~/.seal/security.toml, which no opcode,
+# tool or agent can read or write.
+
+# ---------------------------------------------------------------------------
+# Session defaults
+# ---------------------------------------------------------------------------
+
+# Provider and model for new sessions. `/provider use` and `/model use` write
+# these; setting them here just presets the first session.
+# default_provider = "anthropic"
+# default_model    = "claude-opus-4-8"
+
+# Agent definition that agent-driven flows (and the default tab) start from.
+# Set by `/agent default`.
+# default_agent = "<agent-id>"
+
+# Tool-use iterations allowed in one turn before the loop stops (minimum 1).
+max_turns = 200
+
+# Retries for a failed model call, and the first backoff delay in ms.
+max_model_retries = 3
+model_retry_base_delay_ms = 1000
+
+# Send the full input schema for every opcode inline. Set to true to send a
+# stub instead and let the model fetch the schema on demand with
+# OPCODE_DESCRIBE / OPCODE_LIST - cheaper per turn, one extra call per opcode.
+on_demand_schemas = false
+
+# Debug traces written next to the session's transcript. Off by default: they
+# duplicate the whole conversation on every request.
+debug_session_transcript = false
+debug_model_responses = false
+
+# Per-provider overrides. One table per provider label; the label is the name
+# `default_provider` and `/provider use` refer to.
+# [providers.<label>]
+# default_model = "<model-id>"
+# base_url      = "https://api.example.com"   # a proxy, or a local endpoint
+# models        = ["<model-id>", "<another-model-id>"]  # frequent-model shortcuts
+
+# ---------------------------------------------------------------------------
+# Web gateway
+# ---------------------------------------------------------------------------
+
+# The gateway's own settings - the address and port `seal serve` listens on, the
+# origins allowed to open the WebSocket, and the TLS pair - live in
+# ~/.seal/security.toml, not here. They decide who can reach the agent, so they
+# are boot-only and no opcode, tool or agent can read or write them. See the
+# `gateway` section of that file.
+#
+# For dev work, `seal serve --static-dir DIR` serves the UI from DIR instead of
+# the copy embedded in the binary; it overrides nothing else.
+
+# ---------------------------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------------------------
+
+[retrieval]
+# Operator ceiling on bytes read per retrieval call (FILE_READ and friends).
+# A per-call request is clamped down to this.
+max_scan_bytes = 131072
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+[tool_timeout]
+# Per-call timeout, abort and retry behaviour for opcode dispatch.
+default_seconds = 120
+max_seconds = 600
+retry_max = 3
+retry_base_micros = 2000000
+retry_factor = 2.0
+kill_grace_micros = 5000000
+max_output_bytes = 50000
+abort_poll_micros = 100000
+
+# ---------------------------------------------------------------------------
+# Sub-agents
+# ---------------------------------------------------------------------------
+
+[delegation]
+max_concurrent_children = 3
+child_timeout_seconds = 600.0
+max_spawn_depth = 3
+orchestrator_enabled = true
+
+# Route every child to a different provider or model, or to a direct
+# OpenAI-compatible endpoint (base_url + api_key + api_mode, where api_mode is
+# "chat_completions" or "anthropic_messages").
+# provider = "openai"
+# model    = "gpt-5"
+# base_url = "http://localhost:11434/v1"
+# api_key  = "<key>"
+# api_mode = "chat_completions"
+
+# Reserved: decoded, but nothing reads it yet.
+# subagent_auto_approve = false
+
+# ---------------------------------------------------------------------------
+# Web tools
+# ---------------------------------------------------------------------------
+
+[web]
+# Search provider: parallel | searxng | exa | firecrawl | custom.
+search_provider = "parallel"
+search_max_results = 10
+# Used when search_provider = "searxng".
+searxng_url = "http://localhost:8888"
+
+# WEB_SEARCH stays closed until an endpoint is configured.
+# search_endpoint = "https://api.tavily.com/search"
+# search_auth_key = "<vault-key-name>"   # vault key holding the provider's API key
+# search_allow_list = ["example.com"]    # empty = every domain
+# fetch_allow_list  = ["example.com"]    # empty = every domain (SSRF filters still apply)
+# max_fetch_bytes = 131072               # absent = [retrieval] max_scan_bytes
+
+# ---------------------------------------------------------------------------
+# Session working directories
+# ---------------------------------------------------------------------------
+
+# Per-session workdirs are always on; this table only controls cleanup.
+# Reserved: decoded, but nothing reads it yet.
+# [workdir]
+# cleanup_on_exit = false
+
+# ---------------------------------------------------------------------------
+# Prompt sections
+# ---------------------------------------------------------------------------
+
+[skills]
+# Skill injected into the system prompt at session start. "" disables it.
+autoload = "seal-usage"
+# Inject the <available_skills> catalog so the model can discover skills.
+available_skills = true
+
+[agent]
+# Static behavioural guidance blocks. Set any of them to false to drop it.
+parallel_tool_guidance = true
+tool_use_enforcement = true
+task_completion_guidance = true
+credential_tool_guidance = true
+# Inject the <available_agents> catalog so the model can delegate.
+available_agents = true
+
+# ---------------------------------------------------------------------------
+# Memory search
+# ---------------------------------------------------------------------------
+
+[embedding]
+# Semantic-search backend for memory: "null" (substring search only) or
+# "engram" (a local subprocess index).
+backend = "null"
+# binary_path = "~/.local/bin/engram"
+# index_path  = "~/.seal/memory/engram.db"
+
+# ---------------------------------------------------------------------------
+# Chat channels
+# ---------------------------------------------------------------------------
+
+# Signal: the account comes from the vault (`seal channel signal` sets it up).
+# Fail-closed: the channel is not started until an account resolves.
+# [signal]
+# account = "+15551234567"
+# text_chunk_limit = 1998
+# allow_from = ["+15557654321"]      # empty/absent = accept every sender
+
+# Telegram: the bot token lives in the vault, not here.
+# [telegram]
+# token = "<bot-token>"
+# text_chunk_limit = 3900
+# allow_from = ["123456789"]         # empty/absent = accept every sender

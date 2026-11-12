@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import App from '../App'
+import { pushWsEntry, pushWsActivity } from '../lib/streamClient'
 import { WS_GRACE_MS } from '../hooks/useApi'
 import type { SessionInfo, TranscriptEntry } from '../types'
 
@@ -11,11 +12,16 @@ import type { SessionInfo, TranscriptEntry } from '../types'
 // re-trigger their effects every render and loop).
 vi.mock('../lib/streamClient', () => {
   const unsub = () => {}
+  // The WS is the live path for transcript entries: the backend broadcasts
+  // each entry as it is written, and signals turn completion with a
+  // 'harness-status: idle' activity. Tests drive both.
+  const entryCbs = new Set<(e: unknown) => void>()
+  const activityCbs = new Set<(sid: string, a: unknown) => void>()
   const client = {
     status: 'closed',
     focus: () => {},
-    onEntry: () => unsub,
-    onActivity: () => unsub,
+    onEntry: (cb: (e: unknown) => void) => { entryCbs.add(cb); return () => { entryCbs.delete(cb) } },
+    onActivity: (cb: (sid: string, a: unknown) => void) => { activityCbs.add(cb); return () => { activityCbs.delete(cb) } },
     onLists: () => unsub,
     onStatusChange: () => unsub,
     onAsk: () => unsub,
@@ -26,8 +32,16 @@ vi.mock('../lib/streamClient', () => {
     requestEntries: () => {},
     onEntriesChunk: () => unsub,
     lastError: () => null,
+    reconnectAttempts: () => 0,
+    reconnectNow: () => {},
   }
-  return { streamClient: () => client }
+  const api = {
+    streamClient: () => client,
+    // Test drivers: deliver a WS entry / a turn-completion signal.
+    pushWsEntry: (e: unknown) => { for (const cb of entryCbs) cb(e) },
+    pushWsActivity: (sid: string, a: unknown) => { for (const cb of activityCbs) cb(sid, a) },
+  }
+  return api
 })
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
@@ -94,6 +108,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: 'claude-sonnet-4-20250514',
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
     ...overrides,
@@ -821,14 +836,19 @@ describe('App — slash bubble inline ordering', () => {
     await waitFor(() => {
       expect(fetchCalls.filter((c) => c.url === '/api/sessions/sess-slash/send').length).toBe(2)
     })
-    // Wait for the transcript re-fetch to deliver the second entry and
-    // clear the optimistic pending message. After the send completes,
-    // refresh() triggers a transcript re-fetch which returns the updated
-    // transcript (with e2). The pending message clears once entries.length
+    // The backend broadcasts the new entry over the WS as it is written —
+    // the WS is the live path; the HTTP re-seed is only a consistency check
+    // that runs when the turn completes. Deliver the entry, then signal
+    // turn completion. The pending message clears once entries.length
     // grows beyond entryCountAtSend. Wait for the typing indicator (from
     // the pending-thinking row) to disappear — that signals the pending
     // state has cleared and the transcript-derived rows are the only ones
     // left.
+    await act(async () => {
+      pushWsEntry(makeEntry({ id: 'e2', timestamp: '2024-06-01T12:00:05Z',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'after slash' }] }] }) }))
+      pushWsActivity('sess-slash', { kind: 'harness-status', status: 'idle' })
+    })
     await waitFor(() => {
       expect(document.querySelector('.typing-dot')).toBeFalsy()
     })
@@ -852,6 +872,67 @@ describe('App — slash bubble inline ordering', () => {
     const rel = afterSlashRow!.compareDocumentPosition(slashBubble)
     // slashBubble should PRECEDE afterSlashRow.
     expect(rel & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+  })
+})
+
+// ── A plain reply consumed as an ASK_HUMAN answer ─────────────────────────
+// A chat channel with no answer buttons (Signal, Telegram) can only answer a
+// pending ASK_HUMAN by sending plain text. The gateway now resolves that text
+// as the answer and returns kind:"answer" instead of starting a turn — so NO
+// transcript entry ever arrives for it. The optimistic pending bubble is
+// cleared by transcript growth, which never happens: it must be cleared on a
+// kind:"answer" response too, and the "✓ <answer>" confirmation must be shown
+// as a transient bubble (the same slot slash-command output uses).
+describe('App — plain reply consumed as an ask answer', () => {
+  it('clears the pending bubble and shows the ✓ confirmation for kind:"answer"', async () => {
+    const transcript = [
+      makeEntry({ id: 'e1', timestamp: '2024-06-01T12:00:00Z',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'first message' }] }] }) }),
+    ]
+    const json = (body: unknown) =>
+      new globalThis.Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      if (url === '/api/agents') return json([])
+      if (url === '/api/providers') return json([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }])
+      if (url === '/api/providers/anthropic/models') return json([{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }])
+      if (url === '/api/sessions' && method === 'GET') return json([makeSession({ id: 'sess-ask', description: 'Ask Sess' })])
+      if (url === '/api/sessions/archived') return json([])
+      if (url === '/api/tabs') return json([])
+      if (url === '/api/harnesses' || url === '/api/harnesses/discover') return json([])
+      if (url.includes('/api/sessions/sess-ask/transcript') && method === 'GET') return json(transcript)
+      if (url === '/api/sessions/sess-ask/send' && method === 'POST') {
+        // The message answered a pending question: no turn, no WS entry.
+        return json({ kind: 'answer', response: '✓ main' })
+      }
+      if (url.includes('/questions')) return json([])
+      return json({})
+    }))
+    render(<App />)
+    const row = await screen.findByText('Ask Sess', {}, { timeout: 4000 })
+    fireEvent.click(row)
+    await screen.findByText('first message')
+
+    const textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: '1' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.some((c) => c.url === '/api/sessions/sess-ask/send')).toBe(true)
+    })
+    // The confirmation is surfaced ...
+    await waitFor(() => {
+      expect(screen.getByTestId('slash-bubble')).toBeTruthy()
+    })
+    expect(screen.getByText('✓ main')).toBeTruthy()
+    // ... labelled as an answer, not as command output ...
+    expect(screen.getByText(/sent as the answer/)).toBeTruthy()
+    expect(screen.queryByText(/command output/)).toBeFalsy()
+    // ... and the optimistic pending bubble is gone (no turn will ever
+    // produce the transcript entry that normally clears it).
+    await waitFor(() => {
+      expect(document.querySelector('.typing-dot')).toBeFalsy()
+    })
   })
 })
 

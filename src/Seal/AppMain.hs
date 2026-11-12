@@ -1,5 +1,6 @@
 module Seal.AppMain
   ( appMain
+  , reorderGlobalArgs
   , withDefaultArgs
   ) where
 
@@ -7,6 +8,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Lens (view)
 import System.Environment (getArgs, withArgs)
 import qualified Configuration.Utils as CUtils
+import System.Exit (exitWith)
 import System.Posix.Resource
   ( ResourceLimits (..), ResourceLimit (..), Resource (ResourceOpenFiles)
   , getResourceLimit, setResourceLimit )
@@ -18,6 +20,7 @@ import Seal.Types.Command
 import Seal.Types.Env
 import Seal.Types.App
 import qualified Seal.Tui
+import qualified Seal.Command.AccessControl
 import qualified Seal.Command.Serve
 import qualified Seal.Gateway.OpenApi
 
@@ -42,7 +45,12 @@ dispatch cfg =
     runApp env $ case _config_command cfg of
       CommandNoOp   -> pure ()
       CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy logger)
-      CommandServe autonomy mStaticDir -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir logger)
+      CommandServe autonomy mStaticDir noEnrollToken -> liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir noEnrollToken logger)
+      CommandAccessControl action -> do
+        -- The command returns its code; exiting stays here so every code is
+        -- assertable in-process (design §12).
+        code <- liftIO (Seal.Command.AccessControl.runAccessControl action)
+        liftIO (exitWith code)
       CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 
 -- | Map the process arguments so that an empty argument list behaves as if
@@ -74,4 +82,47 @@ appMain :: IO ()
 appMain = do
   raiseFdLimit
   args <- getArgs
-  withArgs (withDefaultArgs args) (CUtils.runWithConfiguration programInfo dispatch)
+  withArgs (withDefaultArgs (reorderGlobalArgs args)) (CUtils.runWithConfiguration programInfo dispatch)
+
+-- | Move global options (those defined at the @pConfig@ level, outside any
+-- @hsubparser@) before the subcommand keyword. @Options.Applicative@'s
+-- @hsubparser@ creates a hard parser boundary: once the subcommand keyword
+-- (e.g. @serve@) is seen, only subcommand-specific options are recognised.
+-- A global option like @--log-level@ that appears after @serve@ is rejected.
+--
+-- This preprocessing lets @make serve ARGS="--yolo --log-level debug
+-- --no-enrollment-token"@ work: @--log-level@ is hoisted before @serve@,
+-- and the subcommand options (@--yolo@, @--no-enrollment-token@) stay after.
+-- Options that are already before the subcommand are left in place.
+-- @--flag=value@ syntax is a single token and passes through unchanged
+-- (it does not match the bare @--flag@ name).
+reorderGlobalArgs :: [String] -> [String]
+reorderGlobalArgs args =
+  case break isSubcommand args of
+    (_, []) -> args
+    (pre, cmd : post) -> pre ++ hoistGlobals post ++ [cmd] ++ stripGlobals post
+  where
+    subcommands = ["serve", "tui", "access-control", "gen-openapi"]
+    isSubcommand s = s `elem` subcommands
+
+    -- Global option names (defined in pConfig, outside any hsubparser). Each
+    -- takes exactly one argument. The gateway's bind host/port live in
+    -- security.toml, so there are no server flags to hoist.
+    globalOpts = ["--log-level"]
+    isGlobalOpt s = s `elem` globalOpts
+
+    -- Extract global option pairs (flag + value) from the post-subcommand
+    -- args, preserving order, for hoisting before the subcommand keyword.
+    hoistGlobals = go []
+      where
+        go acc [] = reverse acc
+        go acc (f : v : rest) | isGlobalOpt f = go (v : f : acc) rest
+        go acc (_ : rest) = go acc rest
+
+    -- Remove global option pairs from the post-subcommand args, leaving
+    -- only subcommand-specific options.
+    stripGlobals = go
+      where
+        go [] = []
+        go (f : _v : rest) | isGlobalOpt f = go rest
+        go (x : rest) = x : go rest
