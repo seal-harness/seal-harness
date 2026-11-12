@@ -37,6 +37,7 @@ const wireProviders: ProviderCard[] = [
     isDefault: false,
     default_model: null,
     requires_base_url: false,
+    requires_name: false,
   },
 ]
 

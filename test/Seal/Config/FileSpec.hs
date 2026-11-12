@@ -12,6 +12,7 @@ import Test.Hspec
 
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
+  , providerModels
   , SkillsConfig (..)
   , AgentConfig (..)
   , defaultRuntimeConfig
@@ -330,13 +331,16 @@ spec = describe "Seal.Config.File" $ do
           [ "[providers.ollama]"
           , "base_url = \"http://localhost:11434\""
           , "default_model = \"glm-5.2:cloud\""
+          , "models = [\"glm-5.2:cloud\", \"llama3.2\"]"
           , "[providers.anthropic]"
           , "default_model = \"claude-opus-4-8\""
           ]
         Right cfg <- loadRuntimeConfig path
         providerBaseUrl      cfg "ollama"    `shouldBe` Just "http://localhost:11434"
         providerDefaultModel cfg "ollama"    `shouldBe` Just "glm-5.2:cloud"
+        providerModels       cfg "ollama"    `shouldBe` ["glm-5.2:cloud", "llama3.2"]
         providerDefaultModel cfg "anthropic" `shouldBe` Just "claude-opus-4-8"
+        providerModels       cfg "anthropic" `shouldBe` []
         providerBaseUrl      cfg "anthropic" `shouldBe` Nothing
 
     it "has an empty provider map when [providers] is absent" $
@@ -351,7 +355,7 @@ spec = describe "Seal.Config.File" $ do
     it "round-trips provider sections through save/load" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434"))) defaultRuntimeConfig
+            cfg  = upsertProvider "ollama" (const (ProviderConfig (Just "glm-5.2:cloud") (Just "http://localhost:11434") Nothing)) defaultRuntimeConfig
         saveRuntimeConfig path cfg
         Right back <- loadRuntimeConfig path
         rcProviders back `shouldBe` rcProviders cfg

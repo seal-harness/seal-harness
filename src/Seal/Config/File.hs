@@ -34,6 +34,7 @@ module Seal.Config.File
   , loadRuntimeConfig
   , providerBaseUrl
   , providerDefaultModel
+  , providerModels
   , retrievalMaxScanBytes
   , maxTurnsConfig
   , onDemandSchemas
@@ -48,6 +49,7 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , deleteProvider
   , migrateLegacyChannels
   , upsertChannel
   , deleteChannel
@@ -178,6 +180,10 @@ data RuntimeConfig = RuntimeConfig
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+  , pcModels       :: Maybe [Text]
+    -- ^ Models the operator frequently uses with this provider. Surfaced as
+    -- suggestions in the "new tab" model combobox; a free-form model id is
+    -- still accepted. Absent means no suggestions.
   } deriving stock (Eq, Show)
 
 -- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is
@@ -257,7 +263,7 @@ data EmbeddingConfig = EmbeddingConfig
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
-emptyProviderConfig = ProviderConfig Nothing Nothing
+emptyProviderConfig = ProviderConfig Nothing Nothing Nothing
 
 -- | The @[web]@ section: web tool configuration. Every field is optional;
 -- a missing key decodes as 'Nothing' and the resolved default applies at
@@ -487,6 +493,7 @@ providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+  <*> Toml.dioptional (arrayOfText "models")      .= pcModels
 
 -- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
 -- field is optional at the TOML layer; a missing key decodes as 'Nothing'
@@ -734,6 +741,12 @@ providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (rcProviders cf
 providerBaseUrl :: RuntimeConfig -> Text -> Maybe Text
 providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (rcProviders cfg)
 
+-- | The operator's frequently-used models for provider @lbl@. Absent means
+-- no suggestions (an empty list).
+providerModels :: RuntimeConfig -> Text -> [Text]
+providerModels cfg lbl =
+  fromMaybe [] (pcModels =<< Map.lookup lbl (rcProviders cfg))
+
 -- | The resolved operator ceiling on bytes scanned per retrieval. Falls back
 -- to 'defaultRetrievalMaxScanBytes' (128 KiB) when the @[retrieval]@ section
 -- or its @max_scan_bytes@ key is absent. This is the hard upper bound the
@@ -815,6 +828,12 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | Remove one provider section by name (used when deleting a custom
+-- OpenAI-compatible instance; built-ins keep their section).
+deleteProvider :: Text -> RuntimeConfig -> RuntimeConfig
+deleteProvider lbl cfg =
+  cfg { rcProviders = Map.delete lbl (rcProviders cfg) }
 
 -- | A 'ChannelConfig' with all optional fields absent and 'ccKind' defaulting
 -- to 'Signal'. Used by 'upsertChannel' as the seed when the id is absent.

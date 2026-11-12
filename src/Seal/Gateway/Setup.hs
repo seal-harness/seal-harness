@@ -54,7 +54,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.CaseInsensitive qualified as CI
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Either (fromRight)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -66,15 +66,15 @@ import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory)
 
 import Seal.Config.File
-  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig
-  , providerDefaultModel )
+  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Config.Security
   ( SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (SomeProvider)
 import Seal.Providers.Registry
-  ( KnownProvider, defaultModelFor, listSome, parseProvider, providerLabel )
+  ( KnownProvider, customProviderNames, listSome, parseProvider
+  , resolveDefaultModelForName )
 import Seal.Security.Vault
   ( UnlockMode (UnlockStartup), VaultConfig (..), VaultHandle (..), openVault )
 import Seal.Security.Vault.Age
@@ -97,10 +97,10 @@ import Seal.Vault.Provision
 -- 'Network.HTTP.Client.Manager' and a vault handle).
 data SetupDeps = SetupDeps
   { sdProvision       :: ProvisionDeps
-  , sdResolveProvider :: KnownProvider -> ModelId -> IO (Either Text SomeProvider)
+  , sdResolveProvider :: Text -> ModelId -> IO (Either Text SomeProvider)
     -- ^ Re-reads @config.toml@ and the vault handle on every call, so a
-    -- provider saved during setup (including a new ollama base URL) is what
-    -- "Test connection" actually pings.
+    -- provider saved during setup (including a new ollama base URL or a named
+    -- OpenAI-compatible instance) is what "Test connection" actually pings.
   }
 
 -- | Everything the handlers need from the running gateway. Built at the
@@ -192,8 +192,10 @@ setupStateJson state = object
       , "label" .= pcLabel card
       , "configured" .= pcConfigured card
       , "requires_base_url" .= pcRequiresBaseUrl card
+      , "requires_name" .= pcRequiresName card
       , "isDefault" .= pcIsDefault card
       , "default_model" .= pcDefaultModel card
+      , "models" .= pcModels card
       ]
 
 statusText :: StepStatus -> Text
@@ -340,12 +342,16 @@ reopenConfigured env sec recipient identity = do
 -- error (the browser renders it next to the field); only an unknown provider
 -- (400) or a vault that is not open (500) is.
 handleProviderTest :: SetupEnv -> Text -> Request -> IO Response
-handleProviderTest env rawName req =
-  case parseProvider rawName of
-    Nothing -> pure (setupErr status400
+handleProviderTest env rawName req = do
+  runtime <- loadRuntimeConfig (seConfigPath env)
+  let cfg = fromRight defaultRuntimeConfig runtime
+      known = isJust (parseProvider rawName)
+                || rawName `elem` customProviderNames cfg
+  if not known
+    then pure (setupErr status400
       ("unknown provider: " <> rawName)
-      (Just "known providers: anthropic, openrouter, ollama"))
-    Just known -> do
+      (Just "known providers: anthropic, openrouter, ollama, or a configured OpenAI-compatible instance"))
+    else do
       mhandle <- readIORef (seHandleRef env)
       case mhandle of
         -- The design decides the vault-unavailable case by reading the handle
@@ -354,8 +360,8 @@ handleProviderTest env rawName req =
           "the vault is not open"
           (Just "create the vault (or reopen it) before testing a provider"))
         Just _ -> do
-          model <- testModel env known req
-          resolved <- sdResolveProvider (seDeps env) known model
+          model <- testModel env rawName req
+          resolved <- sdResolveProvider (seDeps env) rawName model
           case resolved of
             Left err -> pure (pingFailed err)
             Right provider -> do
@@ -386,8 +392,8 @@ pingFailed err = setupJson status200 (object
 -- | The model the ping uses: the request's @model@ when given, else what a new
 -- session would use (global default, then the provider's configured default,
 -- then the provider's hardcoded default).
-testModel :: SetupEnv -> KnownProvider -> Request -> IO ModelId
-testModel env known req = do
+testModel :: SetupEnv -> Text -> Request -> IO ModelId
+testModel env name req = do
   raw <- collectBodyLimited maxSetupBodyBytes req
   let fromBody = case raw of
         Right bytes -> case A.eitherDecodeStrict' bytes of
@@ -401,13 +407,8 @@ testModel env known req = do
     Nothing -> do
       runtime <- loadRuntimeConfig (seConfigPath env)
       let cfg = fromRight defaultRuntimeConfig runtime
-          label = providerLabel known
-      pure $ ModelId $ fromMaybe
-        (modelText (defaultModelFor known))
-        (rcDefaultModel cfg <> providerDefaultModel cfg label)
-
-modelText :: ModelId -> Text
-modelText (ModelId m) = m
+          ModelId fallback = resolveDefaultModelForName cfg name
+      pure $ ModelId $ fromMaybe fallback (rcDefaultModel cfg)
 
 -- ---------------------------------------------------------------------------
 -- Plumbing

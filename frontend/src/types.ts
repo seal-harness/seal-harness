@@ -255,6 +255,9 @@ export interface ProviderInfo {
   isDefault?: boolean
   /** The configured default model for this provider, if any. */
   defaultModel?: string
+  /** Operator-configured frequently-used models for this provider. Offered
+   *  as suggestions by the new-tab model combobox. Absent means none. */
+  models?: string[]
   /** Whether this provider has a usable credential (or is keyless, like
    *  local Ollama). The backend's /api/providers sets this for every entry;
    *  absent is treated as configured (back-compat with older test mocks). */
@@ -272,19 +275,30 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** The provider implementation ("anthropic", "ollama", "openrouter",
+   *  "openai"). For a custom OpenAI-compatible instance `name` is the
+   *  operator-chosen unique name and `type` is "openai". */
+  type?: string
   isDefault: boolean
   defaultModel: string | null
+  /** Operator-configured frequently-used models for this provider. */
+  models: string[]
   baseUrl: string | null
   authStatus: ProviderAuthStatus
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
- *  api_key is write-only — never returned by the API. */
+ *  api_key is write-only — never returned by the API. `type` is required when
+ *  creating a custom OpenAI-compatible instance (name is its unique id). */
 export interface ProviderInput {
   name?: string
+  type?: string
   api_key?: string
   base_url?: string
   default_model?: string
+  /** Frequently-used models for this provider. Sent as an array; a blank
+   *  entry is ignored by the backend. Pass [] to clear the list. */
+  models?: string[]
 }
 
 // ── Channel CRUD ───────────────────────────────────────────────────────
