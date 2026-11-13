@@ -1661,6 +1661,79 @@ describe('AskHumanForm', () => {
     expect(screen.queryByTestId('ask-human-submitting')).toBeNull()
   })
 
+  // Regression: after the user answers an ASK_HUMAN and the agent's next
+  // response arrives (giving the tool call a result), the answered-call
+  // guard is cleaned up by the effectivePendingQuestions memo. If the
+  // transcript then re-seeds (e.g. on harness-status:idle → refresh after
+  // sending a new message) and the new messages array momentarily lacks
+  // the tool_result (because the HTTP seed returned a limited window or
+  // the tool_result is in a later entry not yet processed),
+  // synthesizePendingQuestions would revive the old ASK_HUMAN form —
+  // showing a prompt the user already answered. The guard must NOT be
+  // cleaned up just because a tool call currently has a result; once a
+  // tool call has been marked answered, it should stay marked.
+  it('does NOT revive a previously-answered ASK_HUMAN after the result arrives and then disappears on re-seed', () => {
+    // Phase 1: ASK_HUMAN with a real pending question.
+    const askMsg = makeAskMessage([{ label: 'main', description: 'd' }])
+    const initialPq = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    const { rerender } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[askMsg]}
+        pendingQuestions={initialPq}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // User answers — form is dismissed.
+    fireEvent.click(screen.getByText('main'))
+    // Simulate WS ask_resolved removing the real pending question.
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[askMsg]}
+        pendingQuestions={[]}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // Phase 2: The agent's next response arrives — the ASK_HUMAN tool call
+    // now has a result. The guard is cleaned up by the memo.
+    const answeredMsg: Message = {
+      ...askMsg,
+      blocks: [{
+        ...askMsg.blocks[0]!,
+        toolCall: { ...askMsg.blocks[0]!.toolCall!, result: 'main' },
+      }],
+    }
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[answeredMsg]}
+        pendingQuestions={[]}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
+
+    // Phase 3: The user sends a new message. The transcript re-seeds, and
+    // the new messages array does NOT include the tool_result (simulating
+    // a limited HTTP seed window or a streaming gap). The old ASK_HUMAN
+    // form must NOT be revived.
+    rerender(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[askMsg]} // same tool call, but result is gone again
+        pendingQuestions={[]}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
+  })
+
   it('typing + Enter submits the Other textarea', () => {
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]

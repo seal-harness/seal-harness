@@ -2626,15 +2626,14 @@ export function ChatArea({
   // answer via `onSend` (a regular user message) instead of
   // `onAnswerQuestionText` (which requires a live store entry).
   const effectivePendingQuestions = useMemo(() => {
-    // Clean up answered tracking for tool calls that now have a result
-    // (the agent continued past the ASK_HUMAN).
-    for (const msg of messages) {
-      for (const block of msg.blocks) {
-        if (block.toolCall?.name === 'ASK_HUMAN' && block.toolCall.result !== undefined) {
-          answeredAskHumanToolCallIds.current.delete(block.toolCall.id)
-        }
-      }
-    }
+    // NOTE: we deliberately do NOT clean up answeredAskHumanToolCallIds
+    // here. Once a tool call has been marked answered, it must stay
+    // marked — a transcript re-seed (e.g. on harness-status:idle → refresh
+    // after sending a new message) can cause the tool_result to
+    // momentarily disappear from the messages array, which would let
+    // synthesizePendingQuestions revive the old ASK_HUMAN form. The tool
+    // call id is unique and never reused, so there is no false-positive
+    // risk; the set is bounded by the session's ASK_HUMAN call count.
     const synth = synthesizePendingQuestions(messages)
     if (synth.length === 0) return pendingQuestions ?? []
     // Filter out synthesized questions whose tool call was already answered
