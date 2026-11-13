@@ -46,6 +46,7 @@ import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Store (CronStore (..))
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
 testAbortReg :: SessionAbortRegistry
@@ -120,8 +121,20 @@ mkDeps = do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adCronStore = stubCronStore
     })
 
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
   it "gatewayApp routes /api/health to the API" $ do

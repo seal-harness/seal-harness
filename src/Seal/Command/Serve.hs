@@ -561,6 +561,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
+  , adCronStore        = bCronStore backends
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

@@ -85,6 +85,7 @@ import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+import Seal.Cron.Store (CronStore)
 import Seal.Handles.AskReply
   ( askIdText, pendingForSession, PendingQuestionInfo (..) )
 import Seal.Core.Backends (Backends (bRunRecords))
@@ -194,6 +195,9 @@ data ApiDeps = ApiDeps
     -- resolution). Real wiring in 'Seal.Command.Serve'; 'stubSetupDeps' in the
     -- test literals, which fail closed rather than touching the filesystem.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
+  , adCronStore        :: CronStore
+    -- ^ The cron job store (file-based under @config/cron/@). Used by
+    -- the cron REST endpoints to read and manage cron jobs.
   }
 
 -- | The REST API as a WAI Application.

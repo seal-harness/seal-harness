@@ -124,6 +124,19 @@ import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Memory.Embedding (nullEmbeddingBackend)
+import Seal.Cron.Store (CronStore (..))
+
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 
 -- ---------------------------------------------------------------------------
 -- The test environment
@@ -541,6 +554,7 @@ buildTestEnv tmp mode mRepo opts = do
         
         , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg = testAbortReg
+        , adCronStore = stubCronStore
         , adSecurityConfig = secCfg
         , adMkSessionExec = Nothing
         }
