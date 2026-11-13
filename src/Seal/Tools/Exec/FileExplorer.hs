@@ -110,6 +110,11 @@ data FileContent = FileContent
 -- @FILE_READ@).
 data FileExplorerHandle = FileExplorerHandle
   { feListDirectory :: FilePath -> IO (Either FileExplorerErr FileListing)
+  , feListDirectories :: [FilePath] -> IO (Either FileExplorerErr [FileListing])
+    -- ^ List several directories in ONE round trip. Returns listings in
+    -- request order. On a truncated transport, only the directories that
+    -- arrived complete are returned (never a partial listing): the caller is
+    -- expected to re-request the remainder individually. See 'remoteListDirsCmd'.
   , feReadFile :: FilePath -> IO (Either FileExplorerErr FileContent)
   , feReadFileBytes :: FilePath -> IO (Either FileExplorerErr (ByteString, Bool))
     -- ^ (bytes up to ceiling, truncated?) — for the download endpoint.
@@ -193,6 +198,7 @@ mapRemoteExecError sshCfg = \case
 mkFailClosedFileExplorer :: FileExplorerHandle
 mkFailClosedFileExplorer = FileExplorerHandle
   { feListDirectory = \_ -> pure (Left FeDisabled)
+  , feListDirectories = \_ -> pure (Left FeDisabled)
   , feReadFile = \_ -> pure (Left FeDisabled)
   , feReadFileBytes = \_ -> pure (Left FeDisabled)
   , feResolveHome = pure (Left FeDisabled)
@@ -208,6 +214,7 @@ mkFailClosedFileExplorer = FileExplorerHandle
 mkLocalFileExplorer :: Int -> FileExplorerHandle
 mkLocalFileExplorer ceilingBytes = FileExplorerHandle
   { feListDirectory = localListDirectory ceilingBytes
+  , feListDirectories = localListDirectories ceilingBytes
   , feReadFile = localReadFile ceilingBytes
   , feReadFileBytes = localReadFileBytes ceilingBytes
   , feResolveHome = localResolveHome
@@ -265,6 +272,19 @@ localListDirectory _ origPath = do
             , flTruncated = truncated
             , flWarning = warning
             })
+
+-- | List several local directories. Sequential and cheap (no round trip per
+-- directory), sharing exactly the semantics of 'localListDirectory', so the
+-- batched and single-path arms cannot drift.
+localListDirectories :: Int -> [FilePath] -> IO (Either FileExplorerErr [FileListing])
+localListDirectories ceilingBytes = go []
+  where
+    go acc [] = pure (Right (reverse acc))
+    go acc (p : ps) = do
+      r <- localListDirectory ceilingBytes p
+      case r of
+        Left e -> pure (Left e)
+        Right l -> go (l : acc) ps
 
 -- | Build a 'FileEntry' for one child of a local directory. Checks
 -- symlink, directory, file type, and best-effort size/mtime.
@@ -405,6 +425,7 @@ mkRemoteFileExplorer sshCfg runner ceilingBytes = do
   homeCache <- newIORef Nothing
   pure $ FileExplorerHandle
     { feListDirectory = remoteListDirectory sshCfg runner ceilingBytes
+    , feListDirectories = remoteListDirectories sshCfg runner ceilingBytes
     , feReadFile = remoteReadFile sshCfg runner ceilingBytes
     , feReadFileBytes = remoteReadFileBytes sshCfg runner ceilingBytes
     , feResolveHome = remoteResolveHome sshCfg runner homeCache
@@ -576,6 +597,103 @@ remoteReadCmd path ceilingBytes =
 -- ---------------------------------------------------------------------------
 -- Output parsing (pure)
 -- ---------------------------------------------------------------------------
+
+-- | The per-directory framing tag emitted by 'remoteListDirsCmd'. Chosen so it
+-- cannot collide with an entry line (which starts with D\/F\/S\/O\/|).
+dirHeaderTag :: Text
+dirHeaderTag = "%%D|"
+
+-- | Build ONE shell command that lists N directories, framing each with
+-- 'dirHeaderTag' so the response can be split. Every path is shell-quoted
+-- (never interpolated raw), and the per-directory body is identical to
+-- 'remoteListCmd' so the two arms agree.
+--
+-- Output shape:
+--
+-- > %%D|/a
+-- > D|sub
+-- > F|f.txt|6|1700000000
+-- > %%D|/b
+-- > F|g.txt|7|1700000000
+remoteListDirsCmd :: [FilePath] -> Text
+remoteListDirsCmd paths = T.intercalate "; " (map one paths)
+  where
+    one :: FilePath -> Text
+    one path = T.pack $ unwords
+      [ "p=" <> shellQuote path <> ";"
+      , "echo " <> shellQuote (T.unpack dirHeaderTag <> path) <> ";"
+      , "if [ ! -e \"$p\" ]; then echo \"" <> T.unpack notFoundMarker <> "\";"
+      , "elif [ ! -d \"$p\" ]; then echo \"" <> T.unpack notDirMarker <> "\";"
+      , "else ls -1A -- \"$p\" 2>/dev/null | while IFS= read -r name; do"
+      , "full=\"$p/$name\";"
+      , "if [ -L \"$full\" ]; then echo \"S|$name\";"
+      , "elif [ -d \"$full\" ]; then echo \"D|$name\";"
+      , "elif [ -f \"$full\" ]; then"
+      , "sz=$(stat -c %s -- \"$full\" 2>/dev/null || stat -f%z \"$full\" 2>/dev/null || echo 0);"
+      , "mt=$(stat -c %Y -- \"$full\" 2>/dev/null || stat -f%m \"$full\" 2>/dev/null || echo 0);"
+      , "echo \"F|$name|$sz|$mt\";"
+      , "else echo \"O|$name\"; fi;"
+      , "done;"
+      , "fi"
+      ]
+
+-- | Split a batched listing response into (path, body) pairs, in arrival
+-- order. A directory whose body was cut off by transport truncation is
+-- dropped entirely, so a caller never sees a partially-listed directory.
+parseBatchedListing :: Text -> [(Text, Text)]
+parseBatchedListing raw =
+  let (clean, _truncated) = stripTruncationMarker raw
+  in go clean
+  where
+    -- Accumulate (path, body-lines) blocks, then reverse each body.
+    go txt =
+      let ls = T.lines txt
+          (blocks, curPath, curLines) = foldl step ([], Nothing, []) ls
+          finish mpath mlines acc =
+            case mpath of
+              Nothing -> acc
+              Just p  -> acc ++ [(p, T.unlines (reverse mlines))]
+      in finish curPath curLines blocks
+
+    step (acc, mpath, mlines) line =
+      case T.stripPrefix dirHeaderTag line of
+        Just p ->
+          let acc' = case mpath of
+                Nothing -> acc
+                Just cur -> acc ++ [(cur, T.unlines (reverse mlines))]
+          in (acc', Just p, [])
+        Nothing -> (acc, mpath, line : mlines)
+
+-- | List several remote directories in ONE SSH round trip. Directories that
+-- did not arrive complete (transport truncation) are omitted from the result:
+-- returning a partial listing would be wrong, and the caller re-requests the
+-- remainder individually.
+remoteListDirectories
+  :: SshConfig -> RemoteRunner -> Int -> [FilePath]
+  -> IO (Either FileExplorerErr [FileListing])
+remoteListDirectories _sshCfg _runner _ceiling [] = pure (Right [])
+remoteListDirectories sshCfg runner _ceiling paths = do
+  let collapsed = map collapsePath paths
+      cmdText = remoteListDirsCmd collapsed
+  case mkShellCommand cmdText of
+    Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
+    Right cmd -> do
+      res <- runRemoteShell runner sshCfg cmd
+      case res of
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
+        Right out -> do
+          let pairs = parseBatchedListing out
+              toListing (p, body) =
+                let entries = sortBy
+                      (comparing (\e -> (not (feIsDir e), feName e)))
+                      (parseRemoteListing body)
+                in FileListing
+                     { flPath = p
+                     , flEntries = entries
+                     , flTruncated = False
+                     , flWarning = checkBlocked (T.unpack p)
+                     }
+          pure (Right (map toListing pairs))
 
 -- | Parse the remote listing output into 'FileEntry' list. Each line is
 -- @S|name@, @D|name@, @F|name|size|mtime@, or @O|name@. Malformed lines

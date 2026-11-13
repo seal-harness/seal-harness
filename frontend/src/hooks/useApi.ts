@@ -1730,8 +1730,37 @@ export async function fetchFileListing(
   }
 }
 
-/** Fetch file content (text). Returns the content on success, or an
- *  error status code on failure. */
+/** Fetch a listing AND, in the same round trip, listings for several extra
+ *  directories (the rail's expansion chain). The backend serves the extras
+ *  from one batched remote operation, so N directories cost one SSH round
+ *  trip instead of N.
+ *
+ *  Returns the primary listing plus any rail listings that arrived complete.
+ *  Directories the transport truncated are simply absent from `rail`; the
+ *  caller re-requests those individually. */
+export async function fetchFileListingWithRail(
+  path: string | null | undefined,
+  railPaths: string[],
+  signal?: AbortSignal,
+): Promise<
+  | { ok: true; listing: FileListing; rail: FileListing[] }
+  | { ok: false; status: number }
+> {
+  try {
+    const qs = new URLSearchParams()
+    if (path) qs.set('path', path)
+    for (const p of railPaths) qs.append('paths', p)
+    const url = `/api/files?${qs.toString()}`
+    const res = await fetch(url, signal ? { signal } : undefined)
+    if (!res.ok) return { ok: false, status: res.status }
+    const body = (await res.json()) as FileListing & { rail?: FileListing[] }
+    const { rail, ...listing } = body
+    return { ok: true, listing: listing as FileListing, rail: rail ?? [] }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
 export async function fetchFileContent(
   path: string,
   signal?: AbortSignal,

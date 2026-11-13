@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
-import { fetchFileListing, fetchFileContent, downloadFile } from '../hooks/useApi'
+import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile } from '../hooks/useApi'
 import { FileTree, type FileTreeNode } from './FileTree'
 
 // ── URL helpers ─────────────────────────────────────────────────────────
@@ -430,6 +430,10 @@ export function FilesView() {
   // only ADD to `expanded`; it must never re-open one of these, or a manual
   // collapse would be silently undone by the next click elsewhere.
   const [collapsedByUser, setCollapsedByUser] = useState<Set<string>>(new Set())
+  const expandedRef = useRef<Set<string>>(new Set())
+  expandedRef.current = expanded
+  const collapsedRef = useRef<Set<string>>(new Set())
+  collapsedRef.current = collapsedByUser
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<number | null>(null)
   const [content, setContent] = useState<FileContent | null>(null)
@@ -489,64 +493,98 @@ export function FilesView() {
   )
 
   // Resolve the main pane: derive the rail root, then decide listing vs viewer.
+  /** Resolve the main pane AND the rail chain for `target` in ONE request.
+   *  Falls back to per-path loading if the batch comes back short (transport
+   *  truncation), so correctness never depends on the optimization. */
+  const loadWithRail = useCallback(
+    async (
+      target: string | null,
+      railPaths: string[],
+    ): Promise<{ listing: FileListing | null; status: number | null; railShort: string[] }> => {
+      const res = await fetchFileListingWithRail(target, railPaths)
+      if (!res.ok) {
+        statusRef.current.set(target, res.status)
+        return { listing: null, status: res.status, railShort: [] }
+      }
+      listingsRef.current.set(target, res.listing)
+      setListings((prev) => new Map(prev).set(target, res.listing))
+      const got = new Set<string>()
+      res.rail.forEach((l) => {
+        listingsRef.current.set(l.path, l)
+        got.add(l.path)
+      })
+      if (res.rail.length > 0) {
+        setListings((prev) => {
+          const next = new Map(prev)
+          res.rail.forEach((l) => next.set(l.path, l))
+          return next
+        })
+      }
+      return {
+        listing: res.listing,
+        status: null,
+        railShort: railPaths.filter((p) => !got.has(p)),
+      }
+    },
+    [],
+  )
+
   // ── Rail seed: ONCE, at the filesystem root ───────────────────────────
   //
   // The rail is rooted at `/` and only ever changes from direct user action
   // (expand/collapse). Navigating up or down changes the main pane only.
   // This effect therefore depends on nothing.
   const [railReady, setRailReady] = useState(false)
-  const seedRef = useRef<Promise<void> | null>(null)
+  const seedDone = useRef<Promise<void>>(Promise.resolve())
   // Bumped by the refresh button; forces both resolve effects to re-run.
   const [refreshTick, setRefreshTick] = useState(0)
   useEffect(() => {
     let cancelled = false
-    // Claim the '/' key synchronously so the ancestor-prefetch effect (which
-    // runs in the same tick) cannot issue a duplicate request for it.
-    seedRef.current = (async () => {
-      const rootRes = await loadListing('/')
+    seedDone.current = (async () => {
+      // Seed '/' together with the ancestor chain of the current path in ONE
+      // batched call, so a cold deep link costs that call plus the content.
+      const initial = pathFromQuery()
+      // Include the target itself for directories: the pane's listing is then
+      // part of the same batched call, so a cold directory view is ONE request.
+      // Ancestors only: `initial` may be a file, and asking the listing
+      // endpoint for a file is a 400 that would fail the whole batch.
+      const chain = initial ? ancestorsOf(initial).filter((a) => a !== '/') : []
+      const res = await fetchFileListingWithRail('/', chain)
       if (cancelled) return
-      if (rootRes.listing) {
-        // Ensure the cache is populated before `railReady` flips, so the
-        // ancestor-prefetch effect (which depends on it) does not re-request
-        // paths the seed just fetched.
-        listingsRef.current.set('/', rootRes.listing)
-      } else {
-        setRailError(new Map([['/', rootRes.status ?? 404]]))
+      if (!res.ok) {
+        setRailError(new Map([['/', res.status]]))
+        setRailReady(true)
+        return
       }
+      listingsRef.current.set('/', res.listing)
+      res.rail.forEach((l) => listingsRef.current.set(l.path, l))
+      setListings(() => {
+        const next = new Map<string | null, FileListing>()
+        next.set('/', res.listing)
+        res.rail.forEach((l) => next.set(l.path, l))
+        return next
+      })
       setRailReady(true)
     })()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── Ancestors of the current path: expanded once per path ─────────────
+  // ── Rail expansion for the current path ───────────────────────────────
   //
-  // Only *adds* to the expansion set, so a user's manual collapse is never
-  // undone by navigation. Fetches any ancestor not yet cached (in parallel:
-  // they all ride the same multiplexed SSH connection).
-  const expandedRef = useRef<Set<string>>(new Set())
-  expandedRef.current = expanded
-
+  // Sticky additions: expand the ancestors of the *current* path so it is
+  // visible, never collapsing anything and never re-opening a node the user
+  // explicitly collapsed. No fetching happens here — the batched seed/pane
+  // calls already populate the cache.
   useEffect(() => {
-    if (!railReady) return
-    // With no `path` the main pane shows $HOME; its rail position is unknown
-    // until that listing arrives, so there is nothing to expand yet.
-    if (!path) return
+    if (!railReady || !path) return
     const chain = ancestorsOf(path)
-
-    // Sticky additions: expand the ancestors not explicitly collapsed by the
-    // user, then prefetch any that are not cached yet (in parallel — they all
-    // ride the same multiplexed SSH connection).
     setExpanded((prev) => {
       const next = new Set(prev)
-      chain.forEach((a) => { if (!collapsedByUser.has(a)) next.add(a) })
+      chain.forEach((a) => { if (!collapsedRef.current.has(a)) next.add(a) })
       return next
     })
-    // `/` is owned by the rail seed, never by ancestor prefetch — otherwise
-    // the two race in the same tick and issue duplicate root requests.
-    const missing = chain.filter((a) => a !== '/' && !listingsRef.current.has(a))
-    void Promise.all(missing.map((a) => loadListing(a)))
-  }, [path, railReady, loadListing, collapsedByUser, refreshTick])
+  }, [path, railReady, refreshTick])
 
   // ── Main pane resolution (per navigation) ─────────────────────────────
   useEffect(() => {
@@ -557,6 +595,10 @@ export function FilesView() {
     setContent(null)
 
     const run = async () => {
+      // The rail seed populates the listing cache for the whole ancestor
+      // chain; waiting for it means a cold deep link needs no extra request.
+      await seedDone.current
+      if (cancelled) return
       const target = path
 
       if (!target) {
@@ -568,19 +610,33 @@ export function FilesView() {
       }
 
       if (target === '/') {
-        await loadListing('/')
         if (!cancelled) setLoading(false)
         return
       }
 
       const parent = parentDir(target)
-      const parentRes = await loadListing(parent)
-      const parentListing = parentRes.listing
+      // The rail seed batches the whole ancestor chain; wait for it so a cold
+      // deep link needs no second request.
+      await seedDone.current
       if (cancelled) return
+      const cached = listingsRef.current.get(parent)
+      const batch = cached
+        ? { listing: cached, status: null, railShort: [] as string[] }
+        : await loadWithRail(
+            parent,
+            ancestorsOf(target).filter((a) => a !== parent),
+          )
+      if (cancelled) return
+      const parentListing = batch.listing
       if (!parentListing) {
-        setError(parentRes.status ?? 404)
+        setError(batch.status ?? 404)
         setLoading(false)
         return
+      }
+      // Truncated batch: fetch the missing ancestors the slow way.
+      if (batch.railShort.length > 0) {
+        await Promise.all(batch.railShort.map((p) => loadListing(p)))
+        if (cancelled) return
       }
 
       const name = basename(target)
@@ -588,6 +644,8 @@ export function FilesView() {
 
       if (entry) {
         if (entry.isDir) {
+          // The seed's batched call normally already fetched this directory;
+          // loadListing only reaches the network on a miss.
           const dirRes = await loadListing(target)
           if (cancelled) return
           if (!dirRes.listing) setError(dirRes.status ?? 404)

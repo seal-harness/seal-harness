@@ -5,6 +5,7 @@ module Seal.Tools.Exec.FileExplorerSpec (spec) where
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Char (chr)
+import Data.Either (fromRight)
 import Data.IORef
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -489,6 +490,97 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
           fcLinesRead fc `shouldBe` 0
         Left e -> expectationFailure ("expected Right, got " <> show e)
 
+
+  --------------------------------------------------------------------------
+  -- Batched directory listing (feListDirectories)
+  --------------------------------------------------------------------------
+
+  describe "feListDirectories (local)" $ do
+    it "lists several directories in one call" $
+      withSystemTempDirectory "fe-batch" $ \tmp -> do
+        createDirectoryIfMissing True (tmp </> "a")
+        createDirectoryIfMissing True (tmp </> "b")
+        writeFile (tmp </> "a" </> "one.txt") "1"
+        writeFile (tmp </> "b" </> "two.txt") "22"
+        let fe = mkLocalFileExplorer 1048576
+        r <- feListDirectories fe [tmp </> "a", tmp </> "b"]
+        case r of
+          Left e -> expectationFailure ("expected Right, got " <> show e)
+          Right ls -> do
+            length ls `shouldBe` 2
+            map (takeFileName' . T.unpack . flPath) ls `shouldBe` ["a", "b"]
+            map (map feName . flEntries) ls `shouldBe` [["one.txt"], ["two.txt"]]
+
+    it "preserves request order" $
+      withSystemTempDirectory "fe-batch-order" $ \tmp -> do
+        mapM_ (\n -> createDirectoryIfMissing True (tmp </> n)) ["z", "m", "a"]
+        let fe = mkLocalFileExplorer 1048576
+        r <- feListDirectories fe
+          [tmp </> "z", tmp </> "m", tmp </> "a"]
+        case r of
+          Left e -> expectationFailure ("expected Right, got " <> show e)
+          Right ls -> map (takeFileName' . T.unpack . flPath) ls `shouldBe` ["z", "m", "a"]
+
+    it "returns Left FeNotFound for a missing path" $
+      withSystemTempDirectory "fe-batch-missing" $ \tmp -> do
+        let fe = mkLocalFileExplorer 1048576
+        r <- feListDirectories fe [tmp </> "nope"]
+        r `shouldBe` Left FeNotFound
+
+    it "returns an empty list for an empty request" $ do
+      let fe = mkLocalFileExplorer 1048576
+      r <- feListDirectories fe []
+      (r :: Either FileExplorerErr [FileListing]) `shouldBe` Right []
+
+  describe "feListDirectories (remote)" $ do
+    it "issues exactly ONE ssh round trip for N directories" $ do
+      calls <- newIORef []
+      let out = T.unlines
+            [ batchHeader "%%D|" "/a", "D|sub", "F|f.txt|6|1700000000"
+            , batchHeader "%%D|" "/b", "F|g.txt|7|1700000000"
+            ]
+      runner <- scriptedRunner calls [Right out]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576
+      r <- feListDirectories fe ["/a", "/b"]
+      let ls = fromRight [] r
+      map flPath ls `shouldBe` ["/a", "/b"]
+      map (length . flEntries) ls `shouldBe` [2, 1]
+      recorded <- readIORef calls
+      length recorded `shouldBe` 1
+
+    it "shell-quotes every path (no injection, leading dash rejected)" $ do
+      calls <- newIORef []
+      runner <- scriptedRunner calls [Right ""]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576
+      _ <- feListDirectories fe ["/a b", "/c;rm -rf /"]
+      recorded <- readIORef calls
+      let cmd = case recorded of (c : _) -> c; [] -> ""
+      -- The security property: every path reaches the shell single-quoted,
+      -- so the embedded `;` cannot terminate the assignment and start a new
+      -- command. Assert the quoted forms literally.
+      -- `extractCmd` re-joins argv with single spaces, so match the quoted
+      -- path token itself rather than the `p=...` assignment prefix.
+      -- The security property: the path reaches the shell single-quoted, so
+      -- its embedded `;` cannot start a new command. `extractCmd` re-joins
+      -- the argv with single spaces, so assert the quote-delimited prefix and
+      -- that the metacharacter sits INSIDE the quotes.
+      T.isInfixOf "p='/a b'" cmd `shouldBe` True
+      T.isInfixOf "p='/c;rm -rf " cmd `shouldBe` True
+      -- no unquoted `;rm` (which would mean injection escaped the quoting)
+      T.isInfixOf "p=/c;rm" cmd `shouldBe` False
+
+    it "reports truncation rather than dropping directories silently" $ do
+      calls <- newIORef []
+      let out = T.unlines [batchHeader "%%D|" "/a", "D|sub"] <> truncationMarkerText <> " 50000 bytes]"
+      runner <- scriptedRunner calls [Right out]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576
+      r <- feListDirectories fe ["/a", "/b"]
+      let ls = fromRight [] r
+      -- only the complete directory is returned; the caller re-requests the rest
+      map flPath ls `shouldBe` ["/a"]
+      recorded <- readIORef calls
+      length recorded `shouldBe` 1
+
 -- ---------------------------------------------------------------------------
 -- Test helpers
 -- ---------------------------------------------------------------------------
@@ -500,6 +592,10 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
 firstEntry :: HasCallStack => [a] -> a
 firstEntry []    = error "firstEntry: empty list (caller should have asserted length first)"
 firstEntry (x:_) = x
+
+-- | Like 'scriptedRunner' but the canned results for 'runRemoteBytes'
+-- are raw 'ByteString' (not encoded from 'Text'). Used for the
+-- non-UTF-8 binary test where 'TE.encodeUtf8' would corrupt the bytes.
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -526,6 +622,8 @@ extractCmd argv = case dropWhile (/= "--") argv of
   (_sep : rest) -> T.pack (unwords rest)
   _             -> T.pack (unwords argv)
 
+
+
 -- | Record a command text and pop the next canned result from the queue.
 -- Shared by 'scriptedRunner'.
 recordAndPop :: IORef [Text] -> IORef [Either ExecError Text] -> Text
@@ -550,9 +648,7 @@ scriptedRunner recRef canned0 = do
           []       -> ([], Right ("", False))
     }
 
--- | Like 'scriptedRunner' but the canned results for 'runRemoteBytes'
--- are raw 'ByteString' (not encoded from 'Text'). Used for the
--- non-UTF-8 binary test where 'TE.encodeUtf8' would corrupt the bytes.
+
 scriptedRunnerBytes :: IORef [Text] -> [Either ExecError ByteString] -> IO RemoteRunner
 scriptedRunnerBytes recRef canned0 = do
   qRef <- newIORef canned0
@@ -568,6 +664,18 @@ scriptedRunnerBytes recRef canned0 = do
             Right bs -> Right (bs, False))
           []       -> ([], Right (BS.empty, False))
     }
+
+
+-- | The framing header a batched listing emits before each directory.
+batchHeader :: Text -> Text -> Text
+batchHeader tag p = tag <> p
+
+-- | Filename component of a path (tests avoid importing System.FilePath here).
+takeFileName' :: FilePath -> FilePath
+takeFileName' p =
+  let r = reverse p
+      (name, _) = break (== '/') r
+  in reverse name
 
 -- | SSH config fixture for tests.
 sshCfg :: SshConfig

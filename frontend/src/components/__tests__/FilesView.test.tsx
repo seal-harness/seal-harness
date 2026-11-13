@@ -53,6 +53,11 @@ function jsonRes(status: number, body: unknown) {
   } as unknown as Response
 }
 
+/** Always register '/', since the rail seed always asks for it. */
+function ensureRoot() {
+  if (!routes.has('/')) routes.set('/', { body: makeListing({ path: '/', entries: [] }) })
+}
+
 function setupFetch() {
   fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
@@ -61,6 +66,7 @@ function setupFetch() {
     const isContent = url.includes('/api/files/content')
     const isDownload = url.includes('/api/files/download')
 
+    ensureRoot()
     if (isDownload) {
       const r = routes.get(path ?? '') ?? {}
       return {
@@ -75,7 +81,19 @@ function setupFetch() {
     // A `null` path means "resolve $HOME" (no path param at all).
     const route = path === null ? routes.get('') : routes.get(path)
     if (!route) return jsonRes(404, { error: 'not found' })
-    return jsonRes(route.status ?? 200, route.body ?? (isContent ? makeContent() : makeListing()))
+    const primary = route.body ?? (isContent ? makeContent() : makeListing())
+    // Batched rail listings: answer every `paths` value from the same route
+    // table, mirroring the backend (which returns only complete listings).
+    const extraPaths = [...url.matchAll(/[?&]paths=([^&]*)/g)].map((mm) =>
+      decodeURIComponent(mm[1]!),
+    )
+    if (extraPaths.length > 0) {
+      const rail = extraPaths
+        .map((p) => routes.get(p)?.body as FileListing | undefined)
+        .filter((l): l is FileListing => l !== undefined)
+      return jsonRes(route.status ?? 200, { ...(primary as object), rail })
+    }
+    return jsonRes(route.status ?? 200, primary)
   })
   vi.stubGlobal('fetch', fetchMock)
 }
@@ -482,7 +500,8 @@ describe('FilesView', () => {
 
   it('does not re-open a manually collapsed ancestor on navigation', async () => {
     setLocation('/home/user/readme.txt')
-    registerChain('/home/user', { '/': ['home'], '/home': ['user'], '/home/user': ['readme.txt'] })
+    routes.set('/', { body: makeListing({ path: '/', entries: [{ name: 'home', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
+    routes.set('/home', { body: makeListing({ path: '/home', entries: [{ name: 'user', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
     routes.set('/home/user', { body: makeListing({ path: '/home/user', entries: [
       { name: 'readme.txt', isDir: false, isSymlink: false, size: 1, mtime: null },
     ] }) })
@@ -560,7 +579,8 @@ describe('FilesView', () => {
 
   it('cold-loads a bookmarked file to the correct view', async () => {
     setLocation('/a/b/c.txt')
-    registerChain('/a/b', { '/a': ['b'], '/a/b': ['c.txt'] })
+    routes.set('/', { body: makeListing({ path: '/', entries: [{ name: 'a', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
+    routes.set('/a', { body: makeListing({ path: '/a', entries: [{ name: 'b', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
     routes.set('/a/b', { body: makeListing({ path: '/a/b', entries: [
       { name: 'c.txt', isDir: false, isSymlink: false, size: 10, mtime: null },
     ] }) })
@@ -580,18 +600,22 @@ describe('FilesView', () => {
     routes.set('/home/user/readme.txt', { body: makeContent() })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
-    // '/', '/home', '/home/user' (rail seed + ancestors) + the content.
-    expect(new Set(requestedPaths()).size).toBe(4)
+    // One batched call for the rail chain AND the parent listing, plus the
+    // file content: TWO operations, independent of path depth.
+    const batched = fetchMock.mock.calls.filter((c) => String(c[0]).includes('paths='))
+    expect(batched.length).toBe(1)
+    expect(new Set(requestedPaths()).size).toBe(2)
   })
 
-  it('cold directory bookmark costs one request per path level', async () => {
+  it('cold directory bookmark costs exactly one batched request', async () => {
     setLocation('/home/user')
     registerParent('/home/user', 'user')
     routes.set('/home/user', { body: makeListing() })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
-    // '/', '/home' (rail + ancestor) + '/home/user' (the content listing).
-    expect(new Set(requestedPaths()).size).toBe(3)
+    // The batched call carries the rail chain AND the parent listing.
+    const batched = fetchMock.mock.calls.filter((c) => String(c[0]).includes('paths='))
+    expect(batched.length).toBe(1)
   })
 
   it('reuses the parent listing when switching sibling files', async () => {

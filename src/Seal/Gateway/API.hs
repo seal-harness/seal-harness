@@ -2306,6 +2306,16 @@ handleAdopt deps body =
 -- | Parse the @path@ query parameter from a WAI request. Returns 'Nothing'
 -- when absent. Returns @Just ""@ for an explicitly empty value (the handler
 -- treats empty as a 400 error).
+-- | Parse the repeatable @paths@ query parameter (used by the file explorer to
+-- request several directory listings in one round trip). Returns @[]@ when
+-- absent. Order is preserved.
+parsePathsQuery :: Request -> [Text]
+parsePathsQuery req =
+  [ TE.decodeUtf8Lenient bs
+  | (k, Just bs) <- queryString req
+  , k == "paths"
+  ]
+
 parsePathQuery :: Request -> Maybe Text
 parsePathQuery req =
   case lookup "path" (queryString req) of
@@ -2348,7 +2358,27 @@ handleFilesList deps req = do
                   eListing <- feListDirectory (adFileExplorer deps) path
                   case eListing of
                     Left err -> pure (fileExplorerErrResponse err)
-                    Right listing -> pure (jsonLBS status200 (A.encode (fileListingJson listing)))
+                    Right listing -> do
+                      -- Optional batched rail listings: one extra SSH round
+                      -- trip for N directories instead of N.
+                      let extra = filter (not . T.null) (parsePathsQuery req)
+                      eRail <-
+                        if null extra
+                          then pure (Right [])
+                          else feListDirectories (adFileExplorer deps)
+                                 (map (joinPath . lexicalCollapse . splitDirectories . T.unpack) extra)
+                      case eRail of
+                        -- No `paths` (or the batch failed): keep the ORIGINAL
+                        -- response shape so existing clients are unaffected.
+                        Left _ -> pure (jsonLBS status200 (A.encode (fileListingJson listing)))
+                        Right [] -> pure (jsonLBS status200 (A.encode (fileListingJson listing)))
+                        Right rail ->
+                          -- Batched: the single-listing fields stay at the top
+                          -- level (backwards compatible) and `rail` is added.
+                          pure (jsonLBS status200 (A.encode
+                            (case fileListingJson listing of
+                               Object o -> Object (KeyMap.insert "rail" (A.toJSON (map fileListingJson rail)) o)
+                               other -> other)))
 
 -- | Handle GET /api/files/content — file content as JSON. Parses the @path@
 -- query parameter, calls 'feReadFile', returns a JSON 'FileContent' or an

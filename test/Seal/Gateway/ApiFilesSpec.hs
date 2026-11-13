@@ -8,6 +8,9 @@ module Seal.Gateway.ApiFilesSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.ByteString.Char8 qualified as BC
+import Data.ByteString.Lazy qualified as BL
+import Data.ByteString.Builder (Builder, toLazyByteString)
+import Data.Text.Encoding (decodeUtf8)
 import Data.IORef (newIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -50,6 +53,36 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [("path", Just (T.pack tmp))])
         responseStatus resp `shouldBe` status200
+
+    it "returns rail listings when `paths` is supplied" $ do
+      withSystemTempDirectory "seal-files-batch" $ \tmp -> do
+        createDirectoryIfMissing True (tmp </> "a")
+        createDirectoryIfMissing True (tmp </> "b")
+        TIO.writeFile (tmp </> "a" </> "one.txt") "1"
+        TIO.writeFile (tmp </> "b" </> "two.txt") "22"
+        let fe = mkLocalFileExplorer 131072
+        deps <- mkDeps fe True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files"]
+            [ ("path", Just (T.pack tmp))
+            , ("paths", Just (T.pack (tmp </> "a")))
+            , ("paths", Just (T.pack (tmp </> "b")))
+            ])
+        responseStatus resp `shouldBe` status200
+        body <- responseBodyText resp
+        -- both rail listings are present, in request order
+        body `shouldSatisfy` T.isInfixOf "\"rail\""
+        body `shouldSatisfy` T.isInfixOf "one.txt"
+        body `shouldSatisfy` T.isInfixOf "two.txt"
+
+    it "omits `rail` when `paths` is absent" $ do
+      withSystemTempDirectory "seal-files-nobatch" $ \tmp -> do
+        let fe = mkLocalFileExplorer 131072
+        deps <- mkDeps fe True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files"] [("path", Just (T.pack tmp))])
+        body <- responseBodyText resp
+        body `shouldSatisfy` (not . T.isInfixOf "\"rail\"")
 
     it "returns 403 when file explorer is disabled" $ do
       deps <- mkDeps mkFailClosedFileExplorer False
@@ -202,6 +235,19 @@ runAppResp app req = do
   mv <- newEmptyMVar
   _rr <- app req (\resp -> putMVar mv resp >> pure ResponseReceived)
   takeMVar mv
+
+-- | Read a 'Response' body as strict 'Text' for assertions. The file-explorer
+-- handlers reply with 'responseLBS', so the body is always 'ResponseBuilder'.
+responseBodyText :: Response -> IO Text
+responseBodyText (ResponseBuilder _ _ builderBody) =
+  decodeUtf8 . BL.toStrict <$> runBuilder builderBody
+responseBodyText (ResponseRaw _ _) = pure ""
+responseBodyText ResponseFile {} = pure ""
+responseBodyText ResponseStream {} = pure ""
+
+-- | Run a Builder into a lazy ByteString.
+runBuilder :: Builder -> IO BL.ByteString
+runBuilder b = pure (toLazyByteString b)
 
 -- | Check that a Maybe is Just.
 isJust :: Maybe a -> Bool
