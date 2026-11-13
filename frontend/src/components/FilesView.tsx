@@ -37,6 +37,24 @@ function basename(path: string): string {
   return idx < 0 ? path : path.slice(idx + 1)
 }
 
+/** Every ancestor of a path, shortest first, always including `/`.
+ *  `/home/user/readme.txt` → `['/', '/home', '/home/user']` */
+function ancestorsOf(path: string): string[] {
+  if (!path || path === '/') return ['/']
+  const parts = path.split('/').filter(Boolean)
+  const out: string[] = ['/']
+  let acc = ''
+  // strictly shorter than the path itself: the path's own parent is the last.
+  for (let i = 0; i < parts.length - 1; i++) {
+    acc += '/' + parts[i]
+    out.push(acc)
+  }
+  // Ensure the immediate parent is present even for a direct child of `/`.
+  const parent = parentDir(path)
+  if (!out.includes(parent)) out.push(parent)
+  return out
+}
+
 function joinPath(dir: string, name: string): string {
   return dir === '/' ? `/${name}` : `${dir}/${name}`
 }
@@ -408,6 +426,10 @@ export function FilesView() {
   // request), so the rail and detail pane share one copy.
   const [listings, setListings] = useState<Map<string | null, FileListing>>(new Map())
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // Paths the user explicitly collapsed. Navigation ("sticky additions") may
+  // only ADD to `expanded`; it must never re-open one of these, or a manual
+  // collapse would be silently undone by the next click elsewhere.
+  const [collapsedByUser, setCollapsedByUser] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<number | null>(null)
   const [content, setContent] = useState<FileContent | null>(null)
@@ -467,7 +489,68 @@ export function FilesView() {
   )
 
   // Resolve the main pane: derive the rail root, then decide listing vs viewer.
+  // ── Rail seed: ONCE, at the filesystem root ───────────────────────────
+  //
+  // The rail is rooted at `/` and only ever changes from direct user action
+  // (expand/collapse). Navigating up or down changes the main pane only.
+  // This effect therefore depends on nothing.
+  const [railReady, setRailReady] = useState(false)
+  const seedRef = useRef<Promise<void> | null>(null)
+  // Bumped by the refresh button; forces both resolve effects to re-run.
+  const [refreshTick, setRefreshTick] = useState(0)
   useEffect(() => {
+    let cancelled = false
+    // Claim the '/' key synchronously so the ancestor-prefetch effect (which
+    // runs in the same tick) cannot issue a duplicate request for it.
+    seedRef.current = (async () => {
+      const rootRes = await loadListing('/')
+      if (cancelled) return
+      if (rootRes.listing) {
+        // Ensure the cache is populated before `railReady` flips, so the
+        // ancestor-prefetch effect (which depends on it) does not re-request
+        // paths the seed just fetched.
+        listingsRef.current.set('/', rootRes.listing)
+      } else {
+        setRailError(new Map([['/', rootRes.status ?? 404]]))
+      }
+      setRailReady(true)
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Ancestors of the current path: expanded once per path ─────────────
+  //
+  // Only *adds* to the expansion set, so a user's manual collapse is never
+  // undone by navigation. Fetches any ancestor not yet cached (in parallel:
+  // they all ride the same multiplexed SSH connection).
+  const expandedRef = useRef<Set<string>>(new Set())
+  expandedRef.current = expanded
+
+  useEffect(() => {
+    if (!railReady) return
+    // With no `path` the main pane shows $HOME; its rail position is unknown
+    // until that listing arrives, so there is nothing to expand yet.
+    if (!path) return
+    const chain = ancestorsOf(path)
+
+    // Sticky additions: expand the ancestors not explicitly collapsed by the
+    // user, then prefetch any that are not cached yet (in parallel — they all
+    // ride the same multiplexed SSH connection).
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      chain.forEach((a) => { if (!collapsedByUser.has(a)) next.add(a) })
+      return next
+    })
+    // `/` is owned by the rail seed, never by ancestor prefetch — otherwise
+    // the two race in the same tick and issue duplicate root requests.
+    const missing = chain.filter((a) => a !== '/' && !listingsRef.current.has(a))
+    void Promise.all(missing.map((a) => loadListing(a)))
+  }, [path, railReady, loadListing, collapsedByUser, refreshTick])
+
+  // ── Main pane resolution (per navigation) ─────────────────────────────
+  useEffect(() => {
+    if (!railReady) return
     let cancelled = false
     setLoading(true)
     setError(null)
@@ -475,44 +558,34 @@ export function FilesView() {
 
     const run = async () => {
       const target = path
-      const railRoot = target ? parentDir(target) : null
-      const rootRes = await loadListing(railRoot)
-      const rootListing = rootRes.listing
+
+      if (!target) {
+        // No `path`: the main pane shows the resolved $HOME listing (the
+        // backend defaults it). The rail is independent and stays at `/`.
+        await loadListing(null)
+        if (!cancelled) setLoading(false)
+        return
+      }
+
+      if (target === '/') {
+        await loadListing('/')
+        if (!cancelled) setLoading(false)
+        return
+      }
+
+      const parent = parentDir(target)
+      const parentRes = await loadListing(parent)
+      const parentListing = parentRes.listing
       if (cancelled) return
-      if (!rootListing) {
-        setError(rootRes.status ?? 404)
-        setLoading(false)
-        return
-      }
-      // Expand the ancestors of the target so it is visible in the rail.
-      if (target && target !== '/') {
-        const segs: string[] = []
-        let acc = ''
-        for (const p of target.split('/').filter(Boolean)) {
-          acc += '/' + p
-          segs.push(acc)
-        }
-        setExpanded((prev) => {
-          const next = new Set(prev)
-          segs.forEach((s) => next.add(s))
-          return next
-        })
-      }
-
-      if (!target || target === '/') {
-        // Rail root IS the content: nothing more to resolve.
-        setLoading(false)
-        return
-      }
-
-      if (target === railRoot) {
-        // A directory bookmark: the root listing is the content.
+      if (!parentListing) {
+        setError(parentRes.status ?? 404)
         setLoading(false)
         return
       }
 
       const name = basename(target)
-      const entry = rootListing.entries.find((e) => e.name === name)
+      const entry = parentListing.entries.find((e) => e.name === name)
+
       if (entry) {
         if (entry.isDir) {
           const dirRes = await loadListing(target)
@@ -543,7 +616,6 @@ export function FilesView() {
         return
       }
       if (probe.status === 400) {
-        // It is a directory after all.
         await loadListing(target)
         setContentLoading(false)
         setLoading(false)
@@ -557,20 +629,33 @@ export function FilesView() {
     void run()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path])
+  }, [path, railReady, refreshTick])
 
   const onNavigate = useCallback((newPath: string | null) => navigateTo(newPath), [])
 
   const onToggle = useCallback(
     (nodePath: string) => {
+      const isExpanded = expandedRef.current.has(nodePath)
+      const nextExpanded = !isExpanded
+
       setExpanded((prev) => {
         const next = new Set(prev)
-        if (next.has(nodePath)) next.delete(nodePath)
+        if (nextExpanded) next.add(nodePath)
+        else next.delete(nodePath)
+        return next
+      })
+
+      // Record the manual intent: a collapse must survive navigation
+      // ("sticky additions" only ever adds), and a re-expand clears the mark.
+      setCollapsedByUser((prev) => {
+        const next = new Set(prev)
+        if (nextExpanded) next.delete(nodePath)
         else next.add(nodePath)
         return next
       })
+
       // Lazily load children on first expand.
-      if (!listingsRef.current.has(nodePath)) void loadListing(nodePath)
+      if (nextExpanded && !listingsRef.current.has(nodePath)) void loadListing(nodePath)
     },
     [loadListing],
   )
@@ -619,8 +704,9 @@ export function FilesView() {
 
   // ── Derive the rail ────────────────────────────────────────────────────
 
-  const railRoot = path ? parentDir(path) : null
-  const rootListing = listings.get(railRoot)
+  // The rail is ALWAYS rooted at the filesystem root. It never re-roots on
+  // navigation; only `expanded` (user-driven) changes what it shows.
+  const rootListing = listings.get('/')
 
   const buildNodes = (listing: FileListing): FileTreeNode[] =>
     sortEntries(listing.entries).map((e) => {
@@ -640,18 +726,15 @@ export function FilesView() {
       }
     })
 
-  // The rail's top level is the parent of the rail root, so the root itself is
-  // reachable; when the rail root is `/` there is no parent.
   const railNodes: FileTreeNode[] = rootListing ? buildNodes(rootListing) : []
-  const railIsLoading = !rootListing && railRoot !== null
+  const railIsLoading = !rootListing
 
   // ── Derive the main pane ───────────────────────────────────────────────
 
   const isDirectoryTarget =
-    path === null || path === '/' || path === railRoot || listings.has(path)
-  const listingForPane: FileListing | undefined = path === null
-    ? rootListing
-    : listings.get(path) ?? (path === railRoot ? rootListing : undefined)
+    path === null || path === '/' || listings.has(path)
+  const listingForPane: FileListing | undefined =
+    path === null ? listings.get(null) : listings.get(path)
 
   return (
     <div style={sectionStyle}>
@@ -666,10 +749,10 @@ export function FilesView() {
             style={{ width: 22, height: 22, padding: 0, fontSize: 13, lineHeight: 1 }}
             onClick={() => {
               listingsRef.current.clear()
-              setListings(new Map())
               inflight.current.clear()
+              setListings(new Map())
               setRailError(new Map())
-              void loadListing(railRoot, true)
+              setRefreshTick((n) => n + 1)
             }}
           >
             ⟳

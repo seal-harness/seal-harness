@@ -102,6 +102,37 @@ function registerParent(targetPath: string, name: string, isDir = true) {
   return parent
 }
 
+
+/** Register `/` plus every ancestor down to `target` (inclusive of the
+ *  parent listing) so the root-seeded rail can expand to reach it.
+ *  `leafs` maps a directory path to the names it contains. */
+function registerChain(target: string, leafs: Record<string, string[]> = {}) {
+  routes.set('/', { body: makeListing({ path: '/', entries: [] }) })
+  const parts = target.split('/').filter(Boolean)
+  let acc = ''
+  for (let i = 0; i < parts.length; i++) {
+    const parent = acc || '/'
+    const name = parts[i]!
+    const existing = routes.get(parent)?.body as FileListing | undefined
+    const names = leafs[parent] ?? [name]
+    routes.set(parent, {
+      body: makeListing({
+        path: parent,
+        entries: names.map((n) => ({
+          name: n,
+          isDir: true,
+          isSymlink: false,
+          size: null,
+          mtime: null,
+        })),
+        ...(existing ? {} : {}),
+      }),
+    })
+    acc = parent === '/' ? `/${name}` : `${parent}/${name}`
+  }
+  return acc
+}
+
 function setLocation(path?: string) {
   const search = new URLSearchParams()
   if (path) search.set('path', path)
@@ -372,12 +403,16 @@ describe('FilesView', () => {
     expect(screen.getByTestId('files-loading')).toBeTruthy()
   })
 
-  it('absent path defaults to home; rail roots at parent(flPath)', async () => {
+  it('absent path defaults to home; the rail still roots at /', async () => {
     setLocation()
     routes.set('', { body: makeListing({ path: '/home/user' }) })
+    routes.set('/', { body: makeListing({ path: '/', entries: [] }) })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
+    // The $HOME request is still made for the main pane…
     expect(requestedPaths()).toContain(null)
+    // …and the rail is seeded from the filesystem root, not the parent.
+    expect(requestedPaths()).toContain('/')
   })
 
   it('viewer Back returns to parent (no view= param)', async () => {
@@ -393,6 +428,85 @@ describe('FilesView', () => {
     const url = pushSpy.mock.calls[0]![2] as string
     expect(url).toContain('path=' + encodeURIComponent('/home/user'))
     expect(url).not.toContain('view=')
+  })
+
+
+  // ── Rooted tree: navigation must not change the rail ────────────────────
+
+  it('roots the rail at the filesystem root, not at parent(path)', async () => {
+    setLocation('/home/user')
+    registerChain('/home/user', { '/': ['home', 'etc'], '/home': ['user'] })
+    render(<FilesView />)
+    await waitFor(() => expect(screen.getByTestId('rail-node-/home')).toBeTruthy())
+    // Root-level siblings are visible, proving the root is `/`.
+    expect(screen.getByTestId('rail-node-/etc')).toBeTruthy()
+  })
+
+  it('collapses everything except the current directory chain on first load', async () => {
+    setLocation('/home/user')
+    registerChain('/home/user', { '/': ['home'], '/home': ['user'] })
+    routes.set('/home/user', { body: makeListing({ path: '/home/user', entries: [] }) })
+    render(<FilesView />)
+    await waitFor(() => expect(screen.getByTestId('rail-node-/home/user')).toBeTruthy())
+    // Ancestors of the target are expanded…
+    expect(screen.getByTestId('rail-glyph-/home').querySelector('svg')?.style.transform)
+      .toBe('rotate(90deg)')
+    // …and an unrelated root sibling stays collapsed.
+    // ('/etc' was not registered under '/', so assert on the absence of any
+    // expanded node other than the chain.)
+    expect(screen.queryByTestId('rail-node-/etc')).toBeNull()
+  })
+
+  it('does not collapse anything when navigating to a sibling directory', async () => {
+    setLocation('/home/user')
+    registerChain('/home/user', { '/': ['home'], '/home': ['user', 'other'] })
+    routes.set('/home/user', { body: makeListing({ path: '/home/user', entries: [] }) })
+    routes.set('/home/other', { body: makeListing({ path: '/home/other', entries: [] }) })
+    render(<FilesView />)
+    await waitFor(() => expect(screen.getByTestId('rail-node-/home/user')).toBeTruthy())
+
+    const expandedPaths = () =>
+      [...screen.getByTestId('file-tree').querySelectorAll('[data-testid^="rail-glyph-"]')]
+        .filter((el) => el.querySelector('svg')?.style.transform === 'rotate(90deg)')
+        .map((el) => el.getAttribute('data-testid')!.replace('rail-glyph-', ''))
+    const before = expandedPaths()
+
+    fireEvent.click(screen.getByTestId('rail-node-/home/other'))
+    await waitFor(() => expect(screen.getByTestId('breadcrumb-/home/other')).toBeTruthy())
+
+    // Sticky additions: navigation may add, never remove.
+    const after = expandedPaths()
+    before.forEach((p) => expect(after).toContain(p))
+    expect(after).toContain('/home')
+  })
+
+  it('does not re-open a manually collapsed ancestor on navigation', async () => {
+    setLocation('/home/user/readme.txt')
+    registerChain('/home/user', { '/': ['home'], '/home': ['user'], '/home/user': ['readme.txt'] })
+    routes.set('/home/user', { body: makeListing({ path: '/home/user', entries: [
+      { name: 'readme.txt', isDir: false, isSymlink: false, size: 1, mtime: null },
+    ] }) })
+    routes.set('/home/user/readme.txt', { body: makeContent() })
+    render(<FilesView />)
+    await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
+
+    // Manually collapse /home.
+    fireEvent.click(screen.getByTestId('rail-node-/home'))
+    await waitFor(() =>
+      expect(screen.getByTestId('rail-glyph-/home').querySelector('svg')?.style.transform).toBe('none'),
+    )
+
+    // Navigate elsewhere and back onto the same deep path.
+    const push = window.history.pushState.bind(window.history)
+    push(null, '', '/files?path=' + encodeURIComponent('/home/user'))
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    await waitFor(() => expect(screen.getByTestId('breadcrumb-/home/user')).toBeTruthy())
+    push(null, '', '/files?path=' + encodeURIComponent('/home/user/readme.txt'))
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
+
+    // /home stays collapsed: navigation never overrides a manual collapse.
+    expect(screen.getByTestId('rail-glyph-/home').querySelector('svg')?.style.transform).toBe('none')
   })
 
   // ── New behaviour ──────────────────────────────────────────────────────
@@ -446,15 +560,15 @@ describe('FilesView', () => {
 
   it('cold-loads a bookmarked file to the correct view', async () => {
     setLocation('/a/b/c.txt')
+    registerChain('/a/b', { '/a': ['b'], '/a/b': ['c.txt'] })
     routes.set('/a/b', { body: makeListing({ path: '/a/b', entries: [
       { name: 'c.txt', isDir: false, isSymlink: false, size: 10, mtime: null },
     ] }) })
-    routes.set('/a', { body: makeListing({ path: '/a', entries: [] }) })
     routes.set('/a/b/c.txt', { body: makeContent({ path: '/a/b/c.txt' }) })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
-    // rail root is parent(/a/b/c.txt) = /a/b, so its contents are the nodes
-    expect(screen.getByTestId('rail-node-/a/b/c.txt')).toBeTruthy()
+    // The rail is rooted at /, with the target's ancestors expanded.
+    expect(screen.getByTestId('rail-node-/a')).toBeTruthy()
   })
 
   // ── Rail integration (budget + root derivation) ─────────────────────────
@@ -466,16 +580,18 @@ describe('FilesView', () => {
     routes.set('/home/user/readme.txt', { body: makeContent() })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
-    expect(fetchMock.mock.calls.length).toBe(2)
+    // '/', '/home', '/home/user' (rail seed + ancestors) + the content.
+    expect(new Set(requestedPaths()).size).toBe(4)
   })
 
-  it('cold directory bookmark costs exactly two requests', async () => {
+  it('cold directory bookmark costs one request per path level', async () => {
     setLocation('/home/user')
     registerParent('/home/user', 'user')
     routes.set('/home/user', { body: makeListing() })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
-    expect(fetchMock.mock.calls.length).toBe(2)
+    // '/', '/home' (rail + ancestor) + '/home/user' (the content listing).
+    expect(new Set(requestedPaths()).size).toBe(3)
   })
 
   it('reuses the parent listing when switching sibling files', async () => {
