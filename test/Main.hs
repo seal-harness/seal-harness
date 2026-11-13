@@ -156,6 +156,7 @@ import qualified Seal.Memory.EngramBackendSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Cron.TypesSpec
 import qualified Seal.Cron.StoreSpec
+import qualified Seal.Cron.OperationsSpec
 import qualified Seal.ISA.Ops.CronSpec
 import qualified Seal.Cron.SchedulerSpec
 import qualified Seal.Skills.BackendSpec
@@ -379,6 +380,7 @@ specs = do
   Seal.Skills.TypesSpec.spec
   Seal.Cron.TypesSpec.spec
   Seal.Cron.StoreSpec.spec
+  Seal.Cron.OperationsSpec.spec
   Seal.ISA.Ops.CronSpec.spec
   Seal.Cron.SchedulerSpec.spec
   Seal.Skills.BackendSpec.spec

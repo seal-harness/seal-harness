@@ -11,6 +11,7 @@ module Seal.Cron.Types
   , CronTimeZone (..)
   , mkCronTimeZone
   , cronTimeZoneText
+  , validateCronTimeZone
   , CronJob (..)
   , CronRun (..)
   , CronRunStatus (..)
@@ -23,6 +24,7 @@ import Data.Aeson
 import Data.Char (isAlphaNum, isAscii, isAsciiLower, isDigit, toLower)
 import Data.List.NonEmpty (NonEmpty, toList)
 import Data.Maybe (fromMaybe)
+import Control.Exception (try, SomeException)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time
@@ -117,6 +119,19 @@ mkCronTimeZone t
   | T.null t = Left "timezone must not be empty"
   | not (isValidIanaTz t) = Left "timezone must be a valid IANA identifier (e.g. America/New_York)"
   | otherwise = Right (CronTimeZone t)
+
+-- | Validate a 'CronTimeZone' against the tz database. The pure
+-- 'mkCronTimeZone' constructor checks format only; this IO function
+-- additionally verifies the zone exists in the database (e.g.
+-- @"Not/AZone"@ passes the format check but is not a real zone). Used
+-- at the write boundary on both the opcode and web paths so a bad zone
+-- can never enter the store and kill the scheduler thread.
+validateCronTimeZone :: CronTimeZone -> IO (Either Text ())
+validateCronTimeZone tz = do
+  eEx <- try (loadTZFromDB (T.unpack (cronTimeZoneText tz)))
+  pure $ case eEx of
+    Left (_ :: SomeException) -> Left ("timezone not found in tz database: " <> cronTimeZoneText tz)
+    Right _ -> Right ()
 
 isValidIanaTz :: Text -> Bool
 isValidIanaTz t =
@@ -313,14 +328,17 @@ nextFireUTC sched refTime =
 -- | Compute next fire with timezone awareness.
 nextFireTZ :: CronSchedule -> CronTimeZone -> UTCTime -> IO (Maybe UTCTime)
 nextFireTZ sched tz refTime = do
-  loadedTz <- loadTZFromDB (T.unpack (cronTimeZoneText tz))
-  let localRef = utcToLocalTimeTZ loadedTz refTime
-      pseudoUtc = localTimeToUTC utc localRef
-  case nextFireUTC sched pseudoUtc of
-    Nothing -> pure Nothing
-    Just nextPseudoUtc -> do
-      let nextLocal = utcToLocalTime utc nextPseudoUtc
-      pure (Just (localTimeToUTCTZ loadedTz nextLocal))
+  eLoaded <- try (loadTZFromDB (T.unpack (cronTimeZoneText tz)))
+  case eLoaded of
+    Left (_ :: SomeException) -> pure Nothing
+    Right loadedTz -> do
+      let localRef = utcToLocalTimeTZ loadedTz refTime
+          pseudoUtc = localTimeToUTC utc localRef
+      case nextFireUTC sched pseudoUtc of
+        Nothing -> pure Nothing
+        Just nextPseudoUtc -> do
+          let nextLocal = utcToLocalTime utc nextPseudoUtc
+          pure (Just (localTimeToUTCTZ loadedTz nextLocal))
 
 -- | Find the next time after @refTime@ that matches all cron fields.
 -- Searches up to 366 days forward (527040 minutes).

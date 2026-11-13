@@ -21,6 +21,7 @@ import Seal.Core.Types (OpName (..), SessionId, TrustLevel (..), sessionIdText)
 import Seal.Types.App (App)
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Cron.Operations (createJob, updateJob, setJobEnabled, deleteJob, CronUpdate (..))
 import Seal.Cron.Types
 import Seal.Cron.Store
 
@@ -87,46 +88,25 @@ handleCreate store v = do
     (_, Nothing, _) -> pure (errResult "create requires {schedule:string}")
     (_, _, Nothing) -> pure (errResult "create requires {prompt:string}")
     (Just name, Just sched, Just prompt) -> do
-      case mkCronExpr sched of
+      let mTzStr = timezoneField v
+          mAgentDefId = agentDefIdField v
+          enabled = enabledField v
+          oneShot = oneShotField v
+      eJob <- liftIO (createJob store name sched mTzStr prompt mAgentDefId enabled oneShot)
+      case eJob of
         Left e -> pure (errResult e)
-        Right expr -> do
-          let mTz = timezoneField v >>= either (const Nothing) Just . mkCronTimeZone
-              mAgentDefId = agentDefIdField v
-              enabled = enabledField v
-              oneShot = oneShotField v
-          if T.null name || T.length name > 100
-            then pure (errResult "name must be 1-100 characters")
-            else if T.null prompt || T.length prompt > 4000
-              then pure (errResult "prompt must be 1-4000 characters")
-              else do
-                allJobs <- liftIO (csList store False)
-                if length allJobs >= 100
-                  then pure (errResult "maximum job count (100) reached")
-                  else do
-                    let baseSlug = slugify name
-                    existingIds <- liftIO (map (cronJobIdText . cjId) <$> csList store False)
-                    let slug = dedupSlug baseSlug existingIds
-                    case mkCronJobId slug of
-                      Left e -> pure (errResult e)
-                      Right jid -> do
-                        now <- liftIO getCurrentTime
-                        mNextFire <- liftIO (computeNextFire expr mTz now)
-                        let job = CronJob
-                              { cjId = jid, cjName = name, cjSchedule = expr
-                              , cjTimezone = mTz, cjPrompt = prompt
-                              , cjAgentDefId = mAgentDefId, cjEnabled = enabled
-                              , cjOneShot = oneShot, cjCreatedAt = now
-                              , cjUpdatedAt = now, cjLastFire = Nothing
-                              , cjRunCount = 0, cjConsecutiveFailures = 0 }
-                        liftIO (csCreate store job)
-                        pure (OpResult
-                          [ TrpText ("created job '" <> name <> "' (id: " <> slug
-                                     <> "), next fire: " <> tshowUTC mNextFire) ]
-                          False
-                          (object [ "action" .= ("create" :: Text), "id" .= slug
-                                  , "name" .= name, "schedule" .= sched
-                                  , "enabled" .= enabled, "one_shot" .= oneShot
-                                  , "next_fire" .= mNextFire ]))
+        Right job -> do
+          now <- liftIO getCurrentTime
+          mNextFire <- liftIO (computeNextFire (cjSchedule job) (cjTimezone job) now)
+          let slug = cronJobIdText (cjId job)
+          pure (OpResult
+            [ TrpText ("created job '" <> name <> "' (id: " <> slug
+                       <> "), next fire: " <> tshowUTC mNextFire) ]
+            False
+            (object [ "action" .= ("create" :: Text), "id" .= slug
+                    , "name" .= name, "schedule" .= sched
+                    , "enabled" .= enabled, "one_shot" .= oneShot
+                    , "next_fire" .= mNextFire ]))
 
 handleRead :: CronStore -> Value -> App OpResult
 handleRead store v = do
@@ -165,35 +145,24 @@ handleUpdate store v = do
   case idField v >>= either (const Nothing) Just . mkCronJobId of
     Nothing -> pure (errResult "update requires {id:string}")
     Just jid -> do
-      mJob <- liftIO (csRead store jid)
-      case mJob of
-        Nothing -> pure (OpResult
-          [ TrpText ("cron job not found: " <> cronJobIdText jid) ] True
-          (object [ "action" .= ("update" :: Text), "id" .= cronJobIdText jid, "found" .= False ]))
-        Just job -> do
-          let mNewSched = scheduleField v
-          case maybe (Right (cjSchedule job)) mkCronExpr mNewSched of
-            Left e -> pure (errResult e)
-            Right newSched -> do
-              let newTz = case timezoneField v of
-                    Just tzText -> either (const Nothing) Just (mkCronTimeZone tzText)
-                    Nothing -> cjTimezone job
-              now <- liftIO getCurrentTime
-              mNextFire <- liftIO (computeNextFire newSched newTz now)
-              let updatedJob = job
-                    { cjName = fromMaybe (cjName job) (nameField v)
-                    , cjSchedule = newSched, cjTimezone = newTz
-                    , cjPrompt = fromMaybe (cjPrompt job) (promptField v)
-                    , cjAgentDefId = case agentDefIdField v of
-                        Just aid -> Just aid; Nothing -> cjAgentDefId job
-                    , cjEnabled = fromMaybe (cjEnabled job) (enabledField' v)
-                    , cjOneShot = fromMaybe (cjOneShot job) (oneShotField' v)
-                    , cjUpdatedAt = now }
-              liftIO (csSave store updatedJob)
-              pure (OpResult
-                [ TrpText ("updated job '" <> cronJobIdText jid <> "'") ] False
-                (object [ "action" .= ("update" :: Text), "id" .= cronJobIdText jid
-                        , "next_fire" .= mNextFire ]))
+      eUpdated <- liftIO (updateJob store jid (CronUpdate
+        { cuName = nameField v
+        , cuSchedule = scheduleField v
+        , cuTimezone = timezoneField v
+        , cuPrompt = promptField v
+        , cuAgentDefId = agentDefIdField v
+        , cuEnabled = enabledField' v
+        , cuOneShot = oneShotField' v
+        }))
+      case eUpdated of
+        Left e -> pure (errResult e)
+        Right updatedJob -> do
+          now <- liftIO getCurrentTime
+          mNextFire <- liftIO (computeNextFire (cjSchedule updatedJob) (cjTimezone updatedJob) now)
+          pure (OpResult
+            [ TrpText ("updated job '" <> cronJobIdText jid <> "'") ] False
+            (object [ "action" .= ("update" :: Text), "id" .= cronJobIdText jid
+                    , "next_fire" .= mNextFire ]))
 
 handleDelete :: CronStore -> Value -> App OpResult
 handleDelete store v = do
@@ -201,7 +170,7 @@ handleDelete store v = do
     Nothing -> pure (errResult "delete requires {id:string}")
     Just jid -> do
       mJob <- liftIO (csRead store jid)
-      liftIO (csDelete store jid)
+      _ <- liftIO (deleteJob store jid)
       let existed = isJust mJob
       pure (OpResult
         [ TrpText (if existed then "deleted" else "deleted (was not present)") ] False
@@ -234,15 +203,14 @@ handleEnable store v = do
   case idField v >>= either (const Nothing) Just . mkCronJobId of
     Nothing -> pure (errResult "enable requires {id:string}")
     Just jid -> do
-      mJob <- liftIO (csRead store jid)
-      case mJob of
-        Nothing -> pure (OpResult
+      eJob <- liftIO (setJobEnabled store jid True)
+      case eJob of
+        Left _ -> pure (OpResult
           [ TrpText ("cron job not found: " <> cronJobIdText jid) ] True
           (object [ "action" .= ("enable" :: Text), "id" .= cronJobIdText jid, "found" .= False ]))
-        Just job -> do
+        Right job -> do
           now <- liftIO getCurrentTime
           mNextFire <- liftIO (computeNextFire (cjSchedule job) (cjTimezone job) now)
-          liftIO (csSave store job { cjEnabled = True, cjUpdatedAt = now })
           pure (OpResult
             [ TrpText ("enabled job '" <> cronJobIdText jid <> "', next fire: " <> tshowUTC mNextFire) ] False
             (object [ "action" .= ("enable" :: Text), "id" .= cronJobIdText jid, "next_fire" .= mNextFire ]))
@@ -252,14 +220,12 @@ handleDisable store v = do
   case idField v >>= either (const Nothing) Just . mkCronJobId of
     Nothing -> pure (errResult "disable requires {id:string}")
     Just jid -> do
-      mJob <- liftIO (csRead store jid)
-      case mJob of
-        Nothing -> pure (OpResult
+      eJob <- liftIO (setJobEnabled store jid False)
+      case eJob of
+        Left _ -> pure (OpResult
           [ TrpText ("cron job not found: " <> cronJobIdText jid) ] True
           (object [ "action" .= ("disable" :: Text), "id" .= cronJobIdText jid, "found" .= False ]))
-        Just job -> do
-          now <- liftIO getCurrentTime
-          liftIO (csSave store job { cjEnabled = False, cjUpdatedAt = now })
+        Right _job -> do
           pure (OpResult
             [ TrpText ("disabled job '" <> cronJobIdText jid <> "'") ] False
             (object [ "action" .= ("disable" :: Text), "id" .= cronJobIdText jid ]))
@@ -371,15 +337,6 @@ renderJob j = T.intercalate "\n"
   , "run_count: " <> T.pack (show (cjRunCount j))
   , "consecutive_failures: " <> T.pack (show (cjConsecutiveFailures j))
   ]
-
-dedupSlug :: Text -> [Text] -> Text
-dedupSlug base existingIds
-  | base `notElem` existingIds = base
-  | otherwise = go (2 :: Int)
-  where
-    go :: Int -> Text
-    go n = let c = base <> "-" <> T.pack (show n)
-           in if c `notElem` existingIds then c else go (n + 1)
 
 tshowUTC :: Maybe UTCTime -> Text
 tshowUTC = maybe "unknown" (T.pack . show)

@@ -320,6 +320,7 @@ library
         Seal.Cron.Types
         Seal.Cron.Store
         Seal.Cron.Scheduler
+        Seal.Cron.Operations
         Seal.ISA.Ops.Cron
         Seal.Logging.ChannelContext
         Seal.Logging.Exceptions
@@ -524,6 +525,7 @@ test-suite tests
          Seal.Skills.BackendNoDirectFsFailSpec
         Seal.Cron.TypesSpec
         Seal.Cron.StoreSpec
+       Seal.Cron.OperationsSpec
         Seal.ISA.Ops.CronSpec
         Seal.Cron.SchedulerSpec
         Seal.Skills.AutoloadSpec
