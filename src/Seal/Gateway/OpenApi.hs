@@ -37,9 +37,9 @@ import qualified Trasa.Method as M
 import Seal.Gateway.Route
   ( SealRoute (..), allRoutes
   , SessionIdOrErr (..), AgentDefIdOrErr (..), SkillIdOrErr (..)
-  , RepoIdOrErr (..), TabIndexOrErr (..), AskIdOrErr (..)
+  , RepoIdOrErr (..), TabIndexOrErr (..), AskIdOrErr (..), CronJobIdOrErr (..)
   , sessionIdCapture, agentDefIdCapture, skillIdCapture
-  , repoIdCapture, tabIndexCapture, askIdCapture, textCapture
+  , repoIdCapture, tabIndexCapture, askIdCapture, cronJobIdCapture, textCapture
   , freeFormBodyCodec
   )
 
@@ -147,6 +147,11 @@ openApiMeta = \case
   RouteSetupVault -> api (match "setup" ./ match "vault" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteSetupVaultReopen -> api (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteProviderTest -> api (match "providers" ./ capture oaText ./ match "test" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteCronList -> api (match "cron" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteCronCreate -> api (match "cron" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteCronGet -> api (match "cron" ./ capture oaCronJobId ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteCronUpdate -> api (match "cron" ./ capture oaCronJobId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteCronDelete -> api (match "cron" ./ capture oaCronJobId ./ end) qend bodyless (resp (one ffBody)) M.delete
 
 -- | Prefix a path with @match "api"@ so the rendered OpenAPI paths include the
 -- @\/api@ prefix the client sees (the gateway strips it before dispatching to
@@ -186,6 +191,9 @@ oaTabIndex = openApiCaptureCodec tabIndexCapture
 
 oaAskId :: OpenApiCaptureCodec AskIdOrErr
 oaAskId = openApiCaptureCodec askIdCapture
+
+oaCronJobId :: OpenApiCaptureCodec CronJobIdOrErr
+oaCronJobId = openApiCaptureCodec cronJobIdCapture
 
 oaText :: OpenApiCaptureCodec Text
 oaText = openApiCaptureCodec textCapture

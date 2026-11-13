@@ -9,7 +9,7 @@ module Seal.Gateway.API
   , handleSetupRepoResponse
   ) where
 
-import Data.Aeson (Value (..), object, (.:), (.=), withObject)
+import Data.Aeson (Value (..), object, (.:), (.=), (.:?), withObject)
 import Data.Aeson.Types (parseMaybe)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -28,7 +28,7 @@ import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
 import Data.Map.Strict qualified as Map
-import Data.Time (diffUTCTime, getCurrentTime)
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 
 import Data.Text (Text)
@@ -85,7 +85,9 @@ import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
-import Seal.Cron.Store (CronStore)
+import Seal.Cron.Store (CronStore, csList, csRead)
+import qualified Seal.Cron.Operations as CronOps
+import Seal.Cron.Types (CronJob (..), mkCronJobId, cronJobIdText, computeNextFire)
 import Seal.Handles.AskReply
   ( askIdText, pendingForSession, PendingQuestionInfo (..) )
 import Seal.Core.Backends (Backends (bRunRecords))
@@ -811,6 +813,23 @@ dispatchApi deps req respond =
       respond (jsonLBS status200 encodeOpenApi)
     (m', ["api", "openapi"]) | m' == methodGet ->
       respond (responseLBS status200 [("Content-Type", "text/html")] swaggerUiHtml)
+    -- GET /api/cron -> list all cron jobs (cheap fields, no next-fire).
+    (m', ["api", "cron"]) | m' == methodGet ->
+      respond =<< handleCronList deps
+    -- POST /api/cron -> create a new cron job (disabled by default).
+    (m', ["api", "cron"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleCronCreate deps body
+    -- GET /api/cron/:id -> read a single cron job (full fields + next_fire).
+    (m', ["api", "cron", jid]) | m' == methodGet ->
+      respond =<< handleCronGet deps jid
+    -- PUT /api/cron/:id -> update a cron job (partial patch).
+    (m', ["api", "cron", jid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleCronUpdate deps jid body
+    -- DELETE /api/cron/:id -> delete a cron job (idempotent, 204).
+    (m', ["api", "cron", jid]) | m' == methodDelete ->
+      respond =<< handleCronDelete deps jid
     -- A preflight for a mutation no longer gets a CORS grant (see below), so a
     -- cross-origin ``simple'' request never reaches the handler either.
     (_m', _) | requestMethod req == methodOptions ->
@@ -831,6 +850,172 @@ swaggerUiHtml = BL.fromChunks
   , "<script>window.onload=function(){SwaggerUIBundle({url:'/api/openapi.json',dom_id:'#swagger-ui',deepLinking:true,presets:[SwaggerUIBundle.presets.apis,SwaggerUIStandalonePreset],layout:'StandaloneLayout'});};</script>"
   , "</body></html>"
   ]
+
+-- ---------------------------------------------------------------------------
+-- Cron CRUD handlers
+-- ---------------------------------------------------------------------------
+
+-- | List all cron jobs as JSON summaries. The summary omits @next_fire@
+-- (which requires a timezone load per job) and includes
+-- @consecutive_failures@ (the signal that a job is failing).
+handleCronList :: ApiDeps -> IO Response
+handleCronList deps = do
+  jobs <- csList (adCronStore deps) False
+  pure (jsonLBS status200 (A.encode (map cronJobSummaryJson jobs)))
+
+-- | Create a cron job. The body is parsed into a dedicated input record
+-- (never into 'CronJob' -- no mass assignment). The job defaults to
+-- @enabled = false@ unless the body says otherwise.
+handleCronCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleCronCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v -> case parseCronCreateInput v of
+      Left e -> pure (errJson status400 e)
+      Right input -> do
+        eJob <- CronOps.createJob
+          (adCronStore deps)
+          (ciName input)
+          (ciSchedule input)
+          (ciTimezone input)
+          (ciPrompt input)
+          (ciAgentDefId input)
+          (ciEnabled input)
+          (ciOneShot input)
+        case eJob of
+          Left e -> pure (errJson status400 e)
+          Right job -> do
+            now <- getCurrentTime
+            mNextFire <- computeNextFire (cjSchedule job) (cjTimezone job) now
+            pure (jsonCreated (cronJobDetailJson job mNextFire))
+
+-- | Read a single cron job by id, including @next_fire@.
+handleCronGet :: ApiDeps -> Text -> IO Response
+handleCronGet deps jidText =
+  case mkCronJobId jidText of
+    Left e -> pure (errJson status400 ("invalid cron job id: " <> e))
+    Right jid -> do
+      mJob <- csRead (adCronStore deps) jid
+      case mJob of
+        Nothing -> pure (errJson status404 ("cron job not found: " <> cronJobIdText jid))
+        Just job -> do
+          now <- getCurrentTime
+          mNextFire <- computeNextFire (cjSchedule job) (cjTimezone job) now
+          pure (jsonLBS status200 (A.encode (cronJobDetailJson job mNextFire)))
+
+-- | Update a cron job (partial patch). Validates exactly as create.
+handleCronUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleCronUpdate deps jidText body =
+  case mkCronJobId jidText of
+    Left e -> pure (errJson status400 ("invalid cron job id: " <> e))
+    Right jid -> case A.decode body :: Maybe A.Value of
+      Nothing -> pure (errJson status400 "invalid JSON body")
+      Just v -> case parseCronUpdateInput v of
+        Left e -> pure (errJson status400 e)
+        Right upd -> do
+          eJob <- CronOps.updateJob (adCronStore deps) jid upd
+          case eJob of
+            Left e -> pure (errJson status400 e)
+            Right job -> do
+              now <- getCurrentTime
+              mNextFire <- computeNextFire (cjSchedule job) (cjTimezone job) now
+              pure (jsonLBS status200 (A.encode (cronJobDetailJson job mNextFire)))
+
+-- | Delete a cron job. Idempotent (204 whether or not it existed).
+handleCronDelete :: ApiDeps -> Text -> IO Response
+handleCronDelete deps jidText =
+  case mkCronJobId jidText of
+    Left e -> pure (errJson status400 ("invalid cron job id: " <> e))
+    Right jid -> do
+      _ <- CronOps.deleteJob (adCronStore deps) jid
+      pure noContent
+
+-- | The list-summary JSON shape: omits @next_fire@, includes
+-- @consecutive_failures@.
+cronJobSummaryJson :: CronJob -> A.Value
+cronJobSummaryJson j = A.object
+  [ "id" .= cjId j
+  , "name" .= cjName j
+  , "schedule" .= cjSchedule j
+  , "timezone" .= cjTimezone j
+  , "prompt" .= cjPrompt j
+  , "agent_def_id" .= cjAgentDefId j
+  , "enabled" .= cjEnabled j
+  , "one_shot" .= cjOneShot j
+  , "created_at" .= cjCreatedAt j
+  , "updated_at" .= cjUpdatedAt j
+  , "last_fire" .= cjLastFire j
+  , "run_count" .= cjRunCount j
+  , "consecutive_failures" .= cjConsecutiveFailures j
+  ]
+
+-- | The detail JSON shape: includes @next_fire@.
+cronJobDetailJson :: CronJob -> Maybe UTCTime -> A.Value
+cronJobDetailJson j mNextFire = A.object
+  [ "id" .= cjId j
+  , "name" .= cjName j
+  , "schedule" .= cjSchedule j
+  , "timezone" .= cjTimezone j
+  , "prompt" .= cjPrompt j
+  , "agent_def_id" .= cjAgentDefId j
+  , "enabled" .= cjEnabled j
+  , "one_shot" .= cjOneShot j
+  , "created_at" .= cjCreatedAt j
+  , "updated_at" .= cjUpdatedAt j
+  , "last_fire" .= cjLastFire j
+  , "run_count" .= cjRunCount j
+  , "consecutive_failures" .= cjConsecutiveFailures j
+  , "next_fire" .= mNextFire
+  ]
+
+-- | The create-input record. Dedicated type so a client cannot set
+-- @created_at@, @run_count@, @consecutive_failures@, or @last_fire@.
+data CronCreateInput = CronCreateInput
+  { ciName       :: !Text
+  , ciSchedule   :: !Text
+  , ciTimezone   :: !(Maybe Text)
+  , ciPrompt     :: !Text
+  , ciAgentDefId :: !(Maybe Text)
+  , ciEnabled    :: !Bool
+  , ciOneShot    :: !Bool
+  }
+
+parseCronCreateInput :: A.Value -> Either Text CronCreateInput
+parseCronCreateInput v = case parseMaybe parser v of
+  Nothing -> Left "invalid cron create body: expected name, schedule, prompt"
+  Just r  -> Right r
+  where
+    parser = withObject "cron create" $ \o -> do
+      name <- o .: "name"
+      sched <- o .: "schedule"
+      mTz <- o .:? "timezone"
+      prompt <- o .: "prompt"
+      mAid <- o .:? "agent_def_id"
+      enabled <- fromMaybe False <$> o .:? "enabled"
+      oneShot <- fromMaybe False <$> o .:? "one_shot"
+      pure CronCreateInput
+        { ciName = name, ciSchedule = sched, ciTimezone = mTz
+        , ciPrompt = prompt, ciAgentDefId = mAid
+        , ciEnabled = enabled, ciOneShot = oneShot }
+
+parseCronUpdateInput :: A.Value -> Either Text CronOps.CronUpdate
+parseCronUpdateInput v = case parseMaybe parser v of
+  Nothing -> Left "invalid cron update body"
+  Just r  -> Right r
+  where
+    parser = withObject "cron update" $ \o -> do
+      mName <- o .:? "name"
+      mSched <- o .:? "schedule"
+      mTz <- o .:? "timezone"
+      mPrompt <- o .:? "prompt"
+      mAid <- o .:? "agent_def_id"
+      mEnabled <- o .:? "enabled"
+      mOneShot <- o .:? "one_shot"
+      pure CronOps.CronUpdate
+        { CronOps.cuName = mName, CronOps.cuSchedule = mSched, CronOps.cuTimezone = mTz
+        , CronOps.cuPrompt = mPrompt, CronOps.cuAgentDefId = mAid
+        , CronOps.cuEnabled = mEnabled, CronOps.cuOneShot = mOneShot }
+
 
 -- | Read the entire request body (collect chunks until empty).
 collectBody :: Request -> IO BL.ByteString

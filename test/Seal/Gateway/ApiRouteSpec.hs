@@ -14,9 +14,9 @@ import Seal.Gateway.Route (allRoutes, routeMeta, SealRoute (..))
 
 -- | The expected route count from the §3.2 table (70 routes — 62 original
 -- + 4 channel CRUD routes added in the Channel CRUD feature + 4 setup routes
--- added by the web first-run setup wizard).
+-- added by the web first-run setup wizard + 5 cron CRUD routes).
 expectedRouteCount :: Int
-expectedRouteCount = 70
+expectedRouteCount = 75
 
 spec :: Spec
 spec = do

@@ -26,12 +26,14 @@ module Seal.Gateway.Types.Route
   , RepoIdOrErr (..)
   , TabIndexOrErr (..)
   , AskIdOrErr (..)
+  , CronJobIdOrErr (..)
   , sessionIdCapture
   , agentDefIdCapture
   , skillIdCapture
   , repoIdCapture
   , tabIndexCapture
   , askIdCapture
+  , cronJobIdCapture
   , textCapture
   , freeFormBodyCodec
   , respCodec
@@ -162,6 +164,12 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteSetupVault    :: SealRoute '[] '[] (Body Req) Resp
   RouteSetupVaultReopen :: SealRoute '[] '[] (Body Req) Resp
   RouteProviderTest  :: SealRoute '[Text] '[] (Body Req) Resp
+  -- Cron
+  RouteCronList      :: SealRoute '[] '[] Bodyless Resp
+  RouteCronCreate    :: SealRoute '[] '[] (Body Req) Resp
+  RouteCronGet       :: SealRoute '[CronJobIdOrErr] '[] Bodyless Resp
+  RouteCronUpdate    :: SealRoute '[CronJobIdOrErr] '[] (Body Req) Resp
+  RouteCronDelete    :: SealRoute '[CronJobIdOrErr] '[] Bodyless Resp
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
@@ -244,6 +252,11 @@ routeMeta = \case
   RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteProviderTest -> Meta (match "providers" ./ capture textCapture ./ match "test" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteCronList -> Meta (match "cron" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteCronCreate -> Meta (match "cron" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteCronGet -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteCronUpdate -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteCronDelete -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -320,6 +333,11 @@ allRoutes =
   , Constructed RouteSetupVault
   , Constructed RouteSetupVaultReopen
   , Constructed RouteProviderTest
+  , Constructed RouteCronList
+  , Constructed RouteCronCreate
+  , Constructed RouteCronGet
+  , Constructed RouteCronUpdate
+  , Constructed RouteCronDelete
   ]
 
 -- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.
@@ -386,6 +404,15 @@ askIdCapture = CaptureCodec
   , captureCodecDecode = Just . AskIdOrErr . Right
   }
 
+-- | A validated 'CronJobId' capture (or the parse error).
+newtype CronJobIdOrErr = CronJobIdOrErr (Either Text Text)
+
+cronJobIdCapture :: CaptureCodec CronJobIdOrErr
+cronJobIdCapture = CaptureCodec
+  { captureCodecEncode = \(CronJobIdOrErr e) -> fromRight "" e
+  , captureCodecDecode = Just . CronJobIdOrErr . Right
+  }
+
 -- | A plain 'Text' capture (unvalidated — used for provider labels + model
 -- names where the legacy router did no validation).
 textCapture :: CaptureCodec Text
@@ -414,6 +441,8 @@ instance ToParamSchema RepoIdOrErr where
 instance ToParamSchema TabIndexOrErr where
   toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
 instance ToParamSchema AskIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema CronJobIdOrErr where
   toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
 
 -- ---------------------------------------------------------------------------
