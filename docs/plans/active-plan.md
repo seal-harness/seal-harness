@@ -2,7 +2,7 @@
 <!-- approved: 2026-10-23 -->
 <!-- gate-iterations: 6 -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: completed -->
 
 CRON_MANAGE Web UI — a `Cron` tab in the top bar with a two-pane CRUD view
 over the existing `CronStore`. The gateway-wide Origin check (WU-4 in the
@@ -20,11 +20,11 @@ Execution: TDD per work unit, one commit per WU.
 | WU | Title | Status |
 |---|---|---|
 | WU-0 | set the active plan | complete |
-| WU-1 | shared cron operations module + total `computeNextFire` | pending |
-| WU-2 | `ApiDeps.adCronStore` field | pending |
-| WU-3 | 5 cron REST endpoints (route count 70 → 75) | pending |
+| WU-1 | shared cron operations module + total `computeNextFire` | complete |
+| WU-2 | `ApiDeps.adCronStore` field | complete |
+| WU-3 | 5 cron REST endpoints (route count 70 → 75) | complete |
 | ~~WU-4~~ | ~~gateway-wide Origin check~~ | dropped (already done) |
-| WU-5 | frontend types + API hooks | pending |
-| WU-6 | `CronView` component | pending |
-| WU-7 | top bar + routing | pending |
-| WU-8 | full gate + docs | pending |
+| WU-5 | frontend types + API hooks | complete |
+| WU-6 | `CronView` component | complete |
+| WU-7 | top bar + routing | complete |
+| WU-8 | full gate + docs | complete |
