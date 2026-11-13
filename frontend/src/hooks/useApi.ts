@@ -16,6 +16,11 @@ import type {
   RepoInfo,
   RepoInput,
   SecretInput,
+  CronJobSummary,
+  CronJobDetail,
+  CronJobInput,
+  CronJobUpdateInput,
+  CronMutationResult,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -1704,4 +1709,101 @@ export async function setDefaultAgent(agent: string | null): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+// ── Cron CRUD ───────────────────────────────────────────────────────────
+
+/** Fetch all cron jobs (list summary — no next_fire). Returns null on
+ *  any failure. */
+export async function fetchCronJobs(): Promise<CronJobSummary[] | null> {
+  return fetchJson<CronJobSummary[]>('/api/cron')
+}
+
+/** Fetch a single cron job by id (detail — includes next_fire). Returns
+ *  null on any failure (including 404). */
+export async function fetchCronJob(id: string): Promise<CronJobDetail | null> {
+  return fetchJson<CronJobDetail>(`/api/cron/${encodeURIComponent(id)}`)
+}
+
+/** Read the backend's `{"error": "..."}` body for a cron mutation. */
+async function cronMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new cron job. Returns the created job (with next_fire) on
+ *  success, or the backend's error message on failure. */
+export async function createCronJob(input: CronJobInput): Promise<CronMutationResult> {
+  try {
+    const res = await fetch('/api/cron', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await cronMutationError(res) }
+    return { ok: true, job: await res.json() as CronJobDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing cron job (partial patch). Returns the updated job
+ *  on success, or the backend's error message on failure. */
+export async function updateCronJob(id: string, input: CronJobUpdateInput): Promise<CronMutationResult> {
+  try {
+    const res = await fetch(`/api/cron/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await cronMutationError(res) }
+    return { ok: true, job: await res.json() as CronJobDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a cron job by id. Returns true when the backend accepted the
+ *  delete (204 — idempotent). */
+export async function deleteCronJob(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/cron/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of cron jobs. Uses the `useHarnesses` interval-poll shape
+ *  (3 s) because cron genuinely changes in the background (the scheduler
+ *  updates last_fire, run_count, and consecutive_failures, and can
+ *  auto-disable a job). The list endpoint does no next-fire computation,
+ *  so each poll is a directory read + JSON encode. */
+export function useCronJobs() {
+  const [jobs, setJobs] = useState<CronJobSummary[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const poll = useCallback(async () => {
+    const data = await fetchCronJobs()
+    if (data) {
+      setJobs(data)
+      setError(false)
+    } else {
+      setError(true)
+    }
+    setLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    poll()
+    const id = setInterval(poll, POLL_INTERVAL)
+    return () => clearInterval(id)
+  }, [poll, refreshCount])
+
+  const refresh = useCallback(() => setRefreshCount((n) => n + 1), [])
+
+  return { jobs, loaded, error, refresh }
 }
