@@ -2,7 +2,7 @@
 <!-- approved: 2026-11-14 -->
 <!-- gate-iterations: 3 -->
 <!-- user-approved: true -->
-<!-- status: in-progress -->
+<!-- status: completed -->
 
 Chunked Resumable Download — full implementation plan.
 
@@ -19,11 +19,11 @@ Operator decisions:
 - Both local and remote arms
 - No cross-reload resume (in-memory only, no IndexedDB)
 
-| WU | Title | Status |
-|---|---|---|
-| WU-1 | Backend: ceiling split + readBoundedFile fix + FileStat + feReadRange + runRemoteStream | pending |
-| WU-2 | Backend: stat + manifest + chunk routes + config + blocked-path | pending |
-| WU-3 | Frontend: confirm dialog + stat + .partial naming + modalStack | pending |
-| WU-4 | Frontend: chunked download orchestration + progress UI | pending |
-| WU-5 | Security: sanitizeHref link block | pending |
-| WU-6 | Docs + full gate | pending |
+| WU | Title | Status | Commit |
+|---|---|---|---|
+| WU-1 | Backend: ceiling split + readBoundedFile fix + FileStat + feReadRange + runRemoteStream | complete | e4d8e50 |
+| WU-2 | Backend: stat + manifest + chunk routes + config + blocked-path | complete | df18a2d |
+| WU-3 | Frontend: confirm dialog + stat + .partial naming + modalStack | complete | 7fe6ed7 |
+| WU-4 | Frontend: chunked download orchestration + progress UI | complete | 8e979a6 |
+| WU-5 | Security: sanitizeHref link block | complete | cdc56ec |
+| WU-6 | Docs + full gate | complete | — |
