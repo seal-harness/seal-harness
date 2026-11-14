@@ -37,7 +37,7 @@ function makeContent(overrides: Partial<FileContent> = {}): FileContent {
   }
 }
 
-type Route = { status?: number; body?: unknown; truncated?: boolean }
+type Route = { status?: number; body?: unknown; truncated?: boolean; size?: number }
 
 /** Map of path -> response. A path absent from the map yields 404. */
 let routes: Map<string, Route>
@@ -66,7 +66,30 @@ function setupFetch() {
     const isContent = url.includes('/api/files/content')
     const isDownload = url.includes('/api/files/download')
 
+    const isStat = url.includes('/api/files/stat')
+    const isManifest = url.includes('/api/files/download/manifest')
+    const isChunk = url.includes('/api/files/download/chunk')
+
     ensureRoot()
+    if (isStat) {
+      const r = routes.get(path ?? '') ?? {}
+      const size = (r as { size?: number }).size ?? 131072
+      return jsonRes(200, { path: path ?? '', size, mtimeEpoch: 1700000000 })
+    }
+    if (isManifest) {
+      const r = routes.get(path ?? '') ?? {}
+      const size = (r as { size?: number }).size ?? 131072
+      return jsonRes(200, { path: path ?? '', size, mtimeEpoch: 1700000000, chunkSize: 4194304, chunkCount: Math.max(1, Math.ceil(size / 4194304)) })
+    }
+    if (isChunk) {
+      return {
+        ok: true, status: 200,
+        headers: new Headers({ 'X-Chunk-SHA256': 'fake-sha', 'X-Chunk-Index': '0' }),
+        arrayBuffer: async () => new ArrayBuffer(0),
+        json: async () => ({}),
+        blob: async () => new Blob([]),
+      } as unknown as Response
+    }
     if (isDownload) {
       const r = routes.get(path ?? '') ?? {}
       return {
@@ -336,28 +359,37 @@ describe('FilesView', () => {
     expect(pushSpy).not.toHaveBeenCalled()
   })
 
-  it('listing download truncation warns', async () => {
+  it('listing download uses chunked path', async () => {
     setLocation('/home/user')
     registerParent('/home/user', 'user')
     routes.set('/home/user', { body: makeListing() })
-    routes.set('/home/user/readme.txt', { truncated: true })
+    routes.set('/home/user/readme.txt', { size: 131072 })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('download-readme.txt')).toBeTruthy())
     fireEvent.click(screen.getByTestId('download-readme.txt'))
-    await waitFor(() => expect(screen.getByTestId('download-truncated-warning')).toBeTruthy())
+    // The chunked download path is used — progress UI or done state appears.
+    await waitFor(() => {
+      const prog = screen.queryByTestId('download-progress')
+      const done = screen.queryByTestId('download-done')
+      const err = screen.queryByTestId('download-error')
+      expect(prog || done || err).toBeTruthy()
+    })
   })
 
-  it('viewer download truncation warns', async () => {
+  it('viewer download uses chunked path', async () => {
     setLocation('/home/user/readme.txt')
     routes.set('/home/user', { body: makeListing() })
     routes.set('/home', { body: makeListing({ path: '/home', entries: [{ name: 'user', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
-    routes.set('/home/user/readme.txt', { body: makeContent(), truncated: true })
+    routes.set('/home/user/readme.txt', { body: makeContent(), size: 131072 })
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('content-download')).toBeTruthy())
     fireEvent.click(screen.getByTestId('content-download'))
-    await waitFor(() =>
-      expect(screen.getByTestId('viewer-download-truncated-warning')).toBeTruthy(),
-    )
+    await waitFor(() => {
+      const prog = screen.queryByTestId('download-progress')
+      const done = screen.queryByTestId('download-done')
+      const err = screen.queryByTestId('download-error')
+      expect(prog || done || err).toBeTruthy()
+    })
   })
 
   it('sensitive-directory banner (listing)', async () => {
@@ -551,7 +583,7 @@ describe('FilesView', () => {
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
     const row = screen.getByTestId('file-entry-readme.txt')
-    expect(row.tagName).toBe('BUTTON')
+    expect(row.tagName).toBe('A')
     expect(row.getAttribute('aria-label')).toBeTruthy()
     const pushSpy = vi.spyOn(window.history, 'pushState')
     fireEvent.click(row)

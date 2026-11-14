@@ -41,7 +41,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (saveSessionMeta, autoBindRepoAgent)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types
-  ( ExecError, RemotePath, SshConfig (..), mkRemotePath, mkSshHost, mkSshUser
+  ( ExecError (..), RemotePath, SshConfig (..), mkRemotePath, mkSshHost, mkSshUser
   )
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs
@@ -933,6 +933,7 @@ scriptedScanRunner recRef canned0 = do
     { runRemote      = recordAndPop recRef qRef . extractCmd
     , runRemoteStdin = \argv _stdin -> recordAndPop recRef qRef (extractCmd argv)
     , runRemoteEnv   = \_env argv -> recordAndPop recRef qRef (extractCmd argv)
+    , runRemoteStream = \_ _action -> pure (Left ExecRemoteUnreachable)
     , runRemoteBytes = \_ -> pure (Right ("", False))
     }
   where

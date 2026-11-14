@@ -18,6 +18,7 @@ module Seal.Tools.Exec.FileExplorer
   ( FileExplorerHandle (..)
   , FileExplorerErr (..)
   , FileEntry (..)
+  , FileStat (..)
   , FileListing (..)
   , FileContent (..)
   , mkLocalFileExplorer
@@ -38,18 +39,20 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime)
-import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import System.Directory
   ( doesDirectoryExist, doesFileExist, getHomeDirectory, getFileSize
   , getModificationTime, listDirectory, pathIsSymbolicLink
+  , canonicalizePath
   )
 import System.FilePath (joinPath, splitDirectories, (</>))
+import System.IO (IOMode (..), SeekMode (..), hFileSize, hSeek, withBinaryFile)
 import System.IO.Error (isDoesNotExistError, isPermissionError)
 import Text.Read (readMaybe)
 
 import Seal.Security.Path (blockedNames, lexicalCollapse)
 import Seal.Tools.Args (mkShellCommand)
-import Seal.Tools.Exec.Remote (RemoteRunner, runRemoteShell, runRemoteBytes, sshExecArgv)
+import Seal.Tools.Exec.Remote (RemoteRunner, runRemoteShell, runRemoteBytes, runRemoteStream, sshExecArgv)
 import Seal.Tools.Exec.Types (ExecError (..), SshConfig (..), getSshHost)
 import Seal.Tools.Exec.UntrustedIO (shellQuote)
 
@@ -100,14 +103,25 @@ data FileContent = FileContent
   , fcIsBinary :: !Bool          -- ^ True if content contains NUL bytes
   } deriving stock (Eq, Show)
 
+-- | Stat metadata for a file — used by the chunked download path to
+-- compute byte ranges and verify offsets. The mtime is truncated to
+-- epoch seconds (integer) — sub-second precision is not needed for
+-- download resumption.
+data FileStat = FileStat
+  { fsPath :: !Text
+  , fsSize :: !Integer
+  , fsMtimeEpoch :: !(Maybe Integer)
+  } deriving stock (Eq, Show)
+
 -- ---------------------------------------------------------------------------
 -- Handle
 -- ---------------------------------------------------------------------------
 
 -- | The file explorer capability handle. Abstracts local vs remote
 -- execution machine access. The @Int@ parameter on construction is the
--- operator-configured byte ceiling for reads (same @maxScanBytes@ as
--- @FILE_READ@).
+-- The two @Int@ parameters on construction are the viewer read ceiling
+-- (@readCeiling@, same @maxScanBytes@ as @FILE_READ@) and the download
+-- chunk size (@downloadChunkBytes@, default 4 MiB for WU-1).
 data FileExplorerHandle = FileExplorerHandle
   { feListDirectory :: FilePath -> IO (Either FileExplorerErr FileListing)
   , feListDirectories :: [FilePath] -> IO (Either FileExplorerErr [FileListing])
@@ -121,6 +135,18 @@ data FileExplorerHandle = FileExplorerHandle
     -- Returns raw bytes so binary files are not corrupted by UTF-8
     -- decode/encode round-trip. The 'Bool' is whether the file exceeded
     -- the byte ceiling.
+  , feStatFile :: FilePath -> IO (Either FileExplorerErr FileStat)
+    -- ^ Stat a file: return size + mtime (epoch seconds). Used by the
+    -- chunked download path to compute byte ranges.
+  , feReadRange :: FilePath -> Integer -> Int -> IO (Either FileExplorerErr ByteString)
+    -- ^ Read at most @len@ bytes starting at @offset@ (0-based). Returns
+    -- the raw bytes. A read past EOF returns 'Left FeIo' (not a short
+    -- read). Used by the chunked download path.
+  , feCanonicalize :: FilePath -> IO (Either FileExplorerErr FilePath)
+    -- ^ Canonicalize a path (resolve symlinks). Local: 'canonicalizePath';
+    -- remote: @readlink -f -- "$p"@. Used by the chunked download routes
+    -- for blocked-path enforcement (SEC-B3) — the canonical path is run
+    -- through 'blockedSegment' before serving any file metadata.
   , feResolveHome :: IO (Either FileExplorerErr FilePath)
   }
 
@@ -201,6 +227,9 @@ mkFailClosedFileExplorer = FileExplorerHandle
   , feListDirectories = \_ -> pure (Left FeDisabled)
   , feReadFile = \_ -> pure (Left FeDisabled)
   , feReadFileBytes = \_ -> pure (Left FeDisabled)
+  , feStatFile = \_ -> pure (Left FeDisabled)
+  , feReadRange = \_ _ _ -> pure (Left FeDisabled)
+  , feCanonicalize = \_ -> pure (Left FeDisabled)
   , feResolveHome = pure (Left FeDisabled)
   }
 
@@ -209,27 +238,33 @@ mkFailClosedFileExplorer = FileExplorerHandle
 -- ---------------------------------------------------------------------------
 
 -- | The local file explorer. Reads via 'System.Directory' on the harness
--- machine. The @Int@ is the operator-configured byte ceiling for reads,
--- captured at construction time.
-mkLocalFileExplorer :: Int -> FileExplorerHandle
-mkLocalFileExplorer ceilingBytes = FileExplorerHandle
-  { feListDirectory = localListDirectory ceilingBytes
-  , feListDirectories = localListDirectories ceilingBytes
-  , feReadFile = localReadFile ceilingBytes
-  , feReadFileBytes = localReadFileBytes ceilingBytes
+-- machine. The two @Int@s are the viewer read ceiling (@readCeiling@)
+-- and the download chunk size (@downloadChunkBytes@), captured at
+-- construction time.
+mkLocalFileExplorer :: Int -> Int -> FileExplorerHandle
+mkLocalFileExplorer readCeiling downloadChunkBytes = FileExplorerHandle
+  { feListDirectory = localListDirectory readCeiling
+  , feListDirectories = localListDirectories readCeiling
+  , feReadFile = localReadFile readCeiling
+  , feReadFileBytes = localReadFileBytes readCeiling
+  , feStatFile = localStatFile
+  , feReadRange = localReadRange downloadChunkBytes
+  , feCanonicalize = localCanonicalize
   , feResolveHome = localResolveHome
   }
 
 -- | Read at most @maxBytes@ from a local file. Returns the bytes read and
 -- a 'Bool' indicating whether the file was truncated (the file is larger
 -- than @maxBytes@).
+-- Uses 'hFileSize' + 'hSeek' + bounded 'hGetSome' so the whole file is
+-- never allocated in memory (the old @BS.readFile@ + @BS.take@ read the
+-- entire file before discarding the tail).
 readBoundedFile :: FilePath -> Int -> IO (BS.ByteString, Bool)
-readBoundedFile path maxBytes = do
-  bs <- BS.readFile path
-  let len = BS.length bs
-  if len <= maxBytes
-    then pure (bs, False)
-    else pure (BS.take maxBytes bs, True)
+readBoundedFile path maxBytes = withBinaryFile path ReadMode $ \h -> do
+  total <- hFileSize h
+  let toRead = fromIntegral (min (fromIntegral maxBytes) total)
+  bs <- BS.hGet h toRead
+  pure (bs, total > fromIntegral maxBytes)
 
 -- | List a local directory. Applies 'lexicalCollapse' to the path first,
 -- checks existence/type, then enumerates entries with best-effort
@@ -380,6 +415,61 @@ localReadFileBytes ceilingBytes origPath = do
           | otherwise -> pure (Left (FeIo (T.pack (show ioErr))))
         Right (bs, truncated) -> pure (Right (bs, truncated))
 
+-- | Stat a local file: size via 'getFileSize', mtime via
+-- 'getModificationTime' truncated to epoch seconds (integer).
+localStatFile :: FilePath -> IO (Either FileExplorerErr FileStat)
+localStatFile origPath = do
+  let path = collapsePath origPath
+  eRes <- checkReadable path
+  case eRes of
+    Left err -> pure (Left err)
+    Right () -> do
+      eSize <- try (getFileSize path) :: IO (Either IOException Integer)
+      case eSize of
+        Left ioErr
+          | isPermissionError ioErr -> pure (Left FePermissionDenied)
+          | isDoesNotExistError ioErr -> pure (Left FeNotFound)
+          | otherwise -> pure (Left (FeIo (T.pack (show ioErr))))
+        Right size -> do
+          eMtime <- try (getModificationTime path) :: IO (Either IOException UTCTime)
+          let mtimeEpoch = case eMtime of
+                Right t -> Just (floor (utcTimeToPOSIXSeconds t))
+                Left _  -> Nothing
+          pure (Right FileStat
+            { fsPath = T.pack path
+            , fsSize = size
+            , fsMtimeEpoch = mtimeEpoch
+            })
+
+-- | Read a range of bytes from a local file: @openBinaryFile@ +
+-- @hSeek AbsoluteSeek offset@ + bounded @hGetSome len@. A read entirely
+-- past EOF returns 'Left FeIo' (not an empty 'ByteString'). A read that
+-- straddles EOF returns the available bytes (a short read is valid for
+-- the final chunk).
+localReadRange :: Int -> FilePath -> Integer -> Int
+              -> IO (Either FileExplorerErr ByteString)
+localReadRange _chunkCap origPath offset len = do
+  let path = collapsePath origPath
+  eRes <- checkReadable path
+  case eRes of
+    Left err -> pure (Left err)
+    Right () -> do
+      eBs <- try (withBinaryFile path ReadMode $ \h -> do
+                    total <- hFileSize h
+                    if offset >= total
+                      then pure Nothing
+                      else do
+                        hSeek h AbsoluteSeek offset
+                        Just <$> BS.hGetSome h len)
+                :: IO (Either IOException (Maybe ByteString))
+      case eBs of
+        Left ioErr
+          | isPermissionError ioErr -> pure (Left FePermissionDenied)
+          | isDoesNotExistError ioErr -> pure (Left FeNotFound)
+          | otherwise -> pure (Left (FeIo (T.pack (show ioErr))))
+        Right Nothing -> pure (Left (FeIo "read past EOF"))
+        Right (Just bs) -> pure (Right bs)
+
 -- | Check that a path exists and is not a directory (for file-read
 -- methods). Returns 'Left FeNotFound' if missing, 'Left FeIsDirectory'
 -- if it's a directory, 'Right ()' if readable.
@@ -409,25 +499,40 @@ localResolveHome = do
     Left ioErr -> Left (FeIo (T.pack (show ioErr)))
     Right home -> Right home
 
+-- | Canonicalize a local path (resolve symlinks). Unlike
+-- 'canonicalizePath' which returns the input unchanged for a non-existent
+-- path, we wrap the result in 'Either' for uniformity with the remote arm.
+localCanonicalize :: FilePath -> IO (Either FileExplorerErr FilePath)
+localCanonicalize origPath = do
+  let path = collapsePath origPath
+  eCanon <- try (canonicalizePath path) :: IO (Either IOException FilePath)
+  pure $ case eCanon of
+    Left ioErr -> Left (FeIo (T.pack (show ioErr)))
+    Right canon -> Right canon
+
 -- ---------------------------------------------------------------------------
 -- Remote arm
 -- ---------------------------------------------------------------------------
 
 -- | The remote file explorer. Reads via SSH through a 'RemoteRunner' to
--- the execution machine. The @Int@ is the operator-configured byte
--- ceiling for reads, captured at construction time.
+-- the execution machine. The two @Int@s are the viewer read ceiling
+-- (@readCeiling@) and the download chunk size (@downloadChunkBytes@),
+-- captured at construction time.
 --
 -- The home-directory resolution is cached in an 'IORef' per handle
 -- instance (per-process, never invalidated; if the SSH user's home
 -- changes, a server restart refreshes it).
-mkRemoteFileExplorer :: SshConfig -> RemoteRunner -> Int -> IO FileExplorerHandle
-mkRemoteFileExplorer sshCfg runner ceilingBytes = do
+mkRemoteFileExplorer :: SshConfig -> RemoteRunner -> Int -> Int -> IO FileExplorerHandle
+mkRemoteFileExplorer sshCfg runner readCeiling downloadChunkBytes = do
   homeCache <- newIORef Nothing
   pure $ FileExplorerHandle
-    { feListDirectory = remoteListDirectory sshCfg runner ceilingBytes
-    , feListDirectories = remoteListDirectories sshCfg runner ceilingBytes
-    , feReadFile = remoteReadFile sshCfg runner ceilingBytes
-    , feReadFileBytes = remoteReadFileBytes sshCfg runner ceilingBytes
+    { feListDirectory = remoteListDirectory sshCfg runner readCeiling
+    , feListDirectories = remoteListDirectories sshCfg runner readCeiling
+    , feReadFile = remoteReadFile sshCfg runner readCeiling
+    , feReadFileBytes = remoteReadFileBytes sshCfg runner readCeiling
+    , feStatFile = remoteStatFile sshCfg runner
+    , feReadRange = remoteReadRange sshCfg runner downloadChunkBytes
+    , feCanonicalize = remoteCanonicalize sshCfg runner
     , feResolveHome = remoteResolveHome sshCfg runner homeCache
     }
 
@@ -527,6 +632,59 @@ remoteReadFileBytes sshCfg runner ceilingBytes origPath = do
             else if isDirBs `BS.isPrefixOf` bs
               then pure (Left FeIsDirectory)
               else pure (Right (bs, truncated))
+
+-- | Stat a remote file via SSH @stat -c '%s %Y' -- "$p"@. Output is
+-- small (two integers), well under the 50K transport cap. Returns
+-- 'FileStat' with size and mtime as epoch seconds.
+remoteStatFile
+  :: SshConfig -> RemoteRunner -> FilePath
+  -> IO (Either FileExplorerErr FileStat)
+remoteStatFile sshCfg runner origPath = do
+  let path = collapsePath origPath
+      cmdText = remoteStatCmd path
+  case mkShellCommand cmdText of
+    Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
+    Right cmd -> do
+      res <- runRemoteShell runner sshCfg cmd
+      case res of
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
+        Right out ->
+          if notFoundMarker `T.isPrefixOf` out
+            then pure (Left FeNotFound)
+            else if isDirMarker `T.isPrefixOf` out
+              then pure (Left FeIsDirectory)
+              else case parseStatOutput out of
+                Left e -> pure (Left e)
+                Right (size, mtime) -> pure (Right FileStat
+                  { fsPath = T.pack path
+                  , fsSize = size
+                  , fsMtimeEpoch = mtime
+                  })
+
+-- | Read a range of bytes from a remote file via SSH @dd bs=$chunkSize
+-- skip=$index count=1 if="$p" 2>/dev/null@. Uses 'runRemoteStream'
+-- (NOT 'runRemoteBytes') so chunks larger than 50K are not truncated by
+-- the transport cap. The path is 'shellQuote'-d.
+remoteReadRange
+  :: SshConfig -> RemoteRunner -> Int -> FilePath -> Integer -> Int
+  -> IO (Either FileExplorerErr ByteString)
+remoteReadRange sshCfg runner chunkCap origPath offset len = do
+  let path = collapsePath origPath
+      chunkSize = min len chunkCap
+      index = offset `div` fromIntegral chunkSize
+      cmdText = remoteReadRangeCmd path chunkSize (fromIntegral index)
+  case mkShellCommand cmdText of
+    Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
+    Right _ -> do
+      let argv = sshExecArgv sshCfg cmdText
+      res <- runRemoteStream runner argv $ \h ->
+               BS.hGetSome h len
+      case res of
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
+        Right bs
+          | BS.null bs -> pure (Left (FeIo "read past EOF"))
+          | otherwise -> pure (Right bs)
+
 -- | Resolve the home directory on the remote machine via SSH @echo
 -- $HOME@. The result is cached in an 'IORef' per handle instance.
 remoteResolveHome
@@ -549,6 +707,27 @@ remoteResolveHome sshCfg runner ref = do
               else do
                 writeIORef ref (Just home)
                 pure (Right home)
+
+-- | Canonicalize a remote path via @readlink -f -- "$p"@ over SSH. The
+-- path is 'shellQuote'-d. Returns the canonical path or an error.
+remoteCanonicalize
+  :: SshConfig -> RemoteRunner -> FilePath
+  -> IO (Either FileExplorerErr FilePath)
+remoteCanonicalize sshCfg runner origPath = do
+  let path = collapsePath origPath
+      cmdText = T.pack $ unwords
+        [ "readlink -f -- " <> shellQuote path ]
+  case mkShellCommand cmdText of
+    Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
+    Right cmd -> do
+      res <- runRemoteShell runner sshCfg cmd
+      case res of
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
+        Right out ->
+          let canon = T.unpack (T.strip out)
+          in if T.null (T.strip out)
+               then pure (Left (FeIo "readlink returned empty"))
+               else pure (Right canon)
 
 -- ---------------------------------------------------------------------------
 -- Remote command construction
@@ -592,6 +771,36 @@ remoteReadCmd path ceilingBytes =
     , "elif [ -d \"$p\" ]; then echo \"" <> T.unpack isDirMarker <> "\";"
     , "else head -c " <> show ceilingBytes <> " -- \"$p\";"
     , "fi"
+    ]
+
+-- | Build the remote stat command. The path is 'shellQuote'-d and
+-- assigned to a shell variable, then @stat -c '%s %Y' -- "$p"@ emits
+-- size and mtime (epoch seconds) on one line. Error sentinels
+-- distinguish missing paths from directories. The @stat -f%z -f%m@
+-- fallback covers BSD/macOS.
+remoteStatCmd :: FilePath -> Text
+remoteStatCmd path =
+  T.pack $ unwords
+    [ "p=" <> shellQuote path <> ";"
+    , "if [ ! -e \"$p\" ]; then echo \"" <> T.unpack notFoundMarker <> "\";"
+    , "elif [ -d \"$p\" ]; then echo \"" <> T.unpack isDirMarker <> "\";"
+    , "else stat -c '%s %Y' -- \"$p\" 2>/dev/null || stat -f%z -f%m -- \"$p\" 2>/dev/null;"
+    , "fi"
+    ]
+
+-- | Build the remote read-range command for @dd@. The path is
+-- 'shellQuote'-d. @dd bs=$chunkSize skip=$index count=1 if="$p"@
+-- reads one chunk of @chunkSize@ bytes starting at byte
+-- @index * chunkSize@. stderr is discarded (@2>/dev/null@) so @dd@'s
+-- progress noise does not corrupt the output.
+remoteReadRangeCmd :: FilePath -> Int -> Int -> Text
+remoteReadRangeCmd path chunkSize index =
+  T.pack $ unwords
+    [ "dd bs=" <> show chunkSize
+    , "skip=" <> show index
+    , "count=1"
+    , "if=" <> shellQuote path
+    , "2>/dev/null"
     ]
 
 -- ---------------------------------------------------------------------------
@@ -764,3 +973,16 @@ parseMtime txt =
   case parseInteger txt of
     Just n | n > 0 -> Just (posixSecondsToUTCTime (fromIntegral n))
     _ -> Nothing
+
+-- | Parse the output of 'remoteStatCmd' — @<size> <mtime>@ on one line.
+-- Returns 'Left FeIo' on malformed output. The mtime is @0@ when @stat@
+-- failed (mapped to 'Nothing').
+parseStatOutput :: Text -> Either FileExplorerErr (Integer, Maybe Integer)
+parseStatOutput out =
+  case T.words (T.strip out) of
+    [sizeTxt, mtimeTxt] ->
+      case (parseInteger sizeTxt, parseInteger mtimeTxt) of
+        (Just sz, Just mt) ->
+          Right (sz, if mt > 0 then Just mt else Nothing)
+        _ -> Left (FeIo ("malformed stat output: " <> out))
+    _ -> Left (FeIo ("malformed stat output: " <> out))

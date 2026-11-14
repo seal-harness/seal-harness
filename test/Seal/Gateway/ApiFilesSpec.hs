@@ -49,7 +49,7 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       withSystemTempDirectory "seal-files-test" $ \tmp -> do
         createDirectoryIfMissing True (tmp </> "subdir")
         TIO.writeFile (tmp </> "hello.txt") "hello world"
-        let fe = mkLocalFileExplorer 131072
+        let fe = mkLocalFileExplorer 131072 131072
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [("path", Just (T.pack tmp))])
         responseStatus resp `shouldBe` status200
@@ -60,7 +60,7 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
         createDirectoryIfMissing True (tmp </> "b")
         TIO.writeFile (tmp </> "a" </> "one.txt") "1"
         TIO.writeFile (tmp </> "b" </> "two.txt") "22"
-        let fe = mkLocalFileExplorer 131072
+        let fe = mkLocalFileExplorer 131072 131072
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps)
           (mkGetReq ["api", "files"]
@@ -77,7 +77,7 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
 
     it "omits `rail` when `paths` is absent" $ do
       withSystemTempDirectory "seal-files-nobatch" $ \tmp -> do
-        let fe = mkLocalFileExplorer 131072
+        let fe = mkLocalFileExplorer 131072 131072
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps)
           (mkGetReq ["api", "files"] [("path", Just (T.pack tmp))])
@@ -90,25 +90,25 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       responseStatus resp `shouldBe` status403
 
     it "returns 400 when path is empty" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [("path", Just "")])
       responseStatus resp `shouldBe` status400
 
     it "returns 404 for a non-existent path" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [("path", Just "/nonexistent/path/that/does/not/exist")])
       responseStatus resp `shouldBe` status404
 
     it "returns 200 when path is absent (defaults to feResolveHome)" $ do
       withSystemTempDirectory "seal-files-test" $ \tmp -> do
         createDirectoryIfMissing True (tmp </> "subdir")
-        let fe = (mkLocalFileExplorer 131072) { feResolveHome = pure (Right tmp) }
+        let fe = (mkLocalFileExplorer 131072 131072) { feResolveHome = pure (Right tmp) }
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [])
         responseStatus resp `shouldBe` status200
 
     it "returns 500 (not 400) when feResolveHome fails with FeExec" $ do
-      let fe = (mkLocalFileExplorer 131072) { feResolveHome = pure (Left (FeExec "SSH unreachable")) }
+      let fe = (mkLocalFileExplorer 131072 131072) { feResolveHome = pure (Left (FeExec "SSH unreachable")) }
       deps <- mkDeps fe True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files"] [])
       responseStatus resp `shouldBe` status500
@@ -122,7 +122,7 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
     it "returns 200 with file content as JSON" $ do
       withSystemTempDirectory "seal-files-test" $ \tmp -> do
         TIO.writeFile (tmp </> "test.txt") "line 1\nline 2\n"
-        let fe = mkLocalFileExplorer 131072
+        let fe = mkLocalFileExplorer 131072 131072
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "content"] [("path", Just (T.pack (tmp </> "test.txt")))])
         responseStatus resp `shouldBe` status200
@@ -133,12 +133,12 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       responseStatus resp `shouldBe` status403
 
     it "returns 400 when path is empty" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "content"] [("path", Just "")])
       responseStatus resp `shouldBe` status400
 
     it "returns 404 for a non-existent file" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "content"] [("path", Just "/nonexistent/file.txt")])
       responseStatus resp `shouldBe` status404
 
@@ -146,7 +146,7 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
     it "returns 200 with octet-stream and Content-Disposition for a valid file" $ do
       withSystemTempDirectory "seal-files-test" $ \tmp -> do
         TIO.writeFile (tmp </> "data.bin") "binary data here"
-        let fe = mkLocalFileExplorer 131072
+        let fe = mkLocalFileExplorer 131072 131072
         deps <- mkDeps fe True
         resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "download"] [("path", Just (T.pack (tmp </> "data.bin")))])
         responseStatus resp `shouldBe` status200
@@ -161,12 +161,12 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       responseStatus resp `shouldBe` status403
 
     it "returns 400 when path is empty" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "download"] [("path", Just "")])
       responseStatus resp `shouldBe` status400
 
     it "returns 404 for a non-existent file" $ do
-      deps <- mkDeps (mkLocalFileExplorer 131072) True
+      deps <- mkDeps (mkLocalFileExplorer 131072 131072) True
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "download"] [("path", Just "/nonexistent/file.bin")])
       responseStatus resp `shouldBe` status404
 
@@ -218,6 +218,9 @@ mkDeps fe enabled = do
     , adAbortReg = abortReg
     , adFileExplorer = fe
     , adFileExplorerEnabled = enabled
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     }
 
 -- | Build a GET request with path segments and query params.

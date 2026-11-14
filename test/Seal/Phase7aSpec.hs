@@ -122,6 +122,9 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adAbortReg = testAbortReg
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -185,6 +188,9 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adAbortReg = testAbortReg
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

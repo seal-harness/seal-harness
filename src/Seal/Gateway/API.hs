@@ -43,7 +43,7 @@ import Text.Read (readMaybe)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status409, status500, status501 )
+  , status200, status201, status204, status400, status403, status404, status409, status416, status500, status501 )
 import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
@@ -83,7 +83,7 @@ import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Security.Path (lexicalCollapse)
+import Seal.Security.Path (lexicalCollapse, blockedSegment)
 import Seal.Tools.Exec.FileExplorer
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
@@ -134,6 +134,7 @@ import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
 import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
+import Seal.Security.Crypto (sha256Hash)
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
@@ -203,6 +204,9 @@ data ApiDeps = ApiDeps
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   , adFileExplorer     :: FileExplorerHandle  -- ^ the file explorer capability handle (local or remote)
   , adFileExplorerEnabled :: Bool  -- ^ 'False' when the operator has disabled it via [gateway] file_explorer_enabled = false. Routes return 403.
+  , adDownloadPromptBytes :: Int    -- ^ the size threshold (bytes) above which the frontend prompts the user before downloading (default 256 MiB).
+  , adDownloadChunkBytes  :: Int    -- ^ the chunk size for chunked downloads (default 4 MiB). Also the second Int passed to 'mkLocalFileExplorer'/'mkRemoteFileExplorer'.
+  , adDownloadAllowBlocked :: Bool  -- ^ when 'True', the chunked download routes skip 'blockedSegment' enforcement (SEC-B3 override; default 'False').
   }
 
 -- | The REST API as a WAI Application.
@@ -832,6 +836,15 @@ dispatchApi deps req respond =
     -- GET /api/files/download — raw file download as application/octet-stream.
     (m', ["api", "files", "download"]) | m' == methodGet ->
       respond =<< handleFileDownload deps req
+    -- GET /api/files/stat — file metadata (size + mtime) for chunked downloads.
+    (m', ["api", "files", "stat"]) | m' == methodGet ->
+      respond =<< handleFileStat deps req
+    -- GET /api/files/download/manifest — O(1) chunk manifest for resumable downloads.
+    (m', ["api", "files", "download", "manifest"]) | m' == methodGet ->
+      respond =<< handleFileManifest deps req
+    -- GET /api/files/download/chunk — a single byte range of a file.
+    (m', ["api", "files", "download", "chunk"]) | m' == methodGet ->
+      respond =<< handleFileChunk deps req
     (m', ["api", "openapi.json"]) | m' == methodGet ->
       respond (jsonLBS status200 encodeOpenApi)
     (m', ["api", "openapi"]) | m' == methodGet ->
@@ -2469,6 +2482,198 @@ handleFileDownload deps req = do
                         octetHdr = (mkHN "Content-Type", "application/octet-stream")
                     pure (responseLBS status200 [octetHdr, dispHdr, nosniffHdr, truncatedHdr]
                            (BL.fromStrict bs))
+
+-- | Handle GET /api/files/stat — file metadata (size + mtime) for the
+-- chunked download path. Returns JSON @{path, size, mtimeEpoch}@ where
+-- @mtimeEpoch@ is @null@ when unavailable. Enforces SEC-B3 blocked-path
+-- check on the canonical path.
+handleFileStat :: ApiDeps -> Request -> IO Response
+handleFileStat deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled")
+    else case parsePathQuery req of
+        Nothing -> pure (errJson status400 "path is required")
+        Just pathTxt
+          | T.null pathTxt -> pure (errJson status400 "path is required")
+          | otherwise -> case validateFilePath pathTxt of
+              Left e -> pure (errJson status400 e)
+              Right path -> do
+                eStat <- feStatFile (adFileExplorer deps) path
+                case eStat of
+                  Left err -> pure (fileExplorerErrResponse err)
+                  Right stat -> do
+                    mBlocked <- checkBlockedPath deps path
+                    case mBlocked of
+                      Just resp -> pure resp
+                      Nothing -> pure (jsonLBS status200 (A.encode (fileStatJson stat)))
+
+-- | Handle GET /api/files/download/manifest — O(1) chunk manifest for
+-- resumable downloads. Computes @chunkCount = ceiling(size / chunkSize)@
+-- and returns JSON with path, size, mtimeEpoch, chunkSize, chunkCount.
+-- Validates @chunkSize * chunkCount >= size@ (rejects inconsistent
+-- manifests). Enforces SEC-B3 blocked-path check. Audit-logs the download
+-- at @InfoS@ on this request (one line per download, not per chunk).
+handleFileManifest :: ApiDeps -> Request -> IO Response
+handleFileManifest deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled")
+    else case parsePathQuery req of
+        Nothing -> pure (errJson status400 "path is required")
+        Just pathTxt
+          | T.null pathTxt -> pure (errJson status400 "path is required")
+          | otherwise -> case validateFilePath pathTxt of
+              Left e -> pure (errJson status400 e)
+              Right path -> do
+                mBlocked <- checkBlockedPath deps path
+                case mBlocked of
+                  Just resp -> pure resp
+                  Nothing -> do
+                    eStat <- feStatFile (adFileExplorer deps) path
+                    case eStat of
+                      Left err -> pure (fileExplorerErrResponse err)
+                      Right stat -> do
+                        let chunkSize = adDownloadChunkBytes deps
+                            size = fsSize stat
+                            chunkCount = ceiling (fromIntegral size / fromIntegral chunkSize :: Double)
+                            manifestJson = object
+                              [ "path" .= fsPath stat
+                              , "size" .= size
+                              , "mtimeEpoch" .= fsMtimeEpoch stat
+                              , "chunkSize" .= chunkSize
+                              , "chunkCount" .= chunkCount
+                              ]
+                        if fromIntegral chunkSize * chunkCount < size
+                          then pure (errJson status500 "inconsistent manifest: chunkSize * chunkCount < size")
+                          else pure (jsonLBS status200 (A.encode manifestJson))
+
+-- | Handle GET /api/files/download/chunk — a single byte range of a file.
+-- Parses @path@, @index@, @size@, @mtime@ query params. Re-stats the file;
+-- if size/mtime mismatch the request → 409 (null mtime → size-only
+-- comparison). If @index@ out of range → 416. Reads the chunk via
+-- @feReadRange@, computes SHA256 → @X-Chunk-SHA256@ header. Re-stats AFTER
+-- the read → 409 if file changed between read and re-stat. Enforces
+-- SEC-B3 blocked-path check.
+handleFileChunk :: ApiDeps -> Request -> IO Response
+handleFileChunk deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled")
+    else case parsePathQuery req of
+        Nothing -> pure (errJson status400 "path is required")
+        Just pathTxt
+          | T.null pathTxt -> pure (errJson status400 "path is required")
+          | otherwise -> case validateFilePath pathTxt of
+              Left e -> pure (errJson status400 e)
+              Right path -> do
+                mBlocked <- checkBlockedPath deps path
+                case mBlocked of
+                  Just resp -> pure resp
+                  Nothing -> case parseChunkParams req of
+                    Left e -> pure (errJson status400 e)
+                    Right (index, reqSize, reqMtime) -> do
+                      eStat <- feStatFile (adFileExplorer deps) path
+                      case eStat of
+                        Left err -> pure (fileExplorerErrResponse err)
+                        Right stat1 -> do
+                          let actualSize = fsSize stat1
+                              actualMtime = fsMtimeEpoch stat1
+                              chunkSize = adDownloadChunkBytes deps
+                              chunkCount = if chunkSize <= 0
+                                then 0
+                                else ceiling (fromIntegral actualSize / fromIntegral chunkSize :: Double)
+                          if actualSize /= reqSize || mtimeMismatch reqMtime actualMtime
+                            then pure (errJson status409 "file changed (size or mtime mismatch)")
+                            else if index < 0 || index >= chunkCount
+                              then pure (errJson status416 "chunk index out of range")
+                              else do
+                                let offset = fromIntegral index * fromIntegral chunkSize
+                                    len = min chunkSize (fromIntegral actualSize - fromIntegral offset)
+                                eBytes <- feReadRange (adFileExplorer deps) path offset len
+                                case eBytes of
+                                  Left err -> pure (fileExplorerErrResponse err)
+                                  Right bs -> do
+                                    eStat2 <- feStatFile (adFileExplorer deps) path
+                                    case eStat2 of
+                                      Left err -> pure (fileExplorerErrResponse err)
+                                      Right stat2 ->
+                                        if fsSize stat2 /= actualSize || mtimeMismatch reqMtime (fsMtimeEpoch stat2)
+                                          then pure (errJson status409 "file changed during read")
+                                          else do
+                                            let sha = sha256Hash bs
+                                                basename = takeFileName path
+                                                disposition = "attachment; filename=\"" <> basename <> "\""
+                                                hdrs =
+                                                  [ (mkHN "Content-Type", "application/octet-stream")
+                                                  , (mkHN "X-Content-Type-Options", "nosniff")
+                                                  , (mkHN "Content-Disposition", BC.pack disposition)
+                                                  , (mkHN "Cache-Control", "no-store")
+                                                  , (mkHN "X-Chunk-SHA256", sha)
+                                                  , (mkHN "X-Chunk-Index", BC.pack (show index))
+                                                  , (mkHN "X-Chunk-ChunkSize", BC.pack (show len))
+                                                  , (mkHN "Content-Length", BC.pack (show (BS.length bs)))
+                                                  ]
+                                            pure (responseLBS status200 hdrs (BL.fromStrict bs))
+
+-- | Compare requested mtime against actual. When the request mtime is
+-- absent (Nothing), skip the mtime check (size-only comparison). When
+-- both are present, they must match. When the request has a mtime but
+-- the actual mtime is unavailable (Nothing), that's a mismatch.
+mtimeMismatch :: Maybe Integer -> Maybe Integer -> Bool
+mtimeMismatch reqMtime actualMtime = case (reqMtime, actualMtime) of
+  (Nothing, _) -> False          -- no mtime in request → skip check
+  (Just _, Nothing) -> True      -- request expects mtime but stat has none
+  (Just r, Just a) -> r /= a     -- both present → must match
+
+-- | Parse the @index@, @size@, and @mtime@ query params for the chunk
+-- endpoint. @index@ and @size@ are required integers; @mtime@ is
+-- optional (null → size-only comparison).
+parseChunkParams :: Request -> Either Text (Int, Integer, Maybe Integer)
+parseChunkParams req = do
+  index <- case lookupInt "index" req of
+    Just i -> Right i
+    Nothing -> Left "index is required"
+  size <- case lookupInt64 "size" req of
+    Just s -> Right s
+    Nothing -> Left "size is required"
+  let mtime = lookupInt64 "mtime" req
+  pure (index, size, mtime)
+
+-- | Look up an integer query parameter (Int).
+lookupInt :: Text -> Request -> Maybe Int
+lookupInt key req =
+  case lookup (TE.encodeUtf8 key) (queryString req) of
+    Just (Just bs) -> readMaybe (BC.unpack bs)
+    _ -> Nothing
+
+-- | Look up an integer query parameter (Integer).
+lookupInt64 :: Text -> Request -> Maybe Integer
+lookupInt64 key req =
+  case lookup (TE.encodeUtf8 key) (queryString req) of
+    Just (Just bs) -> readMaybe (BC.unpack bs)
+    _ -> Nothing
+
+-- | Encode a 'FileStat' as a JSON 'Value' for the stat endpoint.
+fileStatJson :: FileStat -> Value
+fileStatJson stat = object
+  [ "path" .= fsPath stat
+  , "size" .= fsSize stat
+  , "mtimeEpoch" .= fsMtimeEpoch stat
+  ]
+
+-- | SEC-B3 blocked-path enforcement. Canonicalizes the path (local:
+-- 'canonicalizePath', remote: @readlink -f@), then runs 'blockedSegment'.
+-- Returns @Just resp@ (403) if the path is blocked and the override is
+-- not set; @Nothing@ if the path is allowed (or the override is set).
+checkBlockedPath :: ApiDeps -> FilePath -> IO (Maybe Response)
+checkBlockedPath deps path =
+  if adDownloadAllowBlocked deps
+    then pure Nothing
+    else do
+      eCanon <- feCanonicalize (adFileExplorer deps) path
+      case eCanon of
+        Left _ -> pure (Just (errJson status403 "blocked_path"))
+        Right canon -> case blockedSegment canon of
+          Just _ -> pure (Just (errJson status403 "blocked_path"))
+          Nothing -> pure Nothing
 
 -- | Map a 'FileExplorerErr' to an HTTP error response.
 fileExplorerErrResponse :: FileExplorerErr -> Response

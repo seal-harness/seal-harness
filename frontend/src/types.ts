@@ -579,6 +579,25 @@ export interface FileContent {
   isBinary: boolean
 }
 
+/** The result of `GET /api/files/stat?path=<file>`. Mirrors the backend's
+ *  `FileStat` JSON. `mtimeEpoch` is null when mtime is unavailable. */
+export interface FileStat {
+  path: string
+  size: number
+  mtimeEpoch: number | null
+}
+
+/** The result of `GET /api/files/download/manifest?path=<file>`. O(1)
+ *  metadata — no hash list (per design §12). The client computes
+ *  chunkCount from size/chunkSize. */
+export interface FileManifest {
+  path: string
+  size: number
+  mtimeEpoch: number | null
+  chunkSize: number
+  chunkCount: number
+}
+
 // ── Message derivation (UI-internal, from TranscriptEntry) ─────────────
 
 export interface CodeSpan {

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 -- | The remote SSH executor (the 'EbRemote' arm of 'ExecBackend'). Shells
 -- out to the system @ssh@ binary via fixed argv (no shell interpreter)
 -- with **mandatory host-key pinning**: @StrictHostKeyChecking=yes@ and a
@@ -55,7 +56,7 @@ import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO (hClose)
+import System.IO (Handle, hClose)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Files (setFileMode)
 import System.Process
@@ -204,6 +205,9 @@ data RemoteRunner = RemoteRunner
     -- ^ Like 'runRemote' but returns raw 'ByteString' (no UTF-8 decode).
     -- Used by the file explorer's download endpoint so binary files are
     -- served without UTF-8 corruption from the transport's lenient decode.
+  , runRemoteStream :: forall r. [String] -> (Handle -> IO r) -> IO (Either ExecError r)
+    -- ^ Run an argv and hand the stdout 'Handle' to a callback that decides
+    -- how much to read. No 50K cap — used for chunked downloads (WU-1).
   }
 
 -- | The real SSH runner via 'System.Process'. Fail-closed: any IOError or
@@ -214,6 +218,7 @@ mkRealRemoteRunner :: RemoteRunner
 mkRealRemoteRunner = RemoteRunner
   { runRemote      = runReal Nothing []
   , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) [] argv
+  , runRemoteStream = runRealStream Nothing []
   , runRemoteEnv   = runReal Nothing
   , runRemoteBytes = runRealBytes Nothing []
   }
@@ -329,6 +334,53 @@ mkRealRemoteRunner = RemoteRunner
         Right (ExitFailure _, _, _, _) ->
           pure (Left ExecRemoteUnreachable)
 
+    -- | Run an argv and hand the stdout 'Handle' to a callback that decides
+    -- how much to read (NO 50K cap). Used by the file explorer's chunked
+    -- download path ('feReadRange') so 4 MiB chunks are not truncated.
+    -- Error handling mirrors 'runRealBytes': a launch failure or non-zero
+    -- exit becomes 'ExecRemoteUnreachable' (the file explorer maps all exec
+    -- failures to 'FeExec' regardless). The child is reaped by
+    -- 'withManagedProcess' after the callback returns.
+    runRealStream :: forall r. Maybe ByteString -> [(String, String)] -> [String]
+                  -> (Handle -> IO r) -> IO (Either ExecError r)
+    runRealStream mStdin envExtras argv action = do
+      ensureMuxDirAt sshMuxBaseDir
+      let (program, args) = case argv of
+            (p : as) -> (p, as)
+            []       -> error "runRealStream: empty argv (unreachable)"
+          cp0 = (proc program args)
+                  { std_out = CreatePipe, std_err = CreatePipe
+                  , create_group = True
+                  }
+          cp1 = case mStdin of
+            Nothing -> cp0 { std_in = NoStream }
+            Just _  -> cp0 { std_in = CreatePipe }
+      mEnv <- case envExtras of
+        [] -> pure Nothing
+        xs -> Just <$> mergeEnvReal xs
+      let cp = cp1 { env = mEnv }
+      res <- try @IOError
+             (withManagedProcess cp $ \ph mIn hOut hErr -> do
+                case (mIn, mStdin) of
+                  (Just hIn, Just bs) -> do
+                    BS.hPut hIn bs
+                    hClose hIn
+                  _ -> pure ()
+                r <- action hOut
+                _errText <- readBounded hErr 50_000
+                ec <- waitForProcess ph
+                pure (ec, r, _errText))
+      case res of
+        Left _ioErr -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)
+        Right (ExitSuccess, r, _) -> pure (Right r)
+        Right (ExitFailure 255, _, _) -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)
+        Right (ExitFailure _, _, _) ->
+          pure (Left ExecRemoteUnreachable)
+
 -- | Emit a katip log line for the result of a remote SSH exec. Transport
 -- failures (launch fail, exit 255, exit 127) log at 'WarningS' so
 -- operators see SSH connectivity issues in the server console. A
@@ -394,6 +446,7 @@ mkFakeRemoteRunner :: Either ExecError Text -> RemoteRunner
 mkFakeRemoteRunner canned = RemoteRunner
   { runRemote      = \_argv -> pure canned
   , runRemoteStdin = \_argv _stdin -> pure canned
+  , runRemoteStream = \_argv _action -> pure (Left ExecRemoteUnreachable)
   , runRemoteEnv   = \_env _argv -> pure canned
   , runRemoteBytes = \_argv -> pure $ case canned of
       Left e  -> Left e
@@ -417,6 +470,9 @@ mkFakeRemoteRunnerRecording ref canned = RemoteRunner
   , runRemoteStdin = \argv stdin -> do
       modifyIORef' ref (++ [(argv, Just stdin)])
       pure canned
+  , runRemoteStream = \argv _action -> do
+      modifyIORef' ref (++ [(argv, Nothing)])
+      pure (Left ExecRemoteUnreachable)
   , runRemoteEnv = \_env argv -> do
       modifyIORef' ref (++ [(argv, Nothing)])
       pure canned

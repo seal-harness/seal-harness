@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
-import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile } from '../hooks/useApi'
+import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, fetchFileStat } from '../hooks/useApi'
+import { useFileDownload } from '../hooks/useFileDownload'
+import { DownloadProgressUI } from './DownloadProgress'
 import { FileTree, type FileTreeNode } from './FileTree'
+import { DownloadConfirmDialog } from './DownloadConfirmDialog'
 
 // ── URL helpers ─────────────────────────────────────────────────────────
 
@@ -19,6 +22,11 @@ function navigateTo(path: string | null) {
   window.history.pushState(null, '', qs ? `/files?${qs}` : '/files')
   window.dispatchEvent(new PopStateEvent('popstate'))
 }
+
+
+/** The configured prompt threshold for downloads. In production this
+ *  comes from the backend config; for now we use the default. */
+const DOWNLOAD_PROMPT_THRESHOLD = 268435456 // 256 MiB
 
 // ── Paths ───────────────────────────────────────────────────────────────
 
@@ -203,7 +211,7 @@ const rowStyle: React.CSSProperties = {
 
 // ── Sub-components ──────────────────────────────────────────────────────
 
-function Breadcrumbs({ path }: { path: string }) {
+function Breadcrumbs({ path, children }: { path: string; children?: React.ReactNode }) {
   const segs = breadcrumbSegments(path)
   return (
     <div style={headerStyle} data-testid="breadcrumbs">
@@ -226,6 +234,7 @@ function Breadcrumbs({ path }: { path: string }) {
           )}
         </span>
       ))}
+      {children}
     </div>
   )
 }
@@ -251,13 +260,16 @@ function DirectoryListing({
   onOpen,
   onDownload,
   downloadTruncated,
+  showHidden,
 }: {
   listing: FileListing
   onOpen: (entry: FileEntry) => void
   onDownload: (entry: FileEntry) => void
   downloadTruncated: boolean
+  showHidden: boolean
 }) {
-  const sorted = sortEntries(listing.entries)
+  const filtered = showHidden ? listing.entries : listing.entries.filter(e => !e.name.startsWith('.'))
+  const sorted = sortEntries(filtered)
   return (
     <div>
       {listing.warning && (
@@ -273,7 +285,7 @@ function DirectoryListing({
       )}
       {downloadTruncated && (
         <div data-testid="download-truncated-warning" style={{ ...bannerStyle, color: 'var(--warning)' }}>
-          ⚠ Last download was truncated — only the first 128 KiB was saved
+          ⚠ Last download was truncated — the file exceeded the server's byte limit
         </div>
       )}
       {sorted.length === 0 ? (
@@ -303,13 +315,15 @@ function FileRow({
   const fullPath = joinPath(listing.path, entry.name)
   return (
     <div style={{ display: 'flex', alignItems: 'center' }}>
-      <button
-        type="button"
+      <a
+        href={entry.isDir
+          ? `/files?path=${encodeURIComponent(fullPath)}`
+          : `/api/files/content?path=${encodeURIComponent(fullPath)}`}
         data-testid={`file-entry-${entry.name}`}
         className="files-row"
         aria-label={`${entry.isDir ? 'Open directory' : 'Open file'} ${entry.name}`}
         style={{ ...rowStyle, borderBottom: 'none', flex: 1 }}
-        onClick={() => onOpen(entry)}
+        onClick={(e) => { e.preventDefault(); onOpen(entry) }}
       >
         <span style={{ color: 'var(--text-faint)', width: 14, display: 'inline-flex' }}>
           {entry.isDir || entry.isSymlink ? (
@@ -330,17 +344,18 @@ function FileRow({
         <span style={{ color: 'var(--text-faint)', fontSize: 12, width: 160 }}>
           {formatMtime(entry.mtime)}
         </span>
-      </button>
+      </a>
       {!entry.isDir && (
-        <button
-          type="button"
+        <a
           className="icon-btn"
+          href={`/api/files/download?path=${encodeURIComponent(fullPath)}`}
           data-testid={`download-${entry.name}`}
           aria-label={`Download ${entry.name}`}
           title={`Download ${entry.name}`}
           style={{ marginRight: 12 }}
           onClick={(e) => {
             e.stopPropagation()
+            e.preventDefault()
             onDownload(entry)
           }}
         >
@@ -349,7 +364,7 @@ function FileRow({
             <path d="M4.5 7 L8 10.5 L11.5 7" />
             <path d="M3 13 h10" />
           </svg>
-        </button>
+        </a>
       )}
       <span style={{ display: 'none' }}>{fullPath}</span>
     </div>
@@ -383,9 +398,15 @@ function FileContentView({
         </div>
       )}
       <div style={{ ...headerStyle }}>
-        <button type="button" className="btn btn-ghost" data-testid="content-download" style={{ fontSize: 12, padding: '3px 8px' }} onClick={onDownload}>
+        <a
+          className="btn btn-ghost"
+          href={`/api/files/download?path=${encodeURIComponent(content.path)}`}
+          data-testid="content-download"
+          style={{ fontSize: 12, padding: '3px 8px' }}
+          onClick={(e) => { e.preventDefault(); onDownload() }}
+        >
           Download
-        </button>
+        </a>
         <button type="button" className="btn btn-ghost" data-testid="content-back" style={{ fontSize: 12, padding: '3px 8px' }} onClick={onBack}>
           Back to directory
         </button>
@@ -438,8 +459,11 @@ export function FilesView() {
   const [error, setError] = useState<number | null>(null)
   const [content, setContent] = useState<FileContent | null>(null)
   const [contentLoading, setContentLoading] = useState(false)
-  const [downloadTruncated, setDownloadTruncated] = useState(false)
-  const [viewerDownloadTruncated, setViewerDownloadTruncated] = useState(false)
+  const [downloadTruncated] = useState(false)
+  const [viewerDownloadTruncated] = useState(false)
+  const [showHidden, setShowHidden] = useState(false)
+  const [confirmDialog, setConfirmDialog] = useState<{ path: string; size: number } | null>(null)
+  const fileDownload = useFileDownload()
   const [railError, setRailError] = useState<Map<string, number>>(new Map())
   const inflight = useRef<Map<string | null, Promise<FileListing | null>>>(new Map())
   const statusRef = useRef<Map<string | null, number>>(new Map())
@@ -739,26 +763,33 @@ export function FilesView() {
     [path, listings],
   )
 
-  const doDownload = useCallback(async (target: string) => {
-    const res = await downloadFile(target)
-    return res.truncated
-  }, [])
-
   const handleDownload = useCallback(
     async (entry: FileEntry) => {
       const listing = path === null
         ? listings.get(null)
         : listings.get(path) ?? listings.get(parentDir(path))
       const base = listing?.path ?? (path ?? '')
-      setDownloadTruncated(await doDownload(joinPath(base, entry.name)))
+      const target = joinPath(base, entry.name)
+      // Fetch stat first; if over threshold, show confirm dialog.
+      const statRes = await fetchFileStat(target)
+      if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
+        setConfirmDialog({ path: target, size: statRes.stat.size })
+      } else {
+        void fileDownload.start(target)
+      }
     },
-    [path, listings, doDownload],
+    [path, listings, fileDownload],
   )
 
   const handleViewerDownload = useCallback(async () => {
     if (!content) return
-    setViewerDownloadTruncated(await doDownload(content.path))
-  }, [content, doDownload])
+    const statRes = await fetchFileStat(content.path)
+    if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
+      setConfirmDialog({ path: content.path, size: statRes.stat.size })
+    } else {
+      void fileDownload.start(content.path)
+    }
+  }, [content, fileDownload])
 
   // ── Derive the rail ────────────────────────────────────────────────────
 
@@ -834,7 +865,20 @@ export function FilesView() {
       </div>
 
       <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
-        <Breadcrumbs path={path ?? rootListing?.path ?? '/'} />
+        <Breadcrumbs path={path ?? rootListing?.path ?? '/'}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', fontSize: '0.85em', color: 'var(--text-muted)' }}>
+            <input
+              type="checkbox"
+              id="show-hidden"
+              checked={showHidden}
+              onChange={(e) => setShowHidden(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            <label htmlFor="show-hidden" style={{ cursor: 'pointer', userSelect: 'none' }}>
+              Show hidden files
+            </label>
+          </div>
+        </Breadcrumbs>
         {loading || contentLoading ? (
           <LoadingState />
         ) : error !== null ? (
@@ -852,9 +896,33 @@ export function FilesView() {
             onOpen={handleOpen}
             onDownload={handleDownload}
             downloadTruncated={downloadTruncated}
+            showHidden={showHidden}
           />
         ) : null}
       </div>
+      {fileDownload.progress && (
+        <DownloadProgressUI
+          progress={fileDownload.progress}
+          onCancel={fileDownload.cancel}
+          onRetry={fileDownload.retry}
+        />
+      )}
+      {confirmDialog && (
+        <DownloadConfirmDialog
+          path={confirmDialog.path}
+          size={confirmDialog.size}
+          threshold={DOWNLOAD_PROMPT_THRESHOLD}
+          onCancel={() => setConfirmDialog(null)}
+          onPartial={() => {
+            setConfirmDialog(null)
+            void fileDownload.start(confirmDialog.path, DOWNLOAD_PROMPT_THRESHOLD)
+          }}
+          onFull={() => {
+            setConfirmDialog(null)
+            void fileDownload.start(confirmDialog.path)
+          }}
+        />
+      )}
     </div>
   )
 }
