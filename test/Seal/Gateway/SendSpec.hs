@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec) where
 
@@ -1410,6 +1411,52 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
   -- internals are deliberately not exported.
   describe "end-of-turn completion delivery" $ do
 
+    -- The wake chain runs inside the parent turn's release action, so its
+    -- duration depends on the machine. A CI failure on x86_64-linux
+    -- (--enable-coverage) reported @expected: 3, but got: 2@ at the
+    -- "exactly three turns" assertion: the count was still rising after
+    -- the old two-sample 200 ms window, so the assertion fired mid-chain.
+    -- Nothing was stranded — the follow-up wake-up turn did run. These
+    -- tests pin the replacement helper's contract, which makes the three
+    -- assertions below sound rather than lucky.
+    describe "the settle helper (regression: slow follow-up wake-up turn)" $ do
+
+      it "waits for the expected value instead of sampling a fixed window" $ do
+        -- Emulates the CI shape: the value reaches 2 immediately, and a
+        -- two-sample 200 ms window would have called that "settled"; it
+        -- only reaches the expected 3 much later.
+        counter <- newIORef (2 :: Int)
+        _ <- forkIO $ do
+          threadDelay 400000
+          writeIORef counter 3
+        settlesTo (readIORef counter) 3
+
+      it "fails when the expected value is never reached (a stranded chain)" $ do
+        -- The failure this suite exists to catch: a completion that is
+        -- never delivered, so the turn count stops at 2 and never reaches
+        -- the expected 3. It must fail — after the deadline, not on the
+        -- first sample.
+        counter <- newIORef (0 :: Int)
+        _ <- forkIO $ do
+          let bump = do
+                threadDelay 5000
+                modifyIORef' counter (+ 1)
+                bump
+          bump
+        -- Never 100: the chain stalls below the expected value.
+        ok <- awaitValueN 200000 5000 (readIORef counter) 100
+        ok `shouldBe` False
+
+      it "fails when the value overshoots the expected value" $ do
+        -- The other direction: the chain ran one turn too many. A helper
+        -- that only waited for "two equal samples" would report success.
+        counter <- newIORef (0 :: Int)
+        _ <- forkIO $ do
+          threadDelay 20000
+          writeIORef counter 5
+        ok <- awaitValueN 200000 5000 (readIORef counter) 3
+        ok `shouldBe` False
+
     it "a completion that arrives during a wake-up turn is delivered by a follow-up wake-up turn" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
         let paths = SealPaths
@@ -1451,11 +1498,9 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
         -- Exactly three turns: the user turn, the first wake-up turn
         -- (which delivers verdict A), and the follow-up (verdict B).
-        n2 `shouldBe` 3
+        settlesTo (length <$> readIORef recorded) 3
         reqs <- readIORef recorded
         let textsOf i = case drop i reqs of
               (r : _) -> requestTexts r
@@ -1484,9 +1529,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabSeen `shouldBe` True
         -- No completion ever arrived: the turn count must settle at one
         -- (the user turn), with no synthetic turn behind it.
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
-        n1 `shouldBe` 1
+        settlesTo (length <$> readIORef recorded) 1
 
     it "the wake chain is bounded: a provider that cannot be resolved produces no unbounded sequence of wake turns, and the completions stay pending" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
@@ -1525,8 +1568,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (c1, c2) <- unchangedAfter 300000 (readIORef resolveCalls)
-        c1 `shouldBe` c2
+        -- The chain must stop. Its attempt count is produced by the same
+        -- wake machinery whose slow tail flaked at SendSpec:1455, so poll
+        -- for the count to hold still rather than sampling twice.
+        c1 <- awaitStable (readIORef resolveCalls)
         c1 `shouldSatisfy` (> 1)    -- the chain really ran wake attempts
         c1 `shouldSatisfy` (<= 12)  -- ... and it stopped: bounded
         -- No wake turn ever reached the provider, and the completion is
@@ -1568,9 +1613,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
-        n1 `shouldBe` 1
+        settlesTo (length <$> readIORef recorded) 1
         -- The mutex must have been released by the no-meta branch: a
         -- LATER wake still works. Restore the meta and repeat the
         -- mid-turn delivery — the wake for verdict B can only acquire
@@ -1586,8 +1629,8 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         putMVar gate2 ()
         seen3 <- waitFor 5000000 (readIORef recorded) ((>= 3) . length)
         seen3 `shouldBe` True
-        (m1, m2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        m1 `shouldBe` m2
+        -- No further turns: the count must reach 3 and then hold still.
+        settlesTo (length <$> readIORef recorded) 3
         reqs <- readIORef recorded
         let textsOf i = case drop i reqs of
               (r : _) -> requestTexts r
@@ -1934,15 +1977,93 @@ instance Provider ChainProvider where
     pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
 
--- | Read a value, wait the given microseconds, read it again: the pair is
--- returned so a test can assert the two reads agree — i.e. that whatever
--- produces the value (a wake chain) has terminated.
-unchangedAfter :: Int -> IO a -> IO (a, a)
-unchangedAfter delayUs readAction = do
-  a <- readAction
-  threadDelay delayUs
-  a' <- readAction
-  pure (a, a')
+-- | How long an assertion may wait for the expected value, and the polling
+-- interval (both microseconds).
+awaitDeadlineUs :: Int
+awaitDeadlineUs = 5000000
+
+awaitStepUs :: Int
+awaitStepUs = 10000
+
+-- | Test-visible parameterised form of 'awaitValue'.
+awaitValueN :: forall a. Eq a => Int -> Int -> IO a -> a -> IO Bool
+awaitValueN deadlineUs stepUs readAction want = go deadlineUs
+  where
+    go :: Int -> IO Bool
+    go remaining
+      | remaining <= 0 = pure False
+      | otherwise = do
+          v <- readAction
+          if v /= want
+            then threadDelay stepUs >> go (remaining - stepUs)
+            else pure True
+
+-- | Wait until @readAction@ equals @want@, then require it to *hold* that
+-- value for 'awaitHoldUs'.
+--
+-- "The wake chain has finished" is not observable at any instant: the
+-- chain runs inside the parent turn's release action, so how long it
+-- takes depends on the machine. This is why the old code was wrong. It
+-- sampled the counter twice, 200 ms apart, and asserted the two samples
+-- agreed — on x86_64-linux CI (--enable-coverage) the follow-up wake-up
+-- turn landed after that window, so both samples read 2 *while the chain
+-- was still running*; the next assertion then saw 3 where it had already
+-- been told to expect 2. Reporting @expected: 3, but got: 2@.
+--
+-- Waiting for the *known-expected* value is sound where waiting for
+-- "two equal samples" is not: the expected value is exactly what the test
+-- asserts, so a genuinely stranded completion (the failure this suite
+-- exists to catch) still fails — it just fails at the deadline instead of
+-- on the first sample. The trailing hold catches a value that overshoots
+-- @want@ because the chain ran one turn too many.
+awaitValue :: forall a. Eq a => IO a -> a -> IO Bool
+awaitValue readAction want = do
+  reached <- awaitValueN awaitDeadlineUs awaitStepUs readAction want
+  if not reached
+    then pure False
+    else holdsFor awaitHoldUs want
+  where
+    holdsFor :: Int -> a -> IO Bool
+    holdsFor w v
+      | w <= 0 = pure True
+      | otherwise = do
+          threadDelay awaitStepUs
+          v' <- readAction
+          if v' == v then holdsFor (w - awaitStepUs) v else pure False
+
+-- | Poll a counter until it holds still, and return it. Used where the
+-- final value is not known in advance (a bound, not an exact count), but
+-- "is it still changing?" still has to be answered without a fixed
+-- two-sample window. If it never stabilises it returns the last reading at
+-- the deadline, which is what makes a runaway count visible to the bound
+-- check that follows rather than silently passing.
+awaitStable :: forall a. Eq a => IO a -> IO a
+awaitStable readAction = go awaitDeadlineUs
+  where
+    go :: Int -> IO a
+    go remaining
+      | remaining <= 0 = readAction
+      | otherwise = do
+          a <- readAction
+          threadDelay awaitStepUs
+          b <- readAction
+          if a == b then pure b else go (remaining - awaitStepUs)
+
+-- | The time @awaitValue@ requires the expected value to persist, so that
+-- a chain which produces @want@ and then keeps going is still a failure.
+awaitHoldUs :: Int
+awaitHoldUs = 300000
+
+-- | Assert that @readAction@ reaches @want@ and stays there. Replaces a
+-- @'unchangedAfter' ... >> a \`shouldBe\` b@ pair, which sampled twice and
+-- so raced the chain it was waiting for (see 'awaitValue').
+settlesTo :: (Eq a, Show a) => IO a -> a -> Expectation
+settlesTo readAction want = do
+  ok <- awaitValue readAction want
+  if ok
+    then pure ()
+    else expectationFailure $
+      "timed out waiting for " <> show want <> " to be reached and held"
 
 -- | A minimal 'TurnAdapter' for the tests that drive 'runSessionTurn'
 -- directly (the gateway's 'mkWebTurnAdapter' is not exported). Every
