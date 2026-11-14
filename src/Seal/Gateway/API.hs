@@ -72,7 +72,7 @@ import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 -- SealLogger/logIO removed: audit logging deferred (design §4.4 is SHOULD not MUST)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
 import Seal.Config.Paths
-  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath )
+  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir )
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Session.AgentMetaCache
@@ -80,7 +80,7 @@ import Seal.Session.AgentMetaCache
 import Seal.Tools.Exec.Untrusted
   ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
-import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
+import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Path (lexicalCollapse)
@@ -403,6 +403,16 @@ dispatchApi deps req respond =
       case mkSessionId sid of
         Left e -> respond (errJson status400 ("invalid session id: " <> e))
         Right sId -> respond =<< handleSessionAgents deps sId
+    -- GET /api/sessions/:id/workdir — returns the session's workdir
+    -- absolute path as JSON: {"path": "<path>"}. The path is computed
+    -- from the security config: local mode →
+    -- @<cache>/workdirs/<sid>@; remote mode →
+    -- @<remote-workspace>/workdirs/<sid>@. The frontend uses this for
+    -- the "open session workdir in Files" link in the chat header.
+    (m', ["api", "sessions", sid, "workdir"]) | m' == methodGet ->
+      case mkSessionId sid of
+        Left e -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> respond =<< handleSessionWorkdir deps sId
     -- PUT /api/sessions/:id/description — set or clear the user-set
     -- display title for a session (the chat-header pencil). Body:
     -- {"description":"<text>"} (empty/missing/whitespace clears it).
@@ -1361,6 +1371,38 @@ handleSessionAgents deps sid = do
         []      -> Nothing
     rightToMaybe (Right a) = Just a
     rightToMaybe (Left _) = Nothing
+
+-- | Handle GET /api/sessions/:id/workdir — returns the session's workdir
+-- absolute path as JSON: @{"path": "<path>"}@. The path is computed from
+-- the security config: local mode → @\<cache\>\/workdirs\/\<sid\>@ (via
+-- 'sessionWorkdir'); remote mode →
+-- @\<remote-workspace\>\/workdirs\/\<sid\>@ (via
+-- 'remoteSessionWorkdirPath'). 404 when the session has no session.json
+-- on disk.
+handleSessionWorkdir :: ApiDeps -> SessionId -> IO Response
+handleSessionWorkdir deps sid = do
+  let paths = srPaths (adSessionRuntime deps)
+      metaPath = sessionMetaPath paths sid
+  exists <- doesFileExist metaPath
+  if not exists
+    then pure (errJson status404 "session not found")
+    else do
+      let wdPath = case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
+            Nothing ->
+              -- Local mode: the workdir is on the same machine as the
+              -- gateway, so the absolute path is directly usable.
+              T.pack (sessionWorkdir paths sid)
+            Just uec -> case uecRemote uec of
+              Just sshCfg ->
+                -- Remote mode with a configured SSH workspace: the
+                -- workdir is on the remote machine.
+                remoteSessionWorkdirPath sshCfg sid
+              Nothing ->
+                -- Remote mode without a complete remote block
+                -- (fail-closed at the executor level): fall back to the
+                -- local path shape so the frontend has something to show.
+                T.pack (sessionWorkdir paths sid)
+      pure (jsonLBS status200 (A.encode (object ["path" .= wdPath])))
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is

@@ -15,7 +15,7 @@ import {
   saveTranscriptViewMode,
   type TranscriptViewMode,
 } from '../lib/transcriptViewMode'
-import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
+import { fetchModelContext, fetchSessionWorkdir, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
@@ -346,6 +346,52 @@ function CopySessionIdButton({ sessionId }: { sessionId: string }) {
           <path d="M3 11 V3.5 A1.5 1.5 0 0 1 4.5 2 H11" />
         </svg>
       )}
+    </button>
+  )
+}
+
+/** Open-workdir button for the chat header. Renders a small folder icon;
+ *  clicking fetches the session's workdir path from the backend and
+ *  navigates the SPA to the Files page opened to that path. Uses the same
+ *  `header-scroll-btn` styling as the adjacent copy-session-id and
+ *  scroll buttons. */
+function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(false)
+
+  const onClick = async () => {
+    if (loading) return
+    setLoading(true)
+    setError(false)
+    const path = await fetchSessionWorkdir(sessionId)
+    setLoading(false)
+    if (!path) {
+      setError(true)
+      // Clear the error indicator after 1.5s (matches the copy feedback).
+      setTimeout(() => setError(false), 1500)
+      return
+    }
+    // In-app navigation to the Files page with the workdir path as a
+    // query parameter. The FilesView reads `path` from the URL on mount
+    // and after popstate, so a pushState + popstate dispatch is enough.
+    const params = new URLSearchParams()
+    params.set('path', path)
+    window.history.pushState(null, '', `/files?${params.toString()}`)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+
+  return (
+    <button
+      className="header-scroll-btn"
+      title={error ? 'Could not resolve workdir' : loading ? 'Resolving…' : 'Open session workdir in Files'}
+      aria-label={error ? 'Could not resolve workdir' : loading ? 'Resolving workdir' : 'Open session workdir in Files'}
+      onClick={onClick}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+        aria-hidden="true">
+        <path d="M2 4.5 A1.5 1.5 0 0 1 3.5 3 H6 L7.5 4.5 H12.5 A1.5 1.5 0 0 1 14 6 V11.5 A1.5 1.5 0 0 1 12.5 13 H3.5 A1.5 1.5 0 0 1 2 11.5 Z" />
+      </svg>
     </button>
   )
 }
@@ -2955,6 +3001,7 @@ export function ChatArea({
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
             {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
+            {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
@@ -3003,6 +3050,7 @@ export function ChatArea({
           <div className="ml-auto flex items-center gap-1 shrink-0">
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <CopySessionIdButton sessionId={selectedSession.id} />
+            <OpenWorkdirButton sessionId={selectedSession.id} />
           </div>
         )}
       </div>

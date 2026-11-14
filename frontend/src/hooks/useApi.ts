@@ -1269,6 +1269,19 @@ export async function setupRepo(sessionId: string, url: string, branch?: string,
     clearTimeout(t)
   }
 }
+
+/** Fetch the absolute workdir path for a session. The backend computes
+ *  the path from the security config: local mode →
+ *  `<cache>/workdirs/<sid>`; remote mode →
+ *  `<remote-workspace>/workdirs/<sid>`. The frontend uses this for the
+ *  "open session workdir in Files" link in the chat header. Returns the
+ *  path string, or null on any failure (network error, 404, parse
+ *  error). */
+export async function fetchSessionWorkdir(sessionId: string): Promise<string | null> {
+  const res = await fetchJson<{ path: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/workdir`)
+  return res?.path ?? null
+}
+
 // ── Agent CRUD ──────────────────────────────────────────────────────────
 
 /** Fetch all agent defs (the full def, including provider/model/system/
