@@ -25,7 +25,7 @@ import Seal.Session.ExecCache
   )
 import Seal.Session.Workdir (SessionExec (..))
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
-import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+import Seal.Tools.Exec.Types (ExecError (..), RemotePath, mkRemotePath)
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), mkInMemWorkdirFs, StubEntry (..)
   )
@@ -191,6 +191,7 @@ recordingRunner ref = RemoteRunner
   { runRemote      = \argv -> record argv >> pure (Right "")
   , runRemoteStdin = \argv _ -> record argv >> pure (Right "")
   , runRemoteEnv   = \_ argv -> record argv >> pure (Right "")
+  , runRemoteStream = \argv _ -> record argv >> pure (Left ExecRemoteUnreachable)
   , runRemoteBytes = \argv -> record argv >> pure (Right ("", False))
   }
   where

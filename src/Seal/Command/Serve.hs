@@ -511,10 +511,12 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- (fail-closed — NOT a local fallback, per architect review).
   let fileExplorerEnabled = fromMaybe True (gcFileExplorerEnabled gwCfg)
   fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
-    Nothing -> pure (mkLocalFileExplorer maxScanBytes)
+    -- WU-1: split ceilings — viewer reads stay at maxScanBytes (128 KiB),
+    -- downloads use a 4 MiB chunk size (full config wiring comes in WU-2).
+    Nothing -> pure (mkLocalFileExplorer maxScanBytes 4194304)
     Just uec -> case uecRemote uec of
       Nothing -> pure mkFailClosedFileExplorer
-      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes
+      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes 4194304
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
