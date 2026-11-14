@@ -2994,12 +2994,16 @@ export function ChatArea({
             </span>
           )
         })()}
+        {selectedSession && (
+          <div className="ml-auto flex items-center gap-1 shrink-0">
+            <CopySessionIdButton sessionId={selectedSession.id} />
+            <OpenWorkdirButton sessionId={selectedSession.id} />
+          </div>
+        )}
         {messages.length > 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
-            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
-            {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
@@ -3042,13 +3046,6 @@ export function ChatArea({
                 </svg>
               )}
             </button>
-          </div>
-        )}
-        {selectedSession && messages.length === 0 && (
-          <div className="ml-auto flex items-center gap-1 shrink-0">
-           {isThinking && onStop && <StopButton onStop={onStop} />}
-            <CopySessionIdButton sessionId={selectedSession.id} />
-            <OpenWorkdirButton sessionId={selectedSession.id} />
           </div>
         )}
       </div>
