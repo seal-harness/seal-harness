@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
 import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile, fetchFileStat } from '../hooks/useApi'
+import { useFileDownload } from '../hooks/useFileDownload'
+import { DownloadProgressUI } from './DownloadProgress'
 import { FileTree, type FileTreeNode } from './FileTree'
 import { DownloadConfirmDialog } from './DownloadConfirmDialog'
 
@@ -447,6 +449,7 @@ export function FilesView() {
   const [downloadTruncated, setDownloadTruncated] = useState(false)
   const [viewerDownloadTruncated, setViewerDownloadTruncated] = useState(false)
   const [confirmDialog, setConfirmDialog] = useState<{ path: string; size: number } | null>(null)
+  const fileDownload = useFileDownload()
   const [railError, setRailError] = useState<Map<string, number>>(new Map())
   const inflight = useRef<Map<string | null, Promise<FileListing | null>>>(new Map())
   const statusRef = useRef<Map<string | null, number>>(new Map())
@@ -874,19 +877,26 @@ export function FilesView() {
           />
         ) : null}
       </div>
+      {fileDownload.progress && (
+        <DownloadProgressUI
+          progress={fileDownload.progress}
+          onCancel={fileDownload.cancel}
+          onRetry={fileDownload.retry}
+        />
+      )}
       {confirmDialog && (
         <DownloadConfirmDialog
           path={confirmDialog.path}
           size={confirmDialog.size}
           threshold={DOWNLOAD_PROMPT_THRESHOLD}
           onCancel={() => setConfirmDialog(null)}
-          onPartial={async () => {
+          onPartial={() => {
             setConfirmDialog(null)
-            setDownloadTruncated(await doDownload(confirmDialog.path, DOWNLOAD_PROMPT_THRESHOLD))
+            void fileDownload.start(confirmDialog.path, DOWNLOAD_PROMPT_THRESHOLD)
           }}
-          onFull={async () => {
+          onFull={() => {
             setConfirmDialog(null)
-            setDownloadTruncated(await doDownload(confirmDialog.path))
+            void fileDownload.start(confirmDialog.path)
           }}
         />
       )}
