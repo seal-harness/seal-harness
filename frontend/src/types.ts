@@ -631,3 +631,59 @@ export interface Message {
    *  confirmation says "sent as the answer — not saved". */
   slashBubbleLabel?: string
 }
+
+// ── Cron ───────────────────────────────────────────────────────────────
+
+/** A cron job summary from `GET /api/cron` (the list response).
+ *  Omits `next_fire` (which requires a timezone load per job) and
+ *  includes `consecutive_failures` (the signal that a job is failing). */
+export interface CronJobSummary {
+  id: string
+  name: string
+  schedule: string
+  timezone: string | null
+  prompt: string
+  agent_def_id: string | null
+  enabled: boolean
+  one_shot: boolean
+  created_at: string
+  updated_at: string
+  last_fire: string | null
+  run_count: number
+  consecutive_failures: number
+}
+
+/** A cron job detail from `GET /api/cron/:id`. Includes `next_fire`. */
+export interface CronJobDetail extends CronJobSummary {
+  next_fire: string | null
+}
+
+/** The input for `POST /api/cron` (create). Dedicated type so the client
+ *  cannot set `created_at`, `run_count`, `consecutive_failures`, or
+ *  `last_fire`. */
+export interface CronJobInput {
+  name: string
+  schedule: string
+  timezone?: string
+  prompt: string
+  agent_def_id?: string
+  enabled?: boolean
+  one_shot?: boolean
+}
+
+/** The input for `PUT /api/cron/:id` (update). All fields optional —
+ *  only the supplied fields are patched. */
+export interface CronJobUpdateInput {
+  name?: string
+  schedule?: string
+  timezone?: string
+  prompt?: string
+  agent_def_id?: string
+  enabled?: boolean
+  one_shot?: boolean
+}
+
+/** The outcome of a cron create/update mutation. */
+export type CronMutationResult =
+  | { ok: true; job: CronJobDetail }
+  | { ok: false; error: string }

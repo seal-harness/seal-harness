@@ -54,7 +54,19 @@ import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Store (CronStore (..))
 
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 spec :: Spec
 spec = describe "Seal.Gateway mutation guard" $ do
 
@@ -232,6 +244,7 @@ mkApp canonicalOrigin = do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adCronStore = stubCronStore
     }
 
 testAbortReg :: SessionAbortRegistry

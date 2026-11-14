@@ -58,6 +58,7 @@ import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webC
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Cron.Store (CronStore (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
@@ -320,6 +321,7 @@ mkDepsFor paths = do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -493,10 +495,27 @@ mkProviderTestDeps tmp cfgRoot vr = do
     
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
+    , adCronStore = stubCronStore
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
 
+
+-- | A pure 'CronStore' stub for inline @deps = ApiDeps {…}@ literals
+-- (which are in a pure @let@ context and cannot call 'memoryCronStore').
+-- Every field raises so a mis-routed request is unmistakable rather than
+-- a plausible-looking empty 200. The cron tests build a real
+-- 'memoryCronStore' in IO and inject it.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate called in non-cron test"
+  , csRead      = \_ -> error "cron store stub: csRead called in non-cron test"
+  , csList      = \_ -> error "cron store stub: csList called in non-cron test"
+  , csSave      = \_ -> error "cron store stub: csSave called in non-cron test"
+  , csDelete    = \_ -> error "cron store stub: csDelete called in non-cron test"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun called in non-cron test"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns called in non-cron test"
+  }
 
 -- | The pure 'RepoRegistryHandle' value backing 'mkFakeRepoRegistryHandle'.
 -- Used by the inline @deps = ApiDeps {…}@ literals (which are in a pure
@@ -2336,6 +2355,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2414,6 +2434,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2482,6 +2503,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2551,6 +2573,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2645,6 +2668,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2704,6 +2728,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2762,6 +2787,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2801,6 +2827,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2892,6 +2919,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2949,6 +2977,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3005,6 +3034,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3055,6 +3085,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3114,6 +3145,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3378,6 +3410,7 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3568,6 +3601,7 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3640,6 +3674,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3687,6 +3722,7 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -3872,6 +3908,7 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4200,6 +4237,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5235,6 +5273,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
                 , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5372,6 +5411,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5461,6 +5501,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5570,6 +5611,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5741,6 +5783,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -5868,6 +5911,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5997,6 +6041,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

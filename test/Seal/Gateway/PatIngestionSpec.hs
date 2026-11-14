@@ -88,6 +88,7 @@ import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), mkRemoteUntrustedIOStub)
 import Seal.Tools.Ssh.Agent (SshAgentEnv (..), mkFakeSshAgentHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Store (CronStore (..))
 
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
 
@@ -274,6 +275,7 @@ mkVaultDeps vr tmp = do
         
         , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg         = testAbortReg
+        , adCronStore = stubCronStore
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing
         }
@@ -313,6 +315,17 @@ getExec ref idx = do
 -- Spec
 ----------------------------------------------------------------------
 
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 spec :: Spec
 spec = describe "Seal.Gateway.PatIngestion (cross-layer integration)" $ do
 
