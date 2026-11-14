@@ -211,7 +211,7 @@ const rowStyle: React.CSSProperties = {
 
 // ── Sub-components ──────────────────────────────────────────────────────
 
-function Breadcrumbs({ path }: { path: string }) {
+function Breadcrumbs({ path, children }: { path: string; children?: React.ReactNode }) {
   const segs = breadcrumbSegments(path)
   return (
     <div style={headerStyle} data-testid="breadcrumbs">
@@ -234,6 +234,7 @@ function Breadcrumbs({ path }: { path: string }) {
           )}
         </span>
       ))}
+      {children}
     </div>
   )
 }
@@ -862,19 +863,20 @@ export function FilesView() {
       </div>
 
       <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
-        <Breadcrumbs path={path ?? rootListing?.path ?? '/'} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', fontSize: '0.85em', color: 'var(--text-muted)' }}>
-          <input
-            type="checkbox"
-            id="show-hidden"
-            checked={showHidden}
-            onChange={(e) => setShowHidden(e.target.checked)}
-            style={{ margin: 0 }}
-          />
-          <label htmlFor="show-hidden" style={{ cursor: 'pointer', userSelect: 'none' }}>
-            Show hidden files
-          </label>
-        </div>
+        <Breadcrumbs path={path ?? rootListing?.path ?? '/'}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', fontSize: '0.85em', color: 'var(--text-muted)' }}>
+            <input
+              type="checkbox"
+              id="show-hidden"
+              checked={showHidden}
+              onChange={(e) => setShowHidden(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            <label htmlFor="show-hidden" style={{ cursor: 'pointer', userSelect: 'none' }}>
+              Show hidden files
+            </label>
+          </div>
+        </Breadcrumbs>
         {loading || contentLoading ? (
           <LoadingState />
         ) : error !== null ? (
